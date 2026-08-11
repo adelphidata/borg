@@ -285,7 +285,7 @@ pub(in crate::doctor) fn check_browser(config: &Config, checks: &mut Vec<Diagnos
         return;
     }
 
-    let detection = crate::browser::find_chrome(config.browser.executable.as_deref());
+    let detection = crate::browser::detection::find_chrome(config.browser.executable.as_deref());
     if let Some(ref exe) = detection.executable {
         checks.push(DiagnosticCheck::pass(
             "Browser",
@@ -306,7 +306,7 @@ pub(in crate::doctor) fn check_browser(config: &Config, checks: &mut Vec<Diagnos
         ));
     }
 
-    if crate::browser::detect_agent_browser() {
+    if crate::browser::detection::detect_agent_browser() {
         checks.push(DiagnosticCheck::pass(
             "Browser",
             "agent-browser CLI also available (legacy)",

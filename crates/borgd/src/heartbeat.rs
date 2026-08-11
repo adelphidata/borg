@@ -234,8 +234,11 @@ pub(crate) fn publish_global(evt: DaemonHeartbeatEvent) {
 
 /// Spawn the heartbeat scheduler + an agent-turn runner. Returns the bus
 /// that `Admin.SubscribeHeartbeatEvents` reads from, the rich trigger channel
-/// Admin RPCs use, and the legacy `poke_tx` channel the HTTP gateway still
-/// signals.
+/// Admin RPCs use, and a bare poke channel for the HTTP gateway.
+///
+/// The gateway lives in a crate `borgd` depends on, so it cannot name
+/// [`HeartbeatTrigger`]; it signals a unit channel instead, which a forwarder
+/// task here translates into a real trigger.
 ///
 /// `shutdown` cancels both spawned tasks. `executor` is used to run each
 /// heartbeat turn through the daemon's session machinery (so heartbeats share
@@ -258,7 +261,29 @@ pub fn spawn(
     // greetings (which still need executor context) work.
     let _ = config;
     let (trigger_tx, trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
-    let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
+    let (poke_tx, mut poke_rx) = mpsc::channel::<()>(8);
+
+    // Forward gateway pokes onto the trigger channel. The receiver used to be
+    // dropped right here, so every `/internal/poke` reported success while
+    // doing nothing at all. A poke is an explicit human request, so it
+    // bypasses quiet hours the same way `Admin.Poke` does.
+    {
+        let poke_trigger_tx = trigger_tx.clone();
+        tokio::spawn(async move {
+            while poke_rx.recv().await.is_some() {
+                if let Err(e) = poke_trigger_tx
+                    .send(HeartbeatTrigger {
+                        source: HeartbeatSource::Scheduled,
+                        bypass_quiet_hours: true,
+                    })
+                    .await
+                {
+                    tracing::warn!("poke received but the heartbeat runner is gone: {e}");
+                    break;
+                }
+            }
+        });
+    }
 
     let bus = HeartbeatBus::default();
     // Install the bus in the process-global slot so the unified scheduled-task

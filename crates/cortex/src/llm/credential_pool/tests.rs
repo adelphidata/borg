@@ -639,7 +639,7 @@ fn credential_pool_table_has_phase_one_columns() {
     // Migration contract: a fresh DB must expose the five new columns added
     // for OAuth + custom-endpoint parity. Catches the case where someone
     // adds a Rust field but forgets the SQL — load would then fail at
-    // SELECT-time and silently fall through to the legacy rotation path.
+    // SELECT-time and silently fall through to the poolless rotation path.
     let (db, _path, _g) = open_test_db();
     let conn = db.conn();
     let mut stmt = conn.prepare("PRAGMA table_info(credential_pool)").unwrap();

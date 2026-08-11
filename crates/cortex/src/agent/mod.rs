@@ -1818,7 +1818,7 @@ impl Agent {
                         debug!(
                             provider = %provider_id,
                             model = %usage.model,
-                            legacy_cost_estimate = ?cost,
+                            client_side_cost_estimate = ?cost,
                             "No rate card for provider/model; skipping budget reconcile \
                              (token usage still logged). Subsequent occurrences are silent."
                         );

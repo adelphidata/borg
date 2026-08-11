@@ -1258,7 +1258,7 @@ Rules:
         // Stay on the head-protected v2 path whenever the feature is configured —
         // even when protection has *decayed* to 0 — so the iterative summary fold
         // and durable checkpoint keep chaining. Only a user who disabled head
-        // protection entirely (configured 0) takes the legacy path.
+        // protection entirely (configured 0) takes the v1 path.
         // Remember why a pass produced nothing. A later pass that succeeds
         // clears it — the summarizer demonstrably works.
         let mut failure: Option<SummarizeFailure> = None;
@@ -1309,7 +1309,7 @@ Rules:
             };
             if dropped > 0 {
                 warn!(
-                    "v2 compaction yielded no progress; fell back to legacy compaction and dropped {dropped} messages"
+                    "v2 compaction yielded no progress; fell back to v1 compaction and dropped {dropped} messages"
                 );
             }
         }

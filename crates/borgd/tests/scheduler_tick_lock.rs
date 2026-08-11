@@ -12,11 +12,11 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
-use borgd::paths::tick_lock_path;
 use borgd::tick_lock::TickLock;
 use borgd::{scheduler, task_runner};
 use cortex::config::Config;
 use cortex::db::{Database, NewTask};
+use cortex::paths::tick_lock_path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;

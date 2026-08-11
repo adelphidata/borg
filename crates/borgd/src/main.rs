@@ -5,8 +5,9 @@
 //! Socket.
 
 use anyhow::Result;
-use borgd::{daemon, paths};
+use borgd::daemon;
 use clap::Parser;
+use cortex::paths;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 

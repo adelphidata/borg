@@ -49,13 +49,12 @@ pub fn prefix_to_channel(prefix: &str) -> Option<&'static str> {
 
 /// Parse a prefixed code like `tg/voyage-kitten-orbit-marble-cinder-pluto`
 /// into `(channel_name, full_code)`. Returns `None` if the code has no valid
-/// prefix OR the suffix is not a well-formed 6-word BIP-39 phrase. Accepts
-/// `tg/` (canonical) and `tg_` (legacy underscore separator) but in both cases
-/// the phrase itself must validate — a hostile sender cannot route a 1-word
-/// stub like `tg_voyage` into the telegram approval path.
+/// prefix OR the suffix is not a well-formed 6-word BIP-39 phrase — a hostile
+/// sender cannot route a 1-word stub like `tg/voyage` into the telegram
+/// approval path.
 pub fn parse_prefixed_code(code: &str) -> Option<(&'static str, &str)> {
     let trimmed = code.trim();
-    let sep_pos = trimmed.find(['/', '_'])?;
+    let sep_pos = trimmed.find('/')?;
     let prefix = &trimmed[..sep_pos];
     let channel = prefix_to_channel(prefix)?;
     let suffix = &trimmed[sep_pos + 1..];
@@ -93,18 +92,13 @@ pub fn validate_phrase(phrase: &str) -> Result<String> {
 
 /// Display name for a channel (capitalized).
 ///
-/// Recognized built-in channels come from `ChannelName`. Unknown strings
-/// (custom script-based channels, legacy aliases like "whatsapp"/"sms")
-/// fall back to specific mappings or the raw string.
+/// Recognized built-in channels come from `ChannelName`. Anything else — a
+/// custom script-based channel — displays under the name its author gave it.
 pub fn channel_display_name(channel_name: &str) -> String {
     let lower = channel_name.to_ascii_lowercase();
-    if let Ok(known) = lower.parse::<crate::channel_names::ChannelName>() {
-        return known.display_name().to_string();
-    }
-    match lower.as_str() {
-        "whatsapp" => "WhatsApp".to_string(),
-        "sms" => "SMS".to_string(),
-        _ => channel_name.to_string(),
+    match lower.parse::<crate::channel_names::ChannelName>() {
+        Ok(known) => known.display_name().to_string(),
+        Err(_) => channel_name.to_string(),
     }
 }
 
@@ -727,25 +721,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_prefixed_code_legacy_underscore_still_routes() {
-        // In-flight pairing requests minted by older daemons used `_` rather
-        // than `/`. We accept both as separators so a stale code isn't bricked
-        // mid-flight; new codes always emit `/`. The phrase itself still has
-        // to validate, so use a freshly generated one that's guaranteed to
-        // be in the BIP-39 wordlist.
+    fn test_parse_prefixed_code_rejects_underscore_separator() {
+        // `_` was once accepted alongside `/`. Only `/` is minted, so an
+        // underscore now means a hand-edited or probed code and must not
+        // route — even when the phrase after it is perfectly valid.
         let phrase = generate_phrase();
-        let code = format!("tg_{phrase}");
-        let (channel, _) = parse_prefixed_code(&code).unwrap();
-        assert_eq!(channel, "telegram");
+        assert!(parse_prefixed_code(&format!("tg_{phrase}")).is_none());
+        assert!(parse_prefixed_code(&format!("tg/{phrase}")).is_some());
     }
 
     #[test]
     fn test_parse_prefixed_code_rejects_malformed_suffix() {
-        // Real failure mode: a hostile sender crafts `tg_voyage` (or any
+        // Real failure mode: a hostile sender crafts `tg/voyage` (or any
         // prefixed-but-not-a-phrase string) and the parser hands it to
         // telegram routing. Pre-validating the suffix at parse time means
         // the approval layer never sees junk codes.
-        assert!(parse_prefixed_code("tg_voyage").is_none());
+        assert!(parse_prefixed_code("tg/voyage").is_none());
         assert!(parse_prefixed_code("tg/voyage-kitten").is_none()); // 2 words
         assert!(parse_prefixed_code("tg/AAAAA-BBBBB-CCCCC-DDDDD-EEEEE-FFFFF").is_none());
     }

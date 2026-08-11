@@ -105,7 +105,7 @@ pub async fn try_build_from_keys(
             warn!(
                 target: "cortex::llm::credential_pool",
                 error = %e,
-                "credential pool: cannot resolve db path — falling through to legacy rotation"
+                "credential pool: cannot resolve db path — falling through to poolless rotation"
             );
             return None;
         }
@@ -116,7 +116,7 @@ pub async fn try_build_from_keys(
             warn!(
                 target: "cortex::llm::credential_pool",
                 error = %e,
-                "credential pool: cannot open DB — falling through to legacy rotation"
+                "credential pool: cannot open DB — falling through to poolless rotation"
             );
             return None;
         }
@@ -146,7 +146,7 @@ pub async fn try_build_from_keys(
             warn!(
                 target: "cortex::llm::credential_pool",
                 error = %e,
-                "credential pool: load failed — falling through to legacy rotation"
+                "credential pool: load failed — falling through to poolless rotation"
             );
             None
         }

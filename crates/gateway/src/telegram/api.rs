@@ -7,7 +7,6 @@ use reqwest::Client;
 use serde::Serialize;
 use tracing::warn;
 
-use super::circuit_breaker::CircuitBreaker;
 use super::types::{
     ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo, InlineKeyboardMarkup,
     MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
@@ -18,6 +17,7 @@ use crate::constants::{
     DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT, TELEGRAM_MAX_FILE_SIZE_BYTES,
 };
 use crate::message_processing::chunker;
+use crate::resilience::circuit_breaker::CircuitBreaker;
 
 const TELEGRAM_API_BASE: &str = crate::constants::TELEGRAM_API_BASE;
 const HTTP_CONNECT_TIMEOUT: Duration = crate::constants::TELEGRAM_HTTP_CONNECT_TIMEOUT;
@@ -52,7 +52,10 @@ impl TelegramClient {
             )?,
             token: token.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            circuit_breaker: Arc::new(CircuitBreaker::new()),
+            circuit_breaker: Arc::new(CircuitBreaker::new(
+                cortex::constants::TELEGRAM_CIRCUIT_FAILURE_THRESHOLD,
+                cortex::constants::TELEGRAM_CIRCUIT_SUSPENSION_SECS,
+            )),
         })
     }
 
@@ -193,7 +196,7 @@ impl TelegramClient {
             if status.as_u16() == 429 {
                 attempts += 1;
                 if attempts > MAX_SEND_RETRIES {
-                    self.circuit_breaker.record_failure(429);
+                    self.circuit_breaker.record_failure_status(429);
                     bail!("sendMessage rate limited after {MAX_SEND_RETRIES} retries");
                 }
                 let retry_secs = resp_body
@@ -213,7 +216,7 @@ impl TelegramClient {
                 continue;
             }
 
-            self.circuit_breaker.record_failure(status.as_u16());
+            self.circuit_breaker.record_failure_status(status.as_u16());
             bail!(
                 "sendMessage failed ({}): {}",
                 status.as_u16(),
@@ -247,7 +250,7 @@ impl TelegramClient {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 if status == 401 {
-                    self.circuit_breaker.record_failure(401);
+                    self.circuit_breaker.record_failure_status(401);
                 } else {
                     self.circuit_breaker.record_success();
                 }
@@ -492,7 +495,7 @@ impl TelegramClient {
             if status.as_u16() == 429 {
                 attempts += 1;
                 if attempts > MAX_SEND_RETRIES {
-                    self.circuit_breaker.record_failure(429);
+                    self.circuit_breaker.record_failure_status(429);
                     bail!("{method} rate limited after {MAX_SEND_RETRIES} retries");
                 }
                 let retry_secs = resp_body
@@ -504,7 +507,7 @@ impl TelegramClient {
                 continue;
             }
 
-            self.circuit_breaker.record_failure(status.as_u16());
+            self.circuit_breaker.record_failure_status(status.as_u16());
             bail!(
                 "{method} failed ({}): {}",
                 status.as_u16(),

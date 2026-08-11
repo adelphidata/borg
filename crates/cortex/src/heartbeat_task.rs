@@ -5,10 +5,11 @@
 
 pub use crate::task_ids::HEARTBEAT_TASK_ID;
 
-/// Sentinel `delivery_channel` value that means "fan out to all
-/// gateway-bound channels" — preserves the legacy multi-channel
-/// heartbeat broadcast semantics without adding a new column. Rejected
-/// by the user-callable `schedule.create` so user tasks can't fan out.
+/// Reserved `delivery_channel` value that means "fan out to all
+/// gateway-bound channels". No real channel may be named `broadcast`, so the
+/// column carries the fan-out case without a second column to keep in sync.
+/// Rejected by the user-callable `schedule.create` so user tasks can't fan
+/// out.
 pub const BROADCAST_DELIVERY: &str = "broadcast";
 
 /// Sentinel `delivery_channel` value meaning "reply wherever this task was

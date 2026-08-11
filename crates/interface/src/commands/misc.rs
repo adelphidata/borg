@@ -158,42 +158,21 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
 }
 
 pub(crate) async fn run_poke() -> Result<()> {
-    // Prefer the gRPC daemon when its socket is present; fall back to the
-    // HTTP gateway poke endpoint for installs where borgd hasn't taken over yet.
+    // borgd is the only way to reach the heartbeat runner. There used to be an
+    // HTTP fallback here for installs where borgd had not taken over yet; no
+    // such install exists, and the fallback only served to turn "the daemon is
+    // not running" into a success-shaped message.
     let socket = crate::daemon_client::default_socket_path();
-    if socket.exists() {
-        match crate::daemon_client::connect(Some(&socket)).await {
-            Ok(mut client) => {
-                // Propagate the gRPC error rather than print-and-return-Ok —
-                // the CLI exit code is the user's only signal that the poke
-                // didn't actually fire.
-                client.poke().await.context("Admin.Poke via borgd")?;
-                println!("Poke signal sent.");
-                return Ok(());
-            }
-            Err(e) => eprintln!("borgd socket present but connect failed: {e:#}"),
-        }
+    if !socket.exists() {
+        anyhow::bail!("borg is not running. Start it with: borg service start");
     }
-
-    let config = cortex::config::Config::load_from_db().await?;
-    let url = format!(
-        "http://{}:{}/internal/poke",
-        config.gateway.host, config.gateway.port
-    );
-    let client = cortex::http::shared();
-    match client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
+    // Propagate errors rather than print-and-return-Ok — the CLI exit code is
+    // the user's only signal that the poke didn't actually fire.
+    let mut client = crate::daemon_client::connect(Some(&socket))
         .await
-    {
-        Ok(r) if r.status().is_success() => println!("Poke signal sent."),
-        Ok(r) => println!("Poke failed: {}", r.status()),
-        Err(_) => {
-            println!("Could not reach daemon. Is it running?");
-            println!("Start it with: borg service start");
-        }
-    }
+        .context("connect to borgd")?;
+    client.poke().await.context("Admin.Poke via borgd")?;
+    println!("Poke signal sent.");
     Ok(())
 }
 

@@ -5,7 +5,6 @@
 //! the `service::*` helpers via `borgd::run_legacy`.
 
 use crate::maintenance::sweep;
-use crate::paths::tick_lock_path;
 use crate::tick_lock::TickLock;
 use anyhow::Result;
 use cortex::config::Config;
@@ -13,6 +12,7 @@ use cortex::constants::{
     DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, SLEEP_DRIFT_THRESHOLD,
     STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL,
 };
+use cortex::paths::tick_lock_path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;

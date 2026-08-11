@@ -35,7 +35,6 @@ pub mod heartbeat_augmenters;
 pub(crate) mod maintenance;
 pub mod orchestrator;
 pub mod pairing;
-pub mod paths;
 pub mod pidlock;
 pub mod pki_grpc;
 /// Daemon tokio runtime construction — enlarged worker stack so the agent

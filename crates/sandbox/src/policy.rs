@@ -336,7 +336,7 @@ impl SandboxPolicy {
         tool_dir: &std::path::Path,
     ) -> SandboxCommand {
         use crate::seatbelt::generate_profile;
-        let profile = match generate_profile(self, tool_dir, Some(program)) {
+        let profile = match generate_profile(self, tool_dir, program) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(

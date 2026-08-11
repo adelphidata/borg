@@ -31,7 +31,10 @@ pub async fn handle_schedule(args: &serde_json::Value, config: &Config) -> Resul
         return Ok("Error: 'type' is required for create. Use 'prompt' for AI tasks or 'command' for shell cron jobs.".to_string());
     }
 
-    // Remap "id" to "task_id"/"job_id" for backward compat with existing helpers
+    // The `schedule` tool names its identifier `id`; the `manage_tasks` and
+    // `manage_cron` tools that share these helpers name theirs `task_id` and
+    // `job_id`. Remap so one helper serves both schemas — this is an adapter
+    // between live tools, not a shim for an old name.
     let mut remapped = args.clone();
     if let Some(id) = args.get("id").cloned() {
         if job_type == "command" {

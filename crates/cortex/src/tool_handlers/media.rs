@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use tracing::instrument;
 
-use crate::browser::{validate_browser_args, BrowserSession};
+use crate::browser::validate::validate_browser_args;
+use crate::browser::BrowserSession;
 use crate::config::Config;
 use crate::types::{ContentPart, MediaData, ToolOutput};
 

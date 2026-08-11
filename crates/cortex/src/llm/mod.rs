@@ -475,7 +475,7 @@ struct ProviderSlot {
     keys: Vec<String>,
     /// Credential pool for this slot. `None` when the DB is unreachable at
     /// construction time (tests, embedded usage); the failover loop falls
-    /// back to the legacy `keys` Vec.
+    /// back to the `keys` Vec.
     pool: Option<Arc<credential_pool::CredentialPool>>,
     temperature: f32,
     max_tokens: u32,
@@ -532,7 +532,7 @@ pub struct LlmClient {
     llm_config: LlmConfig,
     provider: Provider,
     api_key: String,
-    /// Additional fallback keys. Used only as the legacy rotation path when
+    /// Additional fallback keys. Used only as the poolless rotation path when
     /// `primary_pool` is `None` (DB unreachable). When the pool is present,
     /// it owns rotation and this Vec is unused at runtime.
     fallback_keys: Vec<String>,
@@ -1075,7 +1075,7 @@ impl LlmClient {
         let api_key = keys_remaining.remove(0);
 
         // Try to build the primary credential pool. Best-effort: falls back
-        // to legacy rotation when the DB is unreachable (tests, headless
+        // to poolless rotation when the DB is unreachable (tests, headless
         // embedded usage, first-boot before borgd has stamped a DB file).
         let primary_pool =
             if provider.supports_credential_pool() && keys.iter().any(|k| !k.is_empty()) {
@@ -2556,7 +2556,7 @@ impl LlmClient {
 
     /// Parse provider rate-limit headers from `headers` and report the
     /// resulting snapshot to the active credential's pool entry. No-op when
-    /// the pool isn't wired up (legacy rotation path, tests without a pool)
+    /// the pool isn't wired up (poolless rotation path, tests without a pool)
     /// or when the headers don't carry recognizable bucket state.
     fn report_rate_limit_snapshot(&self, headers: &reqwest::header::HeaderMap) {
         let Some(pool) = self.primary_pool.as_ref() else {

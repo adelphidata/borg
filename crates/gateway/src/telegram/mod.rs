@@ -5,7 +5,6 @@ pub mod channel;
 /// Per-chat sequential message queue.
 pub mod chat_queue;
 /// Circuit breaker for Telegram API calls.
-pub mod circuit_breaker;
 /// Update deduplication by update_id.
 pub mod dedup;
 /// Shared Telegram delivery helpers.

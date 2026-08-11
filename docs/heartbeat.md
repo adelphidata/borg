@@ -95,7 +95,7 @@ borg poke
 
 From the TUI, use `/poke`.
 
-This sends a poke signal to the daemon, triggering a scheduled heartbeat that bypasses quiet hours. The CLI prefers the daemon gRPC API and falls back to the legacy HTTP `/internal/poke` gateway endpoint if needed.
+This sends a poke signal to the daemon, triggering a scheduled heartbeat that bypasses quiet hours. The CLI goes through the daemon gRPC API and fails if borgd is not running. The gateway's chat `/poke` command reaches the same runner through the loopback-only `/internal/poke` endpoint.
 
 ## Daemon mode
 

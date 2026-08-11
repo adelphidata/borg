@@ -21,10 +21,6 @@ use tracing::instrument;
 use crate::config::{BrowserConfig as BorgBrowserConfig, UrlPolicyConfig};
 use crate::url_policy::{self, ClassifyOutcome};
 
-// Re-export key types for backward compatibility
-pub use detection::{detect_agent_browser, find_chrome, ChromeDetection};
-pub use validate::validate_browser_args;
-
 /// Persistent CDP browser session. Lazy-launched on first `browser` tool call.
 pub struct BrowserSession {
     browser: Browser,
