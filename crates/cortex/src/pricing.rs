@@ -73,16 +73,22 @@ fn strip_bedrock_version_suffix(model: &str) -> &str {
 
 static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(|| {
     let entries: Vec<(&str, f64, f64)> = vec![
-        // Claude 4.x (frontier)
-        ("claude-opus-4-7", 15.0, 75.0),
+        // Claude 5 (frontier)
+        ("claude-opus-5", 5.0, 25.0),
+        ("claude-sonnet-5", 3.0, 15.0),
+        ("claude-fable-5", 10.0, 50.0),
+        // Claude 4.x. Opus dropped from $15/$75 to $5/$25 at 4.6; 4.7 was
+        // carrying the retired rate and over-reporting cost by 3x.
+        ("claude-opus-4-8", 5.0, 25.0),
+        ("claude-opus-4-7", 5.0, 25.0),
         ("claude-opus-4-20250514", 15.0, 75.0),
         ("claude-opus-4", 15.0, 75.0),
         ("claude-sonnet-4-6", 3.0, 15.0),
         ("claude-sonnet-4-20250514", 3.0, 15.0),
         ("claude-sonnet-4-0", 3.0, 15.0),
         ("claude-sonnet-4", 3.0, 15.0),
-        ("claude-haiku-4-5-20251001", 0.80, 4.0),
-        ("claude-haiku-4-5", 0.80, 4.0),
+        ("claude-haiku-4-5-20251001", 1.0, 5.0),
+        ("claude-haiku-4-5", 1.0, 5.0),
         // Claude 3.x (available on AWS Bedrock incl. GovCloud, mapped via the
         // `anthropic.*` Bedrock ids to these Anthropic public rates)
         ("claude-3-7-sonnet", 3.0, 15.0),
@@ -94,6 +100,15 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
         ("claude-3-5-haiku-20241022", 0.80, 4.0),
         ("claude-3-opus", 15.0, 75.0),
         ("claude-3-opus-20240229", 15.0, 75.0),
+        // xAI. Same rates the direct-provider table in `llm/pricing.rs` already
+        // carries — this table missed them, so Grok spend never reached the
+        // budget at all.
+        ("grok-4", 5.0, 15.0),
+        ("grok-4-fast-reasoning", 0.20, 0.50),
+        ("grok-4-fast-non-reasoning", 0.20, 0.50),
+        ("grok-4-fast", 0.20, 0.50),
+        ("grok-3", 3.0, 15.0),
+        ("grok-3-mini", 0.30, 0.50),
         // GPT-5 family
         ("gpt-5", 1.25, 10.0),
         ("gpt-5-mini", 0.25, 2.0),
@@ -168,9 +183,33 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
         // Anthropic
         BundledRateCardEntry {
             provider_id: "anthropic",
+            model: "claude-opus-5",
+            prompt_per_mtok_usd: "5.00",
+            completion_per_mtok_usd: "25.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-sonnet-5",
+            prompt_per_mtok_usd: "3.00",
+            completion_per_mtok_usd: "15.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-fable-5",
+            prompt_per_mtok_usd: "10.00",
+            completion_per_mtok_usd: "50.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-opus-4-8",
+            prompt_per_mtok_usd: "5.00",
+            completion_per_mtok_usd: "25.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "anthropic",
             model: "claude-opus-4-7",
-            prompt_per_mtok_usd: "15.00",
-            completion_per_mtok_usd: "75.00",
+            prompt_per_mtok_usd: "5.00",
+            completion_per_mtok_usd: "25.00",
         },
         BundledRateCardEntry {
             provider_id: "anthropic",
@@ -193,8 +232,8 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
         BundledRateCardEntry {
             provider_id: "anthropic",
             model: "claude-haiku-4-5",
-            prompt_per_mtok_usd: "0.80",
-            completion_per_mtok_usd: "4.00",
+            prompt_per_mtok_usd: "1.00",
+            completion_per_mtok_usd: "5.00",
         },
         // OpenAI
         BundledRateCardEntry {

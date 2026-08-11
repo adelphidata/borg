@@ -31,8 +31,35 @@ pub struct ModelMetadata {
 /// `claude-haiku-4` before `claude-haiku`). The lookup performs a longest-prefix
 /// scan, so this ordering is for human readability rather than correctness.
 const REGISTRY: &[ModelMetadata] = &[
+    // Claude 5 ships a 1M window as standard rather than as a beta header, so
+    // both figures match. Listed before the 4-x rows purely for readability —
+    // no `claude-opus-5` prefix collides with a `claude-opus-4` row.
+    ModelMetadata {
+        slug: "claude-opus-5",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "claude-sonnet-5",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "claude-fable-5",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
     // Longer/more specific slugs come first so prefix matching resolves them
     // before bare `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`.
+    ModelMetadata {
+        slug: "claude-opus-4-8",
+        context_window: 200_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "claude-opus-4-7",
         context_window: 200_000,
@@ -104,6 +131,39 @@ const REGISTRY: &[ModelMetadata] = &[
         context_window: 200_000,
         max_context_window: 200_000,
         supports_thinking: false,
+    },
+    // `gpt-5.5` and `gpt-5.4-*` would otherwise prefix-match bare `gpt-5` and
+    // inherit its window. Windows follow the gpt-5 analog of the same tier —
+    // full models get the 1M ceiling, mini/nano the 400K one.
+    ModelMetadata {
+        slug: "gpt-5.5-pro",
+        context_window: 272_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-5.5",
+        context_window: 272_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-5.4-mini",
+        context_window: 272_000,
+        max_context_window: 400_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-5.4-nano",
+        context_window: 272_000,
+        max_context_window: 400_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-5.1-codex",
+        context_window: 272_000,
+        max_context_window: 400_000,
+        supports_thinking: true,
     },
     // More specific gpt-5-* slugs precede bare `gpt-5` for longest-prefix match.
     ModelMetadata {
@@ -390,6 +450,18 @@ const REGISTRY: &[ModelMetadata] = &[
     // models and for the 32K `mistral` family entry that `mistral-large` would
     // otherwise shadow-match.
     ModelMetadata {
+        slug: "codellama",
+        context_window: 16_384,
+        max_context_window: 16_384,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "glm-5.2",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
         slug: "glm-5.1",
         context_window: 200_000,
         max_context_window: 200_000,
@@ -596,9 +668,15 @@ pub(crate) fn strip_vendor_prefix(model: &str) -> &str {
 }
 
 /// Look up metadata for `model` by longest matching prefix, after stripping
-/// any vendor prefix (e.g. `anthropic/claude-sonnet-4` matches `claude-sonnet-4`).
+/// any vendor prefix (e.g. `anthropic/claude-sonnet-4` matches `claude-sonnet-4`)
+/// and any AWS Bedrock id shape (`us.anthropic.claude-…-v1:0`).
+///
+/// Bedrock normalization matters as much as the vendor prefix: without it every
+/// `anthropic.*` id misses the registry entirely and silently takes
+/// `DEFAULT_CONTEXT_WINDOW`, so a Bedrock deployment budgets every model the
+/// same regardless of its real window.
 pub fn lookup(model: &str) -> Option<&'static ModelMetadata> {
-    let canonical = strip_vendor_prefix(model);
+    let canonical = strip_vendor_prefix(crate::pricing::strip_bedrock_model_shape(model));
     let lowered = canonical.to_lowercase();
     let mut best: Option<&'static ModelMetadata> = None;
     for entry in REGISTRY {

@@ -413,7 +413,66 @@ fn sync_indices_from_config() {
     open(&mut popup, &cfg);
 
     assert_eq!(popup.provider_index, 2); // anthropic is index 2
-    assert_eq!(popup.model_index, 2); // claude-haiku-4-5 is index 2 in ANTHROPIC_MODELS
+    assert_eq!(popup.model_index, 2); // claude-haiku-4-5 is index 2 in the curated Anthropic block
+    assert!(popup.uncurated_model.is_none());
+}
+
+/// A model the catalog does not curate must stay visible and stay selected.
+///
+/// Resolving it to row 0 would show the recommended pick as the user's current
+/// model — wrong on its face, and one Enter away from switching them without
+/// their knowledge. This is reachable without any corruption: the catalog drops
+/// ids as models retire, and a manifest refresh can do it mid-session.
+#[test]
+fn a_model_missing_from_the_catalog_stays_visible_and_selected() {
+    let mut popup = SettingsPopup::new();
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("anthropic".to_string());
+    cfg.llm.model = "claude-retired-from-the-catalog".to_string();
+    open(&mut popup, &cfg);
+
+    let curated = models_for_provider("anthropic");
+    assert!(
+        !curated
+            .iter()
+            .any(|(id, _)| id == "claude-retired-from-the-catalog"),
+        "precondition: the id must be absent from the curated list"
+    );
+
+    let rows = popup.model_rows("anthropic");
+    assert_eq!(rows.len(), curated.len() + 1, "the row must be appended");
+    assert_eq!(
+        popup.model_index,
+        curated.len(),
+        "the appended row must be the selected one"
+    );
+    assert_eq!(rows[popup.model_index].0, "claude-retired-from-the-catalog");
+    assert_eq!(
+        popup.current_value(&cfg, "model"),
+        "claude-retired-from-the-catalog",
+        "the popup must report the configured model, not the recommended pick"
+    );
+}
+
+/// Switching provider drops the previous provider's uncurated row, or it would
+/// follow the user to a provider that cannot serve it.
+#[test]
+fn changing_provider_clears_an_uncurated_model_row() {
+    let mut popup = SettingsPopup::new();
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("anthropic".to_string());
+    cfg.llm.model = "claude-retired-from-the-catalog".to_string();
+    open(&mut popup, &cfg);
+    assert!(popup.uncurated_model.is_some(), "precondition");
+
+    popup.cycle_provider(&mut cfg, true).unwrap();
+
+    assert!(popup.uncurated_model.is_none());
+    let provider_id = PROVIDERS[popup.provider_index].0;
+    assert_eq!(
+        popup.model_rows(provider_id),
+        models_for_provider(provider_id)
+    );
 }
 
 #[test]
@@ -460,9 +519,20 @@ fn provider_change_updates_model_config() {
     let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
     popup.handle_key(right, &mut cfg).unwrap();
 
-    // Config should now have openai provider and first openai model
+    // Config should now have openai provider and first openai model.
+    // Asserted against the catalog rather than a literal: the rule under test
+    // is "the model resets to the new provider's first option", and pinning
+    // whatever that id happens to be today makes this test fail on every
+    // routine catalog refresh for no behavioural reason.
     assert_eq!(cfg.llm.provider.as_deref(), Some("openai"));
-    assert_eq!(cfg.llm.model, "gpt-5");
+    let openai = models_for_provider("openai");
+    assert!(!openai.is_empty(), "openai must have a curated block");
+    assert_eq!(cfg.llm.model, openai[0].0);
+    assert_ne!(
+        cfg.llm.model,
+        Config::default().llm.model,
+        "the model must actually move off the previous provider's pick"
+    );
 }
 
 #[test]

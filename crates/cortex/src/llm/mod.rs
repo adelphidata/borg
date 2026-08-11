@@ -131,6 +131,7 @@ pub mod credential_sources;
 pub mod deprecations;
 pub(crate) mod gemini;
 pub mod llm_error;
+pub mod model_catalog;
 pub mod model_registry;
 pub mod oauth_refresh;
 mod pricing;

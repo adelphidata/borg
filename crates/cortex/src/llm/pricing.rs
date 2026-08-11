@@ -168,14 +168,57 @@ static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = La
                 output_per_mtok: "75.00",
             },
         ),
+        // Opus dropped from $15/$75 to $5/$25 at 4.6 and has stayed there
+        // through 4.7, 4.8, and 5. Cache multipliers are unchanged: read is
+        // 0.1x input, 5m write 1.25x, 1h write 2x.
+        (
+            "claude-opus-5",
+            AnthropicModelRate {
+                input_per_mtok: "5.00",
+                cache_read_per_mtok: "0.50",
+                cache_write_5m_per_mtok: "6.25",
+                cache_write_1h_per_mtok: "10.00",
+                output_per_mtok: "25.00",
+            },
+        ),
+        (
+            "claude-sonnet-5",
+            AnthropicModelRate {
+                input_per_mtok: "3.00",
+                cache_read_per_mtok: "0.30",
+                cache_write_5m_per_mtok: "3.75",
+                cache_write_1h_per_mtok: "6.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "claude-fable-5",
+            AnthropicModelRate {
+                input_per_mtok: "10.00",
+                cache_read_per_mtok: "1.00",
+                cache_write_5m_per_mtok: "12.50",
+                cache_write_1h_per_mtok: "20.00",
+                output_per_mtok: "50.00",
+            },
+        ),
+        (
+            "claude-opus-4-8",
+            AnthropicModelRate {
+                input_per_mtok: "5.00",
+                cache_read_per_mtok: "0.50",
+                cache_write_5m_per_mtok: "6.25",
+                cache_write_1h_per_mtok: "10.00",
+                output_per_mtok: "25.00",
+            },
+        ),
         (
             "claude-opus-4-7",
             AnthropicModelRate {
-                input_per_mtok: "15.00",
-                cache_read_per_mtok: "1.50",
-                cache_write_5m_per_mtok: "18.75",
-                cache_write_1h_per_mtok: "30.00",
-                output_per_mtok: "75.00",
+                input_per_mtok: "5.00",
+                cache_read_per_mtok: "0.50",
+                cache_write_5m_per_mtok: "6.25",
+                cache_write_1h_per_mtok: "10.00",
+                output_per_mtok: "25.00",
             },
         ),
         (
@@ -418,7 +461,13 @@ pub fn shipped_openai_models() -> &'static [&'static str] {
 /// daemon cost-emission table.
 #[cfg(test)]
 pub fn shipped_anthropic_models() -> &'static [&'static str] {
-    &["claude-sonnet-4", "claude-haiku-4-5"]
+    &[
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-sonnet-4",
+        "claude-haiku-4-5",
+    ]
 }
 
 /// Shipped AWS Bedrock model ids (with region prefix + `-vN:M` suffix) that

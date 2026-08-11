@@ -1,29 +1,29 @@
 //! Dynamic OpenRouter catalog fetch.
 //!
 //! Hits `https://openrouter.ai/api/v1/models` once per session, intersects the
-//! live catalog with our curated [`OPENROUTER_MODELS`] list, and caches the
-//! result in memory. Callers read the cache via [`cached_models`]; a `None`
-//! return means the caller should fall back to the hardcoded list (the cache
-//! is empty because the fetch hasn't completed, never ran, or failed).
+//! live catalog with the curated OpenRouter block of
+//! [`cortex::llm::model_catalog`], and caches the result in memory. Callers read
+//! the cache via [`cached_models`]; a `None` return means the caller should fall
+//! back to the catalog directly (the cache is empty because the fetch hasn't
+//! completed, never ran, or failed).
 //!
-//! The curated list provides stable ordering + labels; the live fetch drops
-//! stale IDs and tags zero-priced models as "(free)". No refresh command, no
-//! disk cache, no TTL.
+//! The catalog owns ordering, labels, and the recommended pick; the live fetch
+//! only drops ids OpenRouter no longer serves and tags zero-priced models as
+//! "(free)". It never adds an id the catalog does not carry.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::onboarding::OPENROUTER_MODELS;
+use cortex::llm::model_catalog;
 
 const CATALOG_URL_DEFAULT: &str = "https://openrouter.ai/api/v1/models";
 // Short cap so a slow catalog fetch can't stall onboarding; falls back to the baked-in list.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// `(model_id, display_label)` pairs — matches the hardcoded shape in
-/// [`crate::onboarding::OPENROUTER_MODELS`] but owned so it can carry a
-/// dynamically-generated `(free)` tag.
+/// `(model_id, display_label)` pairs — the same shape the catalog renders, but
+/// owned so it can carry a dynamically-generated `(free)` tag.
 pub type ModelList = Vec<(String, String)>;
 
 static CACHE: LazyLock<Mutex<Option<ModelList>>> = LazyLock::new(|| Mutex::new(None));
@@ -114,7 +114,7 @@ impl Pricing {
     }
 }
 
-/// Fetch the live catalog and intersect it against [`OPENROUTER_MODELS`].
+/// Fetch the live catalog and intersect it against the curated block.
 ///
 /// Returns `Err` when:
 /// - the HTTP call fails (timeout, non-2xx, transport)
@@ -141,18 +141,18 @@ async fn fetch_and_parse(base_url: &str, timeout: Duration) -> anyhow::Result<Mo
 
 /// Preserve curated order; drop curated IDs missing from the live response;
 /// append "(free)" to labels when pricing is zero.
+///
+/// Labels are rendered by the catalog rather than concatenated here, so the
+/// "(recommended)" badge stays consistent with the offline path.
 fn intersect_with_curated(live: &[CatalogEntry]) -> ModelList {
-    let mut result = Vec::with_capacity(OPENROUTER_MODELS.len());
-    for (curated_id, curated_label) in OPENROUTER_MODELS {
-        let Some(entry) = live.iter().find(|e| e.id == *curated_id) else {
+    let curated = model_catalog::curated_entries("openrouter");
+    let mut result = Vec::with_capacity(curated.len());
+    for entry in &curated {
+        let Some(live_entry) = live.iter().find(|e| e.id == entry.id) else {
             continue;
         };
-        let label = if entry.pricing.as_ref().is_some_and(Pricing::is_free) {
-            format!("{curated_label} (free)")
-        } else {
-            (*curated_label).to_string()
-        };
-        result.push(((*curated_id).to_string(), label));
+        let free = live_entry.pricing.as_ref().is_some_and(Pricing::is_free);
+        result.push((entry.id.clone(), model_catalog::render_label(entry, free)));
     }
     result
 }
@@ -168,6 +168,16 @@ mod tests {
     /// flaky `None`/stale values. Uses a Tokio mutex so the guard can be
     /// held across `await` points without tripping clippy.
     static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Curated ids in catalog order. The fixtures build live responses out of
+    /// real curated entries, so a catalog edit that breaks the intersect shows
+    /// up here rather than passing against invented ids.
+    fn curated_ids() -> Vec<String> {
+        model_catalog::curated_entries("openrouter")
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
 
     fn catalog_body(ids: &[(&str, Option<(&str, &str)>)]) -> serde_json::Value {
         let data: Vec<serde_json::Value> = ids
@@ -204,7 +214,8 @@ mod tests {
     /// uncurated live ID is ignored. Relies on real curated entries.
     #[tokio::test]
     async fn fetch_intersects_with_curated() {
-        let curated_id = OPENROUTER_MODELS[0].0;
+        let ids = curated_ids();
+        let curated_id: &str = &ids[0];
         let body = catalog_body(&[(curated_id, None), ("foo/not-curated", None)]);
         let server = mock_server_with(body, 200).await;
         let got = fetch_and_parse(&server_url(&server), Duration::from_secs(2))
@@ -218,9 +229,10 @@ mod tests {
     /// that *are* live still appear.
     #[tokio::test]
     async fn fetch_drops_stale_curated_ids() {
-        assert!(OPENROUTER_MODELS.len() >= 2, "need two curated entries");
-        let keep = OPENROUTER_MODELS[0].0;
-        let drop = OPENROUTER_MODELS[1].0;
+        let ids = curated_ids();
+        assert!(ids.len() >= 2, "need two curated entries");
+        let keep: &str = &ids[0];
+        let drop: &str = &ids[1];
         let body = catalog_body(&[(keep, None)]);
         let server = mock_server_with(body, 200).await;
         let got = fetch_and_parse(&server_url(&server), Duration::from_secs(2))
@@ -234,9 +246,10 @@ mod tests {
     /// pricing does not.
     #[tokio::test]
     async fn fetch_tags_free_models() {
-        assert!(OPENROUTER_MODELS.len() >= 2);
-        let free_id = OPENROUTER_MODELS[0].0;
-        let paid_id = OPENROUTER_MODELS[1].0;
+        let ids = curated_ids();
+        assert!(ids.len() >= 2);
+        let free_id: &str = &ids[0];
+        let paid_id: &str = &ids[1];
         let body = catalog_body(&[
             (free_id, Some(("0", "0"))),
             (paid_id, Some(("0.000005", "0.000025"))),
@@ -350,7 +363,8 @@ mod tests {
     async fn cache_populated_after_fetch() {
         let _guard = CACHE_TEST_LOCK.lock().await;
         reset_cache();
-        let curated_id = OPENROUTER_MODELS[0].0;
+        let ids = curated_ids();
+        let curated_id: &str = &ids[0];
         let body = catalog_body(&[(curated_id, None)]);
         let server = mock_server_with(body, 200).await;
         let models = fetch_and_parse(&server_url(&server), Duration::from_secs(2))
@@ -398,7 +412,8 @@ mod tests {
         let _guard = CACHE_TEST_LOCK.lock().await;
         reset_cache();
         let got = crate::onboarding::models_for_provider("openrouter");
-        assert_eq!(got.len(), OPENROUTER_MODELS.len());
-        assert_eq!(got[0].0, OPENROUTER_MODELS[0].0);
+        let ids = curated_ids();
+        assert_eq!(got.len(), ids.len());
+        assert_eq!(got[0].0, ids[0]);
     }
 }

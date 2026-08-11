@@ -14,6 +14,12 @@ use crate::daemon_client;
 /// Standard subdirectories created under the Borg data directory.
 pub(crate) const BORG_SUBDIRS: &[&str] = &["memory", "tools", "skills", "logs", "cache"];
 
+/// Catalog provider consulted when the requested one has no curated block.
+///
+/// OpenRouter is the widest list and needs only one credential, so an id we do
+/// not recognise still lands somewhere a new operator can pick from.
+pub(crate) const FALLBACK_PROVIDER: &str = "openrouter";
+
 /// Provider choices with display labels.
 pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     (
@@ -45,173 +51,6 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Model choices per provider.
-///
-/// OpenRouter list leads with the open-weight flagships (GLM, MiniMax, Kimi) as
-/// the recommended defaults, then walks the remaining families — Anthropic,
-/// OpenAI, Gemini, Grok, Qwen, DeepSeek, Mistral — newest slug first within
-/// each. The live catalog fetch ([`crate::openrouter_catalog`]) preserves this
-/// order and drops any IDs OpenRouter no longer serves, so keep the newest
-/// curated slug at the top of its family. New open-weight flagships go up top
-/// with GLM/MiniMax/Kimi; everything else keeps its family grouping. See the
-/// `update-model-catalog` skill.
-pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
-    ("z-ai/glm-5.1", "GLM 5.1 (recommended)"),
-    ("z-ai/glm-4.7", "GLM 4.7"),
-    ("minimax/minimax-m2.7", "MiniMax M2.7"),
-    ("moonshotai/kimi-k3", "Kimi K3 (reasoning)"),
-    ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
-    ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
-    (
-        "anthropic/claude-haiku-4.5",
-        "Claude Haiku 4.5 (fast, cheap)",
-    ),
-    ("openai/gpt-5.5", "GPT-5.5"),
-    ("openai/gpt-5.5-pro", "GPT-5.5 Pro (reasoning)"),
-    ("openai/gpt-5.4-mini", "GPT-5.4 Mini (fast)"),
-    ("openai/gpt-5.4-nano", "GPT-5.4 Nano (cheap)"),
-    ("openai/gpt-5.1-codex", "GPT-5.1 Codex (coding)"),
-    ("openai/gpt-5", "GPT-5"),
-    ("openai/gpt-5-mini", "GPT-5 Mini"),
-    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    ("google/gemini-3-flash-preview", "Gemini 3 Flash"),
-    (
-        "google/gemini-3.1-flash-lite-preview",
-        "Gemini 3.1 Flash Lite",
-    ),
-    ("x-ai/grok-4.20", "Grok 4.20"),
-    ("x-ai/grok-4.20-multi-agent", "Grok 4.20 Multi-Agent"),
-    ("x-ai/grok-4.1-fast", "Grok 4.1 Fast"),
-    ("x-ai/grok-4-fast", "Grok 4 Fast"),
-    ("x-ai/grok-4", "Grok 4"),
-    ("qwen/qwen3.6-max-preview", "Qwen3.6 Max"),
-    ("qwen/qwen3.6-flash", "Qwen3.6 Flash"),
-    ("qwen/qwen3-coder-next", "Qwen3 Coder Next (coding)"),
-    ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
-    ("deepseek/deepseek-v3.2-exp", "DeepSeek V3.2 Exp"),
-    ("deepseek/deepseek-r1", "DeepSeek R1 (reasoning)"),
-    ("mistralai/mistral-large-2512", "Mistral Large 3"),
-    ("mistralai/devstral-2512", "Devstral 2 (coding)"),
-];
-
-pub(crate) const OPENAI_MODELS: &[(&str, &str)] = &[
-    ("gpt-5", "GPT-5 (recommended)"),
-    ("gpt-5-mini", "GPT-5 Mini (fast, cheap)"),
-    ("gpt-5-nano", "GPT-5 Nano (fastest)"),
-    ("o3", "o3 (reasoning)"),
-    ("o4-mini", "o4 Mini (reasoning, fast)"),
-    ("gpt-4.1", "GPT-4.1"),
-    ("gpt-4.1-mini", "GPT-4.1 Mini"),
-    ("gpt-4o", "GPT-4o"),
-];
-
-pub(crate) const ANTHROPIC_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5 (fast, cheap)"),
-    ("claude-sonnet-4", "Claude Sonnet 4"),
-    ("claude-3-5-haiku", "Claude 3.5 Haiku (legacy)"),
-];
-
-pub(crate) const GEMINI_MODELS: &[(&str, &str)] = &[
-    ("gemini-3-pro", "Gemini 3 Pro (recommended)"),
-    ("gemini-3-flash", "Gemini 3 Flash (fast)"),
-    ("gemini-3-flash-lite", "Gemini 3 Flash Lite (fastest)"),
-    ("gemini-2.5-pro", "Gemini 2.5 Pro (legacy)"),
-    ("gemini-2.5-flash", "Gemini 2.5 Flash (legacy)"),
-];
-
-pub(crate) const BEDROCK_MODELS: &[(&str, &str)] = &[
-    (
-        "anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "Claude 3.7 Sonnet (recommended)",
-    ),
-    (
-        "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "Claude 3.5 Sonnet",
-    ),
-    (
-        "anthropic.claude-3-5-haiku-20241022-v1:0",
-        "Claude 3.5 Haiku (fast, cheap)",
-    ),
-];
-
-// `deepseek-chat` / `deepseek-reasoner` are deliberately absent: the provider
-// retires those ids on 2026-07-24 (they alias V4 Flash's non-thinking /
-// thinking modes). Existing configs still resolve — the registry, pricing, and
-// deprecation tables keep the aliases — but the picker must not hand a new
-// operator an id that is about to stop answering.
-pub(crate) const DEEPSEEK_MODELS: &[(&str, &str)] = &[
-    ("deepseek-v4-flash", "DeepSeek V4 Flash (recommended)"),
-    ("deepseek-v4-pro", "DeepSeek V4 Pro (reasoning)"),
-];
-
-pub(crate) const GROQ_MODELS: &[(&str, &str)] = &[
-    ("openai/gpt-oss-120b", "GPT-OSS 120B (recommended)"),
-    (
-        "moonshotai/kimi-k2-instruct",
-        "Kimi K2 Instruct (large, versatile)",
-    ),
-    (
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "Llama 4 Maverick 17B",
-    ),
-    (
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "Llama 4 Scout 17B",
-    ),
-    ("qwen/qwen3-32b", "Qwen3 32B"),
-    (
-        "deepseek-r1-distill-llama-70b",
-        "DeepSeek R1 Distill 70B (reasoning)",
-    ),
-    (
-        "llama-3.3-70b-versatile",
-        "Llama 3.3 70B Versatile (stable)",
-    ),
-    ("llama-3.1-8b-instant", "Llama 3.1 8B Instant (fastest)"),
-];
-
-pub(crate) const XAI_MODELS: &[(&str, &str)] = &[
-    ("grok-4", "Grok 4 (recommended)"),
-    (
-        "grok-4-fast-reasoning",
-        "Grok 4 Fast — reasoning (long context)",
-    ),
-    (
-        "grok-4-fast-non-reasoning",
-        "Grok 4 Fast — non-reasoning (fastest)",
-    ),
-];
-
-// Azure OpenAI deployment names are operator-chosen — these are suggested
-// labels for the most common base-model deployments. The actual deployment
-// name lives in `llm.azure_deployment` (set via /settings after onboarding);
-// the `model` field in the body is informational on Azure (routing is by
-// deployment, not model id).
-pub(crate) const AZURE_OPENAI_MODELS: &[(&str, &str)] = &[
-    ("gpt-4o", "GPT-4o (suggest as deployment name)"),
-    ("gpt-4o-mini", "GPT-4o Mini"),
-    ("gpt-5", "GPT-5"),
-    ("gpt-5-mini", "GPT-5 Mini"),
-    ("o3", "o3 (reasoning)"),
-];
-
-pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5 (fast, cheap)"),
-];
-
-pub(crate) const OLLAMA_MODELS: &[(&str, &str)] = &[
-    ("llama3.3", "Llama 3.3 70B (recommended)"),
-    ("qwen3", "Qwen3 (versatile)"),
-    ("deepseek-r1", "DeepSeek R1 (reasoning)"),
-    ("gpt-oss", "GPT-OSS 20B (OpenAI open-weight)"),
-    ("mistral", "Mistral 7B (fast, lightweight)"),
-    ("codellama", "Code Llama (coding)"),
-];
-
 /// Assembled choices from the onboarding wizard.
 pub struct OnboardingResult {
     pub user_name: String,
@@ -225,42 +64,35 @@ pub struct OnboardingResult {
 
 /// Get the model list for a given provider.
 ///
-/// For `openrouter`, consults the session cache populated by
-/// [`crate::openrouter_catalog::spawn_prefetch`]; falls back to the hardcoded
-/// [`OPENROUTER_MODELS`] list when the cache is empty (cold start or fetch
-/// failure). All other providers return their hardcoded list.
+/// The curated catalog ([`cortex::llm::model_catalog`]) is the single source of
+/// truth for ids, order, and labels. It ships compiled into the binary, so an
+/// airgapped install still gets a full picker, and refreshes from disk cache or
+/// the published manifest when there is a network.
+///
+/// Two providers overlay a live list on top: Ollama reports what is actually
+/// pulled on this machine, and OpenRouter prunes the curated list down to what
+/// it currently serves. Both fall through to the catalog when their cache is
+/// cold.
 pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
-    let hardcoded: &'static [(&'static str, &'static str)] = match provider_id {
-        "openai" => OPENAI_MODELS,
-        "anthropic" => ANTHROPIC_MODELS,
-        "bedrock" => BEDROCK_MODELS,
-        "gemini" => GEMINI_MODELS,
-        "deepseek" => DEEPSEEK_MODELS,
-        "groq" => GROQ_MODELS,
-        "xai" => XAI_MODELS,
-        "azure-openai" => AZURE_OPENAI_MODELS,
+    match provider_id {
         "ollama" => {
-            // Prefer the live installed-model list from `GET /api/tags` —
-            // what's actually pulled on this machine rarely matches the
-            // hardcoded suggestions.
             if let Some(live) = crate::ollama_catalog::cached_models() {
                 return live;
             }
-            OLLAMA_MODELS
         }
-        "claude-cli" => CLAUDE_CLI_MODELS,
         "openrouter" => {
             if let Some(live) = crate::openrouter_catalog::cached_models() {
                 return live;
             }
-            OPENROUTER_MODELS
         }
-        _ => OPENROUTER_MODELS,
-    };
-    hardcoded
-        .iter()
-        .map(|(id, label)| ((*id).to_string(), (*label).to_string()))
-        .collect()
+        _ => {}
+    }
+    let curated = cortex::llm::model_catalog::curated(provider_id);
+    if curated.is_empty() {
+        // An unknown provider id still has to render something choosable.
+        return cortex::llm::model_catalog::curated(FALLBACK_PROVIDER);
+    }
+    curated
 }
 
 /// Run the interactive onboarding wizard. Returns `None` if the user cancels.
@@ -336,19 +168,14 @@ fn keychain_api_key_toml(provider_id: &str) -> Result<String> {
     ))
 }
 
-/// Validate that a model ID is safe for TOML interpolation (alphanumeric, slashes, hyphens, dots).
+/// Validate that a model ID is safe for TOML interpolation and for use as a URL
+/// path segment.
+///
+/// Delegates to the catalog's validator rather than keeping a second copy of
+/// the rules: the two had drifted apart already, and a tightening applied to one
+/// left the other permissive.
 fn validate_model_id(model_id: &str) -> Result<()> {
-    if model_id.is_empty() {
-        bail!("model ID cannot be empty");
-    }
-    if model_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | ':'))
-    {
-        Ok(())
-    } else {
-        bail!("model ID contains invalid characters: {model_id}")
-    }
+    cortex::llm::model_catalog::validate_model_id(model_id)
 }
 
 /// Escape a string value for safe embedding in TOML double-quoted strings.
@@ -1084,8 +911,9 @@ mod tests {
 
     #[test]
     fn bedrock_models_non_empty_and_parseable() {
-        assert!(!BEDROCK_MODELS.is_empty());
-        for (id, _) in BEDROCK_MODELS {
+        let models = models_for_provider("bedrock");
+        assert!(!models.is_empty());
+        for (id, _) in &models {
             assert!(
                 validate_model_id(id).is_ok(),
                 "invalid bedrock model id: {id}"
@@ -1105,45 +933,89 @@ mod tests {
 
     #[test]
     fn ollama_models_non_empty() {
-        assert!(!OLLAMA_MODELS.is_empty());
-        for (id, _) in OLLAMA_MODELS {
+        let models = models_for_provider("ollama");
+        assert!(!models.is_empty());
+        for (id, _) in &models {
             assert!(validate_model_id(id).is_ok(), "invalid model id: {id}");
         }
     }
 
     #[test]
     fn bundled_model_ids_all_parse() {
-        // Regression guard: every hardcoded model ID must pass validate_model_id.
-        // If a typo (or an injected char) sneaks into a constant, onboarding
-        // would generate an invalid config without this guard.
-        for (id, _) in OLLAMA_MODELS {
+        // Regression guard: every curated model ID must pass validate_model_id.
+        // If a typo (or an injected char) reaches the catalog, onboarding would
+        // generate an invalid config without this guard. Driven off the catalog
+        // rather than a fixed provider list, so a new provider block is covered
+        // the day it lands.
+        // Reads the compiled-in floor, not process state: `models_for_provider`
+        // would otherwise assert against whatever this machine has cached in
+        // `~/.borg/cache/model-catalog.json`.
+        let floor = cortex::llm::model_catalog::embedded_manifest();
+        let providers = floor.provider_names();
+        assert!(
+            providers.len() >= 10,
+            "catalog lost providers: {providers:?}"
+        );
+        for provider in &providers {
+            let models = floor.curated(provider);
+            assert!(!models.is_empty(), "no models for provider: {provider}");
+            for (id, _) in &models {
+                assert!(
+                    validate_model_id(id).is_ok(),
+                    "{provider} model id invalid: {id}"
+                );
+            }
+        }
+    }
+
+    /// Every provider the wizard offers must have a curated block, or the
+    /// picker silently hands that provider OpenRouter's list — ids the
+    /// provider will not serve.
+    #[test]
+    fn every_wizard_provider_has_its_own_curated_block() {
+        let catalog = cortex::llm::model_catalog::embedded_manifest().provider_names();
+        for (id, label, _) in PROVIDERS {
             assert!(
-                validate_model_id(id).is_ok(),
-                "ollama model id invalid: {id}"
+                catalog.iter().any(|p| p == id),
+                "provider {label} ({id}) has no catalog block"
             );
         }
-        for (id, _) in DEEPSEEK_MODELS {
-            assert!(
-                validate_model_id(id).is_ok(),
-                "deepseek model id invalid: {id}"
+    }
+
+    /// An id with no curated block still renders something choosable, and it
+    /// is the fallback provider's list rather than an empty picker.
+    #[test]
+    fn unknown_provider_falls_back_rather_than_rendering_nothing() {
+        let got = models_for_provider("no-such-provider");
+        assert_eq!(got, cortex::llm::model_catalog::curated(FALLBACK_PROVIDER));
+        assert!(!got.is_empty());
+        // The fallback has to be a real provider block, not an accident of the
+        // running machine's cache.
+        assert!(!cortex::llm::model_catalog::embedded_manifest()
+            .curated(FALLBACK_PROVIDER)
+            .is_empty());
+    }
+
+    /// Exactly one entry per provider carries the recommended badge, and it is
+    /// the first row — the wizard preselects index 0.
+    #[test]
+    fn the_recommended_pick_leads_every_provider_list() {
+        let floor = cortex::llm::model_catalog::embedded_manifest();
+        for provider in floor.provider_names() {
+            let models = floor.curated(&provider);
+            let flagged: Vec<&String> = models
+                .iter()
+                .filter(|(_, label)| label.contains("(recommended)"))
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(
+                flagged.len(),
+                1,
+                "{provider} recommended count: {flagged:?}"
             );
-        }
-        for (id, _) in BEDROCK_MODELS {
-            assert!(
-                validate_model_id(id).is_ok(),
-                "bedrock model id invalid: {id}"
-            );
-        }
-        for (id, _) in GROQ_MODELS {
-            assert!(validate_model_id(id).is_ok(), "groq model id invalid: {id}");
-        }
-        for (id, _) in XAI_MODELS {
-            assert!(validate_model_id(id).is_ok(), "xai model id invalid: {id}");
-        }
-        for (id, _) in CLAUDE_CLI_MODELS {
-            assert!(
-                validate_model_id(id).is_ok(),
-                "claude-cli model id invalid: {id}"
+            assert_eq!(
+                flagged[0], &models[0].0,
+                "{provider} recommends a row that is not first"
             );
         }
     }

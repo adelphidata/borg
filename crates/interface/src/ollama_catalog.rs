@@ -3,7 +3,7 @@
 //! Hits the local Ollama server's `GET /api/tags` once per session and caches
 //! the installed-model list in memory. Callers read the cache via
 //! [`cached_models`]; a `None` return means the caller should fall back to the
-//! hardcoded [`crate::onboarding::OLLAMA_MODELS`] list (fetch hasn't
+//! curated Ollama block in [`cortex::llm::model_catalog`] (fetch hasn't
 //! completed, never ran, failed, or the server has no models pulled).
 //!
 //! Unlike the OpenRouter catalog there is no curated intersection: the point
@@ -265,7 +265,8 @@ mod tests {
 
         reset_cache();
         let fallback = crate::onboarding::models_for_provider("ollama");
-        assert_eq!(fallback.len(), crate::onboarding::OLLAMA_MODELS.len());
-        assert_eq!(fallback[0].0, crate::onboarding::OLLAMA_MODELS[0].0);
+        let curated = cortex::llm::model_catalog::curated("ollama");
+        assert_eq!(fallback.len(), curated.len());
+        assert_eq!(fallback[0].0, curated[0].0);
     }
 }
