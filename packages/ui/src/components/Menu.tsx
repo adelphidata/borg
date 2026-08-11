@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, type ReactNode } from "react";
 
 /**
  * The row action menu.
@@ -89,8 +89,11 @@ export function Menu({ open, onClose, actions, label, at }: MenuProps) {
       }`}
     >
       {actions.map((action) => (
-        <div key={action.id}>
-          {action.dividerBefore && <div className="my-1 h-px bg-line2" />}
+        // A fragment rather than a wrapper element: a `menu` has to own its
+        // `menuitem`s directly, and an intervening div costs a screen reader
+        // the item count and the arrow-key walk through the list.
+        <Fragment key={action.id}>
+          {action.dividerBefore && <div role="separator" className="my-1 h-px bg-line2" />}
           <button
             type="button"
             role="menuitem"
@@ -102,7 +105,7 @@ export function Menu({ open, onClose, actions, label, at }: MenuProps) {
           >
             {action.icon ?? <span className="w-[13px]" />} {action.label}
           </button>
-        </div>
+        </Fragment>
       ))}
     </div>
   );

@@ -64,13 +64,25 @@ export function useFollowBottom(
     setPinned(next);
   }, []);
 
-  /** Last content height the observer saw, to tell growth from a reflow. */
-  const lastHeight = useRef(0);
+  /**
+   * Last distance from the bottom, not last height: `ConversationPage` reveals
+   * older messages by mounting them *above* the reading position and pushing
+   * `scrollTop` down by the same amount, so the page grows while the distance
+   * to the newest message does not. Measuring height alone would call that
+   * arrival and offer a way back to content the reader never left.
+   */
+  const lastGap = useRef(0);
+
+  const gapNow = useCallback(() => {
+    const el = scrollRef.current;
+    return el ? el.scrollHeight - el.scrollTop - el.clientHeight : 0;
+  }, [scrollRef]);
 
   const scrollToBottom = useCallback(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [scrollRef]);
+    lastGap.current = gapNow();
+  }, [scrollRef, gapNow]);
 
   useEffect(() => {
     setPinnedNow(true);
@@ -85,13 +97,16 @@ export function useFollowBottom(
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
+      // Scrolling away widens the gap without anything arriving, so the new
+      // gap becomes the baseline the next resize is measured against.
+      lastGap.current = gapNow();
       const near = isNearBottom(el);
       setPinnedNow(near);
       if (near) setMissed(false);
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, [scrollRef, setPinnedNow]);
+  }, [scrollRef, setPinnedNow, gapNow]);
 
   useEffect(() => {
     const content = contentRef.current;
@@ -101,20 +116,23 @@ export function useFollowBottom(
     // Seed from what is already on screen, so the first observation is measured
     // against the current transcript rather than against nothing — otherwise
     // any first change at all, including a shrink, reads as growth.
-    lastHeight.current = content.scrollHeight;
+    lastGap.current = gapNow();
     const observer = new ResizeObserver(() => {
-      const height = content.scrollHeight;
-      const grew = height > lastHeight.current;
-      lastHeight.current = height;
-      if (pinnedRef.current) scrollToBottom();
-      // Only growth means something arrived. Revealing earlier messages, a
-      // window resize rewrapping text, or the thinking line disappearing all
-      // change the height without anything new to catch up on.
-      else if (grew) setMissed(true);
+      const gap = gapNow();
+      const arrived = gap > lastGap.current;
+      if (pinnedRef.current) {
+        scrollToBottom();
+        return;
+      }
+      lastGap.current = gap;
+      // Only a widening gap means something landed below the reading position.
+      // Revealing earlier messages, a window resize rewrapping text, or the
+      // thinking line disappearing leave that distance alone or shrink it.
+      if (arrived) setMissed(true);
     });
     observer.observe(content);
     return () => observer.disconnect();
-  }, [contentRef, scrollToBottom]);
+  }, [contentRef, scrollToBottom, gapNow]);
 
   const jumpToLatest = useCallback(() => {
     setPinnedNow(true);

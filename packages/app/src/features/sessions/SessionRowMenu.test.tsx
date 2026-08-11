@@ -118,6 +118,22 @@ describe("the kebab", () => {
     expect(items).toEqual(["Rename", "Export…", "Archive"]);
   });
 
+  it("shuts again when the kebab is pressed a second time", () => {
+    // The menu's outside-click listener treats the trigger as outside it, so a
+    // second press used to close on pointerdown and reopen on the click that
+    // followed — leaving the only way out an Escape or a click elsewhere.
+    render(<SessionRowMenu {...handlers()} />);
+    const kebab = screen.getByLabelText("Conversation actions");
+
+    fireEvent.pointerDown(kebab);
+    fireEvent.click(kebab);
+    expect(screen.getByRole("menu")).toBeTruthy();
+
+    fireEvent.pointerDown(kebab);
+    fireEvent.click(kebab);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
   it("does not open the conversation underneath it", () => {
     const onRowClick = vi.fn();
     render(

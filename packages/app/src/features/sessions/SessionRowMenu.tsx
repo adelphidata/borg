@@ -48,6 +48,12 @@ export function SessionRowMenu(props: SessionRowMenuProps) {
         type="button"
         aria-label="Conversation actions"
         aria-expanded={open}
+        // The menu's outside-click listener sits on `document` and the trigger
+        // is outside the menu, so without this a second press would close on
+        // pointerdown and the click that follows would immediately reopen it —
+        // the kebab could never shut its own menu. Stopping here keeps the
+        // toggle on `onClick`, which keyboard activation also fires.
+        onPointerDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           // The row underneath opens the conversation; the menu must not.
           e.stopPropagation();

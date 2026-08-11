@@ -35,6 +35,14 @@ export function CommandPalette() {
   // A stale cursor from a longer list would point past the end of a shorter one.
   useEffect(() => setCursor(0), [query]);
 
+  // The list also changes under a stable query: the conversation listing lands
+  // after the palette opens, and a toggle row keeps the palette open across the
+  // snapshot that follows it. A cursor past the new end highlights nothing and
+  // makes Enter a silent no-op.
+  useEffect(() => {
+    setCursor((c) => Math.min(c, Math.max(0, results.length - 1)));
+  }, [results.length]);
+
   useEffect(() => {
     if (!open) clearSaveError();
   }, [open, clearSaveError]);

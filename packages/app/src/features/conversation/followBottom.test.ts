@@ -45,6 +45,16 @@ function scroller(height: number, viewport = 200) {
       scrollHeight += by;
       resize();
     },
+    /**
+     * Mounts older cells above the reading position, as "Show earlier" does:
+     * the page grows and `ConversationPage` pushes `scrollTop` down by the same
+     * amount in a layout effect, so the newest message stays where it was.
+     */
+    revealEarlier(by: number) {
+      scrollHeight += by;
+      el.scrollTop += by;
+      resize();
+    },
     scrollTo(top: number) {
       el.scrollTop = top;
       el.dispatchEvent(new Event("scroll"));
@@ -134,6 +144,23 @@ describe("useFollowBottom", () => {
     act(() => view.scrollTo(100));
     act(() => view.resizeContent(-200));
     expect(view.hook.result.current.missed).toBe(false);
+  });
+
+  it("does not claim you missed something when you asked for older messages", () => {
+    // "Show earlier" grows the page above the reading position. Counting that
+    // as arrival offers a way back to a conversation nobody has left.
+    const view = mount();
+    act(() => view.scrollTo(100));
+    act(() => view.revealEarlier(400));
+    expect(view.hook.result.current.missed).toBe(false);
+  });
+
+  it("still catches a reply that lands after older messages were revealed", () => {
+    const view = mount();
+    act(() => view.scrollTo(100));
+    act(() => view.revealEarlier(400));
+    act(() => view.resizeContent(200));
+    expect(view.hook.result.current.missed).toBe(true);
   });
 
   it("resumes following when the user scrolls back down themselves", () => {
