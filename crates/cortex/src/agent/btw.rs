@@ -131,6 +131,7 @@ pub async fn run_btw(
             | StreamEvent::Truncated
             | StreamEvent::ToolIntent
             | StreamEvent::AttemptStarted { .. }
+            | StreamEvent::Reconnecting { .. }
             | StreamEvent::Failover { .. } => {}
         }
     }

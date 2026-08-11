@@ -231,6 +231,25 @@ impl Agent {
                     trace!("Event channel closed, could not deliver attempt marker");
                 }
             }
+            StreamEvent::Reconnecting {
+                attempt,
+                delay_secs,
+            } => {
+                // The wait is about to be seconds-to-a-minute long. Forward it
+                // so the surface can name the pause; without this the turn
+                // just goes quiet and reads as a hang.
+                warn!("LLM connection lost; reconnecting in {delay_secs}s (attempt {attempt})");
+                if event_tx
+                    .send(AgentEvent::LlmReconnecting {
+                        attempt,
+                        delay_secs,
+                    })
+                    .await
+                    .is_err()
+                {
+                    trace!("Event channel closed, could not deliver reconnect notice");
+                }
+            }
             StreamEvent::Done => return StreamEventOutcome::Terminal,
             StreamEvent::Error(e) => {
                 warn!("LLM stream emitted error mid-response: {e}");

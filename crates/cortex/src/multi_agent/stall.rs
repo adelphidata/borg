@@ -98,6 +98,10 @@ impl StallWatchdog {
                 | AgentEvent::Usage(_)
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::LlmAttemptStarted { .. }
+                // A reconnect wait is the client alive and working, not a
+                // wedged child — cancelling it would abandon a turn that is
+                // about to recover.
+                | AgentEvent::LlmReconnecting { .. }
         );
         if is_progress {
             self.idle_cycles = 0;

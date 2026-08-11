@@ -124,6 +124,9 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
             // event — recording it would perturb every event-sequence assertion
             // in this file.
             StreamEvent::AttemptStarted { .. } => {}
+            StreamEvent::Reconnecting { delay_secs, .. } => {
+                events.push(format!("reconnecting:{delay_secs}"));
+            }
         }
     }
     events

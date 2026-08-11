@@ -26,6 +26,11 @@ pub const PROMPT_REQUEST_USER_INPUT: &str = "prompt_request:user_input";
 /// Companion to [`PROMPT_REQUEST_USER_INPUT`] for `ShellConfirmation`.
 pub const PROMPT_REQUEST_SHELL: &str = "prompt_request:shell";
 
+/// `SystemNotice.category` for a dropped provider connection the client is
+/// waiting to retry. Remote surfaces can style it as a transient status
+/// instead of an error — the turn has not failed.
+pub const NOTICE_RECONNECTING: &str = "reconnecting";
+
 /// Translate one core event. Returns `None` when the event has no useful wire
 /// representation — currently only `LlmAttemptStarted`, which is an in-process
 /// liveness marker for the sub-agent stall watchdog and carries nothing a
@@ -34,6 +39,14 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::A
     use pb::agent_event::Kind;
     let kind = match event {
         CoreEvent::LlmAttemptStarted { .. } => return None,
+        // Unlike the liveness marker above, this one is for the user: the
+        // client is about to sit still for seconds to a minute, and silence
+        // reads as a hang. Carried as a notice rather than a new wire kind —
+        // it needs no structure a remote surface would act on.
+        CoreEvent::LlmReconnecting { delay_secs, .. } => Kind::SystemNotice(pb::SystemNotice {
+            category: NOTICE_RECONNECTING.to_string(),
+            text: format!("Reconnecting — waiting for network. Retrying in {delay_secs}s."),
+        }),
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
         CoreEvent::ThinkingDelta(text) => Kind::ThinkingDelta(pb::ThinkingDelta { text }),
         CoreEvent::ToolExecuting {

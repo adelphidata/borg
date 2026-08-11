@@ -138,6 +138,15 @@ pub enum AgentEvent {
     /// watchdog can tell a slow provider from a wedged child — see
     /// [`crate::multi_agent`]'s `StallWatchdog::on_event`.
     LlmAttemptStarted { attempt: u32 },
+    /// The connection to the provider dropped and the client is waiting before
+    /// it tries again. Unlike [`Self::LlmAttemptStarted`] this one *is* for
+    /// display: the wait is long enough that silence would read as a hang.
+    LlmReconnecting {
+        /// Retry index within the current provider leg.
+        attempt: u32,
+        /// How long the client will wait before the next attempt.
+        delay_secs: u64,
+    },
     /// Progress update from a spawned sub-agent.
     SubAgentUpdate {
         /// Unique identifier for the sub-agent.

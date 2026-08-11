@@ -49,8 +49,18 @@ pub enum FailoverReason {
     RateLimit,
     /// Server overloaded or unavailable (500/502/503/504).
     Overloaded,
-    /// Network timeout or connection failure.
+    /// The provider did not answer in time. The connection itself was fine —
+    /// the response was just too slow.
     Timeout,
+    /// The connection to the provider dropped or could not be established.
+    ///
+    /// Split from [`Self::Timeout`] because the recovery is different: a slow
+    /// response is worth retrying at ordinary speed, while an unreachable
+    /// provider is not — retrying it on the normal schedule burns the whole
+    /// budget in seconds and reports failure while the network is merely
+    /// between states. This class backs off far harder and tells the user why
+    /// it is waiting.
+    ConnectionLost,
     /// Malformed request with no useful recovery path (400 without
     /// context/payload keywords).
     Format,
@@ -75,6 +85,7 @@ impl fmt::Display for FailoverReason {
             Self::RateLimit => write!(f, "rate_limit"),
             Self::Overloaded => write!(f, "overloaded"),
             Self::Timeout => write!(f, "timeout"),
+            Self::ConnectionLost => write!(f, "connection_lost"),
             Self::Format => write!(f, "format"),
             Self::ContextOverflow => write!(f, "context_overflow"),
             Self::PayloadTooLarge => write!(f, "payload_too_large"),
@@ -1382,6 +1393,7 @@ mod tests {
         FailoverReason::RateLimit,
         FailoverReason::Overloaded,
         FailoverReason::Timeout,
+        FailoverReason::ConnectionLost,
         FailoverReason::Format,
         FailoverReason::ContextOverflow,
         FailoverReason::PayloadTooLarge,

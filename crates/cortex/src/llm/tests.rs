@@ -2,6 +2,60 @@ use super::*;
 use crate::types::{FunctionCall, ToolCall, ToolDefinition};
 use std::sync::{Arc, Mutex};
 
+// ── Reconnect backoff ──
+
+#[test]
+fn a_lost_connection_waits_seconds_not_milliseconds() {
+    // The configured schedule starts in the hundreds of milliseconds, which
+    // burns the whole retry budget before a network that is merely between
+    // states can come back.
+    let configured = Duration::from_millis(200);
+    let cfg = backoff_config_for(FailoverReason::ConnectionLost, configured);
+
+    assert_eq!(cfg.initial, RECONNECT_INITIAL_DELAY);
+    assert_eq!(cfg.max_delay, RECONNECT_MAX_DELAY);
+    assert!(
+        cfg.initial > configured,
+        "the reconnect wait must be longer than the ordinary retry delay"
+    );
+}
+
+#[test]
+fn every_other_failure_class_keeps_the_configured_schedule() {
+    // The provider is answering in all of these; retrying promptly is right,
+    // and a minute-long pause would be a regression.
+    let configured = Duration::from_millis(250);
+    for reason in [
+        FailoverReason::RateLimit,
+        FailoverReason::Overloaded,
+        FailoverReason::Timeout,
+        FailoverReason::Unknown,
+    ] {
+        let cfg = backoff_config_for(reason, configured);
+        assert_eq!(cfg.initial, configured, "unexpected schedule for {reason}");
+        assert_eq!(cfg.max_delay, BackoffConfig::default().max_delay);
+    }
+}
+
+#[test]
+fn the_reconnect_wait_grows_and_then_holds_at_the_ceiling() {
+    let cfg = backoff_config_for(FailoverReason::ConnectionLost, Duration::from_millis(200));
+
+    let first = crate::util::retry::backoff_with_config(0, &cfg);
+    let later = crate::util::retry::backoff_with_config(10, &cfg);
+
+    assert!(first >= RECONNECT_INITIAL_DELAY);
+    assert!(
+        later > first,
+        "the wait must grow while the provider is down"
+    );
+    // Jitter is additive on top of the cap, so allow the configured fraction.
+    assert!(
+        later <= RECONNECT_MAX_DELAY.mul_f64(1.0 + cfg.jitter_fraction),
+        "the wait must stop growing so recovery is still noticed"
+    );
+}
+
 #[derive(Default)]
 struct CollectingSink {
     events: Mutex<Vec<CostEvent>>,

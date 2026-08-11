@@ -23,6 +23,26 @@ pub enum SseAction {
     Error(LlmError),
 }
 
+/// Replace any URL in a transport error with `<url>`.
+///
+/// Transport errors are the one error class that routinely carries the request
+/// URL, and this text reaches the user, the log file, and any channel relay. A
+/// provider endpoint can embed a deployment id, a project, or a key in its
+/// query string, and none of that helps someone read "the connection dropped".
+fn strip_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let trimmed = token.trim_start_matches(['(', '[', '"', '\'']);
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                "<url>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Process an SSE byte stream, dispatching each non-empty data line to `parse_line`.
 ///
 /// Handles: cancellation, per-chunk timeouts, buffer overflow, line splitting,
@@ -72,10 +92,18 @@ where
                 match maybe_chunk {
                     Ok(Some(Ok(c))) => c,
                     Ok(Some(Err(e))) => {
+                        // The connection broke mid-response. That is not the
+                        // same failure as the chunk timeout below: this one
+                        // says the provider is unreachable, and retrying it at
+                        // ordinary speed spends the whole budget before the
+                        // network has had a chance to come back.
                         return Err(LlmError::Retryable {
-                            source: anyhow::anyhow!("Stream read error: {e}"),
+                            source: anyhow::anyhow!(
+                                "Stream read error: {}",
+                                strip_urls(&e.to_string())
+                            ),
                             retry_after: None,
-                            reason: FailoverReason::Timeout,
+                            reason: FailoverReason::ConnectionLost,
                             status: None,
                         });
                     }
@@ -426,5 +454,86 @@ mod tests {
         // the still-live Sender held by this scope.
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    /// A stream that yields one chunk and then fails, the way a connection
+    /// reset mid-response looks to the reader.
+    fn make_broken_stream(
+        message: &str,
+    ) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, message.to_string());
+        stream::iter(vec![Ok(b"data: partial\n".to_vec()), Err(err)])
+    }
+
+    async fn read_error_from(message: &str) -> LlmError {
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        process_sse_stream(
+            make_broken_stream(message),
+            &tx,
+            &cancel,
+            0,
+            1024 * 1024,
+            |_| SseAction::Continue,
+        )
+        .await
+        .expect_err("a failed read must surface an error")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_not_reported_as_a_timeout() {
+        // The distinction drives the retry schedule: a timeout means the
+        // provider is slow, a dropped connection means it is unreachable.
+        let err = read_error_from("connection reset by peer").await;
+        assert_eq!(err.reason(), FailoverReason::ConnectionLost);
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_does_not_leak_the_request_url() {
+        // Transport errors routinely carry the URL, and this text reaches the
+        // log file and any channel relay.
+        let err = read_error_from(
+            "error sending request for url (https://api.example.com/v1/chat?key=abc123)",
+        )
+        .await;
+
+        let text = err.to_string();
+        assert!(
+            !text.contains("api.example.com"),
+            "the endpoint must not survive into the error text: {text}"
+        );
+        assert!(!text.contains("abc123"));
+        assert!(text.contains("<url>"));
+    }
+
+    #[tokio::test]
+    async fn a_silent_provider_is_still_a_timeout() {
+        // Counterpart: the chunk-timeout arm must keep its own class, or the
+        // reconnect backoff would swallow slow-but-healthy responses too.
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        // A stream that never yields: `stream::pending` starves the 1s budget.
+        let stream = stream::pending::<Result<Vec<u8>, std::io::Error>>();
+
+        let err = process_sse_stream(stream, &tx, &cancel, 1, 1024 * 1024, |_| {
+            SseAction::Continue
+        })
+        .await
+        .expect_err("the chunk budget must expire");
+
+        assert_eq!(err.reason(), FailoverReason::Timeout);
+    }
+
+    #[test]
+    fn stripping_urls_leaves_ordinary_words_alone() {
+        assert_eq!(
+            strip_urls("connection reset by peer"),
+            "connection reset by peer"
+        );
+        assert_eq!(
+            strip_urls("failed to reach https://x.test/a?b=c now"),
+            "failed to reach <url> now"
+        );
     }
 }

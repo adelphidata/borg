@@ -121,6 +121,9 @@ impl<'a> App<'a> {
             // Liveness marker for the sub-agent stall watchdog — nothing to
             // render. The spinner already covers "a request is in flight".
             AgentEvent::LlmAttemptStarted { .. } => {}
+            AgentEvent::LlmReconnecting { delay_secs, .. } => {
+                self.handle_event_llm_reconnecting(delay_secs)
+            }
             AgentEvent::TurnComplete => self.handle_event_turn_complete(),
             AgentEvent::Error(e) => self.handle_event_error(e),
             AgentEvent::SteerReceived { text } => self.handle_event_steer_received(text),
@@ -168,6 +171,17 @@ impl<'a> App<'a> {
         });
         self.stream_status.set_header("Preparing");
         self.stream_status.set_details(None);
+    }
+
+    /// Name the pause when the connection to the provider drops. The wait is
+    /// seconds to a minute long, and the spinner alone cannot distinguish it
+    /// from a model that is simply thinking — which is what makes it read as
+    /// a hang. Plain words, not an error code: the next action is to wait.
+    fn handle_event_llm_reconnecting(&mut self, delay_secs: u64) {
+        self.stream_status.set_header("Reconnecting");
+        self.stream_status.set_details(Some(format!(
+            "waiting for network — retrying in {delay_secs}s"
+        )));
     }
 
     fn handle_event_text_delta(&mut self, delta: String) {

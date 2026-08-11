@@ -258,6 +258,16 @@ pub enum StreamEvent {
     /// discrete (one per attempt) and originates in the transport, so a hung
     /// tool cannot forge it. Non-terminal.
     AttemptStarted { attempt: u32 },
+    /// The connection to the provider dropped and the client is waiting
+    /// before it tries again. Emitted once per reconnect wait, carrying how
+    /// long that wait is, so a surface can say "reconnecting" instead of
+    /// showing a minute of unexplained silence. Non-terminal.
+    Reconnecting {
+        /// Retry index within the current provider leg (0 for the first).
+        attempt: u32,
+        /// How long the client will wait before the next attempt.
+        delay_secs: u64,
+    },
     /// Stream completed.
     Done,
     /// Stream error.
@@ -490,6 +500,33 @@ struct PrimaryIdentity {
 }
 
 /// Multi-provider streaming LLM client with failover and key rotation.
+/// First wait after the connection to the provider drops.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(5);
+/// Ceiling on the reconnect wait.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// The backoff schedule to use for a given failure class.
+///
+/// Every class but [`FailoverReason::ConnectionLost`] keeps the configured
+/// schedule — those are provider-side failures, and the provider is answering,
+/// so retrying promptly is right. An unreachable provider is different: the
+/// configured schedule starts in the hundreds of milliseconds, which exhausts
+/// the retry budget long before a network that is merely between states comes
+/// back. Five seconds to a minute matches how long that actually takes.
+fn backoff_config_for(reason: FailoverReason, initial_delay: Duration) -> BackoffConfig {
+    if reason == FailoverReason::ConnectionLost {
+        return BackoffConfig {
+            initial: RECONNECT_INITIAL_DELAY,
+            max_delay: RECONNECT_MAX_DELAY,
+            ..Default::default()
+        };
+    }
+    BackoffConfig {
+        initial: initial_delay,
+        ..Default::default()
+    }
+}
+
 pub struct LlmClient {
     client: Client,
     llm_config: LlmConfig,
@@ -2144,12 +2181,25 @@ impl LlmClient {
                         } else {
                             backoff_with_config(
                                 attempt,
-                                &BackoffConfig {
-                                    initial: initial_delay,
-                                    ..Default::default()
-                                },
+                                &backoff_config_for(e.reason(), initial_delay),
                             )
                         };
+
+                        if e.reason() == FailoverReason::ConnectionLost {
+                            // The provider is unreachable, so the pause is
+                            // about to be long. Say so: an unexplained
+                            // minute of silence reads as a hang.
+                            if tx
+                                .send(StreamEvent::Reconnecting {
+                                    attempt,
+                                    delay_secs: delay.as_secs(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                tracing::trace!("llm: stream receiver closed");
+                            }
+                        }
 
                         info!(
                             "Retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
@@ -2948,10 +2998,7 @@ impl LlmClient {
                         let delay = e.retry_after().unwrap_or_else(|| {
                             backoff_with_config(
                                 attempt,
-                                &BackoffConfig {
-                                    initial: initial_delay,
-                                    ..Default::default()
-                                },
+                                &backoff_config_for(e.reason(), initial_delay),
                             )
                         });
                         info!(

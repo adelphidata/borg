@@ -112,6 +112,9 @@ pub fn classify_error(raw: &str) -> ErrorCategory {
                 ErrorCategory::Timeout
             }
         }
+        // A dropped or refused connection is exactly "couldn't reach you" —
+        // no transport-detail sniffing needed, the class already says it.
+        Some(FailoverReason::ConnectionLost) => ErrorCategory::Transport,
         Some(FailoverReason::ModelNotFound)
         | Some(FailoverReason::Format)
         | Some(FailoverReason::Unknown)
