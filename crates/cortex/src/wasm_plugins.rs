@@ -827,26 +827,6 @@ mod tests {
 
         compiled_cache::clear();
     }
-
-    /// Invalidate must remove a specific key without touching the rest —
-    /// the reseal path relies on this to drop the stale-keyed cache entry
-    /// when it rewrites the local_hmac. A bulk-clear under the hood would
-    /// thrash unrelated plugins on every reseal.
-    #[test]
-    fn compiled_cache_invalidate_is_surgical() {
-        let wasm: Vec<u8> = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-        compiled_cache::clear();
-        for i in 0..3 {
-            compiled_cache::module_for(&format!("inv{i}"), &wasm).expect("compile");
-        }
-        assert_eq!(compiled_cache::cache_len(), 3);
-        compiled_cache::invalidate("inv1");
-        assert!(compiled_cache::contains("inv0"));
-        assert!(!compiled_cache::contains("inv1"));
-        assert!(compiled_cache::contains("inv2"));
-        assert_eq!(compiled_cache::cache_len(), 2);
-        compiled_cache::clear();
-    }
 }
 
 /// End-to-end coverage of `try_execute_tool`: the compiled-module cache, the

@@ -338,13 +338,11 @@ mod tests {
     /// `heartbeat:scheduled` key.
     #[test]
     fn ensure_session_on_disk_materializes_resumable_deterministic_id() {
-        use std::sync::{Mutex, OnceLock};
-        // Serialize within-module mutation of the process-global BORG_HOME.
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _serial = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Must be the SAME mutex every other env-mutating test in this module
+        // uses: a private lock here would let one of those tests clear
+        // `BORG_HOME` mid-body and strand this test's tempdir (`save` then
+        // fails with ENOENT).
+        let _serial = SESSION_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os(crate::paths::BORG_HOME_ENV);

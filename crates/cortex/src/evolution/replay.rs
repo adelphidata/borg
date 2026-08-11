@@ -12,7 +12,7 @@ use super::{
 };
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
-use super::EVOLUTION_HMAC_LEGACY;
+use super::EVOLUTION_HMAC_DOMAIN;
 
 /// 30-day window in seconds used for time-weighted archetype scoring.
 pub(crate) const WINDOW_30D_SECS: i64 = 30 * 86_400;
@@ -29,7 +29,7 @@ pub(crate) const LAST_30D_WEIGHT: f64 = 0.80;
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 pub fn replay_events(events: &[EvolutionEvent]) -> EvolutionState {
     replay_events_with_key_at(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         events,
         chrono::Utc::now().timestamp(),
     )

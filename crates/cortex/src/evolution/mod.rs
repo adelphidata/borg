@@ -24,7 +24,7 @@ pub mod share_card;
 pub mod signature;
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
-pub(crate) use hmac::{compute_event_hmac, compute_event_hmac_legacy, EVOLUTION_HMAC_LEGACY};
+pub(crate) use hmac::compute_event_hmac;
 pub(crate) use hmac::{verify_event_hmac, EVOLUTION_HMAC_DOMAIN};
 
 pub use celebration::{

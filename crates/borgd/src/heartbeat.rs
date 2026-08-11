@@ -240,7 +240,8 @@ pub(crate) fn publish_global(evt: DaemonHeartbeatEvent) {
 /// [`HeartbeatTrigger`]; it signals a unit channel instead, which a forwarder
 /// task here translates into a real trigger.
 ///
-/// `shutdown` cancels both spawned tasks. `executor` is used to run each
+/// `shutdown` cancels every spawned task (the runner and the poke forwarder).
+/// `executor` is used to run each
 /// heartbeat turn through the daemon's session machinery (so heartbeats share
 /// the per-session history + hooks like any other turn).
 pub fn spawn(
@@ -269,17 +270,27 @@ pub fn spawn(
     // bypasses quiet hours the same way `Admin.Poke` does.
     {
         let poke_trigger_tx = trigger_tx.clone();
+        let poke_cancel = shutdown.clone();
         tokio::spawn(async move {
-            while poke_rx.recv().await.is_some() {
-                if let Err(e) = poke_trigger_tx
-                    .send(HeartbeatTrigger {
-                        source: HeartbeatSource::Scheduled,
-                        bypass_quiet_hours: true,
-                    })
-                    .await
-                {
-                    tracing::warn!("poke received but the heartbeat runner is gone: {e}");
-                    break;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = poke_cancel.cancelled() => break,
+                    poke = poke_rx.recv() => {
+                        if poke.is_none() {
+                            break;
+                        }
+                        if let Err(e) = poke_trigger_tx
+                            .send(HeartbeatTrigger {
+                                source: HeartbeatSource::Scheduled,
+                                bypass_quiet_hours: true,
+                            })
+                            .await
+                        {
+                            tracing::warn!("poke received but the heartbeat runner is gone: {e}");
+                            break;
+                        }
+                    }
                 }
             }
         });

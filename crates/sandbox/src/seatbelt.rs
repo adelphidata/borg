@@ -371,14 +371,24 @@ mod tests {
     }
 
     #[test]
-    fn profile_broad_exec_without_runtime() {
+    fn profile_never_emits_a_blanket_exec_allowance() {
+        // `runtime_bin` used to be optional, and `None` emitted a bare
+        // `(allow process-exec)` that let the sandboxed process run anything.
+        // The parameter is required now, so that rule must never appear —
+        // every exec allowance has to name a literal or a subpath.
         let profile = generate_profile(
             &default_policy(),
             Path::new(TEST_TOOL_DIR),
             TEST_RUNTIME_BIN,
         )
         .unwrap();
-        assert!(profile.contains("(allow process-exec)"));
+        assert!(
+            !profile.contains("(allow process-exec)"),
+            "blanket process-exec is a sandbox escape:\n{profile}"
+        );
+        assert!(profile.contains(&format!(
+            "(allow process-exec (literal \"{TEST_RUNTIME_BIN}\"))"
+        )));
         assert!(profile.contains("(allow process-fork)"));
     }
 

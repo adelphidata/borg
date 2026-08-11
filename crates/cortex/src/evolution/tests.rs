@@ -1066,7 +1066,7 @@ fn metadata_tampering_detected_on_v2_events() {
 }
 
 #[test]
-fn legacy_events_accept_metadata_via_fallback_path() {
+fn metadata_injected_after_sealing_invalidates_the_chain() {
     // Create an xp_gain event (no metadata), then an evolution event
     // where someone injected gates_verified into the metadata AFTER the HMAC was computed
     let e1 = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", 1000, "0");
@@ -1128,15 +1128,12 @@ fn legacy_events_accept_metadata_via_fallback_path() {
     };
 
     let state2 = replay_events(&[e1b, e2_tampered]);
-    // The legacy fallback will verify the HMAC (computed without metadata),
-    // but the metadata injection is still accepted via legacy path.
-    // This is expected — legacy events are trusted. The protection is that
-    // NEW events (written after this code change) include metadata in HMAC.
-    // The key point is that verify_event_hmac accepts it via fallback, which is correct
-    // for backward compatibility.
+    // Verification once fell back to a scheme that left metadata out of the
+    // MAC, so this injection was waved through. With the fallback gone the
+    // seal covers metadata, and rewriting it must break the chain.
     assert!(
-        state2.chain_valid,
-        "legacy-format events should still pass chain verification"
+        !state2.chain_valid,
+        "metadata injected after sealing must invalidate the chain"
     );
 }
 

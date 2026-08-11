@@ -78,7 +78,7 @@ fn require_kek_pem<K: KekStore>(kek: &K, account: &str) -> Result<String> {
 ///    integration test harness to pin a subprocess at a per-test socket
 ///    without auto-spawning a real daemon.
 /// 2. `cortex::paths::resolve_borg_home_readonly` then `borgd.sock` —
-///    honors `$BORG_HOME` / `$BORG_HOME` / `~/.borg` exactly as the
+///    honors `$BORG_HOME`, then `~/.borg`, exactly as the
 ///    daemon does, with no side effects (no directory creation).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("BORG_DAEMON_UDS") {
