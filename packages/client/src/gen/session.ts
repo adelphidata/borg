@@ -32,6 +32,19 @@ export interface SendRequest {
   text: string;
   /** Optional multimodal attachments. Empty = text-only turn. */
   images: InlineImage[];
+  /**
+   * Optional text documents. Reach the model as labelled text inside the
+   * untrusted-content boundary, because the content model has no document
+   * part. Non-text bytes are refused daemon-side.
+   */
+  documents: InlineDocument[];
+}
+
+export interface InlineDocument {
+  filename: string;
+  mimeType: string;
+  /** raw bytes, NOT base64 */
+  content: Uint8Array;
 }
 
 export interface InlineImage {
@@ -672,7 +685,7 @@ export const OpenResponse: MessageFns<OpenResponse> = {
 };
 
 function createBaseSendRequest(): SendRequest {
-  return { sessionId: "", text: "", images: [] };
+  return { sessionId: "", text: "", images: [], documents: [] };
 }
 
 export const SendRequest: MessageFns<SendRequest> = {
@@ -685,6 +698,9 @@ export const SendRequest: MessageFns<SendRequest> = {
     }
     for (const v of message.images) {
       InlineImage.encode(v!, writer.uint32(26).fork()).join();
+    }
+    for (const v of message.documents) {
+      InlineDocument.encode(v!, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -720,6 +736,14 @@ export const SendRequest: MessageFns<SendRequest> = {
           message.images.push(InlineImage.decode(reader, reader.uint32()));
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.documents.push(InlineDocument.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -738,6 +762,9 @@ export const SendRequest: MessageFns<SendRequest> = {
         : "",
       text: isSet(object.text) ? globalThis.String(object.text) : "",
       images: globalThis.Array.isArray(object?.images) ? object.images.map((e: any) => InlineImage.fromJSON(e)) : [],
+      documents: globalThis.Array.isArray(object?.documents)
+        ? object.documents.map((e: any) => InlineDocument.fromJSON(e))
+        : [],
     };
   },
 
@@ -752,6 +779,9 @@ export const SendRequest: MessageFns<SendRequest> = {
     if (message.images?.length) {
       obj.images = message.images.map((e) => InlineImage.toJSON(e));
     }
+    if (message.documents?.length) {
+      obj.documents = message.documents.map((e) => InlineDocument.toJSON(e));
+    }
     return obj;
   },
 
@@ -763,6 +793,103 @@ export const SendRequest: MessageFns<SendRequest> = {
     message.sessionId = object.sessionId ?? "";
     message.text = object.text ?? "";
     message.images = object.images?.map((e) => InlineImage.fromPartial(e)) || [];
+    message.documents = object.documents?.map((e) => InlineDocument.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseInlineDocument(): InlineDocument {
+  return { filename: "", mimeType: "", content: new Uint8Array(0) };
+}
+
+export const InlineDocument: MessageFns<InlineDocument> = {
+  encode(message: InlineDocument, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.filename !== "") {
+      writer.uint32(10).string(message.filename);
+    }
+    if (message.mimeType !== "") {
+      writer.uint32(18).string(message.mimeType);
+    }
+    if (message.content.length !== 0) {
+      writer.uint32(26).bytes(message.content);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): InlineDocument {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseInlineDocument();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.filename = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.mimeType = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.content = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): InlineDocument {
+    return {
+      filename: isSet(object.filename) ? globalThis.String(object.filename) : "",
+      mimeType: isSet(object.mimeType)
+        ? globalThis.String(object.mimeType)
+        : isSet(object.mime_type)
+        ? globalThis.String(object.mime_type)
+        : "",
+      content: isSet(object.content) ? bytesFromBase64(object.content) : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: InlineDocument): unknown {
+    const obj: any = {};
+    if (message.filename !== "") {
+      obj.filename = message.filename;
+    }
+    if (message.mimeType !== "") {
+      obj.mimeType = message.mimeType;
+    }
+    if (message.content.length !== 0) {
+      obj.content = base64FromBytes(message.content);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<InlineDocument>, I>>(base?: I): InlineDocument {
+    return InlineDocument.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<InlineDocument>, I>>(object: I): InlineDocument {
+    const message = createBaseInlineDocument();
+    message.filename = object.filename ?? "";
+    message.mimeType = object.mimeType ?? "";
+    message.content = object.content ?? new Uint8Array(0);
     return message;
   },
 };

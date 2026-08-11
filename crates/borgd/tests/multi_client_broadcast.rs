@@ -159,6 +159,7 @@ async fn two_clients_subscribed_to_same_session_see_identical_event_streams() {
             session_id: opened.session_id.clone(),
             text: "go".into(),
             images: Vec::new(),
+            documents: Vec::new(),
         })
         .await
         .expect("send")

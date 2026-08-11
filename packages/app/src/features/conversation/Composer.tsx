@@ -11,7 +11,7 @@ import {
 import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
-import { collectImages } from "./attachments";
+import { collectAttachments } from "./attachments";
 import { publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
@@ -115,6 +115,10 @@ export function Composer({
     // A restored draft is not a keystroke. A stored `/new` that popped a menu
     // on session switch would put a command under Enter without anyone asking.
     setSlashDismissed(slashQuery(restored) !== null);
+    // Same for `@`: a caret left over from the last conversation would sit at
+    // an offset into text nobody has looked at yet, and a draft ending in a
+    // half-typed path would open a menu on arrival.
+    setCaret(0);
   }, [draftKey]);
 
   // Attachments belong to the conversation, not to the key naming it. Clearing
@@ -183,6 +187,23 @@ export function Composer({
   // sits in, not the last one in the box.
   const [caret, setCaret] = useState(0);
   const syncCaret = () => setCaret(textarea.current?.selectionStart ?? 0);
+
+  /**
+   * Puts the caret at `to` once React has painted the new text, then reads it
+   * back.
+   *
+   * Reading it back rather than trusting `to` is what keeps the state honest:
+   * changing a textarea's value sends the browser's own caret to the end, and
+   * the `keyup` that follows an edit would otherwise record that position as
+   * the truth — leaving the menu completing a token the caret is not in.
+   */
+  const restoreCaret = (to: number) => {
+    requestAnimationFrame(() => {
+      textarea.current?.focus();
+      textarea.current?.setSelectionRange(to, to);
+      syncCaret();
+    });
+  };
   const [pathDismissed, setPathDismissed] = useState(false);
   const [pathCursor, setPathCursor] = useState(0);
   // A conversation with no session open yet has no workspace to scope to.
@@ -220,12 +241,9 @@ export function Composer({
     const next = replacePathToken(draft, at.start, caret, row.path);
     setDraft(next.text);
     setCaret(next.caret);
-    // React does not move the caret for us, and leaving it at the end of the
-    // box would put the next character after text the user has not looked at.
-    requestAnimationFrame(() => {
-      textarea.current?.focus();
-      textarea.current?.setSelectionRange(next.caret, next.caret);
-    });
+    // Leaving the caret at the end of the box would put the next character
+    // after text the user has not looked at.
+    restoreCaret(next.caret);
   };
 
   const runCommand = (index: number) => {
@@ -251,17 +269,19 @@ export function Composer({
 
   const addFiles = useCallback(async (files: readonly File[]) => {
     if (files.length === 0) return;
-    const { attachments: added, errors } = await collectImages(files);
+    const { attachments: added, errors } = await collectAttachments(files);
     if (added.length > 0) {
-      objectUrls.current.push(...added.map((a) => a.previewUrl));
+      // Only images mint one; a document has nothing to preview.
+      objectUrls.current.push(...added.flatMap((a) => (a.previewUrl ? [a.previewUrl] : [])));
       setAttachments((prev) => [...prev, ...added]);
     }
     setError(errors[0]);
   }, []);
 
-  const forget = (urls: string[]) => {
-    for (const url of urls) URL.revokeObjectURL(url);
-    objectUrls.current = objectUrls.current.filter((u) => !urls.includes(u));
+  const forget = (urls: (string | undefined)[]) => {
+    const real = urls.filter((u): u is string => u !== undefined);
+    for (const url of real) URL.revokeObjectURL(url);
+    objectUrls.current = objectUrls.current.filter((u) => !real.includes(u));
   };
 
   const removeAttachment = (index: number) => {
@@ -329,14 +349,12 @@ export function Composer({
     if (e.key === "Backspace" && !e.shiftKey) {
       const el = e.currentTarget;
       const whole =
-        el.selectionStart === el.selectionEnd
-          ? backspacePathToken(draft, el.selectionStart)
-          : null;
+        el.selectionStart === el.selectionEnd ? backspacePathToken(draft, el.selectionStart) : null;
       if (whole) {
         e.preventDefault();
         setDraft(whole.text);
         setCaret(whole.caret);
-        requestAnimationFrame(() => el.setSelectionRange(whole.caret, whole.caret));
+        restoreCaret(whole.caret);
         return;
       }
     }
@@ -364,23 +382,43 @@ export function Composer({
         {error && <div className="mb-2 px-1 text-[11.5px] leading-[1.5] text-alert">{error}</div>}
 
         {attachments.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-2">
-            {attachments.map((a, i) => (
-              <div
-                key={a.previewUrl}
-                className="relative h-[52px] w-[52px] overflow-hidden rounded-[8px] border border-line2"
-              >
-                <img src={a.previewUrl} alt={a.filename} className="h-full w-full object-cover" />
-                <button
-                  type="button"
-                  aria-label={`Remove ${a.filename}`}
-                  onClick={() => removeAttachment(i)}
-                  className="absolute top-0 right-0 flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded-bl-[6px] border-0 bg-surface text-ink2 hover:text-ink"
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            {attachments.map((a, i) =>
+              // An image is its own label, so it shows as a thumbnail. A
+              // document has nothing to look at, so it shows as its name —
+              // which is the part anyone needs to check anyway.
+              a.previewUrl ? (
+                <div
+                  key={`${a.filename}-${i}`}
+                  className="relative h-[52px] w-[52px] overflow-hidden rounded-[8px] border border-line2"
                 >
-                  <CloseIcon size={11} />
-                </button>
-              </div>
-            ))}
+                  <img src={a.previewUrl} alt={a.filename} className="h-full w-full object-cover" />
+                  <button
+                    type="button"
+                    aria-label={`Remove ${a.filename}`}
+                    onClick={() => removeAttachment(i)}
+                    className="absolute top-0 right-0 flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded-bl-[6px] border-0 bg-surface text-ink2 hover:text-ink"
+                  >
+                    <CloseIcon size={11} />
+                  </button>
+                </div>
+              ) : (
+                <span
+                  key={`${a.filename}-${i}`}
+                  className="flex h-[26px] items-center gap-1.5 rounded-[8px] border border-line2 bg-surface px-2 text-[12px] text-ink2"
+                >
+                  {a.filename}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${a.filename}`}
+                    onClick={() => removeAttachment(i)}
+                    className="flex cursor-pointer items-center border-0 bg-transparent p-0 text-ink3 hover:text-ink"
+                  >
+                    <CloseIcon size={11} />
+                  </button>
+                </span>
+              ),
+            )}
           </div>
         )}
 
@@ -439,13 +477,16 @@ export function Composer({
           } ${dragging ? "border-neon" : "border-line"}`}
         >
           <label
-            aria-label="Attach an image"
+            aria-label="Attach a file"
             className="flex h-[29px] flex-none cursor-pointer items-center text-ink3 hover:text-ink2"
           >
             <AttachIcon size={15} />
             <input
               type="file"
-              accept="image/png,image/jpeg,image/gif,image/webp"
+              // Text first, because the picker shows the first entry as its
+              // filter. `text/*` covers most of it; the rest are the types a
+              // browser labels `application/…` despite being text.
+              accept="text/*,.md,.json,.yaml,.yml,.toml,.csv,.log,.rs,.ts,.tsx,.js,.jsx,.py,.go,.sh,.sql,image/png,image/jpeg,image/gif,image/webp"
               multiple
               className="hidden"
               onChange={(e) => {
@@ -464,11 +505,7 @@ export function Composer({
             // replace the textarea's own role, and it is a text box first.
             aria-expanded={slashOpen || (pathOpen && pathRows.length > 0)}
             aria-controls={
-              pathOpen && pathRows.length > 0
-                ? PATH_LIST_ID
-                : slashOpen
-                  ? SLASH_LIST_ID
-                  : undefined
+              pathOpen && pathRows.length > 0 ? PATH_LIST_ID : slashOpen ? SLASH_LIST_ID : undefined
             }
             aria-activedescendant={
               pathOpen && pathRows.length > 0

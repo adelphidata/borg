@@ -28,8 +28,12 @@ export interface CompletionListProps {
   onChoose: (index: number) => void;
   /** Names the list for a screen reader, e.g. "Commands". */
   label: string;
-  /** Shown in place of the rows when nothing matched. */
-  emptyText: string;
+  /**
+   * Shown in place of the rows when nothing matched. Omit it and an empty list
+   * renders nothing at all — right for a menu whose rows arrive over the wire,
+   * where "no rows yet" and "no rows" look the same for the first moment.
+   */
+  emptyText?: string;
   /**
    * Id of the listbox. The input that owns the keys points at it with
    * `aria-controls`, and names the highlighted row with `aria-activedescendant`
@@ -56,12 +60,17 @@ export function CompletionList({
   id,
 }: CompletionListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  const empty = rows.length === 0;
 
   // Arrowing past the fold has to bring the row with it, or the highlight moves
   // somewhere the user cannot see and Enter takes a row they never read.
   useEffect(() => {
     listRef.current?.children[cursor]?.scrollIntoView({ block: "nearest" });
   }, [cursor, rows.length]);
+
+  // An empty box with nothing to say is worse than no box: it takes space above
+  // the input and reads as a list that failed to load.
+  if (empty && emptyText === undefined) return null;
 
   return (
     <div
@@ -72,7 +81,7 @@ export function CompletionList({
       style={{ maxHeight: MAX_HEIGHT_PX }}
       className="mb-2 overflow-y-auto rounded-[11px] border border-line bg-surface2 py-1 shadow-(--frameShadow)"
     >
-      {rows.length === 0 && (
+      {empty && (
         <div className="px-3.5 py-3 text-center text-[12px] leading-[1.5] text-ink3">
           {emptyText}
         </div>

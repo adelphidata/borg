@@ -1,58 +1,83 @@
 import { describe, expect, it } from "vitest";
-import { MAX_ATTACHMENT_BYTES, collectImages, rejectionReason } from "./attachments";
+import {
+  collectAttachments,
+  isSupportedDocument,
+  MAX_ATTACHMENT_BYTES,
+  rejectionReason,
+} from "./attachments";
 
-function file(name: string, type: string, size = 10): File {
-  const blob = new Blob([new Uint8Array(size)], { type });
-  return new File([blob], name, { type });
+function file(name: string, type: string, bytes = 1): File {
+  return new File([new Uint8Array(bytes)], name, { type });
 }
 
-describe("rejectionReason", () => {
-  it("accepts every image type the daemon can carry inline", () => {
-    for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
-      expect(rejectionReason(file("a", type))).toBeNull();
-    }
+describe("what may be attached", () => {
+  it("takes a text file the browser labelled", () => {
+    expect(isSupportedDocument(file("notes.md", "text/markdown"))).toBe(true);
+    expect(isSupportedDocument(file("data.json", "application/json"))).toBe(true);
   });
 
-  it("rejects a non-image and names it", () => {
-    expect(rejectionReason(file("notes.pdf", "application/pdf"))).toContain("notes.pdf");
+  it("takes a source file the OS had no opinion about", () => {
+    // Dropping a `.rs` reports an empty type. Refusing those would make the
+    // rule depend on the OS rather than on the file.
+    expect(isSupportedDocument(file("main.rs", ""))).toBe(true);
+    expect(isSupportedDocument(file("Component.tsx", ""))).toBe(true);
   });
 
-  it("rejects an image past the size cap", () => {
-    const huge = file("big.png", "image/png", MAX_ATTACHMENT_BYTES + 1);
-    expect(rejectionReason(huge)).toContain("larger than");
+  it("does not guess from an extension when the browser was specific", () => {
+    // A PDF is a PDF whatever it is called.
+    expect(isSupportedDocument(file("report.pdf", "application/pdf"))).toBe(false);
+    expect(isSupportedDocument(file("archive.zip", "application/zip"))).toBe(false);
   });
 
-  it("accepts an image exactly at the cap", () => {
-    expect(rejectionReason(file("edge.png", "image/png", MAX_ATTACHMENT_BYTES))).toBeNull();
+  it("refuses an unknown binary rather than sending bytes that cannot decode", () => {
+    expect(isSupportedDocument(file("thing.bin", ""))).toBe(false);
   });
 });
 
-describe("collectImages", () => {
-  it("reads raw bytes, not base64 — the proto is explicit about that", async () => {
-    const bytes = new Uint8Array([137, 80, 78, 71]);
-    const png = new File([bytes], "shot.png", { type: "image/png" });
-
-    const { attachments } = await collectImages([png]);
-
-    expect(attachments).toHaveLength(1);
-    expect(attachments[0]!.data).toEqual(bytes);
-    expect(attachments[0]!.mimeType).toBe("image/png");
-    expect(attachments[0]!.filename).toBe("shot.png");
+describe("rejectionReason", () => {
+  it("names a next action instead of only the rule", () => {
+    const reason = rejectionReason(file("report.pdf", "application/pdf"));
+    expect(reason).toContain("report.pdf");
+    expect(reason).toContain("ask it to read the path");
   });
 
-  it("keeps the good files and reports the bad ones", async () => {
-    const { attachments, errors } = await collectImages([
-      file("ok.png", "image/png"),
-      file("bad.txt", "text/plain"),
+  it("passes an image and a text file alike", () => {
+    expect(rejectionReason(file("shot.png", "image/png"))).toBeNull();
+    expect(rejectionReason(file("run.log", "text/plain"))).toBeNull();
+  });
+
+  it("stops a file past the size cap, whichever kind it is", () => {
+    const big = file("huge.log", "text/plain", MAX_ATTACHMENT_BYTES + 1);
+    expect(rejectionReason(big)).toContain("larger than 10 MB");
+  });
+
+  it("says something useful about a file with no name", () => {
+    expect(rejectionReason(file("", "application/pdf"))).toContain("That file");
+  });
+});
+
+describe("collectAttachments", () => {
+  it("sorts an image from a document, so each reaches its own wire field", async () => {
+    const { attachments, errors } = await collectAttachments([
+      file("shot.png", "image/png"),
+      file("notes.md", "text/markdown"),
     ]);
 
-    expect(attachments).toHaveLength(1);
-    expect(errors).toHaveLength(1);
+    expect(errors).toEqual([]);
+    expect(attachments.map((a) => a.kind)).toEqual(["image", "document"]);
+    // Only an image renders, so only an image is worth a URL to revoke.
+    expect(attachments[0]!.previewUrl).toBeTruthy();
+    expect(attachments[1]!.previewUrl).toBeUndefined();
   });
 
-  it("names a pasted file that arrives without one", async () => {
-    const pasted = new File([new Uint8Array([1])], "", { type: "image/png" });
-    const { attachments } = await collectImages([pasted]);
-    expect(attachments[0]!.filename).toBe("pasted-image");
+  it("keeps the good files and reports the refused one", async () => {
+    const { attachments, errors } = await collectAttachments([
+      file("notes.md", "text/markdown"),
+      file("report.pdf", "application/pdf"),
+    ]);
+
+    expect(attachments.map((a) => a.filename)).toEqual(["notes.md"]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("report.pdf");
   });
 });

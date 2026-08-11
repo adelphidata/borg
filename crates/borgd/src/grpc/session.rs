@@ -15,11 +15,10 @@ use protocols::session::{
     AcpWriteTextFileRequest, AcpWriteTextFileResponse, AgentEvent, AppendAssistantMessageRequest,
     AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
     CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ExecShellRequest,
-    ExecShellResponse, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
-    ListPathsRequest, NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PathEntry,
-    PathList, PromptResponse,
-    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
-    StreamRequest, UndoRequest, UndoResponse,
+    ExecShellResponse, ForkRequest, ForkResponse, InlineDocument, ListPathsRequest,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
+    OpenResponse, PathEntry, PathList, PromptResponse, RewindRequest, RewindResponse, SendRequest,
+    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -56,6 +55,40 @@ pub type AcpEventStream =
 /// async Mutex while it waits for the IDE — without a deadline a slow or
 /// hung client stalls the whole session indefinitely.
 const ACP_FS_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The user's message with any attached documents rendered ahead of it.
+///
+/// The content model has no document part, so a document reaches the model as
+/// text — labelled with its filename and inside the untrusted-content boundary,
+/// because a file arrives *through* the user rather than *from* them.
+///
+/// Composed here rather than inside the backend so a file Borg cannot read is
+/// refused as the answer to `Send`. The web client checks the same thing before
+/// it uploads; that check is a courtesy, and this one is the boundary — any
+/// other caller reaches the same daemon.
+#[allow(clippy::result_large_err)]
+fn compose_turn_text(text: String, documents: Vec<InlineDocument>) -> Result<String, TStatus> {
+    if documents.is_empty() {
+        return Ok(text);
+    }
+    let mut parts = Vec::with_capacity(documents.len() + 1);
+    for document in documents {
+        let document = cortex::session_types::InlineDocument {
+            filename: document.filename,
+            mime_type: document.mime_type,
+            content: document.content,
+        };
+        parts.push(
+            document
+                .to_text_part()
+                .map_err(|e| TStatus::invalid_argument(e.to_string()))?,
+        );
+    }
+    // The user's own words go last, so the instruction reads against the
+    // material rather than ahead of it.
+    parts.push(text);
+    Ok(parts.join("\n\n"))
+}
 
 /// Read the gRPC `grpc-timeout` header off an inbound request and convert it
 /// into an absolute wall-clock deadline. Returns `None` when the client did
@@ -296,6 +329,9 @@ impl Session for SessionSvc {
         // off `req.metadata()`.
         let deadline = parse_grpc_deadline(&req);
         let req = req.into_inner();
+        // Refused before the turn starts, so an unreadable attachment is an
+        // answer to `Send` rather than an error part-way through a reply.
+        let text = compose_turn_text(req.text, req.documents)?;
         let host = self.host_or_err(&req.session_id)?;
 
         // Subscribe BEFORE starting the turn so we can't miss the first event.
@@ -314,7 +350,7 @@ impl Session for SessionSvc {
                 filename: (!i.filename.is_empty()).then_some(i.filename),
             })
             .collect();
-        let (_cancel, baseline_seq) = host.start_turn(req.text, images, None, deadline).await;
+        let (_cancel, baseline_seq) = host.start_turn(text, images, None, deadline).await;
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {
@@ -809,6 +845,66 @@ impl Session for SessionSvc {
             title: outcome.title,
             message_count: outcome.message_count,
         }))
+    }
+}
+
+#[cfg(test)]
+mod compose_turn_text_tests {
+    use super::{compose_turn_text, InlineDocument};
+
+    fn doc(filename: &str, content: &[u8]) -> InlineDocument {
+        InlineDocument {
+            filename: filename.to_string(),
+            mime_type: "text/plain".to_string(),
+            content: content.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_turn_with_no_documents_is_the_text_untouched() {
+        assert_eq!(compose_turn_text("hello".into(), vec![]).unwrap(), "hello");
+    }
+
+    #[test]
+    fn puts_the_material_before_the_instruction_that_acts_on_it() {
+        let composed =
+            compose_turn_text("summarise this".into(), vec![doc("log.txt", b"boom")]).unwrap();
+        assert!(composed.starts_with("<untrusted_content"), "{composed}");
+        assert!(composed.ends_with("summarise this"), "{composed}");
+        assert!(composed.contains("boom"), "{composed}");
+    }
+
+    #[test]
+    fn labels_each_document_so_the_agent_can_tell_them_apart() {
+        let composed = compose_turn_text(
+            "compare".into(),
+            vec![doc("before.txt", b"one"), doc("after.txt", b"two")],
+        )
+        .unwrap();
+        assert!(composed.contains(r#"source="before.txt""#), "{composed}");
+        assert!(composed.contains(r#"source="after.txt""#), "{composed}");
+    }
+
+    #[test]
+    fn refuses_the_turn_rather_than_failing_part_way_through_a_reply() {
+        // The whole point of composing here: an unreadable file is the answer
+        // to `Send`, not an error the user sees after the agent starts talking.
+        let err =
+            compose_turn_text("read this".into(), vec![doc("a.pdf", b"\xff\xfe\x00")]).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("a.pdf"), "{}", err.message());
+    }
+
+    #[test]
+    fn one_bad_document_refuses_the_whole_turn() {
+        // Sending the readable half would look like it worked while quietly
+        // dropping what the user asked about.
+        let err = compose_turn_text(
+            "read these".into(),
+            vec![doc("good.md", b"# fine"), doc("bad.bin", b"\xff\xfe")],
+        )
+        .unwrap_err();
+        assert!(err.message().contains("bad.bin"), "{}", err.message());
     }
 }
 

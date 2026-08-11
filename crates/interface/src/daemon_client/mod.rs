@@ -360,6 +360,9 @@ impl DaemonClient {
                 session_id: session_id.to_string(),
                 text: text.to_string(),
                 images,
+                // The TUI attaches files by path, which `fs_read` already
+                // handles — inline documents are a web/desktop affordance.
+                documents: Vec::new(),
             })
             .await
             .context("Session.Send failed")?

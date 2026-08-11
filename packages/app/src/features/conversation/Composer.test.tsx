@@ -18,18 +18,21 @@ vi.mock("../palette/useCommands", () => ({
   }),
 }));
 
-/** Attaching a real image needs blob URLs and a FileReader; stub the step. */
+/**
+ * Reading a real file needs blob URLs and an ArrayBuffer; stub the step. What
+ * comes back is keyed off the file's own type, so a test can attach either
+ * kind and the composer sees what it would really be handed.
+ */
 vi.mock("./attachments", () => ({
-  collectImages: vi.fn(() =>
+  collectAttachments: vi.fn((files: File[]) =>
     Promise.resolve({
-      attachments: [
-        {
-          mimeType: "image/png",
-          data: new Uint8Array([1]),
-          filename: "shot.png",
-          previewUrl: "blob:shot",
-        },
-      ],
+      attachments: files.map((f) => ({
+        kind: f.type.startsWith("image/") ? "image" : "document",
+        mimeType: f.type,
+        data: new Uint8Array([1]),
+        filename: f.name,
+        previewUrl: f.type.startsWith("image/") ? `blob:${f.name}` : undefined,
+      })),
       errors: [],
     }),
   ),
@@ -436,6 +439,29 @@ describe("path references", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
+  it("does not open a menu on a draft restored from another conversation", () => {
+    sessionStorage.setItem(draftKeyFor("other"), "look at @s");
+    const { rerender } = withWorkspace();
+    // A caret left over from typing here would sit at an offset into text the
+    // user has not looked at, and pop a menu on arrival.
+    type("look at @s");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+
+    rerender(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("other")}
+        conversationKey="other"
+        sessionId="live-1"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "look at @s");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
   it("offers nothing before a session exists to scope the workspace", () => {
     setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
     type("look at @s");
@@ -445,7 +471,8 @@ describe("path references", () => {
   it("writes the chosen path into the sentence, keeping what follows", () => {
     withWorkspace();
     type("look at @s");
-    fireEvent.click(screen.getByText("safety.md"));
+    // Rows answer to pointerdown, so choosing one never blurs the box first.
+    fireEvent.pointerDown(screen.getByText("safety.md"));
     expect(screen.getByRole("textbox")).toHaveProperty("value", "look at @safety.md ");
   });
 
@@ -488,5 +515,59 @@ describe("path references", () => {
 
     expect(onCancel).not.toHaveBeenCalled();
     expect(screen.queryByRole("listbox")).toBeNull();
+  });
+});
+
+describe("attaching a document", () => {
+  const MIXED = [
+    new File(["# hi"], "notes.md", { type: "text/markdown" }),
+    new File([new Uint8Array([1])], "shot.png", { type: "image/png" }),
+  ];
+
+  function pick(container: HTMLElement, files: File[]) {
+    const input = container.querySelector('input[type="file"]')!;
+    fireEvent.change(input, { target: { files } });
+  }
+
+  it("shows a text file by name, since there is nothing to look at", async () => {
+    const { container } = setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    pick(container, [MIXED[0]!]);
+
+    await waitFor(() => expect(screen.getByText("notes.md")).toBeTruthy());
+    // A thumbnail would be an empty box: no image was attached.
+    expect(screen.queryByAltText("notes.md")).toBeNull();
+  });
+
+  it("sends a document and an image together, each in its own field", async () => {
+    const onSend = vi.fn();
+    const { container } = render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+    pick(container, MIXED);
+    await waitFor(() => expect(screen.getByText("notes.md")).toBeTruthy());
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "look at these" } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+
+    const [, attached] = onSend.mock.calls[0]!;
+    expect(attached.map((a: { kind: string }) => a.kind)).toEqual(["document", "image"]);
+  });
+
+  it("drops a document chip without touching the image beside it", async () => {
+    const { container } = setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    pick(container, MIXED);
+    await waitFor(() => expect(screen.getByText("notes.md")).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText("Remove notes.md"));
+
+    expect(screen.queryByText("notes.md")).toBeNull();
+    expect(screen.getByAltText("shot.png")).toBeTruthy();
   });
 });

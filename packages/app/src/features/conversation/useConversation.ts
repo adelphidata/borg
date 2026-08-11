@@ -12,11 +12,20 @@ import { draftKeyFor, moveDraft } from "./draftStore";
 
 /** An image riding along with a turn. */
 export interface Attachment {
+  /**
+   * Which wire field this belongs in. An image is a native content part; a
+   * document reaches the model as labelled text, because the content model has
+   * no document part.
+   */
+  kind: "image" | "document";
   mimeType: string;
   data: Uint8Array;
   filename: string;
-  /** Object URL for the composer thumbnail; revoked when the chip is dropped. */
-  previewUrl: string;
+  /**
+   * Object URL for the composer thumbnail; revoked when the chip is dropped.
+   * Absent on a document, which is shown by name and renders nothing.
+   */
+  previewUrl?: string;
 }
 
 /** One rendered block in the transcript. */
@@ -439,11 +448,20 @@ export function useConversation(target: string | undefined): Conversation {
         {
           sessionId,
           text,
-          images: attachments.map((a) => ({
-            mimeType: a.mimeType,
-            data: a.data,
-            filename: a.filename,
-          })),
+          images: attachments
+            .filter((a) => a.kind === "image")
+            .map((a) => ({
+              mimeType: a.mimeType,
+              data: a.data,
+              filename: a.filename,
+            })),
+          documents: attachments
+            .filter((a) => a.kind === "document")
+            .map((a) => ({
+              filename: a.filename,
+              mimeType: a.mimeType,
+              content: a.data,
+            })),
         },
         {
           onMessage: () => {},

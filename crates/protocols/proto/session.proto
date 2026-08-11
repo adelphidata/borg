@@ -101,6 +101,16 @@ message SendRequest {
   string text = 2;
   // Optional multimodal attachments. Empty = text-only turn.
   repeated InlineImage images = 3;
+  // Optional text documents. Reach the model as labelled text inside the
+  // untrusted-content boundary, because the content model has no document
+  // part. Non-text bytes are refused daemon-side.
+  repeated InlineDocument documents = 4;
+}
+
+message InlineDocument {
+  string filename = 1;
+  string mime_type = 2;
+  bytes content = 3; // raw bytes, NOT base64
 }
 
 message InlineImage {

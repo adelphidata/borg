@@ -363,6 +363,7 @@ async fn daemon_client_round_trips_a_turn() {
             session_id: opened.session_id.clone(),
             text: "hi".into(),
             images: Vec::new(),
+            documents: Vec::new(),
         })
         .await
         .expect("Send must succeed")
