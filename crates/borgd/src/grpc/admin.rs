@@ -48,6 +48,22 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status as TStatus};
 
+/// A stored message as the transcript should show it.
+///
+/// Only a user row is summarized. An attached file is composed into the user's
+/// turn as a wrapped text part — the model must keep reading it, but replaying
+/// the whole file into the bubble means a reopened conversation looks nothing
+/// like the sentence the person actually typed. Every other role is returned
+/// verbatim: a tool row's `<untrusted_content>` *is* the tool's output, and
+/// hiding it would hide what the agent was working from.
+fn display_text(role: &str, content: String) -> String {
+    if role == "user" {
+        cortex::security::sanitize::summarize_untrusted_blocks(&content)
+    } else {
+        content
+    }
+}
+
 /// Boxed session-activity stream; the `Admin::SubscribeSessionActivityStream`
 /// associated type. No `WiredSlot` guard here — the bus lives on the session
 /// registry every `AdminSvc` is built with, so the feed can never be unwired.
@@ -465,8 +481,8 @@ impl Admin for AdminSvc {
                 messages: messages
                     .into_iter()
                     .map(|m| MessageView {
+                        text: display_text(&m.role, m.content.unwrap_or_default()),
                         role: m.role,
-                        text: m.content.unwrap_or_default(),
                         unix_ts: m.created_at as u64,
                         tool_calls_json: m.tool_calls_json.unwrap_or_default(),
                         tool_call_id: m.tool_call_id.unwrap_or_default(),
@@ -1533,3 +1549,30 @@ use helpers::{
     snapshot_row_to_pb, snapshot_to_reply, sub_agent_row_to_pb, task_run_row_to_proto,
     update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome, WiredSlot,
 };
+
+#[cfg(test)]
+mod display_text_tests {
+    use super::display_text;
+    use cortex::security::sanitize::wrap_untrusted;
+
+    #[test]
+    fn a_reopened_turn_shows_the_sentence_the_person_typed() {
+        let stored = format!(
+            "{}\n\nsummarise",
+            wrap_untrusted("notes.md", "pages of text")
+        );
+        assert_eq!(
+            display_text("user", stored),
+            "[attached notes.md]\n\nsummarise"
+        );
+    }
+
+    #[test]
+    fn a_tool_row_keeps_the_boundary_that_frames_its_output() {
+        // The wrapper is the tool result's own framing. Summarizing it here
+        // would blank out what the agent actually read.
+        let stored = wrap_untrusted("fetch", "the page body");
+        assert_eq!(display_text("tool", stored.clone()), stored);
+        assert_eq!(display_text("assistant", stored.clone()), stored);
+    }
+}
