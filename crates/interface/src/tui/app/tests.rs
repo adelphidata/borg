@@ -1334,17 +1334,29 @@ fn update_command_full_flag_matrix() {
         ("/update", false, false),
         ("/update --prerelease", true, false),
         ("/update --pre", true, false),
-        ("/update --dev", true, false),
         ("/update -p", true, false),
         ("/update --check", false, true),
         ("/update -c", false, true),
         ("/update -pc", true, true),
         ("/update --prerelease --check", true, true),
-        ("/update --check --dev", true, true),
+        ("/update --check --pre", true, true),
     ];
     for (input, pre, check) in cases {
         assert_self_update(input, *pre, *check);
     }
+}
+
+/// The `--dev` alias was removed with the rest of the back-compat surface. It
+/// must now be refused like any other unknown flag — a silently-ignored flag
+/// would install a stable build for a user who asked for a pre-release.
+#[test]
+fn update_command_no_longer_accepts_dev() {
+    let mut app = make_app();
+    let result = app.handle_submit("/update --dev").unwrap();
+    assert!(
+        matches!(result, AppAction::Continue),
+        "a removed flag must not trigger SelfUpdate"
+    );
 }
 
 #[test]

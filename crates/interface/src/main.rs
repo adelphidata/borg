@@ -1121,9 +1121,10 @@ mod tests {
         }
     }
 
-    /// `borg update` flags: each name/alias/short maps to the same field;
-    /// `-pc` must combine; `--dev` is the hidden back-compat alias for
-    /// `--prerelease`.
+    /// `borg update` flags: each name/alias/short maps to the same field, and
+    /// `-pc` must combine. The old `--dev` spelling was dropped with the rest
+    /// of the back-compat surface; [`parse_update_no_longer_accepts_dev`]
+    /// pins that it is gone.
     #[test]
     fn parse_update_flag_aliases_and_combinations() {
         // (argv, expected prerelease, expected check)
@@ -1132,7 +1133,6 @@ mod tests {
             (&["--prerelease"], true, false),
             (&["--pre"], true, false),
             (&["-p"], true, false),
-            (&["--dev"], true, false),
             (&["--check"], false, true),
             (&["-c"], false, true),
             (&["-pc"], true, true),
@@ -1156,9 +1156,19 @@ mod tests {
         );
     }
 
+    /// The back-compat alias is gone, so it must fail like any other unknown
+    /// flag rather than silently doing nothing.
     #[test]
-    fn update_help_does_not_advertise_dev_alias() {
-        // --help text for the subcommand must not show --dev (it's a hidden alias).
+    fn parse_update_no_longer_accepts_dev() {
+        let err = match Cli::try_parse_from(["borg", "update", "--dev"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--dev was removed and must not parse"),
+        };
+        assert!(err.to_string().contains("dev"), "error must name it: {err}");
+    }
+
+    #[test]
+    fn update_help_lists_the_supported_flags_only() {
         let err = match Cli::try_parse_from(["borg", "update", "--help"]) {
             Err(e) => e,
             Ok(_) => panic!("--help should short-circuit with help output"),
@@ -1169,7 +1179,7 @@ mod tests {
             "missing --prerelease: {help}"
         );
         assert!(help.contains("--check"), "missing --check: {help}");
-        assert!(!help.contains("--dev"), "--dev should be hidden: {help}");
+        assert!(!help.contains("--dev"), "--dev is gone: {help}");
     }
 
     #[test]

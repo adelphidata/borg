@@ -947,6 +947,13 @@ mod tests {
 
     #[test]
     fn short_lines_pass_through_unchanged() {
+        // Both calls resolve colors from the process-global palette, so a
+        // sibling test swapping it between them would compare two themes and
+        // fail on `style.bg`. Hold the shared lock, like every other test here
+        // that reads the palette.
+        let _lock = crate::tui::themes::active::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // At a generous width, render_patch_wrapped is idempotent w/ render_patch.
         let patch = "*** Begin Patch\n*** Update File: x.rs\n@@\n ctx\n-old\n+new\n*** End Patch";
         let plain = render_patch(patch);
