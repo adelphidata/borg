@@ -100,15 +100,58 @@ fn keyboard_enhancement_disabled() -> bool {
     keyboard_enhancement_disabled_for(disable_env.as_deref(), is_wsl, is_vscode_terminal)
 }
 
+/// Terminals whose handling of `REPORT_EVENT_TYPES` we have to special-case.
+///
+/// Only terminals that *misbehave* earn a variant; everything well-behaved is
+/// [`TerminalKind::Other`] and keeps the full flag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalKind {
+    Iterm2,
+    Ghostty,
+    Other,
+}
+
+impl TerminalKind {
+    /// Whether this terminal leaks the release half of a shortcut it consumes
+    /// into the parent shell.
+    fn leaks_key_releases(self) -> bool {
+        matches!(self, Self::Iterm2 | Self::Ghostty)
+    }
+}
+
+/// Classify the host terminal from its environment.
+///
+/// `TERM` is consulted as a fallback because Ghostty sets `TERM=xterm-ghostty`
+/// in launch paths where `TERM_PROGRAM` never reaches the process — over ssh,
+/// and under some launchers — and the release-event defect is present there
+/// just the same.
+///
+/// Pure function of its inputs so it is testable without touching process env.
+fn terminal_kind_from(term_program: Option<&str>, term: Option<&str>) -> TerminalKind {
+    if let Some(program) = term_program {
+        if program.eq_ignore_ascii_case("iTerm.app") {
+            return TerminalKind::Iterm2;
+        }
+        if program.eq_ignore_ascii_case("ghostty") {
+            return TerminalKind::Ghostty;
+        }
+    }
+    if term.is_some_and(|term| term.eq_ignore_ascii_case("xterm-ghostty")) {
+        return TerminalKind::Ghostty;
+    }
+    TerminalKind::Other
+}
+
 /// Which kitty-protocol flags to request from the *current* terminal.
 ///
 /// `DISAMBIGUATE_ESCAPE_CODES` and `REPORT_ALTERNATE_KEYS` are unconditional.
 /// `REPORT_EVENT_TYPES` — which asks the terminal to report key *release* and
-/// *repeat* in addition to press — is dropped on two transports that mishandle
+/// *repeat* in addition to press — is dropped on the transports that mishandle
 /// it:
 ///
-/// * **iTerm2** leaks the release half of an exit shortcut into the parent
-///   shell, so quitting borg types a stray character at your prompt.
+/// * **iTerm2 and Ghostty** leak the release half of a shortcut they consume
+///   into the parent shell, so quitting borg types a stray character at your
+///   prompt.
 /// * **tmux with `extended-keys xterm`** loses Shift+Enter entirely when event
 ///   types are requested; that format cannot encode both.
 ///
@@ -118,12 +161,12 @@ fn keyboard_enhancement_disabled() -> bool {
 /// Pure function of its inputs so it is unit-testable without a tty — the
 /// terminal probing lives in [`detected_keyboard_transport`].
 fn keyboard_enhancement_flags(
-    is_iterm2: bool,
+    terminal: TerminalKind,
     tmux_extended_keys_format: Option<&str>,
 ) -> KeyboardEnhancementFlags {
     let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
-    if is_iterm2 || tmux_extended_keys_format == Some("xterm") {
+    if terminal.leaks_key_releases() || tmux_extended_keys_format == Some("xterm") {
         flags
     } else {
         flags | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -131,15 +174,17 @@ fn keyboard_enhancement_flags(
 }
 
 /// Probe the host terminal for the inputs [`keyboard_enhancement_flags`] needs.
-fn detected_keyboard_transport() -> (bool, Option<String>) {
-    let is_iterm2 = std::env::var("TERM_PROGRAM")
-        .is_ok_and(|program| program.eq_ignore_ascii_case("iTerm.app"));
+fn detected_keyboard_transport() -> (TerminalKind, Option<String>) {
+    let terminal = terminal_kind_from(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    );
     let tmux_format = if std::env::var_os("TMUX").is_some() {
         read_tmux_extended_keys_format()
     } else {
         None
     };
-    (is_iterm2, tmux_format)
+    (terminal, tmux_format)
 }
 
 /// Read tmux's `extended-keys` option value (`on`/`off`/`always` in newer tmux,
@@ -160,8 +205,8 @@ fn read_tmux_extended_keys_format() -> Option<String> {
 
 /// The flags to push on this host, resolved once per call site.
 fn resolved_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
-    let (is_iterm2, tmux_format) = detected_keyboard_transport();
-    keyboard_enhancement_flags(is_iterm2, tmux_format.as_deref())
+    let (terminal, tmux_format) = detected_keyboard_transport();
+    keyboard_enhancement_flags(terminal, tmux_format.as_deref())
 }
 
 fn keyboard_enhancement_disabled_for(
@@ -647,44 +692,146 @@ mod tests {
         ));
     }
 
-    /// iTerm2 leaks the *release* half of an exit shortcut into the parent
-    /// shell when event types are reported, so quitting borg types a stray
-    /// character at the user's prompt. Disambiguation and alternate keys must
-    /// survive — only event-type reporting is dropped.
+    /// iTerm2 and Ghostty leak the *release* half of a shortcut they consume
+    /// into the parent shell when event types are reported, so quitting borg
+    /// types a stray character at the user's prompt. Disambiguation and
+    /// alternate keys must survive — only event-type reporting is dropped.
     #[test]
-    fn iterm2_does_not_request_event_type_reporting() {
-        let flags = keyboard_enhancement_flags(
-            /*is_iterm2*/ true, /*tmux_extended_keys_format*/ None,
+    fn release_leaking_terminals_do_not_request_event_type_reporting() {
+        for terminal in [TerminalKind::Iterm2, TerminalKind::Ghostty] {
+            let flags =
+                keyboard_enhancement_flags(terminal, /*tmux_extended_keys_format*/ None);
+            assert!(
+                !flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+                "{terminal:?} must not request release events"
+            );
+            assert!(
+                flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+                "{terminal:?} still needs escape-code disambiguation"
+            );
+            assert!(
+                flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS),
+                "{terminal:?} still needs alternate-key reporting"
+            );
+        }
+    }
+
+    /// Ghostty is reachable by two independent signals. `TERM_PROGRAM` is
+    /// absent over ssh and under some launchers, where `TERM` is the only
+    /// evidence — missing that path would leave those sessions leaking.
+    #[test]
+    fn ghostty_is_detected_from_either_term_program_or_term() {
+        assert_eq!(
+            terminal_kind_from(Some("ghostty"), Some("xterm-256color")),
+            TerminalKind::Ghostty,
+            "TERM_PROGRAM alone must identify Ghostty"
         );
-        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
-        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert_eq!(
+            terminal_kind_from(/*term_program*/ None, Some("xterm-ghostty")),
+            TerminalKind::Ghostty,
+            "TERM alone must identify Ghostty when TERM_PROGRAM is absent"
+        );
+        assert_eq!(
+            terminal_kind_from(Some("Ghostty"), /*term*/ None),
+            TerminalKind::Ghostty,
+            "detection must not depend on case"
+        );
+    }
+
+    /// The probe must not mistake a well-behaved terminal for a leaking one:
+    /// that would silently cost every user repeat/press discrimination.
+    #[test]
+    fn terminal_kind_classifies_other_terminals_as_other() {
+        for (term_program, term) in [
+            (Some("iTerm.app"), None),
+            (None, Some("xterm-ghostty")),
+            (Some("ghostty"), None),
+        ] {
+            assert_ne!(
+                terminal_kind_from(term_program, term),
+                TerminalKind::Other,
+                "known-leaking terminal misclassified: {term_program:?}/{term:?}"
+            );
+        }
+        for (term_program, term) in [
+            (None, None),
+            (Some("Apple_Terminal"), Some("xterm-256color")),
+            (Some("WezTerm"), Some("wezterm")),
+            (None, Some("xterm-kitty")),
+            // Substring lookalikes must not trip detection.
+            (Some("ghostty-preview"), Some("xterm-ghostty-ish")),
+        ] {
+            assert_eq!(
+                terminal_kind_from(term_program, term),
+                TerminalKind::Other,
+                "well-behaved terminal misclassified: {term_program:?}/{term:?}"
+            );
+        }
+    }
+
+    /// Pin the bytes that actually reach the terminal. The flag set is an
+    /// internal representation; what fixes the leak is the `>` parameter
+    /// Ghostty receives, and only rendering the command proves it.
+    #[test]
+    fn ghostty_keyboard_enhancement_emits_no_event_type_bit() {
+        let mut ghostty: Vec<u8> = Vec::new();
+        crossterm::queue!(
+            ghostty,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags(
+                TerminalKind::Ghostty,
+                /*tmux_extended_keys_format*/ None,
+            ))
+        )
+        .expect("queue keyboard enhancement flags into an in-memory buffer");
+
+        // 1 = disambiguate escape codes, 4 = report alternate keys. The
+        // event-types bit (2) must be absent, so the sum is 5, not 7.
+        assert_eq!(
+            String::from_utf8_lossy(&ghostty),
+            "\x1b[>5u",
+            "Ghostty must be sent the flag set without event-type reporting"
+        );
+
+        let mut other: Vec<u8> = Vec::new();
+        crossterm::queue!(
+            other,
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags(
+                TerminalKind::Other,
+                /*tmux_extended_keys_format*/ None,
+            ))
+        )
+        .expect("queue keyboard enhancement flags into an in-memory buffer");
+        assert_eq!(
+            String::from_utf8_lossy(&other),
+            "\x1b[>7u",
+            "a well-behaved terminal must still receive event-type reporting"
+        );
     }
 
     /// tmux's `xterm` extended-keys format cannot encode Shift+Enter alongside
     /// event types, and silently drops it. `csi-u` can, so it keeps them.
     #[test]
     fn tmux_event_type_reporting_depends_on_extended_keys_format() {
-        let xterm = keyboard_enhancement_flags(/*is_iterm2*/ false, Some("xterm"));
+        let xterm = keyboard_enhancement_flags(TerminalKind::Other, Some("xterm"));
         assert!(
             !xterm.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
             "tmux xterm format loses Shift+Enter when event types are requested"
         );
 
-        let csi_u = keyboard_enhancement_flags(/*is_iterm2*/ false, Some("csi-u"));
+        let csi_u = keyboard_enhancement_flags(TerminalKind::Other, Some("csi-u"));
         assert!(
             csi_u.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
             "csi-u encodes both, so repeat events must stay distinguishable"
         );
     }
 
-    /// Everything else — Kitty, Ghostty, Alacritty, bare xterm, unknown — keeps
-    /// the full flag set. This is the default path; narrowing it would lose
-    /// repeat/press discrimination for every well-behaved terminal.
+    /// Everything else — Kitty, Alacritty, bare xterm, unknown — keeps the full
+    /// flag set. This is the default path; narrowing it would lose repeat/press
+    /// discrimination for every well-behaved terminal.
     #[test]
     fn other_terminals_keep_full_flag_set() {
         for tmux_format in [None, Some("csi-u")] {
-            let flags = keyboard_enhancement_flags(/*is_iterm2*/ false, tmux_format);
+            let flags = keyboard_enhancement_flags(TerminalKind::Other, tmux_format);
             assert_eq!(
                 flags,
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
