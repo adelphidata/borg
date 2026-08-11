@@ -344,8 +344,8 @@ export function Composer({
             className="min-w-0 flex-1 resize-none border-0 bg-transparent py-1.5 text-[14.5px] leading-[1.4] text-ink outline-none select-text placeholder:text-ink3"
             placeholder={busy ? "Steer Borg…" : "Ask Borg anything"}
             // Focus never leaves the box, so the row Enter would take is only
-            // announced if the box names it.
-            role="combobox"
+            // announced if the box names it. No `role="combobox"`: that would
+            // replace the textarea's own role, and it is a text box first.
             aria-expanded={slashOpen}
             aria-controls={slashOpen ? SLASH_LIST_ID : undefined}
             aria-activedescendant={
