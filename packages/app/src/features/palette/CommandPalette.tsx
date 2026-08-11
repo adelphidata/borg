@@ -1,12 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { CheckIcon, SearchIcon, useTheme } from "@borg/ui";
-import { dispatchKeybind, hintFor, useKeybind } from "../../lib/keybinds";
-import { useQuery } from "../../lib/useDaemon";
-import { useSettings } from "../../lib/settings";
-import { routes } from "../../routes";
-import { buildCommands } from "./commands";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CheckIcon, SearchIcon } from "@borg/ui";
+import { useKeybind } from "../../lib/keybinds";
 import { rank, type Command } from "./score";
+import { useCommands } from "./useCommands";
 
 /**
  * ⌘K.
@@ -20,9 +16,6 @@ import { rank, type Command } from "./score";
  * usable list.
  */
 export function CommandPalette() {
-  const navigate = useNavigate();
-  const settings = useSettings();
-  const { preference, setPreference } = useTheme();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -32,82 +25,10 @@ export function CommandPalette() {
   // While open, Escape belongs to the palette rather than to a running turn.
   useKeybind("cancel-turn", () => setOpen(false), { enabled: open, inInputs: true });
 
-  // Conversations are only fetched while the palette is actually open.
-  const sessions = useQuery(
-    async (borg) => (open ? (await borg.admin.listSessions({})).sessions : []),
-    [open],
-  );
-
-  // Values written but not yet confirmed by a fresh snapshot. Without this a
-  // toggle reads its old value until the write round-trips, so pressing Enter
-  // twice writes the same value twice and the second press silently does
-  // nothing. Cleared per key when the snapshot catches up, or on failure.
-  const [pending, setPending] = useState<Map<string, string>>(new Map());
-  const [saveError, setSaveError] = useState<string>();
-
-  const forget = (key: string) =>
-    setPending((prev) => {
-      const next = new Map(prev);
-      next.delete(key);
-      return next;
-    });
-
-  const saveSetting = useCallback(
-    (key: string, value: string) => {
-      setSaveError(undefined);
-      setPending((prev) => new Map(prev).set(key, value));
-      void settings.save(key, value).then((ok) => {
-        // Reporting success we did not have would leave the row showing a
-        // state the daemon never took.
-        if (!ok)
-          setSaveError(`Could not change that setting. ${settings.saveError?.message ?? ""}`);
-        forget(key);
-      });
-    },
-    [settings.save, settings.saveError],
-  );
-
-  const snapshot = settings.settings.state === "ready" ? settings.settings.data : undefined;
-  const effective = useMemo(() => {
-    if (!snapshot || pending.size === 0) return snapshot;
-    const merged = new Map(snapshot);
-    for (const [key, value] of pending) {
-      const current = merged.get(key);
-      if (current) merged.set(key, { ...current, value });
-    }
-    return merged;
-  }, [snapshot, pending]);
-
   // Only whether a query exists matters, not what it is. Depending on the text
   // would rebuild every one of ~500 rows on each keystroke.
   const searching = query.trim() !== "";
-  const commands = useMemo<Command[]>(
-    () =>
-      buildCommands(
-        {
-          navigate,
-          dispatch: dispatchKeybind,
-          hintFor,
-          settings: effective,
-          saveSetting,
-          sessions: sessions.state === "ready" ? sessions.data : [],
-          themePreference: preference,
-          setThemePreference: setPreference,
-          searching,
-        },
-        routes,
-      ),
-    [
-      navigate,
-      sessions.state,
-      sessions.data,
-      effective,
-      saveSetting,
-      preference,
-      setPreference,
-      searching,
-    ],
-  );
+  const { commands, saveError, clearSaveError } = useCommands({ active: open, searching });
 
   const results = useMemo(() => rank(commands, query).slice(0, 40), [commands, query]);
 
@@ -115,8 +36,8 @@ export function CommandPalette() {
   useEffect(() => setCursor(0), [query]);
 
   useEffect(() => {
-    if (!open) setSaveError(undefined);
-  }, [open]);
+    if (!open) clearSaveError();
+  }, [open, clearSaveError]);
 
   useEffect(() => {
     if (!open) setQuery("");

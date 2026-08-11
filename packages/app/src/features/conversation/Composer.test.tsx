@@ -1,7 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { dispatchKeybind, resetKeybinds } from "../../lib/keybinds";
+import type { Command } from "../palette/score";
 import { Composer } from "./Composer";
 import { draftKeyFor, moveDraft } from "./draftStore";
+
+/**
+ * The command list reaches the composer through the daemon-backed hook the
+ * palette also uses; this file is about what the composer does with it.
+ */
+const registry = vi.hoisted(() => ({ commands: [] as Command[] }));
+vi.mock("../palette/useCommands", () => ({
+  useCommands: () => ({
+    commands: registry.commands,
+    saveError: undefined,
+    clearSaveError: () => {},
+  }),
+}));
 
 /** Attaching a real image needs blob URLs and a FileReader; stub the step. */
 vi.mock("./attachments", () => ({
@@ -39,6 +54,7 @@ async function attach(container: HTMLElement) {
 
 beforeEach(() => {
   sessionStorage.clear();
+  registry.commands = [];
   globalThis.URL.revokeObjectURL = vi.fn();
   // jsdom implements neither of these, and the composer reaches for both.
   window.matchMedia = vi.fn(() => ({
@@ -48,7 +64,10 @@ beforeEach(() => {
   })) as unknown as typeof window.matchMedia;
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetKeybinds();
+});
 
 describe("Composer", () => {
   it("keeps an attachment when a new conversation is issued its id", async () => {
@@ -111,5 +130,195 @@ describe("Composer", () => {
       />,
     );
     expect(screen.getByRole("textbox")).toHaveProperty("value", "half a thought");
+  });
+});
+
+describe("the composer's slash menu", () => {
+  function command(id: string, label: string, run: () => void): Command {
+    return { id, label, run };
+  }
+
+  function type(value: string) {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value } });
+  }
+
+  function enter() {
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  }
+
+  it("opens on a leading slash and offers the commands ⌘K offers", () => {
+    registry.commands = [command("action:new", "New conversation", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    type("/");
+    expect(screen.getByRole("option", { name: /New conversation/ })).toBeTruthy();
+  });
+
+  it("stays shut for a slash inside ordinary prose", () => {
+    registry.commands = [command("action:new", "New conversation", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("look at src/lib/mod.rs");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("runs the highlighted command on Enter instead of sending the token", () => {
+    const run = vi.fn();
+    const onSend = vi.fn();
+    registry.commands = [command("action:new", "New conversation", run)];
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+
+    type("/new");
+    enter();
+
+    expect(run).toHaveBeenCalled();
+    // The daemon has no slash handler: forwarding "/new" would silently do
+    // nothing while looking exactly like a sent message.
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("never steers a running turn with a slash token either", () => {
+    const onSteer = vi.fn();
+    registry.commands = [command("action:new", "New conversation", noop)];
+    render(
+      <Composer
+        busy
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={noop}
+        onSteer={onSteer}
+        onCancel={noop}
+      />,
+    );
+
+    type("/new");
+    enter();
+    expect(onSteer).not.toHaveBeenCalled();
+  });
+
+  it("moves the highlight with the arrows rather than the caret", () => {
+    const second = vi.fn();
+    registry.commands = [
+      command("a", "Alpha", noop),
+      command("b", "Bravo", second),
+      command("c", "Charlie", noop),
+    ];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("/");
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: "Bravo" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+
+    enter();
+    expect(second).toHaveBeenCalled();
+  });
+
+  it("does not recall history with ArrowUp while the menu owns the arrows", () => {
+    const onSend = vi.fn();
+    registry.commands = [command("a", "Alpha", noop)];
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+
+    type("an earlier prompt");
+    enter();
+    expect(onSend).toHaveBeenCalled();
+
+    type("/");
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowUp" });
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "/");
+  });
+
+  it("gives Escape to the menu first, and to a running turn only after", () => {
+    const onCancel = vi.fn();
+    registry.commands = [command("a", "Alpha", noop)];
+    render(
+      <Composer
+        busy
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={onCancel}
+      />,
+    );
+
+    type("/");
+    act(() => void dispatchKeybind("cancel-turn"));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(onCancel).not.toHaveBeenCalled();
+
+    act(() => void dispatchKeybind("cancel-turn"));
+    expect(onCancel).toHaveBeenCalled();
+  });
+
+  it("does not reopen on the next keystroke after it was dismissed", () => {
+    registry.commands = [command("a", "Alpha", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("/");
+    act(() => void dispatchKeybind("cancel-turn"));
+    type("/al");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("offers itself again once the dismissed token is gone", () => {
+    registry.commands = [command("a", "Alpha", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("/");
+    act(() => void dispatchKeybind("cancel-turn"));
+    type("");
+    type("/");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+  });
+
+  it("says so when nothing matches, rather than showing an empty box", () => {
+    registry.commands = [command("a", "Alpha", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("/zzzz");
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+    expect(screen.getByText(/No command matches/)).toBeTruthy();
+  });
+
+  it("sends nothing when Enter lands on a menu with no matches", () => {
+    const onSend = vi.fn();
+    registry.commands = [command("a", "Alpha", noop)];
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+
+    type("/zzzz");
+    enter();
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

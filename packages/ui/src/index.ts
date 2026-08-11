@@ -21,6 +21,11 @@ export { StatusDot, type DotTone } from "./components/StatusDot";
 export { Meter } from "./components/Meter";
 export { Menu, clampToViewport, type MenuAction, type MenuProps } from "./components/Menu";
 export {
+  CompletionList,
+  type CompletionRow,
+  type CompletionListProps,
+} from "./components/CompletionList";
+export {
   AgentsIcon,
   ArchiveIcon,
   AttachIcon,

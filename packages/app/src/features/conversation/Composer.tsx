@@ -1,13 +1,22 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AttachIcon, CloseIcon, Pill, SendIcon, useIsMobile } from "@borg/ui";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AttachIcon, CloseIcon, CompletionList, Pill, SendIcon, useIsMobile } from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
+import { rank } from "../palette/score";
+import { useCommands } from "../palette/useCommands";
 import { collectImages } from "./attachments";
 import { publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
+import { slashQuery } from "./slashToken";
 import type { Attachment } from "./useConversation";
 
 /** Grows with its content up to a ceiling, then scrolls. */
 const MAX_ROWS_PX = 200;
+
+/**
+ * How many rows the `/` menu offers. Short on purpose: it is there to teach
+ * what Borg can do, and a wall of options teaches nothing. ⌘K is the full list.
+ */
+const SLASH_RESULT_LIMIT = 8;
 
 function useAutoGrow(value: string) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -105,6 +114,41 @@ export function Composer({
 
   useKeybind("cancel-turn", onCancel, { enabled: busy, inInputs: true });
 
+  // `/` opens the same command list ⌘K renders. The chord is the shortcut for
+  // people who know it exists; the slash is how everyone else finds out.
+  const token = slashQuery(draft);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [slashCursor, setSlashCursor] = useState(0);
+  const slashOpen = token !== null && !slashDismissed;
+
+  // A refusal applies to the token that earned it. Once the token is gone the
+  // next `/` is a fresh request, not a continuation of the dismissed one.
+  useEffect(() => {
+    if (token === null) setSlashDismissed(false);
+    setSlashCursor(0);
+  }, [token]);
+
+  const { commands } = useCommands({ active: slashOpen, searching: (token ?? "") !== "" });
+  const slashResults = useMemo(
+    () => (slashOpen ? rank(commands, token ?? "").slice(0, SLASH_RESULT_LIMIT) : []),
+    [slashOpen, commands, token],
+  );
+
+  // Registered after the cancel-turn binding above, so while the menu is open
+  // Escape closes it and on close the running turn gets Escape back. A raw
+  // listener here would do both at once.
+  useKeybind("cancel-turn", () => setSlashDismissed(true), { enabled: slashOpen, inInputs: true });
+
+  const runCommand = (index: number) => {
+    const command = slashResults[index];
+    if (!command) return;
+    // The token was the query, never prompt text. Clearing it first means a
+    // command that navigates cannot leave a stray `/` behind in the draft.
+    setDraft("");
+    setSlashDismissed(false);
+    command.run();
+  };
+
   const addFiles = useCallback(async (files: readonly File[]) => {
     if (files.length === 0) return;
     const { attachments: added, errors } = await collectImages(files);
@@ -129,6 +173,12 @@ export function Composer({
   };
 
   const submit = () => {
+    // A slash token is a menu query. The daemon has no slash handler, so
+    // sending it as prompt text would look like it worked and do nothing.
+    if (slashOpen) {
+      runCommand(slashCursor);
+      return;
+    }
     const text = draft.trim();
     if (text === "" && attachments.length === 0) return;
     if (busy) {
@@ -147,6 +197,14 @@ export function Composer({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // While the menu is open the arrows belong to it, not to the caret or to
+    // history recall.
+    if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      const last = Math.max(0, slashResults.length - 1);
+      setSlashCursor((c) => Math.max(0, Math.min(last, e.key === "ArrowDown" ? c + 1 : c - 1)));
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
@@ -189,6 +247,22 @@ export function Composer({
               </div>
             ))}
           </div>
+        )}
+
+        {slashOpen && (
+          <CompletionList
+            label="Commands"
+            emptyText="No command matches. Press Escape to keep typing."
+            rows={slashResults.map((c) => ({
+              id: c.id,
+              label: c.label,
+              detail: c.detail,
+              hint: c.hint,
+            }))}
+            cursor={slashCursor}
+            onHover={setSlashCursor}
+            onChoose={runCommand}
+          />
         )}
 
         <div
