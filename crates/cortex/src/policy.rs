@@ -867,6 +867,49 @@ pub(crate) fn pipeline_segments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Every pipeline stage of `command`, plus the stages of any script it carries
+/// inline — `bash -o pipefail -c "…"`, `sh -lc '…'`, `eval '…'`, `trap '…' EXIT`
+/// — flattened into one list and de-obfuscated.
+///
+/// Guards that match a *verb* rather than a catastrophic pattern need this:
+/// scanning the raw command string alone means `bash -c "git reset --hard"`
+/// sails past, and re-deriving the unwrapping per guard is how two layers end
+/// up disagreeing about what a command runs. Bounded by [`MAX_SHELL_C_DEPTH`],
+/// the same cap the catastrophic pass uses.
+pub(crate) fn executable_segments(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_executable_segments(command, 0, &mut out);
+    out
+}
+
+fn collect_executable_segments(command: &str, depth: u8, out: &mut Vec<String>) {
+    if depth > MAX_SHELL_C_DEPTH {
+        return;
+    }
+    for fragment in command_fragments(command) {
+        // Recurse from the whole fragment: an inline script's payload is an
+        // operand of the fragment, not of one pipeline stage.
+        if let Some(script) = shell_inline_script(fragment) {
+            collect_executable_segments(&script, depth + 1, out);
+        }
+        if let Some(script) = operand_shell_source(fragment) {
+            collect_executable_segments(&script, depth + 1, out);
+        }
+        for segment in fragment.split('|').map(str::trim) {
+            if segment.is_empty() {
+                continue;
+            }
+            out.push(segment.to_string());
+            // Quoting and `$IFS` padding hide a verb from a plain match the
+            // same way they hide a catastrophic pattern.
+            let deob = deobfuscate(segment);
+            if deob != segment {
+                out.push(deob);
+            }
+        }
+    }
+}
+
 /// Filenames/paths that must not be *written* via `cp`/`mv`/`install` or shell
 /// redirection — SSH-key implant (`authorized_keys`, private keys), credential
 /// theft (`.netrc`, `.aws/credentials`, `.pgpass`, `.npmrc`, `.pypirc`), and
@@ -1614,6 +1657,337 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     true
+}
+
+/// Git operations that discard work irrecoverably. Each entry is the `git`
+/// subcommand plus the flag that makes it destructive: `git checkout main` is
+/// routine, `git checkout -f main` throws away the working tree. Narrow by
+/// design — this guard exists to stop the agent destroying the checkout it is
+/// running from, not to police ordinary version control.
+const DESTRUCTIVE_GIT_OPS: &[(&str, &[&str])] = &[
+    ("reset", &["--hard"]),
+    ("checkout", &["-f", "--force"]),
+    ("switch", &["-f", "--force", "--discard-changes"]),
+    ("restore", &["."]),
+    ("clean", &["-f"]),
+    ("branch", &["-D"]),
+    ("worktree", &["remove"]),
+];
+
+/// Proof that a directory is *Borg's* workspace rather than some other
+/// repository that happens to sit above the binary. Without it, an installed
+/// binary at `~/.cargo/bin/borg` under a dotfiles repo at `~/.git` would make
+/// the whole home directory "Borg's checkout" and refuse every destructive git
+/// command in every project under it.
+const SOURCE_CHECKOUT_MARKER: &str = "crates/cortex/Cargo.toml";
+
+/// True when `dir` is a git repository *and* is the Borg workspace.
+fn is_borg_source_checkout(dir: &std::path::Path) -> bool {
+    dir.join(".git").exists() && dir.join(SOURCE_CHECKOUT_MARKER).exists()
+}
+
+/// The Borg source checkout that contains the running binary, if there is one.
+///
+/// A dev build lives at `<checkout>/target/debug/borg`, so walking up from
+/// `current_exe` finds the source tree. An installed binary (`~/.cargo/bin`,
+/// `/usr/local/bin`, a Homebrew prefix) is in no *Borg* checkout, so this
+/// returns `None` and the guard below never fires — correct, since there is no
+/// source tree to protect.
+fn borg_source_checkout() -> Option<&'static std::path::Path> {
+    static ROOT: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+        exe.ancestors()
+            .find(|dir| is_borg_source_checkout(dir))
+            .map(std::path::Path::to_path_buf)
+    });
+    ROOT.as_deref()
+}
+
+/// Refuse a destructive git operation aimed at Borg's own source checkout.
+///
+/// Defense in depth, not a security boundary: a determined caller can always
+/// spell the same operation in a way this does not recognize. The point is
+/// that an agent working in its own repository cannot casually throw the
+/// working tree away — a failure that also destroys the evidence of why.
+///
+/// `cwd` is the directory the command will actually run in. Returns the
+/// refusal text, which names the operation and the way forward.
+pub(crate) fn git_checkout_self_denial(command: &str, cwd: &std::path::Path) -> Option<String> {
+    git_checkout_denial_under(command, cwd, borg_source_checkout()?)
+}
+
+/// [`git_checkout_self_denial`] with the protected root supplied explicitly.
+/// Split out so the matching rules can be tested against a scratch repository
+/// instead of whichever tree the test binary happens to live in.
+fn git_checkout_denial_under(
+    command: &str,
+    cwd: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<String> {
+    let cwd = cwd.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    if !cwd.starts_with(&root) {
+        return None;
+    }
+    for segment in executable_segments(command) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        // The verb must be `git` itself; `mygit` and `echo git reset --hard`
+        // are not git invocations.
+        let Some(git_at) = tokens
+            .iter()
+            .position(|t| strip_path_prefix(t).eq_ignore_ascii_case("git"))
+        else {
+            continue;
+        };
+        // Everything before `git` must be a transparent wrapper (`sudo`, `env`,
+        // `time`), else the word is an argument to some other program.
+        if tokens[..git_at].iter().any(|t| {
+            !LEADING_WRAPPERS.contains(&strip_path_prefix(t).to_ascii_lowercase().as_str())
+        }) {
+            continue;
+        }
+        let rest = &tokens[git_at + 1..];
+        // Skip git's own global options (`-C dir`, `--no-pager`) to reach the
+        // subcommand. `-C` takes an operand, so it consumes the next token.
+        let mut i = 0;
+        while let Some(tok) = rest.get(i) {
+            if *tok == "-C" || *tok == "--git-dir" || *tok == "--work-tree" {
+                i += 2;
+            } else if tok.starts_with('-') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let Some(subcommand) = rest.get(i) else {
+            continue;
+        };
+        let args = &rest[i + 1..];
+        for (op, triggers) in DESTRUCTIVE_GIT_OPS {
+            if subcommand != op {
+                continue;
+            }
+            // `git restore --staged .` only unstages: every byte is still in
+            // the working tree, so refusing it blocks a routine command for no
+            // gain. The destructive form is the one that writes the index back
+            // over the files.
+            if *op == "restore" && args.iter().any(|a| *a == "--staged" || *a == "-S") {
+                continue;
+            }
+            // A bundled short flag (`clean -fdx`) carries its trigger inside
+            // the cluster, so a plain equality test would miss it.
+            let fired = args.iter().any(|a| {
+                triggers.iter().any(|t| {
+                    a == t
+                        || (t.len() == 2
+                            && t.starts_with('-')
+                            && a.starts_with('-')
+                            && !a.starts_with("--")
+                            && a.contains(t.trim_start_matches('-')))
+                })
+            });
+            if fired {
+                return Some(format!(
+                    "`git {op}` with {} would discard work in Borg's own source checkout at {} — \
+                     refused. Borg is running from this tree, so losing it also loses the \
+                     evidence of what went wrong. Run the command yourself if you meant it, or \
+                     work in a separate worktree (`borg worktree add <name>`).",
+                    triggers.join(" or "),
+                    root.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod git_self_checkout_tests {
+    use super::*;
+
+    /// A scratch "source checkout" with a nested subdirectory, so the guard is
+    /// exercised against a real path rather than whichever tree the test
+    /// binary happens to live in.
+    fn scratch_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/cortex")).unwrap();
+        dir
+    }
+
+    fn denial(command: &str, cwd: &std::path::Path, root: &std::path::Path) -> Option<String> {
+        git_checkout_denial_under(command, cwd, root)
+    }
+
+    #[test]
+    fn destructive_git_ops_are_refused_inside_the_source_checkout() {
+        let root = scratch_root();
+        let nested = root.path().join("crates/cortex");
+        // Each of these throws away work with no git-side recovery.
+        let destructive = [
+            "git reset --hard HEAD~5",
+            "git checkout -f main",
+            "git checkout --force main",
+            "git switch --discard-changes main",
+            "git clean -fdx",
+            "git clean -f",
+            "git branch -D feature",
+            "git worktree remove ../other",
+            "git restore .",
+        ];
+        for command in destructive {
+            assert!(
+                denial(command, root.path(), root.path()).is_some(),
+                "`{command}` must be refused at the checkout root"
+            );
+            assert!(
+                denial(command, &nested, root.path()).is_some(),
+                "`{command}` must be refused in a subdirectory too"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_git_is_untouched() {
+        let root = scratch_root();
+        // The guard must not make version control unusable: reading history,
+        // switching branches safely, and dry runs all stay allowed.
+        let benign = [
+            "git status",
+            "git checkout main",
+            "git switch main",
+            "git reset --soft HEAD~1",
+            "git clean -n",
+            "git branch -d merged",
+            "git log --oneline -5",
+            "git worktree list",
+            "git restore --staged file.rs",
+        ];
+        for command in benign {
+            assert_eq!(
+                denial(command, root.path(), root.path()),
+                None,
+                "`{command}` must still be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_command_is_allowed_outside_the_checkout() {
+        // The guard is about Borg's own tree, not about git in general — an
+        // unrelated repository is the agent's to manage.
+        let root = scratch_root();
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(
+            denial("git reset --hard", elsewhere.path(), root.path()),
+            None,
+            "an unrelated repository must not be protected by this guard"
+        );
+    }
+
+    #[test]
+    fn a_payload_hidden_behind_a_shell_is_still_seen() {
+        // The whole reason the guard reads executable_segments: matching the
+        // raw string alone makes `bash -c` a one-token bypass.
+        let root = scratch_root();
+        let wrapped = [
+            "bash -c \"git reset --hard\"",
+            "sh -lc 'git clean -fdx'",
+            "bash -o pipefail -c \"git checkout -f main\"",
+            "echo hi && git reset --hard",
+            "eval 'git reset --hard'",
+            "sudo git clean -fdx",
+        ];
+        for command in wrapped {
+            assert!(
+                denial(command, root.path(), root.path()).is_some(),
+                "`{command}` must be refused — the payload is a destructive git op"
+            );
+        }
+    }
+
+    #[test]
+    fn the_word_git_inside_another_command_is_not_a_git_invocation() {
+        let root = scratch_root();
+        // False positives here would block writing about the guard at all.
+        let not_git = [
+            "echo git reset --hard",
+            "rg 'git reset --hard' docs/",
+            "mygit reset --hard",
+        ];
+        for command in not_git {
+            assert_eq!(
+                denial(command, root.path(), root.path()),
+                None,
+                "`{command}` does not run git"
+            );
+        }
+    }
+
+    #[test]
+    fn unstaging_everything_is_not_discarding_it() {
+        // `git restore --staged .` leaves every byte in the working tree. The
+        // trigger for `restore` is the bare `.`, so without the exemption this
+        // routine command is refused.
+        let root = scratch_root();
+        assert_eq!(
+            denial("git restore --staged .", root.path(), root.path()),
+            None,
+            "unstaging preserves the working tree and must stay allowed"
+        );
+        assert!(
+            denial("git restore .", root.path(), root.path()).is_some(),
+            "the form that overwrites the files must still be refused"
+        );
+    }
+
+    #[test]
+    fn only_borgs_own_workspace_counts_as_the_source_checkout() {
+        // An installed binary under a home directory that is itself a git repo
+        // (dotfiles, very common) would otherwise make every project under
+        // `$HOME` unmanageable: `.git` alone is not proof of Borg's tree.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(
+            !is_borg_source_checkout(dir.path()),
+            "an unrelated git repository is not Borg's checkout"
+        );
+
+        std::fs::create_dir_all(dir.path().join("crates/cortex")).unwrap();
+        std::fs::write(dir.path().join(SOURCE_CHECKOUT_MARKER), "[package]").unwrap();
+        assert!(
+            is_borg_source_checkout(dir.path()),
+            "a git repo carrying the workspace marker is Borg's checkout"
+        );
+    }
+
+    /// The marker the guard keys on must actually exist in this repository, or
+    /// the guard silently never fires in the tree it exists to protect.
+    #[test]
+    fn the_source_checkout_marker_names_a_real_file() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/cortex has a workspace root above it");
+        assert!(
+            workspace.join(SOURCE_CHECKOUT_MARKER).exists(),
+            "{SOURCE_CHECKOUT_MARKER} must exist at {}",
+            workspace.display()
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_operation_and_a_way_forward() {
+        let root = scratch_root();
+        let reason = denial("git clean -fdx", root.path(), root.path()).unwrap();
+        assert!(
+            reason.contains("git clean"),
+            "the operation must be named: {reason}"
+        );
+        assert!(
+            reason.contains("worktree"),
+            "the message must offer the supported alternative: {reason}"
+        );
+    }
 }
 
 #[cfg(test)]

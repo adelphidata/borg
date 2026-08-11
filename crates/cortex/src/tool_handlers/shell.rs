@@ -557,6 +557,27 @@ pub async fn handle_run_shell_with_context(
         }
     }
 
+    // Refuse a destructive git operation aimed at the checkout Borg is running
+    // from. Sibling of the control-plane guard below: both protect Borg's own
+    // state from a command that would otherwise look ordinary. Checked against
+    // the directory the command will really run in, not the process cwd.
+    if let Some(reason) = crate::policy::git_checkout_self_denial(
+        command,
+        workdir.as_deref().unwrap_or(ctx.workspace_cwd()),
+    ) {
+        crate::db::try_emit_global(
+            crate::db::audit_events::SANDBOX_DENIAL,
+            "system",
+            &serde_json::json!({
+                "tool": "run_shell",
+                "command_redacted": redact_command_for_audit(command),
+                "cause": "git_self_checkout",
+            }),
+        )
+        .await;
+        return Ok(format!("{SHELL_DENIED_PREFIX}: {reason}"));
+    }
+
     // Paired shell-side guard for the file-write control-plane deny: refuse
     // `run`/`start` commands that write Borg's own control-plane files or flip
     // a security setting via the CLI. Without this, `echo > ~/.borg/hooks.json`

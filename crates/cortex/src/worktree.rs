@@ -421,6 +421,20 @@ pub async fn remove(
             wt.path.display()
         );
     }
+    // Refused at every force level, like the main-checkout guard above: git
+    // will happily delete the directory a process is sitting in, leaving the
+    // caller with an invalid cwd and every later relative path resolving
+    // nowhere. `force` means "discard uncommitted work", never "saw off the
+    // branch you are on".
+    if let Some(here) = occupied_by_caller(&wt.path) {
+        bail!(
+            "worktree '{}' is the tree this command is running in ({}) — \
+             change to another directory first, then remove it",
+            wt.name(),
+            here.display()
+        );
+    }
+
     if !force && !wt.prunable && has_uncommitted_changes(&wt.path).await? {
         bail!(
             "worktree '{}' has uncommitted changes — commit them, or pass force to discard",
@@ -438,6 +452,25 @@ pub async fn remove(
         .await
         .with_context(|| format!("removing worktree '{}'", wt.name()))?;
     Ok(wt.path)
+}
+
+/// The caller's current directory when it sits at or inside `worktree_path`.
+///
+/// Both sides are canonicalized because a worktree root reached through a
+/// symlink (`/tmp`, `/var` on macOS) compares unequal to the resolved path git
+/// reports — the same trap [`remove`] already canonicalizes around. An
+/// unreadable cwd yields `None`: fail open rather than block a legitimate
+/// removal over a directory we cannot inspect.
+fn occupied_by_caller(worktree_path: &Path) -> Option<std::path::PathBuf> {
+    occupied_by(&std::env::current_dir().ok()?, worktree_path)
+}
+
+/// [`occupied_by_caller`] with the caller's directory supplied explicitly, so
+/// the containment rule can be tested without mutating process-global cwd.
+fn occupied_by(cwd: &Path, worktree_path: &Path) -> Option<std::path::PathBuf> {
+    let cwd = cwd.canonicalize().ok()?;
+    let target = worktree_path.canonicalize().ok()?;
+    cwd.starts_with(&target).then_some(cwd)
 }
 
 /// Whether `worktree_path` has staged, unstaged, or untracked changes.
@@ -995,6 +1028,104 @@ branch refs/heads/shared
             list(&repo).await.unwrap().len(),
             1,
             "only the main checkout should remain"
+        );
+    }
+
+    /// Deleting the directory a process is sitting in leaves it with an
+    /// invalid cwd and every later relative path resolving nowhere. Unlike
+    /// uncommitted work, `force` must not override this.
+    #[tokio::test]
+    async fn remove_refuses_the_worktree_the_caller_is_standing_in() {
+        let (_tmp, repo, root) = fixture();
+        let wt = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "here".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Drive the containment rule directly: mutating process cwd would race
+        // every other test in this binary.
+        assert!(
+            occupied_by(&wt.path, &wt.path).is_some(),
+            "standing at the worktree root counts as occupying it"
+        );
+        let nested = wt.path.join("nested/deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            occupied_by(&nested, &wt.path).is_some(),
+            "standing below the worktree counts as occupying it"
+        );
+
+        // A sibling worktree and the main checkout are both fine to stand in.
+        let sibling = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "sibling".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            occupied_by(&sibling.path, &wt.path).is_none(),
+            "a sibling worktree does not occupy this one"
+        );
+        assert!(
+            occupied_by(&repo, &wt.path).is_none(),
+            "the main checkout does not occupy a worktree"
+        );
+
+        // And the removal itself still works from outside.
+        remove(&repo, &root, "here", false)
+            .await
+            .expect("removal from outside the tree must succeed");
+    }
+
+    /// The end-to-end half of the guard: `remove` itself must refuse, and
+    /// `force` must not talk it round. Serialized and cwd-restoring, because
+    /// process cwd is global to the whole test binary.
+    #[tokio::test]
+    async fn remove_refuses_self_removal_even_with_force() {
+        // Async-aware, because the guard has to survive the `remove` await.
+        static CWD_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+            std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+        let (_tmp, repo, root) = fixture();
+        let wt = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "occupied".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let _guard = CWD_LOCK.lock().await;
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&wt.path).expect("chdir into the worktree");
+        let err = remove(&repo, &root, "occupied", true).await.unwrap_err();
+        std::env::set_current_dir(&previous).expect("restore cwd");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("running in"),
+            "the refusal must say why: {message}"
+        );
+        assert!(
+            message.contains("change to another directory"),
+            "the refusal must name the next action: {message}"
+        );
+        assert!(
+            wt.path.exists(),
+            "force must not delete the tree the caller is standing in"
         );
     }
 
