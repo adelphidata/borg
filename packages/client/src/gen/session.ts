@@ -386,6 +386,30 @@ export interface ExecShellResponse {
   denied: boolean;
 }
 
+export interface ListPathsRequest {
+  sessionId: string;
+  /**
+   * What the user has typed so far, relative to the session's working
+   * directory. A trailing `/` lists that directory. Empty lists the top level.
+   */
+  prefix: string;
+  /** Most rows wanted. Clamped daemon-side; 0 means the daemon's own ceiling. */
+  limit: number;
+}
+
+export interface PathEntry {
+  /**
+   * Relative to the session's working directory, with a trailing `/` on a
+   * directory — spelled the way the user would type it.
+   */
+  path: string;
+  isDir: boolean;
+}
+
+export interface PathList {
+  paths: PathEntry[];
+}
+
 export interface ForkRequest {
   sessionId: string;
 }
@@ -5879,6 +5903,242 @@ export const ExecShellResponse: MessageFns<ExecShellResponse> = {
   },
 };
 
+function createBaseListPathsRequest(): ListPathsRequest {
+  return { sessionId: "", prefix: "", limit: 0 };
+}
+
+export const ListPathsRequest: MessageFns<ListPathsRequest> = {
+  encode(message: ListPathsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.prefix !== "") {
+      writer.uint32(18).string(message.prefix);
+    }
+    if (message.limit !== 0) {
+      writer.uint32(24).uint32(message.limit);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListPathsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListPathsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.prefix = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.limit = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListPathsRequest {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      prefix: isSet(object.prefix) ? globalThis.String(object.prefix) : "",
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0,
+    };
+  },
+
+  toJSON(message: ListPathsRequest): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.prefix !== "") {
+      obj.prefix = message.prefix;
+    }
+    if (message.limit !== 0) {
+      obj.limit = Math.round(message.limit);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ListPathsRequest>, I>>(base?: I): ListPathsRequest {
+    return ListPathsRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ListPathsRequest>, I>>(object: I): ListPathsRequest {
+    const message = createBaseListPathsRequest();
+    message.sessionId = object.sessionId ?? "";
+    message.prefix = object.prefix ?? "";
+    message.limit = object.limit ?? 0;
+    return message;
+  },
+};
+
+function createBasePathEntry(): PathEntry {
+  return { path: "", isDir: false };
+}
+
+export const PathEntry: MessageFns<PathEntry> = {
+  encode(message: PathEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== "") {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.isDir !== false) {
+      writer.uint32(16).bool(message.isDir);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PathEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePathEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.path = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.isDir = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PathEntry {
+    return {
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      isDir: isSet(object.isDir)
+        ? globalThis.Boolean(object.isDir)
+        : isSet(object.is_dir)
+        ? globalThis.Boolean(object.is_dir)
+        : false,
+    };
+  },
+
+  toJSON(message: PathEntry): unknown {
+    const obj: any = {};
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.isDir !== false) {
+      obj.isDir = message.isDir;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<PathEntry>, I>>(base?: I): PathEntry {
+    return PathEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PathEntry>, I>>(object: I): PathEntry {
+    const message = createBasePathEntry();
+    message.path = object.path ?? "";
+    message.isDir = object.isDir ?? false;
+    return message;
+  },
+};
+
+function createBasePathList(): PathList {
+  return { paths: [] };
+}
+
+export const PathList: MessageFns<PathList> = {
+  encode(message: PathList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.paths) {
+      PathEntry.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PathList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePathList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.paths.push(PathEntry.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PathList {
+    return {
+      paths: globalThis.Array.isArray(object?.paths) ? object.paths.map((e: any) => PathEntry.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: PathList): unknown {
+    const obj: any = {};
+    if (message.paths?.length) {
+      obj.paths = message.paths.map((e) => PathEntry.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<PathList>, I>>(base?: I): PathList {
+    return PathList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<PathList>, I>>(object: I): PathList {
+    const message = createBasePathList();
+    message.paths = object.paths?.map((e) => PathEntry.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseForkRequest(): ForkRequest {
   return { sessionId: "" };
 }
@@ -6255,6 +6515,22 @@ export const SessionDefinition = {
       requestType: ExecShellRequest as typeof ExecShellRequest,
       requestStream: false,
       responseType: ExecShellResponse as typeof ExecShellResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Paths under the session's workspace matching a prefix, for a client that
+     * wants to offer file completions.
+     *
+     * Scoped to the workspace and filtered by `[security] blocked_paths`, the
+     * same rules `fs_read` and `list_dir` answer to. A completion menu that
+     * names a file the agent may not read is a leak with a nice interface.
+     */
+    listPaths: {
+      name: "ListPaths",
+      requestType: ListPathsRequest as typeof ListPathsRequest,
+      requestStream: false,
+      responseType: PathList as typeof PathList,
       responseStream: false,
       options: {},
     },

@@ -209,6 +209,16 @@ pub trait SessionBackend: Send + Sync + 'static {
         Err(anyhow::anyhow!("exec_shell not supported by this backend"))
     }
 
+    /// Workspace paths matching a prefix, for a client offering file
+    /// completions. Default unsupported.
+    async fn list_paths(
+        &self,
+        _prefix: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<cortex::tool_handlers::PathSuggestion>> {
+        Err(anyhow::anyhow!("list_paths not supported by this backend"))
+    }
+
     /// Fork the active agent session at its last message. Daemon owns the
     /// single SQLite writer, so this MUST run here rather than in the client.
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {
@@ -726,6 +736,33 @@ impl SessionBackend for AgentBackend {
             },
             denied,
         })
+    }
+
+    /// Completions come from the agent's own resolved `Config` and
+    /// `ExecutionContext`, so the menu can only ever name what this session's
+    /// `fs_read` would agree to open.
+    async fn list_paths(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<cortex::tool_handlers::PathSuggestion>> {
+        let (ctx, security) = {
+            let agent = self.agent.lock().await;
+            (agent.execution_context(), agent.config().security.clone())
+        };
+        let prefix = prefix.to_string();
+        // A directory read is blocking work, and the agent lock is already
+        // released: nothing here belongs on a runtime worker thread.
+        tokio::task::spawn_blocking(move || {
+            cortex::tool_handlers::complete_paths(
+                &prefix,
+                &ctx,
+                &security.blocked_paths,
+                &security.allowed_paths,
+                limit,
+            )
+        })
+        .await?
     }
 
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {

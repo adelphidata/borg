@@ -38,6 +38,16 @@ vi.mock("./attachments", () => ({
 /** The pill talks to the daemon; this file is about the composer. */
 vi.mock("./ModelPill", () => ({ ModelPill: () => null }));
 
+/**
+ * Path completions come from the daemon, scoped and filtered there. This file
+ * is about what the composer does with the rows it is handed.
+ */
+const workspace = vi.hoisted(() => ({ rows: [] as { path: string; isDir: boolean }[] }));
+vi.mock("./usePathCompletions", () => ({
+  usePathCompletions: (sessionId: string | undefined, prefix: string | null) =>
+    sessionId === undefined || prefix === null ? [] : workspace.rows,
+}));
+
 const noop = () => {};
 
 function setup(props: { draftKey: string; conversationKey: string }) {
@@ -382,5 +392,101 @@ describe("the composer's slash menu", () => {
     expect(run).toHaveBeenCalled();
     expect(screen.getByRole("textbox")).toHaveProperty("value", "/dark");
     expect(screen.getByRole("listbox")).toBeTruthy();
+  });
+});
+
+describe("path references", () => {
+  function type(value: string) {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value } });
+  }
+
+  function withWorkspace() {
+    return render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        sessionId="live-1"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    workspace.rows = [
+      { path: "src/", isDir: true },
+      { path: "safety.md", isDir: false },
+    ];
+  });
+
+  it("offers workspace files once an @ is typed", () => {
+    withWorkspace();
+    type("look at @s");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    expect(screen.getByText("src/")).toBeTruthy();
+  });
+
+  it("stays out of an email address", () => {
+    withWorkspace();
+    // No whitespace before the @, so the menu never opens and the rows the
+    // daemon would have returned are never asked for.
+    type("mail bob@ex");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("offers nothing before a session exists to scope the workspace", () => {
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    type("look at @s");
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("writes the chosen path into the sentence, keeping what follows", () => {
+    withWorkspace();
+    type("look at @s");
+    fireEvent.click(screen.getByText("safety.md"));
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "look at @safety.md ");
+  });
+
+  it("takes a written path away whole, not one directory at a time", () => {
+    withWorkspace();
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    type("read @src/main.rs");
+    box.setSelectionRange(box.value.length, box.value.length);
+
+    fireEvent.keyDown(box, { key: "Backspace" });
+    expect(box).toHaveProperty("value", "read ");
+  });
+
+  it("leaves Backspace alone in ordinary prose", () => {
+    withWorkspace();
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    type("hello world");
+    box.setSelectionRange(box.value.length, box.value.length);
+
+    fireEvent.keyDown(box, { key: "Backspace" });
+    // Not prevented, so the browser deletes the one character it always would.
+    expect(box).toHaveProperty("value", "hello world");
+  });
+
+  it("keeps Escape on the path menu rather than cancelling the turn", () => {
+    const onCancel = vi.fn();
+    render(
+      <Composer
+        busy
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        sessionId="live-1"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={onCancel}
+      />,
+    );
+    type("look at @s");
+    act(() => dispatchKeybind("cancel-turn"));
+
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox")).toBeNull();
   });
 });

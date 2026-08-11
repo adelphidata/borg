@@ -317,6 +317,15 @@ impl SessionHost {
         self.inner.backend.exec_shell(command, timeout_ms).await
     }
 
+    /// Workspace paths matching a prefix, for a client's file completions.
+    pub async fn list_paths(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<cortex::tool_handlers::PathSuggestion>> {
+        self.inner.backend.list_paths(prefix, limit).await
+    }
+
     /// Fork the active agent session at its last message. Forwards to the
     /// backend; daemon-side execution is required because SQLite has a single
     /// writer (the daemon) and the TUI cannot open a writer handle without

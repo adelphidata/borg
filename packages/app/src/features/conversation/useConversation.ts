@@ -285,6 +285,13 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
 export interface Conversation {
   /** Open + state + history, routed through DaemonState by the page. */
   opened: QueryResult<{ title: string; model: string; agentSessionId: string }>;
+  /**
+   * The live daemon session, undefined until it opens. Distinct from
+   * `agentSessionId`, which stays empty on a conversation nobody has sent to
+   * yet — this one exists from the moment the page opens, which is what a
+   * workspace-scoped call such as path completion needs.
+   */
+  sessionId: string | undefined;
   cells: Cell[];
   /** Current todo list, empty when the agent has not published one. */
   plan: PlanStep[];
@@ -560,6 +567,7 @@ export function useConversation(target: string | undefined): Conversation {
 
   return {
     opened,
+    sessionId,
     cells,
     plan,
     busy,

@@ -8,14 +8,18 @@
 //! - [`document`] — Word/PowerPoint/Excel/OpenDocument/RTF/EPUB/PDF →
 //!   Markdown conversion used by `read`.
 //! - [`blocked`] — security blocklist enforcement shared by the others.
+//! - [`completion`] — workspace-scoped prefix completion for client file
+//!   pickers, answering to the same containment and blocklist rules.
 
 mod blocked;
+mod completion;
 mod document;
 mod listing;
 mod patch;
 mod read;
 
 pub use blocked::{is_blocked_path, shell_command_targets_control_plane};
+pub use completion::{complete_paths, PathSuggestion, MAX_PATH_SUGGESTIONS};
 pub use listing::{handle_list_dir, handle_list_dir_with_context};
 pub use patch::{
     handle_apply_patch, handle_apply_patch_unified, handle_apply_patch_unified_with_context,

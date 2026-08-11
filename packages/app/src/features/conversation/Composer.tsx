@@ -14,8 +14,10 @@ import { useCommands } from "../palette/useCommands";
 import { collectImages } from "./attachments";
 import { publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
+import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
 import { slashQuery } from "./slashToken";
 import type { Attachment } from "./useConversation";
+import { usePathCompletions } from "./usePathCompletions";
 
 /** Grows with its content up to a ceiling, then scrolls. */
 const MAX_ROWS_PX = 200;
@@ -28,6 +30,9 @@ const SLASH_RESULT_LIMIT = 8;
 
 /** Ties the textarea's `aria-controls` to the list it drives. */
 const SLASH_LIST_ID = "composer-slash-menu";
+
+/** Same, for the `@` path menu. Only one of the two is ever open. */
+const PATH_LIST_ID = "composer-path-menu";
 
 function useAutoGrow(value: string) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -50,6 +55,12 @@ interface ComposerProps {
    * when a new conversation is issued its id, so attachments survive that.
    */
   conversationKey: string;
+  /**
+   * The live daemon session, whose workspace `@` completions are scoped to.
+   * Undefined before it opens, and the menu simply does not appear — a file
+   * picker with no workspace to pick from has nothing to offer.
+   */
+  sessionId?: string;
   onSend: (text: string, attachments: Attachment[]) => void;
   onSteer: (text: string) => void;
   onCancel: () => void;
@@ -67,6 +78,7 @@ export function Composer({
   busy,
   draftKey,
   conversationKey,
+  sessionId,
   onSend,
   onSteer,
   onCancel,
@@ -166,18 +178,55 @@ export function Composer({
     setSlashCursor((c) => Math.min(c, Math.max(0, slashResults.length - 1)));
   }, [slashResults.length]);
 
-  // One handler decides who owns Escape, rather than two registrations racing
+  // `@` names a file. Unlike `/` it has to work mid-sentence, so it needs to
+  // know where the caret is — the token being completed is the one the caret
+  // sits in, not the last one in the box.
+  const [caret, setCaret] = useState(0);
+  const syncCaret = () => setCaret(textarea.current?.selectionStart ?? 0);
+  const [pathDismissed, setPathDismissed] = useState(false);
+  const [pathCursor, setPathCursor] = useState(0);
+  // A conversation with no session open yet has no workspace to scope to.
+  const at = sessionId === undefined ? null : pathToken(draft, caret);
+  const pathOpen = at !== null && !pathDismissed;
+  const pathRows = usePathCompletions(sessionId, pathOpen ? at.query : null);
+
+  useEffect(() => {
+    if (at === null) setPathDismissed(false);
+    setPathCursor(0);
+  }, [at?.query, at === null]);
+
+  useEffect(() => {
+    setPathCursor((c) => Math.min(c, Math.max(0, pathRows.length - 1)));
+  }, [pathRows.length]);
+
+  // One handler decides who owns Escape, rather than three registrations racing
   // for the top of the stack: `useKeybind` re-registers whenever `enabled`
-  // flips, so a turn that starts *after* the menu opened would otherwise take
+  // flips, so a turn that starts *after* a menu opened would otherwise take
   // Escape back and cancel while the menu stayed on screen.
   useKeybind(
     "cancel-turn",
     () => {
-      if (slashOpen) setSlashDismissed(true);
+      if (pathOpen) setPathDismissed(true);
+      else if (slashOpen) setSlashDismissed(true);
       else onCancel();
     },
-    { enabled: busy || slashOpen, inInputs: true },
+    { enabled: busy || slashOpen || pathOpen, inInputs: true },
   );
+
+  /** Writes the chosen path over the token that asked for it. */
+  const choosePath = (index: number) => {
+    const row = pathRows[index];
+    if (!row || at === null) return;
+    const next = replacePathToken(draft, at.start, caret, row.path);
+    setDraft(next.text);
+    setCaret(next.caret);
+    // React does not move the caret for us, and leaving it at the end of the
+    // box would put the next character after text the user has not looked at.
+    requestAnimationFrame(() => {
+      textarea.current?.focus();
+      textarea.current?.setSelectionRange(next.caret, next.caret);
+    });
+  };
 
   const runCommand = (index: number) => {
     const command = slashResults[index];
@@ -224,6 +273,13 @@ export function Composer({
   };
 
   const submit = () => {
+    // A path on offer is the thing being asked for, so Enter writes it. The
+    // token itself is ordinary text either way, so nothing is lost by sending
+    // it — it just would not be the path the user was half-way through naming.
+    if (pathOpen && pathRows.length > 0) {
+      choosePath(pathCursor);
+      return;
+    }
     // While a row is on offer the token is a menu query, not prompt text: the
     // daemon has no slash handler, so sending it would look like it worked and
     // do nothing. With nothing on offer it is just text — otherwise `/tmp` and
@@ -250,13 +306,39 @@ export function Composer({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // While the menu is open the arrows belong to it, not to the caret or to
+    // While a menu is open the arrows belong to it, not to the caret or to
     // history recall.
-    if (slashOpen && slashResults.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-      e.preventDefault();
-      const last = Math.max(0, slashResults.length - 1);
-      setSlashCursor((c) => Math.max(0, Math.min(last, e.key === "ArrowDown" ? c + 1 : c - 1)));
-      return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      if (pathOpen && pathRows.length > 0) {
+        e.preventDefault();
+        const last = pathRows.length - 1;
+        setPathCursor((c) => Math.max(0, Math.min(last, c + step)));
+        return;
+      }
+      if (slashOpen && slashResults.length > 0) {
+        e.preventDefault();
+        const last = slashResults.length - 1;
+        setSlashCursor((c) => Math.max(0, Math.min(last, c + step)));
+        return;
+      }
+    }
+    // A written path is one thing, so Backspace takes it away as one thing —
+    // unpicking `@crates/cortex/src/agent` a character at a time is nobody's
+    // idea of editing.
+    if (e.key === "Backspace" && !e.shiftKey) {
+      const el = e.currentTarget;
+      const whole =
+        el.selectionStart === el.selectionEnd
+          ? backspacePathToken(draft, el.selectionStart)
+          : null;
+      if (whole) {
+        e.preventDefault();
+        setDraft(whole.text);
+        setCaret(whole.caret);
+        requestAnimationFrame(() => el.setSelectionRange(whole.caret, whole.caret));
+        return;
+      }
     }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
@@ -307,6 +389,21 @@ export function Composer({
             out, taking the row's own feedback with it. */}
         {saveError && (
           <div className="mb-2 px-1 text-[11.5px] leading-[1.5] text-alert">{saveError}</div>
+        )}
+
+        {pathOpen && pathRows.length > 0 && (
+          <CompletionList
+            id={PATH_LIST_ID}
+            label="Files"
+            rows={pathRows.map((row) => ({
+              id: row.path,
+              label: row.path,
+              hint: row.isDir ? "Folder" : undefined,
+            }))}
+            cursor={pathCursor}
+            onHover={setPathCursor}
+            onChoose={choosePath}
+          />
         )}
 
         {slashOpen && (
@@ -365,15 +462,29 @@ export function Composer({
             // Focus never leaves the box, so the row Enter would take is only
             // announced if the box names it. No `role="combobox"`: that would
             // replace the textarea's own role, and it is a text box first.
-            aria-expanded={slashOpen}
-            aria-controls={slashOpen ? SLASH_LIST_ID : undefined}
+            aria-expanded={slashOpen || (pathOpen && pathRows.length > 0)}
+            aria-controls={
+              pathOpen && pathRows.length > 0
+                ? PATH_LIST_ID
+                : slashOpen
+                  ? SLASH_LIST_ID
+                  : undefined
+            }
             aria-activedescendant={
-              slashOpen && slashResults.length > 0
-                ? rowDomId(SLASH_LIST_ID, slashCursor)
-                : undefined
+              pathOpen && pathRows.length > 0
+                ? rowDomId(PATH_LIST_ID, pathCursor)
+                : slashOpen && slashResults.length > 0
+                  ? rowDomId(SLASH_LIST_ID, slashCursor)
+                  : undefined
             }
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setCaret(e.target.selectionStart ?? e.target.value.length);
+            }}
+            onKeyUp={syncCaret}
+            onClick={syncCaret}
+            onSelect={syncCaret}
             onKeyDown={onKeyDown}
             onPaste={(e) => {
               const files = Array.from(e.clipboardData.files);

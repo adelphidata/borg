@@ -69,6 +69,14 @@ service Session {
   // inherits it by construction rather than by duplicating it client-side.
   // The result is appended to session history so the next turn has it.
   rpc ExecShell(ExecShellRequest) returns (ExecShellResponse);
+
+  // Paths under the session's workspace matching a prefix, for a client that
+  // wants to offer file completions.
+  //
+  // Scoped to the workspace and filtered by `[security] blocked_paths`, the
+  // same rules `fs_read` and `list_dir` answer to. A completion menu that
+  // names a file the agent may not read is a leak with a nice interface.
+  rpc ListPaths(ListPathsRequest) returns (PathList);
 }
 
 message Empty {}
@@ -352,6 +360,24 @@ message ExecShellResponse {
   // True when the command was refused by policy rather than executed.
   bool denied = 3;
 }
+
+message ListPathsRequest {
+  string session_id = 1;
+  // What the user has typed so far, relative to the session's working
+  // directory. A trailing `/` lists that directory. Empty lists the top level.
+  string prefix = 2;
+  // Most rows wanted. Clamped daemon-side; 0 means the daemon's own ceiling.
+  uint32 limit = 3;
+}
+
+message PathEntry {
+  // Relative to the session's working directory, with a trailing `/` on a
+  // directory — spelled the way the user would type it.
+  string path = 1;
+  bool is_dir = 2;
+}
+
+message PathList { repeated PathEntry paths = 1; }
 
 message ForkRequest { string session_id = 1; }
 message ForkResponse {

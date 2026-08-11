@@ -27,6 +27,7 @@ export function ConversationPage() {
   const [activityOpen, setActivityOpen] = useState(false);
   const {
     opened,
+    sessionId: liveSessionId,
     cells,
     plan,
     busy,
@@ -257,6 +258,7 @@ export function ConversationPage() {
         busy={busy}
         draftKey={draftKey}
         conversationKey={target ?? "latest"}
+        sessionId={liveSessionId}
         onSend={send}
         onSteer={steer}
         onCancel={cancel}

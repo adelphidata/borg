@@ -16,7 +16,8 @@ use protocols::session::{
     AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
     CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ExecShellRequest,
     ExecShellResponse, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PromptResponse,
+    ListPathsRequest, NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PathEntry,
+    PathList, PromptResponse,
     RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
     StreamRequest, UndoRequest, UndoResponse,
 };
@@ -726,6 +727,43 @@ impl Session for SessionSvc {
             output: outcome.output,
             exit_code: outcome.exit_code,
             denied: outcome.denied,
+        }))
+    }
+
+    async fn list_paths(
+        &self,
+        req: Request<ListPathsRequest>,
+    ) -> Result<Response<PathList>, TStatus> {
+        let req = req.into_inner();
+        // A prefix past this is not something anyone typed into a composer.
+        const MAX_PREFIX_BYTES: usize = 4096;
+        if req.prefix.len() > MAX_PREFIX_BYTES {
+            return Err(TStatus::invalid_argument(format!(
+                "prefix is {} bytes; cap is {MAX_PREFIX_BYTES}",
+                req.prefix.len()
+            )));
+        }
+        // Workspace containment and the blocklist are enforced in the backend,
+        // against the session's own resolved `Config` — the same reason
+        // `exec_shell` gates there and not here.
+        let host = self.host_or_err(&req.session_id)?;
+        let limit = if req.limit == 0 {
+            cortex::tool_handlers::MAX_PATH_SUGGESTIONS
+        } else {
+            req.limit as usize
+        };
+        let paths = host
+            .list_paths(&req.prefix, limit)
+            .await
+            .map_err(|e| TStatus::internal(format!("list_paths: {e}")))?;
+        Ok(Response::new(PathList {
+            paths: paths
+                .into_iter()
+                .map(|p| PathEntry {
+                    path: p.path,
+                    is_dir: p.is_dir,
+                })
+                .collect(),
         }))
     }
 
