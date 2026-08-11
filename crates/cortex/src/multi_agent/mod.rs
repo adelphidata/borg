@@ -431,6 +431,14 @@ struct SubAgentHandle {
     pub _join_handle: JoinHandle<()>,
 }
 
+/// How long a finished child's in-memory handle survives before it is reaped.
+///
+/// Five minutes is well past any realistic spawn → wait gap while still
+/// bounding a long-lived `borgd`, where every child ever started would
+/// otherwise stay resident for the life of the process. Deliberately a
+/// constant, not a setting: no user outcome depends on the exact value.
+const TERMINAL_AGENT_RETENTION_SECS: i64 = 300;
+
 /// Shared controller for managing sub-agents from a parent agent.
 pub struct AgentControl {
     agents: HashMap<String, SubAgentHandle>,
@@ -797,6 +805,10 @@ impl AgentControl {
         tools_blocklist: Option<&[&str]>,
     ) -> Result<(String, String)> {
         self.validate_spawn_limits()?;
+        // Sweep on mutation rather than from a background task: the map only
+        // grows when something is spawned, so the growth path is also the
+        // right place to bound it, and no extra task needs supervising.
+        self.reap_finished_agents();
 
         let agent_id = uuid::Uuid::new_v4().to_string();
         let chosen_nickname = match nickname {
@@ -1105,15 +1117,7 @@ impl AgentControl {
             match tokio::time::timeout(remaining, self.completion_rx.recv()).await {
                 Ok(Some(completion)) => {
                     let completed_id = completion.agent_id.clone();
-                    // Update internal state. Persist files_written into
-                    // metrics.files_touched so the early-return path on
-                    // a second wait_for_agent call (or list_agents /
-                    // get_status / DB query) sees the correct list —
-                    // otherwise the next caller would read an empty Vec.
-                    if let Some(handle) = self.agents.get_mut(&completed_id) {
-                        handle.info.status = completion.status.clone();
-                        handle.info.metrics.files_touched = completion.files_written.clone();
-                    }
+                    self.record_completion(&completion);
                     if completed_id == agent_id {
                         return Ok(completion);
                     }
@@ -1202,13 +1206,57 @@ impl AgentControl {
         // it did not ask for here, and they predate anything still in the channel.
         let mut completions: Vec<SubAgentCompletion> = self.completion_buffer.drain(..).collect();
         while let Ok(completion) = self.completion_rx.try_recv() {
-            if let Some(handle) = self.agents.get_mut(&completion.agent_id) {
-                handle.info.status = completion.status.clone();
-                handle.info.metrics.files_touched = completion.files_written.clone();
-            }
+            self.record_completion(&completion);
             completions.push(completion);
         }
         completions
+    }
+
+    /// Fold a completion into the handle it belongs to.
+    ///
+    /// Shared by [`Self::drain_completions`] and [`Self::wait_for_agent`] so
+    /// the two arrival paths cannot disagree about what a finished child
+    /// looks like — in particular `ended_at`, which is the reaper's clock.
+    fn record_completion(&mut self, completion: &SubAgentCompletion) {
+        if let Some(handle) = self.agents.get_mut(&completion.agent_id) {
+            handle.info.status = completion.status.clone();
+            // Persist files_written into metrics.files_touched so the
+            // early-return path on a second `wait_for_agent` call (or
+            // list_agents / get_status / DB query) sees the correct list —
+            // otherwise the next caller would read an empty Vec.
+            handle.info.metrics.files_touched = completion.files_written.clone();
+            if handle.info.status.is_terminal() && handle.info.ended_at.is_none() {
+                handle.info.ended_at = Some(chrono::Utc::now().timestamp());
+            }
+        }
+    }
+
+    /// Drop handles for children that finished longer ago than
+    /// [`TERMINAL_AGENT_RETENTION_SECS`].
+    ///
+    /// A grace period rather than an eager purge: `wait_for_agent` answers
+    /// from the cached handle when a child is already terminal, so removing
+    /// the entry the moment it finishes would turn a legitimate
+    /// spawn-then-wait into "agent not found". The database row remains the
+    /// durable record either way, so nothing is lost when the handle goes.
+    fn reap_finished_agents(&mut self) {
+        self.reap_finished_agents_at(chrono::Utc::now().timestamp());
+    }
+
+    /// [`Self::reap_finished_agents`] with an explicit clock, so tests can age
+    /// an entry past the window without sleeping.
+    fn reap_finished_agents_at(&mut self, now: i64) {
+        self.agents.retain(|_, handle| {
+            if !handle.info.status.is_terminal() {
+                return true;
+            }
+            // A terminal handle with no `ended_at` has not been through a
+            // completion path yet; keep it rather than guess its age.
+            let Some(ended_at) = handle.info.ended_at else {
+                return true;
+            };
+            now.saturating_sub(ended_at) < TERMINAL_AGENT_RETENTION_SECS
+        });
     }
 
     /// Shut down all sub-agents.
@@ -2969,6 +3017,111 @@ mod sub_agent_surface_tests {
                 .expect("ledger lock")
                 .is_empty(),
             "a rejected send must not leave the message on the ledger"
+        );
+    }
+
+    fn reaper_ctrl() -> AgentControl {
+        AgentControl::new(&MultiAgentConfig::default(), "root-session", 0)
+    }
+
+    fn completion_for(agent_id: &str, result: &str) -> SubAgentCompletion {
+        SubAgentCompletion {
+            agent_id: agent_id.to_string(),
+            nickname: "alpha".to_string(),
+            status: SubAgentStatus::Completed {
+                result: result.to_string(),
+            },
+            final_response: Some(result.to_string()),
+            files_written: Vec::new(),
+            undelivered_input: Vec::new(),
+        }
+    }
+
+    // Async only because the mock handle allocates a channel that needs a
+    // reactor; the reaping itself is synchronous.
+    #[tokio::test]
+    async fn recording_a_completion_stamps_the_end_time_the_reaper_reads() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+        assert!(c.get_status("a").unwrap().ended_at.is_none());
+
+        c.record_completion(&completion_for("a", "done"));
+
+        assert!(
+            c.get_status("a").unwrap().ended_at.is_some(),
+            "without an end time the handle can never age out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_child_stays_waitable_inside_the_retention_window() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+        let handle = c.agents.get_mut("a").unwrap();
+        handle.info.status = SubAgentStatus::Completed {
+            result: "done".to_string(),
+        };
+        handle.info.ended_at = Some(1_000);
+
+        c.reap_finished_agents_at(1_000 + TERMINAL_AGENT_RETENTION_SECS - 1);
+
+        let completion = c
+            .wait_for_agent("a", 1)
+            .await
+            .expect("a parent that waits just after completion must still find the result");
+        assert_eq!(completion.final_response.as_deref(), Some("done"));
+    }
+
+    // Async only because the mock handle allocates a channel that needs a
+    // reactor; the reaping itself is synchronous.
+    #[tokio::test]
+    async fn a_finished_child_is_dropped_once_the_window_passes() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+        c.insert_mock_handle("b", "bravo");
+        for (id, ended_at) in [("a", 1_000), ("b", 1_000)] {
+            let handle = c.agents.get_mut(id).unwrap();
+            handle.info.status = SubAgentStatus::Shutdown;
+            handle.info.ended_at = Some(ended_at);
+        }
+
+        c.reap_finished_agents_at(1_000 + TERMINAL_AGENT_RETENTION_SECS);
+
+        assert!(
+            c.is_empty(),
+            "a long-lived daemon must not keep every child it ever spawned"
+        );
+    }
+
+    // Async only because the mock handle allocates a channel that needs a
+    // reactor; the reaping itself is synchronous.
+    #[tokio::test]
+    async fn a_live_child_is_never_reaped() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+
+        // An arbitrarily distant clock: age is irrelevant while the child runs.
+        c.reap_finished_agents_at(i64::MAX);
+
+        assert!(
+            c.get_status("a").is_some(),
+            "reaping a running child would orphan work in flight"
+        );
+    }
+
+    // Async only because the mock handle allocates a channel that needs a
+    // reactor; the reaping itself is synchronous.
+    #[tokio::test]
+    async fn a_terminal_child_with_no_recorded_end_time_is_kept() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+        c.agents.get_mut("a").unwrap().info.status = SubAgentStatus::Shutdown;
+
+        c.reap_finished_agents_at(i64::MAX);
+
+        assert!(
+            c.get_status("a").is_some(),
+            "an unstamped handle has an unknown age; guessing it is old loses results"
         );
     }
 }
