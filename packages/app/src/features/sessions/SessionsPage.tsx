@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
+  Menu,
   PageChrome,
   SECTION_LABEL_TEXT,
   PlusIcon,
@@ -12,7 +13,7 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useKeybind } from "../../lib/keybinds";
-import { SessionRowMenu } from "./SessionRowMenu";
+import { SessionRowMenu, sessionRowActions, useMenuEscape } from "./SessionRowMenu";
 import { useSessions, type SessionRow } from "./useSessions";
 
 function Row({
@@ -30,6 +31,15 @@ function Row({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(session.title);
+  /** Where a right-click opened the menu; absent while it is closed. */
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number }>();
+
+  const rename = () => {
+    setDraft(session.title);
+    setEditing(true);
+  };
+  const actions = sessionRowActions({ onRename: rename, onArchive, onExport });
+  useMenuEscape(menuAt !== undefined, () => setMenuAt(undefined));
 
   const commit = () => {
     const title = draft.trim();
@@ -70,6 +80,12 @@ function Row({
           onOpen();
         }
       }}
+      // The gesture most people reach for on a list row. Same actions as the
+      // kebab — a second door, not a second set of choices.
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setMenuAt({ x: e.clientX, y: e.clientY });
+      }}
       className="group flex cursor-pointer items-center gap-2 rounded-[9px] px-3 py-2.5 hover:bg-surface3"
     >
       {/* "Working" is already spelled out in the line below, so labelling the
@@ -89,13 +105,13 @@ function Row({
             : `${session.messageCount} message${session.messageCount === 1 ? "" : "s"}`}
         </div>
       </div>
-      <SessionRowMenu
-        onRename={() => {
-          setDraft(session.title);
-          setEditing(true);
-        }}
-        onArchive={onArchive}
-        onExport={onExport}
+      <SessionRowMenu onRename={rename} onArchive={onArchive} onExport={onExport} />
+      <Menu
+        open={menuAt !== undefined}
+        onClose={() => setMenuAt(undefined)}
+        label="Conversation actions"
+        actions={actions}
+        at={menuAt}
       />
     </div>
   );

@@ -19,6 +19,7 @@ export { PageChrome } from "./components/PageChrome";
 export { Pill } from "./components/Pill";
 export { StatusDot, type DotTone } from "./components/StatusDot";
 export { Meter } from "./components/Meter";
+export { Menu, clampToViewport, type MenuAction, type MenuProps } from "./components/Menu";
 export {
   AgentsIcon,
   ArchiveIcon,

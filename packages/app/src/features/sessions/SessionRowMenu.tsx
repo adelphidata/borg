@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { ArchiveIcon, MoreIcon, PencilIcon } from "@borg/ui";
+import { useState } from "react";
+import { ArchiveIcon, Menu, MoreIcon, PencilIcon, type MenuAction } from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
 
 export interface SessionRowMenuProps {
@@ -8,36 +8,42 @@ export interface SessionRowMenuProps {
   onExport: (format: string) => void;
 }
 
-const ITEM =
-  "flex w-full cursor-pointer items-center gap-2 border-0 bg-transparent px-3 py-[7px] text-left text-[12.5px] leading-none text-ink2 hover:bg-surface3 hover:text-ink";
+/** Builds the row's actions once, so the kebab and right-click can never differ. */
+export function sessionRowActions({
+  onRename,
+  onArchive,
+  onExport,
+}: SessionRowMenuProps): MenuAction[] {
+  return [
+    { id: "rename", label: "Rename", icon: <PencilIcon size={13} />, onSelect: onRename },
+    { id: "export", label: "Export…", onSelect: () => onExport("md") },
+    {
+      id: "archive",
+      label: "Archive",
+      icon: <ArchiveIcon size={13} />,
+      onSelect: onArchive,
+      dividerBefore: true,
+    },
+  ];
+}
+
+/**
+ * Escape closes an open menu, through the registry rather than a raw listener:
+ * the registry is stacked, so the menu takes Escape and hands it back on close.
+ * A bare listener would close the menu *and* let the composer's cancel through,
+ * killing a running turn with the same keypress.
+ */
+export function useMenuEscape(open: boolean, close: () => void) {
+  useKeybind("cancel-turn", close, { enabled: open, inInputs: true });
+}
 
 /** The per-row overflow menu. Closes on outside click and on Escape. */
-export function SessionRowMenu({ onRename, onArchive, onExport }: SessionRowMenuProps) {
+export function SessionRowMenu(props: SessionRowMenuProps) {
   const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (e: PointerEvent) => {
-      if (!root.current?.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open]);
-
-  // Through the registry rather than a raw listener: the registry is stacked,
-  // so an open menu takes Escape and hands it back on close. A bare listener
-  // would close the menu *and* let the composer's cancel through, killing a
-  // running turn with the same keypress.
-  useKeybind("cancel-turn", () => setOpen(false), { enabled: open, inInputs: true });
-
-  const choose = (action: () => void) => () => {
-    setOpen(false);
-    action();
-  };
+  useMenuEscape(open, () => setOpen(false));
 
   return (
-    <div ref={root} className="relative flex-none">
+    <div className="relative flex-none">
       <button
         type="button"
         aria-label="Conversation actions"
@@ -51,23 +57,12 @@ export function SessionRowMenu({ onRename, onArchive, onExport }: SessionRowMenu
       >
         <MoreIcon size={14} />
       </button>
-      {open && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute top-7 right-0 z-20 w-[150px] overflow-hidden rounded-[9px] border border-line bg-surface2 py-1 shadow-(--frameShadow)"
-        >
-          <button type="button" className={ITEM} onClick={choose(onRename)}>
-            <PencilIcon size={13} /> Rename
-          </button>
-          <button type="button" className={ITEM} onClick={choose(() => onExport("md"))}>
-            <span className="w-[13px]" /> Export…
-          </button>
-          <div className="my-1 h-px bg-line2" />
-          <button type="button" className={ITEM} onClick={choose(onArchive)}>
-            <ArchiveIcon size={13} /> Archive
-          </button>
-        </div>
-      )}
+      <Menu
+        open={open}
+        onClose={() => setOpen(false)}
+        label="Conversation actions"
+        actions={sessionRowActions(props)}
+      />
     </div>
   );
 }

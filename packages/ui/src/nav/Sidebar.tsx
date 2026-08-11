@@ -13,6 +13,11 @@ export interface SidebarProps {
   /** Archives one recent conversation, removing it from the list. */
   onArchiveRecent: (id: string) => void;
   /**
+   * Right-click on a recent row, with the pointer position. The app renders the
+   * menu itself; omit and right-click falls through to the browser's own.
+   */
+  onRecentContextMenu?: (id: string, at: { x: number; y: number }) => void;
+  /**
    * Why the last archive failed, if it did. Rendered under the list — a × that
    * silently does nothing reads as a broken button.
    */
@@ -82,15 +87,27 @@ function RecentRow({
   item,
   onOpen,
   onArchive,
+  onContextMenu,
 }: {
   item: RecentItem;
   onOpen: () => void;
   onArchive: () => void;
+  onContextMenu?: (at: { x: number; y: number }) => void;
 }) {
   return (
     <div
       className="group flex cursor-pointer items-center gap-1 rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
       onClick={onOpen}
+      // Right-click reaches the same action the hover × does. The menu itself
+      // belongs to the app, which owns both the archive call and the stacked
+      // Escape handling this package cannot see.
+      onContextMenu={
+        onContextMenu &&
+        ((e) => {
+          e.preventDefault();
+          onContextMenu({ x: e.clientX, y: e.clientY });
+        })
+      }
     >
       {item.activity && (
         <StatusDot
@@ -124,6 +141,7 @@ export function Sidebar({
   recents,
   onOpenRecent,
   onArchiveRecent,
+  onRecentContextMenu,
   archiveError,
   onNewConversation,
   onSeeAllConversations,
@@ -162,6 +180,7 @@ export function Sidebar({
             item={r}
             onOpen={() => onOpenRecent(r.id)}
             onArchive={() => onArchiveRecent(r.id)}
+            onContextMenu={onRecentContextMenu && ((at) => onRecentContextMenu(r.id, at))}
           />
         ))}
       </div>

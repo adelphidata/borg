@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
+import { ArchiveIcon, Menu, Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { ConversationPage } from "./features/conversation/ConversationPage";
@@ -14,6 +14,7 @@ import {
   sessionActivity,
   subscribeActivity,
 } from "./features/sessions/activityStore";
+import { useMenuEscape } from "./features/sessions/SessionRowMenu";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { UpdatePill } from "./components/UpdatePill";
@@ -89,6 +90,12 @@ function Shell({ platform }: { platform: Platform }) {
     },
   );
 
+  // Right-click on a sidebar row. The menu lives here rather than in the
+  // sidebar because it needs the archive call and the stacked Escape registry,
+  // neither of which the design-system package can see.
+  const [recentMenu, setRecentMenu] = useState<{ id: string; at: { x: number; y: number } }>();
+  useMenuEscape(recentMenu !== undefined, () => setRecentMenu(undefined));
+
   // Attention dots: doctor warnings light Health, pending pairings light
   // Connections. Unreachable daemon lights nothing — the pages say it better.
   const alerts = useQuery(
@@ -126,12 +133,32 @@ function Shell({ platform }: { platform: Platform }) {
             recents={recents}
             onOpenRecent={(id) => navigate(`/c/${id}`)}
             onArchiveRecent={(id) => void archiveSession.run(id)}
+            onRecentContextMenu={(id, at) => setRecentMenu({ id, at })}
             archiveError={archiveSession.error?.message}
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
             user={user}
           />
         )}
+        <Menu
+          open={recentMenu !== undefined}
+          onClose={() => setRecentMenu(undefined)}
+          label="Conversation actions"
+          at={recentMenu?.at}
+          // The sidebar row offers archiving and nothing else, so the menu
+          // offers exactly that. Right-click should reach what the row can do,
+          // not advertise capability it does not have here.
+          actions={[
+            {
+              id: "archive",
+              label: "Archive",
+              icon: <ArchiveIcon size={13} />,
+              onSelect: () => {
+                if (recentMenu) void archiveSession.run(recentMenu.id);
+              },
+            },
+          ]}
+        />
         <Routes>
           {routes.map((r) => (
             <Route key={r.id} path={r.path} element={<r.page />} />
