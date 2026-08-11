@@ -416,6 +416,49 @@ pub struct Tui {
     /// True when running inside tmux. tmux DECSTBM behavior is inconsistent
     /// across versions; treat it the same as Zellij for safety.
     is_tmux: bool,
+    /// Last known terminal size, so an ordinary frame costs no ioctl.
+    ///
+    /// The size is queried at least twice per draw and cannot change without
+    /// one of the events below, so the query was pure overhead on every frame
+    /// of every stream. Correctness rests on invalidating it at each point the
+    /// terminal can change behind us: a resize event, a Ctrl+Z/`fg` bounce,
+    /// and an external program that owned the screen. `Cell` rather than a
+    /// `&mut self` signature because reading the size is conceptually a query
+    /// and every call site holds `&self`.
+    cached_size: SizeCache,
+}
+
+/// One-slot cache for the terminal's dimensions.
+///
+/// Split from [`Tui`] because `Tui` is bound to a live `CrosstermBackend`,
+/// which no unit test can construct — the caching rule is the part that must
+/// not regress, so it lives where it can be tested.
+#[derive(Debug, Default)]
+pub struct SizeCache(std::cell::Cell<Option<Size>>);
+
+impl SizeCache {
+    /// Return the cached size, or compute and store one with `query`.
+    fn get_or_query<E>(
+        &self,
+        query: impl FnOnce() -> std::result::Result<Size, E>,
+    ) -> std::result::Result<Size, E> {
+        if let Some(size) = self.0.get() {
+            return Ok(size);
+        }
+        let size = query()?;
+        self.0.set(Some(size));
+        Ok(size)
+    }
+
+    /// Store a size known from a resize event, with no query.
+    fn set(&self, size: Size) {
+        self.0.set(Some(size));
+    }
+
+    /// Drop the stored size so the next read queries again.
+    fn invalidate(&self) {
+        self.0.set(None);
+    }
 }
 
 impl Tui {
@@ -431,6 +474,7 @@ impl Tui {
             alt_screen_enabled,
             is_zellij,
             is_tmux,
+            cached_size: SizeCache::default(),
         })
     }
 
@@ -443,8 +487,30 @@ impl Tui {
         self.is_zellij || self.is_tmux
     }
 
+    /// The current terminal size, served from the cache when one is warm.
+    ///
+    /// A miss queries the backend and warms the cache. Every path that can
+    /// change the real size calls [`Self::note_resize`] or
+    /// [`Self::invalidate_size_cache`] first, so a hit is always current.
     pub fn terminal_size(&self) -> Result<Size> {
-        self.terminal.size()
+        self.cached_size.get_or_query(|| self.terminal.size())
+    }
+
+    /// Adopt the dimensions carried by a terminal resize event.
+    ///
+    /// The event is the authoritative notification, so the new size is taken
+    /// from it rather than triggering another query.
+    pub fn note_resize(&self, width: u16, height: u16) {
+        self.cached_size.set(Size { width, height });
+    }
+
+    /// Forget the cached size, so the next read queries the terminal.
+    ///
+    /// Needed wherever something other than Borg owned the screen — a
+    /// Ctrl+Z/`fg` bounce or an external program — because a resize during
+    /// that window produces no event we ever see.
+    pub fn invalidate_size_cache(&self) {
+        self.cached_size.invalidate();
     }
 
     /// Buffer `lines` to be flushed above the viewport on the next [`Tui::draw`].
@@ -500,6 +566,9 @@ impl Tui {
         // flush) forces a full repaint. Mirrors the `terminal.clear()` call
         // in `enter_alt_screen`.
         self.terminal.invalidate_viewport();
+        // An alt-screen surface runs its own event loop, so a resize while it
+        // was up was consumed there and never reached the main loop's cache.
+        self.invalidate_size_cache();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -991,6 +1060,118 @@ mod tests {
         assert_ne!(
             alt_viewport.height, inline_height,
             "alt-screen popups must not be clipped to the inline viewport height"
+        );
+    }
+
+    /// Counts how many times the backend was actually asked for its size.
+    struct CountingProbe {
+        size: std::cell::Cell<Size>,
+        queries: std::cell::Cell<usize>,
+    }
+
+    impl CountingProbe {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                size: std::cell::Cell::new(Size { width, height }),
+                queries: std::cell::Cell::new(0),
+            }
+        }
+
+        fn query(&self) -> std::result::Result<Size, std::convert::Infallible> {
+            self.queries.set(self.queries.get() + 1);
+            Ok(self.size.get())
+        }
+    }
+
+    #[test]
+    fn repeated_reads_query_the_terminal_once() {
+        // The size is read at least twice per frame; before the cache that was
+        // an ioctl per read, on every frame of every stream.
+        let probe = CountingProbe::new(120, 40);
+        let cache = SizeCache::default();
+
+        for _ in 0..10 {
+            assert_eq!(
+                cache.get_or_query(|| probe.query()).unwrap(),
+                Size {
+                    width: 120,
+                    height: 40
+                }
+            );
+        }
+
+        assert_eq!(probe.queries.get(), 1, "ordinary frames must not re-query");
+    }
+
+    #[test]
+    fn a_resize_event_updates_the_size_without_a_query() {
+        // The event carries the new geometry, so asking the terminal again
+        // would be a second round trip for an answer we already have.
+        let probe = CountingProbe::new(120, 40);
+        let cache = SizeCache::default();
+        cache.get_or_query(|| probe.query()).unwrap();
+
+        cache.set(Size {
+            width: 80,
+            height: 24,
+        });
+
+        assert_eq!(
+            cache.get_or_query(|| probe.query()).unwrap(),
+            Size {
+                width: 80,
+                height: 24
+            }
+        );
+        assert_eq!(probe.queries.get(), 1, "the event is the answer");
+    }
+
+    #[test]
+    fn invalidating_forces_the_next_read_to_ask_the_terminal() {
+        // A Ctrl+Z bounce or an external program can be resized while Borg is
+        // not reading events, so there is no notification to adopt — the only
+        // safe move is to ask again.
+        let probe = CountingProbe::new(120, 40);
+        let cache = SizeCache::default();
+        cache.get_or_query(|| probe.query()).unwrap();
+
+        probe.size.set(Size {
+            width: 200,
+            height: 60,
+        });
+        cache.invalidate();
+
+        assert_eq!(
+            cache.get_or_query(|| probe.query()).unwrap(),
+            Size {
+                width: 200,
+                height: 60
+            },
+            "a stale size after a resume would misplace the whole viewport"
+        );
+        assert_eq!(probe.queries.get(), 2);
+    }
+
+    /// Source guard: every path that hands the screen to something else must
+    /// drop the cached geometry. A resize during those windows produces no
+    /// event, so a missing invalidation is a silently wrong viewport — and it
+    /// is invisible in a unit test of the cache itself.
+    #[test]
+    fn every_screen_handover_invalidates_the_size_cache() {
+        let loop_src = include_str!("mod.rs");
+        for context in ["AppAction::Suspend", "LaunchExternalEditor"] {
+            let start = loop_src
+                .find(context)
+                .unwrap_or_else(|| panic!("{context} arm present"));
+            let window = &loop_src[start..loop_src.len().min(start + 3000)];
+            assert!(
+                window.contains("invalidate_size_cache"),
+                "{context} hands the screen to another program; it must drop the cached size"
+            );
+        }
+        assert!(
+            include_str!("tui_lifecycle.rs").contains("self.invalidate_size_cache()"),
+            "leave_alt_screen must drop the cached size"
         );
     }
 }

@@ -892,7 +892,13 @@ async fn run_event_loop(
                     // xterm ?1007h so wheel events arrive as Up/Down keys.
                     // DO NOT re-introduce a mouse handler — it would require
                     // ?1000h/?1002h/?1003h, all of which break text selection.
-                    Some(Ok(Event::Resize(_, _))) => AppAction::Continue,
+                    // The event carries the new geometry, and it is the only
+                    // notification we get — `draw_viewport` reads the cache
+                    // rather than re-querying the terminal every frame.
+                    Some(Ok(Event::Resize(width, height))) => {
+                        tui.note_resize(width, height);
+                        AppAction::Continue
+                    }
                     Some(Err(_)) | None => AppAction::Quit,
                     _ => AppAction::Continue,
                 }
@@ -1209,6 +1215,10 @@ async fn run_event_loop(
                     // stale. Re-probe the cursor and realign the inline viewport
                     // before repainting so the composer lands below the shell
                     // output rather than overlapping it.
+                    // The user may have resized the window while we were
+                    // stopped. No resize event reaches a stopped process, so
+                    // the cached size has to be dropped rather than trusted.
+                    tui.invalidate_size_cache();
                     tui.terminal.reposition_viewport_to_cursor();
                 }
             }
@@ -1365,7 +1375,10 @@ async fn run_event_loop(
                 let result = external_editor::open_external_editor(&current_text);
 
                 let _ = tui_lifecycle::set_modes();
-                // Force a full repaint after the editor's screen output.
+                // Force a full repaint after the editor's screen output. The
+                // editor owned the screen, so a resize during it produced no
+                // event we saw — drop the cached geometry with the viewport.
+                tui.invalidate_size_cache();
                 tui.terminal.invalidate_viewport();
 
                 match result {
