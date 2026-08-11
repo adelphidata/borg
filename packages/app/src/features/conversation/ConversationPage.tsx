@@ -7,6 +7,7 @@ import { useKeybind } from "../../lib/keybinds";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
 import { draftKeyFor } from "./draftStore";
+import { useFollowBottom } from "./followBottom";
 import { ChangedFilesCard } from "./cells/ChangedFilesCard";
 import { PlanPanel } from "./cells/PlanPanel";
 import { ToolRunCell } from "./cells/ToolRunCell";
@@ -41,7 +42,6 @@ export function ConversationPage() {
     fork,
     context,
   } = useConversation(target);
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   // The daemon rewinds by user-message ordinal, so each user cell needs its
   // position among user cells rather than its index in the list.
@@ -94,6 +94,7 @@ export function ConversationPage() {
   // would otherwise shove the page down by however much they turned out to be.
   // Distance from the bottom is the one measure that survives that.
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const fromBottom = useRef<number | undefined>(undefined);
   const showEarlier = () => {
     const el = scrollRef.current;
@@ -110,10 +111,8 @@ export function ConversationPage() {
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
-  // Follow the newest cell, like any chat surface.
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [cells.length, busy]);
+  // Follow the newest content, but only while the user is actually down there.
+  const { pinned, missed, jumpToLatest } = useFollowBottom(scrollRef, contentRef, target);
 
   const title = opened.state === "ready" && opened.data.title ? opened.data.title : "Conversation";
   const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
@@ -155,6 +154,7 @@ export function ConversationPage() {
         className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
       >
         <div
+          ref={contentRef}
           className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
             isMobile ? "px-[22px]" : "px-[30px]"
           }`}
@@ -203,7 +203,6 @@ export function ConversationPage() {
                     {describeSendFailure(sendError)}
                   </div>
                 )}
-                <div ref={bottomRef} />
               </>
             )}
           </DaemonState>
@@ -213,6 +212,20 @@ export function ConversationPage() {
       <div
         className={`mx-auto w-full max-w-[660px] ${isMobile ? "px-[40px]" : "px-[30px]"} empty:hidden`}
       >
+        {/* Only once something has actually arrived unseen. Scrolling up on a
+            settled transcript is reading, not falling behind, and does not
+            need a way back. */}
+        {!pinned && missed && (
+          <div className="mb-2 flex justify-center">
+            <button
+              type="button"
+              onClick={jumpToLatest}
+              className="cursor-pointer rounded-full border border-line bg-surface2 px-3.5 py-1.5 text-[11.5px] leading-none text-ink2 hover:text-ink"
+            >
+              Jump to latest
+            </button>
+          </div>
+        )}
         {/* A silent stall used to look identical to an idle agent. */}
         {streamError && (
           <div className="mb-2 rounded-[10px] border border-alert bg-alert-soft px-3.5 py-2 text-[11.5px] leading-[1.5] text-ink2">
