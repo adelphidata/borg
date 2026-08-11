@@ -128,18 +128,17 @@ pub async fn handle_manage_tasks(args: &serde_json::Value, config: &Config) -> R
 /// re-seeded idempotently on migration; deleting them would leave the
 /// system without a heartbeat / maintenance loop until the next migration
 /// run. Returns `Some(error_string)` if the action should be refused.
+///
+/// This is the agent-facing gate only. `borg tasks` does not route through
+/// here, so the operator keeps control — the refusal names that route rather
+/// than an `*.enabled` setting, which only some of these rows actually have.
 fn reject_system_task(task_id: &str, action: &str) -> Option<String> {
-    let is_system = task_id == crate::heartbeat_task::HEARTBEAT_TASK_ID
-        || task_id == crate::maintenance::MAINTENANCE_TASK_ID
-        || task_id == crate::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID
-        || task_id == crate::memory::consolidation::WEEKLY_CONSOLIDATION_TASK_ID
-        || task_id == crate::daily_summary::DAILY_SUMMARY_TASK_ID;
-    if is_system {
+    if crate::task_ids::is_system_task_id(task_id) {
         Some(format!(
             "Error: refusing to {action} system-seeded task {task_id}. \
-             System tasks (heartbeat, maintenance, consolidation, daily summary) \
-             are managed by configuration; pause via the relevant `*.enabled` \
-             setting instead."
+             System tasks (heartbeat, maintenance, consolidation, daily summary, \
+             security audit) are managed by Borg itself. The operator can still \
+             run `borg tasks pause {task_id}` or `borg tasks run {task_id}` directly."
         ))
     } else {
         None
@@ -155,7 +154,7 @@ fn resolve_origin_delivery(
     let Some(ch) = delivery_channel else {
         return (None, delivery_target);
     };
-    if ch != "origin" {
+    if ch != crate::heartbeat_task::ORIGIN_DELIVERY {
         return (Some(ch), delivery_target);
     }
     let Some(origin) = crate::gateway_context::current() else {
@@ -163,7 +162,10 @@ fn resolve_origin_delivery(
             "schedule: delivery_channel='origin' requested outside a gateway turn; \
              leaving unresolved"
         );
-        return (Some("origin".to_string()), delivery_target);
+        return (
+            Some(crate::heartbeat_task::ORIGIN_DELIVERY.to_string()),
+            delivery_target,
+        );
     };
     let target_json = serde_json::json!({
         "sender": origin.sender_id,

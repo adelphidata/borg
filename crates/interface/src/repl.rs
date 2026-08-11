@@ -29,10 +29,10 @@ pub async fn run(
 /// process boot (see `main`), so it is intentionally not repeated here.
 pub(crate) fn runtime_degradation_warnings(config: &Config) -> Vec<String> {
     let mut out = Vec::new();
-    // Mirrors the heartbeat's `SkipReason::NoLlmProvider` condition: without a
-    // provider the agent has no model to call and every turn will fail.
-    let provider = config.llm.provider.as_deref().map(str::trim).unwrap_or("");
-    if provider.is_empty() {
+    // Same predicate as the heartbeat's `SkipReason::NoLlmProvider` and the
+    // scheduled-task preflight: without a provider the agent has no model to
+    // call and every turn will fail.
+    if config.llm.provider_unset() {
         out.push(
             "no LLM provider configured — the agent cannot run turns until one is set \
              (`borg settings set llm.provider <name>`)"

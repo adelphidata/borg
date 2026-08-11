@@ -464,8 +464,41 @@ async fn scheduled_task_checks(db: &Database) -> Vec<DiagnosticCheck> {
             "Scheduled Tasks",
             "tasks with errors",
             format!(
-                "{} task(s) failed their last run (e.g. {sample}) — inspect via `borg schedule list`",
+                "{} task(s) failed their last run (e.g. {sample}) — inspect via `borg tasks list`",
                 errored.len()
+            ),
+        ));
+    }
+
+    // A task whose delivery columns cannot address anyone runs to completion
+    // and then drops its result. The scheduler refuses the run outright, but
+    // that only shows up once the task next fires — this names it beforehand.
+    // Same predicate as the scheduler's, so the two cannot disagree.
+    // System-seeded rows deliberately have no channel, so they are exempt.
+    let mut undeliverable: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t.status == crate::tasks::TASK_STATUS_ACTIVE)
+        .filter(|t| !crate::task_ids::is_system_task_id(&t.id))
+        .filter(|t| {
+            crate::tasks::delivery_defect(
+                t.delivery_channel.as_deref(),
+                t.delivery_target.as_deref(),
+            )
+            .is_some()
+        })
+        .map(|t| t.name.as_str())
+        .collect();
+    undeliverable.sort_unstable();
+    if !undeliverable.is_empty() {
+        out.push(DiagnosticCheck::warn(
+            "Scheduled Tasks",
+            "tasks that cannot deliver",
+            format!(
+                "{} task(s) name a delivery channel they cannot address, so their \
+                 results go nowhere ({}) — ask Borg to set a delivery channel \
+                 and target for them",
+                undeliverable.len(),
+                undeliverable.join(", ")
             ),
         ));
     }
@@ -595,6 +628,95 @@ mod tests {
         assert!(
             msg.contains("flaky job"),
             "warning names the offending task: {msg}"
+        );
+    }
+
+    /// Build a task row differing only in the fields this check reads.
+    fn task_spec<'a>(
+        id: &'a str,
+        name: &'a str,
+        channel: Option<&'a str>,
+        target: Option<&'a str>,
+    ) -> NewTask<'a> {
+        NewTask {
+            id,
+            name,
+            prompt: "do stuff",
+            schedule_type: "interval",
+            schedule_expr: "1h",
+            timezone: "local",
+            next_run: Some(100),
+            max_retries: Some(3),
+            timeout_ms: None,
+            delivery_channel: channel,
+            delivery_target: target,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_tasks_warns_about_a_channel_with_no_target() {
+        let db = Database::test_db().await;
+        let find = |checks: Vec<DiagnosticCheck>| {
+            checks
+                .into_iter()
+                .find(|c| c.name == "tasks that cannot deliver")
+        };
+
+        // Re-seed the heartbeat row in the shape that *would* warn, to prove
+        // the system-task exemption actually carries its weight. As seeded it
+        // has no channel, so the fail-open rule alone would exempt it and the
+        // exemption could be deleted with this test still passing.
+        db.delete_task(crate::task_ids::HEARTBEAT_TASK_ID)
+            .await
+            .expect("clear seeded heartbeat");
+
+        // A system row must stay silent even misaddressed, as must a fully
+        // addressed task, a channel-less user task, and a broadcast.
+        for (id, name, channel, target) in [
+            (
+                crate::task_ids::HEARTBEAT_TASK_ID,
+                "heartbeat",
+                Some("telegram"),
+                None,
+            ),
+            ("addressed", "addressed job", Some("telegram"), Some("42")),
+            ("silent", "side-effect job", None, None),
+            (
+                "fanout",
+                "broadcast job",
+                Some(crate::heartbeat_task::BROADCAST_DELIVERY),
+                None,
+            ),
+        ] {
+            db.create_task(&task_spec(id, name, channel, target))
+                .await
+                .expect("create task");
+        }
+        assert!(
+            find(scheduled_task_checks(&db).await).is_none(),
+            "well-formed and system tasks must not warn"
+        );
+
+        db.create_task(&task_spec("orphan", "orphan job", Some("telegram"), None))
+            .await
+            .expect("create task");
+        let warn = find(scheduled_task_checks(&db).await).expect("undeliverable warning present");
+        assert!(warns(&warn), "a channel with no target must warn");
+        let CheckStatus::Warn(msg) = &warn.status else {
+            unreachable!()
+        };
+        assert!(msg.contains("orphan job"), "warning names the task: {msg}");
+        assert!(msg.contains("ask Borg"), "warning names the fix: {msg}");
+        assert_eq!(
+            crate::tasks::unknown_borg_command(msg),
+            None,
+            "warning must not name a command that does not exist: {msg}"
         );
     }
 

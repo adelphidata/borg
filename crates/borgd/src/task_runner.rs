@@ -178,6 +178,20 @@ pub async fn spawn_task_execution(
                 );
             }
         }
+        // Pre-dispatch validation. Nothing below this line has executed yet,
+        // so a task that could not possibly reach the user costs zero tokens
+        // — which is the whole point of checking here rather than at delivery
+        // time, where every site silently drops the result instead.
+        //
+        // Ahead of the concurrency permit, not behind it: the check is pure
+        // and synchronous, and a run that can never execute must not hold one
+        // of the few run slots while it records its refusal.
+        if let crate::task_preflight::Preflight::Blocked { code, message } =
+            crate::task_preflight::check(&task, &config)
+        {
+            handle_task_misconfigured(&task, run_id, code, &message, &config).await;
+            return;
+        }
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
@@ -1661,6 +1675,158 @@ async fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, 
     tracing::warn!(task = %task_name, error, "heartbeat: failed");
 }
 
+/// How many consecutive failed runs it takes before the failure notice starts
+/// naming the way out. Below this a task is having a bad week; at it, the task
+/// is broken in a way no retry budget will fix — `record_task_failure` resets
+/// `retry_count` every time, so nothing else escalates.
+const CONSECUTIVE_FAILURE_ALERT_THRESHOLD: i64 = 5;
+
+/// The way-out advice to append to a failure notice, or an empty string when
+/// the task has not failed often enough to warrant it.
+///
+/// `>=`, not `==`: this is only called on a failure that is actually reported
+/// to the user — a run that scheduled a transient retry returns before here.
+/// That run still lengthened the streak, so an `==` test on the crossing run
+/// silently misses the escalation whenever the crossing run was a retry. The
+/// advice rides along on a message the user is already being sent, so
+/// repeating it costs nothing.
+///
+/// A query error yields no advice: the failure notice itself still goes out,
+/// and inventing a streak would be worse than omitting the hint.
+async fn failure_escalation(db: &cortex::db::Database, task_id: &str, task_name: &str) -> String {
+    match db.consecutive_failed_runs(task_id).await {
+        Ok(streak) if streak >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD => {
+            tracing::warn!(
+                task = %task_name,
+                streak,
+                "scheduled task is failing every run"
+            );
+            format!(
+                "\n\nThis task has failed {streak} runs in a row. \
+                 Run `borg tasks pause {task_id}` to stop it."
+            )
+        }
+        Ok(_) => String::new(),
+        Err(e) => {
+            tracing::warn!("Task '{task_name}': failure-streak query failed: {e}");
+            String::new()
+        }
+    }
+}
+
+/// Record a run that was refused before it started, and tell the operator
+/// once.
+///
+/// "Once" is derived from the run history rather than a column: we alert only
+/// when the previous terminal run was not already `misconfigured`. The next
+/// healthy run writes `success`, which re-arms the alert with no explicit
+/// clearing anywhere — and so no success path can forget to do it.
+async fn handle_task_misconfigured(
+    task: &cortex::db::ScheduledTaskRow,
+    run_id: i64,
+    code: crate::task_preflight::BlockCode,
+    message: &str,
+    config: &Config,
+) {
+    let task_name = task.name.as_str();
+    let mut first_time = true;
+    match cortex::db::Database::open().await {
+        Ok(db) => {
+            match db.previous_terminal_run_status(&task.id, run_id).await {
+                Ok(Some(prev)) => {
+                    first_time = prev != cortex::tasks::RUN_STATUS_MISCONFIGURED;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Fail loud, not silent: repeating one notice is a far
+                    // smaller harm than never sending it.
+                    tracing::warn!(
+                        task = %task_name,
+                        error = %e,
+                        "could not read previous run status — alerting anyway"
+                    );
+                }
+            }
+            match db
+                .record_task_misconfigured(&task.id, run_id, message)
+                .await
+            {
+                // The run row is the alert-once marker. If it was pruned out
+                // from under us the next tick finds no `misconfigured`
+                // predecessor and alerts again — say so, rather than letting a
+                // repeating notice look like a logic bug.
+                Ok(false) => tracing::warn!(
+                    task = %task_name,
+                    run_id,
+                    "run row vanished before it could be marked misconfigured — \
+                     this notice may repeat"
+                ),
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::warn!("Task '{task_name}': failed to record misconfiguration: {e}")
+                }
+            }
+            if first_time {
+                cortex::activity_log::log_activity(
+                    &db,
+                    "warn",
+                    "task",
+                    &format!("Task '{task_name}' skipped: {message}"),
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Task '{task_name}': DB open failed at preflight block: {e}");
+        }
+    }
+    tracing::warn!(
+        task = %task_name,
+        code = code.as_str(),
+        first_time,
+        "scheduled task refused before dispatch: {message}"
+    );
+
+    if !first_time || code.kind() == crate::task_preflight::BlockKind::Delivery {
+        // A delivery blocker means the channel itself is the problem, so the
+        // notice has nowhere to go. Log only — never both.
+        return;
+    }
+    if let (Some(channel), Some(target)) = (&task.delivery_channel, &task.delivery_target) {
+        // Only the *first* blocker is reported, so a task can be blocked for a
+        // non-delivery reason while its channel is separately unusable —
+        // unsupported by `send_threaded`, or missing its token. Attempting the
+        // send would just log a failure and emit a `delivery_failed` audit for
+        // a notice nobody asked for; checking first keeps the noise out.
+        //
+        // (It would *not* corrupt the alert-once marker: `record_delivery_failure`
+        // only rewrites a run whose status is still `success`, so a
+        // `misconfigured` row survives a failed send untouched.)
+        if let Err(reason) = crate::channel_delivery::precheck(channel, |env| {
+            config.resolve_credential_or_env(env).is_some()
+        }) {
+            tracing::warn!(
+                task = %task_name,
+                "skip notice not delivered: {reason}"
+            );
+            return;
+        }
+        deliver_task_result(
+            channel,
+            target,
+            &format!("{task_name} [SKIPPED]"),
+            message,
+            config,
+            None,
+            RunRef {
+                task_id: &task.id,
+                run_id,
+            },
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_task_failure(
     task_id: &str,
@@ -1675,6 +1841,7 @@ async fn handle_task_failure(
     config: &Config,
     error: &str,
 ) {
+    let mut escalation = String::new();
     match cortex::db::Database::open().await {
         Ok(db) => {
             if let Err(e) = db
@@ -1704,6 +1871,7 @@ async fn handle_task_failure(
             if let Err(e) = db.record_task_failure(task_id, error).await {
                 tracing::warn!("Task '{task_name}': failed to record failure: {e}");
             }
+            escalation = failure_escalation(&db, task_id, task_name).await;
             if schedule_type == "once" {
                 if let Err(e) = db.update_task_status(task_id, "completed").await {
                     tracing::warn!("Task '{task_name}': failed to mark completed: {e}");
@@ -1715,7 +1883,7 @@ async fn handle_task_failure(
     tracing::warn!("Task '{task_name}' failed: {error}");
 
     if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-        let msg = format!("Error: {error}");
+        let msg = format!("Error: {error}{escalation}");
         deliver_task_result(
             ch,
             tgt,
@@ -1759,7 +1927,7 @@ async fn deliver_task_result(
     executor: Option<&Arc<DaemonSessionExecutor>>,
     run: RunRef<'_>,
 ) {
-    if channel == "origin" {
+    if channel == cortex::heartbeat_task::ORIGIN_DELIVERY {
         tracing::warn!("Task '{task_name}' has unresolved 'origin' delivery — dropping");
         record_delivery_failure(run, "unresolved 'origin' delivery target — result dropped").await;
         return;

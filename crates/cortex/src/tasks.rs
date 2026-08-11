@@ -143,6 +143,15 @@ pub const RUN_STATUS_MISSED: &str = "missed";
 /// `RUN_STATUS_FAILED`: the work succeeded, the handoff didn't. Without this
 /// the run row said `success` while the user got nothing.
 pub const RUN_STATUS_DELIVERY_FAILED: &str = "delivery_failed";
+/// The run was refused before it started, because the task itself is
+/// misconfigured — a delivery channel with nowhere to send, an unsupported
+/// channel, a missing channel token, or no LLM provider for a task that needs
+/// one. Nothing executed, so no tokens were spent.
+///
+/// Deliberately not `RUN_STATUS_FAILED`: a misconfiguration never self-heals
+/// by retrying, and counting it as a failure would inflate the failure
+/// dashboards with one entry per tick, forever.
+pub const RUN_STATUS_MISCONFIGURED: &str = "misconfigured";
 
 /// One-shot task: runs once at `next_run`, then marked completed.
 pub const SCHEDULE_TYPE_ONCE: &str = "once";
@@ -150,6 +159,104 @@ pub const SCHEDULE_TYPE_ONCE: &str = "once";
 pub const SCHEDULE_TYPE_CRON: &str = "cron";
 /// Interval-scheduled task: recurring, every N duration.
 pub const SCHEDULE_TYPE_INTERVAL: &str = "interval";
+
+/// What is structurally wrong with a task's delivery configuration.
+///
+/// "Structurally" is the whole scope: this decides only what can be read off
+/// the row itself. Whether the named channel is one delivery actually supports,
+/// and whether its credential resolves, needs the daemon's channel table and is
+/// composed on top of this by the scheduler's pre-dispatch check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryDefect {
+    /// Still addressed to [`crate::heartbeat_task::ORIGIN_DELIVERY`], so the
+    /// originating conversation was never resolved.
+    UnresolvedOrigin,
+    /// Names a channel but no target, so the result is silently discarded.
+    NoTarget,
+}
+
+impl DeliveryDefect {
+    /// The operator-facing fix, phrased as an imperative.
+    ///
+    /// The route is the agent, not the CLI: `borg tasks` can create, delete,
+    /// pause, resume and run a task, but it has no verb that edits an existing
+    /// task's delivery columns. The `schedule` tool does, so asking Borg is the
+    /// action that actually works. Naming a command that does not parse is
+    /// worse than naming none — [`crate::tasks::tests`] pins this.
+    pub fn next_action(&self) -> &'static str {
+        match self {
+            DeliveryDefect::UnresolvedOrigin => {
+                "ask Borg to set a concrete delivery channel and target for it"
+            }
+            DeliveryDefect::NoTarget => "ask Borg to set a delivery target for it",
+        }
+    }
+}
+
+/// Every `borg …` invocation an operator-facing message is allowed to name.
+///
+/// Kept as data so the assertion below is one list to update, and deliberately
+/// spelled out rather than derived from clap: the point is to catch a message
+/// that names a plausible-sounding command nobody implemented.
+const VALID_BORG_COMMANDS: &[&str] = &[
+    "borg init",
+    "borg doctor",
+    "borg tasks list",
+    "borg tasks create",
+    "borg tasks delete",
+    "borg tasks pause",
+    "borg tasks resume",
+    "borg tasks run",
+    "borg tasks runs",
+    "borg tasks status",
+    "borg settings set",
+];
+
+/// Refuse an operator-facing message that tells the user to run a command that
+/// does not exist.
+///
+/// A misconfiguration notice earns its place only by naming a next action, and
+/// an action that fails with "unrecognized subcommand" is worse than silence —
+/// it costs the operator a round trip and their trust in the rest of the
+/// advice. Exposed (rather than test-local) because the messages are composed
+/// in `cortex` and again in the daemon's scheduler, and both must be held to
+/// this. Returns the offending fragment, or `None` when the message is clean.
+pub fn unknown_borg_command(message: &str) -> Option<&str> {
+    let mut rest = message;
+    while let Some(at) = rest.find("borg ") {
+        let candidate = &rest[at..];
+        if !VALID_BORG_COMMANDS.iter().any(|c| candidate.starts_with(c)) {
+            let end = candidate
+                .find(['`', '.', ',', '\n'])
+                .unwrap_or(candidate.len());
+            return Some(&candidate[..end]);
+        }
+        rest = &rest[at + "borg ".len()..];
+    }
+    None
+}
+
+/// Read a task's delivery columns and report what, if anything, makes them
+/// undeliverable.
+///
+/// Fails open: only an affirmative misconfiguration returns `Some`. A task with
+/// no channel is not broken — the seeded system rows have none, and a task
+/// whose whole job is a side effect never needed one. `broadcast` fans out to
+/// whatever channels exist, so it carries no target of its own.
+///
+/// One definition, two consumers: the doctor warns about it ahead of time and
+/// the scheduler refuses the run. They must name the same condition.
+pub fn delivery_defect(channel: Option<&str>, target: Option<&str>) -> Option<DeliveryDefect> {
+    let channel = channel.map(str::trim).filter(|c| !c.is_empty())?;
+    if channel == crate::heartbeat_task::ORIGIN_DELIVERY {
+        return Some(DeliveryDefect::UnresolvedOrigin);
+    }
+    if channel == crate::heartbeat_task::BROADCAST_DELIVERY {
+        return None;
+    }
+    let has_target = target.map(str::trim).is_some_and(|t| !t.is_empty());
+    (!has_target).then_some(DeliveryDefect::NoTarget)
+}
 
 /// Format a run status for CLI/tool display.
 pub fn format_run_status(status: &str) -> &str {
@@ -159,6 +266,7 @@ pub fn format_run_status(status: &str) -> &str {
         RUN_STATUS_FAILED => "FAIL",
         RUN_STATUS_MISSED => "MISSED",
         RUN_STATUS_DELIVERY_FAILED => "UNDELIVERED",
+        RUN_STATUS_MISCONFIGURED => "MISCONFIGURED",
         other => other,
     }
 }
@@ -767,6 +875,89 @@ mod tests {
             let got = check_scheduled_command(command, &policy).err();
             assert_eq!(got, *expected, "gate verdict wrong for {command:?}");
         }
+    }
+
+    #[test]
+    fn delivery_defect_fails_open_and_names_only_real_defects() {
+        use crate::heartbeat_task::{BROADCAST_DELIVERY, ORIGIN_DELIVERY};
+        // The doctor and the scheduler both read this. A false positive here
+        // stops a working task; a false negative is the original silent drop.
+        /// (label, delivery_channel, delivery_target, expected defect)
+        type Case<'a> = (
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<DeliveryDefect>,
+        );
+        let cases: &[Case] = &[
+            // Fail open — the seeded system rows all look like this.
+            ("no channel", None, None, None),
+            ("blank channel", Some("   "), None, None),
+            ("no channel, stray target", None, Some("12345"), None),
+            // Broadcast fans out; it carries no target of its own.
+            ("broadcast", Some(BROADCAST_DELIVERY), None, None),
+            // Addressed, so deliverable.
+            ("addressed", Some("telegram"), Some("12345"), None),
+            ("channel is padded", Some(" telegram "), Some("12345"), None),
+            // The silent drop.
+            (
+                "no target",
+                Some("telegram"),
+                None,
+                Some(DeliveryDefect::NoTarget),
+            ),
+            (
+                "blank target",
+                Some("telegram"),
+                Some("  "),
+                Some(DeliveryDefect::NoTarget),
+            ),
+            // Never resolved to a real conversation.
+            (
+                "origin",
+                Some(ORIGIN_DELIVERY),
+                Some("12345"),
+                Some(DeliveryDefect::UnresolvedOrigin),
+            ),
+        ];
+        for (label, channel, target, expected) in cases {
+            assert_eq!(delivery_defect(*channel, *target), *expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn every_delivery_defect_names_an_action_the_user_can_take() {
+        // A defect the operator cannot act on is just noise in the doctor, and
+        // one that names a command that does not parse is worse than noise.
+        for defect in [DeliveryDefect::UnresolvedOrigin, DeliveryDefect::NoTarget] {
+            let action = defect.next_action();
+            assert!(
+                action.contains("delivery") && action.contains("Borg"),
+                "{defect:?} must say what to change and who changes it: {action}"
+            );
+            assert_eq!(
+                unknown_borg_command(action),
+                None,
+                "{defect:?} names a command that does not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_borg_command_catches_an_invented_subcommand() {
+        // This guard is what stops the delivery advice regressing to the
+        // `borg schedule update` that never existed, so it has to work.
+        assert_eq!(
+            unknown_borg_command("run `borg schedule update` to fix it"),
+            Some("borg schedule update")
+        );
+        assert_eq!(unknown_borg_command("run `borg tasks pause abc123`"), None);
+        assert_eq!(unknown_borg_command("no command here at all"), None);
+        assert_eq!(
+            unknown_borg_command("first run `borg init`, then `borg onboard`"),
+            Some("borg onboard"),
+            "a valid command must not mask a later invalid one"
+        );
     }
 
     #[test]

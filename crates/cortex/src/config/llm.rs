@@ -463,6 +463,44 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// True when no *primary* provider is named at all.
+    ///
+    /// Only "nothing named" counts. Credentials resolve from the keychain, the
+    /// environment, or the pool at call time, so testing a *key* here would
+    /// report a working setup as broken.
+    ///
+    /// One definition, three lanes: the heartbeat's `SkipReason::NoLlmProvider`
+    /// and the REPL's startup warning both mean the interactive/primary client,
+    /// and must not drift apart.
+    ///
+    /// Background work should ask [`Self::no_provider_at_all`] instead — see
+    /// the note there.
+    pub fn provider_unset(&self) -> bool {
+        self.provider
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    }
+
+    /// True when neither the primary nor the auxiliary chain names a provider.
+    ///
+    /// Background lanes build through `LlmClient::for_auxiliary`, which
+    /// resolves `llm.aux.provider` *before* falling back to the primary. A box
+    /// configured with only an aux provider runs scheduled tasks fine, so
+    /// blocking it on [`Self::provider_unset`] alone would refuse work that
+    /// demonstrably succeeds.
+    pub fn no_provider_at_all(&self) -> bool {
+        let aux_unset = self
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.provider.as_deref())
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty();
+        self.provider_unset() && aux_unset
+    }
+
     /// Resolve the thinking level for `model`: most-specific matching
     /// `thinking_overrides` entry → global `thinking` → `Off`.
     ///

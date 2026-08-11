@@ -475,14 +475,10 @@ pub async fn execute_heartbeat_turn(
     // snapshot yet), and a "heartbeat errored during first-run" toast is
     // exactly the wrong first impression. Also catches deliberately-unset
     // and credential-revoked states.
-    if config
-        .llm
-        .provider
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty()
-    {
+    //
+    // Shares its predicate with the scheduled-task preflight and the REPL's
+    // startup warning, so the lanes cannot disagree about "no provider".
+    if config.llm.provider_unset() {
         return HeartbeatResult::Skipped {
             reason: SkipReason::NoLlmProvider,
         };

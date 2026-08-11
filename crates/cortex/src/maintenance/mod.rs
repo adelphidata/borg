@@ -464,7 +464,7 @@ pub async fn run_daily_maintenance_with_registry(
     // 5. Proactively scan for stalled scheduled tasks. This duplicates
     //    what the daemon loop does on a 5-minute cadence, but running it
     //    here covers the case where the daemon isn't running and the user
-    //    fires this task manually with `borg schedule run <id>`.
+    //    fires this task manually with `borg tasks run <id>`.
     if !budget.is_blown() {
         match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS)
             .await

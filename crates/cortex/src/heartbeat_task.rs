@@ -11,6 +11,12 @@ pub use crate::task_ids::HEARTBEAT_TASK_ID;
 /// by the user-callable `schedule.create` so user tasks can't fan out.
 pub const BROADCAST_DELIVERY: &str = "broadcast";
 
+/// Sentinel `delivery_channel` value meaning "reply wherever this task was
+/// created from". It is resolved to a concrete channel at create time; a row
+/// still carrying it at run time means that resolution failed, so the result
+/// has nowhere to go.
+pub const ORIGIN_DELIVERY: &str = "origin";
+
 /// Returns true if the task ID matches the seeded heartbeat row.
 pub fn is_heartbeat_task_id(id: &str) -> bool {
     id == HEARTBEAT_TASK_ID

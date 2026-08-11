@@ -5,6 +5,10 @@ use super::Database;
 use anyhow::Result;
 use libsql::params;
 
+/// How far back [`Database::consecutive_failed_runs`] looks. Bounds the scan
+/// on a task with a long run history; any alert threshold is far below this.
+const CONSECUTIVE_FAILURE_WINDOW: i64 = 64;
+
 /// Column list shared by all scheduled-task SELECT queries.
 const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash";
 
@@ -232,6 +236,118 @@ impl Database {
             params!(task_id, error),
         ).await?;
         Ok(())
+    }
+
+    /// Record that a claimed run was refused before it started, because the
+    /// task is misconfigured.
+    ///
+    /// Deliberately *not* `record_task_failure`: that resets `retry_count` and
+    /// `retry_after`. A misconfiguration is orthogonal to a retry already in
+    /// flight, and clearing it here would cancel a legitimate retry of the
+    /// previous run. Only the diagnostic is written.
+    ///
+    /// Returns whether the run row was actually marked. `false` means the row
+    /// was gone — retention pruned it mid-flight — which matters because that
+    /// row *is* the alert-once marker: without it the next tick sees no
+    /// `misconfigured` predecessor and alerts again. The caller decides what to
+    /// do about that; reporting success here would hide it.
+    pub async fn record_task_misconfigured(
+        &self,
+        task_id: &str,
+        run_id: i64,
+        reason: &str,
+    ) -> Result<bool> {
+        let marked = self
+            .conn
+            .execute(
+                "UPDATE task_runs SET status = ?1, duration_ms = 0, error = ?2 WHERE id = ?3",
+                params!(crate::tasks::RUN_STATUS_MISCONFIGURED, reason, run_id),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET last_error = ?2 WHERE id = ?1",
+                params!(task_id, reason),
+            )
+            .await?;
+        Ok(marked > 0)
+    }
+
+    /// The status of the newest finished run before `before_run_id`, ignoring
+    /// runs still in flight.
+    ///
+    /// This is what makes "alert once" work without a schema change: the
+    /// previous terminal status *is* the marker. It self-clears, because the
+    /// next healthy run writes `success`.
+    ///
+    /// One honest limitation: retention pruning can drop the history that
+    /// carried the marker, which lets a single alert repeat. That is bounded
+    /// and preferable to a column that three separate success paths would each
+    /// have to remember to clear.
+    pub async fn previous_terminal_run_status(
+        &self,
+        task_id: &str,
+        before_run_id: i64,
+    ) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                // Ordered by `id`, matching the `id < ?2` cursor. `started_at`
+                // would read the index in its own order and save a sort, but a
+                // retry's `started_at` is computed at the top of the tick, so a
+                // lower-id row can carry a later timestamp and outrank the true
+                // predecessor. The alert-once marker hangs off this one row, so
+                // the cursor and the order have to agree.
+                "SELECT status FROM task_runs \
+                 WHERE task_id = ?1 AND id < ?2 AND status != ?3 \
+                 ORDER BY id DESC LIMIT 1",
+                params!(task_id, before_run_id, crate::tasks::RUN_STATUS_RUNNING),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// How many runs have failed in a row, counting back from the newest
+    /// finished run. Stops at the first non-failure.
+    ///
+    /// Used to escalate a task that fails every single tick, which no retry
+    /// budget catches: `record_task_failure` resets `retry_count`, so a
+    /// permanently broken recurring task keeps failing at full cadence.
+    ///
+    /// The scan is capped: callers only compare against a small threshold, and
+    /// an unbounded `ORDER BY id DESC` would sort the entire run history of a
+    /// long-lived task on every failure. A streak longer than the window
+    /// saturates at [`CONSECUTIVE_FAILURE_WINDOW`], which is still far past any
+    /// threshold worth alerting on.
+    pub async fn consecutive_failed_runs(&self, task_id: &str) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                // `id`, not `started_at`, for the same reason as
+                // `previous_terminal_run_status`: a retry's timestamp is taken
+                // at the top of the tick, so time order and insertion order can
+                // disagree and a streak walked by time would stop early.
+                "SELECT status FROM task_runs \
+                 WHERE task_id = ?1 AND status != ?2 \
+                 ORDER BY id DESC LIMIT ?3",
+                params!(
+                    task_id,
+                    crate::tasks::RUN_STATUS_RUNNING,
+                    CONSECUTIVE_FAILURE_WINDOW
+                ),
+            )
+            .await?;
+        let mut streak = 0;
+        while let Some(row) = rows.next().await? {
+            if row.get::<String>(0)? != crate::tasks::RUN_STATUS_FAILED {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
     }
 
     /// Record that a run's body succeeded but its result never reached the
@@ -1504,5 +1620,141 @@ mod delivery_failure_tests {
             Some(9_999),
             "the scheduled retry must not be cancelled"
         );
+    }
+
+    /// Finish a run with the given status, and return its id.
+    async fn finished_run(db: &Database, task_id: &str, status: &str) -> i64 {
+        let run_id = db.start_task_run(task_id, 1_000).await.expect("start run");
+        db.conn
+            .execute(
+                "UPDATE task_runs SET status = ?1 WHERE id = ?2",
+                params!(status, run_id),
+            )
+            .await
+            .expect("set status");
+        run_id
+    }
+
+    #[tokio::test]
+    async fn misconfigured_run_preserves_a_retry_already_in_flight() {
+        // A misconfiguration is orthogonal to a retry of the *previous* run.
+        // Clearing retry state here — as `record_task_failure` would — silently
+        // cancels a retry that was going to succeed.
+        let db = Database::test_db().await;
+        seed(&db, "m1").await;
+        db.set_task_retry("m1", 2, "connection refused", 9_999)
+            .await
+            .expect("set retry");
+        let run_id = db.start_task_run("m1", 1_000).await.expect("start run");
+
+        db.record_task_misconfigured("m1", run_id, "no delivery target")
+            .await
+            .expect("record");
+
+        let (status, error) = run_state(&db, run_id).await;
+        assert_eq!(status, crate::tasks::RUN_STATUS_MISCONFIGURED);
+        assert_eq!(error.as_deref(), Some("no delivery target"));
+        let task = db
+            .get_task_by_id("m1")
+            .await
+            .expect("query")
+            .expect("task exists");
+        assert_eq!(task.retry_count, 2, "retry attempt count must survive");
+        assert_eq!(task.retry_after, Some(9_999), "the retry must not be lost");
+        assert_eq!(task.last_error.as_deref(), Some("no delivery target"));
+    }
+
+    #[tokio::test]
+    async fn a_misconfigured_run_is_not_counted_as_a_failure() {
+        // Counting it would put one entry per tick into the failure
+        // dashboards, forever, for a problem retrying can never fix.
+        let db = Database::test_db().await;
+        seed(&db, "m2").await;
+        let run_id = db.start_task_run("m2", 1_000).await.expect("start run");
+        db.record_task_misconfigured("m2", run_id, "no delivery target")
+            .await
+            .expect("record");
+
+        assert_eq!(
+            db.count_failed_runs_since(0).await.expect("count"),
+            0,
+            "misconfigured runs must stay out of the failure count"
+        );
+        assert_eq!(
+            db.consecutive_failed_runs("m2").await.expect("streak"),
+            0,
+            "and out of the failure streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_previous_terminal_status_skips_runs_still_in_flight() {
+        // This is the alert-once marker. A concurrent run sitting at `running`
+        // must not read as "nothing came before", or the alert repeats.
+        let db = Database::test_db().await;
+        seed(&db, "m3").await;
+        let first = finished_run(&db, "m3", crate::tasks::RUN_STATUS_MISCONFIGURED).await;
+        let in_flight = db.start_task_run("m3", 2_000).await.expect("start run");
+        let current = db.start_task_run("m3", 3_000).await.expect("start run");
+        assert!(in_flight < current, "ids must be ordered by start");
+
+        assert_eq!(
+            db.previous_terminal_run_status("m3", current)
+                .await
+                .expect("query")
+                .as_deref(),
+            Some(crate::tasks::RUN_STATUS_MISCONFIGURED),
+            "the newest *finished* run is the marker"
+        );
+        assert_eq!(
+            db.previous_terminal_run_status("m3", first)
+                .await
+                .expect("query"),
+            None,
+            "the very first run has no predecessor"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_failure_streak_stops_at_the_last_success() {
+        // `record_task_failure` resets `retry_count` on every failure, so this
+        // streak is the only thing that can tell a bad week from a task that
+        // is broken for good.
+        let db = Database::test_db().await;
+        seed(&db, "m4").await;
+        assert_eq!(db.consecutive_failed_runs("m4").await.expect("streak"), 0);
+
+        for _ in 0..3 {
+            finished_run(&db, "m4", crate::tasks::RUN_STATUS_FAILED).await;
+        }
+        assert_eq!(db.consecutive_failed_runs("m4").await.expect("streak"), 3);
+
+        finished_run(&db, "m4", crate::tasks::RUN_STATUS_SUCCESS).await;
+        assert_eq!(
+            db.consecutive_failed_runs("m4").await.expect("streak"),
+            0,
+            "one success resets the streak"
+        );
+
+        finished_run(&db, "m4", crate::tasks::RUN_STATUS_FAILED).await;
+        assert_eq!(
+            db.consecutive_failed_runs("m4").await.expect("streak"),
+            1,
+            "counting resumes from the success, not from zero history"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_failure_streak_is_per_task() {
+        // A shared counter would escalate a healthy task because a noisy
+        // neighbour is failing.
+        let db = Database::test_db().await;
+        seed(&db, "m5").await;
+        seed(&db, "m6").await;
+        for _ in 0..4 {
+            finished_run(&db, "m5", crate::tasks::RUN_STATUS_FAILED).await;
+        }
+        assert_eq!(db.consecutive_failed_runs("m5").await.expect("streak"), 4);
+        assert_eq!(db.consecutive_failed_runs("m6").await.expect("streak"), 0);
     }
 }

@@ -46,6 +46,7 @@ pub mod session;
 pub mod session_activity;
 pub mod session_heartbeat;
 pub mod supervisor;
+pub mod task_preflight;
 pub mod task_runner;
 pub mod tick_lock;
 /// Owner of the optional public-internet tunnel (cloudflared / ngrok /
