@@ -6,6 +6,26 @@ export interface Command {
   hint?: string;
   /** Extra words that should match without being displayed. */
   keywords?: string;
+  /**
+   * The live state the row acts on, in muted text after the label — `on` /
+   * `off` for a toggle. The verb alone never says which way the row will go.
+   */
+  detail?: string;
+  /** Renders a trailing check: this row IS the current value. */
+  active?: boolean;
+  /**
+   * Keeps the palette open after running, for rows you pick by seeing the
+   * result — theme being the one that matters.
+   */
+  keepOpen?: boolean;
+  /**
+   * Sorts before the score: a lower tier always outranks a higher one, however
+   * well the higher one matches. This is how a row with a real name stays
+   * above a raw subsystem key that happens to contain the same letters —
+   * relevance alone would put `tts.timeout_ms` over "TTS provider enabled".
+   * Defaults to 0.
+   */
+  tier?: number;
   run: () => void;
 }
 
@@ -62,6 +82,6 @@ export function rank(commands: Command[], query: string): Command[] {
       return hits.length === 0 ? null : { command, best: Math.max(...hits) };
     })
     .filter((r): r is { command: Command; best: number } => r !== null)
-    .sort((a, b) => b.best - a.best)
+    .sort((a, b) => (a.command.tier ?? 0) - (b.command.tier ?? 0) || b.best - a.best)
     .map((r) => r.command);
 }

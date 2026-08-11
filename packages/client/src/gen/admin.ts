@@ -371,7 +371,25 @@ export interface SettingMutation {
 export interface SettingEntry {
   key: string;
   value: string;
+  /**
+   * Where the value came from: "db" for an override, otherwise the compiled
+   * default. Despite the name this is the *source*, not the display grouping —
+   * that is `group` below.
+   */
   category: string;
+  /**
+   * Display metadata, carried from the curated `TUI_SETTINGS` table so every
+   * surface labels a setting the same way. All three are empty for a key that
+   * table does not name; a client showing such a key falls back to the key
+   * itself and should rank it below the curated ones.
+   *
+   * Outcome-facing label, e.g. "Show reasoning" for `conversation.show_thinking`.
+   */
+  label: string;
+  /** Control type: one of bool, float, uint, select, text, secret. */
+  kind: string;
+  /** Section heading the setting belongs under, e.g. "Conversation". */
+  group: string;
 }
 
 export interface SettingsSnapshot {
@@ -5162,7 +5180,7 @@ export const SettingMutation: MessageFns<SettingMutation> = {
 };
 
 function createBaseSettingEntry(): SettingEntry {
-  return { key: "", value: "", category: "" };
+  return { key: "", value: "", category: "", label: "", kind: "", group: "" };
 }
 
 export const SettingEntry: MessageFns<SettingEntry> = {
@@ -5175,6 +5193,15 @@ export const SettingEntry: MessageFns<SettingEntry> = {
     }
     if (message.category !== "") {
       writer.uint32(26).string(message.category);
+    }
+    if (message.label !== "") {
+      writer.uint32(34).string(message.label);
+    }
+    if (message.kind !== "") {
+      writer.uint32(42).string(message.kind);
+    }
+    if (message.group !== "") {
+      writer.uint32(50).string(message.group);
     }
     return writer;
   },
@@ -5210,6 +5237,30 @@ export const SettingEntry: MessageFns<SettingEntry> = {
           message.category = reader.string();
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.label = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.kind = reader.string();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.group = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5224,6 +5275,9 @@ export const SettingEntry: MessageFns<SettingEntry> = {
       key: isSet(object.key) ? globalThis.String(object.key) : "",
       value: isSet(object.value) ? globalThis.String(object.value) : "",
       category: isSet(object.category) ? globalThis.String(object.category) : "",
+      label: isSet(object.label) ? globalThis.String(object.label) : "",
+      kind: isSet(object.kind) ? globalThis.String(object.kind) : "",
+      group: isSet(object.group) ? globalThis.String(object.group) : "",
     };
   },
 
@@ -5238,6 +5292,15 @@ export const SettingEntry: MessageFns<SettingEntry> = {
     if (message.category !== "") {
       obj.category = message.category;
     }
+    if (message.label !== "") {
+      obj.label = message.label;
+    }
+    if (message.kind !== "") {
+      obj.kind = message.kind;
+    }
+    if (message.group !== "") {
+      obj.group = message.group;
+    }
     return obj;
   },
 
@@ -5249,6 +5312,9 @@ export const SettingEntry: MessageFns<SettingEntry> = {
     message.key = object.key ?? "";
     message.value = object.value ?? "";
     message.category = object.category ?? "";
+    message.label = object.label ?? "";
+    message.kind = object.kind ?? "";
+    message.group = object.group ?? "";
     return message;
   },
 };

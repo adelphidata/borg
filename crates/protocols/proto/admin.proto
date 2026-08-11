@@ -467,7 +467,26 @@ message DreamReport {
 
 message SettingKey { string key = 1; }
 message SettingMutation { string key = 1; string value = 2; }
-message SettingEntry { string key = 1; string value = 2; string category = 3; }
+message SettingEntry {
+  string key = 1;
+  string value = 2;
+  // Where the value came from: "db" for an override, otherwise the compiled
+  // default. Despite the name this is the *source*, not the display grouping —
+  // that is `group` below.
+  string category = 3;
+
+  // Display metadata, carried from the curated `TUI_SETTINGS` table so every
+  // surface labels a setting the same way. All three are empty for a key that
+  // table does not name; a client showing such a key falls back to the key
+  // itself and should rank it below the curated ones.
+  //
+  // Outcome-facing label, e.g. "Show reasoning" for `conversation.show_thinking`.
+  string label = 4;
+  // Control type: one of bool, float, uint, select, text, secret.
+  string kind = 5;
+  // Section heading the setting belongs under, e.g. "Conversation".
+  string group = 6;
+}
 message SettingsSnapshot { repeated SettingEntry entries = 1; }
 
 message SessionList {

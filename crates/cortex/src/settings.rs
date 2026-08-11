@@ -73,6 +73,27 @@ pub enum TuiSettingKind {
     Secret,
 }
 
+impl std::fmt::Display for TuiSettingKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            TuiSettingKind::Bool => "bool",
+            TuiSettingKind::Float => "float",
+            TuiSettingKind::Uint => "uint",
+            TuiSettingKind::Select => "select",
+            TuiSettingKind::Text => "text",
+            TuiSettingKind::Secret => "secret",
+        };
+        f.write_str(name)
+    }
+}
+
+/// The curated display metadata for `key`, or `None` when the settings table
+/// does not name it. The one lookup every surface uses, so the TUI popup and
+/// the gRPC clients can never label the same setting differently.
+pub fn tui_setting(key: &str) -> Option<&'static TuiSettingDecl> {
+    TUI_SETTINGS.iter().find(|decl| decl.key == key)
+}
+
 /// Display metadata for a TUI-visible setting. Emitted by the `tui_settings`
 /// block of `define_settings!` so the popup list lives alongside the registry
 /// rather than in a separate source of truth.
@@ -708,6 +729,40 @@ mod tests {
                 "Float-kind setting '{}' has no entry in TUI_FLOAT_RANGES",
                 decl.key
             );
+        }
+    }
+
+    #[test]
+    fn tui_setting_resolves_a_curated_key_and_only_a_curated_key() {
+        let decl = tui_setting("conversation.show_thinking")
+            .expect("a key the settings table names must resolve");
+        assert_eq!(decl.label, "Show reasoning");
+        assert_eq!(decl.kind, TuiSettingKind::Bool);
+        assert_eq!(decl.category, "Conversation");
+
+        // Most of the registry is uncurated. Those keys must report no display
+        // metadata rather than a guess, because that emptiness is how a client
+        // knows not to put the key in front of someone as if it were a name.
+        assert!(tui_setting("heartbeat.min_interval_secs").is_none());
+        assert!(tui_setting("no.such.setting").is_none());
+    }
+
+    #[test]
+    fn kind_renders_the_names_clients_match_on() {
+        // These strings cross the gRPC boundary: the web palette decides
+        // whether a setting is a flippable toggle by comparing against "bool".
+        // Renaming a variant's rendering here silently turns every toggle in
+        // every client back into a navigation.
+        let cases = [
+            (TuiSettingKind::Bool, "bool"),
+            (TuiSettingKind::Float, "float"),
+            (TuiSettingKind::Uint, "uint"),
+            (TuiSettingKind::Select, "select"),
+            (TuiSettingKind::Text, "text"),
+            (TuiSettingKind::Secret, "secret"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.to_string(), expected, "wire name for {kind:?} changed");
         }
     }
 

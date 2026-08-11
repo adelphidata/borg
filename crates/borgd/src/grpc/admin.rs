@@ -280,10 +280,20 @@ impl Admin for AdminSvc {
         Ok(Response::new(SettingsSnapshot {
             entries: entries
                 .into_iter()
-                .map(|e| SettingEntry {
-                    key: e.key,
-                    value: e.value,
-                    category: e.source.to_string(),
+                .map(|e| {
+                    // Curated display metadata, when the settings table names
+                    // this key. Clients that get an empty label fall back to
+                    // the key itself, so an uncurated setting stays reachable
+                    // without being promoted as if it were user-facing.
+                    let decl = cortex::settings::tui_setting(&e.key);
+                    SettingEntry {
+                        key: e.key,
+                        value: e.value,
+                        category: e.source.to_string(),
+                        label: decl.map(|d| d.label.to_string()).unwrap_or_default(),
+                        kind: decl.map(|d| d.kind.to_string()).unwrap_or_default(),
+                        group: decl.map(|d| d.category.to_string()).unwrap_or_default(),
+                    }
                 })
                 .collect(),
         }))

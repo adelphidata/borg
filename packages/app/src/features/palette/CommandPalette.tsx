@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { SearchIcon } from "@borg/ui";
+import { CheckIcon, SearchIcon, useTheme } from "@borg/ui";
 import { dispatchKeybind, hintFor, useKeybind } from "../../lib/keybinds";
 import { useQuery } from "../../lib/useDaemon";
 import { useSettings } from "../../lib/settings";
 import { routes } from "../../routes";
+import { buildCommands } from "./commands";
 import { rank, type Command } from "./score";
 
 /**
@@ -21,6 +22,7 @@ import { rank, type Command } from "./score";
 export function CommandPalette() {
   const navigate = useNavigate();
   const settings = useSettings();
+  const { preference, setPreference } = useTheme();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -36,50 +38,85 @@ export function CommandPalette() {
     [open],
   );
 
-  const commands = useMemo<Command[]>(() => {
-    const go: Command[] = routes.map((route) => ({
-      id: `route:${route.id}`,
-      label: `Go to ${route.label}`,
-      hint: "Navigate",
-      run: () => navigate(route.path),
-    }));
+  // Values written but not yet confirmed by a fresh snapshot. Without this a
+  // toggle reads its old value until the write round-trips, so pressing Enter
+  // twice writes the same value twice and the second press silently does
+  // nothing. Cleared per key when the snapshot catches up, or on failure.
+  const [pending, setPending] = useState<Map<string, string>>(new Map());
+  const [saveError, setSaveError] = useState<string>();
 
-    const actions: Command[] = [
-      {
-        id: "action:new",
-        label: "New conversation",
-        // Both the hint and the behaviour come from the keybind layer, so the
-        // palette can never advertise or perform a stale version of either.
-        hint: hintFor("new-conversation"),
-        keywords: "chat start fresh",
-        run: () => dispatchKeybind("new-conversation"),
-      },
-    ];
+  const forget = (key: string) =>
+    setPending((prev) => {
+      const next = new Map(prev);
+      next.delete(key);
+      return next;
+    });
 
-    const recents: Command[] = (sessions.state === "ready" ? sessions.data : []).map((s) => ({
-      id: `session:${s.id}`,
-      label: s.title || "Untitled",
-      hint: "Conversation",
-      run: () => navigate(`/c/${s.id}`),
-    }));
+  const saveSetting = useCallback(
+    (key: string, value: string) => {
+      setSaveError(undefined);
+      setPending((prev) => new Map(prev).set(key, value));
+      void settings.save(key, value).then((ok) => {
+        // Reporting success we did not have would leave the row showing a
+        // state the daemon never took.
+        if (!ok)
+          setSaveError(`Could not change that setting. ${settings.saveError?.message ?? ""}`);
+        forget(key);
+      });
+    },
+    [settings.save, settings.saveError],
+  );
 
-    const registry = settings.settings.state === "ready" ? [...settings.settings.data.keys()] : [];
-    const settingRows: Command[] = registry.map((key) => ({
-      id: `setting:${key}`,
-      label: key,
-      hint: "Setting",
-      // Dots and underscores hide word boundaries from the subsequence match.
-      keywords: key.replace(/[._]/g, " "),
-      run: () => navigate(`/settings/key/${encodeURIComponent(key)}`),
-    }));
+  const snapshot = settings.settings.state === "ready" ? settings.settings.data : undefined;
+  const effective = useMemo(() => {
+    if (!snapshot || pending.size === 0) return snapshot;
+    const merged = new Map(snapshot);
+    for (const [key, value] of pending) {
+      const current = merged.get(key);
+      if (current) merged.set(key, { ...current, value });
+    }
+    return merged;
+  }, [snapshot, pending]);
 
-    return [...actions, ...go, ...recents, ...settingRows];
-  }, [navigate, sessions.state, sessions.data, settings.settings]);
+  // Only whether a query exists matters, not what it is. Depending on the text
+  // would rebuild every one of ~500 rows on each keystroke.
+  const searching = query.trim() !== "";
+  const commands = useMemo<Command[]>(
+    () =>
+      buildCommands(
+        {
+          navigate,
+          dispatch: dispatchKeybind,
+          hintFor,
+          settings: effective,
+          saveSetting,
+          sessions: sessions.state === "ready" ? sessions.data : [],
+          themePreference: preference,
+          setThemePreference: setPreference,
+          searching,
+        },
+        routes,
+      ),
+    [
+      navigate,
+      sessions.state,
+      sessions.data,
+      effective,
+      saveSetting,
+      preference,
+      setPreference,
+      searching,
+    ],
+  );
 
   const results = useMemo(() => rank(commands, query).slice(0, 40), [commands, query]);
 
   // A stale cursor from a longer list would point past the end of a shorter one.
   useEffect(() => setCursor(0), [query]);
+
+  useEffect(() => {
+    if (!open) setSaveError(undefined);
+  }, [open]);
 
   useEffect(() => {
     if (!open) setQuery("");
@@ -94,7 +131,9 @@ export function CommandPalette() {
 
   const choose = (command: Command | undefined) => {
     if (!command) return;
-    setOpen(false);
+    // A toggle or a theme is picked by watching it land, so those rows keep the
+    // palette open. Closing would hide the only confirmation the row gives.
+    if (!command.keepOpen) setOpen(false);
     command.run();
   };
 
@@ -132,6 +171,18 @@ export function CommandPalette() {
           />
         </div>
 
+        {/* A row that keeps the palette open so you can watch a toggle land
+            has to say when it did not. Otherwise a failed write looks exactly
+            like a slow one: the state simply never changes. */}
+        {saveError && (
+          <div
+            role="alert"
+            className="flex-none border-b border-line2 px-4 py-2 text-[11.5px] leading-[1.4] text-alert"
+          >
+            {saveError.trim()} Check that the Borg app is running, then try again.
+          </div>
+        )}
+
         <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto py-1.5">
           {results.length === 0 && (
             <div className="px-4 py-6 text-center text-[12.5px] leading-[1.5] text-ink3">
@@ -148,9 +199,16 @@ export function CommandPalette() {
                 i === cursor ? "bg-surface3" : "bg-transparent"
               }`}
             >
-              <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[1.35] text-ink">
+              <span className="min-w-0 truncate text-[13.5px] leading-[1.35] text-ink">
                 {command.label}
               </span>
+              {command.detail && (
+                <span className="flex-none text-[11.5px] leading-none text-ink3">
+                  {command.detail}
+                </span>
+              )}
+              <span className="min-w-0 flex-1" />
+              {command.active && <CheckIcon size={14} role="img" aria-label="Current" />}
               {command.hint && (
                 <span className="flex-none text-[11px] leading-none text-ink3">{command.hint}</span>
               )}

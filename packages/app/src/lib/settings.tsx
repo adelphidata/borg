@@ -8,6 +8,15 @@ export interface DaemonSetting {
   value: string;
   /** True when the value is a DB override rather than the compiled default. */
   overridden: boolean;
+  /**
+   * Curated display metadata from the daemon's settings table. Empty for a key
+   * that table does not name — the great majority — which is what marks a
+   * setting as internal rather than something to put in front of someone.
+   */
+  label: string;
+  /** `bool` | `float` | `uint` | `select` | `text` | `secret`, or empty. */
+  kind: string;
+  group: string;
 }
 
 interface SettingsContextValue {
@@ -34,7 +43,14 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     return new Map(
       snapshot.entries.map((e) => [
         e.key,
-        { key: e.key, value: e.value, overridden: e.category === "db" },
+        {
+          key: e.key,
+          value: e.value,
+          overridden: e.category === "db",
+          label: e.label,
+          kind: e.kind,
+          group: e.group,
+        },
       ]),
     );
   });
