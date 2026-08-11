@@ -3,6 +3,7 @@
 //! Provides ghost commits (full repo snapshots for atomic undo), git context
 //! collection for system prompt enrichment, and turn diff tracking.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -56,7 +57,8 @@ pub(crate) fn hardened_prelude() -> &'static [&'static str] {
     ]
 }
 
-/// Make a `git` invocation non-interactive.
+/// Harden a `git` invocation: scrub its environment and make it
+/// non-interactive.
 ///
 /// Every git command we run is local plumbing, so nothing should ever prompt.
 /// Two independent channels have to be closed:
@@ -68,16 +70,27 @@ pub(crate) fn hardened_prelude() -> &'static [&'static str] {
 /// * **the controlling terminal** — git opens `/dev/tty` *directly* for
 ///   credential prompts, so nulling stdin alone does not stop it.
 ///   `GIT_TERMINAL_PROMPT=0` turns a would-be prompt into an immediate error.
-fn make_git_non_interactive(cmd: &mut tokio::process::Command) {
+///
+/// The environment is scrubbed for the same reason the shell tool, the hook
+/// runner, and MCP stdio children scrub theirs: git is a child process that
+/// prints what it is told to print, and the daemon's environment holds every
+/// provider key the credential pool has loaded. A repository that configures
+/// an alias or an external diff driver should not be able to read them, and
+/// git needs none of them for local plumbing.
+fn harden_git_command(cmd: &mut tokio::process::Command) {
     // Delegates rather than repeating the body: this is a security contract, and
     // the next hardening env var added to one copy would silently miss the other.
-    make_git_non_interactive_sync(cmd.as_std_mut());
+    harden_git_command_sync(cmd.as_std_mut());
 }
 
-/// [`make_git_non_interactive`] for the blocking `std::process` git runners in
+/// [`harden_git_command`] for the blocking `std::process` git runners in
 /// the patch applicator (which run under [`run_sync_with_timeout`]). A
 /// credential prompt there would still burn the whole budget before erroring.
-pub(crate) fn make_git_non_interactive_sync(cmd: &mut std::process::Command) {
+pub(crate) fn harden_git_command_sync(cmd: &mut std::process::Command) {
+    // Filter first: it starts with `env_clear`, so anything set before this
+    // call is dropped, and `GIT_TERMINAL_PROMPT` below must come after it —
+    // the name is on the allowlist, so an ambient `=1` would otherwise win.
+    crate::security::env_allowlist::apply_filtered_env_std(cmd, &HashMap::new());
     cmd.stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
 }
@@ -242,7 +255,7 @@ pub(crate) fn git_config_env(overrides: &[(String, String)]) -> Vec<(String, Str
 async fn filter_neutralizing_env(cwd: &Path) -> Vec<(String, String)> {
     let mut discovery = tokio::process::Command::new("git");
     discovery.args(filter_discovery_argv()).current_dir(cwd);
-    make_git_non_interactive(&mut discovery);
+    harden_git_command(&mut discovery);
     let result = run_with_timeout(discovery).await;
     let stdout = match result {
         // `--get-regexp` exits 1 when nothing matches — that's the common case.
@@ -461,7 +474,7 @@ async fn run_git_inner(
     argv.extend_from_slice(args);
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&argv).current_dir(cwd);
-    make_git_non_interactive(&mut cmd);
+    harden_git_command(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -1492,5 +1505,84 @@ mod tests {
         let ctx = collect_git_context(&repo).await;
         assert_eq!(ctx.repo_root, ctx.main_repo_root);
         assert!(!format_git_context(&ctx).contains("Linked worktree of"));
+    }
+
+    #[test]
+    fn hardening_replaces_the_environment_rather_than_adding_to_it() {
+        let mut cmd = std::process::Command::new("git");
+        // Whatever a caller staged before hardening must not survive: the
+        // filter is the whole environment, not an overlay on the ambient one.
+        cmd.env("OPENROUTER_API_KEY", "sk-should-not-survive");
+        // An ambient opt-in to prompting must lose to the explicit override.
+        cmd.env("GIT_TERMINAL_PROMPT", "1");
+
+        harden_git_command_sync(&mut cmd);
+
+        let envs: HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+
+        assert!(
+            !envs.contains_key("OPENROUTER_API_KEY"),
+            "a provider key must never reach a git child"
+        );
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0"),
+            "the non-interactive override must be applied after the filter"
+        );
+        assert!(
+            envs.contains_key("PATH"),
+            "git needs PATH; the filter must re-add it explicitly, since env_clear \
+             means inheritance is no longer available"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_git_child_cannot_read_a_secret_from_its_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+
+        // A `!`-prefixed alias is the shape that matters: it runs a program of
+        // the repository's choosing, which is exactly the reader we are denying.
+        let dump = |hardened: bool| -> String {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["-c", "alias.leak=!printenv", "leak"])
+                .current_dir(dir)
+                .env("OPENROUTER_API_KEY", "sk-should-not-survive");
+            if hardened {
+                harden_git_command_sync(&mut cmd);
+            }
+            let out = cmd.output().expect("spawn git");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+
+        assert!(
+            dump(false).contains("sk-should-not-survive"),
+            "control: without hardening a git child does read the parent env, \
+             so the assertion below is testing something real"
+        );
+        assert!(
+            !dump(true).contains("sk-should-not-survive"),
+            "the hardened runner must not hand a provider key to git"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_still_functions_under_the_scrubbed_environment() {
+        // The filter is only safe if git keeps working: PATH, HOME and the
+        // locale vars have to survive it, or every git call fails to spawn.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+
+        let head = run_git_inner(&["rev-parse", "--abbrev-ref", "HEAD"], dir, &[])
+            .await
+            .expect("git must still run with a filtered environment");
+        assert!(!head.is_empty(), "expected a branch name, got {head:?}");
     }
 }

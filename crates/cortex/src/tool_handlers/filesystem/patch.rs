@@ -454,7 +454,7 @@ fn filter_neutralizing_env_sync(repo_root: &std::path::Path) -> Vec<(String, Str
     discovery
         .args(crate::git::filter_discovery_argv())
         .current_dir(repo_root);
-    crate::git::make_git_non_interactive_sync(&mut discovery);
+    crate::git::harden_git_command_sync(&mut discovery);
     let output = crate::git::run_sync_with_timeout(discovery);
     match output {
         // `--get-regexp` exits 1 when nothing matches — the common case.
@@ -482,7 +482,7 @@ fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: &[(String, String)]) 
     argv.extend_from_slice(args);
     let mut cmd = std::process::Command::new("git");
     cmd.args(&argv).current_dir(cwd);
-    crate::git::make_git_non_interactive_sync(&mut cmd);
+    crate::git::harden_git_command_sync(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }

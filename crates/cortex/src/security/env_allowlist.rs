@@ -373,6 +373,18 @@ pub fn filter_parent_env(extra_allowed: &HashSet<String>) -> HashMap<String, Str
 /// caller-controlled value is never accidentally shadowed by an ambient
 /// parent-env entry of the same name.
 pub fn apply_filtered_env(cmd: &mut tokio::process::Command, extra_env: &HashMap<String, String>) {
+    // Both spellings must stay one implementation: a name added to the filter
+    // for the async spawn sites has to reach the blocking ones too, and two
+    // bodies would drift the first time only one is edited.
+    apply_filtered_env_std(cmd.as_std_mut(), extra_env);
+}
+
+/// [`apply_filtered_env`] for callers holding a blocking [`std::process::Command`]
+/// — the git runners in the patch applicator spawn that way.
+pub fn apply_filtered_env_std(
+    cmd: &mut std::process::Command,
+    extra_env: &HashMap<String, String>,
+) {
     cmd.env_clear();
     for (k, v) in filter_parent_env(&HashSet::new()) {
         if !extra_env.contains_key(&k) {
