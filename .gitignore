@@ -40,6 +40,13 @@ issues/
 /.claude/hooks/
 /.claude/
 /.agents/
+# ...except the checked-in build-cache hook. Re-listing each level is required:
+# git will not descend into an ignored directory to find a negation.
+!/.claude/
+/.claude/*
+!/.claude/hooks/
+/.claude/hooks/*
+!/.claude/hooks/clean-worktree-target.py
 
 # Local scratch scripts (one-off maintenance tooling)
 /scripts/scratch/
