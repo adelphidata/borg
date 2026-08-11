@@ -118,8 +118,46 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
-fn parse_u64(s: &str) -> Option<u64> {
-    s.trim().parse::<u64>().ok()
+/// Which way a fractional header value is rounded.
+#[derive(Clone, Copy)]
+enum Rounding {
+    /// Toward zero — used for `remaining`, so we never claim headroom the
+    /// provider did not grant.
+    Down,
+    /// Away from zero — used for `limit`, since a larger denominator lowers
+    /// [`Bucket::remaining_pct`].
+    Up,
+}
+
+/// Parse a rate-limit count that may arrive fractional.
+///
+/// Providers usually send integers, but some report a computed allowance such
+/// as `999.5`. A strict integer parse rejected those, and [`build_bucket`]
+/// dropped the whole bucket — silently disabling headroom-aware routing for
+/// that credential exactly when it mattered. The reset parser in this module
+/// already accepted fractional durations, so this closes an inconsistency too.
+///
+/// Both rounding directions push `remaining_pct` *down*, so a fractional
+/// header can only make the pool more cautious, never less. Genuinely
+/// unparseable input still yields `None` and drops that bucket alone.
+fn parse_count(s: &str, rounding: Rounding) -> Option<u64> {
+    let s = s.trim();
+    // Integer first: f64 cannot represent every u64 exactly, and a provider
+    // reporting a very large token budget deserves the exact value.
+    if let Ok(exact) = s.parse::<u64>() {
+        return Some(exact);
+    }
+    let value = s.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let rounded = match rounding {
+        Rounding::Down => value.floor(),
+        Rounding::Up => value.ceil(),
+    };
+    // Float-to-int casts saturate, so an out-of-range value clamps to u64::MAX
+    // rather than wrapping.
+    Some(rounded as u64)
 }
 
 fn parse_openai_style(headers: &HeaderMap, now_ms: i64) -> (Option<Bucket>, Option<Bucket>) {
@@ -206,8 +244,8 @@ fn build_bucket<F>(
 where
     F: Fn(&str, i64) -> Option<i64>,
 {
-    let limit = parse_u64(limit?)?;
-    let remaining = parse_u64(remaining?)?;
+    let limit = parse_count(limit?, Rounding::Up)?;
+    let remaining = parse_count(remaining?, Rounding::Down)?;
     let reset_at_ms = parse_reset(reset?, now_ms)?;
     Some(Bucket {
         limit,
@@ -472,6 +510,122 @@ mod tests {
         );
         let tok = snap.tokens.expect("tokens bucket should survive");
         assert_eq!(tok.remaining, 50);
+    }
+
+    /// A provider reporting a computed allowance (`999.5`) used to drop the
+    /// whole bucket, silently disabling headroom-aware routing for that
+    /// credential.
+    #[test]
+    fn fractional_counts_produce_a_bucket() {
+        let h = hm(&[
+            ("x-ratelimit-limit-requests", "1000.5"),
+            ("x-ratelimit-remaining-requests", "12.9"),
+            ("x-ratelimit-reset-requests", "30s"),
+        ]);
+        let snap = parse_rate_limit_headers(Provider::OpenAi, &h, NOW).expect("snapshot");
+        let bucket = snap.requests.expect("fractional bucket must survive");
+        assert_eq!(
+            bucket.remaining, 12,
+            "remaining rounds down so we never claim headroom the provider withheld"
+        );
+        assert_eq!(
+            bucket.limit, 1001,
+            "limit rounds up so the computed headroom percentage stays cautious"
+        );
+    }
+
+    /// Anthropic's family goes through the same parser, so the fix must hold
+    /// for both header flavors.
+    #[test]
+    fn fractional_counts_produce_a_bucket_for_anthropic_headers() {
+        let h = hm(&[
+            ("anthropic-ratelimit-requests-limit", "40.0"),
+            ("anthropic-ratelimit-requests-remaining", "0.5"),
+            ("anthropic-ratelimit-requests-reset", "2030-01-01T00:00:00Z"),
+        ]);
+        let snap = parse_rate_limit_headers(Provider::Anthropic, &h, NOW).expect("snapshot");
+        let bucket = snap.requests.expect("fractional bucket must survive");
+        assert_eq!(bucket.limit, 40);
+        assert_eq!(
+            bucket.remaining, 0,
+            "half a request is not a request — round down to empty"
+        );
+        assert_eq!(
+            bucket.remaining_pct(),
+            0,
+            "a nearly-empty bucket must read as empty so the pool rotates off it"
+        );
+    }
+
+    /// Rounding must stay conservative: a fraction can only lower the reported
+    /// headroom, never raise it above what an exact reading would give.
+    #[test]
+    fn fractional_rounding_never_overstates_headroom() {
+        let fractional = hm(&[
+            ("x-ratelimit-limit-requests", "100.4"),
+            ("x-ratelimit-remaining-requests", "50.9"),
+            ("x-ratelimit-reset-requests", "1s"),
+        ]);
+        let exact = hm(&[
+            ("x-ratelimit-limit-requests", "100"),
+            ("x-ratelimit-remaining-requests", "50"),
+            ("x-ratelimit-reset-requests", "1s"),
+        ]);
+        let fractional_pct = parse_rate_limit_headers(Provider::OpenAi, &fractional, NOW)
+            .expect("snapshot")
+            .requests
+            .expect("bucket")
+            .remaining_pct();
+        let exact_pct = parse_rate_limit_headers(Provider::OpenAi, &exact, NOW)
+            .expect("snapshot")
+            .requests
+            .expect("bucket")
+            .remaining_pct();
+        assert!(
+            fractional_pct <= exact_pct,
+            "fractional {fractional_pct}% must not exceed exact {exact_pct}%"
+        );
+    }
+
+    /// Values past f64's exact-integer range must survive unchanged; routing
+    /// off a silently rounded token budget would be worse than not parsing it.
+    #[test]
+    fn very_large_integer_counts_stay_exact() {
+        let huge = (1u64 << 60) + 1;
+        let h = hm(&[
+            ("x-ratelimit-limit-tokens", &huge.to_string()),
+            ("x-ratelimit-remaining-tokens", &huge.to_string()),
+            ("x-ratelimit-reset-tokens", "1s"),
+        ]);
+        let snap = parse_rate_limit_headers(Provider::OpenAi, &h, NOW).expect("snapshot");
+        let bucket = snap.tokens.expect("bucket");
+        assert_eq!(bucket.limit, huge);
+        assert_eq!(bucket.remaining, huge);
+    }
+
+    /// Widening the parser must not start accepting nonsense. Negatives,
+    /// non-finite values, and plain garbage still drop their bucket.
+    #[test]
+    fn non_numeric_and_out_of_domain_counts_still_drop_the_bucket() {
+        for bad in ["abc", "-1", "-0.5", "NaN", "inf", "1e", ""] {
+            let h = hm(&[
+                ("x-ratelimit-limit-requests", "100"),
+                ("x-ratelimit-remaining-requests", bad),
+                ("x-ratelimit-reset-requests", "1s"),
+                ("x-ratelimit-limit-tokens", "100"),
+                ("x-ratelimit-remaining-tokens", "50"),
+                ("x-ratelimit-reset-tokens", "2s"),
+            ]);
+            let snap = parse_rate_limit_headers(Provider::OpenAi, &h, NOW).expect("snapshot");
+            assert!(
+                snap.requests.is_none(),
+                "remaining={bad:?} must drop the requests bucket"
+            );
+            assert!(
+                snap.tokens.is_some(),
+                "remaining={bad:?} must not disturb the tokens bucket"
+            );
+        }
     }
 
     #[test]
