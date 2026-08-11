@@ -630,10 +630,17 @@ impl<'a> App<'a> {
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::BudgetLimited => "budget hit",
-            // Suppressed states: the goal is either already resolved
-            // (Complete) or the agent is actively handling the condition
-            // (Blocked, UsageLimited) — a passive footer tag would be noise.
-            GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::Complete => return None,
+            // Blocked stops auto-continuation until the user resumes, so
+            // nothing is moving and nobody is coming. Suppressing it made a
+            // dead goal indistinguishable from no goal at all — the user had
+            // to run `/goal` to discover the run had stopped. "stalled"
+            // answers the question the footer is actually asked: is anything
+            // still happening?
+            GoalStatus::Blocked => "stalled",
+            // Still suppressed: the goal is already resolved (Complete), or
+            // the agent recovers on its own once the provider window reopens
+            // (UsageLimited) — a passive footer tag would be noise.
+            GoalStatus::UsageLimited | GoalStatus::Complete => return None,
         };
         let started_at = self.goal_started_at?;
         let now = chrono::Utc::now().timestamp();
@@ -1881,14 +1888,25 @@ mod tests {
         assert_eq!(tag, "/goal budget hit (45s)");
     }
 
+    /// A blocked goal has stopped auto-continuing and waits on the user. If
+    /// the footer stays silent it looks exactly like no goal at all, and the
+    /// run sits dead until someone thinks to type `/goal`.
+    #[test]
+    fn goal_indicator_blocked_reads_as_stalled() {
+        let mut app = make_app();
+        app.goal_status = Some(cortex::goals::GoalStatus::Blocked);
+        let now = chrono::Utc::now().timestamp();
+        app.goal_started_at = Some(now - 45); // 45s elapsed
+        let tag = app.compose_goal_indicator().expect("indicator");
+        assert_eq!(tag, "/goal stalled (45s)");
+    }
+
     #[test]
     fn goal_indicator_suppressed_for_silent_states() {
-        // Complete / Blocked / UsageLimited are not surfaced as a passive
-        // footer tag — the goal is either done or the agent is actively
-        // handling the condition.
+        // Complete is done; UsageLimited recovers on its own once the
+        // provider window reopens. Neither earns a passive footer tag.
         for state in [
             cortex::goals::GoalStatus::Complete,
-            cortex::goals::GoalStatus::Blocked,
             cortex::goals::GoalStatus::UsageLimited,
         ] {
             let mut app = make_app();
