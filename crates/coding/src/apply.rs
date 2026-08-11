@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::fs_atomic::UTF8_BOM;
@@ -80,12 +80,20 @@ impl Deref for ApplyPatchResult {
     }
 }
 
-/// Validate that `path` stays within `base_dir` after canonicalization.
+/// Validate that `path` stays within `base_dir` after canonicalization, and
+/// return the resolved absolute path.
+///
+/// The resolved path is the caller's dedup key: two operations can spell the
+/// same file differently (`a.txt` and `./a.txt`, or a symlink and its target)
+/// and only the resolved form reveals that they collide. It is deliberately
+/// *not* used as the write path — [`reject_symlink`] must still see the
+/// literal spelling, or a patch that writes through a symlink would resolve to
+/// the target and slip past that guard.
 ///
 /// NOTE: This function enforces base_dir containment. Cross-directory support
 /// is handled at the tool handler layer by setting base_dir="/" and pre-validating
 /// paths against blocked_paths. Do not loosen this check here.
-fn validate_patch_path(path: &str, base_dir: &Path) -> Result<()> {
+fn validate_patch_path(path: &str, base_dir: &Path) -> Result<PathBuf> {
     if path.is_empty() {
         bail!("Empty file path in patch operation");
     }
@@ -126,7 +134,76 @@ fn validate_patch_path(path: &str, base_dir: &Path) -> Result<()> {
     if !resolved.starts_with(&canonical_base) {
         bail!("Path traversal detected: '{path}' escapes base directory");
     }
-    Ok(())
+    Ok(resolved)
+}
+
+/// What a single patch operation does to one file.
+#[derive(Clone, Copy)]
+enum TargetRole {
+    /// The file's content is produced: an add, an in-place update, or a move
+    /// destination.
+    Written,
+    /// The file ceases to exist: a delete, or the source side of a move.
+    Removed,
+}
+
+impl TargetRole {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Written => "write",
+            Self::Removed => "remove",
+        }
+    }
+}
+
+/// Tracks which file each operation has already written or removed, keyed by
+/// resolved path.
+#[derive(Default)]
+struct ClaimedTargets {
+    written: HashMap<PathBuf, String>,
+    removed: HashMap<PathBuf, String>,
+}
+
+impl ClaimedTargets {
+    /// Record that the operation spelled `literal` plays `role` for `resolved`.
+    ///
+    /// Rejects only the two genuinely incoherent cases: writing one file twice,
+    /// or removing it twice. Both are silent data loss today, because the
+    /// overlay is keyed by the *literal* spelling — `a.txt` and `./a.txt` (or a
+    /// symlink and its target) occupy separate entries, so each operation
+    /// derives its content from the pre-patch file and the later write discards
+    /// the earlier one. [`commit_prepared_patch`] compounds it by snapshotting
+    /// the file twice for rollback, the second time after the first write has
+    /// already landed.
+    ///
+    /// A file may still be removed and then written, or written and then
+    /// removed. That is what makes a move chain (`a`→`b`, `c`→`a`) legal: `a`
+    /// is a move source and then a move destination, which is coherent and
+    /// applies in order.
+    fn claim(
+        &mut self,
+        role: TargetRole,
+        resolved: PathBuf,
+        literal: &str,
+    ) -> std::result::Result<(), String> {
+        let slot = match role {
+            TargetRole::Written => &mut self.written,
+            TargetRole::Removed => &mut self.removed,
+        };
+        match slot.get(&resolved) {
+            Some(first) if first == literal => {
+                Err(format!("Multiple operations {} '{literal}'", role.verb()))
+            }
+            Some(first) => Err(format!(
+                "Multiple operations {} the same file: '{first}' and '{literal}'",
+                role.verb()
+            )),
+            None => {
+                slot.insert(resolved, literal.to_string());
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Snapshot of a file's state before patch application, for rollback.
@@ -176,6 +253,10 @@ fn reject_symlink(path: &std::path::Path) -> Result<()> {
 fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
     let mut errors = Vec::new();
     let mut overlay: HashMap<String, Option<String>> = HashMap::new();
+    // Keyed by resolved path because the overlay above is keyed by the literal
+    // one, which is what lets two spellings of one file diverge; see
+    // [`ClaimedTargets::claim`].
+    let mut claimed = ClaimedTargets::default();
     let mut actions = Vec::new();
     let mut affected = AffectedPaths::default();
     let mut diffs = Vec::new();
@@ -183,8 +264,15 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
     for op in &patch.operations {
         match op {
             PatchOperation::AddFile { path, content } => {
-                if let Err(err) = validate_patch_path(path, base_dir) {
-                    errors.push(err.to_string());
+                let resolved = match validate_patch_path(path, base_dir) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                if let Err(err) = claimed.claim(TargetRole::Written, resolved, path) {
+                    errors.push(err);
                     continue;
                 }
                 if content.len() > MAX_PATCH_FILE_SIZE {
@@ -225,14 +313,39 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                 move_to,
                 hunks,
             } => {
-                if let Err(err) = validate_patch_path(path, base_dir) {
-                    errors.push(err.to_string());
+                let resolved = match validate_patch_path(path, base_dir) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                // A rename retires the source and produces the destination. A
+                // move onto itself names one file twice, so it stays a plain
+                // in-place write.
+                let renames = move_to.as_ref().is_some_and(|dest| dest != path);
+                let source_role = if renames {
+                    TargetRole::Removed
+                } else {
+                    TargetRole::Written
+                };
+                if let Err(err) = claimed.claim(source_role, resolved, path) {
+                    errors.push(err);
                     continue;
                 }
                 if let Some(dest) = move_to {
-                    if let Err(err) = validate_patch_path(dest, base_dir) {
-                        errors.push(err.to_string());
-                        continue;
+                    let resolved_dest = match validate_patch_path(dest, base_dir) {
+                        Ok(resolved) => resolved,
+                        Err(err) => {
+                            errors.push(err.to_string());
+                            continue;
+                        }
+                    };
+                    if renames {
+                        if let Err(err) = claimed.claim(TargetRole::Written, resolved_dest, dest) {
+                            errors.push(err);
+                            continue;
+                        }
                     }
                 }
 
@@ -344,8 +457,15 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                 }
             }
             PatchOperation::DeleteFile { path } => {
-                if let Err(err) = validate_patch_path(path, base_dir) {
-                    errors.push(err.to_string());
+                let resolved = match validate_patch_path(path, base_dir) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
+                if let Err(err) = claimed.claim(TargetRole::Removed, resolved, path) {
+                    errors.push(err);
                     continue;
                 }
 
@@ -1038,6 +1158,199 @@ mod tests {
         assert_eq!(affected.added, vec!["sub/dir/hello.txt"]);
         let content = std::fs::read_to_string(dir.path().join("sub/dir/hello.txt")).unwrap();
         assert_eq!(content, "hello world");
+    }
+
+    /// Two updates spelled differently resolve to one file. Before the claim
+    /// gate both keyed the overlay separately, each rebased on the pre-patch
+    /// content, and the second write silently discarded the first.
+    #[test]
+    fn two_updates_of_one_file_via_different_spellings_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::UpdateFile {
+                path: "f.txt".to_string(),
+                move_to: None,
+                hunks: vec![simple_hunk("a", "b")],
+            },
+            PatchOperation::UpdateFile {
+                path: "./f.txt".to_string(),
+                move_to: None,
+                hunks: vec![simple_hunk("a", "c")],
+            },
+        ]);
+
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("write the same file") && err.contains("f.txt"),
+            "collision must name the conflicting spellings, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\n",
+            "a rejected patch must not touch the filesystem"
+        );
+    }
+
+    /// The same defect reached through a symlink: two different names, one
+    /// underlying file. Only comparing *resolved* paths catches this.
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_symlink_and_its_target_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("real.txt"), "a\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+            .unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::UpdateFile {
+                path: "real.txt".to_string(),
+                move_to: None,
+                hunks: vec![simple_hunk("a", "b")],
+            },
+            PatchOperation::UpdateFile {
+                path: "link.txt".to_string(),
+                move_to: None,
+                hunks: vec![simple_hunk("a", "c")],
+            },
+        ]);
+
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("write the same file"),
+            "symlink and target must collide, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("real.txt")).unwrap(),
+            "a\n"
+        );
+    }
+
+    #[test]
+    fn two_deletes_of_one_file_via_different_spellings_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::DeleteFile {
+                path: "f.txt".to_string(),
+            },
+            PatchOperation::DeleteFile {
+                path: "./f.txt".to_string(),
+            },
+        ]);
+
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("remove the same file"),
+            "double delete must be reported as a removal collision, got: {err}"
+        );
+        assert!(
+            dir.path().join("f.txt").exists(),
+            "a rejected patch must not delete anything"
+        );
+    }
+
+    /// Repeating one spelling is the same defect, and must name it plainly
+    /// rather than claiming two different files collided.
+    #[test]
+    fn two_adds_of_the_same_spelling_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        let patch = make_patch(vec![
+            PatchOperation::AddFile {
+                path: "new.txt".to_string(),
+                content: "first".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "new.txt".to_string(),
+                content: "second".to_string(),
+            },
+        ]);
+
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("Multiple operations write 'new.txt'"),
+            "got: {err}"
+        );
+        assert!(!dir.path().join("new.txt").exists());
+    }
+
+    /// Regression guard for the claim gate's role split: a file may be a move
+    /// *source* and then a move *destination* in one patch. Rejecting that
+    /// would forbid rotating files through a shared name.
+    #[test]
+    fn move_chain_reusing_a_name_still_applies() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "from a\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "from c\n").unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::UpdateFile {
+                path: "a.txt".to_string(),
+                move_to: Some("b.txt".to_string()),
+                hunks: Vec::new(),
+            },
+            PatchOperation::UpdateFile {
+                path: "c.txt".to_string(),
+                move_to: Some("a.txt".to_string()),
+                hunks: Vec::new(),
+            },
+        ]);
+
+        apply_patch(&patch, dir.path()).expect("a move chain must still apply");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "from a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "from c\n"
+        );
+        assert!(!dir.path().join("c.txt").exists());
+    }
+
+    /// Removing a file and then recreating it is coherent and stays allowed.
+    #[test]
+    fn delete_then_add_of_one_file_still_applies() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::DeleteFile {
+                path: "f.txt".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "f.txt".to_string(),
+                content: "new\n".to_string(),
+            },
+        ]);
+
+        apply_patch(&patch, dir.path()).expect("delete then re-add must apply");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// A rename onto the file's own name is a plain in-place update, not a
+    /// self-collision.
+    #[test]
+    fn move_onto_the_same_path_still_applies() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: Some("f.txt".to_string()),
+            hunks: vec![simple_hunk("a", "b")],
+        }]);
+
+        apply_patch(&patch, dir.path()).expect("self-move must apply");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "b\n"
+        );
     }
 
     #[test]

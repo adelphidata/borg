@@ -29,6 +29,42 @@ use std::fs;
 
 use coding::apply_patch_to_dir;
 
+// ── Test: one file reached twice through different spellings ──
+
+/// End-to-end through the DSL parser: a real patch that edits `notes.txt` and
+/// `./notes.txt` must be refused, not silently apply only the second hunk set.
+#[test]
+fn patch_text_targeting_one_file_twice_is_rejected() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+    fs::write(dir.join("notes.txt"), "alpha\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-alpha
++beta
+*** Update File: ./notes.txt
+@@
+-alpha
++gamma
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir)
+        .expect_err("two operations on one file must be refused")
+        .to_string();
+    assert!(
+        err.contains("write the same file"),
+        "error must explain the collision, got: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("notes.txt")).expect("read"),
+        "alpha\n",
+        "a refused patch must leave the file untouched"
+    );
+}
+
 // ── Test: multi-file add in single patch ──
 
 #[test]
