@@ -40,6 +40,8 @@ pub mod policy;
 pub mod runner;
 /// macOS Seatbelt profile generation.
 pub mod seatbelt;
+/// Normalized sandbox denial events (classification only).
+pub mod violation;
 /// Windows sandbox backend (trampoline arg construction, restricted-token
 /// and elevated-IPC backends). Trampoline arg construction is
 /// platform-neutral so it builds and tests on all hosts; the actual

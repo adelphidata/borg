@@ -783,6 +783,7 @@ pub async fn handle_run_shell_with_context(
             } else {
                 (stdout, stderr)
             };
+            note_sandbox_denial(ctx, &stderr, code).await;
             let mut result =
                 format!("Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
             if code != Some(0) {
@@ -973,6 +974,7 @@ pub async fn run_gate_command(
             if let Some(g) = _guard {
                 g.complete(code);
             }
+            note_sandbox_denial(ctx, &stderr, code).await;
             let output = if stderr.trim().is_empty() {
                 stdout
             } else if stdout.trim().is_empty() {
@@ -1144,6 +1146,30 @@ async fn session_action_with_registry(
 /// echo > /etc/passwd` from an IDE-launched agent can't escape the
 /// declared workspace. Non-ACP callers retain the existing direct-spawn
 /// behavior to avoid changing semantics for the TUI/REPL.
+/// File a sandbox denial into the vitals chain, if this command was sandboxed
+/// and its result looks like one.
+///
+/// Observability only: the command has already failed by the time this runs,
+/// and nothing here can change that. It is deliberately gated on the same
+/// condition as [`wrap_run_shell_for_sandbox`] — an unsandboxed command cannot
+/// produce a denial, so classifying its stderr could only produce noise.
+async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str, code: Option<i32>) {
+    if !ctx.enforce_workspace_root() {
+        return;
+    }
+    let backend = sandbox::violation::SandboxBackend::current();
+    let Some(violation) = sandbox::violation::classify(backend, code, stderr) else {
+        return;
+    };
+    tracing::info!(
+        backend = backend.as_str(),
+        kind = violation.kind.as_str(),
+        reason = %violation.reason,
+        "sandbox denied an operation"
+    );
+    crate::vitals::record_sandbox_violation(&violation).await;
+}
+
 fn wrap_run_shell_for_sandbox(
     ctx: &ExecutionContext,
     config: &Config,

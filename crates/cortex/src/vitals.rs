@@ -801,6 +801,63 @@ impl std::fmt::Debug for VitalsHook {
     }
 }
 
+/// The `source` every sandbox denial is filed under. Stable: stored rows are
+/// queried by this string.
+pub const SANDBOX_VIOLATION_SOURCE: &str = "sandbox_violation";
+
+/// Build the metadata blob for a sandbox denial.
+///
+/// Split from [`record_sandbox_violation`] so the redaction and bounding can
+/// be tested without a database — those are the parts that must not regress.
+/// The snippet is redacted here rather than at the classifier: `sandbox` has
+/// no secret patterns, and the value is about to be persisted.
+pub fn sandbox_violation_metadata(violation: &sandbox::violation::SandboxViolation) -> String {
+    let path = match &violation.kind {
+        sandbox::violation::ViolationKind::Filesystem { path } => path.clone(),
+        sandbox::violation::ViolationKind::Network => None,
+    };
+    serde_json::json!({
+        "backend": violation.backend.as_str(),
+        "kind": violation.kind.as_str(),
+        "reason": violation.reason,
+        "path": path,
+        "snippet": crate::security::secrets::redact_secrets(&violation.snippet),
+    })
+    .to_string()
+}
+
+/// Record a sandbox denial into the HMAC-verified vitals chain.
+///
+/// Filed as [`EventCategory::Telemetry`], so it contributes no stat deltas:
+/// the sandbox doing its job is not a failure of the agent, and letting a
+/// denial move stability would punish exactly the behaviour we want.
+///
+/// Best-effort by design — this is observability, and a database that will not
+/// open must never turn into a second failure on top of the denial the caller
+/// is already reporting.
+pub async fn record_sandbox_violation(violation: &sandbox::violation::SandboxViolation) {
+    let metadata = sandbox_violation_metadata(violation);
+    let db = match crate::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("sandbox violation not recorded (db open failed): {e}");
+            return;
+        }
+    };
+    let deltas = deltas_for(EventCategory::Telemetry);
+    if let Err(e) = db
+        .record_vitals_event(
+            &EventCategory::Telemetry.to_string(),
+            SANDBOX_VIOLATION_SOURCE,
+            &deltas,
+            Some(metadata.as_str()),
+        )
+        .await
+    {
+        tracing::warn!("sandbox violation not recorded: {e}");
+    }
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -1880,5 +1937,68 @@ mod tests {
         assert!(!state.chain_valid);
         assert_eq!(state.stability, 40);
         assert_eq!(state.growth, 40);
+    }
+
+    fn violation_with_snippet(snippet: &str) -> sandbox::violation::SandboxViolation {
+        sandbox::violation::SandboxViolation {
+            backend: sandbox::violation::SandboxBackend::Seatbelt,
+            kind: sandbox::violation::ViolationKind::Filesystem {
+                path: Some("/Users/someone/.ssh/id_ed25519".to_string()),
+            },
+            reason: "file-read-data".to_string(),
+            snippet: snippet.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_sandbox_violation_records_the_backend_kind_reason_and_path() {
+        let metadata =
+            sandbox_violation_metadata(&violation_with_snippet("deny(1) file-read-data"));
+        let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("valid JSON");
+
+        assert_eq!(parsed["backend"], "seatbelt");
+        assert_eq!(parsed["kind"], "filesystem");
+        assert_eq!(parsed["reason"], "file-read-data");
+        assert_eq!(parsed["path"], "/Users/someone/.ssh/id_ed25519");
+    }
+
+    #[test]
+    fn a_secret_in_the_denial_snippet_is_redacted_before_it_is_persisted() {
+        // The snippet is raw stderr from a command the agent chose to run, so
+        // it can contain anything the command printed. The vitals chain is
+        // durable and exportable; a key must not survive into it.
+        let secret = "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678";
+        let metadata = sandbox_violation_metadata(&violation_with_snippet(&format!(
+            "env ANTHROPIC_API_KEY={secret}"
+        )));
+
+        assert!(
+            !metadata.contains(secret),
+            "the denial snippet must be redacted, got: {metadata}"
+        );
+        assert!(metadata.contains("REDACTED"));
+    }
+
+    #[test]
+    fn a_network_violation_records_no_path() {
+        let violation = sandbox::violation::SandboxViolation {
+            backend: sandbox::violation::SandboxBackend::Bubblewrap,
+            kind: sandbox::violation::ViolationKind::Network,
+            reason: "bwrap-network".to_string(),
+            snippet: String::new(),
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sandbox_violation_metadata(&violation)).expect("valid JSON");
+
+        assert_eq!(parsed["kind"], "network");
+        assert!(parsed["path"].is_null());
+    }
+
+    #[test]
+    fn a_sandbox_violation_moves_no_stats() {
+        // Filed as Telemetry on purpose: the sandbox blocking something is the
+        // system working, and it must not read as the agent misbehaving.
+        assert_eq!(deltas_for(EventCategory::Telemetry), StatDeltas::default());
     }
 }
