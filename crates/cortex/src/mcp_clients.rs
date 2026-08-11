@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Config, McpServerConfig};
 use crate::types::ToolDefinition;
@@ -120,6 +120,19 @@ struct ServerLimits {
     rate_limit_per_minute: u32,
     rate_limit_burst: u32,
     call_timeout: Duration,
+    /// How long dispatch will wait for an in-flight start before giving up.
+    ///
+    /// Reuses `mcp.servers.<name>.connect_timeout_ms` rather than adding a key:
+    /// it is already the operator's answer to "how long may connecting to this
+    /// server take". `startup_grace_ms` is a *boot* budget (2s by default) and
+    /// would expire on almost every real stdio spawn.
+    ///
+    /// Note the slight stretch: a start is spawn + handshake + `tools/list`,
+    /// while this key names only the connect. The default is 5s, so a healthy
+    /// but slow stdio server can time out a first call while its start is still
+    /// legitimately running. The refusal says nothing was sent, and the start
+    /// continues, so the next call succeeds — raise the key if that shows up.
+    connect_timeout: Duration,
 }
 
 /// Commands the session actor accepts.
@@ -197,6 +210,225 @@ fn bump_server_epoch(server: &str) {
         .or_insert(0) += 1;
 }
 
+/// Terminal outcome of one server start, published to everyone waiting on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StartState {
+    /// Still starting. The only non-terminal value.
+    Running,
+    /// Started and registered; the session map now holds an entry.
+    Ready,
+    /// Did not start. `detail` is the cause chain; `reauth` marks the class of
+    /// failure retrying cannot fix.
+    Failed { detail: String, reauth: bool },
+    /// A reload removed the server while it was starting.
+    Superseded,
+}
+
+/// One in-flight start, and the channel waiters read its outcome from.
+///
+/// `tokio::sync::watch` rather than `Notify`/`oneshot`/`broadcast`: N waiters
+/// need the *value* of a one-shot event, and a waiter that subscribes after the
+/// terminal state was published must still see it. `Notify` drops that edge,
+/// `oneshot` serves one consumer, and `broadcast` can lag a slow reader out. A
+/// receiver keeps serving the last value after the sender drops, so the map
+/// entry can be removed the moment the start finishes while parked waiters
+/// still resolve.
+struct StartSlot {
+    /// Epoch captured when the claim was taken, so a superseding reload is
+    /// detectable without re-reading config.
+    epoch: u64,
+    state: watch::Sender<StartState>,
+}
+
+/// Servers with a start in flight, keyed by server name so the key agrees with
+/// `session_map`, `limits_map`, `buckets`, and `SERVER_EPOCHS`.
+///
+/// This is what lets dispatch wait for a start instead of telling the model to
+/// "retry shortly", and what stops [`reload_from_config`] spawning a second
+/// child for a server whose first start has not landed yet.
+static STARTING: OnceLock<Mutex<HashMap<String, Arc<StartSlot>>>> = OnceLock::new();
+
+fn starting_map() -> &'static Mutex<HashMap<String, Arc<StartSlot>>> {
+    STARTING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII handle for a claimed start. Dropping it publishes a terminal state, so
+/// a panicking `start_server` wakes its waiters with an error instead of
+/// hanging them until the timeout.
+struct StartClaim {
+    server: String,
+    slot: Arc<StartSlot>,
+    /// What to do with the registry if this start does not succeed — carried on
+    /// the claim so the panic path in `Drop` cleans up the same way the `Err`
+    /// path does.
+    on_failure: OnStartFailure,
+}
+
+impl StartClaim {
+    /// The epoch this start began under.
+    fn epoch(&self) -> u64 {
+        self.slot.epoch
+    }
+
+    /// Publish the terminal outcome and retire the slot.
+    ///
+    /// `Drop` still runs afterwards, and must: forgetting `self` to skip it
+    /// would also skip dropping the `Arc<StartSlot>`, leaking the whole watch
+    /// channel on every completed start. Drop is already a no-op here — it
+    /// only acts while the state is still `Running`, and `retire` is guarded by
+    /// `Arc::ptr_eq`.
+    fn finish(self, state: StartState) {
+        self.slot.state.send_replace(state);
+        self.retire();
+    }
+
+    /// Remove our own entry, and only ours.
+    ///
+    /// `Arc::ptr_eq` guards the generation: a stale claim whose server has
+    /// since been torn down and re-claimed must not evict the newer slot.
+    fn retire(&self) {
+        let mut map = lock_recover(starting_map());
+        if map
+            .get(&self.server)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &self.slot))
+        {
+            map.remove(&self.server);
+        }
+    }
+}
+
+impl Drop for StartClaim {
+    fn drop(&mut self) {
+        // Hoisted out of the `if`: holding the watch's read guard across the
+        // body would self-deadlock on `send_replace`. A plain `if` happens to
+        // drop the temporary first, but `if let` would not — do not rely on it.
+        let still_running = *self.slot.state.borrow() == StartState::Running;
+        // Only reached when `finish` was not called — a panic or an early
+        // return inside the start task. Waiters must not be left parked.
+        if still_running {
+            tracing::warn!(
+                target: MCP_LOG_TARGET,
+                event = "start_claim_dropped",
+                server = %self.server,
+                "MCP start task ended without publishing an outcome",
+            );
+            // A cache-warmed server advertised tools on the promise that this
+            // start would land. It didn't, so withdraw them — otherwise the
+            // server sits at `Starting` forever with tools nobody can call.
+            if self.on_failure == OnStartFailure::DropTools {
+                if let Some(reg) = REGISTRY.get() {
+                    reg.drop_server(&self.server);
+                }
+            }
+            self.slot.state.send_replace(StartState::Failed {
+                detail: "the start task ended without reporting an outcome".to_string(),
+                reauth: false,
+            });
+        }
+        self.retire();
+    }
+}
+
+/// Claim the right to start `server`, or report why it was not granted.
+enum StartClaimOutcome {
+    /// The caller owns the start and must publish a terminal state.
+    Claimed(Box<StartClaim>),
+    /// Someone else is already starting it; wait on this instead.
+    AlreadyStarting(watch::Receiver<StartState>),
+    /// The server is already live — nothing to start.
+    AlreadyRunning,
+}
+
+/// Take the single critical section that decides who starts a server.
+///
+/// Lock order is STARTING → session_map, and no other site takes them the other
+/// way round. Checking the session map *inside* the same critical section is
+/// what makes "at most one child per server" true by construction: a caller
+/// cannot observe "not running, not starting" and then race another caller to
+/// the spawn.
+fn claim_start(server: &str, on_failure: OnStartFailure) -> StartClaimOutcome {
+    let mut map = lock_recover(starting_map());
+    if let Some(slot) = map.get(server) {
+        return StartClaimOutcome::AlreadyStarting(slot.state.subscribe());
+    }
+    if lock_recover(session_map()).contains_key(server) {
+        return StartClaimOutcome::AlreadyRunning;
+    }
+    let (tx, _rx) = watch::channel(StartState::Running);
+    let slot = Arc::new(StartSlot {
+        epoch: server_epoch(server),
+        state: tx,
+    });
+    map.insert(server.to_string(), slot.clone());
+    StartClaimOutcome::Claimed(Box::new(StartClaim {
+        server: server.to_string(),
+        slot,
+        on_failure,
+    }))
+}
+
+/// Whether a start is in flight for `server`.
+fn is_starting(server: &str) -> bool {
+    lock_recover(starting_map()).contains_key(server)
+}
+
+/// Every server that is live *or* still starting.
+///
+/// Takes STARTING first and releases it before touching `session_map`, which is
+/// the order [`claim_start`] documents. Holding both the other way round is an
+/// ABBA deadlock against `claim_start`, and reload has two concurrent entry
+/// points (the config watcher and the admin RPC) that can hit it. Both callers
+/// go through here so the order cannot be got wrong in one of them.
+fn live_or_starting() -> HashSet<String> {
+    let starting: Vec<String> = lock_recover(starting_map()).keys().cloned().collect();
+    let sessions = lock_recover(session_map());
+    sessions.keys().cloned().chain(starting).collect()
+}
+
+/// Wake a server's waiters with [`StartState::Superseded`] and drop its slot.
+///
+/// Called from the reload teardown next to `bump_server_epoch`, so a waiter
+/// parked on a server the operator just removed resolves at once instead of
+/// sitting out its connect timeout.
+fn cancel_start(server: &str) {
+    let slot = lock_recover(starting_map()).remove(server);
+    if let Some(slot) = slot {
+        slot.state.send_replace(StartState::Superseded);
+    }
+}
+
+/// Wait for an in-flight start to reach a terminal state.
+///
+/// Returns `None` when the wait timed out — the start is still running, and
+/// crucially *nothing was dispatched*, so the caller can say so.
+async fn await_start(mut rx: watch::Receiver<StartState>, limit: Duration) -> Option<StartState> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        // Checked before waiting: the terminal state may have been published
+        // before this receiver subscribed, and `changed()` only reports edges
+        // after the current value.
+        {
+            let state = rx.borrow_and_update().clone();
+            if state != StartState::Running {
+                return Some(state);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, rx.changed()).await {
+            Ok(Ok(())) => {}
+            // The sender was dropped without a terminal state. `StartClaim`'s
+            // Drop publishes one first, so this only happens if the slot was
+            // built and abandoned outside a claim — treat it as terminal
+            // rather than spinning.
+            Ok(Err(_)) => return Some(rx.borrow().clone()),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// How long a cached catalog may be served for a server that never manages to
 /// come back up. Any successful discovery rewrites the row, so in practice this
 /// only bounds staleness for a persistently broken server.
@@ -269,6 +501,7 @@ fn record_limits(server: &str, cfg: &McpServerConfig) {
         rate_limit_per_minute: cfg.rate_limit_per_minute,
         rate_limit_burst: cfg.rate_limit_burst,
         call_timeout: Duration::from_millis(cfg.call_timeout_ms),
+        connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
     };
     let mut map = lock_recover(limits_map());
     map.insert(server.to_string(), limits);
@@ -702,6 +935,41 @@ fn blind_call_refusal(full_name: &str, input_schema: &Value, missing: &[String])
 /// next handler); `Ok(Some(text))` on success (text is already wrapped in
 /// the trust-boundary tag); `Err` for structured failures (rate limit,
 /// transport, schema mismatch). Refusals are never silent.
+/// Block until `server`'s in-flight start settles, and translate a
+/// non-dispatchable outcome into the error the model should see.
+///
+/// `None` means "go ahead": either nothing was starting, or the start
+/// succeeded. Each message below tells the model whether retrying is worth it,
+/// because guessing wrong is expensive in both directions.
+async fn await_pending_start(server: &str, limit: Duration) -> Option<anyhow::Error> {
+    let rx = {
+        let map = lock_recover(starting_map());
+        map.get(server).map(|slot| slot.state.subscribe())
+    }?;
+    match await_start(rx, limit).await {
+        Some(StartState::Ready) => None,
+        Some(StartState::Failed { detail, reauth }) if reauth => Some(anyhow!(
+            "MCP server '{server}' failed authentication while starting: {detail}. \
+             Re-add its credentials; retrying will not help."
+        )),
+        Some(StartState::Failed { detail, .. }) => {
+            Some(anyhow!("MCP server '{server}' failed to start: {detail}"))
+        }
+        Some(StartState::Superseded) => Some(anyhow!(
+            "MCP server '{server}' was removed by a config reload; its tools are \
+             no longer available."
+        )),
+        // Still `Running`, or the wait expired. Naming the no-side-effects
+        // guarantee matters: without it the model cannot tell whether a
+        // mutating call is safe to repeat.
+        Some(StartState::Running) | None => Some(anyhow!(
+            "MCP server '{server}' did not finish starting within {}ms; the call \
+             was not sent, so no side effects occurred.",
+            limit.as_millis()
+        )),
+    }
+}
+
 pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>> {
     if !name.starts_with("mcp_") {
         return Ok(None);
@@ -752,6 +1020,16 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             ));
         }
     };
+    // Join an in-flight start before the rate gate, for the same reason the
+    // blind-call probe sits there: a call that cannot succeed must not consume
+    // a rate token. Dispatch only ever *waits* — it never initiates a start.
+    // Every cached-catalog server already has one in flight from
+    // `serve_cached_catalog`, and starting one here would need `Config` on the
+    // dispatch path, which `lookup_limits` deliberately keeps off it.
+    if let Some(refusal) = await_pending_start(&tool.server, limits.connect_timeout).await {
+        return Err(refusal);
+    }
+
     let per_minute = limits.rate_limit_per_minute;
     let burst = limits.rate_limit_burst;
     let call_timeout = limits.call_timeout;
@@ -789,17 +1067,10 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         match map.get(&tool.server) {
             Some(s) => s.clone(),
             None => {
-                // The tool is registered but nothing can carry the call. When
-                // the catalog came from the cache, say so — "no live session"
-                // reads like a fault, but a starting server is expected to be
-                // callable in a moment.
-                if reg.health(&tool.server) == Some(mcp::registry::ServerHealth::Starting) {
-                    return Err(anyhow!(
-                        "MCP server '{server}' is still initializing; its tools were listed \
-                         from a cached catalog — retry shortly",
-                        server = tool.server
-                    ));
-                }
+                // Reached only after `await_pending_start` said the start
+                // succeeded, so the session existed a moment ago and has since
+                // gone. A rate token *was* spent getting here, but nothing was
+                // sent to the server.
                 return Err(anyhow!(
                     "MCP server '{server}' has no live session",
                     server = tool.server
@@ -1110,37 +1381,33 @@ pub async fn initialize(config: &Config) -> Result<()> {
     // grace expires continues in the background and registers its tools on
     // completion, exactly as a cache-warmed server already does. The agent
     // always boots promptly.
+    // Claimed through the same registry as the cache-warmed path, so a reload
+    // racing boot sees these as in-flight and does not spawn a second child.
     let mut join_set = tokio::task::JoinSet::new();
     for (name, cfg) in cold {
-        let config = config.clone();
-        let reg = reg.clone();
-        let builtin_owned: Vec<String> = builtin_refs.iter().map(ToString::to_string).collect();
-        // Captured before spawning: if a reload tears this server down while
-        // the start is in flight, the epoch moves and the task undoes its
-        // registration (mirrors the cached-catalog background start).
-        let epoch = server_epoch(&name);
+        let Some(handle) = spawn_start(
+            &name,
+            &cfg,
+            config,
+            reg,
+            &builtin_refs,
+            OnStartFailure::KeepTools,
+        ) else {
+            // Already starting or already live — nothing for this loop to do.
+            continue;
+        };
+        // Joined to hold the startup grace open. `StartClaim`'s Drop already
+        // wakes waiters and cleans up on a panic, but the payload only surfaces
+        // here — the wrapper future itself cannot panic, so the join arms below
+        // would never see it.
         join_set.spawn(async move {
-            let refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
-            if let Err(e) = start_server(&name, &cfg, &config, &reg, &refs).await {
-                report_start_failure(&name, &e, &reg).await;
-                return name;
-            }
-            if server_epoch(&name) != epoch {
-                // A reload removed this server while we were starting it, and
-                // `start_server` has just registered it again. Undo that —
-                // the operator's config is the authority, not our stale
-                // in-flight work.
-                lock_recover(session_map()).remove(&name);
-                reg.drop_server(&name);
-                purge_cached_catalog(&name).await;
-                tracing::info!(
+            if let Err(join_err) = handle.await {
+                tracing::error!(
                     target: MCP_LOG_TARGET,
-                    event = "cold_start_superseded",
-                    server = %name,
-                    "MCP server was removed while starting; its registration was rolled back",
+                    error = %join_err,
+                    "MCP start task panicked during initialize",
                 );
             }
-            name
         });
     }
 
@@ -1156,7 +1423,7 @@ pub async fn initialize(config: &Config) -> Result<()> {
             break;
         }
         match tokio::time::timeout(remaining, join_set.join_next()).await {
-            Ok(Some(Ok(_name))) => {}
+            Ok(Some(Ok(()))) => {}
             Ok(Some(Err(join_err))) => {
                 // A panic in start_server must not take initialize down with
                 // it — the server is simply absent, like any other failure.
@@ -1232,6 +1499,115 @@ async fn report_start_failure(server_name: &str, e: &anyhow::Error, reg: &McpReg
         }),
     )
     .await;
+}
+
+/// What a caller wants done if the start fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnStartFailure {
+    /// Leave the registry alone — nothing was advertised on this server's
+    /// behalf yet (cold start).
+    KeepTools,
+    /// Withdraw the tools. The cached catalog was a promise the server would be
+    /// callable shortly; it will not be.
+    DropTools,
+}
+
+/// Run one server start under a claim, publishing its outcome to any waiter.
+///
+/// The single spawn site for a server start. Both the cache-warmed path and the
+/// cold `initialize` loop go through here, so at most one start per server is
+/// ever in flight at a time: one claim, one spawn.
+///
+/// Scope of that guarantee: it holds for *concurrent* starts. A reload that
+/// removes a server calls `cancel_start`, which retires the slot while the old
+/// task may still be running, so a later re-add can spawn while the previous
+/// child is winding down. The epoch check below is what keeps the stale one
+/// from re-registering.
+///
+/// Returns `None` when someone else already owns the start (or the server is
+/// already live) — the caller's work is then already being done. Otherwise the
+/// handle lets a caller that wants to bound its wait, like `initialize`'s
+/// startup grace, join the task; dropping it just detaches.
+fn spawn_start(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    config: &Config,
+    reg: &McpRegistry,
+    builtin: &[&str],
+    on_failure: OnStartFailure,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let claim = match claim_start(server_name, on_failure) {
+        StartClaimOutcome::Claimed(c) => c,
+        StartClaimOutcome::AlreadyStarting(_) | StartClaimOutcome::AlreadyRunning => return None,
+    };
+    Some(spawn_claimed_start(
+        *claim,
+        server_name,
+        server_cfg,
+        config,
+        reg,
+        builtin,
+        on_failure,
+    ))
+}
+
+/// [`spawn_start`] for a caller that already holds the claim.
+///
+/// Exists so `serve_cached_catalog` can claim *before* it registers cached
+/// tools: registering first leaves a window where another thread sees tools for
+/// a server with neither a session nor a start, and gets "no live session" —
+/// which reads like a fault rather than "not ready yet".
+#[allow(clippy::too_many_arguments)]
+fn spawn_claimed_start(
+    claim: StartClaim,
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    config: &Config,
+    reg: &McpRegistry,
+    builtin: &[&str],
+    on_failure: OnStartFailure,
+) -> tokio::task::JoinHandle<()> {
+    let name = server_name.to_string();
+    let cfg = server_cfg.clone();
+    let config = config.clone();
+    let reg = reg.clone();
+    let builtin_owned: Vec<String> = builtin.iter().map(ToString::to_string).collect();
+
+    tokio::spawn(async move {
+        let epoch = claim.epoch();
+        let refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
+        match start_server(&name, &cfg, &config, &reg, &refs).await {
+            Err(e) => {
+                if on_failure == OnStartFailure::DropTools {
+                    reg.drop_server(&name);
+                }
+                let (_, reauth) = classify_startup_failure(&e);
+                let detail = format!("{e:#}");
+                report_start_failure(&name, &e, &reg).await;
+                claim.finish(StartState::Failed { detail, reauth });
+            }
+            Ok(()) => {
+                if server_epoch(&name) != epoch {
+                    // A reload removed this server while we were starting it,
+                    // and `start_server` has just registered it again. Undo
+                    // that — the operator's config is the authority, not our
+                    // stale in-flight work.
+                    lock_recover(session_map()).remove(&name);
+                    reg.drop_server(&name);
+                    purge_cached_catalog(&name).await;
+                    tracing::info!(
+                        target: MCP_LOG_TARGET,
+                        event = "start_superseded",
+                        server = %name,
+                        "MCP server was removed while starting; its registration was rolled back",
+                    );
+                    claim.finish(StartState::Superseded);
+                } else {
+                    claim.finish(StartState::Ready);
+                }
+            }
+        }
+    })
 }
 
 /// Try to register `server_name`'s cached catalog and start it in the
@@ -1323,6 +1699,17 @@ async fn serve_cached_catalog(
         return false;
     }
 
+    // Claim before registering. Registering first opens a window in which the
+    // tools are visible but the server has neither a session nor an in-flight
+    // start, so a concurrent dispatch gets "no live session" — a fault message
+    // for a server that is merely not ready yet.
+    let claim = match claim_start(server_name, OnStartFailure::DropTools) {
+        StartClaimOutcome::Claimed(c) => *c,
+        // Someone else already owns this server's start; let them finish. The
+        // caller must still skip its inline start.
+        StartClaimOutcome::AlreadyStarting(_) | StartClaimOutcome::AlreadyRunning => return true,
+    };
+
     let registered =
         match register_cached_catalog(server_name, server_cfg, &manifest, &row, reg, builtin) {
             Ok(count) => count,
@@ -1334,6 +1721,9 @@ async fn serve_cached_catalog(
                     error = %e,
                     "cached catalog could not be registered; starting server inline",
                 );
+                // Releases the claim (Drop publishes a terminal state) so the
+                // inline start the caller now takes can claim it afresh.
+                drop(claim);
                 return false;
             }
         };
@@ -1347,68 +1737,22 @@ async fn serve_cached_catalog(
         "serving cached MCP catalog while the server starts",
     );
 
-    let server_owned = server_name.to_string();
-    let cfg_owned = server_cfg.clone();
-    let config_owned = config.clone();
-    let reg_owned = reg.clone();
-    let builtin_owned: Vec<String> = builtin.iter().map(ToString::to_string).collect();
-    // Captured before spawning: if a reload tears this server down while the
-    // start is in flight, the epoch moves and the task undoes its registration.
-    let epoch = server_epoch(server_name);
-    let start = tokio::spawn({
-        let server_owned = server_owned.clone();
-        let reg_owned = reg_owned.clone();
-        async move {
-            let builtin_refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
-            if let Err(e) = start_server(
-                &server_owned,
-                &cfg_owned,
-                &config_owned,
-                &reg_owned,
-                &builtin_refs,
-            )
-            .await
-            {
-                // The cached tools were a promise this server would be callable
-                // shortly. It won't be, so withdraw them rather than leave the
-                // model calling into a server that will never answer.
-                reg_owned.drop_server(&server_owned);
-                report_start_failure(&server_owned, &e, &reg_owned).await;
-                return;
-            }
-            if server_epoch(&server_owned) != epoch {
-                // A reload removed this server while we were starting it, and
-                // `start_server` has just registered it again. Undo that — the
-                // operator's config is the authority, not our stale in-flight
-                // work.
-                lock_recover(session_map()).remove(&server_owned);
-                reg_owned.drop_server(&server_owned);
-                purge_cached_catalog(&server_owned).await;
-                tracing::info!(
-                    target: MCP_LOG_TARGET,
-                    event = "catalog_cache_start_superseded",
-                    server = %server_owned,
-                    "MCP server was removed while starting; its registration was rolled back",
-                );
-            }
-        }
-    });
-    // A panic in the start task would otherwise vanish with the dropped
-    // `JoinHandle`, leaving the server advertising cached tools at `Starting`
-    // forever and telling the model to "retry shortly" on every call. Withdraw
-    // the promise on a panic exactly as the `Err` path does.
-    tokio::spawn(async move {
-        if let Err(join_err) = start.await {
-            reg_owned.drop_server(&server_owned);
-            tracing::error!(
-                target: MCP_LOG_TARGET,
-                event = "catalog_cache_start_task_died",
-                server = %server_owned,
-                error = %join_err,
-                "MCP start task panicked or was cancelled; cached tools withdrawn",
-            );
-        }
-    });
+    // The claim registered here is what dispatch waits on: a call for one of
+    // the cached tools blocks until this start lands, instead of being told to
+    // "retry shortly" for a tool it was offered. A panic inside the start wakes
+    // those waiters through `StartClaim`'s Drop.
+    // Detached on purpose: boot must not block on this server. Waiters reach it
+    // through the start registry, not through this handle. A panic inside wakes
+    // them through `StartClaim`'s Drop, which also withdraws the cached tools.
+    drop(spawn_claimed_start(
+        claim,
+        server_name,
+        server_cfg,
+        config,
+        reg,
+        builtin,
+        OnStartFailure::DropTools,
+    ));
     true
 }
 
@@ -1423,8 +1767,9 @@ pub struct ReloadReport {
     /// Servers that were running before this reload and have been torn down
     /// (either removed from config or flipped to disabled).
     pub removed: Vec<String>,
-    /// Servers that were already running and remain. Limits are reseated
-    /// in-place so rate-limit knob changes take effect without a teardown.
+    /// Servers that were already running — or still starting — and remain.
+    /// Limits are reseated in-place so rate-limit knob changes take effect
+    /// without a teardown.
     pub unchanged: usize,
     /// Per-server start failures: `(server_name, error_message)`. Reload is
     /// best-effort per-server — other servers still come up.
@@ -1458,10 +1803,10 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
         HashSet::new()
     };
 
-    let current: HashSet<String> = {
-        let map = lock_recover(session_map());
-        map.keys().cloned().collect()
-    };
+    // Live *or* starting. A server whose start is still in flight has no
+    // `session_map` entry yet, so keying on that alone would put it in
+    // `to_add` and spawn a second child for it.
+    let current: HashSet<String> = live_or_starting();
 
     let mut to_remove: Vec<String> = current.difference(&desired).cloned().collect();
     let mut to_add: Vec<String> = desired.difference(&current).cloned().collect();
@@ -1487,6 +1832,9 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
         // Tell any in-flight cache-warmed start that this server is gone, so it
         // doesn't register its tools back after we've dropped them.
         bump_server_epoch(name);
+        // And wake anything parked on that start now, rather than leaving it to
+        // sit out the full connect timeout for a server that no longer exists.
+        cancel_start(name);
         // A server removed from config must not come back as cached tools on
         // the next restart.
         purge_cached_catalog(name).await;
@@ -1511,8 +1859,48 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
             // Race: server was removed from config between the diff and now.
             continue;
         };
-        match start_server(&name, cfg, config, reg, &builtin_refs).await {
+        // Claim before starting. The `current` set above was a snapshot, so a
+        // cache-warmed start can have begun between the diff and here; losing
+        // the claim means someone else already owns this server's start and we
+        // wait for their result rather than spawning a second child.
+        let claim = match claim_start(&name, OnStartFailure::KeepTools) {
+            StartClaimOutcome::Claimed(c) => c,
+            StartClaimOutcome::AlreadyRunning => continue,
+            StartClaimOutcome::AlreadyStarting(rx) => {
+                let limit = Duration::from_millis(cfg.connect_timeout_ms);
+                match await_start(rx, limit).await {
+                    Some(StartState::Ready) => added.push(name),
+                    Some(StartState::Failed { detail, .. }) => failures.push((name, detail)),
+                    // Removed under us — it is already in `to_remove`, so
+                    // reporting it here too would double-count it.
+                    Some(StartState::Superseded) => {}
+                    // Still going when we gave up. The server is configured but
+                    // appears in neither `added` nor `unchanged`, so without
+                    // this line `/reload mcp` would not mention it at all.
+                    Some(StartState::Running) | None => failures.push((
+                        name,
+                        format!(
+                            "still starting after {}ms; the reload stopped waiting, \
+                             but the start continues in the background",
+                            limit.as_millis()
+                        ),
+                    )),
+                }
+                continue;
+            }
+        };
+        let epoch = claim.epoch();
+        let result = start_server(&name, cfg, config, reg, &builtin_refs).await;
+        match result {
             Ok(()) => {
+                if server_epoch(&name) != epoch {
+                    lock_recover(session_map()).remove(&name);
+                    reg.drop_server(&name);
+                    purge_cached_catalog(&name).await;
+                    claim.finish(StartState::Superseded);
+                    continue;
+                }
+                claim.finish(StartState::Ready);
                 tracing::info!(server = %name, "MCP server started via reload");
                 added.push(name);
             }
@@ -1522,6 +1910,13 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                 // `err_msg` feeds the AuthFailed message, the audit reason, and
                 // the ReloadReport failures entry, so all three keep the detail.
                 let err_msg = format!("{e:#}");
+                // Publish before the reporting below: a dispatch parked on this
+                // start should be released as soon as the outcome is known, not
+                // after an audit write.
+                claim.finish(StartState::Failed {
+                    detail: err_msg.clone(),
+                    reauth: reauth_required,
+                });
                 tracing::warn!(server = %name, error = %err_msg, error_kind, "MCP reload: server failed to start");
                 if reauth_required {
                     reg.set_health(
@@ -2342,6 +2737,76 @@ pub mod testing {
                 g.clear();
             }
         }
+        // Waiters parked on a start from the previous test must not outlive it,
+        // and a leftover slot would make the next test's `claim_start` lose.
+        if let Some(s) = STARTING.get() {
+            let stale: Vec<Arc<StartSlot>> = match s.lock() {
+                Ok(mut g) => g.drain().map(|(_, slot)| slot).collect(),
+                Err(_) => Vec::new(),
+            };
+            for slot in stale {
+                slot.state.send_replace(StartState::Superseded);
+            }
+        }
+        // Epochs leak across tests otherwise: a server torn down in one test
+        // starts the next at a non-zero epoch, and a start that captures 0
+        // wrongly concludes it was superseded.
+        if let Some(e) = SERVER_EPOCHS.get() {
+            if let Ok(mut g) = e.lock() {
+                g.clear();
+            }
+        }
+    }
+
+    /// Claim a start for `server` without spawning anything, and hand back the
+    /// claim so the test decides when — and how — it finishes.
+    ///
+    /// The seam that lets a test drive the in-flight window deterministically
+    /// instead of racing a real subprocess spawn.
+    pub struct TestStartClaim(Option<StartClaim>);
+
+    impl TestStartClaim {
+        /// Publish `Ready`, as a successful start would.
+        pub fn finish_ready(mut self) {
+            if let Some(c) = self.0.take() {
+                c.finish(StartState::Ready);
+            }
+        }
+
+        /// Publish a failure, optionally the kind re-credentialling fixes.
+        pub fn finish_failed(mut self, detail: &str, reauth: bool) {
+            if let Some(c) = self.0.take() {
+                c.finish(StartState::Failed {
+                    detail: detail.to_string(),
+                    reauth,
+                });
+            }
+        }
+    }
+
+    /// Take a start claim for `server`, or `None` if one is already held.
+    ///
+    /// `withdraw_tools_on_failure` mirrors the cache-warmed path: those tools
+    /// were advertised on the promise the start would land, so a failure has to
+    /// take them back down.
+    pub fn begin_start_for_test(
+        server: &str,
+        withdraw_tools_on_failure: bool,
+    ) -> Option<TestStartClaim> {
+        let on_failure = if withdraw_tools_on_failure {
+            OnStartFailure::DropTools
+        } else {
+            OnStartFailure::KeepTools
+        };
+        match claim_start(server, on_failure) {
+            StartClaimOutcome::Claimed(c) => Some(TestStartClaim(Some(*c))),
+            StartClaimOutcome::AlreadyStarting(_) | StartClaimOutcome::AlreadyRunning => None,
+        }
+    }
+
+    /// Whether a start is currently claimed for `server`.
+    pub fn is_start_in_flight(server: &str) -> bool {
+        is_starting(server)
     }
 
     /// Install a session whose transport is the caller's choice (typically
@@ -2423,6 +2888,342 @@ mod tests {
             "trust=\"untrusted\" attribute missing — every MCP tool result \
              must declare itself untrusted to the prompt assembler"
         );
+    }
+
+    mod start_registry {
+        use super::*;
+        use std::sync::Mutex as StdMutex;
+
+        /// The start registry is process-global, so these cannot interleave.
+        static SERIAL: StdMutex<()> = StdMutex::new(());
+
+        fn guard() -> std::sync::MutexGuard<'static, ()> {
+            let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            testing::reset_all();
+            g
+        }
+
+        fn rt() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime")
+        }
+
+        #[test]
+        fn a_second_claim_is_refused_while_one_is_in_flight() {
+            let _g = guard();
+            // The item-6 invariant in miniature: whoever holds the claim owns
+            // the only spawn, so a racing caller cannot start a second child.
+            let first = testing::begin_start_for_test("srv", false).expect("first claim");
+            assert!(
+                testing::begin_start_for_test("srv", false).is_none(),
+                "a second claim must be refused while the first is in flight"
+            );
+            assert!(testing::is_start_in_flight("srv"));
+            first.finish_ready();
+            assert!(
+                !testing::is_start_in_flight("srv"),
+                "finishing must retire the slot"
+            );
+            assert!(
+                testing::begin_start_for_test("srv", false).is_some(),
+                "a retired slot must be re-claimable"
+            );
+        }
+
+        #[test]
+        fn a_waiter_sees_a_terminal_state_published_before_it_subscribed() {
+            let _g = guard();
+            // `watch` is chosen for exactly this: the start can finish between
+            // dispatch reading the map and dispatch awaiting. A `Notify` would
+            // drop the edge and park the waiter until its timeout.
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let rx = {
+                let map = lock_recover(starting_map());
+                map.get("srv").expect("slot").state.subscribe()
+            };
+            claim.finish_ready();
+            let got = rt().block_on(await_start(rx, Duration::from_millis(50)));
+            assert_eq!(got, Some(StartState::Ready));
+        }
+
+        #[test]
+        fn a_dropped_claim_wakes_waiters_instead_of_hanging_them() {
+            let _g = guard();
+            // A panic inside the start task unwinds through `StartClaim::Drop`.
+            // Without that, every waiter would sit out the full timeout.
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let rx = {
+                let map = lock_recover(starting_map());
+                map.get("srv").expect("slot").state.subscribe()
+            };
+            drop(claim);
+            let got = rt().block_on(await_start(rx, Duration::from_millis(50)));
+            assert!(
+                matches!(got, Some(StartState::Failed { reauth: false, .. })),
+                "expected a failure, got {got:?}"
+            );
+            assert!(
+                !testing::is_start_in_flight("srv"),
+                "a dropped claim must leave the server re-claimable"
+            );
+        }
+
+        #[test]
+        fn cancelling_a_start_supersedes_its_waiters_at_once() {
+            let _g = guard();
+            // What `reload_from_config` calls when it removes a server: a
+            // waiter must not sit out a connect timeout for a server that no
+            // longer exists.
+            let _claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let rx = {
+                let map = lock_recover(starting_map());
+                map.get("srv").expect("slot").state.subscribe()
+            };
+            cancel_start("srv");
+            let started = std::time::Instant::now();
+            let got = rt().block_on(await_start(rx, Duration::from_secs(30)));
+            assert_eq!(got, Some(StartState::Superseded));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "waiter must wake on cancel, not on the timeout"
+            );
+        }
+
+        #[test]
+        fn a_wait_that_expires_reports_no_side_effects() {
+            let _g = guard();
+            // The model has to know a mutating retry is safe. A timeout that
+            // only said "timed out" leaves that ambiguous.
+            let _claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let err = rt()
+                .block_on(await_pending_start("srv", Duration::from_millis(20)))
+                .expect("a still-running start must refuse the call");
+            let msg = format!("{err}");
+            assert!(msg.contains("was not sent"), "{msg}");
+            assert!(msg.contains("no side effects"), "{msg}");
+        }
+
+        #[test]
+        fn dispatch_passes_through_when_nothing_is_starting() {
+            let _g = guard();
+            let got = rt().block_on(await_pending_start("srv", Duration::from_millis(20)));
+            assert!(
+                got.is_none(),
+                "a server with no in-flight start must not be blocked"
+            );
+        }
+
+        #[test]
+        fn a_ready_start_lets_the_call_through() {
+            let _g = guard();
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            claim.finish_ready();
+            let got = rt().block_on(await_pending_start("srv", Duration::from_millis(20)));
+            assert!(got.is_none(), "a completed start must not refuse the call");
+        }
+
+        #[test]
+        fn a_call_parked_on_a_start_is_released_when_it_succeeds() {
+            let _g = guard();
+            // The connect-on-first-use path proper: the call arrives *during*
+            // the start, not after it. The test above takes the fast path where
+            // the state was already terminal before the wait began.
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let got = rt().block_on(async {
+                let waiter = tokio::spawn(await_pending_start("srv", Duration::from_secs(30)));
+                tokio::task::yield_now().await;
+                claim.finish_ready();
+                waiter.await.expect("waiter")
+            });
+            assert!(
+                got.is_none(),
+                "a start that lands must release the call, got {got:?}"
+            );
+        }
+
+        #[test]
+        fn a_failed_cache_warmed_start_withdraws_the_tools_it_promised() {
+            let _g = guard();
+            // The cached catalog advertised tools on the promise this start
+            // would land. When it dies — here by dropping the claim, which is
+            // the panic path — those tools must come back down, or the model
+            // keeps calling a server that will never answer.
+            let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(64));
+            reg.set_health("srv", mcp::registry::ServerHealth::Starting);
+            assert!(
+                reg.status().servers.contains_key("srv"),
+                "precondition: the server is known to the registry"
+            );
+
+            let claim = testing::begin_start_for_test("srv", true).expect("claim");
+            drop(claim);
+
+            assert!(
+                !reg.status().servers.contains_key("srv"),
+                "a DropTools failure must withdraw the server's registry entry"
+            );
+        }
+
+        #[test]
+        fn a_failed_cold_start_leaves_the_registry_alone() {
+            let _g = guard();
+            // The counterpart: a cold start advertised nothing on this server's
+            // behalf, so its failure must not evict whatever is there.
+            let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(64));
+            reg.set_health("srv", mcp::registry::ServerHealth::Starting);
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            drop(claim);
+            assert!(
+                reg.status().servers.contains_key("srv"),
+                "a KeepTools failure must not touch the registry"
+            );
+        }
+
+        #[test]
+        fn each_failure_tells_the_model_whether_retrying_is_worth_it() {
+            let _g = guard();
+            // (reauth, must appear, must not appear)
+            let cases: &[(bool, &str, &str)] = &[
+                (true, "retrying will not help", "did not finish"),
+                (false, "failed to start", "retrying will not help"),
+            ];
+            for (reauth, expected, forbidden) in cases {
+                testing::reset_all();
+                let claim = testing::begin_start_for_test("srv", false).expect("claim");
+                // Fail the start *while* the call is parked on it — the real
+                // interleaving. Finishing first would retire the slot, and the
+                // caller would fall through to the ordinary session lookup.
+                let err = rt()
+                    .block_on(async {
+                        let waiter =
+                            tokio::spawn(await_pending_start("srv", Duration::from_secs(30)));
+                        tokio::task::yield_now().await;
+                        claim.finish_failed("boom: 401", *reauth);
+                        waiter.await.expect("waiter")
+                    })
+                    .expect("a failed start must refuse the call");
+                let msg = format!("{err}");
+                assert!(msg.contains(expected), "reauth={reauth}: {msg}");
+                assert!(!msg.contains(forbidden), "reauth={reauth}: {msg}");
+                assert!(msg.contains("boom: 401"), "the cause must survive: {msg}");
+            }
+        }
+
+        #[test]
+        fn a_stale_claim_cannot_evict_a_newer_one() {
+            let _g = guard();
+            // Teardown-then-reclaim: the first claim's Drop runs late, and must
+            // not remove the slot a second generation installed.
+            let stale = testing::begin_start_for_test("srv", false).expect("first claim");
+            cancel_start("srv");
+            let fresh = testing::begin_start_for_test("srv", false).expect("second claim");
+            drop(stale);
+            assert!(
+                testing::is_start_in_flight("srv"),
+                "the stale claim's Drop evicted the newer slot"
+            );
+            fresh.finish_ready();
+        }
+
+        #[test]
+        fn reset_all_clears_the_start_registry_and_the_epochs() {
+            let _g = guard();
+            // Both leak across tests otherwise: a leftover slot makes the next
+            // `claim_start` lose, and a non-zero epoch makes a fresh start
+            // conclude it was superseded.
+            let _claim = testing::begin_start_for_test("srv", false).expect("claim");
+            bump_server_epoch("srv");
+            assert!(testing::is_start_in_flight("srv"));
+            assert_ne!(server_epoch("srv"), 0);
+            testing::reset_all();
+            assert!(!testing::is_start_in_flight("srv"));
+            assert_eq!(server_epoch("srv"), 0);
+        }
+
+        #[test]
+        fn reload_treats_an_in_flight_start_as_present_and_does_not_respawn_it() {
+            let _g = guard();
+            // The item-6 regression. `reload_from_config` used to build its
+            // `current` set from `session_map` alone, so a server whose start
+            // had not landed yet looked absent, went into `to_add`, and got a
+            // second child spawned for it.
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+
+            let desired: HashSet<String> = ["srv".to_string()].into_iter().collect();
+            // The production helper, not a copy of it — a re-implementation
+            // here would keep passing after `reload_from_config` regressed.
+            let current = live_or_starting();
+            assert!(
+                current.contains("srv"),
+                "an in-flight start must count as present"
+            );
+
+            let to_add: Vec<&String> = desired.difference(&current).collect();
+            let unchanged: Vec<&String> = desired.intersection(&current).collect();
+            assert!(
+                to_add.is_empty(),
+                "an in-flight start must not be queued for a second spawn: {to_add:?}"
+            );
+            assert_eq!(unchanged.len(), 1, "it belongs in unchanged instead");
+
+            // And the claim is what makes it safe even if it *were* queued.
+            assert!(
+                testing::begin_start_for_test("srv", false).is_none(),
+                "the claim must refuse a second spawn regardless of the diff"
+            );
+            claim.finish_ready();
+        }
+
+        #[test]
+        fn the_wait_is_bounded_by_the_servers_own_connect_timeout() {
+            let _g = guard();
+            // Two servers with different `connect_timeout_ms` prove the bound
+            // comes from the per-server setting, not a constant.
+            let cfg = |connect_timeout_ms: u64| crate::config::McpServerConfig {
+                enabled: true,
+                transport: crate::config::TransportSpec::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                },
+                connect_timeout_ms,
+                call_timeout_ms: 120_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+                cache_tools: true,
+            };
+            record_limits("slow", &cfg(1234));
+            record_limits("quick", &cfg(77));
+            assert_eq!(
+                lookup_limits("slow").expect("slow limits").connect_timeout,
+                Duration::from_millis(1234)
+            );
+            assert_eq!(
+                lookup_limits("quick")
+                    .expect("quick limits")
+                    .connect_timeout,
+                Duration::from_millis(77)
+            );
+
+            // And the refusal quotes the value that server was configured with,
+            // so the bound provably comes from the per-server key rather than
+            // from a constant that happens to be in the same ballpark.
+            for (server, ms) in [("slow", 1234u128), ("quick", 77u128)] {
+                let _claim = testing::begin_start_for_test(server, false).expect("claim");
+                let limit = lookup_limits(server).expect("limits").connect_timeout;
+                let err = rt()
+                    .block_on(await_pending_start(server, limit))
+                    .expect("a still-running start must refuse");
+                assert!(
+                    format!("{err}").contains(&format!("{ms}ms")),
+                    "{server}: refusal should quote {ms}ms, got: {err}"
+                );
+                cancel_start(server);
+            }
+        }
     }
 
     // TokenBucket refill/fail-closed math is covered in `crate::rate_limit`.
