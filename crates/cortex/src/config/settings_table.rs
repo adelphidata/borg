@@ -275,6 +275,7 @@ define_settings! {
         "agents.max_children_per_agent" => agents.max_children_per_agent, parsed(u32);
         "agents.max_concurrent" => agents.max_concurrent, parsed(u32);
         "agents.delegate_timeout_secs" => agents.delegate_timeout_secs, parsed(u64);
+        "agents.min_wait_timeout_secs" => agents.min_wait_timeout_secs, parsed(u64);
         "agents.orchestrator_enabled" => agents.orchestrator_enabled, parsed(bool);
         "agents.delegation_model" => agents.delegation_model, opt_string;
         "agents.delegation_provider" => agents.delegation_provider, opt_string;

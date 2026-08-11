@@ -448,6 +448,9 @@ pub struct AgentControl {
     /// source of truth — `spawn_agent(blocking=true)` reads the same config
     /// key, so the two paths cannot drift.
     pub delegate_timeout_secs: u64,
+    /// Floor applied to a caller-supplied `wait_for_agent` timeout
+    /// (`agents.min_wait_timeout_secs`). See [`AgentControl::effective_wait_timeout`].
+    pub min_wait_timeout_secs: u64,
     _max_concurrent: u32,
     name_pool: names::NamePool,
     parent_session_id: String,
@@ -504,6 +507,7 @@ impl AgentControl {
             max_spawn_depth: config.max_spawn_depth,
             max_children_per_agent: config.max_children_per_agent,
             delegate_timeout_secs: config.delegate_timeout_secs,
+            min_wait_timeout_secs: config.min_wait_timeout_secs,
             _max_concurrent: config.max_concurrent,
             name_pool: names::NamePool::new(),
             parent_session_id: parent_session_id.to_string(),
@@ -1031,13 +1035,27 @@ impl AgentControl {
         Ok(())
     }
 
+    /// Raise a caller-supplied wait to `min_wait_timeout_secs`.
+    ///
+    /// Expiry here is destructive — [`Self::cancel_timed_out_child`] shuts the
+    /// child down — so a caller that guesses a small `timeout_secs` kills a
+    /// worker that was never stuck. Clamping up is always the safe direction:
+    /// the worst case is waiting slightly longer for a child that really is
+    /// wedged, against losing a healthy one's work outright.
+    pub fn effective_wait_timeout(&self, requested_secs: u64) -> u64 {
+        requested_secs.max(self.min_wait_timeout_secs)
+    }
+
     /// Wait for a specific sub-agent to complete.
+    ///
+    /// `timeout_secs` is clamped by [`Self::effective_wait_timeout`]; on expiry
+    /// the child is cancelled.
     pub async fn wait_for_agent(
         &mut self,
         agent_id: &str,
         timeout_secs: u64,
     ) -> Result<SubAgentCompletion> {
-        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        let timeout = tokio::time::Duration::from_secs(self.effective_wait_timeout(timeout_secs));
         let deadline = tokio::time::Instant::now() + timeout;
 
         if let Some(handle) = self.agents.get(agent_id) {
@@ -1490,15 +1508,90 @@ mod agents_feature_tests {
     use tokio::sync::broadcast::error::TryRecvError;
 
     fn ctrl() -> AgentControl {
+        // No wait floor by default so the timeout-path tests below exercise
+        // cancellation without burning wall-clock. The floor itself is covered
+        // by `ctrl_with_min_wait`.
+        ctrl_with_min_wait(0)
+    }
+
+    fn ctrl_with_min_wait(min_wait_timeout_secs: u64) -> AgentControl {
         let cfg = MultiAgentConfig {
             enabled: true,
             max_spawn_depth: 5,
             max_children_per_agent: 10,
             max_concurrent: 10,
             delegate_timeout_secs: 60,
+            min_wait_timeout_secs,
             ..MultiAgentConfig::default()
         };
         AgentControl::new(&cfg, "root-session", 0)
+    }
+
+    /// The floor only ever raises a request. Lowering one would hand back the
+    /// original footgun, and the ceiling belongs to the caller.
+    #[test]
+    fn effective_wait_timeout_raises_only_short_requests() {
+        let c = ctrl_with_min_wait(30);
+        assert_eq!(c.effective_wait_timeout(0), 30, "0 must reach the floor");
+        assert_eq!(c.effective_wait_timeout(1), 30, "1s must reach the floor");
+        assert_eq!(c.effective_wait_timeout(30), 30, "at the floor, unchanged");
+        assert_eq!(
+            c.effective_wait_timeout(600),
+            600,
+            "a generous request must pass through untouched"
+        );
+    }
+
+    /// The shipped default must actually protect a child; a floor of zero
+    /// would make the whole clamp inert.
+    #[test]
+    fn default_config_ships_a_non_zero_wait_floor() {
+        assert!(
+            MultiAgentConfig::default().min_wait_timeout_secs > 0,
+            "a zero floor leaves a guessed timeout_secs=0 cancelling healthy children"
+        );
+    }
+
+    /// A short wait must not expire — and so must not cancel the child —
+    /// before the floor has elapsed. Virtual time keeps this instant.
+    #[tokio::test(start_paused = true)]
+    async fn short_wait_does_not_cancel_the_child_before_the_floor_elapses() {
+        let mut c = ctrl_with_min_wait(30);
+        let cancel = c.insert_mock_handle("wedged", "atlas");
+
+        tokio::select! {
+            _ = c.wait_for_agent("wedged", 0) => {
+                panic!("a clamped wait must not expire before its floor")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(20)) => {}
+        }
+
+        assert!(
+            !cancel.is_cancelled(),
+            "child cancelled inside the floor window — the clamp was ignored"
+        );
+        assert!(
+            !c.get_status("wedged").unwrap().status.is_terminal(),
+            "child must still be running"
+        );
+    }
+
+    /// Past the floor the destructive timeout still fires — clamping delays
+    /// cancellation, it must not disable it.
+    #[tokio::test(start_paused = true)]
+    async fn clamped_wait_still_cancels_once_the_floor_elapses() {
+        let mut c = ctrl_with_min_wait(30);
+        let cancel = c.insert_mock_handle("wedged", "atlas");
+
+        let err = c
+            .wait_for_agent("wedged", 0)
+            .await
+            .expect_err("a never-completing child must still time out");
+        assert!(
+            err.to_string().contains("Timeout"),
+            "unexpected error: {err}"
+        );
+        assert!(cancel.is_cancelled(), "expired wait must cancel the child");
     }
 
     /// `set_paused` must flip both the in-memory status AND the

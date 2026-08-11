@@ -511,11 +511,14 @@ pub async fn handle_wait_for_agent(
     agent_control: &mut AgentControl,
 ) -> Result<String> {
     let agent_id = require_str_param(args, "agent_id")?;
-    let timeout_secs = args["timeout_secs"]
+    let requested_secs = args["timeout_secs"]
         .as_u64()
         .unwrap_or(agent_control.delegate_timeout_secs);
+    let effective_secs = agent_control.effective_wait_timeout(requested_secs);
 
-    let completion = agent_control.wait_for_agent(agent_id, timeout_secs).await?;
+    let completion = agent_control
+        .wait_for_agent(agent_id, requested_secs)
+        .await?;
 
     let mut obj = json!({
         "agent_id": completion.agent_id,
@@ -526,9 +529,30 @@ pub async fn handle_wait_for_agent(
             .as_deref()
             .map(|s| super::bound_sub_agent_summary(s, super::SUB_AGENT_SUMMARY_MAX_CHARS)),
     });
+    attach_timeout_adjustment(&mut obj, requested_secs, effective_secs);
     attach_error_detail(&mut obj, completion.error_detail());
     attach_undelivered_input(&mut obj, &completion.undelivered_input);
     Ok(obj.to_string())
+}
+
+/// Tell the caller when its requested wait was raised to the configured floor.
+///
+/// Silence would be worse than noise here: the model would keep believing a
+/// 1-second poll is available and keep writing one, never learning that the
+/// call it thinks is cheap is the call that cancels its worker.
+fn attach_timeout_adjustment(
+    obj: &mut serde_json::Value,
+    requested_secs: u64,
+    effective_secs: u64,
+) {
+    if effective_secs <= requested_secs {
+        return;
+    }
+    obj["timeout_secs_used"] = json!(effective_secs);
+    obj["timeout_note"] = json!(format!(
+        "Requested timeout_secs={requested_secs} was raised to {effective_secs}. \
+         A wait that expires cancels the sub-agent, so short waits are not polls."
+    ));
 }
 
 /// Fold a sub-agent's terminal-error detail (bounded error text + recovery
@@ -705,6 +729,39 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raised timeout must be reported, or the model keeps writing the
+    /// short poll that cancels its own worker and never learns otherwise.
+    #[test]
+    fn timeout_adjustment_is_reported_when_the_request_was_raised() {
+        let mut obj = json!({});
+        attach_timeout_adjustment(
+            &mut obj, /*requested_secs*/ 1, /*effective_secs*/ 30,
+        );
+        assert_eq!(obj["timeout_secs_used"], json!(30));
+        let note = obj["timeout_note"].as_str().expect("note must be present");
+        assert!(
+            note.contains('1') && note.contains("30"),
+            "note must name both the requested and the effective value: {note}"
+        );
+        assert!(
+            note.contains("cancels"),
+            "note must explain why a short wait is not a poll: {note}"
+        );
+    }
+
+    /// The common case costs no context: an honoured timeout adds nothing.
+    #[test]
+    fn timeout_adjustment_is_silent_when_the_request_was_honoured() {
+        for (requested, effective) in [(600u64, 600u64), (30, 30)] {
+            let mut obj = json!({});
+            attach_timeout_adjustment(&mut obj, requested, effective);
+            assert!(
+                obj.get("timeout_secs_used").is_none() && obj.get("timeout_note").is_none(),
+                "unclamped wait ({requested} -> {effective}) must stay silent"
+            );
+        }
+    }
 
     /// `spawn_agent` schema is what the LLM sees every turn. The
     /// caller-surface parameters (`context`, `toolsets`, `role_kind`) must

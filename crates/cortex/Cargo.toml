@@ -127,7 +127,9 @@ required-features = ["test-support"]
 workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` gives tests virtual time (`start_paused`), so timeout behaviour
+# can be asserted without burning the wall-clock it describes. Dev-only.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 libc = { workspace = true }
 wiremock = "0.6"
 libsql = { workspace = true }

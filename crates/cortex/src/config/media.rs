@@ -1231,6 +1231,14 @@ pub struct MultiAgentConfig {
     /// Default timeout (seconds) used by `spawn_agent` in blocking and batch
     /// modes when the caller does not supply `timeout_secs`.
     pub delegate_timeout_secs: u64,
+    /// Floor (seconds) applied to a caller-supplied `wait_for_agent` timeout.
+    ///
+    /// A wait that expires does not merely return — it *cancels the child*. A
+    /// model that guesses a small `timeout_secs` therefore destroys a healthy
+    /// worker it only meant to poll. Raising the value is strictly safer than
+    /// honouring it, so short requests are clamped and the adjustment is
+    /// reported back to the caller.
+    pub min_wait_timeout_secs: u64,
     /// Global kill switch for orchestrator-role re-delegation. When `false`,
     /// every spawned child is treated as a leaf regardless of role — they
     /// cannot themselves call `spawn_agent`. The numeric `max_spawn_depth`
@@ -1263,6 +1271,10 @@ impl Default for MultiAgentConfig {
             max_children_per_agent: 5,
             max_concurrent: 3,
             delegate_timeout_secs: 600,
+            // One heartbeat interval (`heartbeat_interval_secs`) is the
+            // shortest wait that can observe a healthy child proving itself
+            // alive. Anything shorter cancels workers that were never stuck.
+            min_wait_timeout_secs: 30,
             orchestrator_enabled: true,
             delegation_model: None,
             delegation_provider: None,
