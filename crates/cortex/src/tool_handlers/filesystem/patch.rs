@@ -88,6 +88,25 @@ fn deny_skill_patch(
                  relative to the skills directory (no absolute paths or '..')"
             ));
         }
+        // A colon anywhere in the path is rejected as a class. On NTFS a member
+        // named `scripts/helper.py:payload` writes a hidden alternate data
+        // stream into the visible `scripts/helper.py`; a directory walk never
+        // enumerates streams, so those bytes escape both operator review and
+        // the skill scanner. On Unix the same string is one `Component::Normal`
+        // and slips past the checks above. This also subsumes drive letters
+        // (`C:\...`), which parse as an ordinary component off Windows. `/` is
+        // the only legal separator here, so no portable path needs a colon.
+        if let Some(bad) = path
+            .components()
+            .find(|c| c.as_os_str().to_string_lossy().contains(':'))
+        {
+            let bad = bad.as_os_str().to_string_lossy().into_owned();
+            return Some(format!(
+                "Access denied: {raw_path} — the path component '{bad}' contains \
+                 ':', which is not allowed in a skill patch path. Use plain \
+                 '/'-separated names."
+            ));
+        }
         if crate::skills::is_builtin_skill_name(&first) {
             return Some(format!(
                 "Access denied: '{first}' is a built-in skill and cannot be modified. \
@@ -1548,6 +1567,44 @@ diff --git a/notes.txt b/notes.txt
         assert!(
             denial.is_some_and(|d| d.contains("blocked path")),
             "blocked-path component must be refused"
+        );
+    }
+
+    /// A colon in any component is an NTFS alternate-data-stream write on
+    /// Windows and an ordinary-looking name everywhere else, so the refusal
+    /// must be OS-independent — these cases fail on macOS CI, not only on
+    /// Windows.
+    #[test]
+    fn deny_skill_patch_refuses_colon_in_any_component() {
+        let config = Config::default();
+        let cases = [
+            ("trailing stream name", "my-skill/helper.py:payload"),
+            ("empty stream name", "my-skill/helper.py:"),
+            ("mid-path component", "my-skill/sub:dir/helper.py"),
+            ("leading component", "my:skill/helper.py"),
+            ("bare drive letter", "C:/evil/helper.py"),
+            ("qualified drive letter", "C:\\evil\\helper.py"),
+        ];
+        for (label, path) in cases {
+            let patch = format!("*** Begin Patch\n*** Add File: {path}\n+body\n*** End Patch");
+            let denial = deny_skill_patch(&patch, std::path::Path::new("/tmp/skills"), &config);
+            assert!(
+                denial.is_some_and(|d| d.contains("Access denied")),
+                "{label} ({path}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_skill_patch_still_allows_ordinary_nested_paths() {
+        // The colon guard must not become a blanket refusal of nested writes.
+        let config = Config::default();
+        let patch =
+            "*** Begin Patch\n*** Add File: my-skill/scripts/helper.py\n+body\n*** End Patch";
+        let denial = deny_skill_patch(patch, std::path::Path::new("/tmp/skills"), &config);
+        assert!(
+            denial.is_none(),
+            "a plain nested path must still be allowed, got: {denial:?}"
         );
     }
 
