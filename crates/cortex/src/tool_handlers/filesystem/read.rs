@@ -118,6 +118,44 @@ fn frame(
     output
 }
 
+/// Name the file kind when `path` is something a byte read cannot finish:
+/// a FIFO blocks until a writer appears, a socket refuses, and a device read
+/// can hang or stream forever. The existing guards are name-based (`/proc`
+/// leaves), which cannot see an arbitrary special file in the workspace, so
+/// the check is a single `stat` on the resolved path.
+///
+/// Follows symlinks, matching the `is_dir()` check it sits beside. A `stat`
+/// error is never a refusal — the caller falls through to the ordinary
+/// not-found and read handling, which already report failures usefully.
+fn special_file_note(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let file_type = std::fs::metadata(path).ok()?.file_type();
+        let kind = if file_type.is_fifo() {
+            "a named pipe (FIFO)"
+        } else if file_type.is_socket() {
+            "a socket"
+        } else if file_type.is_char_device() {
+            "a character device"
+        } else if file_type.is_block_device() {
+            "a block device"
+        } else {
+            return None;
+        };
+        Some(format!(
+            "{} is {kind}, not a regular file — no read was attempted, because \
+             reading it can block indefinitely.",
+            path.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Apply the 1-based `offset`/`limit` line window and the `max_chars` ceiling,
 /// annotating the result whenever the caller is not seeing all of it.
 fn window_text(content: &str, offset: usize, limit: usize, max_chars: usize) -> String {
@@ -130,6 +168,13 @@ fn window_text(content: &str, offset: usize, limit: usize, max_chars: usize) -> 
     } else {
         total_lines
     };
+
+    // Past the end: the window is empty for a reason the caller cannot infer
+    // from an empty string, which reads as "the file has no content here".
+    // A genuinely empty file is reported by its own message upstream.
+    if total_lines > 0 && start >= total_lines {
+        return format!("[no lines at offset {offset} — the file ends at line {total_lines}]\n");
+    }
 
     let mut output = String::new();
     for line in &lines[start..end] {
@@ -217,6 +262,13 @@ pub fn handle_read_file_with_context(
         return Ok(ToolOutput::Text(format!(
             "Access denied: {raw_path} is in a blocked path."
         )));
+    }
+
+    // After the blocked-path check, so a denied path reports the denial rather
+    // than disclosing its file kind — and before every branch that opens the
+    // file, since document, image, and plain text all reach a blocking read.
+    if let Some(note) = special_file_note(&canonical) {
+        return Ok(ToolOutput::Text(note));
     }
 
     let ext = canonical
@@ -623,6 +675,116 @@ mod tests {
             }
             _ => panic!("expected Text"),
         }
+    }
+
+    /// Run `read_file` on another thread so a regressed guard fails the test
+    /// with a timeout instead of hanging the whole suite: a FIFO with no
+    /// writer blocks `read_to_string` forever, which is the bug being pinned.
+    #[cfg(unix)]
+    fn read_with_deadline(path: &std::path::Path) -> String {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        let owned = path.to_path_buf();
+        std::thread::spawn(move || {
+            let config = Config::default();
+            let out = handle_read_file(&json!({"path": owned.to_string_lossy()}), &config);
+            // A closed receiver means the deadline already fired; the panic
+            // below is the real failure, so drop this send quietly.
+            let _ = tx.send(out.map(|o| match o {
+                ToolOutput::Text(s) => s,
+                other => format!("{other:?}"),
+            }));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => result.expect("read_file returned an error"),
+            Err(_) => panic!("read_file blocked on a special file — the stat guard is missing"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on unix CI");
+        assert!(status.success(), "mkfifo failed");
+
+        let out = read_with_deadline(&fifo);
+        assert!(
+            out.contains("named pipe"),
+            "expected the FIFO kind to be named: {out}"
+        );
+        assert!(
+            out.contains("no read was attempted"),
+            "the model must be told nothing was read: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_refuses_a_socket_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        // Bind holds the socket file for the length of the test.
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let out = read_with_deadline(&sock);
+        assert!(
+            out.contains("socket"),
+            "expected the socket kind to be named: {out}"
+        );
+        assert!(
+            out.contains("no read was attempted"),
+            "the model must be told nothing was read: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_still_reads_a_regular_file_beside_a_special_one() {
+        // The guard must not become a blanket refusal: a plain file in the
+        // same directory reads exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        let plain = dir.path().join("notes.txt");
+        std::fs::write(&plain, "hello\n").unwrap();
+
+        let out = read_with_deadline(&plain);
+        assert!(out.contains("hello"), "expected the file content: {out}");
+        assert!(
+            !out.contains("no read was attempted"),
+            "a regular file must not trip the guard: {out}"
+        );
+    }
+
+    #[test]
+    fn window_text_past_eof_says_where_the_file_ends() {
+        // Returning "" here reads as "this part of the file is blank", which
+        // is a different fact from "you asked past the last line".
+        let out = window_text("a\nb\nc\n", 10, 0, 10_000);
+        assert!(
+            out.contains("offset 10"),
+            "the requested offset must be echoed: {out}"
+        );
+        assert!(
+            out.contains("line 3"),
+            "the last real line must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn window_text_at_the_last_line_still_returns_it() {
+        // Off-by-one guard: line 3 of a 3-line file is in range, not past EOF.
+        let out = window_text("a\nb\nc\n", 3, 0, 10_000);
+        assert_eq!(out, "c\n", "expected the last line, got: {out}");
     }
 
     #[test]
