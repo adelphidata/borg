@@ -2543,3 +2543,69 @@ mod selectors {
         }
     }
 }
+
+/// Build a loaded skill for the listing tests.
+fn listing_skill(name: &str, source: SkillSource, available: bool, disabled: bool) -> Skill {
+    Skill {
+        manifest: SkillManifest {
+            name: name.to_string(),
+            description: format!("what {name} is for"),
+            ..Default::default()
+        },
+        body: String::new(),
+        source,
+        available,
+        disabled,
+        references: Vec::new(),
+        scripts: Vec::new(),
+    }
+}
+
+#[test]
+fn offerable_skills_reports_name_description_and_origin() {
+    let listings = offerable_skills(&[
+        listing_skill("git", SkillSource::BuiltIn, true, false),
+        listing_skill("mine", SkillSource::User, true, false),
+    ]);
+
+    assert_eq!(
+        listings
+            .iter()
+            .map(|s| (s.name.as_str(), s.builtin))
+            .collect::<Vec<_>>(),
+        vec![("git", true), ("mine", false)]
+    );
+    assert_eq!(listings[0].description, "what git is for");
+}
+
+#[test]
+fn offerable_skills_omits_what_the_agent_will_not_load() {
+    // Offering these would teach a capability that is not there, and the
+    // failure would land a turn later with nothing to explain it.
+    let listings = offerable_skills(&[
+        listing_skill("present", SkillSource::BuiltIn, true, false),
+        listing_skill("unmet-requirements", SkillSource::BuiltIn, false, false),
+        listing_skill("turned-off", SkillSource::BuiltIn, false, true),
+    ]);
+
+    assert_eq!(
+        listings.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["present"]
+    );
+}
+
+#[test]
+fn offerable_skills_sorts_by_name_so_the_order_does_not_wander() {
+    // The client re-ranks by its own recency and needs a stable base order;
+    // the loader emits built-ins in registry order, which is not alphabetical.
+    let listings = offerable_skills(&[
+        listing_skill("zebra", SkillSource::BuiltIn, true, false),
+        listing_skill("apple", SkillSource::User, true, false),
+        listing_skill("mango", SkillSource::BuiltIn, true, false),
+    ]);
+
+    assert_eq!(
+        listings.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["apple", "mango", "zebra"]
+    );
+}

@@ -38,7 +38,8 @@ use protocols::admin::{
     ScheduledTaskUpdate, SessionActivityEvent as PbSessionActivityEvent, SessionArchiveMutation,
     SessionDetail, SessionList, SessionRef, SessionSummary, SessionTitleMutation,
     SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
-    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
+    SettingMutation, SettingsSnapshot, SkillEntry as PbSkillEntry, SkillList as PbSkillList,
+    SubprocessSnapshot, TriggerHeartbeatRequest,
     TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
@@ -712,6 +713,34 @@ impl Admin for AdminSvc {
         .await
         .map_err(|e| TStatus::internal(format!("persistent_warnings failed: {e}")))?;
         Ok(Response::new(WarningList { warnings }))
+    }
+
+    async fn list_skills(&self, _req: Request<Empty>) -> Result<Response<PbSkillList>, TStatus> {
+        let config = cortex::config::Config::load_from_db()
+            .await
+            .map_err(|e| TStatus::internal(format!("list_skills config load failed: {e}")))?;
+
+        // The loader walks the on-disk skills dir and probes `$PATH` for every
+        // declared binary, so it belongs off the runtime's worker threads.
+        let listings = tokio::task::spawn_blocking(move || {
+            let resolved = config.resolve_credentials();
+            let skills = cortex::skills::load_all_skills(&resolved, &config.skills)?;
+            anyhow::Ok(cortex::skills::offerable_skills(&skills))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("list_skills panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("list_skills failed: {e}")))?;
+
+        Ok(Response::new(PbSkillList {
+            skills: listings
+                .into_iter()
+                .map(|s| PbSkillEntry {
+                    name: s.name,
+                    description: s.description,
+                    builtin: s.builtin,
+                })
+                .collect(),
+        }))
     }
 
     async fn send_approval_greeting(

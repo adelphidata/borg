@@ -146,6 +146,34 @@ describe("the composer's slash menu", () => {
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
   }
 
+  it("writes a skill row's prompt text and leaves the sending to the user", () => {
+    // Choosing a skill is the agent's call. The row hands over the sentence it
+    // would have taken to say so, and stops.
+    const onSend = vi.fn();
+    const noted = vi.fn();
+    registry.commands = [
+      { id: "skill:git", label: "git", insert: "Use the git skill to ", run: noted },
+    ];
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+
+    type("/git");
+    enter();
+
+    expect(noted).toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "Use the git skill to ");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
   it("opens on a leading slash and offers the commands ⌘K offers", () => {
     registry.commands = [command("action:new", "New conversation", noop)];
     setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });

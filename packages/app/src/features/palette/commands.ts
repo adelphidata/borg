@@ -11,11 +11,18 @@ import { THEME_PREFERENCES, type ThemePreference } from "@borg/ui";
 import type { DaemonSetting } from "../../lib/settings";
 import { APPEARANCE_LABELS } from "../settings/catalog";
 import type { Command } from "./score";
+import { byRecency } from "./skillRecency";
 
 /** The subset of a session listing a command row needs. */
 export interface CommandSession {
   id: string;
   title: string;
+}
+
+/** The subset of `Admin.ListSkills` a command row needs. */
+export interface CommandSkill {
+  name: string;
+  description: string;
 }
 
 /** The shape `routes.tsx` supplies; kept local so this module stays testable. */
@@ -34,6 +41,12 @@ export interface CommandContext {
   settings: Map<string, DaemonSetting> | undefined;
   saveSetting: (key: string, value: string) => void;
   sessions: CommandSession[];
+  /** Empty on a surface with no prompt box — skill rows need one to write into. */
+  skills: CommandSkill[];
+  /** Skill names most-recently-used first, from `skillRecency`. */
+  skillRecency: string[];
+  /** Records that a skill row was picked, so the next list leads with it. */
+  noteSkillUse: (name: string) => void;
   themePreference: ThemePreference;
   setThemePreference: (preference: ThemePreference) => void;
   /**
@@ -147,5 +160,19 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
         }))
     : [];
 
-  return [...actions, ...go, ...appearance, ...settingRows, ...recents, ...raw];
+  // Ordered by last use before ranking, so the handful someone actually reaches
+  // for stay at the top of a set that only ever grows.
+  const skills: Command[] = byRecency(ctx.skills, (s) => s.name, ctx.skillRecency).map((skill) => ({
+    id: `skill:${skill.name}`,
+    label: skill.name,
+    hint: "Skill",
+    // The description is what the skill says it is for, which is exactly what
+    // someone scanning the list needs and never fits in the name.
+    detail: skill.description,
+    keywords: skill.description,
+    insert: `Use the ${skill.name} skill to `,
+    run: () => ctx.noteSkillUse(skill.name),
+  }));
+
+  return [...actions, ...go, ...appearance, ...settingRows, ...skills, ...recents, ...raw];
 }

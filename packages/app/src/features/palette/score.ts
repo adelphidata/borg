@@ -26,6 +26,17 @@ export interface Command {
    * Defaults to 0.
    */
   tier?: number;
+  /**
+   * Prompt text this row puts in the composer instead of acting on its own.
+   *
+   * Skills are chosen by the agent, not by the UI: a row that ran one would be
+   * the UI deciding, and it has none of what that decision needs. So the row
+   * writes what you would have typed and leaves the sending to you.
+   *
+   * Only a surface that owns a prompt box can honour this, which is why skill
+   * rows reach the composer's `/` menu and not ⌘K.
+   */
+  insert?: string;
   run: () => void;
 }
 

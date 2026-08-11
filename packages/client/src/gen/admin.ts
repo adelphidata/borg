@@ -597,6 +597,23 @@ export interface WarningList {
   warnings: string[];
 }
 
+/** Skills. */
+export interface SkillEntry {
+  /** Frontmatter name — what the catalog, invocation, and shadowing all key on. */
+  name: string;
+  /** One-line frontmatter description, already capped by the authoring limit. */
+  description: string;
+  /**
+   * True for a skill compiled into the binary, false for one under
+   * `~/.borg/skills/`.
+   */
+  builtin: boolean;
+}
+
+export interface SkillList {
+  skills: SkillEntry[];
+}
+
 /** Pairing. */
 export interface PairingFilter {
   channelName: string;
@@ -7795,6 +7812,158 @@ export const WarningList: MessageFns<WarningList> = {
   },
 };
 
+function createBaseSkillEntry(): SkillEntry {
+  return { name: "", description: "", builtin: false };
+}
+
+export const SkillEntry: MessageFns<SkillEntry> = {
+  encode(message: SkillEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.description !== "") {
+      writer.uint32(18).string(message.description);
+    }
+    if (message.builtin !== false) {
+      writer.uint32(24).bool(message.builtin);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSkillEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.name = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.description = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.builtin = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SkillEntry {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      description: isSet(object.description) ? globalThis.String(object.description) : "",
+      builtin: isSet(object.builtin) ? globalThis.Boolean(object.builtin) : false,
+    };
+  },
+
+  toJSON(message: SkillEntry): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.description !== "") {
+      obj.description = message.description;
+    }
+    if (message.builtin !== false) {
+      obj.builtin = message.builtin;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillEntry>, I>>(base?: I): SkillEntry {
+    return SkillEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillEntry>, I>>(object: I): SkillEntry {
+    const message = createBaseSkillEntry();
+    message.name = object.name ?? "";
+    message.description = object.description ?? "";
+    message.builtin = object.builtin ?? false;
+    return message;
+  },
+};
+
+function createBaseSkillList(): SkillList {
+  return { skills: [] };
+}
+
+export const SkillList: MessageFns<SkillList> = {
+  encode(message: SkillList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.skills) {
+      SkillEntry.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSkillList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.skills.push(SkillEntry.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SkillList {
+    return {
+      skills: globalThis.Array.isArray(object?.skills) ? object.skills.map((e: any) => SkillEntry.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: SkillList): unknown {
+    const obj: any = {};
+    if (message.skills?.length) {
+      obj.skills = message.skills.map((e) => SkillEntry.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillList>, I>>(base?: I): SkillList {
+    return SkillList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillList>, I>>(object: I): SkillList {
+    const message = createBaseSkillList();
+    message.skills = object.skills?.map((e) => SkillEntry.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBasePairingFilter(): PairingFilter {
   return { channelName: "" };
 }
@@ -13254,6 +13423,19 @@ export const AdminDefinition = {
       requestType: Empty as typeof Empty,
       requestStream: false,
       responseType: WarningList as typeof WarningList,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Skills the agent will actually load this run, so a client can show what
+     * Borg knows how to do without reimplementing the loader's shadowing and
+     * requirement rules.
+     */
+    listSkills: {
+      name: "ListSkills",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SkillList as typeof SkillList,
       responseStream: false,
       options: {},
     },

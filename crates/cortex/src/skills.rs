@@ -215,6 +215,41 @@ pub fn modified_bundled_skills(skills_dir: &std::path::Path) -> Vec<BundledSkill
     out
 }
 
+/// One skill as a client surface should see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillListing {
+    /// Frontmatter name — what invocation and shadowing both key on.
+    pub name: String,
+    /// One-line frontmatter description.
+    pub description: String,
+    /// True for a skill compiled into the binary.
+    pub builtin: bool,
+}
+
+/// The skills a client should offer, from an already-loaded set.
+///
+/// Only what the agent will actually load this run. A skill the user disabled,
+/// or whose binaries and credentials are missing, is not something Borg can do
+/// — offering it teaches a capability that is not there, and the failure lands
+/// a turn later where nothing explains it.
+///
+/// [`load_all_skills`] has already applied built-in shadowing, so a user copy
+/// under a bundled name never reaches here. Sorted by name, because the caller
+/// re-ranks by its own recency and needs a stable base order.
+pub fn offerable_skills(skills: &[Skill]) -> Vec<SkillListing> {
+    let mut out: Vec<SkillListing> = skills
+        .iter()
+        .filter(|s| s.available && !s.disabled)
+        .map(|s| SkillListing {
+            name: s.manifest.name.clone(),
+            description: s.manifest.description.clone(),
+            builtin: matches!(s.source, SkillSource::BuiltIn),
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// Skills that cannot be disabled — always loaded regardless of user config.
 /// Use sparingly: only for skills that teach core agent capabilities whose
 /// tools are always present (e.g. `scheduler` teaches the always-available

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTheme } from "@borg/ui";
 import { dispatchKeybind, hintFor } from "../../lib/keybinds";
@@ -7,6 +7,7 @@ import { useSettings } from "../../lib/settings";
 import { routes } from "../../routes";
 import { buildCommands } from "./commands";
 import type { Command } from "./score";
+import { noteSkillUse, readSkillRecency } from "./skillRecency";
 
 interface UseCommandsOptions {
   /**
@@ -16,6 +17,11 @@ interface UseCommandsOptions {
   active: boolean;
   /** Whether the user has typed a query — uncurated keys appear only then. */
   searching: boolean;
+  /**
+   * Whether this surface can accept the prompt text a skill row writes. Only
+   * the composer can, so only the composer pays for the listing.
+   */
+  withSkills?: boolean;
 }
 
 export interface CommandsResult {
@@ -35,7 +41,11 @@ export interface CommandsResult {
  * Both ⌘K and the composer's `/` menu call this, which is what stops the two
  * from offering different answers to the same question.
  */
-export function useCommands({ active, searching }: UseCommandsOptions): CommandsResult {
+export function useCommands({
+  active,
+  searching,
+  withSkills = false,
+}: UseCommandsOptions): CommandsResult {
   const navigate = useNavigate();
   const settings = useSettings();
   const { preference, setPreference } = useTheme();
@@ -45,24 +55,39 @@ export function useCommands({ active, searching }: UseCommandsOptions): Commands
     [active],
   );
 
+  const wantSkills = active && withSkills;
+  const skills = useQuery(
+    async (borg) => (wantSkills ? (await borg.admin.listSkills({})).skills : []),
+    [wantSkills],
+  );
+
+  const [skillRecency, setSkillRecency] = useState<string[]>(() => readSkillRecency(localStorage));
+  const noteSkill = useCallback((name: string) => {
+    setSkillRecency(noteSkillUse(localStorage, name));
+  }, []);
+
   // Values written but not yet confirmed by a fresh snapshot. Without this a
   // toggle reads its old value until the write round-trips, so pressing Enter
   // twice writes the same value twice and the second press silently does
   // nothing. Cleared per key when the snapshot catches up, or on failure.
   const [pending, setPending] = useState<Map<string, string>>(new Map());
-  const [saveError, setSaveError] = useState<string>();
+  const [failed, setFailed] = useState(false);
 
-  const clearSaveError = useCallback(() => setSaveError(undefined), []);
+  const clearSaveError = useCallback(() => setFailed(false), []);
 
   const saveSetting = useCallback(
     (key: string, value: string) => {
-      setSaveError(undefined);
+      setFailed(false);
       setPending((prev) => new Map(prev).set(key, value));
       void settings.save(key, value).then((ok) => {
         // Reporting success we did not have would leave the row showing a
-        // state the daemon never took.
-        if (!ok)
-          setSaveError(`Could not change that setting. ${settings.saveError?.message ?? ""}`);
+        // state the daemon never took. The overlay for a *successful* write
+        // stays until the snapshot confirms it: `save` resolves as soon as the
+        // RPC returns, while the refetch it triggers is still in flight, so
+        // dropping it here would flash the old state back and let a second
+        // Enter rewrite the same value.
+        if (ok) return;
+        setFailed(true);
         setPending((prev) => {
           const next = new Map(prev);
           next.delete(key);
@@ -70,10 +95,30 @@ export function useCommands({ active, searching }: UseCommandsOptions): Commands
         });
       });
     },
-    [settings.save, settings.saveError],
+    [settings.save],
   );
 
   const snapshot = settings.settings.state === "ready" ? settings.settings.data : undefined;
+
+  // Retire an overlay once the snapshot agrees with it — or once its key has
+  // left the registry, which would otherwise pin the overlay forever.
+  useEffect(() => {
+    if (!snapshot || pending.size === 0) return;
+    const next = new Map(pending);
+    for (const [key, value] of pending) {
+      const current = snapshot.get(key);
+      if (!current || current.value === value) next.delete(key);
+    }
+    if (next.size !== pending.size) setPending(next);
+  }, [snapshot, pending]);
+
+  // Composed at render rather than inside the `then` above: the provider sets
+  // its own error state as the write rejects, so a message built in that
+  // callback would carry the *previous* failure's text (usually none at all).
+  const saveError = failed
+    ? `Could not change that setting. ${settings.saveError?.message ?? ""}`.trim()
+    : undefined;
+
   const effective = useMemo(() => {
     if (!snapshot || pending.size === 0) return snapshot;
     const merged = new Map(snapshot);
@@ -96,6 +141,9 @@ export function useCommands({ active, searching }: UseCommandsOptions): Commands
               settings: effective,
               saveSetting,
               sessions: sessions.state === "ready" ? sessions.data : [],
+              skills: skills.state === "ready" ? skills.data : [],
+              skillRecency,
+              noteSkillUse: noteSkill,
               themePreference: preference,
               setThemePreference: setPreference,
               searching,
@@ -110,6 +158,10 @@ export function useCommands({ active, searching }: UseCommandsOptions): Commands
       navigate,
       sessions.state,
       sessions.data,
+      skills.state,
+      skills.data,
+      skillRecency,
+      noteSkill,
       effective,
       saveSetting,
       preference,

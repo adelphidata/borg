@@ -141,10 +141,19 @@ export function Composer({
     setSlashCursor(0);
   }, [token]);
 
-  const { commands, saveError } = useCommands({
+  const { commands, saveError, clearSaveError } = useCommands({
     active: slashOpen,
     searching: (token ?? "") !== "",
+    // This surface has the prompt box a skill row writes into.
+    withSkills: true,
   });
+
+  // The failure belongs to the menu that caused it. The composer outlives the
+  // menu by the whole conversation, so without this a toggle that failed once
+  // leaves a red line sitting above the input through every message after it.
+  useEffect(() => {
+    if (!slashOpen) clearSaveError();
+  }, [slashOpen, clearSaveError]);
   const slashResults = useMemo(
     () => (slashOpen ? rank(commands, token ?? "").slice(0, SLASH_RESULT_LIMIT) : []),
     [slashOpen, commands, token],
@@ -173,6 +182,16 @@ export function Composer({
   const runCommand = (index: number) => {
     const command = slashResults[index];
     if (!command) return;
+    // A skill row writes what you would have typed and stops there — choosing
+    // the skill is the agent's call, and sending is yours. The trailing space
+    // in `insert` is where the caret lands, so the sentence carries on.
+    if (command.insert !== undefined) {
+      setDraft(command.insert);
+      setSlashDismissed(true);
+      command.run();
+      textarea.current?.focus();
+      return;
+    }
     // A toggle or a theme row is picked by watching it land, so it keeps the
     // menu open — same rule ⌘K follows, because it is the same row. Otherwise
     // the token was the query and never prompt text: clearing it first means a

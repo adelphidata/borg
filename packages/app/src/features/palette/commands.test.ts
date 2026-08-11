@@ -24,6 +24,9 @@ function context(over: Partial<CommandContext> = {}): CommandContext {
     settings: new Map(),
     saveSetting: vi.fn(),
     sessions: [],
+    skills: [],
+    skillRecency: [],
+    noteSkillUse: vi.fn(),
     themePreference: "system",
     setThemePreference: vi.fn(),
     searching: false,
@@ -186,5 +189,48 @@ describe("buildCommands", () => {
   it("survives a settings snapshot that has not loaded yet", () => {
     const commands = buildCommands(context({ settings: undefined, searching: true }), ROUTES);
     expect(commands.some((c) => c.id === "action:new")).toBe(true);
+  });
+
+  describe("skill rows", () => {
+    const SKILLS = [
+      { name: "git", description: "Work with repositories" },
+      { name: "weather", description: "Look up a forecast" },
+    ];
+
+    it("writes prompt text rather than acting, because the agent picks the skill", () => {
+      const commands = buildCommands(context({ skills: SKILLS }), ROUTES);
+      const git = commands.find((c) => c.id === "skill:git");
+      expect(git?.insert).toBe("Use the git skill to ");
+      expect(git?.label).toBe("git");
+    });
+
+    it("offers what the skill says it is for, so the name does not have to carry it", () => {
+      const commands = buildCommands(context({ skills: SKILLS }), ROUTES);
+      expect(commands.find((c) => c.id === "skill:weather")?.detail).toBe("Look up a forecast");
+      // Searchable by purpose: nobody types "weather" when they want a forecast.
+      expect(rank(commands, "forecast").map((c) => c.id)).toContain("skill:weather");
+    });
+
+    it("leads with the skill last used", () => {
+      const commands = buildCommands(
+        context({ skills: SKILLS, skillRecency: ["weather"] }),
+        ROUTES,
+      );
+      const skills = commands.filter((c) => c.id.startsWith("skill:"));
+      expect(skills.map((c) => c.id)).toEqual(["skill:weather", "skill:git"]);
+    });
+
+    it("records the use, so the next list leads with it", () => {
+      const noteSkillUse = vi.fn();
+      const commands = buildCommands(context({ skills: SKILLS, noteSkillUse }), ROUTES);
+      commands.find((c) => c.id === "skill:git")?.run();
+      expect(noteSkillUse).toHaveBeenCalledWith("git");
+    });
+
+    it("has no skill rows on a surface with nowhere to write them", () => {
+      // ⌘K passes no skills: prompt text needs a prompt box.
+      const commands = buildCommands(context({ skills: [] }), ROUTES);
+      expect(commands.some((c) => c.id.startsWith("skill:"))).toBe(false);
+    });
   });
 });
