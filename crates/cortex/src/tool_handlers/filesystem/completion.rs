@@ -51,10 +51,12 @@ pub fn complete_paths(
     allowed: &[String],
     limit: usize,
 ) -> Result<Vec<PathSuggestion>> {
-    let root = ctx
-        .workspace_root()
-        .canonicalize()
-        .with_context(|| format!("workspace root {} is unreadable", ctx.workspace_root().display()))?;
+    let root = ctx.workspace_root().canonicalize().with_context(|| {
+        format!(
+            "workspace root {} is unreadable",
+            ctx.workspace_root().display()
+        )
+    })?;
 
     // An absolute path, or one through `~`, is not a workspace reference at
     // all. Refusing the whole shape is simpler to be sure of than resolving it

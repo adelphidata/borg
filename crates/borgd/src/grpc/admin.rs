@@ -39,8 +39,7 @@ use protocols::admin::{
     SessionDetail, SessionList, SessionRef, SessionSummary, SessionTitleMutation,
     SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
     SettingMutation, SettingsSnapshot, SkillEntry as PbSkillEntry, SkillList as PbSkillList,
-    SubprocessSnapshot, TriggerHeartbeatRequest,
-    TunnelStatusReply, WarningList, WebhookRef,
+    SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::Arc;

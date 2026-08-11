@@ -85,7 +85,13 @@ fn refuses_an_absolute_or_home_relative_prefix() {
 #[test]
 fn never_names_a_credential_the_read_tools_would_refuse() {
     let dir = tempfile::tempdir().unwrap();
-    for name in [".env", ".env.local", "credentials.json", "id_rsa", "private_key.pem"] {
+    for name in [
+        ".env",
+        ".env.local",
+        "credentials.json",
+        "id_rsa",
+        "private_key.pem",
+    ] {
         fs::write(dir.path().join(name), "").unwrap();
     }
     fs::write(dir.path().join(".editorconfig"), "").unwrap();
@@ -164,13 +170,16 @@ fn honours_the_cap_the_caller_asks_for() {
         .unwrap();
     let s = security();
     let rows = complete_paths("file", &ctx, &s.blocked_paths, &s.allowed_paths, 5).unwrap();
-    assert_eq!(paths(&rows), [
-        "file-00.txt",
-        "file-01.txt",
-        "file-02.txt",
-        "file-03.txt",
-        "file-04.txt"
-    ]);
+    assert_eq!(
+        paths(&rows),
+        [
+            "file-00.txt",
+            "file-01.txt",
+            "file-02.txt",
+            "file-03.txt",
+            "file-04.txt"
+        ]
+    );
 }
 
 #[test]
