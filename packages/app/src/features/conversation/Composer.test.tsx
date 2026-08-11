@@ -227,27 +227,44 @@ describe("the composer's slash menu", () => {
     expect(second).toHaveBeenCalled();
   });
 
-  it("does not recall history with ArrowUp while the menu owns the arrows", () => {
-    const onSend = vi.fn();
-    registry.commands = [command("a", "Alpha", noop)];
-    render(
-      <Composer
-        busy={false}
-        draftKey={draftKeyFor("s")}
-        conversationKey="s"
-        onSend={onSend}
-        onSteer={noop}
-        onCancel={noop}
-      />,
-    );
-
-    type("an earlier prompt");
-    enter();
-    expect(onSend).toHaveBeenCalled();
+  it("walks the highlight back up, and stops at the first row", () => {
+    const first = vi.fn();
+    registry.commands = [command("a", "Alpha", first), command("b", "Bravo", noop)];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
 
     type("/");
-    fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowUp" });
-    expect(screen.getByRole("textbox")).toHaveProperty("value", "/");
+    const box = screen.getByRole("textbox");
+    fireEvent.keyDown(box, { key: "ArrowDown" });
+    fireEvent.keyDown(box, { key: "ArrowUp" });
+    fireEvent.keyDown(box, { key: "ArrowUp" });
+
+    expect(screen.getByRole("option", { name: "Alpha" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    enter();
+    expect(first).toHaveBeenCalled();
+  });
+
+  it("keeps Escape on the menu even when the turn starts after it opened", () => {
+    // `useKeybind` re-registers when `enabled` flips, so a turn beginning while
+    // the menu is open used to push the cancel binding on top and take Escape.
+    const onCancel = vi.fn();
+    registry.commands = [command("a", "Alpha", noop)];
+    const props = {
+      draftKey: draftKeyFor("s"),
+      conversationKey: "s",
+      onSend: noop,
+      onSteer: noop,
+      onCancel,
+    };
+    const { rerender } = render(<Composer busy={false} {...props} />);
+
+    type("/");
+    rerender(<Composer busy {...props} />);
+
+    act(() => void dispatchKeybind("cancel-turn"));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(onCancel).not.toHaveBeenCalled();
   });
 
   it("gives Escape to the menu first, and to a running turn only after", () => {
@@ -303,7 +320,9 @@ describe("the composer's slash menu", () => {
     expect(screen.getByText(/No command matches/)).toBeTruthy();
   });
 
-  it("sends nothing when Enter lands on a menu with no matches", () => {
+  it("sends a slash token that matches nothing, rather than swallowing it", () => {
+    // `/tmp` and `/etc/hosts` are things people say. With no row on offer the
+    // token is ordinary text, and Enter must not be a silent no-op.
     const onSend = vi.fn();
     registry.commands = [command("a", "Alpha", noop)];
     render(
@@ -319,6 +338,21 @@ describe("the composer's slash menu", () => {
 
     type("/zzzz");
     enter();
-    expect(onSend).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith("/zzzz", []);
+  });
+
+  it("keeps the menu open for a row that is picked by watching it land", () => {
+    // Theme and toggle rows carry `keepOpen` in the palette; the same row
+    // reached through `/` has to behave the same way.
+    const run = vi.fn();
+    registry.commands = [{ id: "theme:dark", label: "Dark", run, keepOpen: true }];
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    type("/dark");
+    enter();
+
+    expect(run).toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "/dark");
+    expect(screen.getByRole("listbox")).toBeTruthy();
   });
 });

@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AttachIcon, CloseIcon, CompletionList, Pill, SendIcon, useIsMobile } from "@borg/ui";
+import {
+  AttachIcon,
+  CloseIcon,
+  CompletionList,
+  Pill,
+  rowDomId,
+  SendIcon,
+  useIsMobile,
+} from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
@@ -17,6 +25,9 @@ const MAX_ROWS_PX = 200;
  * what Borg can do, and a wall of options teaches nothing. ⌘K is the full list.
  */
 const SLASH_RESULT_LIMIT = 8;
+
+/** Ties the textarea's `aria-controls` to the list it drives. */
+const SLASH_LIST_ID = "composer-slash-menu";
 
 function useAutoGrow(value: string) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -87,7 +98,11 @@ export function Composer({
   // provisional → real migration a new conversation makes once the daemon
   // answers, where the text has already been moved across for us.
   useEffect(() => {
-    setDraft(sessionStorage.getItem(draftKey) ?? "");
+    const restored = sessionStorage.getItem(draftKey) ?? "";
+    setDraft(restored);
+    // A restored draft is not a keystroke. A stored `/new` that popped a menu
+    // on session switch would put a command under Enter without anyone asking.
+    setSlashDismissed(slashQuery(restored) !== null);
   }, [draftKey]);
 
   // Attachments belong to the conversation, not to the key naming it. Clearing
@@ -112,8 +127,6 @@ export function Composer({
     publishDraft(draftKey, draft);
   }, [draft, draftKey]);
 
-  useKeybind("cancel-turn", onCancel, { enabled: busy, inInputs: true });
-
   // `/` opens the same command list ⌘K renders. The chord is the shortcut for
   // people who know it exists; the slash is how everyone else finds out.
   const token = slashQuery(draft);
@@ -128,24 +141,43 @@ export function Composer({
     setSlashCursor(0);
   }, [token]);
 
-  const { commands } = useCommands({ active: slashOpen, searching: (token ?? "") !== "" });
+  const { commands, saveError } = useCommands({
+    active: slashOpen,
+    searching: (token ?? "") !== "",
+  });
   const slashResults = useMemo(
     () => (slashOpen ? rank(commands, token ?? "").slice(0, SLASH_RESULT_LIMIT) : []),
     [slashOpen, commands, token],
   );
 
-  // Registered after the cancel-turn binding above, so while the menu is open
-  // Escape closes it and on close the running turn gets Escape back. A raw
-  // listener here would do both at once.
-  useKeybind("cancel-turn", () => setSlashDismissed(true), { enabled: slashOpen, inInputs: true });
+  // The list changes under a stable token — the settings snapshot and the
+  // session listing both arrive after the menu opens. A cursor left past the
+  // new end would take Enter to a row that is not there.
+  useEffect(() => {
+    setSlashCursor((c) => Math.min(c, Math.max(0, slashResults.length - 1)));
+  }, [slashResults.length]);
+
+  // One handler decides who owns Escape, rather than two registrations racing
+  // for the top of the stack: `useKeybind` re-registers whenever `enabled`
+  // flips, so a turn that starts *after* the menu opened would otherwise take
+  // Escape back and cancel while the menu stayed on screen.
+  useKeybind(
+    "cancel-turn",
+    () => {
+      if (slashOpen) setSlashDismissed(true);
+      else onCancel();
+    },
+    { enabled: busy || slashOpen, inInputs: true },
+  );
 
   const runCommand = (index: number) => {
     const command = slashResults[index];
     if (!command) return;
-    // The token was the query, never prompt text. Clearing it first means a
+    // A toggle or a theme row is picked by watching it land, so it keeps the
+    // menu open — same rule ⌘K follows, because it is the same row. Otherwise
+    // the token was the query and never prompt text: clearing it first means a
     // command that navigates cannot leave a stray `/` behind in the draft.
-    setDraft("");
-    setSlashDismissed(false);
+    if (!command.keepOpen) setDraft("");
     command.run();
   };
 
@@ -173,9 +205,11 @@ export function Composer({
   };
 
   const submit = () => {
-    // A slash token is a menu query. The daemon has no slash handler, so
-    // sending it as prompt text would look like it worked and do nothing.
-    if (slashOpen) {
+    // While a row is on offer the token is a menu query, not prompt text: the
+    // daemon has no slash handler, so sending it would look like it worked and
+    // do nothing. With nothing on offer it is just text — otherwise `/tmp` and
+    // `/etc/hosts` would be unsendable, and Enter a silent no-op.
+    if (slashOpen && slashResults.length > 0) {
       runCommand(slashCursor);
       return;
     }
@@ -199,7 +233,7 @@ export function Composer({
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // While the menu is open the arrows belong to it, not to the caret or to
     // history recall.
-    if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+    if (slashOpen && slashResults.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
       e.preventDefault();
       const last = Math.max(0, slashResults.length - 1);
       setSlashCursor((c) => Math.max(0, Math.min(last, e.key === "ArrowDown" ? c + 1 : c - 1)));
@@ -249,10 +283,18 @@ export function Composer({
           </div>
         )}
 
+        {/* A row that changes a setting is picked by watching it land, so a
+            failed write has to say so here too — the menu closes on the way
+            out, taking the row's own feedback with it. */}
+        {saveError && (
+          <div className="mb-2 px-1 text-[11.5px] leading-[1.5] text-alert">{saveError}</div>
+        )}
+
         {slashOpen && (
           <CompletionList
+            id={SLASH_LIST_ID}
             label="Commands"
-            emptyText="No command matches. Press Escape to keep typing."
+            emptyText="No command matches. Press Enter to send it as a message."
             rows={slashResults.map((c) => ({
               id: c.id,
               label: c.label,
@@ -301,6 +343,16 @@ export function Composer({
             rows={1}
             className="min-w-0 flex-1 resize-none border-0 bg-transparent py-1.5 text-[14.5px] leading-[1.4] text-ink outline-none select-text placeholder:text-ink3"
             placeholder={busy ? "Steer Borg…" : "Ask Borg anything"}
+            // Focus never leaves the box, so the row Enter would take is only
+            // announced if the box names it.
+            role="combobox"
+            aria-expanded={slashOpen}
+            aria-controls={slashOpen ? SLASH_LIST_ID : undefined}
+            aria-activedescendant={
+              slashOpen && slashResults.length > 0
+                ? rowDomId(SLASH_LIST_ID, slashCursor)
+                : undefined
+            }
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}

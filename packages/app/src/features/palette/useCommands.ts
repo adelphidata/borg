@@ -86,21 +86,27 @@ export function useCommands({ active, searching }: UseCommandsOptions): Commands
 
   const commands = useMemo<Command[]>(
     () =>
-      buildCommands(
-        {
-          navigate,
-          dispatch: dispatchKeybind,
-          hintFor,
-          settings: effective,
-          saveSetting,
-          sessions: sessions.state === "ready" ? sessions.data : [],
-          themePreference: preference,
-          setThemePreference: setPreference,
-          searching,
-        },
-        routes,
-      ),
+      !active
+        ? []
+        : buildCommands(
+            {
+              navigate,
+              dispatch: dispatchKeybind,
+              hintFor,
+              settings: effective,
+              saveSetting,
+              sessions: sessions.state === "ready" ? sessions.data : [],
+              themePreference: preference,
+              setThemePreference: setPreference,
+              searching,
+            },
+            routes,
+          ),
+    // `active` gates the build itself: a closed palette and a composer with no
+    // `/` in it render no rows, and building ~500 of them on every settings
+    // snapshot for a surface nobody is looking at is pure cost.
     [
+      active,
       navigate,
       sessions.state,
       sessions.data,

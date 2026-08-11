@@ -9,6 +9,8 @@
  * two look similar on purpose and behave differently on purpose.
  */
 
+import { useEffect, useRef } from "react";
+
 export interface CompletionRow {
   id: string;
   label: string;
@@ -28,9 +30,21 @@ export interface CompletionListProps {
   label: string;
   /** Shown in place of the rows when nothing matched. */
   emptyText: string;
+  /**
+   * Id of the listbox. The input that owns the keys points at it with
+   * `aria-controls`, and names the highlighted row with `aria-activedescendant`
+   * built from [`rowDomId`] — focus stays in the input, so that is the only way
+   * a screen reader learns what Enter will take.
+   */
+  id: string;
 }
 
 const MAX_HEIGHT_PX = 232;
+
+/** The DOM id of row `index` in the list with the given `id`. */
+export function rowDomId(id: string, index: number): string {
+  return `${id}-row-${index}`;
+}
 
 export function CompletionList({
   rows,
@@ -39,9 +53,20 @@ export function CompletionList({
   onChoose,
   label,
   emptyText,
+  id,
 }: CompletionListProps) {
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Arrowing past the fold has to bring the row with it, or the highlight moves
+  // somewhere the user cannot see and Enter takes a row they never read.
+  useEffect(() => {
+    listRef.current?.children[cursor]?.scrollIntoView({ block: "nearest" });
+  }, [cursor, rows.length]);
+
   return (
     <div
+      ref={listRef}
+      id={id}
       role="listbox"
       aria-label={label}
       style={{ maxHeight: MAX_HEIGHT_PX }}
@@ -55,6 +80,7 @@ export function CompletionList({
       {rows.map((row, i) => (
         <button
           key={row.id}
+          id={rowDomId(id, i)}
           type="button"
           role="option"
           aria-selected={i === cursor}

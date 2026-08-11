@@ -46,6 +46,11 @@ service Admin {
   // Persistent doctor warnings — latest doctor_runs row's persistent_warnings.
   rpc GetPersistentWarnings(Empty) returns (WarningList);
 
+  // Skills the agent will actually load this run, so a client can show what
+  // Borg knows how to do without reimplementing the loader's shadowing and
+  // requirement rules.
+  rpc ListSkills(Empty) returns (SkillList);
+
   // Pairing requests + approved senders.
   rpc ListPairingRequests(PairingFilter) returns (PairingRequestList);
   rpc ApprovePairing(PairingApproval) returns (Empty);
@@ -643,6 +648,18 @@ message AmbientStatus {
 }
 
 message WarningList { repeated string warnings = 1; }
+
+// Skills.
+message SkillEntry {
+  // Frontmatter name — what the catalog, invocation, and shadowing all key on.
+  string name = 1;
+  // One-line frontmatter description, already capped by the authoring limit.
+  string description = 2;
+  // True for a skill compiled into the binary, false for one under
+  // `~/.borg/skills/`.
+  bool builtin = 3;
+}
+message SkillList { repeated SkillEntry skills = 1; }
 
 // Pairing.
 message PairingFilter { string channel_name = 1; } // empty = all

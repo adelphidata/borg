@@ -22,6 +22,7 @@ export { Meter } from "./components/Meter";
 export { Menu, clampToViewport, type MenuAction, type MenuProps } from "./components/Menu";
 export {
   CompletionList,
+  rowDomId,
   type CompletionRow,
   type CompletionListProps,
 } from "./components/CompletionList";
