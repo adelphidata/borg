@@ -33,12 +33,26 @@ pub struct InlineDocument {
     pub content: Vec<u8>,
 }
 
-/// The largest a single document may be once it is text.
+/// The largest a single document may be.
 ///
-/// Matched to the client's own attachment cap. It is repeated here because the
-/// client check is a convenience and this one is the boundary: a caller that is
-/// not the web UI reaches the same daemon.
-pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Deliberately far below the image cap, because the binding limit on text is
+/// the context window rather than the wire: 256 KB is already ~64k tokens, and
+/// a megabyte of log would be accepted here only to fail at the provider after
+/// the upload was paid for. A file past this belongs on disk, where `fs_read`
+/// can page through it.
+///
+/// The client checks the same number first. That check is a convenience and
+/// this one is the boundary: a caller that is not the web UI reaches the same
+/// daemon.
+pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+
+/// The largest `Session.Send` message the daemon will decode.
+///
+/// tonic defaults to 4 MB, which silently sits *below* the 10 MB image the
+/// client is told it may attach — the turn would die in the codec with a raw
+/// length error instead of a sentence anyone can act on. This raises the floor
+/// so the caps the UI advertises are the caps that actually apply.
+pub const MAX_INBOUND_TURN_BYTES: usize = 16 * 1024 * 1024;
 
 impl InlineDocument {
     /// The document as a text part, or an error naming what is wrong with it.
@@ -51,9 +65,11 @@ impl InlineDocument {
     pub fn to_text_part(&self) -> anyhow::Result<String> {
         if self.content.len() > MAX_DOCUMENT_BYTES {
             anyhow::bail!(
-                "{} is {} bytes; the cap is {MAX_DOCUMENT_BYTES}",
+                "{} is too long to attach to one message ({} KB; the cap is {} KB). \
+                 Save it somewhere Borg can reach and ask it to read the path instead.",
                 self.label(),
-                self.content.len()
+                self.content.len() / 1024,
+                MAX_DOCUMENT_BYTES / 1024
             );
         }
         // Refused rather than replaced. `from_utf8_lossy` would hand the model
@@ -142,6 +158,16 @@ mod tests {
             .to_string();
         assert!(err.contains("huge.log"), "{err}");
         assert!(err.contains("cap"), "{err}");
+        assert!(err.contains("read the path"), "{err}");
+    }
+
+    #[test]
+    fn the_document_cap_fits_inside_what_the_daemon_will_decode() {
+        // The two numbers are set apart from each other, so nothing stops them
+        // from being edited into disagreement. If the document cap ever climbs
+        // past the message cap, an in-cap file dies in the codec with a raw
+        // length error instead of the sentence above.
+        assert!(MAX_DOCUMENT_BYTES < MAX_INBOUND_TURN_BYTES);
     }
 
     #[test]

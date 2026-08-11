@@ -329,10 +329,13 @@ impl Session for SessionSvc {
         // off `req.metadata()`.
         let deadline = parse_grpc_deadline(&req);
         let req = req.into_inner();
-        // Refused before the turn starts, so an unreadable attachment is an
-        // answer to `Send` rather than an error part-way through a reply.
-        let text = compose_turn_text(req.text, req.documents)?;
+        // The session is resolved first so a `Send` to a session that is gone
+        // reports that, rather than complaining about an attachment nobody can
+        // deliver either way. Composition still happens before the turn starts,
+        // so an unreadable attachment is an answer to `Send` rather than an
+        // error part-way through a reply.
         let host = self.host_or_err(&req.session_id)?;
+        let text = compose_turn_text(req.text, req.documents)?;
 
         // Subscribe BEFORE starting the turn so we can't miss the first event.
         // `start_turn` returns the baseline seq sampled atomically *after*

@@ -8,6 +8,7 @@ import {
   useRetryingServerStream,
   type QueryResult,
 } from "../../lib/useDaemon";
+import { splitAttachments } from "./attachments";
 import { draftKeyFor, moveDraft } from "./draftStore";
 
 /** An image riding along with a turn. */
@@ -445,24 +446,7 @@ export function useConversation(target: string | undefined): Conversation {
       setSendError(undefined);
       // The turn's events arrive on the Stream subscription above.
       borg.session.send(
-        {
-          sessionId,
-          text,
-          images: attachments
-            .filter((a) => a.kind === "image")
-            .map((a) => ({
-              mimeType: a.mimeType,
-              data: a.data,
-              filename: a.filename,
-            })),
-          documents: attachments
-            .filter((a) => a.kind === "document")
-            .map((a) => ({
-              filename: a.filename,
-              mimeType: a.mimeType,
-              content: a.data,
-            })),
-        },
+        { sessionId, text, ...splitAttachments(attachments) },
         {
           onMessage: () => {},
           onError: (error) => {

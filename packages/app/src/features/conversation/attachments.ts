@@ -25,6 +25,12 @@ const DOCUMENT_TYPES = new Set([
  * reports `""`. Refusing those would make "attach a file" mean "attach a file
  * the OS happens to have an opinion about", which is not a rule anyone can
  * hold in their head.
+ *
+ * Nothing in a credential's family belongs on this list. `.env` reads as the
+ * extension `env`, so naming it here would ship a secrets file to the model
+ * while `.env.local` — extension `local` — was refused beside it. Borg's
+ * `blocked_paths` rule keeps those files away from every other read path; an
+ * attach button is not the place to make an exception.
  */
 const DOCUMENT_EXTENSIONS = new Set([
   "c",
@@ -36,8 +42,6 @@ const DOCUMENT_EXTENSIONS = new Set([
   "css",
   "csv",
   "diff",
-  "env",
-  "example",
   "go",
   "gradle",
   "h",
@@ -87,6 +91,15 @@ const DOCUMENT_EXTENSIONS = new Set([
 /** 10 MB, matched to what a single turn can reasonably carry inline. */
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
+/**
+ * 256 KB — the daemon's `MAX_DOCUMENT_BYTES`, kept in step by hand.
+ *
+ * Text is capped far lower than an image because the limit that bites is the
+ * context window, not the wire. Sending a megabyte of log would only buy a
+ * provider error after the upload.
+ */
+export const MAX_DOCUMENT_BYTES = 256 * 1024;
+
 export function isSupportedImage(file: { type: string }): boolean {
   return IMAGE_TYPES.has(file.type);
 }
@@ -113,13 +126,20 @@ export function isSupportedDocument(file: { type: string; name: string }): boole
 /** Why a file was rejected, or null when it is fine to attach. */
 export function rejectionReason(file: File): string | null {
   const name = file.name || "That file";
-  if (!isSupportedImage(file) && !isSupportedDocument(file)) {
+  const isImage = isSupportedImage(file);
+  if (!isImage && !isSupportedDocument(file)) {
     // Names the next action rather than the rule that was broken: a bare "not
     // supported" leaves someone holding a PDF with nowhere to go.
     return `${name} is not an image or a text file. Save it somewhere Borg can reach and ask it to read the path.`;
   }
-  if (file.size > MAX_ATTACHMENT_BYTES) {
-    return `${name} is larger than ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`;
+  if (isImage) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      return `${name} is larger than ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB`;
+    }
+    return null;
+  }
+  if (file.size > MAX_DOCUMENT_BYTES) {
+    return `${name} is too long to attach to one message (over ${MAX_DOCUMENT_BYTES / 1024} KB). Save it somewhere Borg can reach and ask it to read the path.`;
   }
   return null;
 }
@@ -144,6 +164,30 @@ export async function toAttachment(file: File): Promise<Attachment> {
   };
 }
 
+/**
+ * Splits attachments into the two `SendRequest` fields they belong in.
+ *
+ * The wire keeps images and documents apart because the daemon does different
+ * things with them: an image becomes a multimodal part, a document is decoded
+ * as text behind the untrusted-content boundary. Sending one down the other's
+ * field is silent corruption, so this is its own function with its own test.
+ */
+export function splitAttachments(attachments: readonly Attachment[]): {
+  images: { mimeType: string; data: Uint8Array; filename: string }[];
+  documents: { filename: string; mimeType: string; content: Uint8Array }[];
+} {
+  const images = [];
+  const documents = [];
+  for (const a of attachments) {
+    if (a.kind === "image") {
+      images.push({ mimeType: a.mimeType, data: a.data, filename: a.filename });
+    } else {
+      documents.push({ filename: a.filename, mimeType: a.mimeType, content: a.data });
+    }
+  }
+  return { images, documents };
+}
+
 /** Collects every supported file out of a paste or drop, reporting the rest. */
 export async function collectAttachments(
   files: readonly File[],
@@ -152,8 +196,17 @@ export async function collectAttachments(
   const errors: string[] = [];
   for (const file of files) {
     const reason = rejectionReason(file);
-    if (reason) errors.push(reason);
-    else attachments.push(await toAttachment(file));
+    if (reason) {
+      errors.push(reason);
+      continue;
+    }
+    try {
+      attachments.push(await toAttachment(file));
+    } catch {
+      // A file moved or removed between the picker and the read. Silence here
+      // would be a chip that never appears and no reason why.
+      errors.push(`${file.name || "That file"} could not be read. Try attaching it again.`);
+    }
   }
   return { attachments, errors };
 }

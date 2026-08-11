@@ -387,7 +387,9 @@ export function Composer({
               // An image is its own label, so it shows as a thumbnail. A
               // document has nothing to look at, so it shows as its name —
               // which is the part anyone needs to check anyway.
-              a.previewUrl ? (
+              // Branching on `kind` rather than on `previewUrl`: the kind is
+              // what was decided about the file, the URL is one consequence.
+              a.kind === "image" && a.previewUrl ? (
                 <div
                   key={`${a.filename}-${i}`}
                   className="relative h-[52px] w-[52px] overflow-hidden rounded-[8px] border border-line2"

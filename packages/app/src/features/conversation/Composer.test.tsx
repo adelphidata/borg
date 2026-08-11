@@ -538,7 +538,10 @@ describe("attaching a document", () => {
     expect(screen.queryByAltText("notes.md")).toBeNull();
   });
 
-  it("sends a document and an image together, each in its own field", async () => {
+  // Which wire field each one lands in is `splitAttachments`' claim, tested
+  // against the real function in attachments.test.ts. This is only that the
+  // composer carries both kinds through to the send handler and drops neither.
+  it("hands a document and an image together to the send handler", async () => {
     const onSend = vi.fn();
     const { container } = render(
       <Composer
@@ -556,8 +559,9 @@ describe("attaching a document", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "look at these" } });
     fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
 
-    const [, attached] = onSend.mock.calls[0]!;
-    expect(attached.map((a: { kind: string }) => a.kind)).toEqual(["document", "image"]);
+    const [text, attached] = onSend.mock.calls[0]!;
+    expect(text).toBe("look at these");
+    expect(attached.map((a: { filename: string }) => a.filename)).toEqual(["notes.md", "shot.png"]);
   });
 
   it("drops a document chip without touching the image beside it", async () => {

@@ -44,7 +44,8 @@ pub fn build_services(
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin::AdminSvc::new(registry.clone())),
-        session: SessionServer::new(session::SessionSvc::new(registry, factory)),
+        session: SessionServer::new(session::SessionSvc::new(registry, factory))
+            .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
     }
@@ -112,7 +113,8 @@ pub fn build_services_with_extras(
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin_svc),
-        session: SessionServer::new(session::SessionSvc::new(registry, factory)),
+        session: SessionServer::new(session::SessionSvc::new(registry, factory))
+            .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
     }
