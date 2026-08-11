@@ -330,7 +330,7 @@ async fn send_approval_notification_inner(
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
             let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let client = reqwest::Client::new();
+            let client = crate::http::shared();
             let resp = client
                 .post(&url)
                 .json(&serde_json::json!({

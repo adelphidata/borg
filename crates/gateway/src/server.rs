@@ -1056,12 +1056,11 @@ fn build_router(
 /// instance before binding the port.
 async fn probe_existing_instance(addr: &str) -> bool {
     async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .ok()?;
-        let resp = client
+        // Two seconds, not the shared default: this runs before binding the
+        // port, so startup stalls for exactly as long as this probe takes.
+        let resp = cortex::http::shared()
             .get(format!("http://{addr}/healthz"))
+            .timeout(Duration::from_secs(2))
             .send()
             .await
             .ok()?;

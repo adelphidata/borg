@@ -484,7 +484,7 @@ async fn resolve_session_and_commands(
             "http://{}:{}/internal/poke",
             config.gateway.host, config.gateway.port
         );
-        let response = match reqwest::Client::new()
+        let response = match cortex::http::shared()
             .post(&poke_url)
             .timeout(INTERNAL_POKE_TIMEOUT)
             .send()

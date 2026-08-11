@@ -110,19 +110,19 @@ pub async fn fetch_latest_release(dev: bool) -> Result<ReleaseInfo> {
 }
 
 async fn fetch_latest_release_with_base(base_url: &str, dev: bool) -> Result<ReleaseInfo> {
-    let client = reqwest::Client::new();
+    let client = crate::http::shared();
 
     if dev {
-        fetch_release_list(&client, base_url, ReleaseKind::Prerelease).await
+        fetch_release_list(client, base_url, ReleaseKind::Prerelease).await
     } else {
         let latest_url = format!("{base_url}/releases/latest");
-        match get_github_json::<ReleaseInfo>(&client, &latest_url, "latest release").await {
+        match get_github_json::<ReleaseInfo>(client, &latest_url, "latest release").await {
             Ok(release) => Ok(release),
             Err(primary) => {
                 tracing::warn!(
                     "latest release endpoint failed, falling back to release list: {primary:#}"
                 );
-                fetch_release_list(&client, base_url, ReleaseKind::Stable)
+                fetch_release_list(client, base_url, ReleaseKind::Stable)
                     .await
                     .with_context(|| format!("Failed to resolve latest stable release after /releases/latest failed: {primary}"))
             }
@@ -354,7 +354,9 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
         .find(|a| a.name == "checksums.txt")
         .map(|a| &a.browser_download_url);
 
-    let client = reqwest::Client::new();
+    // Release archives are tens of megabytes, so this is the long profile —
+    // the ordinary 30s cap would abort a healthy download on a slow link.
+    let client = crate::http::downloads();
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
     // Download the tarball

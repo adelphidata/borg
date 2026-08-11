@@ -91,6 +91,8 @@ pub mod hmac_chain;
 pub mod hooks;
 /// Host security audit checks.
 pub mod host_audit;
+/// Shared outbound HTTP clients (timeouts, user-agent, connection pooling).
+pub mod http;
 /// IDENTITY.md load/save for agent personality.
 pub mod identity;
 /// Normalized ingress message schema and pre-dispatch gate (rate-limit,

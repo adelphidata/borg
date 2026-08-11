@@ -251,16 +251,10 @@ async fn close_firecrawl(cfg: &BrowserConfig, id: &str) -> Result<()> {
 /// Per-call timeouts are applied on the request builder (see [`req_timeout`]),
 /// not baked into the client, so each call still honors `startup_timeout_ms`.
 fn http_client() -> Result<&'static reqwest::Client> {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client);
-    }
-    // Build outside `get_or_init` so a (rare) construction failure surfaces as
-    // an error instead of poisoning the slot with a panic.
-    let client = reqwest::Client::builder()
-        .build()
-        .context("failed to build HTTP client for remote browser backend")?;
-    Ok(CLIENT.get_or_init(|| client))
+    // This backend set no options of its own, so it uses the workspace client
+    // and inherits its timeouts. Every call below still applies its own
+    // per-request budget from `req_timeout`.
+    Ok(crate::http::shared())
 }
 
 /// Per-request timeout for a remote-backend control-plane call.

@@ -483,7 +483,9 @@ impl AudioTranscriber {
         }
 
         let audio = &config.audio;
-        let client = Client::new();
+        // Cloned, not built: every provider entry below shares the one
+        // connection pool, and per-request budgets are applied on the request.
+        let client = crate::http::shared().clone();
         let mut entries: Vec<ProviderEntry> = Vec::new();
 
         for model_cfg in &audio.models {

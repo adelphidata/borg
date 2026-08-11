@@ -143,9 +143,11 @@ struct TagDetails {
 /// worse than the hardcoded suggestions, which double as `ollama pull`
 /// candidates).
 async fn fetch_and_parse(url: &str, timeout: Duration) -> anyhow::Result<ModelList> {
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-    let resp = client
+    // Shared pool, per-request budget: the caller's timeout is a property of
+    // this one fetch, not a reason to own a second connection pool.
+    let resp = cortex::http::shared()
         .get(url)
+        .timeout(timeout)
         .header("Accept", "application/json")
         .send()
         .await?

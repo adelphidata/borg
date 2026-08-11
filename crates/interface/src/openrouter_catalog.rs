@@ -122,9 +122,11 @@ impl Pricing {
 /// - the intersection with the curated list is empty (we'd otherwise return
 ///   nothing useful and callers should fall back to the hardcoded list)
 async fn fetch_and_parse(base_url: &str, timeout: Duration) -> anyhow::Result<ModelList> {
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-    let resp = client
+    // Shared pool, per-request budget: the caller's timeout is a property of
+    // this one fetch, not a reason to own a second connection pool.
+    let resp = cortex::http::shared()
         .get(base_url)
+        .timeout(timeout)
         .header("Accept", "application/json")
         .send()
         .await?

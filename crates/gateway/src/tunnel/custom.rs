@@ -215,7 +215,7 @@ impl Tunnel for CustomTunnel {
         let Some(url) = self.health_url.as_ref() else {
             return alive;
         };
-        match timeout(HEALTH_TIMEOUT, reqwest::Client::new().get(url).send()).await {
+        match timeout(HEALTH_TIMEOUT, cortex::http::shared().get(url).send()).await {
             Ok(Ok(resp)) => resp.status().is_success(),
             _ => false,
         }

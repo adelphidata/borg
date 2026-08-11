@@ -184,11 +184,14 @@ async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> St
     let url = format!("http://{addr}/internal/restart");
 
     let daemon_signalled = async {
-        let client = reqwest::Client::builder()
+        // Two seconds, not the shared default: this only asks a daemon on
+        // loopback whether it is alive, and the user is waiting on the answer.
+        let resp = cortex::http::shared()
+            .post(&url)
             .timeout(std::time::Duration::from_secs(2))
-            .build()
+            .send()
+            .await
             .ok()?;
-        let resp = client.post(&url).send().await.ok()?;
         resp.status().is_success().then_some(())
     }
     .await

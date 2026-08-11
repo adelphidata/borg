@@ -11,6 +11,11 @@ const MAX_FETCH_CHARS: usize = constants::WEB_FETCH_MAX_CHARS;
 const MAX_SEARCH_RESULTS: usize = constants::WEB_MAX_SEARCH_RESULTS;
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; Borg/0.1)";
 
+/// Builds its own client rather than using [`crate::http::shared`]: web
+/// fetching presents a browser user-agent, because sites serve different
+/// content (or refuse outright) to an unfamiliar one. The sibling client at
+/// [`fetch_url`] additionally installs an SSRF-guarding DNS resolver, which is
+/// a security boundary for this path only.
 fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)

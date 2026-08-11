@@ -180,7 +180,7 @@ pub(crate) async fn run_poke() -> Result<()> {
         "http://{}:{}/internal/poke",
         config.gateway.host, config.gateway.port
     );
-    let client = reqwest::Client::new();
+    let client = cortex::http::shared();
     match client
         .post(&url)
         .timeout(std::time::Duration::from_secs(5))
@@ -233,7 +233,7 @@ pub(crate) async fn run_cancel(session: Option<String>) -> Result<()> {
         "http://{}:{}/internal/cancel",
         config.gateway.host, config.gateway.port
     );
-    let client = reqwest::Client::new();
+    let client = cortex::http::shared();
     let mut req = client.post(&url).timeout(std::time::Duration::from_secs(5));
     if let Some(ref sid) = session {
         req = req.query(&[("session", sid)]);
@@ -268,7 +268,7 @@ pub(crate) async fn run_away(message: Option<String>) -> Result<()> {
         "http://{}:{}/internal/away",
         config.gateway.host, config.gateway.port
     );
-    let client = reqwest::Client::new();
+    let client = cortex::http::shared();
     let mut req = client.post(&url).timeout(std::time::Duration::from_secs(5));
     if let Some(msg) = &message {
         req = req
@@ -298,7 +298,7 @@ pub(crate) async fn run_available() -> Result<()> {
         "http://{}:{}/internal/available",
         config.gateway.host, config.gateway.port
     );
-    let client = reqwest::Client::new();
+    let client = cortex::http::shared();
     match client
         .post(&url)
         .timeout(std::time::Duration::from_secs(5))
