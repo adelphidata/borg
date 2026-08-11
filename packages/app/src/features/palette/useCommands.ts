@@ -55,7 +55,16 @@ export function useCommands({
     [active],
   );
 
-  const wantSkills = active && withSkills;
+  // Latched rather than tracking `active`: the daemon answers `ListSkills` by
+  // walking the skills directory and probing `$PATH` for every declared binary,
+  // and the composer's menu opens and closes on every `/` typed and deleted.
+  // Once is enough — the set does not change while the surface is mounted.
+  const [askedSkills, setAskedSkills] = useState(false);
+  const wantSkills = askedSkills || (active && withSkills);
+  useEffect(() => {
+    if (active && withSkills) setAskedSkills(true);
+  }, [active, withSkills]);
+
   const skills = useQuery(
     async (borg) => (wantSkills ? (await borg.admin.listSkills({})).skills : []),
     [wantSkills],
