@@ -8,7 +8,7 @@
 //!   3. The bytes round-trip drops content (would reduce length to zero).
 //!
 //! Mirrors the harness pattern in `admin_rpc_smoke.rs` (process-global
-//! `BORG_DATA_DIR`, serialized via mutex).
+//! `BORG_HOME`, serialized via mutex).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
@@ -53,7 +53,7 @@ async fn export_session_round_trips_messages() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary serialize through SERIAL above.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     // Seed a session with one user + one assistant message via direct DB

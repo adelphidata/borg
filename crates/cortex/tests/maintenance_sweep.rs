@@ -11,7 +11,7 @@
 //!   - The sweep never calls an LLM.
 //!
 //! These drive `cortex::maintenance::run_daily_maintenance` against a real
-//! SQLite DB rooted under `BORG_DATA_DIR=<tempdir>` and assert on the
+//! SQLite DB rooted under `BORG_HOME=<tempdir>` and assert on the
 //! returned `MaintenanceReport` counters plus the post-sweep DB state.
 //!
 //! Previously gated behind `phase9-tests-disabled` (never enabled), so the
@@ -48,7 +48,7 @@ use cortex::constants::SECS_PER_DAY;
 use cortex::db::{Database, NewTask};
 use cortex::maintenance::run_daily_maintenance;
 
-/// Tests in this binary share the process-global `BORG_DATA_DIR` env var
+/// Tests in this binary share the process-global `BORG_HOME` env var
 /// (which `Database::open` and `Config::data_dir`/`logs_dir` consult). Run
 /// them serialized so each gets a clean tempdir without racing.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -57,9 +57,9 @@ fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: env mutation under multi-threaded test runners can race FFI
     // `getenv`. SERIAL above guarantees no other test in this binary reads
-    // or writes BORG_DATA_DIR concurrently.
+    // or writes BORG_HOME concurrently.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     tmp
 }
@@ -158,7 +158,7 @@ async fn happy_path_drains_seeded_state() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_HOME");
 
     // Seed: 3 expired cache entries (older than 30-day TTL).
     let ttl_secs = 30 * SECS_PER_DAY;
@@ -259,7 +259,7 @@ async fn budget_exhausted_short_circuits_remaining_steps() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_HOME");
 
     // Seed enough work to overflow a tiny budget. 5 expired cache rows are
     // pruned in a single SQL statement that charges 5 actions at once —
@@ -331,7 +331,7 @@ async fn disabled_returns_skipped_report_no_mutations() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _tmp = isolated_data_dir();
 
-    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_HOME");
 
     // Seed an expired row that the sweep WOULD prune if it ran.
     let ttl_secs = 30 * SECS_PER_DAY;

@@ -51,8 +51,8 @@ impl SkillsDataDirEnv {
     fn new() -> Self {
         let lock = skills_env_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("BORG_DATA_DIR").ok();
-        unsafe { std::env::set_var("BORG_DATA_DIR", tmp.path()) };
+        let prev = std::env::var("BORG_HOME").ok();
+        unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
         Self {
             _lock: lock,
             tmp,
@@ -69,8 +69,8 @@ impl Drop for SkillsDataDirEnv {
     fn drop(&mut self) {
         unsafe {
             match &self.prev {
-                Some(v) => std::env::set_var("BORG_DATA_DIR", v),
-                None => std::env::remove_var("BORG_DATA_DIR"),
+                Some(v) => std::env::set_var("BORG_HOME", v),
+                None => std::env::remove_var("BORG_HOME"),
             }
         }
     }

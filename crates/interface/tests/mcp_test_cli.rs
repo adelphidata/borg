@@ -2,7 +2,7 @@
 
 //! End-to-end coverage for `borg mcp test <id>`, the operator's primary
 //! one-shot validator for a configured MCP server. Spawns the real
-//! `borg` binary against a fresh `BORG_DATA_DIR` and drives the three
+//! `borg` binary against a fresh `BORG_HOME` and drives the three
 //! failure modes the CLI ships with:
 //!
 //! 1. Global kill switch off (`mcp.enabled = false`) — must refuse with a
@@ -16,7 +16,7 @@
 //!    server hang the operator's terminal indefinitely.
 //!
 //! All three live in one `#[test]` because they share a single
-//! `BORG_DATA_DIR` — re-initializing the DB between cases would
+//! `BORG_HOME` — re-initializing the DB between cases would
 //! duplicate the per-spawn setup cost (~hundreds of ms) without adding
 //! coverage.
 
@@ -37,7 +37,7 @@ fn run_borg(
 ) -> (std::process::ExitStatus, String, String) {
     let mut child = Command::new(borg_exe())
         .args(args)
-        .env("BORG_DATA_DIR", data_dir)
+        .env("BORG_HOME", data_dir)
         // Headless Linux runners take the `FileKekStore` branch when
         // `kek_backend = auto` and the OS keychain is absent. Without a
         // passphrase the very first DB op fails with a KEK-init error

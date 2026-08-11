@@ -222,7 +222,7 @@ async fn start_harness() -> Harness {
     // SAFETY: this test binary contains a single async test that touches the
     // env, so no concurrent mutation is possible.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     let socket = tmp.path().join("borgd.sock");
@@ -232,7 +232,7 @@ async fn start_harness() -> Harness {
     let registry = SessionRegistry::new();
     // We use a stub backend rather than the production AgentBackend because
     // AgentBackend::new requires a configured LLM provider in the temp
-    // BORG_DATA_DIR — supplying that would just shift the test from
+    // BORG_HOME — supplying that would just shift the test from
     // "wire-shape regression" to "Agent::new init plumbing", which is
     // already covered by other tests. The wire path under test (Open →
     // Send → stream of AgentEvents → close) is identical for stub and

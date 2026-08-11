@@ -348,7 +348,7 @@ fn resolve_credential_or_env_prefers_config_over_keychain() {
 
 // ── Credentials-file fallback (~/.borg/.credentials.json) ──
 
-/// Serializes tests that touch `$BORG_DATA_DIR` — Cargo runs tests
+/// Serializes tests that touch `$BORG_HOME` — Cargo runs tests
 /// multi-threaded in one process and would otherwise race on env and on the
 /// shared credentials file.
 fn creds_file_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -369,8 +369,8 @@ impl CredsFileEnv {
     fn new() -> Self {
         let lock = creds_file_env_lock();
         let tmp = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var("BORG_DATA_DIR").ok();
-        unsafe { std::env::set_var("BORG_DATA_DIR", tmp.path()) };
+        let prev = std::env::var("BORG_HOME").ok();
+        unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
         Self {
             _lock: lock,
             _tmp: tmp,
@@ -386,8 +386,8 @@ impl Drop for CredsFileEnv {
     fn drop(&mut self) {
         unsafe {
             match &self.prev {
-                Some(v) => std::env::set_var("BORG_DATA_DIR", v),
-                None => std::env::remove_var("BORG_DATA_DIR"),
+                Some(v) => std::env::set_var("BORG_HOME", v),
+                None => std::env::remove_var("BORG_HOME"),
             }
         }
     }

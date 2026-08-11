@@ -34,7 +34,7 @@ pub struct GatewayHarness {
     pub borg_home: PathBuf,
     pub shutdown: CancellationToken,
     // Held for the lifetime of the harness so concurrent tests in the
-    // same binary serialise on the shared `BORG_DATA_DIR` and SQLite
+    // same binary serialise on the shared `BORG_HOME` and SQLite
     // file. Dropped (and the lock released) when the harness drops.
     _serial: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -63,7 +63,7 @@ impl GatewayHarness {
 /// never hits the executor) pass `false`. Per-session scripted
 /// output is registered via [`register_stub_for_session`].
 pub async fn boot_gateway(with_executor: bool) -> GatewayHarness {
-    // Serialise test bodies *within* this test binary — `BORG_DATA_DIR`
+    // Serialise test bodies *within* this test binary — `BORG_HOME`
     // and the SQLite file under it don't tolerate parallel migrations +
     // opens. Cross-binary isolation (cargo runs each `tests/*.rs` as a
     // separate process) is automatic: each process has its own env, its
@@ -245,15 +245,15 @@ fn install_global_executor() {
     session_executor::set_global(exec);
 }
 
-/// Process-shared `BORG_DATA_DIR`. Created on first call, kept alive
+/// Process-shared `BORG_HOME`. Created on first call, kept alive
 /// by a `OnceLock<TempDir>` so the directory stays present for the
 /// lifetime of the test binary regardless of individual harness drops.
 fn ensure_shared_borg_home() -> PathBuf {
     use std::sync::OnceLock;
     static SHARED: OnceLock<tempfile::TempDir> = OnceLock::new();
     let dir = SHARED.get_or_init(|| {
-        let td = tempfile::tempdir().expect("tempdir for BORG_DATA_DIR");
-        std::env::set_var("BORG_DATA_DIR", td.path());
+        let td = tempfile::tempdir().expect("tempdir for BORG_HOME");
+        std::env::set_var("BORG_HOME", td.path());
         td
     });
     dir.path().to_path_buf()

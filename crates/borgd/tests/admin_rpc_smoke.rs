@@ -1,9 +1,9 @@
 //! Integration tests for the admin/status RPCs added in sub-stage 1 of the
-//! popup-migration work. Each test seeds a temp BORG_DATA_DIR with realistic
+//! popup-migration work. Each test seeds a temp BORG_HOME with realistic
 //! fixtures, spins a borgd over a UDS, and asserts on a SPECIFIC observable
 //! outcome that would fail if proto wiring or the underlying reader broke.
 //!
-//! Tests share process state (BORG_DATA_DIR env, `Database::open()` resolves
+//! Tests share process state (BORG_HOME env, `Database::open()` resolves
 //! it at request time) so they're serialized through a single mutex. We
 //! intentionally use ONE big test per group — splitting into N tiny tests
 //! would just multiply the env-mutation surface for no extra signal.
@@ -46,7 +46,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-// Serialize tests in this binary: BORG_DATA_DIR is process-global and
+// Serialize tests in this binary: BORG_HOME is process-global and
 // `Database::open()` re-reads it at every request. Without this lock, two
 // tests running concurrently would each open the OTHER test's tempdir DB.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -64,7 +64,7 @@ async fn start_harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     // Force the DB to materialize NOW so seeding code in the test body
     // sees the same file the handlers will reopen.

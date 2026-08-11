@@ -6,7 +6,7 @@
 //!   per-test Unix Domain Socket. The session factory is
 //!   [`borgd::session::scripted::ScriptedFactory`], so every session runs
 //!   under a [`ScriptedBackend`] whose per-turn behavior the test controls.
-//!   The fixture also seeds `BORG_DATA_DIR` with `onboarded = "true"` so the
+//!   The fixture also seeds `BORG_HOME` with `onboarded = "true"` so the
 //!   ACP transport's `require_onboarding` check passes.
 //!
 //! - [`AcpClient`] — spawns `borg acp` as a real subprocess pinned to the
@@ -18,7 +18,7 @@
 //!
 //! ## Tempdir / serialization model
 //!
-//! `BORG_DATA_DIR` is a process-wide env var; setting it from one test
+//! `BORG_HOME` is a process-wide env var; setting it from one test
 //! affects every concurrent test in the same binary. Following the same
 //! pattern as `crates/borgd/tests/ingress_e2e_common.rs`, a single
 //! `OnceLock<TempDir>` provides one shared data dir for the whole binary,
@@ -96,8 +96,8 @@ impl Stream for TrackedUnixListener {
 fn shared_data_dir() -> &'static Path {
     static SHARED: OnceLock<TempDir> = OnceLock::new();
     let dir = SHARED.get_or_init(|| {
-        let td = tempfile::tempdir().expect("tempdir for BORG_DATA_DIR");
-        std::env::set_var("BORG_DATA_DIR", td.path());
+        let td = tempfile::tempdir().expect("tempdir for BORG_HOME");
+        std::env::set_var("BORG_HOME", td.path());
         // Initialise the DB once so subsequent fixtures can write to it
         // without racing migrations. Onboarding flag set so the ACP
         // transport's `require_onboarding` gate passes.
@@ -457,7 +457,7 @@ impl AcpClient {
                 std::env::var_os("HOME").unwrap_or_else(|| std::ffi::OsString::from("/tmp")),
             )
             .env("BORG_DAEMON_UDS", &fixture.uds_path)
-            .env("BORG_DATA_DIR", shared_data_dir())
+            .env("BORG_HOME", shared_data_dir())
             .env("BORG_ACP_NO_AUTOSPAWN", "1")
             // Propagate coverage instrumentation env so `cargo llvm-cov`
             // captures the subprocess side of the transport; without this
@@ -718,7 +718,7 @@ impl Drop for AcpClient {
             // case exits within milliseconds, and the fixture's serial lock
             // is released right after this Drop — a subprocess lingering
             // for the full grace period would overlap the next test's use
-            // of the shared BORG_DATA_DIR database.
+            // of the shared BORG_HOME database.
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 loop {

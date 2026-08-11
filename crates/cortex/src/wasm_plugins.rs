@@ -855,7 +855,7 @@ mod tests {
 /// entry point because the cache and audit code only meet at that seam.
 ///
 /// All assertions live in one test function so the `OnceLock`-installed audit
-/// writer is set up exactly once and `BORG_DATA_DIR` stays pinned to a single
+/// writer is set up exactly once and `BORG_HOME` stays pinned to a single
 /// tempdir for the whole sequence. Splitting these would race on global state.
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -875,7 +875,7 @@ mod e2e_tests {
     use super::{compiled_cache, try_execute_tool, HMAC_DOMAIN};
 
     /// Serializes E2E setup against any other test that mutates
-    /// `$BORG_DATA_DIR` in the same test binary (see
+    /// `$BORG_HOME` in the same test binary (see
     /// `config/tests/credentials.rs` for the canonical pattern).
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -894,9 +894,9 @@ mod e2e_tests {
         fn new() -> Self {
             let tmp = tempfile::TempDir::new().expect("tempdir");
             let path = tmp.path().to_path_buf();
-            let prev = std::env::var("BORG_DATA_DIR").ok();
+            let prev = std::env::var("BORG_HOME").ok();
             // SAFETY: env mutation guarded by env_lock; restore on Drop.
-            unsafe { std::env::set_var("BORG_DATA_DIR", &path) };
+            unsafe { std::env::set_var("BORG_HOME", &path) };
             Self {
                 prev,
                 _tmp: tmp,
@@ -910,8 +910,8 @@ mod e2e_tests {
             // SAFETY: env mutation guarded by env_lock.
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
-                    None => std::env::remove_var("BORG_DATA_DIR"),
+                    Some(v) => std::env::set_var("BORG_HOME", v),
+                    None => std::env::remove_var("BORG_HOME"),
                 }
             }
         }

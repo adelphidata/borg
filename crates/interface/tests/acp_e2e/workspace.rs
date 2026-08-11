@@ -178,7 +178,7 @@ async fn session_new_with_invalid_cwd_does_not_open_factory() {
 
 #[tokio::test]
 async fn workspace_dir_remains_independent_of_data_dir() {
-    // The fixture deliberately keeps BORG_DATA_DIR (where the daemon stores
+    // The fixture deliberately keeps BORG_HOME (where the daemon stores
     // sessions/settings) separate from the per-test workspace tempdir.
     // A regression that conflated the two — e.g. defaulting workspace_root
     // to the data dir when cwd is missing — would let workspace-bound tools
@@ -202,13 +202,13 @@ async fn workspace_dir_remains_independent_of_data_dir() {
         .expect("captured ExecutionContext");
     assert_eq!(ctx.workspace_cwd(), real);
 
-    let data_dir = std::env::var("BORG_DATA_DIR").expect("BORG_DATA_DIR set by harness");
+    let data_dir = std::env::var("BORG_HOME").expect("BORG_HOME set by harness");
     let data_dir_canon = std::path::Path::new(&data_dir)
         .canonicalize()
-        .expect("canonicalize BORG_DATA_DIR");
+        .expect("canonicalize BORG_HOME");
     assert_ne!(
         ctx.workspace_cwd(),
         data_dir_canon,
-        "workspace_cwd must not coincide with BORG_DATA_DIR"
+        "workspace_cwd must not coincide with BORG_HOME"
     );
 }

@@ -1257,7 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn handle_memory_lists_inventory_across_stores() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
 
         let db = cortex::db::Database::open().await.unwrap();
         db.upsert_memory_entry("global", "shared-note", "saved fact")
@@ -1272,7 +1272,7 @@ mod tests {
         assert!(out.contains("[long-term:global] shared-note"));
         assert!(out.contains("[knowledge:global] global/memory.md"));
 
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]

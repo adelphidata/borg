@@ -623,7 +623,7 @@ mod tests {
             }
         }
 
-        /// Variant that ALSO repoints `BORG_DATA_DIR` at a fresh tempdir,
+        /// Variant that ALSO repoints `BORG_HOME` at a fresh tempdir,
         /// so file-based checks (e.g. `cortex::identity::is_personalized`)
         /// don't see the developer's real `~/.borg`. One lock acquisition
         /// covers both — calling `clear_native()` then a separate
@@ -631,8 +631,8 @@ mod tests {
         fn clear_native_with_isolated_data_dir() -> Self {
             let mut guard = Self::clear_native();
             let tmp = tempfile::tempdir().expect("tempdir");
-            guard.prev_data_dir = std::env::var("BORG_DATA_DIR").ok();
-            std::env::set_var("BORG_DATA_DIR", tmp.path());
+            guard.prev_data_dir = std::env::var("BORG_HOME").ok();
+            std::env::set_var("BORG_HOME", tmp.path());
             guard._tmp = Some(tmp);
             guard
         }
@@ -675,8 +675,8 @@ mod tests {
             }
             if self._tmp.is_some() {
                 match &self.prev_data_dir {
-                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
-                    None => std::env::remove_var("BORG_DATA_DIR"),
+                    Some(v) => std::env::set_var("BORG_HOME", v),
+                    None => std::env::remove_var("BORG_HOME"),
                 }
             }
         }

@@ -10,7 +10,7 @@
 //! - set-strategy: rejects garbage values and persists valid ones
 //!
 //! The harness invokes `AdminSvc` directly. A process-wide mutex serializes
-//! tests because `BORG_DATA_DIR` is per-process and `Database::open()` re-reads it.
+//! tests because `BORG_HOME` is per-process and `Database::open()` re-reads it.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
@@ -34,7 +34,7 @@ async fn fresh_admin_with_provider(seed_key: &str) -> (AdminSvc, tempfile::TempD
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         std::env::set_var(TEST_ENV_VAR, seed_key);
     }
     // Materialize the DB and pick the primary provider via settings so
@@ -52,7 +52,7 @@ fn teardown_env() {
     // SAFETY: serialized by SERIAL.
     unsafe {
         std::env::remove_var(TEST_ENV_VAR);
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 }
 

@@ -5,7 +5,7 @@
 //!   Unicode) and enforces 20k-token cap (warn at 8k).
 //!
 //! These tests drive the production `cortex::memory::write_memory_db` end
-//! to end against a real SQLite database (via `BORG_DATA_DIR=<tempdir>`)
+//! to end against a real SQLite database (via `BORG_HOME=<tempdir>`)
 //! and assert:
 //!   - small entries persist silently;
 //!   - mid-sized entries (≥ warn, < reject) persist (warning is a `tracing`
@@ -15,14 +15,14 @@
 //!   - the injection scanner runs before the size check (override phrase
 //!     under the cap is still rejected).
 //!
-//! ── Why we use `BORG_DATA_DIR` instead of an in-memory DB ──
+//! ── Why we use `BORG_HOME` instead of an in-memory DB ──
 //!
 //! `write_memory_db` opens its own `Database::open()` connection. There is
 //! no `_with(db, ...)` variant on the public API, and rightly so — the
 //! function's whole job is to enforce the cap on the production write
 //! path. Passing a sidecar in-memory DB would not exercise the same
 //! `Database::open()` resolution we need to validate. Tests serialize via
-//! `SERIAL` because `BORG_DATA_DIR` is process-wide.
+//! `SERIAL` because `BORG_HOME` is process-wide.
 //!
 //! ── Mutation verification ──
 //!
@@ -40,18 +40,18 @@ use cortex::db::Database;
 use cortex::memory::tokenizer::estimate_tokens;
 use cortex::memory::{read_memory_db, write_memory_db, WriteMode};
 
-/// Tests in this binary share `BORG_DATA_DIR` and the on-disk DB it points
+/// Tests in this binary share `BORG_HOME` and the on-disk DB it points
 /// at — serialize so they don't read each other's writes.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Set BORG_DATA_DIR to a fresh tempdir and return the guard. Drop the
+/// Set BORG_HOME to a fresh tempdir and return the guard. Drop the
 /// guard last so the dir survives the test body.
 fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: `set_var` is unsafe under Rust 2024's stricter env model
     // because env mutation races other threads (libc getenv, FFI). For
     // this binary the risk is bounded:
-    //   - Every test body that reads BORG_DATA_DIR holds `SERIAL`, so no
+    //   - Every test body that reads BORG_HOME holds `SERIAL`, so no
     //     other test in the same harness mutates or reads the var
     //     concurrently.
     //   - Production code paths under test (`Database::open` →
@@ -59,7 +59,7 @@ fn isolated_data_dir() -> tempfile::TempDir {
     //   - No background threads in this binary call FFI that consults
     //     `getenv`.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     tmp
 }
@@ -281,7 +281,7 @@ async fn read_back_through_low_level_db_matches_write_memory_db() {
         .await
         .expect("ok");
 
-    let db = Database::open().await.expect("open db at BORG_DATA_DIR");
+    let db = Database::open().await.expect("open db at BORG_HOME");
     let row = db
         .get_memory_entry("global", "anchor")
         .await

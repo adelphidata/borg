@@ -27,7 +27,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-// Process-global; `Database::open()` resolves BORG_DATA_DIR every call.
+// Process-global; `Database::open()` resolves BORG_HOME every call.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 async fn make_channel(socket: &Path) -> Channel {
@@ -54,7 +54,7 @@ async fn send_approval_greeting_rejects_empty_args_and_requires_executor() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary serialize via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     let socket = tmp.path().join("borgd.sock");
@@ -120,7 +120,7 @@ async fn send_approval_greeting_accepts_request_when_executor_wired() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     // Materialize DB so Config::load_from_db() inside the spawned greeting
     // task has something to read; the agent will then fail to construct

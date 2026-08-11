@@ -810,12 +810,12 @@ mod tests {
         assert!(err.contains("filename"), "got: {err}");
     }
 
-    /// Combined lifecycle test: uses BORG_DATA_DIR, so kept as a single test to
+    /// Combined lifecycle test: uses BORG_HOME, so kept as a single test to
     /// avoid env-var races with other tests in this crate.
     #[tokio::test]
     async fn handle_write_and_read_roundtrip_global() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let cfg = Config::default();
 
         let args = serde_json::json!({
@@ -986,6 +986,6 @@ mod tests {
             "append chain must compose both pieces, got: {chain}"
         );
 
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 }

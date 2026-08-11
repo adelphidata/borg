@@ -4,7 +4,7 @@
 //! header), points `LlmClient` at it with a multi-key config, and asserts on
 //! the stream's events plus the pool's post-request state.
 //!
-//! These tests share the process-wide `BORG_DATA_DIR` env var because the
+//! These tests share the process-wide `BORG_HOME` env var because the
 //! credential pool persists to `~/.borg/borg.db` via `Config::db_path()`. A
 //! module-level `Mutex` serializes them so each gets a clean tempdir.
 
@@ -27,20 +27,20 @@ use cortex::llm::{LlmClient, StreamEvent};
 use cortex::security::secrets_resolve::SecretRef;
 use cortex::types::{Message, MessageContent, Role};
 
-/// Process-global serialization for tests that mutate `BORG_DATA_DIR`.
+/// Process-global serialization for tests that mutate `BORG_HOME`.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Monotonic suffix for per-test env var names — avoids residual values
 /// from earlier tests bleeding into later ones inside the same process.
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Pin `BORG_DATA_DIR` to a fresh tempdir for the duration of the test.
+/// Pin `BORG_HOME` to a fresh tempdir for the duration of the test.
 fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: `SERIAL` above guarantees only one test in this binary mutates
-    // env at a time; no other thread reads `BORG_DATA_DIR` concurrently.
+    // env at a time; no other thread reads `BORG_HOME` concurrently.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     tmp
 }

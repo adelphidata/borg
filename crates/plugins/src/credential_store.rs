@@ -28,7 +28,7 @@ struct CredentialsFile {
 }
 
 fn data_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("BORG_DATA_DIR") {
+    if let Ok(dir) = std::env::var("BORG_HOME") {
         return Ok(PathBuf::from(dir));
     }
     Ok(dirs::home_dir()
@@ -180,7 +180,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
-    /// Serializes tests that mutate `$BORG_DATA_DIR`. Cargo runs tests in one
+    /// Serializes tests that mutate `$BORG_HOME`. Cargo runs tests in one
     /// process across multiple threads; concurrent tests would clobber each
     /// other's tempdir pointer and race on the shared credentials file.
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -201,9 +201,9 @@ mod tests {
         fn new() -> Self {
             let lock = env_lock();
             let tmp = TempDir::new().unwrap();
-            let prev = std::env::var("BORG_DATA_DIR").ok();
+            let prev = std::env::var("BORG_HOME").ok();
             unsafe {
-                std::env::set_var("BORG_DATA_DIR", tmp.path());
+                std::env::set_var("BORG_HOME", tmp.path());
             }
             Self {
                 _lock: lock,
@@ -217,8 +217,8 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
-                    None => std::env::remove_var("BORG_DATA_DIR"),
+                    Some(v) => std::env::set_var("BORG_HOME", v),
+                    None => std::env::remove_var("BORG_HOME"),
                 }
             }
         }

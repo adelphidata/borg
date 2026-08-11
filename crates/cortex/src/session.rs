@@ -548,7 +548,7 @@ mod tests {
         // process- and call-unique temp name and removes it on every path.
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
 
@@ -571,14 +571,14 @@ mod tests {
             Session::load("save-residue").unwrap().meta.id,
             "save-residue"
         );
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn load_last_session_returns_most_recently_updated() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
 
@@ -587,27 +587,27 @@ mod tests {
 
         let result = load_last_session().unwrap().unwrap();
         assert_eq!(result.meta.id, "new-session");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn load_last_session_returns_none_when_no_sessions() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
 
         let result = load_last_session().unwrap();
         assert!(result.is_none());
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn load_last_session_skips_corrupt_files() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
 
@@ -616,14 +616,14 @@ mod tests {
 
         let result = load_last_session().unwrap().unwrap();
         assert_eq!(result.meta.id, "valid-session");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn save_then_load_last_session_roundtrip() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
 
         let mut session = Session::new();
         session.meta.title = "Roundtrip test".to_string();
@@ -632,37 +632,37 @@ mod tests {
         let loaded = load_last_session().unwrap().unwrap();
         assert_eq!(loaded.meta.id, session.meta.id);
         assert_eq!(loaded.meta.title, "Roundtrip test");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_empty() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let result = resolve_session_id("");
         assert!(matches!(result, Err(ResolveSessionError::Empty)));
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_not_found_empty_dir() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
 
         let result = resolve_session_id("anything");
         assert!(matches!(result, Err(ResolveSessionError::NotFound(_))));
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_not_found() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
         write_test_session(&sdir, "aaa-111", "2025-01-01T00:00:00+00:00");
@@ -672,28 +672,28 @@ mod tests {
             Err(ResolveSessionError::NotFound(p)) => assert_eq!(p, "zzz"),
             other => panic!("expected NotFound, got {other:?}"),
         }
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_exact_match() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
         write_test_session(&sdir, "aaa-111", "2025-01-01T00:00:00+00:00");
 
         let meta = resolve_session_id("aaa-111").unwrap();
         assert_eq!(meta.id, "aaa-111");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_unique_prefix() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
         write_test_session(&sdir, "aaa-111", "2025-01-01T00:00:00+00:00");
@@ -701,14 +701,14 @@ mod tests {
 
         let meta = resolve_session_id("aaa").unwrap();
         assert_eq!(meta.id, "aaa-111");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_ambiguous_prefix() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
         write_test_session(&sdir, "aaa-111", "2025-01-01T00:00:00+00:00");
@@ -722,14 +722,14 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn resolve_session_id_exact_wins_over_prefix() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let sdir = tmp.path().join("sessions");
         fs::create_dir_all(&sdir).unwrap();
         write_test_session(&sdir, "abc", "2025-01-01T00:00:00+00:00");
@@ -738,21 +738,21 @@ mod tests {
         // "abc" is both an exact id and a prefix of "abcdef" — exact must win.
         let meta = resolve_session_id("abc").unwrap();
         assert_eq!(meta.id, "abc");
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
     fn save_does_not_create_last_session_file() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
 
         let session = Session::new();
         session.save().unwrap();
 
         let last_file = tmp.path().join("last_session");
         assert!(!last_file.exists());
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 }
 

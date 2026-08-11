@@ -19,7 +19,7 @@ use cortex::config::Config;
 use cortex::execution_context::ExecutionContext;
 use cortex::telemetry::BorgMetrics;
 
-/// Serializes the file: `BORG_DATA_DIR` is process-global, so parallel tests
+/// Serializes the file: `BORG_HOME` is process-global, so parallel tests
 /// here would race each other's data dir.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -77,7 +77,7 @@ async fn backend_in(
     let guard = ENV_LOCK.lock().await;
     let home = tempfile::tempdir().expect("tempdir");
     // SAFETY: serialized by `ENV_LOCK`; read during backend construction.
-    unsafe { std::env::set_var("BORG_DATA_DIR", home.path()) };
+    unsafe { std::env::set_var("BORG_HOME", home.path()) };
 
     let ctx = ExecutionContext::for_workspace(cwd.to_path_buf(), cwd.to_path_buf())
         .expect("workspace context for the worktree");

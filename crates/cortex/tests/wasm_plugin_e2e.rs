@@ -34,7 +34,7 @@ use plugins::wasm::{
     WasmToolManifest,
 };
 
-/// Tests in this binary share the process-global `BORG_DATA_DIR` env var
+/// Tests in this binary share the process-global `BORG_HOME` env var
 /// (which `Database::open` and `Config::data_dir` consult). Run them
 /// serialized so each gets a clean tempdir without racing — same pattern
 /// as `tests/maintenance_sweep.rs`.
@@ -44,9 +44,9 @@ fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: env mutation under multi-threaded test runners can race FFI
     // `getenv`. SERIAL guarantees no other test in this binary reads or
-    // writes BORG_DATA_DIR concurrently.
+    // writes BORG_HOME concurrently.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     tmp
 }
@@ -373,7 +373,7 @@ async fn deprecated_key_and_seal_quarantine_e2e() {
     let tmp = isolated_data_dir();
 
     // Install the process-global audit writer pointing at the DB rooted at
-    // this test's BORG_DATA_DIR. `install_global_audit` is `OnceLock::set` —
+    // this test's BORG_HOME. `install_global_audit` is `OnceLock::set` —
     // if a sibling test in this binary already installed one we cannot run
     // the audit-row assertions, so flag the run order explicitly.
     let audit_db = Arc::new(tokio::sync::Mutex::new(

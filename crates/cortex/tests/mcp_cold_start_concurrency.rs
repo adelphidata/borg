@@ -22,19 +22,19 @@ use cortex::mcp_clients;
 use mcp::manifest::ToolFilter;
 
 /// Serialize tests in this binary: both mutate the process-wide
-/// `BORG_DATA_DIR` env var and share the global MCP registry. Tokio's mutex
+/// `BORG_HOME` env var and share the global MCP registry. Tokio's mutex
 /// is safe to hold across the `initialize` await and doesn't poison, so one
 /// test's panic can't cascade into the other.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Pin `BORG_DATA_DIR` to a fresh tempdir so the catalog-cache probe inside
+/// Pin `BORG_HOME` to a fresh tempdir so the catalog-cache probe inside
 /// `initialize` opens a scratch DB, never the operator's live `~/.borg`.
 fn isolated_data_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: `SERIAL` guarantees only one test in this binary mutates env
-    // at a time; no other thread reads `BORG_DATA_DIR` concurrently.
+    // at a time; no other thread reads `BORG_HOME` concurrently.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     tmp
 }

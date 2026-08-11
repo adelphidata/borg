@@ -1078,7 +1078,7 @@ mod tests {
         // needles. The resolved-home dir needles must catch it. Read the home
         // from the cached needles: they resolve once per process, so a fresh
         // `resolve_borg_home_readonly` here could disagree under parallel
-        // tests that move $BORG_DATA_DIR.
+        // tests that move $BORG_HOME.
         let Some(home) = CONTROL_PLANE_DIR_NEEDLES
             .iter()
             .find(|n| n.starts_with('/'))

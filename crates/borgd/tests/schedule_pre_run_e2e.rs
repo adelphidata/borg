@@ -52,7 +52,7 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Tests in this binary share `BORG_DATA_DIR` env + a global writer DB —
+/// Tests in this binary share `BORG_HOME` env + a global writer DB —
 /// run them sequentially so each gets a clean slate.
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -82,7 +82,7 @@ impl DispatchHarness {
 
         let data_dir = tempfile::tempdir().expect("tempdir");
         unsafe {
-            std::env::set_var("BORG_DATA_DIR", data_dir.path());
+            std::env::set_var("BORG_HOME", data_dir.path());
         }
 
         let server = MockServer::start().await;

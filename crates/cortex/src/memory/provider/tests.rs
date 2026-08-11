@@ -210,7 +210,7 @@ async fn handle_memory_search_with_unconfigured_external_does_not_recurse() {
     // code with a stack overflow.
     registry::reset_warn_once_for_tests();
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("BORG_DATA_DIR", tmp.path());
+    std::env::set_var("BORG_HOME", tmp.path());
     let mut cfg = Config::default();
     cfg.memory.provider = MemoryProviderKind::Mem0;
     // No api_key set → registry falls back to Native.
@@ -233,7 +233,7 @@ async fn handle_write_memory_with_unconfigured_external_prepends_fallback_notice
     // operator can see the misconfiguration.
     registry::reset_warn_once_for_tests();
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("BORG_DATA_DIR", tmp.path());
+    std::env::set_var("BORG_HOME", tmp.path());
     let mut cfg = Config::default();
     cfg.memory.provider = MemoryProviderKind::Mem0;
     let result = crate::tool_handlers::handle_write_memory(

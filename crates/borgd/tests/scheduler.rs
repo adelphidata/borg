@@ -32,7 +32,7 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary serialize via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     // Seed a due command task.
@@ -120,7 +120,7 @@ async fn emergency_pause_defers_dispatch_and_resume_restores_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary serialize via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     let due_at;

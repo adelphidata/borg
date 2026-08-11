@@ -6,9 +6,9 @@
 //! - happy-path: handler doesn't actually persist or doesn't actually delete
 //! - clear-when-absent: returns `removed=false` rather than erroring out
 //!
-//! Calls the in-process `AdminSvc` directly — the BORG_DATA_DIR env points
+//! Calls the in-process `AdminSvc` directly — the BORG_HOME env points
 //! at a tempdir so each test owns its DB. Serialized with a process-wide
-//! mutex because `Database::open()` re-reads BORG_DATA_DIR on every call.
+//! mutex because `Database::open()` re-reads BORG_HOME on every call.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
@@ -26,7 +26,7 @@ async fn fresh_admin() -> (AdminSvc, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     // Materialize the DB so subsequent handler calls reopen the same file.
     let _ = Database::open().await.expect("seed DB open");

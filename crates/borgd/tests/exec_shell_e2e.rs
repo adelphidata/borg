@@ -10,7 +10,7 @@ use borgd::session::backend::{AgentBackend, SessionBackend};
 use cortex::config::Config;
 use cortex::telemetry::BorgMetrics;
 
-/// Serializes the whole file: `BORG_DATA_DIR` is process-global, so parallel
+/// Serializes the whole file: `BORG_HOME` is process-global, so parallel
 /// tests here would race each other's data dir — the same failure shape as the
 /// known `cortex session::tests` flake.
 /// Async-aware: the guard is deliberately held across the backend's `.await`
@@ -21,12 +21,12 @@ async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().await
 }
 
-/// Isolate `BORG_DATA_DIR` so the backend's session writes land in a tempdir.
+/// Isolate `BORG_HOME` so the backend's session writes land in a tempdir.
 /// Callers must hold [`env_lock`] for the lifetime of the returned dir.
 fn isolated_home() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: serialized by `ENV_LOCK`; read during backend construction.
-    unsafe { std::env::set_var("BORG_DATA_DIR", tmp.path()) };
+    unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
     tmp
 }
 

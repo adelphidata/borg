@@ -11,7 +11,7 @@
 //! Cargo's module-discovery rules forbid a sibling `acp_e2e/mod.rs` next to
 //! the entry file (`acp_e2e.rs`). Keeping everything in one test binary
 //! lets all cases share the harness's `OnceLock<TempDir>` for
-//! `BORG_DATA_DIR` and serialise via a single `tokio::sync::Mutex`.
+//! `BORG_HOME` and serialise via a single `tokio::sync::Mutex`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

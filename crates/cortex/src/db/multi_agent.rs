@@ -385,7 +385,7 @@ mod tests {
     use crate::db::Database;
 
     /// Tokio mutex — safe to hold across `await`. Serializes
-    /// process-wide `BORG_DATA_DIR` mutations so parallel tests don't
+    /// process-wide `BORG_HOME` mutations so parallel tests don't
     /// trample each other's data-dir env var (the cortex DB open path
     /// resolves the path from that variable).
     static DB_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -405,7 +405,7 @@ mod tests {
     async fn list_sub_agent_runs_returns_full_transitive_descendants() {
         let _guard = DB_ENV_MUTEX.lock().await;
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
         let db = Database::open().await.expect("open test db");
         // Tree under ROOT:  A → B → C ;  ROOT2 → X (must not appear)
         insert_at(&db, "A", "ROOT", "sess-A", 0).await;
@@ -434,6 +434,6 @@ mod tests {
         assert!(depth_of("A") <= depth_of("B"));
         assert!(depth_of("B") <= depth_of("C"));
 
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 }

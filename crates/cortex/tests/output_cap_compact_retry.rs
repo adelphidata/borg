@@ -76,7 +76,7 @@ async fn harness() -> Harness {
     let env_key = format!("BORG_TEST_OUTPUT_CAP_KEY_{n}");
     std::env::set_var(&env_key, "test-key-value");
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    std::env::set_var("BORG_DATA_DIR", data_dir.path());
+    std::env::set_var("BORG_HOME", data_dir.path());
 
     let server = MockServer::start().await;
 

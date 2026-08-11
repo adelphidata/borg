@@ -41,12 +41,12 @@ struct Harness {
 
 async fn start_harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // SAFETY: BORG_DATA_DIR is read every `Database::open()`. We serialize
+    // SAFETY: BORG_HOME is read every `Database::open()`. We serialize
     // tests within this binary through SERIAL so they don't see each other's
     // tempdirs. cargo runs separate `--test <name>` binaries in distinct
     // processes, so cross-binary env leakage is not a concern.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     let _ = Database::open().await.expect("seed DB open");
 

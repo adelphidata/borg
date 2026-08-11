@@ -84,7 +84,7 @@ struct Harness {
 
 /// Stand up a wiremock LLM that returns the given tool call on the first
 /// `POST /v1/chat/completions`, then a text response on every subsequent call.
-/// Returns a `Config` wired to that endpoint plus a TempDir for `BORG_DATA_DIR`.
+/// Returns a `Config` wired to that endpoint plus a TempDir for `BORG_HOME`.
 async fn harness(call_id: &str, tool_name: &str, args_json: &str) -> Harness {
     let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let env_key = format!("BORG_TEST_PLAN_MODE_KEY_{n}");
@@ -94,7 +94,7 @@ async fn harness(call_id: &str, tool_name: &str, args_json: &str) -> Harness {
     // agent's call to `Database::open()` writes to `~/.borg/borg.db`, which
     // would cross-contaminate the user's real DB and parallel test runs.
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    std::env::set_var("BORG_DATA_DIR", data_dir.path());
+    std::env::set_var("BORG_HOME", data_dir.path());
 
     let server = MockServer::start().await;
 

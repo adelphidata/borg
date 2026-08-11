@@ -5,34 +5,24 @@
 //! (or accept a `&Path` from a caller that did) and then use the helpers below
 //! — never compose `home.join("memory")` by hand.
 //!
-//! # Two env vars, one resolution order
-//!
-//! Historically the codebase used `BORG_DATA_DIR` for cortex (test isolation
-//! sets it heavily) and `BORG_HOME` for the daemon CLI flag. Both are honored
-//! to preserve existing test fixtures and operator muscle memory:
+//! # Resolution order
 //!
 //! 1. Explicit `override_path` argument (CLI flag).
 //! 2. `$BORG_HOME` env var.
-//! 3. `$BORG_DATA_DIR` env var (legacy; kept for cortex test fixtures).
-//! 4. `~/.borg`.
+//! 3. `~/.borg`.
 //!
-//! `BORG_HOME` is the preferred name for new docs and tooling. Once test
-//! fixtures migrate, `BORG_DATA_DIR` can be retired without breaking ops.
+//! `BORG_HOME` is the only env var. A second name (`BORG_DATA_DIR`) used to
+//! sit between steps 2 and 3; two names for one directory meant a stale value
+//! in a parent shell could silently split state across two dirs.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::constants::{DB_FILE, HEARTBEAT_FILE, IDENTITY_FILE, MEMORY_INDEX_FILE};
 
-/// Env var read by the daemon CLI flag and operator docs.
+/// The one env var naming the data directory. Read by the daemon CLI flag,
+/// operator docs, and every test fixture that needs isolation.
 pub const BORG_HOME_ENV: &str = "BORG_HOME";
-
-/// Legacy env var still honored for cortex test fixtures.
-//
-// TODO: retire `BORG_DATA_DIR` once the ~50 test sites that set it migrate
-// to `BORG_HOME`. The resolver above places it second so `BORG_HOME` wins
-// when both are set — the migration can be staged.
-pub const BORG_DATA_DIR_ENV: &str = "BORG_DATA_DIR";
 
 /// Typed enumeration of every well-known subdirectory under `$BORG_HOME`.
 ///
@@ -89,8 +79,6 @@ pub fn resolve_borg_home(override_path: Option<&Path>) -> Result<PathBuf> {
         p.to_path_buf()
     } else if let Some(p) = std::env::var_os(BORG_HOME_ENV) {
         PathBuf::from(p)
-    } else if let Some(p) = std::env::var_os(BORG_DATA_DIR_ENV) {
-        PathBuf::from(p)
     } else {
         dirs::home_dir()
             .context("could not determine home directory")?
@@ -123,9 +111,6 @@ pub fn resolve_borg_home_readonly(override_path: Option<&Path>) -> Result<PathBu
         return Ok(p.to_path_buf());
     }
     if let Some(p) = std::env::var_os(BORG_HOME_ENV) {
-        return Ok(PathBuf::from(p));
-    }
-    if let Some(p) = std::env::var_os(BORG_DATA_DIR_ENV) {
         return Ok(PathBuf::from(p));
     }
     Ok(dirs::home_dir()
@@ -241,8 +226,8 @@ mod tests {
         }
     }
 
-    /// Serializes tests that mutate `BORG_HOME` / `BORG_DATA_DIR` so the
-    /// cargo-test thread pool doesn't race on process-wide env state.
+    /// Serializes tests that mutate `BORG_HOME` so the cargo-test thread
+    /// pool doesn't race on process-wide env state.
     fn paths_env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -254,28 +239,21 @@ mod tests {
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_home: Option<std::ffi::OsString>,
-        prev_data: Option<std::ffi::OsString>,
     }
 
     impl EnvGuard {
-        fn set(home: Option<&Path>, data: Option<&Path>) -> Self {
+        fn set(home: Option<&Path>) -> Self {
             let lock = paths_env_lock();
             let prev_home = std::env::var_os(BORG_HOME_ENV);
-            let prev_data = std::env::var_os(BORG_DATA_DIR_ENV);
             unsafe {
                 match home {
                     Some(p) => std::env::set_var(BORG_HOME_ENV, p),
                     None => std::env::remove_var(BORG_HOME_ENV),
                 }
-                match data {
-                    Some(p) => std::env::set_var(BORG_DATA_DIR_ENV, p),
-                    None => std::env::remove_var(BORG_DATA_DIR_ENV),
-                }
             }
             Self {
                 _lock: lock,
                 prev_home,
-                prev_data,
             }
         }
     }
@@ -287,49 +265,51 @@ mod tests {
                     Some(v) => std::env::set_var(BORG_HOME_ENV, v),
                     None => std::env::remove_var(BORG_HOME_ENV),
                 }
-                match self.prev_data.take() {
-                    Some(v) => std::env::set_var(BORG_DATA_DIR_ENV, v),
-                    None => std::env::remove_var(BORG_DATA_DIR_ENV),
-                }
             }
         }
     }
 
     #[test]
-    fn explicit_override_wins_over_both_env_vars() {
-        // With BOTH env vars set to different paths, an explicit override
-        // still wins. Locks out env race with the rest of the test suite.
+    fn explicit_override_wins_over_the_env_var() {
+        // An explicit override (the CLI flag) must beat an inherited
+        // `BORG_HOME`, or `borg --borg-home /x` would silently write to
+        // whatever a parent shell exported.
         let home_env = tempfile::tempdir().unwrap();
-        let data_env = tempfile::tempdir().unwrap();
-        let _g = EnvGuard::set(Some(home_env.path()), Some(data_env.path()));
+        let _g = EnvGuard::set(Some(home_env.path()));
         let override_path = std::path::PathBuf::from("/tmp/explicit-override-12345");
         let home = resolve_borg_home_readonly(Some(&override_path)).unwrap();
         assert_eq!(home, override_path);
     }
 
     #[test]
-    fn borg_home_takes_precedence_over_borg_data_dir() {
-        // `BORG_HOME` must win over `BORG_DATA_DIR`. If this ordering reverts,
-        // processes started by `borgd --listen` (which sets `BORG_HOME` via
-        // clap-env) would silently fall through to `BORG_DATA_DIR` from a
-        // parent shell, splitting state across two dirs.
+    fn env_var_wins_over_the_default_home() {
         let home_env = tempfile::tempdir().unwrap();
-        let data_env = tempfile::tempdir().unwrap();
-        assert_ne!(home_env.path(), data_env.path());
-        let _g = EnvGuard::set(Some(home_env.path()), Some(data_env.path()));
-        let resolved = resolve_borg_home_readonly(None).unwrap();
-        assert_eq!(resolved, home_env.path());
+        let _g = EnvGuard::set(Some(home_env.path()));
+        assert_eq!(resolve_borg_home_readonly(None).unwrap(), home_env.path());
     }
 
     #[test]
-    fn borg_data_dir_used_when_borg_home_unset() {
-        // The legacy env var still resolves when BORG_HOME is absent — this
-        // keeps the ~50 cortex test fixtures that set BORG_DATA_DIR working
-        // without changes.
-        let data_env = tempfile::tempdir().unwrap();
-        let _g = EnvGuard::set(None, Some(data_env.path()));
+    fn borg_data_dir_is_no_longer_honoured() {
+        // `BORG_DATA_DIR` was a second name for the same directory. It is
+        // gone: a stale export must not redirect the data dir, it must be
+        // ignored in favour of the default.
+        let stray = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(None);
+        let prev = std::env::var_os("BORG_DATA_DIR");
+        unsafe { std::env::set_var("BORG_DATA_DIR", stray.path()) };
         let resolved = resolve_borg_home_readonly(None).unwrap();
-        assert_eq!(resolved, data_env.path());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BORG_DATA_DIR", v),
+                None => std::env::remove_var("BORG_DATA_DIR"),
+            }
+        }
+        assert_ne!(
+            resolved,
+            stray.path(),
+            "BORG_DATA_DIR must no longer redirect the data dir"
+        );
+        assert_eq!(resolved, dirs::home_dir().unwrap().join(".borg"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 /// Serializes tests in this binary because they mutate the process-wide
-/// `BORG_DATA_DIR` env var.
+/// `BORG_HOME` env var.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -35,7 +35,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary serialize via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
 
     // Seed a due command task (POSIX no-op) — would succeed in ~milliseconds
@@ -125,6 +125,6 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
 
     // SAFETY: serialized via SERIAL.
     unsafe {
-        std::env::remove_var("BORG_DATA_DIR");
+        std::env::remove_var("BORG_HOME");
     }
 }

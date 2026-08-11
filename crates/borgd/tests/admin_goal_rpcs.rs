@@ -1,9 +1,9 @@
 //! Integration tests for the four `/goal` Admin RPCs added in the Ralph-loop
 //! E2E port: `GetGoal`, `SetGoal`, `ClearGoal`, `PauseGoalOnInterrupt`.
 //!
-//! Each test seeds a temp BORG_DATA_DIR, spins a borgd over a UDS, and drives
+//! Each test seeds a temp BORG_HOME, spins a borgd over a UDS, and drives
 //! the tonic-generated client against it. Tests share process state
-//! (BORG_DATA_DIR is read at every `Database::open()`) so they are serialized
+//! (BORG_HOME is read at every `Database::open()`) so they are serialized
 //! through `SERIAL`. We bundle positive AND negative cases per RPC into the
 //! same test body — the harness setup cost dwarfs the assertions.
 
@@ -43,7 +43,7 @@ async fn start_harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: tests in this binary are serialized via SERIAL.
     unsafe {
-        std::env::set_var("BORG_DATA_DIR", tmp.path());
+        std::env::set_var("BORG_HOME", tmp.path());
     }
     // Force the DB to materialize and run migrations now so the test body
     // can seed sessions/goals through the same file the handlers reopen.
@@ -372,7 +372,7 @@ async fn set_goal_budget_changes_in_place_and_preserves_accounting() {
         .into_inner();
     let original_id = created.goal_id.clone();
 
-    // Charge some usage directly against the DB (same BORG_DATA_DIR the
+    // Charge some usage directly against the DB (same BORG_HOME the
     // handler reopens) so we can prove SetBudget preserves it.
     {
         let db = Database::open().await.expect("open db");
