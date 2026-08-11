@@ -110,7 +110,7 @@ async fn create_browserbase(cfg: &BrowserConfig) -> Result<RemoteSession> {
         "keepAlive": true,
     });
 
-    let resp = http_client()?
+    let resp = http_client()
         .post(format!("{base}/v1/sessions"))
         .timeout(req_timeout(cfg))
         .header("X-BB-API-Key", key)
@@ -139,7 +139,7 @@ async fn close_browserbase(cfg: &BrowserConfig, id: &str) -> Result<()> {
         "projectId": cfg.browserbase_project_id.clone().unwrap_or_default(),
         "status": "REQUEST_RELEASE",
     });
-    http_client()?
+    http_client()
         .post(format!("{base}/v1/sessions/{id}"))
         .timeout(req_timeout(cfg))
         .header("X-BB-API-Key", key)
@@ -161,7 +161,7 @@ async fn create_browser_use(cfg: &BrowserConfig) -> Result<RemoteSession> {
         constants::BROWSER_BROWSER_USE_BASE_URL,
     );
 
-    let resp = http_client()?
+    let resp = http_client()
         .post(format!("{base}/api/v3/browsers"))
         .timeout(req_timeout(cfg))
         .bearer_auth(key)
@@ -186,7 +186,7 @@ async fn close_browser_use(cfg: &BrowserConfig, id: &str) -> Result<()> {
         &cfg.browser_use_base_url,
         constants::BROWSER_BROWSER_USE_BASE_URL,
     );
-    http_client()?
+    http_client()
         .delete(format!("{base}/api/v3/browsers/{id}"))
         .timeout(req_timeout(cfg))
         .bearer_auth(key)
@@ -207,7 +207,7 @@ async fn create_firecrawl(cfg: &BrowserConfig) -> Result<RemoteSession> {
         constants::BROWSER_FIRECRAWL_BASE_URL,
     );
 
-    let resp = http_client()?
+    let resp = http_client()
         .post(format!("{base}/v2/browser"))
         .timeout(req_timeout(cfg))
         .bearer_auth(key)
@@ -232,7 +232,7 @@ async fn close_firecrawl(cfg: &BrowserConfig, id: &str) -> Result<()> {
         &cfg.firecrawl_base_url,
         constants::BROWSER_FIRECRAWL_BASE_URL,
     );
-    http_client()?
+    http_client()
         .delete(format!("{base}/v2/browser/{id}"))
         .timeout(req_timeout(cfg))
         .bearer_auth(key)
@@ -250,11 +250,11 @@ async fn close_firecrawl(cfg: &BrowserConfig, id: &str) -> Result<()> {
 /// reused so we don't pay TLS + connection-pool setup on every create/close.
 /// Per-call timeouts are applied on the request builder (see [`req_timeout`]),
 /// not baked into the client, so each call still honors `startup_timeout_ms`.
-fn http_client() -> Result<&'static reqwest::Client> {
+fn http_client() -> &'static reqwest::Client {
     // This backend set no options of its own, so it uses the workspace client
     // and inherits its timeouts. Every call below still applies its own
     // per-request budget from `req_timeout`.
-    Ok(crate::http::shared())
+    crate::http::shared()
 }
 
 /// Per-request timeout for a remote-backend control-plane call.

@@ -805,6 +805,16 @@ impl std::fmt::Debug for VitalsHook {
 /// queried by this string.
 pub const SANDBOX_VIOLATION_SOURCE: &str = "sandbox_violation";
 
+/// The category sandbox denials are filed under.
+///
+/// A named function rather than an inline literal so the "moves no stats"
+/// guarantee can be tested against the value the recorder actually uses.
+/// Telemetry on purpose: the sandbox blocking something is the system working,
+/// and it must never read as the agent misbehaving.
+fn sandbox_violation_category() -> EventCategory {
+    EventCategory::Telemetry
+}
+
 /// Build the metadata blob for a sandbox denial.
 ///
 /// Split from [`record_sandbox_violation`] so the redaction and bounding can
@@ -844,10 +854,11 @@ pub async fn record_sandbox_violation(violation: &sandbox::violation::SandboxVio
             return;
         }
     };
-    let deltas = deltas_for(EventCategory::Telemetry);
+    let category = sandbox_violation_category();
+    let deltas = deltas_for(category);
     if let Err(e) = db
         .record_vitals_event(
-            &EventCategory::Telemetry.to_string(),
+            &category.to_string(),
             SANDBOX_VIOLATION_SOURCE,
             &deltas,
             Some(metadata.as_str()),
@@ -1997,8 +2008,20 @@ mod tests {
 
     #[test]
     fn a_sandbox_violation_moves_no_stats() {
-        // Filed as Telemetry on purpose: the sandbox blocking something is the
-        // system working, and it must not read as the agent misbehaving.
-        assert_eq!(deltas_for(EventCategory::Telemetry), StatDeltas::default());
+        // The category the recorder actually passes must be a scoring-neutral
+        // one: the sandbox blocking something is the system working, and it
+        // must not read as the agent misbehaving.
+        assert_eq!(
+            deltas_for(sandbox_violation_category()),
+            StatDeltas::default(),
+            "a denial must not move the agent's stats"
+        );
+        // Proves the assertion above can fail: the table does score other
+        // categories, so scoring-neutral is a property of this choice.
+        assert_ne!(
+            deltas_for(EventCategory::Success),
+            StatDeltas::default(),
+            "if no category scored, the guarantee above would be vacuous"
+        );
     }
 }

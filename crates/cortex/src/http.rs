@@ -119,6 +119,56 @@ mod tests {
         assert!(USER_AGENT.len() > "borg/".len(), "version must be present");
     }
 
+    /// Strip every `#[cfg(test)]` module from `source`, leaving the shipped
+    /// code. A test that wants a bare client is building a fixture, not
+    /// shipping an untimed request — but truncating at the *first* test module
+    /// would also blind the guard to every line after it, which is where an
+    /// inline `mod tests` sits in the middle of a file.
+    fn production_source(source: &str) -> String {
+        let mut kept = String::with_capacity(source.len());
+        let mut skipping_from_depth: Option<i32> = None;
+        let mut depth: i32 = 0;
+        for line in source.lines() {
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            if skipping_from_depth.is_none() && line.trim_start().starts_with("#[cfg(test)]") {
+                skipping_from_depth = Some(depth);
+            }
+            if skipping_from_depth.is_none() {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+            depth += opens - closes;
+            if let Some(start) = skipping_from_depth {
+                // The test module has closed; resume scanning after it.
+                if depth <= start && closes > 0 {
+                    skipping_from_depth = None;
+                }
+            }
+        }
+        kept
+    }
+
+    /// The stripper must not blind the guard to code that follows an inline
+    /// test module — the case the old "split at the first `#[cfg(test)]`"
+    /// approach missed entirely.
+    #[test]
+    fn stripping_test_modules_keeps_the_code_that_follows_them() {
+        let source = "fn before() {}\n\
+                      #[cfg(test)]\n\
+                      mod tests {\n\
+                      fn t() { let c = reqwest::Client::new(); }\n\
+                      }\n\
+                      fn after() { let c = reqwest::Client::new(); }\n";
+        let kept = production_source(source);
+        assert!(kept.contains("fn before"), "code before must survive");
+        assert!(kept.contains("fn after"), "code after must survive");
+        assert!(
+            kept.matches("reqwest::Client::new()").count() == 1,
+            "exactly the post-test-module call must remain visible, got: {kept}"
+        );
+    }
+
     /// Guard: a bare `reqwest::Client::new()` has no timeout, so a server that
     /// accepts the connection and then goes quiet wedges the caller forever.
     /// The type system cannot express "construct clients only here", and the
@@ -173,11 +223,9 @@ mod tests {
                 let Ok(source) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                // Skip test modules: a test that wants a bare client is
-                // building a fixture, not shipping an untimed request.
-                let production = source.split("#[cfg(test)]").next().unwrap_or_default();
-                if production.contains("reqwest::Client::new()")
-                    || production.contains("reqwest::Client::builder()")
+                if production_source(&source).contains("reqwest::Client::new()")
+                    || production_source(&source).contains("reqwest::Client::builder()")
+                    || production_source(&source).contains("reqwest::ClientBuilder::new()")
                 {
                     offenders.push(rel);
                 }

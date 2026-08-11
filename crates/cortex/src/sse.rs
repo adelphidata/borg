@@ -30,17 +30,24 @@ pub enum SseAction {
 /// provider endpoint can embed a deployment id, a project, or a key in its
 /// query string, and none of that helps someone read "the connection dropped".
 fn strip_urls(text: &str) -> String {
-    text.split_whitespace()
-        .map(|token| {
+    // `split_inclusive` on whitespace keeps each separator attached to the
+    // token before it, so newlines and runs of spaces survive verbatim. Only
+    // the URL tokens change; the rest of the message reads as the transport
+    // wrote it.
+    text.split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let (token, sep) = match piece.find(char::is_whitespace) {
+                Some(i) => piece.split_at(i),
+                None => (piece, ""),
+            };
             let trimmed = token.trim_start_matches(['(', '[', '"', '\'']);
             if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                "<url>"
+                format!("<url>{sep}")
             } else {
-                token
+                piece.to_string()
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// Process an SSE byte stream, dispatching each non-empty data line to `parse_line`.
@@ -534,6 +541,16 @@ mod tests {
         assert_eq!(
             strip_urls("failed to reach https://x.test/a?b=c now"),
             "failed to reach <url> now"
+        );
+    }
+
+    /// Redaction must not reformat the message. A multi-line transport error
+    /// stays readable; only the URL token changes.
+    #[test]
+    fn stripping_urls_preserves_the_original_layout() {
+        assert_eq!(
+            strip_urls("error sending request\n  url: https://x.test/v1\n  cause: reset"),
+            "error sending request\n  url: <url>\n  cause: reset"
         );
     }
 }

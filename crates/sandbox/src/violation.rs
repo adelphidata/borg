@@ -122,7 +122,10 @@ pub fn classify(
         })
     };
 
-    if exit_code == Some(SIGSYS_SHELL_STATUS) {
+    // Backend-gated: signal 31 is `SIGSYS` only on Linux. On Darwin it is
+    // `SIGUSR2`, so an unqualified check would file a command the user killed
+    // with `kill -USR2` as a seccomp denial.
+    if backend == SandboxBackend::Bubblewrap && exit_code == Some(SIGSYS_SHELL_STATUS) {
         // Killed by the seccomp filter. There is no path and often no output.
         return build(ViolationKind::Filesystem { path: None }, "seccomp");
     }
@@ -169,13 +172,27 @@ fn seatbelt_denial(line: &str) -> Option<(String, Option<String>)> {
     Some((operation.to_string(), path))
 }
 
+/// Text that marks a `bwrap:` line as a *denial* rather than an ordinary setup
+/// failure. Without one of these, `bwrap: execvp foo: No such file or
+/// directory` — a plain command-not-found — would be recorded as a denial.
+const BWRAP_DENIAL_MARKERS: &[&str] = &[
+    "permission denied",
+    "operation not permitted",
+    "read-only file system",
+];
+
 /// Parse a bwrap denial line. bwrap prefixes its own errors with `bwrap:`,
-/// which is what makes them distinguishable from the child's output.
+/// which is what makes them distinguishable from the child's output. The
+/// prefix alone is not enough — bwrap uses it for every startup error, so a
+/// positive denial marker is required as well.
 fn bwrap_denial(line: &str) -> Option<(String, ViolationKind)> {
     let message = line.trim().strip_prefix("bwrap:")?.trim();
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("network") || lowered.contains("unshare net") {
         return Some(("bwrap-network".to_string(), ViolationKind::Network));
+    }
+    if !BWRAP_DENIAL_MARKERS.iter().any(|m| lowered.contains(m)) {
+        return None;
     }
     // `bwrap: Can't create file at /etc/passwd: Permission denied`
     let path = message
@@ -261,6 +278,31 @@ mod tests {
             ViolationKind::Filesystem {
                 path: Some("/etc/passwd".to_string()),
             }
+        );
+    }
+
+    /// bwrap prefixes every startup failure, not just denials. A missing
+    /// binary is the common one and must not be recorded as a denial.
+    #[test]
+    fn a_bwrap_startup_failure_is_not_reported_as_a_denial() {
+        for line in [
+            "bwrap: execvp nosuchcmd: No such file or directory",
+            "bwrap: Creating new namespace failed: Invalid argument",
+        ] {
+            assert!(
+                classify(SandboxBackend::Bubblewrap, Some(1), line).is_none(),
+                "must not classify: {line}"
+            );
+        }
+    }
+
+    /// Signal 31 is `SIGSYS` on Linux but `SIGUSR2` on Darwin. The status
+    /// check must therefore never fire for the Seatbelt backend.
+    #[test]
+    fn the_seccomp_status_is_not_read_as_a_denial_on_seatbelt() {
+        assert!(
+            classify(SandboxBackend::Seatbelt, Some(SIGSYS_SHELL_STATUS), "").is_none(),
+            "status 159 means SIGUSR2 on macOS, not a sandbox denial"
         );
     }
 

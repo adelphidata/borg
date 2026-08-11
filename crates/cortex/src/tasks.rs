@@ -730,6 +730,7 @@ pub fn is_transient_error(error: &str) -> bool {
         Some(FailoverReason::RateLimit)
             | Some(FailoverReason::Overloaded)
             | Some(FailoverReason::Timeout)
+            | Some(FailoverReason::ConnectionLost)
     )
 }
 

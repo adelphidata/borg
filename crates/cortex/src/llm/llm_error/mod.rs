@@ -60,6 +60,11 @@ pub enum FailoverReason {
     /// budget in seconds and reports failure while the network is merely
     /// between states. This class backs off far harder and tells the user why
     /// it is waiting.
+    ///
+    /// Scope today: only the response-stream read path constructs this.
+    /// [`classify_error_text`] still maps connection prose ("connection reset
+    /// by peer") to [`Self::Timeout`], so a failure at request-send time keeps
+    /// the ordinary schedule. Widening the classifier is the follow-up.
     ConnectionLost,
     /// Malformed request with no useful recovery path (400 without
     /// context/payload keywords).

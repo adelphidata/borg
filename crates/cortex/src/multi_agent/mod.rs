@@ -1107,6 +1107,19 @@ impl AgentControl {
             return Ok(self.completion_buffer.remove(idx));
         }
 
+        // No handle and no buffered completion: either the id is wrong, or the
+        // agent finished more than `TERMINAL_AGENT_RETENTION_SECS` ago and was
+        // reaped. Waiting the full timeout would report "timeout" for a child
+        // that already succeeded, so fail now and name the durable record.
+        if !self.agents.contains_key(agent_id) {
+            let retention = TERMINAL_AGENT_RETENTION_SECS;
+            bail!(
+                "Agent '{agent_id}' is not tracked in this session — it was never spawned here, \
+                 or it finished more than {retention}s ago and its handle was released. Its \
+                 result is in the sub-agent record; re-spawn if you need it to run again."
+            );
+        }
+
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -3090,6 +3103,34 @@ mod sub_agent_surface_tests {
         assert!(
             c.is_empty(),
             "a long-lived daemon must not keep every child it ever spawned"
+        );
+    }
+
+    /// A wait on a reaped handle must not sit out the whole timeout and then
+    /// blame the child. It has to say the handle is gone, immediately.
+    #[tokio::test]
+    async fn waiting_on_a_reaped_child_fails_fast_and_explains_why() {
+        let mut c = reaper_ctrl();
+        c.insert_mock_handle("a", "alpha");
+        let handle = c.agents.get_mut("a").unwrap();
+        handle.info.status = SubAgentStatus::Shutdown;
+        handle.info.ended_at = Some(1_000);
+        c.reap_finished_agents_at(1_000 + TERMINAL_AGENT_RETENTION_SECS);
+
+        let started = tokio::time::Instant::now();
+        let err = c
+            .wait_for_agent("a", 30)
+            .await
+            .expect_err("a reaped handle cannot be waited on");
+
+        assert!(
+            started.elapsed() < tokio::time::Duration::from_secs(5),
+            "must not burn the 30s wait budget on a handle it already knows is gone"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("not tracked") && text.contains("re-spawn"),
+            "the error must name the cause and the next action, got: {text}"
         );
     }
 

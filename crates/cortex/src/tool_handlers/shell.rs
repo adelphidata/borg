@@ -1139,20 +1139,14 @@ async fn session_action_with_registry(
     }
 }
 
-/// Decide whether to wrap `run_shell` invocations in a workspace-scoped
-/// sandbox profile. ACP sessions (`ctx.enforce_workspace_root() == true`)
-/// MUST be sandboxed — that's the kernel-level boundary the plan
-/// (§"Tool-Specific Behavior — `run_shell`") requires so a `cd /tmp;
-/// echo > /etc/passwd` from an IDE-launched agent can't escape the
-/// declared workspace. Non-ACP callers retain the existing direct-spawn
-/// behavior to avoid changing semantics for the TUI/REPL.
 /// File a sandbox denial into the vitals chain, if this command was sandboxed
 /// and its result looks like one.
 ///
 /// Observability only: the command has already failed by the time this runs,
 /// and nothing here can change that. It is deliberately gated on the same
 /// condition as [`wrap_run_shell_for_sandbox`] — an unsandboxed command cannot
-/// produce a denial, so classifying its stderr could only produce noise.
+/// produce a denial, so classifying its stderr could only produce noise. That
+/// gate is ACP-only, so today the TUI and REPL lanes record nothing.
 async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str, code: Option<i32>) {
     if !ctx.enforce_workspace_root() {
         return;
@@ -1170,6 +1164,13 @@ async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str, code: Option<
     crate::vitals::record_sandbox_violation(&violation).await;
 }
 
+/// Decide whether to wrap `run_shell` invocations in a workspace-scoped
+/// sandbox profile. ACP sessions (`ctx.enforce_workspace_root() == true`)
+/// MUST be sandboxed — that's the kernel-level boundary the plan
+/// (§"Tool-Specific Behavior — `run_shell`") requires so a `cd /tmp;
+/// echo > /etc/passwd` from an IDE-launched agent can't escape the
+/// declared workspace. Non-ACP callers retain the existing direct-spawn
+/// behavior to avoid changing semantics for the TUI/REPL.
 fn wrap_run_shell_for_sandbox(
     ctx: &ExecutionContext,
     config: &Config,
