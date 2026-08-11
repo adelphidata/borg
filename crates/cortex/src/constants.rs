@@ -311,6 +311,17 @@ pub const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 /// Max inbound text payload from webhook (32 KB).
 pub const MAX_INBOUND_TEXT_BYTES: usize = 32 * 1024;
 
+/// Max bytes of any single free-text field written to the conversation log
+/// at `~/.borg/logs/{date}.jsonl` (32 KB).
+///
+/// Every other capture path is already bounded — hook output at 8 KB, shell
+/// output through a head/tail buffer that spills the middle to a file — but
+/// the conversation log wrote whatever it was handed. One `fs_read` of a large
+/// file, or an MCP result returning a blob, then lands in the daily log whole.
+/// Sized well above a normal message so ordinary history is untouched, and far
+/// below the point where the file stops being readable.
+pub const MAX_LOG_FIELD_BYTES: usize = 32 * 1024;
+
 // ── Embedding provider defaults ───────────────────────────────────
 
 /// Default embedding dimension for OpenAI models (text-embedding-3-small).

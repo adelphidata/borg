@@ -6,8 +6,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::constants;
 use crate::output_redaction::{current_policy, OutputSink, RedactionPolicy};
 use crate::types::{Message, MessageContent};
+use crate::util::truncate::floor_char_boundary;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LogEntry {
@@ -59,6 +61,25 @@ fn append_entry(entry: &LogEntry) -> Result<()> {
     Ok(())
 }
 
+/// Bound one free-text log field to [`constants::MAX_LOG_FIELD_BYTES`].
+///
+/// Truncation is announced rather than silent: a reader who finds a tool
+/// result ending mid-sentence needs to know the log cut it, not the tool.
+/// Splitting happens on a character boundary so the JSONL line stays valid
+/// UTF-8 — a multi-byte character cut in half would make the row unreadable
+/// for every consumer, which is worse than the growth being bounded.
+fn bound_log_field(text: &str) -> String {
+    if text.len() <= constants::MAX_LOG_FIELD_BYTES {
+        return text.to_string();
+    }
+    let end = floor_char_boundary(text, constants::MAX_LOG_FIELD_BYTES);
+    let omitted = text.len() - end;
+    format!(
+        "{}\n[log truncated — {omitted} bytes omitted]",
+        &text[..end]
+    )
+}
+
 pub fn log_message(message: &Message) {
     log_message_with_policy(message, &current_policy())
 }
@@ -75,7 +96,9 @@ pub fn log_message_with_policy(message: &Message, policy: &RedactionPolicy) {
     // still benefits from output-side redaction once their message lands in
     // `~/.borg/logs/*.jsonl`. There is no per-sender thread context for log
     // lines (they're session-scoped at the JSONL row level elsewhere).
-    let redact = |s: &str| policy.apply(OutputSink::Log, None, s).into_owned();
+    // Redact first, then bound. Truncating first could cut a credential in
+    // half and leave the surviving prefix unmatched by the redaction patterns.
+    let redact = |s: &str| bound_log_field(&policy.apply(OutputSink::Log, None, s));
 
     let kind = match message.role {
         crate::types::Role::User => {
@@ -410,5 +433,83 @@ mod tests {
             .collect();
 
         assert!(verbose_fmt[0].len() > default_fmt[0].len());
+    }
+
+    const TRUNCATION_MARKER: &str = "[log truncated";
+
+    #[test]
+    fn a_field_within_the_cap_is_returned_byte_identical() {
+        let ordinary = "a tool result that nobody needs to truncate";
+        assert_eq!(bound_log_field(ordinary), ordinary);
+
+        // The boundary itself must not truncate: `<=` not `<`.
+        let exactly_at_cap = "x".repeat(constants::MAX_LOG_FIELD_BYTES);
+        assert_eq!(bound_log_field(&exactly_at_cap), exactly_at_cap);
+    }
+
+    #[test]
+    fn an_oversized_field_is_truncated_and_says_how_much_it_dropped() {
+        let overflow = 5_000;
+        let huge = "x".repeat(constants::MAX_LOG_FIELD_BYTES + overflow);
+
+        let bounded = bound_log_field(&huge);
+
+        assert!(
+            bounded.contains(TRUNCATION_MARKER),
+            "a reader must be able to tell the log cut the value, not the tool: {bounded:?}"
+        );
+        assert!(
+            bounded.contains(&format!("{overflow} bytes omitted")),
+            "the marker must report the real omitted count: {bounded:?}"
+        );
+        let body = bounded
+            .split_once('\n')
+            .expect("marker is on its own line")
+            .0;
+        assert_eq!(body.len(), constants::MAX_LOG_FIELD_BYTES);
+        assert!(huge.starts_with(body), "the kept prefix must be verbatim");
+    }
+
+    #[test]
+    fn truncation_splits_on_a_character_boundary() {
+        // One ASCII byte then two-byte characters, so the cap lands mid-character.
+        let multibyte_count = constants::MAX_LOG_FIELD_BYTES;
+        let huge = format!("a{}", "é".repeat(multibyte_count));
+        assert!(!huge.is_char_boundary(constants::MAX_LOG_FIELD_BYTES));
+
+        let bounded = bound_log_field(&huge);
+        let body = bounded
+            .split_once('\n')
+            .expect("marker is on its own line")
+            .0;
+
+        assert_eq!(
+            body.len(),
+            constants::MAX_LOG_FIELD_BYTES - 1,
+            "the split backs off to the last whole character"
+        );
+        assert!(body.ends_with('é'));
+        assert!(!body.contains('\u{fffd}'), "no half character survived");
+    }
+
+    #[test]
+    fn a_truncated_field_still_writes_one_valid_json_line() {
+        let entry = LogEntry {
+            timestamp: "2026-03-14T10:30:00+00:00".to_string(),
+            kind: LogEntryKind::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: bound_log_field(&"é".repeat(constants::MAX_LOG_FIELD_BYTES)),
+            },
+        };
+
+        let line = serde_json::to_string(&entry).expect("truncated field serializes");
+        assert!(!line.contains('\n'), "one entry must stay on one JSONL row");
+
+        let parsed: LogEntry = serde_json::from_str(&line).expect("row round-trips");
+        let LogEntryKind::ToolResult { content, .. } = parsed.kind else {
+            panic!("wrong variant");
+        };
+        assert!(content.contains(TRUNCATION_MARKER));
+        assert!(content.len() < constants::MAX_LOG_FIELD_BYTES + 100);
     }
 }
