@@ -11,9 +11,8 @@ use crate::security::secrets_resolve::SecretRef;
 ///
 /// Borg is autonomous by default — there is no "Default" mode. The only modes
 /// are `Execute` (the standard, autonomous mode) and `Plan` (read-only).
-/// A third "Default" mode previously existed and was removed deliberately;
-/// `FromStr` accepts `"default"` as a silent alias for `Execute` so legacy
-/// settings rows keep working, but it must not be re-added as a variant.
+/// A third "Default" mode previously existed and was removed deliberately; it
+/// must not be re-added as a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CollaborationMode {
@@ -36,9 +35,7 @@ impl FromStr for CollaborationMode {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            // "default" is a legacy alias mapped to Execute; do not reintroduce
-            // a Default variant (see the type-level doc comment).
-            "default" | "execute" => Ok(Self::Execute),
+            "execute" => Ok(Self::Execute),
             "plan" => Ok(Self::Plan),
             other => {
                 anyhow::bail!("Unknown collaboration mode '{other}'. Valid: execute, plan")

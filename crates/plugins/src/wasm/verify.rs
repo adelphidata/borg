@@ -2,7 +2,7 @@
 //!
 //! Install gauntlet order (manifest parse → SHA-256 pin → Ed25519 signature
 //! → static WASM walk → HMAC seal) lives in [`verify_package`]; post-install
-//! integrity checks live in [`verify_installed_hmac`] and [`legacy_hmac`].
+//! integrity checks live in [`verify_installed_hmac`].
 
 use std::path::{Path, PathBuf};
 
@@ -166,9 +166,8 @@ fn verify_publisher_signature(
     Ok(())
 }
 
-/// Recompute the current-scheme local HMAC seal. Public so cortex can rewrite
-/// the row after auto-resealing a legacy install. The result is what
-/// `verify_installed_hmac` will check on the next execution.
+/// Compute the local HMAC seal for an installed plugin — what
+/// `verify_installed_hmac` checks on the next execution.
 pub fn compute_local_hmac_current(
     key: &[u8],
     manifest_bytes: &[u8],
@@ -189,103 +188,6 @@ fn compute_local_hmac(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<
     mac.update(&(wasm.len() as u64).to_be_bytes());
     mac.update(wasm);
     Ok(hex_encode(&mac.finalize().into_bytes()))
-}
-
-/// Legacy (pre-current) HMAC sealing — kept verification-only so installs
-/// sealed by an older borg can be auto-resealed under the current scheme
-/// without forcing the operator to reinstall every plugin.
-///
-/// Two differences from `compute_local_hmac`:
-///   1. The derived-key domain on the cortex side was
-///      `b"borg-wasm-plugin-local-hmac"` (no `-v2` suffix). Cortex passes that
-///      legacy key when it falls back through this verifier.
-///   2. Framing used a single NUL separator between manifest and wasm bytes —
-///      no length prefix. The length-prefixed scheme is more robust against
-///      framing-substitution mistakes if the manifest format ever changes,
-///      but the legacy framing has no known exploit *without* the per-install
-///      KEK-derived key. We accept a v1 MAC as a trust signal at parity with
-///      a v2 MAC because forging either one requires the same secret. The
-///      Ed25519 publisher signature is the remote-trust anchor and is not
-///      touched by this path — the local HMAC is strictly a post-install
-///      tamper signal. If a v1-class collision is ever discovered, this
-///      module must be deleted (not loosened), forcing reinstall.
-pub mod legacy_hmac {
-    use super::{anyhow, bail, constant_time_eq, hex_decode, hex_encode, HmacSha256, Result};
-    use hmac::Mac;
-
-    /// Verify `expected_hmac` against the pre-current ("v1") sealing scheme.
-    /// Callers MUST treat success as a signal to reseal under the current
-    /// scheme (see `cortex::wasm_plugins`), not as a permanent integrity state.
-    pub fn verify(
-        legacy_key: &[u8],
-        manifest_bytes: &[u8],
-        wasm: &[u8],
-        expected_hmac: &str,
-    ) -> Result<()> {
-        if legacy_key.is_empty() {
-            bail!("legacy HMAC key is required");
-        }
-        let expected = hex_decode(expected_hmac)?;
-        let actual_hex = compute(legacy_key, manifest_bytes, wasm)?;
-        let actual = hex_decode(&actual_hex)?;
-        if constant_time_eq(&actual, &expected) {
-            Ok(())
-        } else {
-            bail!("installed WASM plugin legacy integrity check failed")
-        }
-    }
-
-    /// Compute the legacy ("v1") HMAC over `manifest_bytes + wasm` under the
-    /// legacy framing (NUL-separated, no length prefix). Exposed for tests
-    /// that need to construct a legacy-sealed install to drive the auto-reseal
-    /// path in cortex; production never seals under this framing.
-    pub fn compute(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
-        let mut mac =
-            HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key length"))?;
-        mac.update(manifest_bytes);
-        mac.update(b"\0");
-        mac.update(wasm);
-        Ok(hex_encode(&mac.finalize().into_bytes()))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn legacy_verify_round_trip() {
-            // Real failure mode: a future framing tweak that silently breaks
-            // verification of in-the-wild v1 seals — every existing install
-            // would be force-quarantined on upgrade. Round-trip a known input
-            // to lock the framing down.
-            let key = b"legacy-key-bytes-2026";
-            let manifest = b"{\"id\":\"dev/echo\"}";
-            let wasm = b"\0asm\x01\x00\x00\x00";
-            let mac = compute(key, manifest, wasm).expect("compute legacy");
-            verify(key, manifest, wasm, &mac).expect("verify legacy");
-
-            // Tamper either side, expect failure.
-            let mut tampered = wasm.to_vec();
-            *tampered.last_mut().unwrap() ^= 0xFF;
-            assert!(verify(key, manifest, &tampered, &mac).is_err());
-
-            let mut tampered_manifest = manifest.to_vec();
-            tampered_manifest[0] ^= 0xFF;
-            assert!(verify(key, &tampered_manifest, wasm, &mac).is_err());
-        }
-
-        #[test]
-        fn legacy_verify_empty_key_rejected() {
-            // A misconfigured boot must fail loudly here rather than silently
-            // accept everything via a zero-length key — mirrors the v2 path.
-            let err = verify(b"", b"manifest", b"wasm", &"0".repeat(64))
-                .expect_err("empty key must be rejected");
-            assert!(
-                err.to_string().contains("legacy HMAC key"),
-                "error must point at the key, got: {err}",
-            );
-        }
-    }
 }
 
 fn safe_plugin_dir_name(id: &str) -> Result<String> {

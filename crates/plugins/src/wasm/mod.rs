@@ -17,8 +17,8 @@ pub use execute::{
 };
 pub use validate::{validate_host_http_request, validate_manifest, validate_wasm_module};
 pub use verify::{
-    canonical_manifest_bytes, compute_local_hmac_current, install_verified_package, legacy_hmac,
-    sha256_hex, verify_installed_hmac, verify_package, InstalledWasmPackage, VerifiedWasmPackage,
+    canonical_manifest_bytes, compute_local_hmac_current, install_verified_package, sha256_hex,
+    verify_installed_hmac, verify_package, InstalledWasmPackage, VerifiedWasmPackage,
 };
 
 use anyhow::{bail, Result};

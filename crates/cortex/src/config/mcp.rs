@@ -68,16 +68,6 @@ pub struct McpConfig {
     /// `0` means don't wait at all. Default: 2_000.
     #[serde(default = "default_startup_grace_ms")]
     pub startup_grace_ms: u64,
-    /// Legacy switch for MCP schema deferral: `true` forces
-    /// [`McpToolSearchMode::On`] (full deferral behind `search_tools`)
-    /// regardless of `tool_search_mode`. `false` (the default) delegates to
-    /// `tool_search_mode`, whose `auto` default keeps small catalogs eager
-    /// but defers a catalog whose schemas outgrow `listing_max_tokens`.
-    /// Prefer `tool_search_mode`. Native/compiled-in tools are never
-    /// deferred; dispatch is registry-keyed, so a deferred tool is callable
-    /// as soon as the model discovers it.
-    #[serde(default)]
-    pub tool_search: bool,
     /// Tiered disclosure policy for MCP tool schemas — see
     /// [`McpToolSearchMode`]. Default `auto`: small catalogs stay eager
     /// (schemas advertised directly, unchanged behaviour); a catalog whose
@@ -172,7 +162,6 @@ impl Default for McpConfig {
             startup_max_retries: default_startup_max_retries(),
             startup_retry_base_ms: default_startup_retry_base_ms(),
             startup_grace_ms: default_startup_grace_ms(),
-            tool_search: false,
             tool_search_mode: McpToolSearchMode::default(),
             listing_max_tokens: default_listing_max_tokens(),
         }
@@ -180,17 +169,6 @@ impl Default for McpConfig {
 }
 
 impl McpConfig {
-    /// Resolve the effective disclosure mode, honoring the legacy
-    /// `tool_search` boolean: `true` forces `On` so existing installs that
-    /// opted into full deferral keep it.
-    pub fn effective_tool_search_mode(&self) -> McpToolSearchMode {
-        if self.tool_search {
-            McpToolSearchMode::On
-        } else {
-            self.tool_search_mode
-        }
-    }
-
     /// Decide the MCP disclosure tier from three size estimates (in tokens):
     /// the full schema payload, the name+description listing, and the
     /// names-only listing. All three are estimates of what the corresponding
@@ -204,7 +182,7 @@ impl McpConfig {
         if !self.enabled {
             return McpDisclosureTier::Eager; // no MCP tools — moot
         }
-        let deferred = match self.effective_tool_search_mode() {
+        let deferred = match self.tool_search_mode {
             McpToolSearchMode::Off => false,
             McpToolSearchMode::On => true,
             McpToolSearchMode::Auto => schema_tokens > self.listing_max_tokens,

@@ -355,7 +355,6 @@ define_settings! {
         "mcp.startup_max_retries" => mcp.startup_max_retries, parsed(u32);
         "mcp.startup_retry_base_ms" => mcp.startup_retry_base_ms, parsed(u64);
         "mcp.startup_grace_ms" => mcp.startup_grace_ms, parsed(u64);
-        "mcp.tool_search" => mcp.tool_search, parsed(bool);
         "mcp.listing_max_tokens" => mcp.listing_max_tokens, parsed(usize);
 
         // ── Credentials ──
@@ -460,29 +459,18 @@ define_settings! {
             Ok(format!("{key} = ({n} endpoints)"))
         };
 
-        // llm.claude_cli_path: opt_string. Empty or the legacy "(auto-detect)"
-        // display sentinel both clear to None — earlier versions of the
-        // extractor returned the sentinel as the round-trip value, so this
-        // arm has to absorb whatever crept into the DB.
+        // llm.claude_cli_path: opt_string. Empty clears to None.
         "llm.claude_cli_path" => |s, key, value| {
-            s.llm.claude_cli_path = if value.is_empty() || value == "(auto-detect)" {
-                None
-            } else {
-                Some(value.to_string())
-            };
+            s.llm.claude_cli_path = (!value.is_empty()).then(|| value.to_string());
             Ok(format!("{key} = {value}"))
         };
 
-        // provider: opt_string. Same sentinel-clearing rule as claude_cli_path
-        // — without this, an "unset" round-trip persisted "(auto-detect)" as
-        // the literal provider name, which then failed Provider::from_str at
-        // turn time with "Unknown provider: (auto-detect)".
+        // provider: opt_string. Empty clears to None. "(auto-detect)" is a
+        // display-only string (see the getter) and is never persisted, so it
+        // is not accepted here — a literal one would fail Provider::from_str
+        // at turn time anyway.
         "provider" => |s, key, value| {
-            s.llm.provider = if value.is_empty() || value == "(auto-detect)" {
-                None
-            } else {
-                Some(value.to_string())
-            };
+            s.llm.provider = (!value.is_empty()).then(|| value.to_string());
             Ok(format!("{key} = {value}"))
         };
 
@@ -1067,7 +1055,6 @@ define_settings! {
         // (edited via the Slice 3 CLI), so only the kill switch surfaces
         // in the TUI popup.
         "mcp.enabled" => "MCP", Bool, "MCP";
-        "mcp.tool_search" => "MCP tool search", Bool, "MCP";
         "mcp.tool_search_mode" => "MCP disclosure mode", Select, "MCP";
         "mcp.listing_max_tokens" => "MCP listing budget (tokens)", Uint, "MCP";
 

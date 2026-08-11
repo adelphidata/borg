@@ -1097,7 +1097,20 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 16;
+    const CURRENT_VERSION: u32 = 1;
+
+    /// True when the stamp matches this binary exactly, so migrations can be
+    /// skipped.
+    ///
+    /// Deliberately `==`, not `>=`. The chain was squashed from 16 steps to
+    /// one, so developer databases still carry a stamp of 16 — under `>=`
+    /// every future migration would be skipped on those machines with no
+    /// error at all, surfacing much later as "no such column". Any stamp that
+    /// is not ours means "re-emit the baseline", which is safe because
+    /// `migrate_v1` is entirely `CREATE … IF NOT EXISTS`.
+    fn stamp_is_current(stamp: u32) -> bool {
+        stamp == Self::CURRENT_VERSION
+    }
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -1112,18 +1125,8 @@ impl Database {
             .await?;
 
         let current = self.schema_version().await?;
-        if current >= Self::CURRENT_VERSION {
-            // The stamp alone doesn't prove the shape: worktrees share
-            // `~/.borg/borg.db`, and a divergently-numbered binary can
-            // stamp any version — including one at or past ours — without
-            // having run our migrations. Run the probe-first shape repair
-            // on every open; on a healthy DB it is read-only PRAGMA /
-            // sqlite_master probes plus no-op `IF NOT EXISTS` DDL. It runs
-            // outside the writer transaction: writes only happen on a
-            // damaged DB, where each step is individually idempotent, so a
-            // crash or a rare concurrent-repair race just leaves work for
-            // the next open instead of corrupting anything.
-            return self.migrate_v16().await;
+        if Self::stamp_is_current(current) {
+            return Ok(());
         }
 
         // Acquire the writer lock explicitly. libsql's `Transaction` API is
@@ -1162,63 +1165,13 @@ impl Database {
         // acquire the writer in turn, and the second runs `CREATE TABLE …`
         // against tables the first just created.
         let current = self.schema_version().await?;
-        if current >= Self::CURRENT_VERSION {
+        if Self::stamp_is_current(current) {
             return Ok(());
         }
 
-        // Async fn pointers don't compose into a slice literal the way sync
-        // ones did; the migration set is tiny so a direct dispatch keeps the
-        // CURRENT_VERSION→migrate_vN coupling explicit.
-        if current < 1 {
-            self.migrate_v1().await?;
-        }
-        if current < 2 {
-            self.migrate_v2().await?;
-        }
-        if current < 3 {
-            self.migrate_v3().await?;
-        }
-        if current < 4 {
-            self.migrate_v4().await?;
-        }
-        if current < 5 {
-            self.migrate_v5().await?;
-        }
-        if current < 6 {
-            self.migrate_v6().await?;
-        }
-        if current < 7 {
-            self.migrate_v7().await?;
-        }
-        if current < 8 {
-            self.migrate_v8().await?;
-        }
-        if current < 9 {
-            self.migrate_v9().await?;
-        }
-        if current < 10 {
-            self.migrate_v10().await?;
-        }
-        if current < 11 {
-            self.migrate_v11().await?;
-        }
-        if current < 12 {
-            self.migrate_v12().await?;
-        }
-        if current < 13 {
-            self.migrate_v13().await?;
-        }
-        if current < 14 {
-            self.migrate_v14().await?;
-        }
-        if current < 15 {
-            self.migrate_v15().await?;
-        }
-        if current < 16 {
-            self.migrate_v16().await?;
-        }
+        self.migrate_v1().await?;
         const _: () = assert!(
-            Database::CURRENT_VERSION == 16,
+            Database::CURRENT_VERSION == 1,
             "add the new migrate_vN call above and bump this constant",
         );
 
@@ -1236,25 +1189,10 @@ impl Database {
                     Ok(0)
                 }
             },
-            None => {
-                // Check if tables already exist (pre-versioning database)
-                let mut rows = self
-                    .conn
-                    .query(
-                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
-                        (),
-                    )
-                    .await?;
-                let count: i64 = match rows.next().await? {
-                    Some(row) => row.get::<i64>(0)?,
-                    None => 0,
-                };
-                if count > 0 {
-                    Ok(1) // Legacy DB with original tables
-                } else {
-                    Ok(0) // Fresh database
-                }
-            }
+            // No stamp means a fresh database. `migrate_v1` is all
+            // `CREATE … IF NOT EXISTS`, so re-emitting it over a DB that
+            // somehow already carries the shape is a no-op either way.
+            None => Ok(0),
         }
     }
 }

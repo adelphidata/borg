@@ -251,11 +251,12 @@ pub struct MessageRow {
     /// Typed payload for non-message events, serialized as
     /// [`crate::conversation::SessionEventKind`]. `None` for message rows.
     pub event_json: Option<String>,
-    /// Per-session HMAC chain link over this event's immutable fields. `None`
-    /// on legacy rows written before the log was chained.
+    /// Per-session HMAC chain link over this event's immutable fields. Nullable
+    /// in the schema only; every persist path sets it, and `None` fails chain
+    /// verification.
     pub hmac: Option<String>,
     /// HMAC of the previous event in this session's chain (`"0"` for the first
-    /// chained event). `None` on legacy rows.
+    /// chained event). Same nullability caveat as [`Self::hmac`].
     pub prev_hmac: Option<String>,
 }
 

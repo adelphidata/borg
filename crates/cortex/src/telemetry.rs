@@ -50,7 +50,6 @@ pub mod names {
     pub const WASM_CACHE_MISSES: &str = "borg.wasm.cache_misses_total";
     pub const WASM_RATE_LIMITED: &str = "borg.wasm.rate_limited_total";
     pub const WASM_RESOURCE_EXHAUSTED: &str = "borg.wasm.resource_exhausted_total";
-    pub const WASM_RESEALED: &str = "borg.wasm.resealed_total";
 }
 
 /// Guard that shuts down OpenTelemetry providers on drop.
@@ -475,7 +474,6 @@ pub mod wasm_metrics {
         cache_misses: Counter<u64>,
         rate_limited: Counter<u64>,
         resource_exhausted: Counter<u64>,
-        resealed: Counter<u64>,
     }
 
     impl Instruments {
@@ -513,10 +511,6 @@ pub mod wasm_metrics {
                 resource_exhausted: m
                     .u64_counter(names::WASM_RESOURCE_EXHAUSTED)
                     .with_description("Plugin executions stopped by a resource ceiling")
-                    .build(),
-                resealed: m
-                    .u64_counter(names::WASM_RESEALED)
-                    .with_description("Plugins whose local HMAC was upgraded to the current scheme")
                     .build(),
             }
         }
@@ -579,11 +573,6 @@ pub mod wasm_metrics {
             self.rate_limited
                 .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
         }
-
-        pub fn record_reseal(&self, plugin_id: &str) {
-            self.resealed
-                .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
-        }
     }
 
     /// The five buckets we explicitly surface on the resource-exhausted counter.
@@ -629,10 +618,6 @@ pub mod wasm_metrics {
 
     pub fn record_rate_limited(plugin_id: &str) {
         global().record_rate_limited(plugin_id);
-    }
-
-    pub fn record_reseal(plugin_id: &str) {
-        global().record_reseal(plugin_id);
     }
 }
 
@@ -1083,7 +1068,6 @@ mod tests {
         inst.record_cache(WasmCacheOutcome::Hit);
         inst.record_cache(WasmCacheOutcome::Miss);
         inst.record_rate_limited("plug-r");
-        inst.record_reseal("plug-s");
 
         let rms = collect(&provider, &exporter);
 
@@ -1117,11 +1101,6 @@ mod tests {
                 name: names::WASM_RATE_LIMITED,
                 sum: 1,
                 label: Some(("plugin_id", "plug-r")),
-            },
-            Expect {
-                name: names::WASM_RESEALED,
-                sum: 1,
-                label: Some(("plugin_id", "plug-s")),
             },
         ];
 

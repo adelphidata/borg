@@ -9,8 +9,10 @@ use crate::constants::{
 };
 
 impl Database {
-    /// Full schema. Borg has no released DBs, so all prior incremental
-    /// migrations were squashed into this single emit-the-final-shape step.
+    /// The whole schema, in one step. Borg has no released DBs, so there is
+    /// nothing to upgrade *from* — `SCHEMA_SQL` is the single source of truth
+    /// for the shape, and a new table or column belongs there, not in a
+    /// follow-on migration.
     pub(super) async fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_SQL.as_str()).await?;
         self.seed_default_tasks().await?;
@@ -19,498 +21,6 @@ impl Database {
         self.seed_heartbeat_task().await?;
         self.seed_default_budget().await?;
         self.seed_bundled_rate_cards().await?;
-        Ok(())
-    }
-
-    /// Adds the `apns_device_tokens` table that the APNs push pipeline
-    /// keys off — one row per (device_id, apns_token) registration.
-    /// Provider: Apple Push Notification Service. The App Attest pubkey
-    /// is stored DER-encoded so the verifier (when wired) can re-check
-    /// future assertion signatures without re-running attestation.
-    pub(super) async fn migrate_v3(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS apns_device_tokens (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_id TEXT NOT NULL UNIQUE,
-                    apns_token TEXT NOT NULL,
-                    bundle_id TEXT NOT NULL,
-                    app_attest_key_id TEXT NOT NULL,
-                    app_attest_pub_key_der BLOB NOT NULL,
-                    registered_at INTEGER NOT NULL,
-                    last_push_at INTEGER,
-                    invalidated_at INTEGER,
-                    invalidated_reason TEXT
-                );
-                CREATE INDEX IF NOT EXISTS apns_device_tokens_active
-                    ON apns_device_tokens (invalidated_at) WHERE invalidated_at IS NULL;",
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// No-op: FTS5 virtual tables are emitted directly in `SCHEMA_SQL`. Kept as
-    /// a placeholder so `CURRENT_VERSION` stays at 3 and fresh installs skip it.
-    pub(super) async fn migrate_v2(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// Hash gateway pairing codes at rest.
-    ///
-    /// `pairing_requests.code` previously held the plaintext 6-word BIP-39
-    /// phrase a sender had to present for approval. Anyone with read access
-    /// to the DB file could replay the code before approval expiry. Rename
-    /// the column to `code_hash` and expire all pending rows — we cannot
-    /// re-hash plaintext we no longer have, but pairings are short-lived so
-    /// the operator just creates new ones.
-    /// Add /handoff state-machine columns to `sessions`. Idempotent — only
-    /// adds the columns that the current schema is missing, so fresh installs
-    /// (which already get the full shape from `SCHEMA_SQL`) skip the ALTERs.
-    pub(super) async fn migrate_v5(&self) -> Result<()> {
-        let mut rows = self.conn.query("PRAGMA table_info(sessions)", ()).await?;
-        let mut existing = std::collections::HashSet::new();
-        while let Some(row) = rows.next().await? {
-            existing.insert(row.get::<String>(1)?);
-        }
-        for (col, ddl) in [
-            (
-                "handoff_state",
-                "ALTER TABLE sessions ADD COLUMN handoff_state TEXT",
-            ),
-            (
-                "handoff_target",
-                "ALTER TABLE sessions ADD COLUMN handoff_target TEXT",
-            ),
-            (
-                "handoff_error",
-                "ALTER TABLE sessions ADD COLUMN handoff_error TEXT",
-            ),
-            (
-                "handoff_requested_at",
-                "ALTER TABLE sessions ADD COLUMN handoff_requested_at INTEGER",
-            ),
-        ] {
-            if !existing.contains(col) {
-                self.conn.execute_batch(ddl).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Backfill `sub_agent_runs` with the per-agent metrics + model columns
-    /// and create `agent_tree_snapshots`. Idempotent — fresh installs get
-    /// the final shape from `SCHEMA_SQL` and ALTERs short-circuit when the
-    /// column already exists.
-    pub(super) async fn migrate_v6(&self) -> Result<()> {
-        let mut rows = self
-            .conn
-            .query("PRAGMA table_info(sub_agent_runs)", ())
-            .await?;
-        let mut existing = std::collections::HashSet::new();
-        while let Some(row) = rows.next().await? {
-            existing.insert(row.get::<String>(1)?);
-        }
-        for (col, ddl) in [
-            (
-                "model",
-                "ALTER TABLE sub_agent_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "input_tokens",
-                "ALTER TABLE sub_agent_runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "output_tokens",
-                "ALTER TABLE sub_agent_runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "reasoning_tokens",
-                "ALTER TABLE sub_agent_runs ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "cost_usd",
-                "ALTER TABLE sub_agent_runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0",
-            ),
-            (
-                "tool_calls",
-                "ALTER TABLE sub_agent_runs ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "files_touched",
-                "ALTER TABLE sub_agent_runs ADD COLUMN files_touched TEXT NOT NULL DEFAULT '[]'",
-            ),
-        ] {
-            if !existing.contains(col) {
-                self.conn.execute(ddl, ()).await?;
-            }
-        }
-        self.conn
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_sub_agent_runs_session ON sub_agent_runs(session_id);
-                 CREATE TABLE IF NOT EXISTS agent_tree_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    turn_id TEXT NOT NULL,
-                    label TEXT NOT NULL,
-                    started_at INTEGER NOT NULL,
-                    finished_at INTEGER NOT NULL,
-                    snapshot_json TEXT NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_agent_tree_snapshots_session
-                    ON agent_tree_snapshots(session_id, id DESC);",
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Add covering indexes for time-range scans on `sessions` and
-    /// `messages`. `sessions(created_at)` and `messages(created_at)`
-    /// drove full-table scans on dashboard / audit / consolidation
-    /// queries; the partial `messages(created_at) WHERE tool_calls_json
-    /// IS NOT NULL` index speeds up `tool_call_counts_since` without
-    /// indexing the much larger plain-message majority. Idempotent.
-    pub(super) async fn migrate_v7(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_created_at
-                    ON sessions(created_at);
-                 CREATE INDEX IF NOT EXISTS idx_messages_created_at
-                    ON messages(created_at);
-                 CREATE INDEX IF NOT EXISTS idx_messages_toolcalls
-                    ON messages(created_at)
-                    WHERE tool_calls_json IS NOT NULL;",
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Elevate `messages` into the first-class session event log: add the
-    /// `event_kind`/`event_json` payload columns and the `hmac`/`prev_hmac`
-    /// chain columns. Idempotent — fresh installs get the final shape from
-    /// `SCHEMA_SQL` and these ALTERs short-circuit when the column already
-    /// exists. Existing message rows keep working: NULL `event_kind` decodes
-    /// as a conversational message, NULL `hmac` is a legacy-unchained row.
-    /// Add the per-session lease columns (worker-pool / fallible executors).
-    /// Idempotent: guarded by `PRAGMA table_info` so re-running on an
-    /// already-migrated DB is a no-op.
-    pub(super) async fn migrate_v9(&self) -> Result<()> {
-        let mut rows = self.conn.query("PRAGMA table_info(sessions)", ()).await?;
-        let mut existing = std::collections::HashSet::new();
-        while let Some(row) = rows.next().await? {
-            existing.insert(row.get::<String>(1)?);
-        }
-        for (col, ddl) in [
-            (
-                "lease_owner",
-                "ALTER TABLE sessions ADD COLUMN lease_owner TEXT",
-            ),
-            (
-                "lease_expiry",
-                "ALTER TABLE sessions ADD COLUMN lease_expiry INTEGER",
-            ),
-            (
-                "lease_epoch",
-                "ALTER TABLE sessions ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0",
-            ),
-        ] {
-            if !existing.contains(col) {
-                self.conn.execute_batch(ddl).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Cache of stdio MCP servers' advertised tool catalogs, so a restart can
-    /// present tools while the server process is still starting. See
-    /// `db::mcp_catalog_cache` for why the key is a keyed MAC.
-    pub(super) async fn migrate_v10(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS mcp_catalog_cache (
-                    config_hash TEXT PRIMARY KEY,
-                    server_name TEXT NOT NULL,
-                    tools_json  TEXT NOT NULL,
-                    server_info TEXT,
-                    cached_at   INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_mcp_catalog_cache_server
-                    ON mcp_catalog_cache(server_name);",
-            )
-            .await?;
-        Ok(())
-    }
-
-    pub(super) async fn migrate_v8(&self) -> Result<()> {
-        let mut rows = self.conn.query("PRAGMA table_info(messages)", ()).await?;
-        let mut existing = std::collections::HashSet::new();
-        while let Some(row) = rows.next().await? {
-            existing.insert(row.get::<String>(1)?);
-        }
-        for (col, ddl) in [
-            (
-                "event_kind",
-                "ALTER TABLE messages ADD COLUMN event_kind TEXT",
-            ),
-            (
-                "event_json",
-                "ALTER TABLE messages ADD COLUMN event_json TEXT",
-            ),
-            ("hmac", "ALTER TABLE messages ADD COLUMN hmac TEXT"),
-            (
-                "prev_hmac",
-                "ALTER TABLE messages ADD COLUMN prev_hmac TEXT",
-            ),
-        ] {
-            if !existing.contains(col) {
-                self.conn.execute_batch(ddl).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// True if `name` exists as a table in the main schema. Used by the
-    /// shape repair: `PRAGMA table_info` on a missing table yields zero rows
-    /// and no error, so an unguarded ALTER-based re-run would attempt every
-    /// ADD COLUMN and abort the whole migration transaction with "no such
-    /// table" — turning a damaged-but-openable DB into one that fails boot.
-    pub(super) async fn table_exists(&self, name: &str) -> Result<bool> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                params![name],
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
-    }
-
-    /// Shape repair for stranded DBs. All worktrees share `~/.borg/borg.db`,
-    /// so a binary whose migration numbering differed can stamp
-    /// `schema_version` past a migration without ever running it — e.g. a
-    /// DB at version 10 whose `messages` table still lacks the v8
-    /// `hmac`/`prev_hmac`/`event_*` columns, making every message persist
-    /// fail with "no such column: hmac". Re-run every idempotent migration:
-    /// the table/index-creating ones are `IF NOT EXISTS` throughout, and the
-    /// ALTER-based ones probe `PRAGMA table_info` first, so on a healthy DB
-    /// this is read-only probing plus no-op DDL.
-    ///
-    /// `run_migrations` also invokes this when `schema_version` is already
-    /// at (or past) `CURRENT_VERSION` — the stamp alone proves nothing on a
-    /// shared DB, and gating the repair on the version number would leave
-    /// the exact stranding class it exists to fix unrepaired.
-    pub(super) async fn migrate_v11(&self) -> Result<()> {
-        // Table-creating repairs (v3, v10) are unconditional `IF NOT EXISTS`.
-        self.migrate_v3().await?;
-        self.migrate_v10().await?;
-        // ALTER-based repairs need their base table; a base table can only
-        // be missing on a DB that never ran an equivalent of `migrate_v1`,
-        // which is damage this repair can't fix — warn instead of aborting
-        // the open.
-        let sessions = self.table_exists("sessions").await?;
-        let messages = self.table_exists("messages").await?;
-        let sub_agent_runs = self.table_exists("sub_agent_runs").await?;
-        if sessions {
-            self.migrate_v5().await?;
-            self.migrate_v9().await?;
-        } else {
-            tracing::warn!(
-                "shape repair: `sessions` table missing entirely; skipping column repair"
-            );
-        }
-        if sub_agent_runs {
-            self.migrate_v6().await?;
-        } else {
-            tracing::warn!(
-                "shape repair: `sub_agent_runs` table missing entirely; skipping column repair"
-            );
-        }
-        if messages {
-            self.migrate_v8().await?;
-        } else {
-            tracing::warn!(
-                "shape repair: `messages` table missing entirely; skipping column repair"
-            );
-        }
-        if sessions && messages {
-            self.migrate_v7().await?;
-        }
-        Ok(())
-    }
-
-    /// Per-task model pins on `scheduled_tasks`, and pin/archive state on
-    /// `sessions`.
-    ///
-    /// Wraps the v11 shape repair so the newest repair entry point is a single
-    /// call: `run_migrations` invokes this both on upgrade and on every open of
-    /// an already-stamped DB, for the shared-`borg.db` stranding reason
-    /// documented on [`Self::migrate_v11`].
-    ///
-    /// Idempotent: each ALTER is guarded by a `PRAGMA table_info` probe, so a
-    /// fresh install (which gets the final shape from `SCHEMA_SQL`) does
-    /// read-only probing.
-    pub(super) async fn migrate_v12(&self) -> Result<()> {
-        self.migrate_v11().await?;
-        self.add_missing_columns(
-            "scheduled_tasks",
-            &[("model", "TEXT"), ("model_provider", "TEXT")],
-        )
-        .await?;
-        self.add_missing_columns(
-            "sessions",
-            &[
-                ("pinned", "INTEGER NOT NULL DEFAULT 0"),
-                ("archived_at", "INTEGER"),
-            ],
-        )
-        .await
-    }
-
-    /// `session_heartbeats`: a recurring prompt that re-enters its own session.
-    ///
-    /// Wraps the v13 repair so the newest entry point stays a single call, per
-    /// the shared-`borg.db` stranding reason on [`Self::migrate_v11`]. The
-    /// table is `IF NOT EXISTS`, so a fresh install does no work.
-    pub(super) async fn migrate_v14(&self) -> Result<()> {
-        self.migrate_v13().await?;
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS session_heartbeats (
-                    session_id    TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                    prompt        TEXT NOT NULL,
-                    interval_secs INTEGER NOT NULL,
-                    paused        INTEGER NOT NULL DEFAULT 0,
-                    next_fire_at  INTEGER NOT NULL,
-                    created_at    INTEGER NOT NULL
-                );",
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Monitor-mode scheduled tasks: `monitor_mode` marks a task whose LLM
-    /// turn is suppressed whenever its `pre_run_command` output is unchanged
-    /// from the previous run; `last_pre_run_hash` stores that baseline.
-    ///
-    /// Wraps the v14 repair so the newest entry point stays a single call,
-    /// per the shared-`borg.db` stranding reason on [`Self::migrate_v11`].
-    /// Column adds are probe-first, so a fresh install (which already has
-    /// both columns from `SCHEMA_SQL`) does no work.
-    pub(super) async fn migrate_v15(&self) -> Result<()> {
-        self.migrate_v14().await?;
-        self.add_missing_columns(
-            "scheduled_tasks",
-            &[
-                ("monitor_mode", "INTEGER NOT NULL DEFAULT 0"),
-                ("last_pre_run_hash", "TEXT"),
-            ],
-        )
-        .await
-    }
-
-    /// Workspace identity on sessions: `cwd` is the (canonicalized) working
-    /// directory the session was opened from and `git_repo_root` the toplevel
-    /// of the enclosing git checkout, when there is one. Both nullable —
-    /// sessions opened by channels/daemon lanes with no meaningful workspace
-    /// stay `NULL` and are simply invisible to workspace-scoped resume.
-    ///
-    /// Wraps the v15 repair so the newest entry point stays a single call,
-    /// per the shared-`borg.db` stranding reason on [`Self::migrate_v11`].
-    /// Column adds are probe-first, so a fresh install (which already has
-    /// both columns from `SCHEMA_SQL`) does no work.
-    pub(super) async fn migrate_v16(&self) -> Result<()> {
-        self.migrate_v15().await?;
-        self.add_missing_columns("sessions", &[("cwd", "TEXT"), ("git_repo_root", "TEXT")])
-            .await
-    }
-
-    /// `goal_gates`: deterministic shell commands that must pass before a goal
-    /// completes.
-    ///
-    /// Wraps the v12 repair so each migration's entry point stays a single
-    /// call, per the shared-`borg.db` stranding reason on
-    /// [`Self::migrate_v11`]. The table is `IF NOT EXISTS`, so a fresh install
-    /// (which already has it from `SCHEMA_SQL`) does no work.
-    pub(super) async fn migrate_v13(&self) -> Result<()> {
-        self.migrate_v12().await?;
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS goal_gates (
-                    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    ordinal          INTEGER NOT NULL,
-                    command          TEXT NOT NULL,
-                    attempts         INTEGER NOT NULL DEFAULT 0,
-                    last_exit_code   INTEGER,
-                    last_output      TEXT,
-                    last_fingerprint TEXT,
-                    created_at       INTEGER NOT NULL,
-                    PRIMARY KEY (session_id, ordinal)
-                );",
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Add each absent `(column, type)` to `table`, skipping a table that
-    /// doesn't exist at all.
-    ///
-    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, and re-running an ALTER for an
-    /// existing column is a hard error — so every column-adding migration has
-    /// to probe first to stay idempotent. Deriving the DDL from the same
-    /// `column` the probe tests keeps the two from disagreeing.
-    async fn add_missing_columns(&self, table: &str, columns: &[(&str, &str)]) -> Result<()> {
-        let mut rows = self
-            .conn
-            .query(&format!("PRAGMA table_info({table})"), ())
-            .await?;
-        let mut existing = std::collections::HashSet::new();
-        while let Some(row) = rows.next().await? {
-            existing.insert(row.get::<String>(1)?);
-        }
-        // A table that exists has at least one column, so an empty probe means
-        // the table itself is missing — no `table_exists` round-trip needed.
-        if existing.is_empty() {
-            tracing::warn!(
-                "shape repair: `{table}` table missing entirely; skipping column repair"
-            );
-            return Ok(());
-        }
-        for (column, ty) in columns {
-            if !existing.contains(*column) {
-                self.conn
-                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) async fn migrate_v4(&self) -> Result<()> {
-        // Fresh installs already emit the final shape via `SCHEMA_SQL`
-        // (which defines `code_hash`). Only DBs that ran through the v3
-        // schema (plaintext `code` column) still need the rename — probe
-        // pragma_table_info to make the rename idempotent.
-        let mut rows = self
-            .conn
-            .query("PRAGMA table_info(pairing_requests)", ())
-            .await?;
-        let mut has_plaintext_column = false;
-        while let Some(row) = rows.next().await? {
-            let col: String = row.get(1)?;
-            if col == "code" {
-                has_plaintext_column = true;
-                break;
-            }
-        }
-        if has_plaintext_column {
-            self.conn
-                .execute_batch(
-                    "ALTER TABLE pairing_requests RENAME COLUMN code TO code_hash;
-                     UPDATE pairing_requests
-                        SET status = 'expired'
-                        WHERE status = 'pending';",
-                )
-                .await?;
-        }
         Ok(())
     }
 
@@ -751,6 +261,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- rewrites the stored CREATE text and trips over inline comments.
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -766,13 +277,19 @@ CREATE TABLE IF NOT EXISTS messages (
     -- carry fine-grained lifecycle events (tool-call-started, compaction,
     -- fork markers); conversational rows leave them NULL and decode from
     -- role/content. `hmac`/`prev_hmac` form a per-session tamper-evident
-    -- chain; NULL on rows written before chaining (legacy-tolerant on replay).
+    -- chain.
     event_kind TEXT,
     event_json TEXT,
     hmac TEXT,
     prev_hmac TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+-- Partial index: `tool_call_counts_since` scans only rows carrying tool calls,
+-- so indexing the much larger plain-message majority would be dead weight.
+CREATE INDEX IF NOT EXISTS idx_messages_toolcalls
+    ON messages(created_at)
+    WHERE tool_calls_json IS NOT NULL;
 
 -- FTS lives on a standard FTS5 virtual table with `messages` as the
 -- external content source. Sync triggers below keep the index aligned with
@@ -1498,6 +1015,25 @@ CREATE TABLE IF NOT EXISTS mcp_catalog_cache (
 CREATE INDEX IF NOT EXISTS idx_mcp_catalog_cache_server
     ON mcp_catalog_cache(server_name);
 
+-- APNs device registrations ------------------------------------------------
+-- One row per (device_id, apns_token) registration the push pipeline keys off.
+-- The App Attest pubkey is stored DER-encoded so the verifier (when wired) can
+-- re-check future assertion signatures without re-running attestation.
+CREATE TABLE IF NOT EXISTS apns_device_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL UNIQUE,
+    apns_token TEXT NOT NULL,
+    bundle_id TEXT NOT NULL,
+    app_attest_key_id TEXT NOT NULL,
+    app_attest_pub_key_der BLOB NOT NULL,
+    registered_at INTEGER NOT NULL,
+    last_push_at INTEGER,
+    invalidated_at INTEGER,
+    invalidated_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS apns_device_tokens_active
+    ON apns_device_tokens (invalidated_at) WHERE invalidated_at IS NULL;
+
 -- Output redaction audit ---------------------------------------------------
 -- Records *that* a secret was redacted from agent output (channels / TUI /
 -- logs), not the secret itself. The audit log is safe to share because it
@@ -1626,331 +1162,84 @@ mod tests {
         );
     }
 
-    // Worktrees share ~/.borg/borg.db, so a binary with different migration
-    // numbering can stamp schema_version past a column-adding migration
-    // without running it. Observed in the wild: a version-10 DB whose
-    // messages table lacked the v8 hmac/prev_hmac/event_* columns, failing
-    // every message persist with "no such column: hmac". migrate_v11 must
-    // repair the shape and advance the version.
+    /// The squash removed the per-open shape-repair pass, and with it the
+    /// tests that asserted a damaged DB got rebuilt. `SCHEMA_SQL` is now the
+    /// only thing that decides the shape, so guard it directly: open a fresh
+    /// DB and assert the objects a running agent needs are all there. Drop a
+    /// `CREATE` from `SCHEMA_SQL` and this fails, which is exactly what the
+    /// deleted repair pass used to catch at runtime.
     #[tokio::test]
-    async fn stranded_schema_version_gets_messages_columns_repaired() {
+    async fn fresh_db_carries_the_full_schema() {
         let db = Database::test_db().await;
-
-        // Simulate the stranded state: rebuild `messages` with the exact
-        // pre-v8 column set observed in the wild, version stamped past 8.
-        db.conn
-            .execute_batch(
-                "DROP TABLE messages;
-                 CREATE TABLE messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT,
-                    tool_calls_json TEXT,
-                    tool_call_id TEXT,
-                    timestamp TEXT,
-                    created_at INTEGER NOT NULL,
-                    content_parts_json TEXT
-                 );",
+        let conn = db.conn();
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','index') \
+                 AND name NOT LIKE 'sqlite_%'",
+                (),
             )
             .await
             .unwrap();
-        db.set_meta("schema_version", "10").await.unwrap();
-
-        db.run_migrations().await.unwrap();
-
-        let mut rows = db
-            .conn
-            .query("PRAGMA table_info(messages)", ())
-            .await
-            .unwrap();
-        let mut cols: Vec<String> = Vec::new();
+        let mut present: Vec<String> = Vec::new();
         while let Some(row) = rows.next().await.unwrap() {
-            cols.push(row.get::<String>(1).unwrap());
+            present.push(row.get::<String>(0).unwrap());
         }
-        for required in ["event_kind", "event_json", "hmac", "prev_hmac"] {
+
+        // Tables and indexes that only ever reached the schema through an
+        // ALTER-style migration are the ones the squash could have silently
+        // dropped, so they are named explicitly alongside the core tables.
+        for object in [
+            "sessions",
+            "messages",
+            "meta",
+            "settings",
+            "scheduled_tasks",
+            "memory_entries",
+            "goals",
+            "goal_gates",
+            "apns_device_tokens",
+            "apns_device_tokens_active",
+            "idx_sessions_created_at",
+            "idx_messages_created_at",
+            "idx_messages_toolcalls",
+        ] {
             assert!(
-                cols.iter().any(|c| c == required),
-                "messages must regain {required}; columns: {cols:?}"
+                present.iter().any(|n| n == object),
+                "fresh DB is missing `{object}`; SCHEMA_SQL lost it. Present: {present:?}"
             );
         }
-        assert_eq!(
-            db.schema_version().await.unwrap(),
-            Database::CURRENT_VERSION,
-            "repair must advance the version so it doesn't re-run every boot"
-        );
-
-        // The originally-failing operation now succeeds end-to-end.
-        db.upsert_session("s1", 100, 100, 0, "m", "test")
-            .await
-            .unwrap();
-        db.insert_message("s1", "user", Some("hello"), None, None, None, None)
-            .await
-            .unwrap();
     }
 
-    // v15 adds monitor-mode columns to scheduled_tasks. A pre-v15 DB (shape
-    // simulated by rebuilding the table without them, version stamped 14)
-    // must gain both columns and land on CURRENT_VERSION; a fresh DB must
-    // already carry them from SCHEMA_SQL.
+    /// A fresh DB must land on `CURRENT_VERSION`, and a second open must be a
+    /// no-op rather than replaying the baseline.
     #[tokio::test]
-    async fn v15_adds_monitor_columns_to_scheduled_tasks() {
-        async fn scheduled_task_columns(db: &Database) -> Vec<String> {
-            let mut rows = db
-                .conn
-                .query("PRAGMA table_info(scheduled_tasks)", ())
-                .await
-                .unwrap();
-            let mut cols = Vec::new();
-            while let Some(row) = rows.next().await.unwrap() {
-                cols.push(row.get::<String>(1).unwrap());
-            }
-            cols
-        }
-
-        // Fresh DB: SCHEMA_SQL emits the final shape directly.
-        let fresh = Database::test_db().await;
-        let cols = scheduled_task_columns(&fresh).await;
-        for required in ["monitor_mode", "last_pre_run_hash"] {
-            assert!(
-                cols.iter().any(|c| c == required),
-                "fresh scheduled_tasks must have {required}; columns: {cols:?}"
-            );
-        }
+    async fn fresh_db_is_stamped_current_and_reopen_is_idempotent() {
+        let db = Database::test_db().await;
         assert_eq!(
-            fresh.schema_version().await.unwrap(),
+            db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION
         );
-
-        // Upgrade path: pre-v15 shape (no monitor columns), version 14.
-        let db = Database::test_db().await;
-        db.conn
-            .execute_batch(
-                "DROP TABLE task_runs;
-                 DROP TABLE scheduled_tasks;
-                 CREATE TABLE scheduled_tasks (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    schedule_type TEXT NOT NULL,
-                    schedule_expr TEXT NOT NULL,
-                    timezone TEXT NOT NULL DEFAULT 'local',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    next_run INTEGER,
-                    created_at INTEGER NOT NULL,
-                    retry_count INTEGER NOT NULL DEFAULT 0,
-                    max_retries INTEGER NOT NULL DEFAULT 3,
-                    retry_after INTEGER,
-                    last_error TEXT,
-                    timeout_ms INTEGER NOT NULL DEFAULT 300000,
-                    delivery_channel TEXT,
-                    delivery_target TEXT,
-                    allowed_tools TEXT,
-                    task_type TEXT NOT NULL DEFAULT 'prompt',
-                    pre_run_command TEXT,
-                    pre_run_cwd TEXT,
-                    pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000,
-                    bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0,
-                    min_interval_secs INTEGER,
-                    last_response_hash TEXT,
-                    model TEXT,
-                    model_provider TEXT
-                 );",
-            )
-            .await
-            .unwrap();
-        db.set_meta("schema_version", "14").await.unwrap();
-
         db.run_migrations().await.unwrap();
-
-        let cols = scheduled_task_columns(&db).await;
-        for required in ["monitor_mode", "last_pre_run_hash"] {
-            assert!(
-                cols.iter().any(|c| c == required),
-                "v15 must add {required}; columns: {cols:?}"
-            );
-        }
         assert_eq!(
             db.schema_version().await.unwrap(),
-            Database::CURRENT_VERSION,
-            "upgrade must land on CURRENT_VERSION"
-        );
-
-        // The upgraded shape must actually be readable through the accessors
-        // (TASK_COLUMNS indexes into the new columns).
-        db.create_task(&crate::db::NewTask {
-            id: "post-upgrade",
-            name: "post-upgrade",
-            prompt: "p",
-            schedule_type: "interval",
-            schedule_expr: "5m",
-            timezone: "local",
-            next_run: None,
-            max_retries: None,
-            timeout_ms: None,
-            delivery_channel: None,
-            delivery_target: None,
-            allowed_tools: None,
-            task_type: "prompt",
-            pre_run_command: Some("true"),
-            pre_run_cwd: None,
-            pre_run_timeout_ms: None,
-            min_interval_secs: None,
-        })
-        .await
-        .unwrap();
-        let row = db.get_task_by_id("post-upgrade").await.unwrap().unwrap();
-        assert!(!row.monitor_mode, "new column must default to off");
-        assert_eq!(row.last_pre_run_hash, None);
-    }
-
-    // v16 adds workspace-identity columns to sessions. A pre-v16 DB (shape
-    // simulated by dropping them, version stamped 15) must gain both columns
-    // and land on CURRENT_VERSION; a fresh DB must already carry them from
-    // SCHEMA_SQL.
-    #[tokio::test]
-    async fn v16_adds_workspace_columns_to_sessions() {
-        async fn session_columns(db: &Database) -> Vec<String> {
-            let mut rows = db
-                .conn
-                .query("PRAGMA table_info(sessions)", ())
-                .await
-                .unwrap();
-            let mut cols = Vec::new();
-            while let Some(row) = rows.next().await.unwrap() {
-                cols.push(row.get::<String>(1).unwrap());
-            }
-            cols
-        }
-
-        // Fresh DB: SCHEMA_SQL emits the final shape directly.
-        let fresh = Database::test_db().await;
-        let cols = session_columns(&fresh).await;
-        for required in ["cwd", "git_repo_root"] {
-            assert!(
-                cols.iter().any(|c| c == required),
-                "fresh sessions must have {required}; columns: {cols:?}"
-            );
-        }
-        assert_eq!(
-            fresh.schema_version().await.unwrap(),
             Database::CURRENT_VERSION
         );
+    }
 
-        // Upgrade path: pre-v16 shape (no workspace columns), version 15.
+    /// Developer databases predate the squash and still carry a stamp of 16.
+    /// A `>=` guard would treat that as "already migrated" and silently skip
+    /// every future migration on exactly the machines that run this code.
+    #[tokio::test]
+    async fn stamp_above_current_still_migrates_and_is_restamped() {
         let db = Database::test_db().await;
-        db.conn
-            .execute_batch(
-                "ALTER TABLE sessions DROP COLUMN cwd;
-                 ALTER TABLE sessions DROP COLUMN git_repo_root;",
-            )
-            .await
-            .unwrap();
-        db.set_meta("schema_version", "15").await.unwrap();
+        db.set_meta("schema_version", "16").await.unwrap();
 
         db.run_migrations().await.unwrap();
 
-        let cols = session_columns(&db).await;
-        for required in ["cwd", "git_repo_root"] {
-            assert!(
-                cols.iter().any(|c| c == required),
-                "v16 must add {required}; columns: {cols:?}"
-            );
-        }
         assert_eq!(
             db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION,
-            "upgrade must land on CURRENT_VERSION"
-        );
-
-        // The upgraded shape must be usable end-to-end: stamp a workspace and
-        // resolve it back (SessionRow::COLUMNS indexes into the new columns).
-        db.upsert_session("post-upgrade", 1, 2, 0, "m", "t")
-            .await
-            .unwrap();
-        db.set_session_workspace("post-upgrade", "/w/repo/sub", Some("/w/repo"))
-            .await
-            .unwrap();
-        let row = db
-            .most_recent_session_in_workspace(Some("/w/repo"), "/w/repo/sub")
-            .await
-            .unwrap()
-            .expect("stamped session must be resolvable after upgrade");
-        assert_eq!(row.id, "post-upgrade");
-        assert_eq!(row.cwd.as_deref(), Some("/w/repo/sub"));
-        assert_eq!(row.git_repo_root.as_deref(), Some("/w/repo"));
-    }
-
-    // The stranding mechanism is version-number-based, so a divergent binary
-    // can just as well stamp AT (or past) CURRENT_VERSION. The repair must
-    // not be gated on `current < CURRENT_VERSION` — that would leave the
-    // exact population the fix targets permanently broken.
-    #[tokio::test]
-    async fn shape_repair_runs_even_when_version_already_current() {
-        let db = Database::test_db().await;
-
-        db.conn
-            .execute_batch(
-                "DROP TABLE messages;
-                 CREATE TABLE messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT,
-                    tool_calls_json TEXT,
-                    tool_call_id TEXT,
-                    timestamp TEXT,
-                    created_at INTEGER NOT NULL,
-                    content_parts_json TEXT
-                 );",
-            )
-            .await
-            .unwrap();
-        db.set_meta("schema_version", &Database::CURRENT_VERSION.to_string())
-            .await
-            .unwrap();
-
-        db.run_migrations().await.unwrap();
-
-        let mut rows = db
-            .conn
-            .query("PRAGMA table_info(messages)", ())
-            .await
-            .unwrap();
-        let mut cols: Vec<String> = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            cols.push(row.get::<String>(1).unwrap());
-        }
-        for required in ["event_kind", "event_json", "hmac", "prev_hmac"] {
-            assert!(
-                cols.iter().any(|c| c == required),
-                "repair must run on a fully-stamped DB; missing {required}: {cols:?}"
-            );
-        }
-    }
-
-    // A stranded DB can be missing whole tables (v3/v10 are CREATE-based),
-    // not just columns — the repair must recreate them, and must not abort
-    // the open when an ALTER target table is absent entirely.
-    #[tokio::test]
-    async fn shape_repair_recreates_missing_tables_and_survives_absent_alter_targets() {
-        let db = Database::test_db().await;
-
-        db.conn
-            .execute_batch(
-                "DROP TABLE mcp_catalog_cache;
-                 DROP TABLE sub_agent_runs;",
-            )
-            .await
-            .unwrap();
-        db.set_meta("schema_version", "10").await.unwrap();
-
-        // Must not error even though migrate_v6's ALTER target is gone.
-        db.run_migrations().await.unwrap();
-
-        assert!(
-            db.table_exists("mcp_catalog_cache").await.unwrap(),
-            "CREATE-based v10 must be part of the shape repair"
+            "a stale higher stamp must be corrected, not honoured"
         );
     }
 }

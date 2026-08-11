@@ -77,17 +77,6 @@ pub(crate) mod compiled_cache {
         Ok((module, CacheOutcome::Miss))
     }
 
-    /// Promote `local_hmac` to most-recently-used without inserting if missing.
-    /// Used by the reseal path so the old key is dropped cleanly when we
-    /// rewrite the seal.
-    pub(crate) fn invalidate(local_hmac: &str) {
-        if let Some(m) = CACHE.get() {
-            if let Ok(mut g) = m.lock() {
-                g.pop(local_hmac);
-            }
-        }
-    }
-
     #[cfg(all(test, feature = "phase9-tests-disabled"))]
     pub(crate) fn cache_len() -> usize {
         CACHE
@@ -114,21 +103,13 @@ pub(crate) mod compiled_cache {
     }
 }
 
-/// HMAC derived-key domain currently in use. Cortex passes the key derived
-/// from this domain as the local-HMAC key for every install + verify. A
-/// pre-current ("v1") install whose seal verifies under `LEGACY_HMAC_DOMAIN`
-/// but not this one is auto-resealed (see `legacy_hmac::verify`); operators
-/// do not have to reinstall to track a framing bump.
+/// HMAC derived-key domain. Cortex passes the key derived from this domain as
+/// the local-HMAC key for every install + verify. A seal that does not verify
+/// under it quarantines the plugin — there is no second scheme to fall back to.
 ///
 /// `pub` so cross-crate integration tests can derive the same key when
 /// fabricating installs end-to-end.
 pub const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
-
-/// Pre-current ("v1") domain. Verification-only — see `legacy_hmac::verify`
-/// in the plugins crate. If a plugin's stored seal verifies under the legacy
-/// scheme but not the current one, we reseal under the current scheme and
-/// emit `wasm_plugin_resealed` so the operator sees the migration happened.
-pub const LEGACY_HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac";
 
 /// Names of built-in tools — WASM plugins may not shadow them. Single source
 /// of truth lives in [`crate::tool::names::BUILTIN_TOOL_NAMES`].
@@ -479,76 +460,25 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
         .with_context(|| format!("failed to read {}", wasm_path.display()))?;
     let key = db.derive_hmac_key(HMAC_DOMAIN);
 
-    let mut effective_hmac = row.local_hmac.clone();
+    let effective_hmac = row.local_hmac.clone();
     if let Err(current_err) =
         plugins::wasm::verify_installed_hmac(&key, &manifest_bytes, &wasm, &row.local_hmac)
     {
-        // The seal didn't verify under the current scheme. Try the legacy
-        // scheme before quarantining: a plugin sealed by a previous borg
-        // release should auto-migrate, not force the operator to reinstall.
-        let legacy_key = db.derive_hmac_key(LEGACY_HMAC_DOMAIN);
-        if plugins::wasm::legacy_hmac::verify(&legacy_key, &manifest_bytes, &wasm, &row.local_hmac)
-            .is_ok()
-        {
-            // Recompute under the current scheme and persist. We
-            // intentionally re-run the full v2 install seal so the new MAC
-            // is what `verify_installed_hmac` would expect on the next call.
-            match plugins::wasm::compute_local_hmac_current(&key, &manifest_bytes, &wasm) {
-                Ok(new_seal) => {
-                    db.update_wasm_plugin_local_hmac(&row.plugin_id, &new_seal)
-                        .await
-                        .with_context(|| format!("persist resealed HMAC for {}", row.plugin_id))?;
-                    compiled_cache::invalidate(&row.local_hmac);
-                    crate::telemetry::wasm_metrics::record_reseal(&row.plugin_id);
-                    crate::db::try_emit_global(
-                        crate::db::audit_events::WASM_PLUGIN_RESEALED,
-                        &row.plugin_id,
-                        &serde_json::json!({
-                            "plugin_id": &row.plugin_id,
-                            "from": "legacy",
-                            "to": "current",
-                        }),
-                    )
-                    .await;
-                    effective_hmac = new_seal;
-                }
-                Err(e) => {
-                    crate::telemetry::wasm_metrics::record_quarantine(
-                        &row.plugin_id,
-                        "reseal_failed",
-                    );
-                    crate::db::try_emit_global(
-                        crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
-                        &row.plugin_id,
-                        &serde_json::json!({
-                            "plugin_id": &row.plugin_id,
-                            "reason": e.to_string(),
-                            "reason_category": "reseal_failed",
-                        }),
-                    )
-                    .await;
-                    db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())
-                        .await?;
-                    return Err(e).context("WASM plugin quarantined");
-                }
-            }
-        } else {
-            // Neither scheme verifies — genuine tamper / corruption.
-            crate::telemetry::wasm_metrics::record_quarantine(&row.plugin_id, "integrity_failure");
-            crate::db::try_emit_global(
-                crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
-                &row.plugin_id,
-                &serde_json::json!({
-                    "plugin_id": &row.plugin_id,
-                    "reason": current_err.to_string(),
-                    "reason_category": "integrity_failure",
-                }),
-            )
-            .await;
-            db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())
-                .await?;
-            return Err(current_err).context("WASM plugin quarantined");
-        }
+        // The seal doesn't verify — tamper or corruption. Quarantine.
+        crate::telemetry::wasm_metrics::record_quarantine(&row.plugin_id, "integrity_failure");
+        crate::db::try_emit_global(
+            crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
+            &row.plugin_id,
+            &serde_json::json!({
+                "plugin_id": &row.plugin_id,
+                "reason": current_err.to_string(),
+                "reason_category": "integrity_failure",
+            }),
+        )
+        .await;
+        db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())
+            .await?;
+        return Err(current_err).context("WASM plugin quarantined");
     }
 
     let manifest: plugins::wasm::WasmPluginManifest =

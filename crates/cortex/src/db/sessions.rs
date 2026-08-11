@@ -346,9 +346,8 @@ impl Database {
             let now = chrono::Utc::now().timestamp();
             // Per-session chain: link from the last event in THIS session, so
             // each session's log is its own chain and a fork starts fresh.
-            // Last chained hmac in THIS session, or "0" for the first event —
-            // whether there's no prior row at all or the prior row is an
-            // unchained legacy row (NULL hmac).
+            // Last chained hmac in THIS session, or "0" when there is no prior
+            // row.
             let mut prev_hmac: String = {
                 let mut rows = self
                     .conn
@@ -2514,39 +2513,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_unchained_prefix_then_chained_suffix_verifies() {
-        // Sessions that existed before chaining have NULL-hmac rows. A chained
-        // row appended after upgrade must still verify against a "0" baseline.
+    async fn unchained_row_fails_chain_verification() {
+        // Every persist path chains, so a NULL-hmac row means someone wrote to
+        // the DB directly. That is the tampering the chain exists to catch —
+        // it must not be waved through just because there is nothing to check.
         let db = test_db().await;
         db.upsert_session("s1", 100, 100, 0, "m", "test")
             .await
             .unwrap();
-        // Simulate a legacy row: direct insert with NULL hmac/prev_hmac.
+        // Smuggle in a row behind the chained writer's back.
         db.conn
             .execute(
-                "INSERT INTO messages (session_id, role, content, created_at) VALUES ('s1','user','legacy',100)",
+                "INSERT INTO messages (session_id, role, content, created_at) VALUES ('s1','user','smuggled',100)",
                 (),
             )
             .await
             .unwrap();
-        // Now append through the chained path.
-        db.insert_message(
-            "s1",
-            "assistant",
-            Some("modern reply"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        // Append through the chained path.
+        db.insert_message("s1", "assistant", Some("reply"), None, None, None, None)
+            .await
+            .unwrap();
 
         let rows = db.load_session_messages("s1").await.unwrap();
-        assert!(rows[0].hmac.is_none(), "legacy row stays unchained");
+        assert!(rows[0].hmac.is_none(), "smuggled row is unchained");
         assert!(rows[1].hmac.is_some(), "appended row is chained");
         let key = db.derive_hmac_key(crate::conversation::SESSION_HMAC_DOMAIN);
-        assert!(crate::conversation::verify_session_chain(&key, &rows));
+        assert!(
+            !crate::conversation::verify_session_chain(&key, &rows),
+            "an unchained row must fail verification"
+        );
     }
 
     #[tokio::test]

@@ -24,8 +24,12 @@
 //! (`event`, `session_id`, `turn`, `tool`) plus `timestamp` and a
 //! `delivery_id` that also rides in the `X-Borg-Delivery` header. The body is
 //! passed through the secret-redaction pass before signing, and endpoints
-//! with a configured secret get `X-Borg-Signature-256: sha256=<hex>` — an
-//! HMAC-SHA256 over the exact body bytes sent.
+//! with a configured secret get `X-Borg-Signature-256: sha256=<hex>` — a plain
+//! HMAC-SHA256 over the exact body bytes sent, matching the widely-implemented
+//! `X-Hub-Signature-256` convention. Receivers are third-party code we do not
+//! control, so this MAC must stay a bare `HMAC(secret, body)`: it deliberately
+//! does not go through `hmac_chain::compute_hmac`, whose length-prefix framing
+//! no standard verifier reproduces.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -385,13 +389,26 @@ async fn deliver(client: &reqwest::Client, delivery: &Delivery) {
     }
 }
 
+/// Bare `HMAC-SHA256(secret, body)`, hex-encoded — the `X-Hub-Signature-256`
+/// shape every off-the-shelf webhook verifier implements. Kept separate from
+/// `hmac_chain::compute_hmac` on purpose: that one length-prefixes each field
+/// for injectivity within Borg's own chains, and a receiver has no way to
+/// reproduce the prefix.
+#[allow(clippy::expect_used)]
+fn sign_body(secret: &[u8], body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key size");
+    mac.update(body);
+    crate::util::hex::hex_encode(&mac.finalize().into_bytes())
+}
+
 async fn send_once(client: &reqwest::Client, delivery: &Delivery) -> Attempt {
     let mut req = client
         .post(&delivery.url)
         .header("content-type", "application/json")
         .header("X-Borg-Delivery", &delivery.delivery_id);
     if let Some(secret) = &delivery.secret {
-        let sig = crate::hmac_chain::compute_hmac(secret.as_bytes(), &[delivery.body.as_bytes()]);
+        let sig = sign_body(secret.as_bytes(), delivery.body.as_bytes());
         req = req.header("X-Borg-Signature-256", format!("sha256={sig}"));
     }
     match req.body(delivery.body.clone()).send().await {
@@ -516,11 +533,27 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let expected = format!(
-            "sha256={}",
-            crate::hmac_chain::compute_hmac(b"top-secret", &[&req.body])
+        // Recomputed here from primitives rather than via `sign_body`, so this
+        // asserts the published `X-Hub-Signature-256` contract instead of
+        // agreeing with whatever the implementation happens to do. A framed or
+        // salted MAC must fail this.
+        let expected = {
+            use hmac::{Hmac, Mac};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"top-secret").unwrap();
+            mac.update(&req.body);
+            format!(
+                "sha256={}",
+                mac.finalize()
+                    .into_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        };
+        assert_eq!(
+            sig_header, expected,
+            "signature must be a bare HMAC-SHA256 over the body bytes sent"
         );
-        assert_eq!(sig_header, expected, "HMAC must cover the body bytes sent");
 
         // Delivery id header must equal the delivery_id field inside the
         // signed body — one id, generated once.

@@ -116,7 +116,7 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
     /// Plugin marketplace settings.
-    #[serde(default, alias = "customizations")]
+    #[serde(default)]
     pub plugins: PluginsConfig,
     /// MCP (Model Context Protocol) client settings.
     #[serde(default)]

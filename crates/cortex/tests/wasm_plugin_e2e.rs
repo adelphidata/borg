@@ -357,9 +357,10 @@ async fn tampered_wasm_quarantines_on_dispatch() {
 ///    `sunset_at` timestamp so the operator can see the warning landed.
 /// 2. Post-sunset deprecated publisher key: install is rejected hard, no
 ///    plugin row is persisted.
-/// 3. Auto-reseal of a legacy-framed install seal on first execute: the
-///    plugin runs, the DB's `local_hmac` is rewritten under the current
-///    framing, and a `WASM_PLUGIN_RESEALED` audit row records the migration.
+/// 3. A seal that does not verify under the current scheme quarantines the
+///    plugin on execute, refuses to run the guest, and records a
+///    `WASM_PLUGIN_QUARANTINED` audit row. There is no second sealing scheme
+///    to fall back to, so an unverifiable seal is always tamper.
 ///
 /// All three phases live in one `#[test]` because `install_global_audit`
 /// installs a process-singleton writer (OnceLock). Splitting them into
@@ -367,7 +368,7 @@ async fn tampered_wasm_quarantines_on_dispatch() {
 /// tempdir, and `try_emit_global` would silently write to an orphaned DB
 /// the next test cannot inspect. One test, one tempdir, one writer.
 #[tokio::test]
-async fn deprecated_key_and_auto_reseal_e2e() {
+async fn deprecated_key_and_seal_quarantine_e2e() {
     let _g = SERIAL.lock().expect("serial lock");
     let tmp = isolated_data_dir();
 
@@ -504,13 +505,12 @@ async fn deprecated_key_and_auto_reseal_e2e() {
         .expect("clear deprecated");
     drop(db);
 
-    // ── Phase 3: auto-reseal of legacy-framed seal on first execute ──
+    // ── Phase 3: an unverifiable seal quarantines instead of running ──
     //
-    // Invariant: an install sealed under the pre-current ("legacy") HMAC
-    // framing must auto-migrate on first execute — the operator should not
-    // be forced to reinstall to track a framing bump. The seal must be
-    // rewritten under the current framing AND a `WASM_PLUGIN_RESEALED`
-    // audit row must record the migration so the operator sees it happened.
+    // Invariant: the local HMAC is the post-install tamper signal. A stored
+    // seal that does not verify under the current key must stop the guest
+    // from executing, flip the row to quarantined, and leave an audit trail.
+    // Silently repairing the seal here would turn the tamper detector off.
     let _pkg_dir = install_echo_plugin(tmp.path()).await;
     let db = Database::open().await.expect("open db");
     let row = db
@@ -520,63 +520,56 @@ async fn deprecated_key_and_auto_reseal_e2e() {
         .expect("echo row present after install");
     let manifest_bytes = fs::read(&row.manifest_path).expect("read installed manifest");
     let wasm_bytes = fs::read(&row.wasm_path).expect("read installed wasm");
-    // Compute the legacy HMAC and overwrite the DB's local_hmac to simulate a
-    // legacy-sealed install. This is exactly the on-upgrade state the
-    // auto-reseal path was built for.
-    let legacy_key = db.derive_hmac_key(wasm_plugins::LEGACY_HMAC_DOMAIN);
-    let legacy_hmac =
-        plugins::wasm::legacy_hmac::compute(&legacy_key, &manifest_bytes, &wasm_bytes)
-            .expect("compute legacy hmac");
+    // Overwrite the stored seal with one computed under a different key —
+    // indistinguishable from an attacker who edited the row.
+    let wrong_key = db.derive_hmac_key(b"not-the-real-hmac-domain");
+    let wrong_seal =
+        plugins::wasm::compute_local_hmac_current(&wrong_key, &manifest_bytes, &wasm_bytes)
+            .expect("compute wrong-key seal");
     assert_ne!(
-        legacy_hmac, row.local_hmac,
-        "legacy framing must differ from current — if equal, this test would never exercise reseal",
+        wrong_seal, row.local_hmac,
+        "wrong-key seal must differ from the real one, or this test proves nothing",
     );
-    db.update_wasm_plugin_local_hmac("dev/echo", &legacy_hmac)
+    db.update_wasm_plugin_local_hmac("dev/echo", &wrong_seal)
         .await
-        .expect("install legacy hmac");
+        .expect("install wrong seal");
     drop(db);
 
-    let out = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
+    let err = wasm_plugins::try_execute_tool("echo_wasm", &json!({}))
         .await
-        .expect("reseal-execute Ok")
-        .expect("reseal-execute Some");
-    assert_eq!(out, "OK", "reseal must succeed and guest must still run");
+        .expect_err("a bad seal must refuse to execute");
+    assert!(
+        err.to_string().contains("quarantined"),
+        "error must name the quarantine, got: {err}",
+    );
 
     let db = Database::open().await.expect("open db");
     let row_after = db
         .get_wasm_plugin("dev/echo")
         .await
-        .expect("get echo after reseal")
+        .expect("get echo after quarantine")
         .expect("echo row still present");
-    let current_key = db.derive_hmac_key(wasm_plugins::HMAC_DOMAIN);
-    let expected_current =
-        plugins::wasm::compute_local_hmac_current(&current_key, &manifest_bytes, &wasm_bytes)
-            .expect("compute current");
     assert_eq!(
-        row_after.local_hmac, expected_current,
-        "post-reseal seal must match current-framing HMAC; legacy was {legacy_hmac}, current would be {expected_current}, DB has {}",
-        row_after.local_hmac,
+        row_after.status, "quarantined",
+        "row must be quarantined, got status {}",
+        row_after.status,
     );
 
     let events = db
         .list_audit_events()
         .await
-        .expect("list audit after reseal");
-    let reseal_row = events
+        .expect("list audit after quarantine");
+    let row = events
         .iter()
         .find(|e| {
-            e.event_type == audit_events::WASM_PLUGIN_RESEALED && e.principal_id == "dev/echo"
+            e.event_type == audit_events::WASM_PLUGIN_QUARANTINED && e.principal_id == "dev/echo"
         })
-        .expect("WASM_PLUGIN_RESEALED audit row for dev/echo exists");
-    let reseal_payload: serde_json::Value =
-        serde_json::from_str(&reseal_row.event_json).expect("reseal payload");
+        .expect("WASM_PLUGIN_QUARANTINED audit row for dev/echo exists");
+    let payload: serde_json::Value =
+        serde_json::from_str(&row.event_json).expect("quarantine payload");
     assert_eq!(
-        reseal_payload["from"], "legacy",
-        "reseal payload must record source framing as legacy; got {reseal_payload}",
-    );
-    assert_eq!(
-        reseal_payload["to"], "current",
-        "reseal payload must record target framing as current; got {reseal_payload}",
+        payload["reason_category"], "integrity_failure",
+        "quarantine must be categorized as an integrity failure; got {payload}",
     );
 }
 

@@ -100,7 +100,11 @@ impl ThinkingLevel {
 pub struct LlmConfig {
     /// LLM provider name (auto-detected from API keys if omitted).
     pub provider: Option<String>,
-    /// Environment variable name holding the API key (legacy).
+    /// Name of the environment variable holding the API key. Defaults to the
+    /// provider's conventional variable, which is how a bare
+    /// `OPENROUTER_API_KEY` in the environment resolves with no other config.
+    /// Lowest-priority credential source — [`Self::api_key`] and
+    /// [`Self::api_keys`] both win over it.
     pub api_key_env: String,
     /// Single SecretRef for API key (takes priority over api_key_env).
     #[serde(skip_serializing_if = "Option::is_none")]

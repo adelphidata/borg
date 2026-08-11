@@ -2,9 +2,6 @@
 //!
 //! Provides a generic HMAC builder, chain verification, per-hour rate limiting,
 //! and periodic checkpointing. Used by vitals, bond, and evolution systems.
-//!
-//! Fields are concatenated without separators to maintain backward compatibility
-//! with existing event chains in user databases.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -17,12 +14,16 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Compute an HMAC-SHA256 over a sequence of fields.
 ///
-/// Fields are concatenated directly (no separators) to maintain backward
-/// compatibility with existing persisted event chains.
+/// Each field is length-prefixed with its big-endian `u64` byte count. Plain
+/// concatenation is ambiguous: `["ab", "c"]` and `["a", "bc"]` feed the MAC the
+/// same bytes, so an attacker who controls two adjacent fields can shift the
+/// boundary between them and keep the HMAC valid. The length prefix pins the
+/// split, making the encoding injective.
 #[allow(clippy::expect_used)]
 pub fn compute_hmac(key: &[u8], fields: &[&[u8]]) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     for field in fields {
+        mac.update(&(field.len() as u64).to_be_bytes());
         mac.update(field);
     }
     hex_encode(&mac.finalize().into_bytes())
@@ -185,6 +186,26 @@ mod tests {
         let h1 = compute_hmac(key, &[b"alpha", b"beta"]);
         let h2 = compute_hmac(key, &[b"alpha", b"gamma"]);
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hmac_pins_field_boundaries() {
+        // Under plain concatenation both of these feed the MAC "abc", so an
+        // attacker controlling two adjacent fields could move the split and
+        // keep the HMAC valid. Length-prefixing must separate them.
+        let key = b"test-key";
+        let h1 = compute_hmac(key, &[b"ab", b"c"]);
+        let h2 = compute_hmac(key, &[b"a", b"bc"]);
+        assert_ne!(
+            h1, h2,
+            "different field splits of the same bytes must not collide"
+        );
+    }
+
+    #[test]
+    fn compute_hmac_distinguishes_empty_field_from_absent_one() {
+        let key = b"test-key";
+        assert_ne!(compute_hmac(key, &[b"a", b""]), compute_hmac(key, &[b"a"]));
     }
 
     #[test]

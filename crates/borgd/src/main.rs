@@ -18,24 +18,10 @@ struct Args {
     #[arg(long, env = "BORG_HOME")]
     borg_home: Option<PathBuf>,
 
-    /// (Deprecated) historical no-op. The UDS no longer has an "insecure"
-    /// mode — the per-installation CA + paired-device flow is enforced
-    /// unconditionally. Accepted silently so existing launchd / systemd
-    /// unit files keep starting, but the daemon emits a deprecation
-    /// warning. Remove from your unit file at your convenience; will be
-    /// hard-rejected after one minor release.
-    #[arg(long, hide = true)]
-    insecure_uds: bool,
-
     /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`). The
     /// listener enforces mTLS; clients must hold a paired-device cert.
     #[arg(long)]
     listen: Option<String>,
-
-    /// (Legacy, deprecated) permit unauthenticated TCP. Ignored — the
-    /// TCP listener always requires mTLS.
-    #[arg(long)]
-    insecure_tcp: bool,
 }
 
 fn main() -> Result<()> {
@@ -83,19 +69,6 @@ async fn async_main() -> Result<()> {
         env_filter,
         Box::new(tracing_subscriber::fmt::layer()),
     );
-
-    if args.insecure_tcp {
-        tracing::warn!(
-            "--insecure-tcp is deprecated: TCP listener now requires mTLS unconditionally"
-        );
-    }
-    if args.insecure_uds {
-        tracing::warn!(
-            "--insecure-uds is deprecated and a no-op: the UDS no longer has an insecure mode. \
-             Remove it from your launchd / systemd unit; the daemon will hard-reject this flag \
-             in a future release."
-        );
-    }
 
     tracing::info!(borg_home = %home.display(), "starting borgd");
 

@@ -754,7 +754,7 @@ mod tests {
         // Turn on MCP tool-search deferral so `search_tools` is produced and
         // matched against its summary (both directions of the guard).
         config.mcp.enabled = true;
-        config.mcp.tool_search = true;
+        config.mcp.tool_search_mode = crate::config::mcp::McpToolSearchMode::On;
         let defs = core_tool_definitions(&config).await;
 
         let summary_names: std::collections::HashSet<&str> =
@@ -792,33 +792,33 @@ mod tests {
         let mut config = Config::default();
         config.mcp.enabled = true;
 
-        config.mcp.tool_search = true;
+        config.mcp.tool_search_mode = crate::config::mcp::McpToolSearchMode::On;
         let deferred = core_tool_definitions(&config).await;
         assert!(
             deferred
                 .iter()
                 .any(|d| d.function.name == tool_names::SEARCH_TOOLS),
-            "search_tools must be advertised when mcp.tool_search is on"
+            "search_tools must be advertised when tool_search_mode is on"
         );
 
-        config.mcp.tool_search = false;
+        config.mcp.tool_search_mode = crate::config::mcp::McpToolSearchMode::Off;
         let direct = core_tool_definitions(&config).await;
         assert!(
             !direct
                 .iter()
                 .any(|d| d.function.name == tool_names::SEARCH_TOOLS),
-            "search_tools must NOT be advertised when mcp.tool_search is off"
+            "search_tools must NOT be advertised when tool_search_mode is off"
         );
     }
 
     #[tokio::test]
     async fn search_tools_requires_mcp_enabled() {
-        // `tool_search` with mcp disabled is a no-op — no sessions exist, so
+        // Deferral with mcp disabled is a no-op — no sessions exist, so
         // deferring would hide nothing and strand the model with a search over an
         // empty set. The meta-tool must only appear when MCP is actually on.
         let mut config = Config::default();
         config.mcp.enabled = false;
-        config.mcp.tool_search = true;
+        config.mcp.tool_search_mode = crate::config::mcp::McpToolSearchMode::On;
         let defs = core_tool_definitions(&config).await;
         assert!(
             !defs
@@ -832,10 +832,13 @@ mod tests {
     async fn native_tools_present_regardless_of_deferral() {
         // Deferral only gates the MCP surface — native/compiled-in tools must be
         // advertised in both modes so the agent never loses its core toolset.
-        for tool_search in [true, false] {
+        for mode in [
+            crate::config::mcp::McpToolSearchMode::On,
+            crate::config::mcp::McpToolSearchMode::Off,
+        ] {
             let mut config = Config::default();
             config.mcp.enabled = true;
-            config.mcp.tool_search = tool_search;
+            config.mcp.tool_search_mode = mode;
             let defs = core_tool_definitions(&config).await;
             let names: std::collections::HashSet<&str> =
                 defs.iter().map(|d| d.function.name.as_str()).collect();
@@ -846,7 +849,7 @@ mod tests {
             ] {
                 assert!(
                     names.contains(expected),
-                    "native tool `{expected}` must be present (tool_search={tool_search})"
+                    "native tool `{expected}` must be present (tool_search_mode={mode:?})"
                 );
             }
         }
@@ -1395,11 +1398,6 @@ mod mcp_disclosure_tests {
 
         // On: always deferred, even when tiny.
         cfg.tool_search_mode = McpToolSearchMode::On;
-        assert_eq!(cfg.disclosure_tier(10, 5, 2), McpDisclosureTier::Listed);
-
-        // Legacy bool forces On regardless of mode.
-        cfg.tool_search_mode = McpToolSearchMode::Off;
-        cfg.tool_search = true;
         assert_eq!(cfg.disclosure_tier(10, 5, 2), McpDisclosureTier::Listed);
 
         // MCP disabled → moot, eager passthrough.

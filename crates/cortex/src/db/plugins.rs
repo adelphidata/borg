@@ -407,9 +407,14 @@ impl Database {
         Ok(())
     }
 
-    /// Persist the new local HMAC after an auto-reseal. Idempotent — only
-    /// rewrites the seal column, leaving status and quarantine fields alone.
-    /// Used by the v1→v2 migration path in `cortex::wasm_plugins`.
+    /// Rewrite only the seal column, leaving status and quarantine fields
+    /// alone.
+    ///
+    /// No production path calls this — the install flow writes the seal once
+    /// and nothing ever legitimately rewrites it. It exists so the integration
+    /// tests can plant a bad seal and prove the verifier quarantines, which is
+    /// the same thing an attacker with DB write access would do. Do not reach
+    /// for it in agent code.
     pub async fn update_wasm_plugin_local_hmac(
         &self,
         plugin_id: &str,

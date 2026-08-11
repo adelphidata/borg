@@ -195,11 +195,9 @@ pub(crate) struct ComputerUseArgs {
     /// substring of the app name (e.g. "Finder", "chrome"). For `capture`,
     /// when set and `window_id` is omitted, the frontmost matching window is
     /// resolved via `list_windows` and its `pid`/`window_id` reported so
-    /// follow-up actions can target it. Accepts either `app` (the reference's
-    /// name) or the legacy `target` key. Still honoured by the security
-    /// denylist.
-    #[serde(default, alias = "app")]
-    pub target: Option<String>,
+    /// follow-up actions can target it. Honoured by the security denylist.
+    #[serde(default)]
+    pub app: Option<String>,
 
     /// `capture` only — selects between `som` (default: image + numbered
     /// overlay), `vision` (plain PNG inline), and `ax` (text-only). Optional
@@ -824,7 +822,7 @@ async fn capture_internal(args: &ComputerUseArgs, driver: &dyn Driver) -> Result
         keys: None,
         element_index: None,
         value: None,
-        target: None,
+        app: None,
         mode: Some(CaptureMode::Vision),
         capture_after: None,
     };
@@ -1001,7 +999,7 @@ async fn resolve_capture_window(
         return Ok((args.pid, window_id, None));
     }
     let entries = list_window_entries(driver).await?;
-    let chosen = pick_window(&entries, args.target.as_deref(), "capture")?;
+    let chosen = pick_window(&entries, args.app.as_deref(), "capture")?;
     let note = format!(
         "(targeting {} — pid {}, window_id {})",
         chosen.app, chosen.pid, chosen.window_id
@@ -1345,7 +1343,7 @@ fn check_denylist(args: &ComputerUseArgs) -> Option<String> {
             // literally names a denied surface. `focus_app` additionally
             // re-checks the *resolved* window (see `denied_focus_surface`),
             // which is the authoritative guard against substring bypass.
-            let target = args.target.as_deref().unwrap_or("");
+            let target = args.app.as_deref().unwrap_or("");
             denied_focus_surface(target).map(|denied| {
                 format!(
                     "computer_use denied focus_app target '{target}': matches '{denied}', a macOS security surface that must not be driven."
@@ -1788,7 +1786,7 @@ async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
 /// is stateless across tool calls, so the ids are returned rather than stored).
 async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
     let app = args
-        .target
+        .app
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -2081,7 +2079,7 @@ mod tests {
         // matching window even when it isn't frontmost.
         let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
         let mut args = args_with_action(ComputerUseAction::Capture);
-        args.target = Some("finder".into());
+        args.app = Some("finder".into());
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let calls = driver.calls.lock().unwrap();
         assert_eq!(calls[0].0, "list_windows");
@@ -2098,7 +2096,7 @@ mod tests {
         let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
         let mut args = args_with_action(ComputerUseAction::Capture);
         args.mode = Some(CaptureMode::Som);
-        args.target = Some("Chrome".into());
+        args.app = Some("Chrome".into());
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let calls = driver.calls.lock().unwrap();
         assert_eq!(calls[1].0, "get_window_state");
@@ -2113,7 +2111,7 @@ mod tests {
         // window.
         let driver = FakeDriver::new(vec![windows_listing()]);
         let mut args = args_with_action(ComputerUseAction::Capture);
-        args.target = Some("Spotify".into());
+        args.app = Some("Spotify".into());
         let err = handle_with_driver(&args, &driver).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no on-screen window"), "got: {msg}");
@@ -2134,7 +2132,7 @@ mod tests {
             let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
             let mut args = args_with_action(ComputerUseAction::Capture);
             args.mode = Some(CaptureMode::Vision);
-            args.target = Some(sentinel.into());
+            args.app = Some(sentinel.into());
             let _ = handle_with_driver(&args, &driver).await.unwrap();
             let calls = driver.calls.lock().unwrap();
             assert_eq!(calls[0].0, "list_windows");
@@ -2156,7 +2154,7 @@ mod tests {
             )],
         }]);
         let mut args = args_with_action(ComputerUseAction::Capture);
-        args.target = Some("screen".into());
+        args.app = Some("screen".into());
         let err = handle_with_driver(&args, &driver).await.unwrap_err();
         assert!(
             err.to_string().contains("no desktop/shell window"),
@@ -2332,7 +2330,7 @@ mod tests {
             keys: None,
             element_index: None,
             value: None,
-            target: None,
+            app: None,
             mode: None,
             capture_after: None,
         }
@@ -2554,7 +2552,7 @@ mod tests {
         for target in denied_targets {
             let driver = FakeDriver::new(vec![ok_response()]);
             let mut args = args_with_action(ComputerUseAction::FocusApp);
-            args.target = Some(target.into());
+            args.app = Some(target.into());
             let out = handle_with_driver(&args, &driver).await.unwrap();
             let text = match out {
                 ToolOutput::Text(t) => t,
@@ -2587,7 +2585,7 @@ mod tests {
         let mut args = args_with_action(ComputerUseAction::FocusApp);
         // "settings" is NOT a substring-superset of "System Settings", so it
         // slips the input denylist — but it resolves the denied window.
-        args.target = Some("settings".into());
+        args.app = Some("settings".into());
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
@@ -2847,7 +2845,7 @@ mod tests {
         // drives windows in the background).
         let driver = FakeDriver::new(vec![windows_listing()]);
         let mut args = args_with_action(ComputerUseAction::FocusApp);
-        args.target = Some("Finder".into());
+        args.app = Some("Finder".into());
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
@@ -2889,7 +2887,7 @@ mod tests {
         // on-screen app names, not silently grab the frontmost window.
         let driver = FakeDriver::new(vec![windows_listing()]);
         let mut args = args_with_action(ComputerUseAction::FocusApp);
-        args.target = Some("Photoshop".into());
+        args.app = Some("Photoshop".into());
         let err = handle_with_driver(&args, &driver)
             .await
             .expect_err("focus_app with no match must error");
@@ -2899,12 +2897,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_app_accepts_app_serde_alias() {
-        // The public schema names the param `app`; internally it deserializes
-        // into `target` via the serde alias. Parity check on the wire name.
+    async fn app_arg_matches_the_advertised_schema_key() {
+        // The struct field and the key we advertise to the model must be the
+        // same word. They used to differ (`target` internally, `app` on the
+        // wire, bridged by a serde alias); with the alias gone, a rename on
+        // either side alone silently stops the model's `app` from binding.
+        let mut config = crate::config::Config::default();
+        config.computer_use.enabled = true;
+        let defs = crate::tool::definitions::core_tool_definitions(&config).await;
+        let def = defs
+            .iter()
+            .find(|d| d.function.name == crate::tool::names::COMPUTER_USE)
+            .expect("computer_use must be advertised when enabled");
+        let props = def.function.parameters["properties"]
+            .as_object()
+            .expect("computer_use schema exposes properties");
+        assert!(
+            props.contains_key("app"),
+            "schema must still advertise `app`; keys: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+
         let args: ComputerUseArgs =
             serde_json::from_value(json!({"action": "focus_app", "app": "Finder"})).unwrap();
-        assert_eq!(args.target.as_deref(), Some("Finder"));
+        assert_eq!(args.app.as_deref(), Some("Finder"));
     }
 
     #[tokio::test]

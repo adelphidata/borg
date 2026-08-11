@@ -21,10 +21,6 @@ use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 /// Domain string for HMAC key derivation. Combined with per-installation salt.
 pub(crate) const VITALS_HMAC_DOMAIN: &[u8] = b"borg-vitals-chain-v1";
 
-/// Legacy compiled-in secret for installations without per-install salt.
-#[cfg(test)]
-const VITALS_HMAC_LEGACY: &[u8] = b"borg-vitals-chain-v1";
-
 /// Compute HMAC for a vitals event using the shared HMAC chain module.
 pub(crate) fn compute_event_hmac(
     key: &[u8],
@@ -395,7 +391,7 @@ fn apply_decay_to_delta(delta: i8, multiplier: f64) -> i8 {
 /// Verifies HMAC chain and applies per-category-per-hour rate limits.
 #[cfg(test)]
 pub fn replay_events(events: &[VitalsEvent]) -> VitalsState {
-    replay_events_with_key(VITALS_HMAC_LEGACY, events)
+    replay_events_with_key(VITALS_HMAC_DOMAIN, events)
 }
 
 /// Replay events with a specific HMAC key (for per-installation derived keys).
@@ -1198,16 +1194,16 @@ mod tests {
     #[test]
     fn test_hmac_deterministic() {
         let deltas = deltas_for(EventCategory::Interaction);
-        let h1 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "interaction", "test", deltas, 1000);
-        let h2 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "interaction", "test", deltas, 1000);
+        let h1 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "interaction", "test", deltas, 1000);
+        let h2 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "interaction", "test", deltas, 1000);
         assert_eq!(h1, h2);
     }
 
     #[test]
     fn test_hmac_changes_with_input() {
         let deltas = deltas_for(EventCategory::Interaction);
-        let h1 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "interaction", "test", deltas, 1000);
-        let h2 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "interaction", "test", deltas, 1001);
+        let h1 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "interaction", "test", deltas, 1000);
+        let h2 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "interaction", "test", deltas, 1001);
         assert_ne!(h1, h2);
     }
 
@@ -1215,7 +1211,7 @@ mod tests {
     fn test_hmac_chain_verification() {
         let deltas = deltas_for(EventCategory::Success);
         let hmac1 =
-            compute_event_hmac(VITALS_HMAC_LEGACY, "0", "success", "run_shell", deltas, 100);
+            compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "success", "run_shell", deltas, 100);
         let event = VitalsEvent {
             id: 1,
             category: "success".to_string(),
@@ -1230,8 +1226,8 @@ mod tests {
             hmac: hmac1.clone(),
             prev_hmac: "0".to_string(),
         };
-        assert!(verify_event_hmac(VITALS_HMAC_LEGACY, &event, "0"));
-        assert!(!verify_event_hmac(VITALS_HMAC_LEGACY, &event, "wrong_prev"));
+        assert!(verify_event_hmac(VITALS_HMAC_DOMAIN, &event, "0"));
+        assert!(!verify_event_hmac(VITALS_HMAC_DOMAIN, &event, "wrong_prev"));
     }
 
     #[test]
@@ -1239,7 +1235,7 @@ mod tests {
         let deltas = deltas_for(EventCategory::Creation);
         let ts = 1000;
         let hmac = compute_event_hmac(
-            VITALS_HMAC_LEGACY,
+            VITALS_HMAC_DOMAIN,
             "0",
             "creation",
             "apply_patch",
@@ -1295,7 +1291,7 @@ mod tests {
         for i in 0..20 {
             let ts = hour_base + i;
             let hmac =
-                compute_event_hmac(VITALS_HMAC_LEGACY, &prev, "creation", "test", deltas, ts);
+                compute_event_hmac(VITALS_HMAC_DOMAIN, &prev, "creation", "test", deltas, ts);
             events.push(VitalsEvent {
                 id: i + 1,
                 category: "creation".to_string(),
@@ -1333,7 +1329,7 @@ mod tests {
         for i in 0..4 {
             let ts = hour_base + i;
             let hmac = compute_event_hmac(
-                VITALS_HMAC_LEGACY,
+                VITALS_HMAC_DOMAIN,
                 &prev,
                 "success",
                 "run_shell",
@@ -1372,7 +1368,7 @@ mod tests {
         let mut prev = "0".to_string();
         for (i, source) in sources.iter().enumerate() {
             let ts = hour_base + i as i64;
-            let hmac = compute_event_hmac(VITALS_HMAC_LEGACY, &prev, "success", source, deltas, ts);
+            let hmac = compute_event_hmac(VITALS_HMAC_DOMAIN, &prev, "success", source, deltas, ts);
             events.push(VitalsEvent {
                 id: i as i64 + 1,
                 category: "success".to_string(),
@@ -1405,7 +1401,7 @@ mod tests {
         for i in 0..4 {
             let ts = hour_base + i;
             let hmac = compute_event_hmac(
-                VITALS_HMAC_LEGACY,
+                VITALS_HMAC_DOMAIN,
                 &prev,
                 "failure",
                 "run_shell",
@@ -1469,7 +1465,7 @@ mod tests {
         // Build a 3-event chain: event1 (valid) → event2 (corrupted) → event3 (valid chain from event2)
         let deltas = deltas_for(EventCategory::Success);
 
-        let hmac1 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "success", "test", deltas, 1000);
+        let hmac1 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "success", "test", deltas, 1000);
         let event1 = VitalsEvent {
             id: 1,
             category: "success".to_string(),
@@ -1503,7 +1499,7 @@ mod tests {
 
         // Event 3: valid chain from event2's corrupted hmac — should still be skipped
         let hmac3 = compute_event_hmac(
-            VITALS_HMAC_LEGACY,
+            VITALS_HMAC_DOMAIN,
             "corrupted",
             "success",
             "test",
@@ -1608,8 +1604,8 @@ mod tests {
             growth: 0,
             happiness: -1,
         };
-        let hmac1 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "correction", "test", deltas, 1000);
-        let hmac2 = compute_event_hmac(VITALS_HMAC_LEGACY, "0", "correction", "test", deltas, 1000);
+        let hmac1 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "correction", "test", deltas, 1000);
+        let hmac2 = compute_event_hmac(VITALS_HMAC_DOMAIN, "0", "correction", "test", deltas, 1000);
         assert_eq!(hmac1, hmac2);
         assert!(!hmac1.is_empty());
     }
@@ -1672,7 +1668,7 @@ mod tests {
     ) -> VitalsEvent {
         let deltas = deltas_for(category);
         let cat_str = category.to_string();
-        let hmac = compute_event_hmac(VITALS_HMAC_LEGACY, prev_hmac, &cat_str, source, deltas, ts);
+        let hmac = compute_event_hmac(VITALS_HMAC_DOMAIN, prev_hmac, &cat_str, source, deltas, ts);
         VitalsEvent {
             id,
             category: cat_str,

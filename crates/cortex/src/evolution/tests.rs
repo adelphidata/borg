@@ -133,7 +133,7 @@ fn classify_tool_archetype_table() {
 #[test]
 fn hmac_deterministic() {
     let h1 = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "xp_gain",
         3,
@@ -143,7 +143,7 @@ fn hmac_deterministic() {
         1000,
     );
     let h2 = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "xp_gain",
         3,
@@ -158,7 +158,7 @@ fn hmac_deterministic() {
 #[test]
 fn hmac_verify_valid() {
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "xp_gain",
         1,
@@ -180,13 +180,13 @@ fn hmac_verify_valid() {
         session_id: None,
         pubkey_id: None,
     };
-    assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+    assert!(verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &event, "0"));
 }
 
 #[test]
 fn hmac_tamper_detection() {
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "xp_gain",
         1,
@@ -210,13 +210,13 @@ fn hmac_tamper_detection() {
     };
     // Tamper with XP
     event.xp_delta = 999;
-    assert!(!verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+    assert!(!verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &event, "0"));
 }
 
 #[test]
 fn hmac_chain_linking() {
-    let h1 = compute_event_hmac(EVOLUTION_HMAC_LEGACY, "0", "xp_gain", 1, "", "a", "", 1000);
-    let h2 = compute_event_hmac(EVOLUTION_HMAC_LEGACY, &h1, "xp_gain", 1, "", "b", "", 2000);
+    let h1 = compute_event_hmac(EVOLUTION_HMAC_DOMAIN, "0", "xp_gain", 1, "", "a", "", 1000);
+    let h2 = compute_event_hmac(EVOLUTION_HMAC_DOMAIN, &h1, "xp_gain", 1, "", "b", "", 2000);
     assert_ne!(h1, h2);
 
     let e2 = EvolutionEvent {
@@ -232,9 +232,9 @@ fn hmac_chain_linking() {
         session_id: None,
         pubkey_id: None,
     };
-    assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &e2, &h1));
+    assert!(verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &e2, &h1));
     // Wrong prev_hmac
-    assert!(!verify_event_hmac(EVOLUTION_HMAC_LEGACY, &e2, "0"));
+    assert!(!verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &e2, "0"));
 }
 
 // ── Replay ──
@@ -249,7 +249,7 @@ fn make_event(
     prev_hmac: &str,
 ) -> EvolutionEvent {
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         prev_hmac,
         event_type,
         xp_delta,
@@ -823,7 +823,7 @@ fn stage2_gates_require_low_correction_rate() {
 #[test]
 fn derived_key_produces_different_hmacs_than_legacy() {
     let legacy = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "xp_gain",
         5,
@@ -843,7 +843,7 @@ fn derived_key_produces_different_hmacs_than_legacy() {
 #[test]
 fn xp_overflow_saturates() {
     // Build events with massive XP to test u32 saturation
-    let key = EVOLUTION_HMAC_LEGACY;
+    let key = EVOLUTION_HMAC_DOMAIN;
     let mut events = Vec::new();
     let mut prev_hmac = "0".to_string();
 
@@ -1021,7 +1021,7 @@ fn compute_archetype_stable_days_empty_db_returns_zero() {
 
 #[test]
 fn metadata_included_in_hmac_v2() {
-    let key = EVOLUTION_HMAC_LEGACY;
+    let key = EVOLUTION_HMAC_DOMAIN;
     // Same event data, different metadata should produce different HMACs
     let h1 = compute_event_hmac(key, "0", "evolution", 0, "", "gate_check", "", 1000);
     let h2 = compute_event_hmac(
@@ -1038,33 +1038,8 @@ fn metadata_included_in_hmac_v2() {
 }
 
 #[test]
-fn legacy_events_still_verify() {
-    // Event with HMAC computed WITHOUT metadata (legacy v1)
-    let key = EVOLUTION_HMAC_LEGACY;
-    let legacy_hmac = compute_event_hmac_legacy(key, "0", "xp_gain", 1, "ops", "run_shell", 1000);
-    let event = EvolutionEvent {
-        id: 1,
-        event_type: "xp_gain".to_string(),
-        xp_delta: 1,
-        archetype: Some("ops".to_string()),
-        source: "run_shell".to_string(),
-        metadata_json: None,
-        created_at: 1000,
-        hmac: legacy_hmac,
-        prev_hmac: "0".to_string(),
-        session_id: None,
-        pubkey_id: None,
-    };
-    // verify_event_hmac should accept via legacy fallback
-    assert!(
-        verify_event_hmac(key, &event, "0"),
-        "legacy events should still verify via fallback"
-    );
-}
-
-#[test]
 fn metadata_tampering_detected_on_v2_events() {
-    let key = EVOLUTION_HMAC_LEGACY;
+    let key = EVOLUTION_HMAC_DOMAIN;
     let meta = r#"{"gates_verified":false}"#;
     let hmac = compute_event_hmac(key, "0", "evolution", 0, "", "gate_check", meta, 1000);
     let mut event = EvolutionEvent {
@@ -1099,7 +1074,7 @@ fn legacy_events_accept_metadata_via_fallback_path() {
     // Evolution event with v2 HMAC including metadata
     let meta = r#"{"gates_verified":true}"#;
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         &e1.hmac,
         "evolution",
         0,
@@ -1129,7 +1104,7 @@ fn legacy_events_accept_metadata_via_fallback_path() {
     // Now create the same evolution event but with tampered metadata
     let e1b = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", 1000, "0");
     let no_meta_hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         &e1b.hmac,
         "evolution",
         0,
@@ -1186,7 +1161,7 @@ fn make_verified_evolution(
         None => r#"{"gates_verified":true}"#.to_string(),
     };
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         prev_hmac,
         "evolution",
         0,
@@ -1221,7 +1196,7 @@ fn make_unverified_evolution(
 ) -> EvolutionEvent {
     // Empty metadata: HMAC v2 signs "" so it verifies via v1 legacy path.
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         prev_hmac,
         "evolution",
         0,
@@ -1529,73 +1504,6 @@ fn replay_rate_limits_share_card_created_to_three_per_hour() {
 }
 
 #[test]
-fn replay_hmac_v1_v2_mixed_chain() {
-    // A chain where early events use legacy v1 HMAC (no metadata) and
-    // later events use v2 HMAC (with metadata). Both must verify.
-    //
-    // e1: legacy v1 (constructed via compute_event_hmac_legacy)
-    let h1 = compute_event_hmac_legacy(
-        EVOLUTION_HMAC_LEGACY,
-        "0",
-        "xp_gain",
-        2,
-        "ops",
-        "run_shell",
-        1_000,
-    );
-    let e1 = EvolutionEvent {
-        id: 1,
-        event_type: "xp_gain".to_string(),
-        xp_delta: 2,
-        archetype: Some("ops".to_string()),
-        source: "run_shell".to_string(),
-        metadata_json: None,
-        created_at: 1_000,
-        hmac: h1.clone(),
-        prev_hmac: "0".to_string(),
-        session_id: None,
-        pubkey_id: None,
-    };
-
-    // e2: v2 evolution event with metadata, chained off e1
-    let e2 = make_verified_evolution(2, "gate_check", 2_000, &h1, Some("Warden"));
-
-    // e3: v1 again (legacy path), chained off e2
-    let h3 = compute_event_hmac_legacy(
-        EVOLUTION_HMAC_LEGACY,
-        &e2.hmac,
-        "xp_gain",
-        1,
-        "ops",
-        "run_shell",
-        3_700,
-    );
-    let e3 = EvolutionEvent {
-        id: 3,
-        event_type: "xp_gain".to_string(),
-        xp_delta: 1,
-        archetype: Some("ops".to_string()),
-        source: "run_shell".to_string(),
-        metadata_json: None,
-        created_at: 3_700,
-        hmac: h3,
-        prev_hmac: e2.hmac.clone(),
-        session_id: None,
-        pubkey_id: None,
-    };
-
-    let state = replay_events(&[e1, e2, e3]);
-    assert!(
-        state.chain_valid,
-        "mixed v1/v2 chain should verify end-to-end"
-    );
-    assert_eq!(state.stage, Stage::Evolved);
-    assert_eq!(state.evolution_name.as_deref(), Some("Warden"));
-    // Post-evolution xp_gain of 1 should be the only XP in current stage.
-    assert_eq!(state.total_xp, 1);
-}
-
-#[test]
 fn replay_hmac_key_mismatch_invalidates_all_events_evolution() {
     let e1 = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", 1_000, "0");
     let e2 = make_event(2, "xp_gain", 3, Some("ops"), "run_shell", 3_700, &e1.hmac);
@@ -1784,7 +1692,7 @@ fn make_event_with_meta(
     metadata: Option<&str>,
 ) -> EvolutionEvent {
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         prev_hmac,
         event_type,
         xp_delta,
@@ -1846,7 +1754,7 @@ fn time_weighted_scoring_prefers_recent_when_in_window() {
         prev = e.hmac.clone();
         events.push(e);
     }
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &events, now);
     // Builder: lifetime=9, last_30d=9 → effective = 9*0.20 + 9*0.80 = 9
     // Ops: lifetime=12, last_30d=0 → effective = 12*0.20 = 2.4 → 2
     assert_eq!(state.dominant_archetype, Some(Archetype::Builder));
@@ -1892,7 +1800,7 @@ fn time_weighted_scoring_reverts_when_window_shifts_out() {
     }
     // Shift forward 60 days → nothing is within last 30d
     let future_now = original_now + 60 * 86_400;
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, future_now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &events, future_now);
     assert_eq!(state.dominant_archetype, Some(Archetype::Ops));
     // last_30d is empty for both archetypes
     assert!(state.last_30d_scores.is_empty());
@@ -1933,7 +1841,7 @@ fn dominant_history_records_shifts() {
         prev = e.hmac.clone();
         events.push(e);
     }
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &events, now);
     assert!(
         state.dominant_history.len() >= 2,
         "expected at least one shift, got {:?}",
@@ -1971,7 +1879,7 @@ fn classification_event_sets_evolution_name() {
         &e2.hmac,
         Some(class_meta),
     );
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &[e1, e2, e3], now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &[e1, e2, e3], now);
     assert_eq!(state.stage, Stage::Evolved);
     assert_eq!(state.evolution_name.as_deref(), Some("Tool Forgemaster"));
     assert_eq!(
@@ -1995,7 +1903,7 @@ fn classification_does_not_advance_stage() {
         "0",
         Some(class_meta),
     );
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &[e1], now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &[e1], now);
     assert_eq!(state.stage, Stage::Base);
     assert_eq!(state.evolution_name.as_deref(), Some("Name"));
 }
@@ -2020,7 +1928,7 @@ fn source_decay_contract_holds() {
         prev = e.hmac.clone();
         events.push(e);
     }
-    let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+    let state = replay_events_with_key_at(EVOLUTION_HMAC_DOMAIN, &events, now);
     assert_eq!(state.total_xp, 5, "decay contract: 2+2+1+0 = 5");
 }
 
@@ -2378,7 +2286,7 @@ fn replay_accepts_new_v2_event_types() {
         e.metadata_json = Some(r#"{"from_level":0,"to_level":1,"stage":"base"}"#.to_string());
         // Re-sign with metadata so v2 HMAC matches.
         e.hmac = compute_event_hmac(
-            EVOLUTION_HMAC_LEGACY,
+            EVOLUTION_HMAC_DOMAIN,
             &e.prev_hmac,
             &e.event_type,
             e.xp_delta,
@@ -2393,7 +2301,7 @@ fn replay_accepts_new_v2_event_types() {
         let mut e = make_event(3, "milestone_unlocked", 0, None, "hook", 1600, &e2.hmac);
         e.metadata_json = Some(r#"{"milestone_id":"level_10","title":"Lvl.10"}"#.to_string());
         e.hmac = compute_event_hmac(
-            EVOLUTION_HMAC_LEGACY,
+            EVOLUTION_HMAC_DOMAIN,
             &e.prev_hmac,
             &e.event_type,
             e.xp_delta,
@@ -2427,7 +2335,7 @@ fn replay_accepts_new_v2_event_types() {
 fn hmac_tamper_detection_on_new_event_types() {
     let meta = r#"{"from_level":9,"to_level":10,"stage":"base"}"#;
     let hmac = compute_event_hmac(
-        EVOLUTION_HMAC_LEGACY,
+        EVOLUTION_HMAC_DOMAIN,
         "0",
         "level_up",
         0,
@@ -2450,10 +2358,10 @@ fn hmac_tamper_detection_on_new_event_types() {
         pubkey_id: None,
     };
     // Pristine event verifies.
-    assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+    assert!(verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &event, "0"));
     // Tamper with metadata — v2 HMAC must reject.
     event.metadata_json = Some(r#"{"from_level":9,"to_level":99,"stage":"base"}"#.to_string());
-    assert!(!verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+    assert!(!verify_event_hmac(EVOLUTION_HMAC_DOMAIN, &event, "0"));
 }
 
 #[test]

@@ -75,16 +75,12 @@ fn collaboration_mode_from_str_roundtrip() {
 }
 
 #[test]
-fn collaboration_mode_from_str_legacy_default_alias() {
-    // Existing DB rows may carry "default" from the pre-removal era; they must
-    // resolve to Execute rather than erroring out and breaking the daemon boot.
-    let mode: CollaborationMode = "default".parse().unwrap();
-    assert_eq!(mode, CollaborationMode::Execute);
-}
-
-#[test]
 fn collaboration_mode_from_str_invalid() {
     assert!("bogus".parse::<CollaborationMode>().is_err());
+    // "default" was a removed third mode. It must not quietly resolve to
+    // Execute — a stored "default" should surface as a config error, not
+    // silently pick a mode the operator never chose.
+    assert!("default".parse::<CollaborationMode>().is_err());
 }
 
 #[test]
@@ -99,13 +95,6 @@ fn apply_setting_collaboration_mode() {
     cfg.apply_setting("conversation.collaboration_mode", "plan")
         .unwrap();
     assert_eq!(cfg.conversation.collaboration_mode, CollaborationMode::Plan);
-    // Legacy alias still applies for stored "default" rows.
-    cfg.apply_setting("conversation.collaboration_mode", "default")
-        .unwrap();
-    assert_eq!(
-        cfg.conversation.collaboration_mode,
-        CollaborationMode::Execute
-    );
 }
 
 #[test]
@@ -126,9 +115,8 @@ fn collaboration_mode_blocks_mutations_only_for_plan() {
 ///
 /// Borg is autonomous by design — the previous `Default` mode acted like a
 /// chat assistant that asked questions instead of executing, which conflicts
-/// with the project's positioning. It was deliberately removed; "default"
-/// survives only as a `FromStr` alias for legacy DB rows. Any attempt to
-/// re-add a `Default` variant must be challenged.
+/// with the project's positioning. It was deliberately removed, alias and all.
+/// Any attempt to re-add a `Default` variant must be challenged.
 ///
 /// This is a source-grep guard (allowed by CLAUDE.md as an "invariant types
 /// can't express" exception, like the prompt-cache and TUI mouse guards).

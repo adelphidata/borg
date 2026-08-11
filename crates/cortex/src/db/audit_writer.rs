@@ -58,7 +58,6 @@ pub mod audit_events {
     pub const WASM_PLUGIN_EXECUTED: &str = "wasm_plugin_executed";
     pub const WASM_PLUGIN_QUARANTINED: &str = "wasm_plugin_quarantined";
     pub const WASM_PLUGIN_RATE_LIMITED: &str = "wasm_plugin_rate_limited";
-    pub const WASM_PLUGIN_RESEALED: &str = "wasm_plugin_resealed";
     pub const WASM_PLUGIN_DISABLED: &str = "wasm_plugin_disabled";
     pub const WASM_PLUGIN_ENABLED: &str = "wasm_plugin_enabled";
     /// An installed plugin was refused at dispatch because its publisher key is

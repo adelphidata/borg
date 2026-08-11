@@ -9,7 +9,7 @@ use clap::Parser;
 #[command(name = "update", no_binary_name = true)]
 pub struct UpdateArgs {
     /// Install the latest pre-release (experimental) build instead of stable.
-    #[arg(long, short = 'p', alias = "dev", visible_alias = "pre")]
+    #[arg(long, short = 'p', visible_alias = "pre")]
     pub prerelease: bool,
     /// Check for updates without installing.
     #[arg(long, short = 'c')]
@@ -41,14 +41,12 @@ mod tests {
             ("", false, false),
             ("--prerelease", true, false),
             ("--pre", true, false),
-            ("--dev", true, false),
             ("-p", true, false),
             ("--check", false, true),
             ("-c", false, true),
             ("-pc", true, true),
             ("-cp", true, true),
             ("--prerelease --check", true, true),
-            ("--check --dev", true, true),
             ("  --pre   --check  ", true, true),
         ];
         for (input, want_pre, want_check) in cases {
@@ -62,6 +60,15 @@ mod tests {
                 "input {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_slash_rejects_removed_dev_alias() {
+        // `--dev` was an undocumented alias for `--prerelease`. It is gone, and
+        // an unknown flag must fail loudly rather than quietly opting a user
+        // into pre-release builds.
+        let err = parse("--dev").expect_err("--dev must no longer parse");
+        assert!(err.to_string().contains("dev"), "error must name the token");
     }
 
     #[test]
@@ -107,17 +114,12 @@ mod tests {
     }
 
     #[test]
-    fn help_advertises_standard_flags_and_hides_dev() {
+    fn help_advertises_standard_flags() {
         let help = UpdateArgs::command().render_help().to_string();
         assert!(help.contains("--prerelease"), "help missing --prerelease");
         assert!(help.contains("--pre"), "help missing visible alias --pre");
         assert!(help.contains("-p"), "help missing -p short");
         assert!(help.contains("--check"), "help missing --check");
         assert!(help.contains("-c"), "help missing -c short");
-        // --dev is a hidden alias and must not appear in rendered help.
-        assert!(
-            !help.contains("--dev"),
-            "help must not advertise hidden alias --dev: {help}"
-        );
     }
 }

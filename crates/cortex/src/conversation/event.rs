@@ -43,11 +43,11 @@ pub struct SessionEvent {
     pub created_at: i64,
     /// What happened.
     pub kind: SessionEventKind,
-    /// Chain link over this event's immutable payload. `None` on legacy rows
-    /// written before the log was HMAC-chained.
+    /// Chain link over this event's immutable payload. `None` only on a row
+    /// written outside the persist path, which fails verification.
     pub hmac: Option<String>,
-    /// HMAC of the previous event in this session's chain. `None` on legacy
-    /// rows; `"0"` marks the first chained event in a session.
+    /// HMAC of the previous event in this session's chain. `"0"` marks the
+    /// first chained event in a session; `None` fails verification.
     pub prev_hmac: Option<String>,
 }
 
@@ -253,10 +253,13 @@ fn message_from_row(row: &MessageRow) -> Option<Message> {
 /// `"0"`, so when the rows span a fork lineage (see
 /// [`crate::db::Database::load_session_lineage_rows`]) a change of `session_id`
 /// restarts the expected link at `"0"` — the boundary between an ancestor's
-/// chain and the child's own chain is legitimate, not a break. Legacy rows
-/// written before chaining (NULL `hmac`) are tolerated — they don't advance the
-/// expected link, so a chained suffix appended after an upgrade still verifies.
-/// Returns `false` if any chained row's link is broken (tampering or reordering).
+/// chain and the child's own chain is legitimate, not a break.
+///
+/// A row with a NULL `hmac`/`prev_hmac` fails verification. Every persist path
+/// chains, so an unchained row means the DB was written to directly — exactly
+/// the tampering this function exists to detect.
+///
+/// Returns `false` if any row's link is broken (tampering or reordering).
 pub fn verify_session_chain(key: &[u8], rows: &[MessageRow]) -> bool {
     let mut expected_prev = String::from("0");
     let mut current_session: Option<&str> = None;
@@ -268,7 +271,10 @@ pub fn verify_session_chain(key: &[u8], rows: &[MessageRow]) -> bool {
             expected_prev = String::from("0");
         }
         let (Some(hmac), Some(prev)) = (row.hmac.as_deref(), row.prev_hmac.as_deref()) else {
-            continue; // unchained legacy row — cannot verify, don't fail the chain
+            // Unchained row: nothing to verify against. Like a broken link, it
+            // does not advance the expected-prev.
+            all_valid = false;
+            continue;
         };
         let recomputed = compute_session_event_hmac(key, prev, &row.into());
         if crate::hmac_chain::verify_chain_link(hmac, prev, &expected_prev, &recomputed) {
