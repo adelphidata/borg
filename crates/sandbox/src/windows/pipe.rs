@@ -95,9 +95,7 @@ impl PipeSession {
 /// before spawning, so there's no reader yet at write time.
 pub fn send(request: &SpawnRequest) -> io::Result<PipeSession> {
     let bytes = serialize_request(request);
-    let buf_size: u32 = (super::ipc::MAX_REQUEST_BYTES as u32)
-        .checked_add(8)
-        .unwrap_or(u32::MAX);
+    let buf_size: u32 = (super::ipc::MAX_REQUEST_BYTES as u32).saturating_add(8);
 
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
