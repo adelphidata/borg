@@ -245,6 +245,11 @@ pub fn render_label(entry: &CatalogEntry, free: bool) -> String {
 /// caught by [`tests::embedded_manifest_is_valid`] — there is no runtime path
 /// that can reach a bad embedded manifest.
 fn embedded() -> &'static Manifest {
+    // The input is compiled into the binary, so neither call can fail at
+    // runtime for anything an operator did — a bad manifest is a build defect,
+    // caught by `embedded_manifest_is_valid`. There is no sensible fallback
+    // either: this *is* the fallback every other tier degrades to.
+    #[allow(clippy::expect_used)]
     static EMBEDDED: LazyLock<Manifest> = LazyLock::new(|| {
         let parsed: Manifest = serde_json::from_str(EMBEDDED_MANIFEST)
             .expect("embedded model-catalog.json must parse");
@@ -385,7 +390,7 @@ pub fn default_model(provider: &str) -> Option<String> {
 
 /// Every provider key the catalog knows, sorted.
 pub fn providers() -> Vec<String> {
-    with_manifest(|m| m.provider_names())
+    with_manifest(Manifest::provider_names)
 }
 
 /// The compiled-in floor.
