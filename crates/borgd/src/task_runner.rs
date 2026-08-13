@@ -2757,11 +2757,21 @@ mod pre_run_tests {
         let cmd = build_filtered_sh_command("true", &on, std::path::Path::new("."))
             .await
             .expect("allowed");
-        assert_ne!(
-            cmd.as_std().get_program().to_string_lossy(),
-            "sh",
-            "with the key on the command must be wrapped by the sandbox helper"
-        );
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        // Seatbelt ships with macOS; bwrap is an optional distro package, and
+        // `wrap_bubblewrap` deliberately passes through when it is missing (CI
+        // runners have none). Assert what each host can actually promise.
+        if cfg!(target_os = "macos") || which::which("bwrap").is_ok() {
+            assert_ne!(
+                program, "sh",
+                "with the key on the command must be wrapped by the sandbox helper"
+            );
+        } else {
+            assert_eq!(
+                program, "sh",
+                "without a sandbox helper installed the documented behaviour is passthrough"
+            );
+        }
     }
 
     // ── run_pre_run_command (real fork) ──
