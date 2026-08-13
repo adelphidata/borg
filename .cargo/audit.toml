@@ -1,0 +1,32 @@
+# `cargo audit` reads Cargo.lock, not the compiled dependency graph, so it
+# reports crates that only *appear* in the lockfile. The entries below are all
+# such artifacts: `cargo tree -i <crate> -e normal` finds none of them in the
+# default feature set — only `--all-features` pulls them in, through
+# songbird 0.6 behind the opt-in `discord-voice-channels` feature.
+#
+# Two paths reach them:
+#   * rustls-webpki 0.102.8 — songbird's OPTIONAL `serenity` feature
+#     (→ tokio-tungstenite 0.21 → rustls 0.22). borg drives voice through the
+#     manual ConnectionInfo + `tungstenite` backend instead, so the compiled
+#     tree resolves rustls-webpki 0.103.13 only.
+#   * the libcrux family — songbird's DAVE (E2EE) dep `davey` → openmls →
+#     hpke-rs. openmls selects the `hpke-rs-rust-crypto` backend in the
+#     resolved feature set, so the libcrux backend is never built.
+#
+# The same list, with the same reasoning, is in `deny.toml`. Revisit when
+# serenity's rustls stack modernizes, when openmls drops libcrux from its
+# graph, or if voice support is dropped.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0049", # rustls-webpki: CRLs not authoritative by Distribution Point
+    "RUSTSEC-2026-0098", # rustls-webpki: URI-name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard-name constraints accepted
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext
+    "RUSTSEC-2026-0207", # libcrux-sha3: wrong incremental portable SHAKE output
+    "RUSTSEC-2026-0208", # libcrux-sha3: panic in AVX2 SHAKE-256
+    "RUSTSEC-2026-0209", # libcrux-aesgcm: AAD length limit not enforced
+    "RUSTSEC-2026-0210", # libcrux-aesgcm: renamed to libcrux-aes (unmaintained)
+    "RUSTSEC-2026-0211", # libcrux-aesgcm: non-constant-time tag check
+    "RUSTSEC-2026-0212", # libcrux-secrets: constant-time swap/select on aarch64
+]

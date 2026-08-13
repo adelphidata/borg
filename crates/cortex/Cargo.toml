@@ -11,7 +11,7 @@ coding = { path = "../coding" }
 sandbox = { path = "../sandbox" }
 plugins = { path = "../plugins" }
 mcp = { path = "../mcp" }
-lru = "0.16"
+lru = "0.18"
 tokio = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 url = { workspace = true }

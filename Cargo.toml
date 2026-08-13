@@ -72,7 +72,7 @@ libsql = { version = "0.9", default-features = false, features = ["core", "encry
 roaring = "0.11"
 scraper = "0.22"
 pdf-extract = "0.12"
-anydoc = "0.1.7"
+anydoc = "0.1.8"
 shellexpand = "3"
 sha2 = "0.10"
 hmac = "0.12"

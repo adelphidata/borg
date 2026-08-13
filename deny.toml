@@ -34,6 +34,12 @@ ignore = [
     "RUSTSEC-2026-0099", # rustls-webpki: wildcard-name constraints accepted
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
     "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext
+    # Same DAVE path, same reasoning: `cargo tree -i <crate> -e normal` finds
+    # none of these in the default feature set — only `--all-features` pulls
+    # them, via davey → openmls_rust_crypto → hpke-rs.
+    "RUSTSEC-2026-0207", # libcrux-sha3: wrong incremental portable SHAKE output
+    "RUSTSEC-2026-0208", # libcrux-sha3: panic in AVX2 SHAKE-256
+    "RUSTSEC-2026-0212", # libcrux-secrets: constant-time swap/select on aarch64
 ]
 
 [licenses]
@@ -50,6 +56,13 @@ allow = [
     "MPL-2.0",
     "BSL-1.0",
     "NCSA",
+    # webpki-roots / webpki-root-certs ship Mozilla's CA bundle under the
+    # Community Data License Agreement. Permissive, data-only, no copyleft
+    # reach into the binary that links them.
+    "CDLA-Permissive-2.0",
+    # whisper-rs / whisper-rs-sys (local speech-to-text) are dedicated to the
+    # public domain, which is strictly more permissive than anything above.
+    "Unlicense",
 ]
 
 [bans]

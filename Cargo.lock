@@ -204,9 +204,9 @@ dependencies = [
 
 [[package]]
 name = "anydoc"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96db46b7211c9994a0be9f3c520936c2682af8cc8151c69c9f9416a8426de574"
+checksum = "2b8e42cf43074578dd1d5a6771d1f28282790b2bf4bca60061ff51fd8ca03c09"
 dependencies = [
  "calamine",
  "cfb",
@@ -1508,7 +1508,7 @@ dependencies = [
  "keyring",
  "libc",
  "libsql",
- "lru 0.16.4",
+ "lru 0.18.2",
  "mcp",
  "msedge-tts",
  "notify",
@@ -3287,17 +3287,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -4803,9 +4792,9 @@ dependencies = [
 
 [[package]]
 name = "lopdf"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67513274c50a2b51e5f75d9e682fcf4ab064a8a9c9ae2c3c59309084882bb24d"
+checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
 dependencies = [
  "aes",
  "bitflags 2.13.1",
@@ -4833,33 +4822,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lopdf"
-version = "0.42.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
-dependencies = [
- "aes",
- "bitflags 2.13.1",
- "cbc",
- "ecb",
- "encoding_rs",
- "flate2",
- "getrandom 0.4.3",
- "indexmap",
- "itoa",
- "log",
- "md-5",
- "nom 8.0.0",
- "rand 0.10.2",
- "rangemap",
- "sha2 0.10.9",
- "stringprep",
- "thiserror 2.0.19",
- "ttf-parser",
- "weezl",
-]
-
-[[package]]
 name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4870,11 +4832,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -5911,7 +5873,7 @@ dependencies = [
  "encoding_rs",
  "euclid",
  "log",
- "lopdf 0.42.0",
+ "lopdf",
  "postscript",
  "type1-encoding-parser",
  "unicode-normalization",
@@ -5919,14 +5881,14 @@ dependencies = [
 
 [[package]]
 name = "pdf-inspector"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7475018de0880b394b7cc50f871fac0c010aa411dcd14c64074a3e640a4c05c"
+checksum = "fd2f755e49ad38eafbc82ba2bec1c59d57b5bf829b13a8f35e4263bc8913df3a"
 dependencies = [
  "env_logger",
  "include_dir",
  "log",
- "lopdf 0.41.0",
+ "lopdf",
  "once_cell",
  "rayon",
  "regex",
