@@ -350,12 +350,17 @@ impl Driver for CuaDriver {
                 "clientInfo": {"name": "borg", "version": env!("CARGO_PKG_VERSION")},
             }
         });
-        write_line(&mut stdin, &init).await.with_context(|| {
-            format!(
-                "send initialize to cua-driver (it may have exited at startup){}",
-                stderr_suffix(&stderr_tail)
-            )
-        })?;
+        if let Err(e) = write_line(&mut stdin, &init).await {
+            // A failed write means the child is already gone, so wait for its
+            // stderr before quoting it.
+            stderr_tail.settle().await;
+            return Err(e).with_context(|| {
+                format!(
+                    "send initialize to cua-driver (it may have exited at startup){}",
+                    stderr_tail.suffix()
+                )
+            });
+        }
         // Drain the initialize response — we don't currently inspect it, but
         // skipping the read would leave the driver waiting for backpressure.
         read_reply(
@@ -416,8 +421,49 @@ impl Driver for CuaDriver {
 /// Short on purpose: the reply is already in hand, this only bounds cleanup.
 const DRIVER_WINDDOWN: Duration = Duration::from_secs(5);
 
-/// Capped stderr tail shared between the drain task and error decoration.
-type StderrTail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+/// Capped stderr tail shared between the drain task and error decoration,
+/// plus the drain task itself so a caller building a "driver died" error can
+/// wait for the child's last words first.
+struct StderrTail {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// Bound on waiting for the drain task after the child's stdout closed. The
+/// task ends at stderr EOF, which the exiting child has already caused — this
+/// only covers the scheduling gap, so it stays short.
+const STDERR_SETTLE: Duration = Duration::from_millis(500);
+
+impl StderrTail {
+    /// Wait (briefly) for the drain task to finish reading. Without this the
+    /// error can be formatted before the drain task has been scheduled at all,
+    /// and the child's stderr — the only diagnostic a startup exit leaves —
+    /// silently goes missing.
+    async fn settle(&self) {
+        let handle = self.drain.lock().await.take();
+        if let Some(handle) = handle {
+            if tokio::time::timeout(STDERR_SETTLE, handle).await.is_err() {
+                tracing::debug!("cua-driver stderr drain still running after {STDERR_SETTLE:?}");
+            }
+        }
+    }
+
+    /// `" Driver stderr tail: …"` when the driver said anything, empty
+    /// otherwise.
+    fn suffix(&self) -> String {
+        let bytes = self
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let text = String::from_utf8_lossy(&bytes);
+        let text = text.trim();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!(" Driver stderr tail: {text}")
+        }
+    }
+}
 
 /// Continuously drain the child's stderr, keeping only the last few KB. The
 /// task ends on its own when the child exits (pipe EOF); errors reading a
@@ -425,9 +471,9 @@ type StderrTail = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
 fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
     use tokio::io::AsyncReadExt;
     const TAIL_CAP: usize = 8 * 1024;
-    let tail: StderrTail = std::sync::Arc::default();
-    let writer = std::sync::Arc::clone(&tail);
-    tokio::spawn(async move {
+    let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::default();
+    let writer = std::sync::Arc::clone(&buf);
+    let drain = tokio::spawn(async move {
         let mut chunk = [0u8; 4096];
         loop {
             match stderr.read(&mut chunk).await {
@@ -449,20 +495,9 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
             }
         }
     });
-    tail
-}
-
-/// `" Driver stderr tail: …"` when the driver said anything, empty otherwise.
-fn stderr_suffix(tail: &StderrTail) -> String {
-    let bytes = tail
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.trim();
-    if text.is_empty() {
-        String::new()
-    } else {
-        format!(" Driver stderr tail: {text}")
+    StderrTail {
+        buf,
+        drain: tokio::sync::Mutex::new(Some(drain)),
     }
 }
 
@@ -485,10 +520,13 @@ async fn read_reply(
             .map_err(|_| wedged(timeout, phase, stderr_tail))?
             .with_context(|| format!("read cua-driver stdout during {phase}"))?;
         let Some(line) = line else {
+            // stdout closed because the child died; its stderr is the only
+            // diagnostic, so let the drain task catch up before quoting it.
+            stderr_tail.settle().await;
             anyhow::bail!(
                 "cua-driver exited during {phase} without replying — check the binary at \
                  computer_use.driver_path speaks MCP (`cua-driver mcp`).{}",
-                stderr_suffix(stderr_tail)
+                stderr_tail.suffix()
             );
         };
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -519,7 +557,7 @@ fn wedged(timeout: Duration, phase: &str, stderr_tail: &StderrTail) -> anyhow::E
     };
     anyhow::anyhow!(
         "cua-driver timed out after {timeout:?} during {phase}. {hint} — run `cua-driver doctor` on the host to check.{}",
-        stderr_suffix(stderr_tail)
+        stderr_tail.suffix()
     )
 }
 
@@ -3814,6 +3852,30 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"real
         assert!(
             matches!(&resp.content[0], DriverContent::Text(t) if t == "real reply"),
             "notification consumed as the reply: {resp:?}"
+        );
+    }
+
+    /// Regression: the stderr tail must survive a driver that closes stdout
+    /// *before* it writes its complaint. Reading the tail the moment stdout
+    /// hits EOF races the drain task — under load that raced away the only
+    /// diagnostic a startup exit leaves behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_arrives_after_stdout_closes_and_still_reaches_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = stub_driver(
+            &dir,
+            r#"exec 1>&-
+sleep 0.2
+echo 'late complaint from the driver' >&2
+exit 64"#,
+        );
+        let driver = CuaDriver::new(binary, Duration::from_secs(5), false);
+        let err = driver.call("screenshot", json!({})).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("late complaint from the driver"),
+            "stderr written after stdout closed must still reach the error: {msg}"
         );
     }
 
