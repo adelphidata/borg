@@ -532,9 +532,12 @@ fn record_failure() {
 /// malformed body, unsupported version — surfaces as `Err` so the caller keeps
 /// what it already had.
 async fn fetch_manifest(url: &str, timeout: Duration) -> anyhow::Result<Manifest> {
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-    let resp = client
+    // The shared pool, with this call's own ceiling applied per request — a
+    // catalog refresh is ordinary JSON traffic with no special TLS or redirect
+    // policy to preserve.
+    let resp = crate::http::shared()
         .get(url)
+        .timeout(timeout)
         .header("Accept", "application/json")
         .send()
         .await?
