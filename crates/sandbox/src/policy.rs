@@ -9,12 +9,20 @@ pub struct SandboxPolicy {
     pub fs_read: Vec<String>,
     /// Paths the sandboxed process may write.
     pub fs_write: Vec<String>,
-    /// Glob patterns to deny read access to (e.g. `["~/.borg/**"]`).
+    /// Paths to deny read access to (e.g. `["~/.borg/secrets"]`).
     /// Evaluated after fs_read allows; deny takes precedence.
+    ///
+    /// These are **paths, not globs**. Both backends deny a path and everything
+    /// beneath it, so a trailing `/**` or `/*` is redundant — it is accepted and
+    /// normalized away by [`SandboxPolicy::with_denies_normalized`]. Any other
+    /// glob metacharacter cannot be expressed as a sandbox rule and is a hard
+    /// error there, because silently dropping a deny rule fails *open*.
     #[serde(default)]
     pub deny_read: Vec<String>,
     /// Paths to deny write access to, even if not in fs_write.
     /// Always includes `~/.borg/` to protect agent config from tool writes.
+    ///
+    /// Same path-not-glob rule as [`SandboxPolicy::deny_read`].
     #[serde(default)]
     pub deny_write: Vec<String>,
     /// Domain allowlist for network-enabled tools. When non-empty and `network` is true,
@@ -136,6 +144,31 @@ pub(crate) fn fail_closed_windows_public(context: &str, detail: &str) -> Sandbox
     fail_closed_windows(context, detail)
 }
 
+/// Refuse to run at all, on whichever shell this platform has.
+///
+/// The counterpart to [`fail_closed_windows`] for failures that are not
+/// Windows-specific — currently an unenforceable deny rule, which every backend
+/// must reject rather than run without.
+fn fail_closed(context: &str, detail: &str) -> SandboxCommand {
+    if cfg!(target_os = "windows") {
+        return fail_closed_windows(context, detail);
+    }
+    tracing::error!("Sandbox refused to run unsandboxed: {context}: {detail}");
+    SandboxCommand {
+        program: "/bin/sh".to_string(),
+        // The message rides in as `$0`, never interpolated into the script.
+        // `detail` quotes a config-supplied path, and a path holding a single
+        // quote would otherwise close the literal and run as a command — in
+        // the one code path whose whole job is to refuse to run anything.
+        args: vec![
+            "-c".to_string(),
+            "printf '%s\n' \"$0\" >&2; exit 1".to_string(),
+            format!("Borg sandbox setup failed: {context}: {detail}"),
+        ],
+        _resources: None,
+    }
+}
+
 fn fail_closed_windows(context: &str, detail: &str) -> SandboxCommand {
     tracing::error!("Windows sandbox refused to run unsandboxed: {context}: {detail}");
     SandboxCommand {
@@ -155,6 +188,53 @@ fn expand_tilde_paths(paths: &[String]) -> Vec<String> {
         .iter()
         .map(|p| crate::paths::expand_tilde(p).to_string_lossy().into_owned())
         .collect()
+}
+
+/// Glob metacharacters no sandbox backend can express as a deny rule.
+///
+/// `**`/`*` in *trailing* position is handled separately by
+/// [`normalize_deny_entry`] — these are the ones with no path equivalent.
+const GLOB_METACHARACTERS: &[char] = &['*', '?', '['];
+
+/// Reduce a deny entry to the literal path both backends can actually enforce.
+///
+/// A trailing `/**` or `/*` is dropped: Seatbelt's `(subpath …)` and bwrap's
+/// `--tmpfs`/`--ro-bind` overlays already cover a directory and everything under
+/// it, so `~/.borg/**` and `~/.borg` deny exactly the same set.
+///
+/// Anything else containing a glob metacharacter is an error. It cannot be
+/// turned into a rule, and the previous behaviour — bwrap's `hide_path` silently
+/// returning on a `symlink_metadata` error — meant such an entry enforced
+/// *nothing* while still reading like a deny in the config.
+fn normalize_deny_entry(entry: &str) -> Result<String, String> {
+    let trimmed = entry
+        .strip_suffix("/**")
+        .or_else(|| entry.strip_suffix("/*"))
+        .unwrap_or(entry);
+
+    if let Some(bad) = trimmed.chars().find(|c| GLOB_METACHARACTERS.contains(c)) {
+        return Err(format!(
+            "deny path {entry:?} contains the glob metacharacter {bad:?}; \
+             deny entries are paths, not globs (a trailing `/**` is allowed). \
+             Use a concrete path with a directory prefix instead"
+        ));
+    }
+
+    if trimmed.is_empty() {
+        return Err(format!(
+            "deny path {entry:?} resolves to an empty path; \
+             a deny rule anchored at the filesystem root cannot be expressed"
+        ));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+/// Normalize every entry in `paths`, failing on the first that cannot be
+/// expressed. Fails closed by construction: the caller gets no policy at all
+/// rather than one missing a rule.
+fn normalize_deny_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    paths.iter().map(|p| normalize_deny_entry(p)).collect()
 }
 
 /// TLS trust-store roots a network-enabled policy needs to be able to read.
@@ -284,6 +364,23 @@ impl SandboxPolicy {
         self
     }
 
+    /// Reduce every `deny_read`/`deny_write` entry to a literal path, erroring
+    /// on any that cannot be expressed as a sandbox rule.
+    ///
+    /// See [`SandboxPolicy::deny_read`] for the accepted shapes. Applied by
+    /// [`SandboxPolicy::wrap_command`] on every backend, so an unexpressible
+    /// deny refuses the command instead of quietly leaving the path readable.
+    pub fn with_denies_normalized(&self) -> Result<Self, String> {
+        Ok(Self {
+            deny_read: normalize_deny_paths(&self.deny_read)?,
+            deny_write: normalize_deny_paths(&self.deny_write)?,
+            network: self.network,
+            fs_read: self.fs_read.clone(),
+            fs_write: self.fs_write.clone(),
+            allowed_domains: self.allowed_domains.clone(),
+        })
+    }
+
     /// Wrap a command with platform-specific sandbox isolation.
     pub fn wrap_command(
         &self,
@@ -291,12 +388,21 @@ impl SandboxPolicy {
         args: &[String],
         tool_dir: &std::path::Path,
     ) -> SandboxCommand {
+        // Normalize first, on every backend: a deny rule we cannot express must
+        // stop the command, never be dropped on the way to the backend. Done
+        // here rather than in `configured()` so it also covers policies built
+        // by hand, and so the callers of `configured()` keep their signatures.
+        let policy = match self.with_denies_normalized() {
+            Ok(policy) => policy,
+            Err(e) => return fail_closed("unenforceable sandbox deny rule", &e),
+        };
+
         if cfg!(target_os = "macos") {
-            self.wrap_seatbelt(program, args, tool_dir)
+            policy.wrap_seatbelt(program, args, tool_dir)
         } else if cfg!(target_os = "linux") {
-            self.wrap_bubblewrap(program, args, tool_dir)
+            policy.wrap_bubblewrap(program, args, tool_dir)
         } else if cfg!(target_os = "windows") {
-            self.wrap_windows(program, args, tool_dir)
+            policy.wrap_windows(program, args, tool_dir)
         } else {
             tracing::warn!("Sandboxing not available on this platform; running unsandboxed");
             SandboxCommand::passthrough(program, args)
@@ -470,6 +576,151 @@ mod blocked_path_tests {
                 "/home/u/project".to_string(),
                 "/home/u/.aws_notes".to_string()
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod deny_normalization_tests {
+    use super::*;
+
+    /// Spec: the documented `~/.borg/**` spelling must reach the backends as
+    /// the path it denies, not be dropped. Before this, bwrap's `hide_path`
+    /// found no such file and emitted no rule at all — the deny failed open.
+    #[test]
+    fn a_trailing_recursive_glob_normalizes_to_its_directory() {
+        for entry in ["/home/u/.borg/**", "/home/u/.borg/*"] {
+            assert_eq!(
+                normalize_deny_entry(entry).unwrap(),
+                "/home/u/.borg",
+                "{entry} must reduce to the directory it denies"
+            );
+        }
+    }
+
+    /// Spec: a pattern with no literal directory prefix cannot become a rule,
+    /// so it must be an error rather than a silently missing deny.
+    #[test]
+    fn an_unexpressible_glob_is_rejected() {
+        let cases = [
+            "/**/*.env",
+            "/home/*/.ssh",
+            "/home/u/id_?sa",
+            "/home/u/[abc]",
+        ];
+        for entry in cases {
+            let err = normalize_deny_entry(entry)
+                .expect_err("{entry} is not expressible and must not be accepted");
+            assert!(
+                err.contains("paths, not globs"),
+                "{entry}: error must say why: {err}"
+            );
+        }
+    }
+
+    /// A bare `/**` strips to nothing; denying the whole root is not a rule
+    /// either backend can express, so it must not silently become a no-op.
+    #[test]
+    fn an_entry_that_strips_to_empty_is_rejected() {
+        assert!(normalize_deny_entry("/**").is_err());
+    }
+
+    #[test]
+    fn a_literal_path_is_unchanged() {
+        assert_eq!(
+            normalize_deny_entry("/home/u/.ssh").unwrap(),
+            "/home/u/.ssh"
+        );
+    }
+
+    /// Both deny lists are normalized, and an error in either one loses the
+    /// whole policy — there is no partial policy to accidentally run under.
+    #[test]
+    fn normalization_covers_both_deny_lists() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/a/**".to_string()],
+            deny_write: vec!["/b/*".to_string()],
+            ..Default::default()
+        };
+        let normalized = policy.with_denies_normalized().unwrap();
+        assert_eq!(normalized.deny_read, vec!["/a".to_string()]);
+        assert_eq!(normalized.deny_write, vec!["/b".to_string()]);
+
+        let bad = SandboxPolicy {
+            deny_write: vec!["/**/*.env".to_string()],
+            ..Default::default()
+        };
+        assert!(bad.with_denies_normalized().is_err());
+    }
+
+    /// Spec: the refusal stub must never interpolate a config-supplied path
+    /// into its shell script. `{:?}` escapes double quotes and backslashes but
+    /// not single quotes, so a deny entry carrying one would close the literal
+    /// and run as a command — inside the one code path whose entire job is to
+    /// refuse to run anything.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn the_refusal_stub_never_interpolates_a_path_into_its_script() {
+        let hostile = "/tmp/'; touch /tmp/borg-pwned; echo '*";
+        let policy = SandboxPolicy {
+            deny_read: vec![hostile.to_string()],
+            ..Default::default()
+        };
+        let cmd = policy.wrap_command(
+            "echo",
+            &["hi".to_string()],
+            std::path::Path::new("/tmp/tool"),
+        );
+
+        let script = &cmd.args[1];
+        assert!(
+            !script.contains("borg-pwned"),
+            "the offending path must not reach the script body: {script}"
+        );
+        assert!(
+            cmd.args.last().is_some_and(|m| m.contains("borg-pwned")),
+            "the path belongs in the message argument, not the script"
+        );
+
+        // And the stub still refuses, loudly.
+        let out = std::process::Command::new(&cmd.program)
+            .args(&cmd.args)
+            .output()
+            .expect("the refusal stub must be runnable");
+        assert!(
+            !out.status.success(),
+            "an unenforceable deny must not exit 0"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Borg sandbox setup failed"),
+            "the refusal must explain itself on stderr"
+        );
+        assert!(
+            !std::path::Path::new("/tmp/borg-pwned").exists(),
+            "the injected command must not have run"
+        );
+    }
+
+    /// The whole point: an unenforceable deny must stop the command. A
+    /// wrapper that ran the program anyway would be the fail-open bug in a
+    /// new place.
+    #[test]
+    fn wrap_command_refuses_an_unenforceable_deny() {
+        let policy = SandboxPolicy {
+            fs_read: vec!["/".to_string()],
+            deny_read: vec!["/**/*.env".to_string()],
+            ..Default::default()
+        };
+        let cmd = policy.wrap_command(
+            "cat",
+            &["/etc/hosts".to_string()],
+            std::path::Path::new("/tmp/tool"),
+        );
+        assert_ne!(cmd.program, "cat", "the real program must never run");
+        assert!(
+            cmd.args.iter().any(|a| a.contains("exit 1")),
+            "the stub must exit non-zero: {:?}",
+            cmd.args
         );
     }
 }

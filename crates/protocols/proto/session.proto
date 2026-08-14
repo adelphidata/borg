@@ -105,6 +105,10 @@ message SendRequest {
   // untrusted-content boundary, because the content model has no document
   // part. Non-text bytes are refused daemon-side.
   repeated InlineDocument documents = 4;
+  // Resume the turn that was cut short instead of starting a new one. The
+  // agent continues from its own partial reply; `text`, `images`, and
+  // `documents` must be empty.
+  bool resume_interrupted = 5;
 }
 
 message InlineDocument {

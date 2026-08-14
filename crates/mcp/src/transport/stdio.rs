@@ -103,9 +103,12 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
 
     for (key, value) in std::env::vars() {
         if is_env_allowed(&key) {
+            let value = super::absolutize_ca_path(&key, &value);
             cmd.env(key, value);
         }
     }
+    // Applied last so an explicit per-server `env` entry always wins over an
+    // inherited one.
     for (key, value) in &config.env {
         cmd.env(key, value);
     }
@@ -120,6 +123,13 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
     } else {
         None
     };
+
+    // Windows counterpart to the unix process group the watchdog relies on:
+    // hold the server in a kill-on-close job so its descendants cannot outlive
+    // it. Inert on unix, and `None` (keep the existing cleanup) on any failure.
+    let job = child.id().and_then(|pid| {
+        crate::job_object::contain(pid, &config.server_name, crate::job_object::OnClose::Kill)
+    });
 
     let stdin = child.stdin.take().ok_or_else(|| {
         McpError::Connect(format!("child '{}' produced no stdin", config.command))
@@ -173,6 +183,7 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
         stderr_pump: Some(stderr_pump),
         server_name: config.server_name,
         watchdog_pid,
+        job,
     })
 }
 
@@ -242,6 +253,11 @@ pub struct StdioTransport {
     /// catchable `SIGTERM` here asks it to reap the real server group. `None`
     /// for direct spawns (non-unix), which rely on `kill_on_drop`.
     watchdog_pid: Option<i32>,
+    /// Windows containment for the server's descendants. Held for the
+    /// transport's whole life: the job kills its members when the last handle
+    /// closes, so dropping this is what reaps the tree. Always `None` on unix,
+    /// where the watchdog's process group does the same job.
+    job: Option<crate::job_object::JobObject>,
 }
 
 impl StdioTransport {
@@ -355,6 +371,13 @@ impl Transport for StdioTransport {
         // Drop path can't re-`SIGTERM` a recycled pid (PID reuse would land the
         // signal on an unrelated process during heavy spawn churn).
         self.watchdog_pid = None;
+        // Kill anything the server left behind. The server itself is already
+        // gone by here; this is for the descendants `start_kill` never reached.
+        // Dropping the job would do the same, but `close` promises the tree is
+        // down by the time it returns, not whenever the transport is dropped.
+        if let Some(job) = self.job.take() {
+            job.terminate();
+        }
         Ok(())
     }
 }

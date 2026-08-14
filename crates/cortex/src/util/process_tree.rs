@@ -75,16 +75,16 @@ pub(crate) fn wait_or_kill_group(
 
 /// Send `sig` to every process in `pgid`.
 ///
-/// Best-effort: `ESRCH` (the group is already gone) and every other failure are
-/// ignored — the caller's `wait` is what actually reaps the direct child.
+/// Best-effort: `ESRCH` (the group is already gone) is ignored — the caller's
+/// `wait` is what actually reaps the direct child.
+///
+/// Delegates to [`mcp::process_group::signal_group_or_members`], which retries
+/// per-member when macOS refuses the group call with `EPERM`. Signalling the
+/// group and dropping the result silently left every descendant alive on
+/// Borg's primary platform.
 #[cfg(unix)]
 pub(crate) fn signal_group(pgid: i32, sig: i32) {
-    // SAFETY: FFI call to `killpg`. `pgid` is our own child's process group —
-    // the child leads its group via `spawn_in_own_group` at spawn time — so we
-    // never signal an unrelated group. A non-zero return is ignored.
-    unsafe {
-        libc::killpg(pgid, sig);
-    }
+    mcp::process_group::signal_group_or_members(pgid, sig);
 }
 
 /// SIGKILL the process group led by `pid`, for the abandon path where there is

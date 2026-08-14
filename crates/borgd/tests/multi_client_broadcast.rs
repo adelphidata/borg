@@ -160,6 +160,7 @@ async fn two_clients_subscribed_to_same_session_see_identical_event_streams() {
             text: "go".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send")

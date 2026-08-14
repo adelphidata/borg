@@ -125,6 +125,19 @@ pub trait SessionBackend: Send + Sync + 'static {
         text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
     );
 
+    /// Resume the turn that was cut short, with no new user message.
+    ///
+    /// Emits events on the same channel `run_turn` uses, so the caller's
+    /// forwarder cannot tell the two apart. Backends that hold no agent report
+    /// the limitation as a turn error rather than failing the RPC — the
+    /// session is otherwise healthy.
+    async fn resume_turn(&self, event_tx: mpsc::Sender<AgentEvent>, _cancel: CancellationToken) {
+        let msg = "resuming an interrupted turn is not supported by this session";
+        if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
+            tracing::warn!(error = %e, "failed to surface unsupported resume");
+        }
+    }
+
     /// Stable session id (for logs / SessionRegistry indexing).
     fn session_id(&self) -> &str;
 
@@ -543,6 +556,43 @@ impl SessionBackend for AgentBackend {
             tracing::warn!(session_id = %self.session_id, error = %chained, "agent turn failed");
             if let Err(send_err) = event_tx.send(AgentEvent::Error(chained)).await {
                 tracing::warn!(error = %send_err, "failed to surface agent error to client");
+            }
+        }
+    }
+
+    async fn resume_turn(&self, event_tx: mpsc::Sender<AgentEvent>, cancel: CancellationToken) {
+        // Same two guards `run_turn` applies, and for the same reasons: a
+        // resume is a turn, so it must not overlap another one and must not
+        // advance a session this worker does not own.
+        let mut agent = match self.agent.try_lock() {
+            Ok(a) => a,
+            Err(_) => {
+                let msg = "another turn is already in flight for this session";
+                tracing::warn!(session_id = %self.session_id, "{msg}");
+                if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
+                    tracing::warn!(error = %e, "failed to surface concurrent-turn error");
+                }
+                return;
+            }
+        };
+
+        if let LeaseStatus::Conflict = self.acquire_lease().await {
+            let msg = "this session is owned by another worker; cannot run the turn here";
+            tracing::warn!(session_id = %self.session_id, "{msg}");
+            if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
+                tracing::warn!(error = %e, "failed to surface session-ownership conflict");
+            }
+            return;
+        }
+
+        if let Err(e) = agent
+            .resume_interrupted_turn(event_tx.clone(), cancel)
+            .await
+        {
+            let chained = format!("{e:#}");
+            tracing::warn!(session_id = %self.session_id, error = %chained, "resume failed");
+            if let Err(send_err) = event_tx.send(AgentEvent::Error(chained)).await {
+                tracing::warn!(error = %send_err, "failed to surface resume error to client");
             }
         }
     }

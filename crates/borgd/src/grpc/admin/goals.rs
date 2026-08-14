@@ -196,6 +196,14 @@ pub(super) async fn set_goal(
     let bus = svc.goal_bus_handle();
     let outcome = async {
         let db = Database::open().await.map_err(SetGoalError::Internal)?;
+        // The ceiling is a DB-backed setting, so it is read per mutation
+        // rather than captured at daemon start — `borg settings set` must take
+        // effect on the next `/goal`, not the next restart.
+        let max_budget = cortex::config::Config::load_from_db()
+            .await
+            .map_err(SetGoalError::Internal)?
+            .goals
+            .max_token_budget;
         // Create/Replace autocreate a session when none exists so `/goal
         // <text>` works on a freshly-launched TUI without forcing the user
         // to send a message first. Status/budget mutations still require
@@ -218,7 +226,7 @@ pub(super) async fn set_goal(
             GoalMutationOp::Create => {
                 let obj = cortex::goals::validate_objective(&objective)
                     .map_err(SetGoalError::Invalid)?;
-                let budget = cortex::goals::validate_budget(token_budget)
+                let budget = cortex::goals::validate_budget(token_budget, max_budget)
                     .map_err(SetGoalError::Invalid)?;
                 let inserted = db
                     .insert_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
@@ -235,7 +243,7 @@ pub(super) async fn set_goal(
             GoalMutationOp::Replace => {
                 let obj = cortex::goals::validate_objective(&objective)
                     .map_err(SetGoalError::Invalid)?;
-                let budget = cortex::goals::validate_budget(token_budget)
+                let budget = cortex::goals::validate_budget(token_budget, max_budget)
                     .map_err(SetGoalError::Invalid)?;
                 let existed = db
                     .get_goal(&session_id)
@@ -335,7 +343,7 @@ pub(super) async fn set_goal(
                 })
             }
             GoalMutationOp::SetBudget => {
-                let budget = cortex::goals::validate_budget(token_budget)
+                let budget = cortex::goals::validate_budget(token_budget, max_budget)
                     .map_err(SetGoalError::Invalid)?;
                 let current = db
                     .get_goal(&session_id)

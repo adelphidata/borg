@@ -876,6 +876,7 @@ impl Agent {
                                 db,
                                 &self.session.meta.id,
                                 self.config.goals.default_token_budget,
+                                self.config.goals.max_token_budget,
                             )
                             .await
                         }

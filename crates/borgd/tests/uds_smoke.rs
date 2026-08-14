@@ -199,6 +199,81 @@ async fn uds_channel(socket: PathBuf) -> Channel {
         .expect("connect")
 }
 
+/// Spec: a resume carries no new user content. Text sent alongside
+/// `resume_interrupted` would be silently dropped — the resume path never
+/// reads it — so the daemon must refuse instead of quietly losing the user's
+/// message.
+#[tokio::test]
+async fn a_resume_carrying_a_message_is_refused_rather_than_dropped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let backend = ScriptedBackend::new("s1", |_text, tx, _cancel| {
+        tokio::spawn(async move {
+            let _ = tx.send(CoreEvent::TurnComplete).await;
+        })
+    });
+    let factory = StubFactory::new(backend);
+    let (socket, _shutdown) = spawn_session_service(tmp.path(), factory).await;
+
+    let mut client = SessionClient::new(uds_channel(socket).await);
+    let opened = client
+        .open(OpenRequest {
+            resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
+        })
+        .await
+        .expect("open ok")
+        .into_inner();
+
+    let status = client
+        .send(SendRequest {
+            session_id: opened.session_id.clone(),
+            text: "and also do this".into(),
+            images: Vec::new(),
+            documents: Vec::new(),
+            resume_interrupted: true,
+        })
+        .await
+        .expect_err("a resume with a message must be refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("ordinary turn"),
+        "the refusal must name the next action: {}",
+        status.message()
+    );
+
+    // A bare resume is accepted and routed to `resume_turn`, not `run_turn`.
+    // This backend scripts `run_turn` to answer TurnComplete and inherits the
+    // trait's default `resume_turn`, which reports the limitation as a turn
+    // error — so the arm that answers proves which one the daemon called.
+    let mut stream = client
+        .send(SendRequest {
+            session_id: opened.session_id.clone(),
+            text: String::new(),
+            images: Vec::new(),
+            documents: Vec::new(),
+            resume_interrupted: true,
+        })
+        .await
+        .expect("a bare resume must be accepted")
+        .into_inner();
+    let mut reported = None;
+    while let Some(item) = stream.next().await {
+        match item.expect("evt ok").kind {
+            Some(Kind::Error(e)) => reported = Some(e.message),
+            Some(Kind::TurnComplete(_)) => {
+                panic!("a resume must not be routed to run_turn")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        reported.is_some_and(|m| m.contains("resuming an interrupted turn")),
+        "the resume must reach the backend's resume path"
+    );
+}
+
 #[tokio::test]
 async fn open_send_streams_deltas_and_terminates_on_turn_complete() {
     // Real failure mode: the per-turn server-stream from `Session.Send` would
@@ -236,6 +311,7 @@ async fn open_send_streams_deltas_and_terminates_on_turn_complete() {
             text: "go".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send ok")
@@ -300,6 +376,7 @@ async fn cancel_during_turn_aborts_within_500ms_and_emits_error() {
             text: "long".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send ok")
@@ -368,6 +445,7 @@ async fn stream_resume_after_disconnect_replays_missed_events_with_no_dupes() {
             text: "go".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send ok")
@@ -468,6 +546,7 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
             text: "delete".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send ok")
@@ -546,6 +625,7 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
             text: "first".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send 0")
@@ -567,6 +647,7 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
             text: "second".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send 1")
@@ -670,6 +751,7 @@ async fn get_state_reports_whether_a_turn_is_in_flight() {
             text: "go".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("send ok")

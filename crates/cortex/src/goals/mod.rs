@@ -175,13 +175,24 @@ pub fn validate_objective(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Validate a token budget. `None` is unbounded and always valid; `Some(n)`
-/// must be strictly positive.
-pub fn validate_budget(budget: Option<i64>) -> Result<Option<i64>, String> {
-    match budget {
-        None => Ok(None),
-        Some(n) if n > 0 => Ok(Some(n)),
-        Some(n) => Err(format!("token_budget must be positive (got {n})")),
+/// Validate a token budget against an optional ceiling.
+///
+/// `budget: None` is unbounded and always valid; `Some(n)` must be strictly
+/// positive. When `max` is set, a budget above it is rejected — an unchecked
+/// budget lets a model opt out of the limit that bounds the Ralph loop simply
+/// by asking for a large enough number.
+pub fn validate_budget(budget: Option<i64>, max: Option<i64>) -> Result<Option<i64>, String> {
+    let n = match budget {
+        None => return Ok(None),
+        Some(n) if n > 0 => n,
+        Some(n) => return Err(format!("token_budget must be positive (got {n})")),
+    };
+    match max {
+        Some(max) if n > max => Err(format!(
+            "token_budget {n} exceeds the configured maximum of {max} \
+             (raise goals.max_token_budget to allow it)"
+        )),
+        _ => Ok(Some(n)),
     }
 }
 
@@ -271,13 +282,47 @@ mod tests {
 
     #[test]
     fn validate_budget_rejects_zero_and_negative() {
-        assert!(validate_budget(Some(0)).is_err());
-        assert!(validate_budget(Some(-1)).is_err());
+        assert!(validate_budget(Some(0), None).is_err());
+        assert!(validate_budget(Some(-1), None).is_err());
     }
 
     #[test]
     fn validate_budget_accepts_none_and_positive() {
-        assert_eq!(validate_budget(None).unwrap(), None);
-        assert_eq!(validate_budget(Some(100)).unwrap(), Some(100));
+        assert_eq!(validate_budget(None, None).unwrap(), None);
+        assert_eq!(validate_budget(Some(100), None).unwrap(), Some(100));
+    }
+
+    /// Spec: the ceiling is what keeps a budget meaningful. Without it a model
+    /// can ask for a number large enough that the Ralph loop is effectively
+    /// unbounded again.
+    #[test]
+    fn validate_budget_enforces_the_ceiling() {
+        let max = Some(1_000);
+        assert_eq!(validate_budget(Some(999), max).unwrap(), Some(999));
+        assert_eq!(
+            validate_budget(Some(1_000), max).unwrap(),
+            Some(1_000),
+            "the ceiling itself must be allowed"
+        );
+
+        let err = validate_budget(Some(1_001), max).expect_err("above the ceiling");
+        assert!(
+            err.contains("1001") && err.contains("1000"),
+            "the error must name both numbers: {err}"
+        );
+        assert!(
+            err.contains("goals.max_token_budget"),
+            "the error must name the setting that would allow it: {err}"
+        );
+    }
+
+    /// An unset ceiling must not start rejecting budgets that were valid
+    /// before — the default is still unbounded.
+    #[test]
+    fn validate_budget_without_a_ceiling_is_unchanged() {
+        assert_eq!(
+            validate_budget(Some(i64::MAX), None).unwrap(),
+            Some(i64::MAX)
+        );
     }
 }

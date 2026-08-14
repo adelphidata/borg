@@ -737,6 +737,26 @@ async fn handle_export(
     session_id: &str,
     format: cortex::export::ExportFormat,
 ) {
+    handle_export_to(
+        app,
+        client,
+        session_id,
+        format,
+        &crate::tui::app::ExportDestination::DefaultFile,
+    )
+    .await;
+}
+
+/// As [`handle_export`], but honouring an explicit destination.
+async fn handle_export_to(
+    app: &mut App<'_>,
+    client: &mut DaemonClient,
+    session_id: &str,
+    format: cortex::export::ExportFormat,
+    destination: &crate::tui::app::ExportDestination,
+) {
+    use crate::tui::app::ExportDestination;
+
     let format_str = format.as_str();
     // TUI exports always redact (fail-closed default); the raw-output escape
     // hatch is the CLI's `borg export --no-redact`.
@@ -749,13 +769,59 @@ async fn handle_export(
     };
     let rendered = String::from_utf8_lossy(&resp.content).into_owned();
     let filename = resp.suggested_filename;
-    let path = match std::env::current_dir() {
-        Ok(cwd) => cwd.join(&filename),
-        Err(e) => {
-            app.push_system_message(format!("Export failed (cwd): {e}"));
+    let short: String = session_id.chars().take(8).collect();
+
+    let target = match destination {
+        ExportDestination::Clipboard => {
+            match copy_to_clipboard(&rendered) {
+                Ok(()) => app.push_system_message(format!(
+                    "Copied session {} to the clipboard ({} bytes, {format_str}).",
+                    short,
+                    rendered.len()
+                )),
+                // A clipboard is absent over SSH and in most CI shells. Say so
+                // and name the fallback rather than reporting a bare error.
+                Err(e) => app.push_system_message(format!(
+                    "Could not reach the clipboard: {e}\nExport to a file instead: /export {format_str} <path>"
+                )),
+            }
             return;
         }
+        ExportDestination::File(path) => path.clone(),
+        ExportDestination::DefaultFile => std::path::PathBuf::from(&filename),
     };
+
+    // A relative path resolves against the directory the user is looking at.
+    let path = if target.is_absolute() {
+        target
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&target),
+            Err(e) => {
+                app.push_system_message(format!("Export failed (cwd): {e}"));
+                return;
+            }
+        }
+    };
+
+    // A path ending in a separator, or naming an existing directory, means
+    // "put the suggested filename in here" rather than "write a file with a
+    // directory's name" — which would fail with a confusing OS error.
+    let path = if path.is_dir() {
+        path.join(&filename)
+    } else {
+        path
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            app.push_system_message(format!(
+                "Export aborted: {} does not exist.",
+                parent.display()
+            ));
+            return;
+        }
+    }
     // create_new closes the TOCTOU window between exists() and write(). If the
     // filename already exists (same second stamp, rapid re-export), fail loudly
     // rather than clobber — the transcript message tells the user.
@@ -779,8 +845,35 @@ async fn handle_export(
             return;
         }
     }
-    let short: String = session_id.chars().take(8).collect();
     app.push_system_message(format!("Exported session {} → {}", short, path.display()));
+}
+
+/// Put `text` on the system clipboard.
+///
+/// Separate from the caller so the "no clipboard here" case (SSH, most CI
+/// shells) surfaces as a message naming the file fallback, not a bare error.
+/// The clipboard handle, kept alive for the life of the process.
+///
+/// On X11 and Wayland the clipboard is owned by a *running* process: the
+/// selection dies with the handle that set it, so a handle dropped at the end
+/// of the call would leave the user a success message and an empty paste
+/// buffer. macOS and Windows copy into a system-owned pasteboard and do not
+/// care, but they share the path.
+static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut held = CLIPBOARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.is_none() {
+        *held = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    let clipboard = held
+        .as_mut()
+        .ok_or_else(|| "clipboard handle unavailable".to_string())?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// User-facing message after a `/update --check` (dry-run) completes.
@@ -1120,6 +1213,39 @@ async fn run_event_loop(
                     }
                 });
             }
+            AppAction::ResumeInterruptedTurn { event_tx, cancel } => {
+                draw_viewport(tui, app)?;
+                // Same cancel bridge an ordinary turn gets: a resumed turn is
+                // a turn, so Ctrl+C must reach `Session.Cancel`.
+                {
+                    let mut cancel_client = client.clone();
+                    let sid = session_id.to_string();
+                    let cancel_for_task = cancel.clone();
+                    tokio::spawn(async move {
+                        cancel_for_task.cancelled().await;
+                        if let Err(e) = cancel_client.cancel(&sid).await {
+                            tracing::warn!(error = %e, "Session.Cancel failed");
+                        }
+                    });
+                }
+
+                let mut send_client = client.clone();
+                let sid = session_id.to_string();
+                tokio::spawn(async move {
+                    match send_client.resume_interrupted_turn(&sid).await {
+                        Ok(stream) => {
+                            forward_event_stream(send_client, sid, stream, event_tx).await;
+                        }
+                        Err(e) => {
+                            if let Err(send_err) =
+                                event_tx.send(AgentEvent::Error(format!("{e:#}"))).await
+                            {
+                                tracing::warn!(error = %send_err, "failed to surface resume error");
+                            }
+                        }
+                    }
+                });
+            }
             AppAction::ForkSession => {
                 // Forking writes to SQLite (new session row + copied messages).
                 // The daemon is the single writer — do NOT open the DB here.
@@ -1320,7 +1446,10 @@ async fn run_event_loop(
             AppAction::ExportSession { id, format } => {
                 handle_export(app, client, &id, format).await;
             }
-            AppAction::ExportCurrentSession { format } => {
+            AppAction::ExportCurrentSession {
+                format,
+                destination,
+            } => {
                 let id = match client.get_state(session_id).await {
                     Ok(s) => s.agent_session_id,
                     Err(e) => {
@@ -1328,7 +1457,7 @@ async fn run_event_loop(
                         continue;
                     }
                 };
-                handle_export(app, client, &id, format).await;
+                handle_export_to(app, client, &id, format, &destination).await;
             }
             AppAction::LoadSession { id } => {
                 // Clear existing UI state before loading a new session.

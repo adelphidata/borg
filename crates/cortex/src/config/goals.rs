@@ -20,6 +20,13 @@ pub struct GoalsConfig {
     /// one. `None` = unbounded. The tool handler reads this on every
     /// `create_goal` invocation.
     pub default_token_budget: Option<i64>,
+    /// Ceiling on any goal's `token_budget`. `None` = no ceiling.
+    ///
+    /// A budget is what stops a Ralph loop from running until the credit runs
+    /// out, so a model that asks for an enormous one has effectively disabled
+    /// it. `create_goal` rejects a request above this, and a goal created with
+    /// no budget at all inherits this value rather than becoming unbounded.
+    pub max_token_budget: Option<i64>,
     /// Per-gate wall-clock budget, in milliseconds. A gate that overruns counts
     /// as failed — a test suite that hangs is not evidence the goal is done.
     #[serde(default = "default_gate_timeout_ms")]
@@ -52,6 +59,7 @@ impl Default for GoalsConfig {
         Self {
             enabled: true,
             default_token_budget: None,
+            max_token_budget: None,
             gate_timeout_ms: default_gate_timeout_ms(),
             gate_max_attempts: default_gate_max_attempts(),
         }

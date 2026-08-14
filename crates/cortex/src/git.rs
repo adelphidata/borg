@@ -429,6 +429,120 @@ pub(crate) async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
     run_git_inner(args, cwd, &[]).await
 }
 
+/// `git status --porcelain` result, in the `Clone`able shape a shared future
+/// needs. `anyhow::Error` is not `Clone`, so the error is flattened to its
+/// rendered text — every consumer of this treats a failed status as "unknown"
+/// and only ever reports the message.
+type StatusResult = std::result::Result<String, String>;
+
+/// In-flight `git status --porcelain` scans, keyed by canonical repository root.
+///
+/// `workspace_fingerprint` runs at every goal turn boundary and
+/// `collect_git_context` at every prompt build, so on a large tree several
+/// identical scans were routinely in flight at once. Entries are removed as
+/// soon as the scan completes: this deduplicates concurrent callers, it is not
+/// a cache, and a later caller always gets a fresh scan.
+static STATUS_SCANS_IN_FLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, futures::future::Shared<BoxedStatusFuture>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Removes a repository's in-flight entry when the scan task ends, however it
+/// ends.
+struct InFlightEntry(PathBuf);
+
+impl Drop for InFlightEntry {
+    fn drop(&mut self) {
+        STATUS_SCANS_IN_FLIGHT
+            .lock()
+            // A poisoned lock means another scan panicked. The map holds no
+            // invariant worth preserving, and skipping the removal here is the
+            // one thing that must not happen.
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+type BoxedStatusFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = StatusResult> + Send + 'static>>;
+
+/// Number of `git status` subprocesses actually started, per repository, for
+/// the coalescing tests. Deduplication is invisible from the outside — callers
+/// get the same answer either way — so counting the leaders is the only way to
+/// assert it. Keyed per repository so a test that owns its own temporary repo
+/// is unaffected by scans other tests run in parallel.
+#[cfg(test)]
+static STATUS_SCANS_STARTED: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// How many scans have been started for `repo_root` since the process began.
+#[cfg(test)]
+fn scans_started_for(repo_root: &Path) -> usize {
+    let key = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let map = STATUS_SCANS_STARTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.get(&key).copied().unwrap_or(0)
+}
+
+/// Run `git status --porcelain` in `repo_root`, sharing one invocation between
+/// concurrent callers for the same repository.
+///
+/// Keyed on the canonicalized root so a sibling directory, a symlink alias, and
+/// the root itself all collapse to a single scan.
+async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
+    let key = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+
+    let shared = {
+        // A std mutex, held only across the map lookup and insert — never
+        // across the await below.
+        let mut in_flight = match STATUS_SCANS_IN_FLIGHT.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock means some other caller panicked mid-scan. The
+            // map holds no invariant worth preserving, so carry on with it.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(existing) = in_flight.get(&key) {
+            existing.clone()
+        } else {
+            // Spawned rather than run inline so the scan still completes (and
+            // still removes its entry) if the caller that started it is
+            // cancelled mid-turn. A leader that vanished without clearing the
+            // map would wedge every later caller behind a dead future.
+            let scan_key = key.clone();
+            #[cfg(test)]
+            {
+                let mut started = STATUS_SCANS_STARTED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *started.entry(key.clone()).or_insert(0) += 1;
+            }
+            let handle = tokio::spawn(async move {
+                // A drop guard, not a trailing statement: if `run_git` panics
+                // or the task is dropped, the entry must still go. A stranded
+                // entry is permanent — the `Shared` future stays resolved, so
+                // every later caller for this repo would be served the same
+                // stale answer (or the same error) for the process lifetime,
+                // and `workspace_fingerprint` would stop noticing real edits.
+                let _entry = InFlightEntry(scan_key.clone());
+                run_git(&["status", "--porcelain"], &scan_key)
+                    .await
+                    .map_err(|e| e.to_string())
+            });
+            let future: BoxedStatusFuture = Box::pin(async move {
+                handle
+                    .await
+                    .unwrap_or_else(|e| Err(format!("git status task failed: {e}")))
+            });
+            let shared = futures::FutureExt::shared(future);
+            in_flight.insert(key, shared.clone());
+            shared
+        }
+    };
+
+    shared.await
+}
+
 /// A cheap "has the tree changed?" token: `HEAD` plus a digest of
 /// `git status --porcelain`.
 ///
@@ -444,7 +558,7 @@ pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
     let repo_root = find_repo_root(cwd)?;
     let (head, status) = tokio::join!(
         run_git(&["rev-parse", "HEAD"], &repo_root),
-        run_git(&["status", "--porcelain"], &repo_root),
+        git_status_porcelain(&repo_root),
     );
     // A repo with no commits yet has no HEAD; its status alone still
     // distinguishes states, so substitute a placeholder rather than bail.
@@ -503,7 +617,7 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
         run_git(&["branch", "--show-current"], work_dir),
         run_git(&["rev-parse", "--short", "HEAD"], work_dir),
         run_git(&["log", "--oneline", "-5", "--no-decorate"], work_dir),
-        run_git(&["status", "--porcelain"], work_dir),
+        git_status_porcelain(work_dir),
         run_git(&["remote", "get-url", "origin"], work_dir),
     );
 
@@ -690,6 +804,149 @@ async fn run_git_with_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a throwaway repo with a dirty worktree so `git status` has
+    /// something to report.
+    fn temp_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join("tracked.txt"), "hello").unwrap();
+        dir
+    }
+
+    /// Spec: concurrent callers for one repository share a single
+    /// `git status` subprocess. `workspace_fingerprint` (every goal turn
+    /// boundary) and `collect_git_context` (every prompt build) overlap
+    /// routinely, and each was paying for its own scan of the whole tree.
+    #[tokio::test]
+    async fn concurrent_status_scans_share_one_subprocess() {
+        let repo = temp_repo();
+
+        // All eight futures are constructed first, so the first one to be
+        // polled registers the in-flight entry that the other seven find.
+        // `git status` takes milliseconds; the remaining polls take
+        // microseconds, so the leader cannot finish before they arrive.
+        let results =
+            futures::future::join_all((0..8).map(|_| git_status_porcelain(repo.path()))).await;
+
+        assert_eq!(
+            scans_started_for(repo.path()),
+            1,
+            "eight concurrent callers must share one scan"
+        );
+        let first = results[0].as_ref().expect("status succeeds");
+        for r in &results {
+            assert_eq!(
+                r.as_ref().expect("every caller gets the result"),
+                first,
+                "a shared scan must give every caller the same answer"
+            );
+        }
+        assert!(
+            first.contains("tracked.txt"),
+            "the untracked file must show up: {first:?}"
+        );
+    }
+
+    /// Spec: deduplication is per repository. Two repos must not collapse into
+    /// one scan, or a second workspace would read the first one's status.
+    #[tokio::test]
+    async fn different_repositories_scan_independently() {
+        let a = temp_repo();
+        let b = temp_repo();
+        std::fs::write(b.path().join("only-in-b.txt"), "x").unwrap();
+
+        let (ra, rb) = tokio::join!(
+            git_status_porcelain(a.path()),
+            git_status_porcelain(b.path())
+        );
+        assert_eq!(
+            (scans_started_for(a.path()), scans_started_for(b.path())),
+            (1, 1),
+            "two repositories need one scan each, not a shared one"
+        );
+
+        assert!(!ra.unwrap().contains("only-in-b.txt"));
+        assert!(rb.unwrap().contains("only-in-b.txt"));
+    }
+
+    /// Spec: this deduplicates, it does not cache. A caller arriving after the
+    /// previous scan finished must see changes made in between.
+    #[tokio::test]
+    async fn a_later_caller_gets_a_fresh_scan() {
+        let repo = temp_repo();
+        let first = git_status_porcelain(repo.path()).await.unwrap();
+        assert!(!first.contains("added-later.txt"));
+
+        std::fs::write(repo.path().join("added-later.txt"), "x").unwrap();
+
+        let second = git_status_porcelain(repo.path()).await.unwrap();
+        assert_eq!(
+            scans_started_for(repo.path()),
+            2,
+            "the completed scan must have been evicted, not reused"
+        );
+        assert!(
+            second.contains("added-later.txt"),
+            "a stale answer would make the goal-loop fingerprint miss real work: {second:?}"
+        );
+    }
+
+    /// Spec: a scan that ends abnormally must still release its in-flight
+    /// entry. A stranded entry is permanent — the resolved `Shared` future
+    /// would serve the same answer to every later caller for that repository,
+    /// so `workspace_fingerprint` would stop seeing real edits and the goal
+    /// quality gates would replay instead of re-running.
+    #[tokio::test]
+    async fn an_abandoned_scan_releases_its_slot() {
+        let repo = temp_repo();
+        let key = std::fs::canonicalize(repo.path()).expect("canonicalize");
+
+        // Park an entry the way a leader task does, then end the task by
+        // unwinding rather than returning.
+        let panicked = tokio::spawn({
+            let key = key.clone();
+            async move {
+                let _entry = InFlightEntry(key.clone());
+                STATUS_SCANS_IN_FLIGHT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        key,
+                        futures::FutureExt::shared(
+                            Box::pin(std::future::pending()) as BoxedStatusFuture
+                        ),
+                    );
+                panic!("the scan subprocess blew up");
+            }
+        })
+        .await;
+        assert!(panicked.is_err(), "the test's scan task must have panicked");
+
+        assert!(
+            STATUS_SCANS_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .is_none(),
+            "a panicking scan must still release its slot, or this repository \
+             is wedged on a stale answer for the process lifetime"
+        );
+
+        // The repository scans normally afterwards rather than resolving to
+        // the parked future, which would never complete.
+        let status = git_status_porcelain(repo.path())
+            .await
+            .expect("a released slot must allow a fresh scan");
+        assert!(status.contains("tracked.txt"));
+    }
 
     #[test]
     fn find_repo_root_in_git_dir() {

@@ -130,6 +130,7 @@ impl App<'_> {
                 return Some(Ok(AppAction::ClearHistory));
             }
             "/undo" => return Some(Ok(AppAction::UndoLastTurn)),
+            "/resume-turn" => return Some(Ok(self.begin_resume_turn())),
             "/sessions" => {
                 let client = self.client.clone();
                 self.sessions_popup.show(&client);
@@ -149,6 +150,7 @@ impl App<'_> {
             "/export" => {
                 return Some(Ok(AppAction::ExportCurrentSession {
                     format: cortex::export::ExportFormat::Json,
+                    destination: crate::tui::app::ExportDestination::DefaultFile,
                 }));
             }
             "/new" => return Some(self.cmd_new()),
@@ -164,14 +166,23 @@ impl App<'_> {
         }
 
         if let Some(rest) = trimmed.strip_prefix("/export ") {
-            let arg = rest.trim();
-            match arg.parse::<cortex::export::ExportFormat>() {
+            // `/export <format> [destination]`. The destination is optional and
+            // may itself contain spaces, so only the first word is the format.
+            let rest = rest.trim();
+            let (format_arg, dest_arg) = match rest.split_once(char::is_whitespace) {
+                Some((f, d)) => (f, d),
+                None => (rest, ""),
+            };
+            match format_arg.parse::<cortex::export::ExportFormat>() {
                 Ok(format) => {
-                    return Some(Ok(AppAction::ExportCurrentSession { format }));
+                    return Some(Ok(AppAction::ExportCurrentSession {
+                        format,
+                        destination: crate::tui::app::parse_export_destination(dest_arg),
+                    }));
                 }
                 Err(e) => {
                     self.push_system_message(format!(
-                        "Error: {e}\nUsage: /export [json|csv|txt|md]"
+                        "Error: {e}\nUsage: /export [json|csv|txt|md] [path|clipboard]"
                     ));
                     return Some(Ok(AppAction::Continue));
                 }
@@ -405,7 +416,8 @@ impl App<'_> {
              /compact   - Compact conversation history\n  \
              /clear     - Clear conversation\n  \
              /cancel    - Stop the current in-progress turn\n  \
-             /undo      - Undo last agent turn\n\
+             /undo      - Undo last agent turn\n  \
+             /resume-turn - Continue a reply that was cut short\n\
              \n  \
              /memory    - Show memory\n  \
              /history   - Show conversation history\n  \
@@ -433,7 +445,7 @@ impl App<'_> {
              /fork      - Branch the current session into a new one (preserves history up to now)\n  \
              /worktree  - Isolated git checkouts to code in (alias: /wt)\n  \
              /resume <id> - Resume a saved session by id (prefix ok)\n  \
-             /export [fmt] - Export current session (fmt: json|csv|txt|md, default json)\n\
+             /export [fmt] [path|clipboard] - Export current session (fmt: json|csv|txt|md, default json)\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
              /skills    - Manage skills (alias of /plugins)\n  \
@@ -1311,7 +1323,9 @@ impl App<'_> {
             GoalSubcommand::Gate(sub) => self.cmd_goal_gate(sub),
             GoalSubcommand::Budget { budget } => {
                 if let Some(b) = budget {
-                    if let Err(e) = cortex::goals::validate_budget(Some(b)) {
+                    if let Err(e) =
+                        cortex::goals::validate_budget(Some(b), self.config.goals.max_token_budget)
+                    {
                         self.push_system_message(format!("/goal: {e}"));
                         return Ok(AppAction::Continue);
                     }
@@ -1342,7 +1356,10 @@ impl App<'_> {
                     }
                 };
                 if let Some(budget_val) = budget {
-                    if let Err(e) = cortex::goals::validate_budget(Some(budget_val)) {
+                    if let Err(e) = cortex::goals::validate_budget(
+                        Some(budget_val),
+                        self.config.goals.max_token_budget,
+                    ) {
                         self.push_system_message(format!("/goal: {e}"));
                         return Ok(AppAction::Continue);
                     }
@@ -2514,7 +2531,55 @@ pub(super) fn snapshot_cells_as_messages(cells: &[HistoryCell]) -> Vec<Message> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{parse_export_destination, ExportDestination};
     use cortex::types::Role;
+
+    /// Spec: the destination is optional, so every pre-existing `/export` and
+    /// `/export <fmt>` spelling must still mean "write the suggested filename
+    /// into the current directory".
+    #[test]
+    fn an_absent_export_destination_stays_the_default_file() {
+        for input in ["", "   "] {
+            assert_eq!(
+                parse_export_destination(input),
+                ExportDestination::DefaultFile,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_is_recognized_regardless_of_case() {
+        for input in ["clipboard", "Clipboard", "CLIPBOARD"] {
+            assert_eq!(
+                parse_export_destination(input),
+                ExportDestination::Clipboard,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// A `~` must be expanded here rather than handed to the OS, which does no
+    /// such expansion and would create a directory literally named `~`.
+    #[test]
+    fn a_tilde_destination_is_expanded() {
+        let ExportDestination::File(path) = parse_export_destination("~/out.md") else {
+            panic!("a path destination");
+        };
+        assert!(path.is_absolute(), "{path:?}");
+        assert!(!path.to_string_lossy().starts_with('~'), "{path:?}");
+        assert!(path.ends_with("out.md"));
+    }
+
+    /// Paths with spaces are ordinary on macOS, so only the *first* word is
+    /// the format — the rest is the destination, verbatim.
+    #[test]
+    fn a_destination_may_contain_spaces() {
+        assert_eq!(
+            parse_export_destination("my notes/session one.md"),
+            ExportDestination::File("my notes/session one.md".into())
+        );
+    }
 
     /// The bare form and its read-only synonyms must never mutate anything —
     /// an operator typing `/worktree` to look around must not create one.

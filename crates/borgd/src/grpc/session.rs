@@ -335,6 +335,16 @@ impl Session for SessionSvc {
         // so an unreadable attachment is an answer to `Send` rather than an
         // error part-way through a reply.
         let host = self.host_or_err(&req.session_id)?;
+        // A resume carries no new user content by definition; anything attached
+        // to it would be silently dropped, so refuse instead.
+        if req.resume_interrupted
+            && !(req.text.is_empty() && req.images.is_empty() && req.documents.is_empty())
+        {
+            return Err(TStatus::invalid_argument(
+                "a resume carries no new message; send the text as an ordinary turn instead",
+            ));
+        }
+        let resume = req.resume_interrupted;
         let text = compose_turn_text(req.text, req.documents)?;
 
         // Subscribe BEFORE starting the turn so we can't miss the first event.
@@ -353,7 +363,11 @@ impl Session for SessionSvc {
                 filename: (!i.filename.is_empty()).then_some(i.filename),
             })
             .collect();
-        let (_cancel, baseline_seq) = host.start_turn(text, images, None, deadline).await;
+        let (_cancel, baseline_seq) = if resume {
+            host.start_resume_turn(deadline).await
+        } else {
+            host.start_turn(text, images, None, deadline).await
+        };
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {

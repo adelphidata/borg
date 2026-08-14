@@ -152,11 +152,61 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_RUNTIME_DIR",
+    // Custom CA trust stores. A CA bundle names *which* certificates to trust;
+    // it is not a credential, and withholding it does not protect anything —
+    // it just makes every outbound TLS call from a server behind a corporate
+    // MITM proxy fail with an unverifiable-certificate error the operator
+    // cannot act on. Values are paths, absolutized by
+    // [`absolutize_ca_path`] before they reach the child.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+];
+
+/// Allowlisted variables whose value is a filesystem path.
+///
+/// Borg does not set the child's working directory to its own, so a relative
+/// path inherited from the operator's shell would resolve against whatever
+/// directory the server happens to start in — silently pointing at the wrong
+/// file, or none.
+const CA_PATH_ENV_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
 ];
 
 /// True iff `key` is in the inherit allowlist.
 pub fn is_env_allowed(key: &str) -> bool {
     ENV_ALLOWLIST.contains(&key)
+}
+
+/// Resolve a CA trust-store variable to an absolute path.
+///
+/// Returns the value unchanged for any other variable, for an already-absolute
+/// path, and for an empty value — an empty `SSL_CERT_FILE` is how some tools
+/// spell "use the built-in store", and turning it into the current directory
+/// would change that meaning.
+pub fn absolutize_ca_path(key: &str, value: &str) -> String {
+    if !CA_PATH_ENV_VARS.contains(&key) || value.is_empty() {
+        return value.to_string();
+    }
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).to_string_lossy().into_owned(),
+        Err(e) => {
+            tracing::warn!(
+                key,
+                error = %e,
+                "cannot resolve a relative CA path; passing it through unchanged"
+            );
+            value.to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +225,63 @@ mod tests {
         assert!(!is_env_allowed("BORG_KEK_PASSPHRASE"));
         assert!(!is_env_allowed("AWS_SECRET_ACCESS_KEY"));
         assert!(!is_env_allowed("GITHUB_TOKEN"));
+    }
+
+    /// Spec: a CA bundle names which certificates to trust. It carries no
+    /// secret, and withholding it only breaks TLS for servers behind a
+    /// corporate proxy. Pinned as a deliberate carve-out so the credential
+    /// assertions above and these cannot be confused for one another.
+    #[test]
+    fn allowlist_admits_ca_trust_stores() {
+        for key in [
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "NODE_EXTRA_CA_CERTS",
+            "REQUESTS_CA_BUNDLE",
+        ] {
+            assert!(is_env_allowed(key), "{key} must reach MCP children");
+        }
+    }
+
+    /// Spec: borg does not set the child's cwd to its own, so a relative CA
+    /// path inherited from the operator's shell must be resolved before it is
+    /// handed over or it points somewhere else entirely.
+    /// Spec: the two CA lists must not drift. `ENV_ALLOWLIST` decides what the
+    /// child inherits and `CA_PATH_ENV_VARS` decides what gets absolutized; a
+    /// name in the second but not the first is dead, and a CA name added only
+    /// to the first is inherited as a relative path that resolves against the
+    /// server's own directory.
+    #[test]
+    fn every_ca_path_variable_is_also_inheritable() {
+        for key in CA_PATH_ENV_VARS {
+            assert!(
+                is_env_allowed(key),
+                "{key} is absolutized but never inherited"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_ca_path_is_made_absolute() {
+        let resolved = absolutize_ca_path("SSL_CERT_FILE", "certs/ca.pem");
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "must be absolute: {resolved}"
+        );
+        assert!(resolved.ends_with("certs/ca.pem"));
+    }
+
+    #[test]
+    fn absolutize_leaves_everything_else_alone() {
+        // Already absolute.
+        assert_eq!(
+            absolutize_ca_path("SSL_CERT_FILE", "/etc/ssl/ca.pem"),
+            "/etc/ssl/ca.pem"
+        );
+        // Empty means "use the built-in store"; joining it to cwd would
+        // silently redirect that to a directory.
+        assert_eq!(absolutize_ca_path("SSL_CERT_FILE", ""), "");
+        // Not a path variable: PATH is a list and must never be rewritten.
+        assert_eq!(absolutize_ca_path("PATH", "bin:sbin"), "bin:sbin");
     }
 }

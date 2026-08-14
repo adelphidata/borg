@@ -23,6 +23,11 @@ impl BwrapVersion {
     pub fn supports_unshare_user(&self) -> bool {
         (self.major, self.minor) >= (0, 2)
     }
+
+    /// Returns true if this version supports `--as-pid-1` (added in 0.4.0).
+    pub fn supports_as_pid_1(&self) -> bool {
+        (self.major, self.minor) >= (0, 4)
+    }
 }
 
 /// Detect the installed bwrap version by running `bwrap --version`.
@@ -147,6 +152,16 @@ pub fn build_bwrap_args_versioned(
     }
     args.extend(["--proc".to_string(), "/proc".to_string()]);
     args.extend(["--dev".to_string(), "/dev".to_string()]);
+    // `--dev` overlays a minimal device tree, which also hides `/dev/shm`.
+    // Bind it back so POSIX shared memory keeps working — Python's
+    // `multiprocessing` and anything using `/dev/shm` for scratch space break
+    // without it. `--bind-try` is a no-op when the host has no `/dev/shm`,
+    // unlike `--bind`, which would fail the entire spawn.
+    args.extend([
+        "--bind-try".to_string(),
+        "/dev/shm".to_string(),
+        "/dev/shm".to_string(),
+    ]);
 
     for path in &policy.fs_read {
         push_bind_if_exists(&mut args, "--ro-bind", path);
@@ -186,6 +201,16 @@ pub fn build_bwrap_args_versioned(
     }
 
     args.push("--unshare-pid".to_string());
+
+    // `--unshare-pid` alone gives the namespace no init: a descendant whose
+    // parent exits first is reparented to nothing and stays a zombie for the
+    // sandbox's lifetime. `--as-pid-1` makes bwrap itself PID 1 so it reaps
+    // them. Version-gated because an older bwrap rejects the unknown flag and
+    // would fail the whole spawn.
+    let supports_as_pid_1 = version.is_none_or(BwrapVersion::supports_as_pid_1);
+    if supports_as_pid_1 {
+        args.push("--as-pid-1".to_string());
+    }
 
     let supports_die = version.is_none_or(BwrapVersion::supports_die_with_parent);
     if supports_die {
@@ -467,20 +492,22 @@ mod tests {
     #[test]
     fn version_feature_cutoffs_table() {
         // Spec: feature predicates fire at the exact cutoff version.
-        // --die-with-parent landed in 0.1.8; --unshare-user landed in 0.2.0.
-        // A regression that shifts a cutoff (e.g. wrong inequality) flips
-        // exactly one row here. Table-driven so a new gate is one row, not
-        // a new test function.
-        let cases: &[(u32, u32, u32, bool, bool)] = &[
-            // major, minor, patch, supports_die_with_parent, supports_unshare_user
-            (0, 1, 5, false, false),
-            (0, 1, 7, false, false),
-            (0, 1, 8, true, false), // die-with-parent cutoff
-            (0, 1, 9, true, false),
-            (0, 2, 0, true, true), // unshare-user cutoff
-            (0, 4, 0, true, true),
+        // --die-with-parent landed in 0.1.8; --unshare-user landed in 0.2.0;
+        // --as-pid-1 landed in 0.4.0. A regression that shifts a cutoff (e.g.
+        // wrong inequality) flips exactly one row here. Table-driven so a new
+        // gate is one row, not a new test function.
+        let cases: &[(u32, u32, u32, bool, bool, bool)] = &[
+            // major, minor, patch, die_with_parent, unshare_user, as_pid_1
+            (0, 1, 5, false, false, false),
+            (0, 1, 7, false, false, false),
+            (0, 1, 8, true, false, false), // die-with-parent cutoff
+            (0, 1, 9, true, false, false),
+            (0, 2, 0, true, true, false), // unshare-user cutoff
+            (0, 3, 9, true, true, false),
+            (0, 4, 0, true, true, true), // as-pid-1 cutoff
+            (0, 6, 2, true, true, true),
         ];
-        for (major, minor, patch, want_die, want_unshare) in cases.iter().copied() {
+        for (major, minor, patch, want_die, want_unshare, want_pid1) in cases.iter().copied() {
             let v = BwrapVersion {
                 major,
                 minor,
@@ -496,7 +523,69 @@ mod tests {
                 want_unshare,
                 "unshare_user: {major}.{minor}.{patch}"
             );
+            assert_eq!(
+                v.supports_as_pid_1(),
+                want_pid1,
+                "as_pid_1: {major}.{minor}.{patch}"
+            );
         }
+    }
+
+    /// Spec: `--unshare-pid` must never be emitted without `--as-pid-1` on a
+    /// bwrap that supports it, or the namespace has no reaper and orphaned
+    /// descendants accumulate as zombies for the sandbox's lifetime.
+    #[test]
+    fn build_args_gates_as_pid_1_by_version() {
+        let modern = BwrapVersion {
+            major: 0,
+            minor: 4,
+            patch: 0,
+        };
+        let args =
+            build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), Some(&modern));
+        assert!(args.contains(&"--unshare-pid".to_string()));
+        assert!(
+            args.contains(&"--as-pid-1".to_string()),
+            "0.4.0 supports --as-pid-1: {args:?}"
+        );
+
+        let ancient = BwrapVersion {
+            major: 0,
+            minor: 3,
+            patch: 9,
+        };
+        let args =
+            build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), Some(&ancient));
+        assert!(
+            !args.contains(&"--as-pid-1".to_string()),
+            "an unknown flag would fail the whole spawn on 0.3.9: {args:?}"
+        );
+
+        // Undetectable version is treated as modern, like every other gate here.
+        let args = build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), None);
+        assert!(args.contains(&"--as-pid-1".to_string()));
+    }
+
+    /// Spec: `--dev` shadows the host device tree, so `/dev/shm` must be bound
+    /// back or POSIX shared memory (Python `multiprocessing`, and anything
+    /// using it as scratch) stops working inside the sandbox.
+    #[test]
+    fn build_args_restores_dev_shm_after_the_dev_overlay() {
+        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
+        let dev = args
+            .iter()
+            .position(|a| a == "--dev")
+            .expect("a minimal /dev is always mounted");
+        let shm = args
+            .iter()
+            .position(|a| a == "--bind-try")
+            .expect("/dev/shm must be bound back: {args:?}");
+        assert!(
+            shm > dev,
+            "the shm bind must come after the --dev overlay or it is shadowed: {args:?}"
+        );
+        assert_eq!(args[shm + 1], "/dev/shm");
+        assert_eq!(args[shm + 2], "/dev/shm");
     }
 
     #[test]

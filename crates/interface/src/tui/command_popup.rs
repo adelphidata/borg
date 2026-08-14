@@ -50,6 +50,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear conversation"),
     ("/cancel", "Stop the current in-progress turn"),
     ("/undo", "Undo last agent turn"),
+    ("/resume-turn", "Continue a reply that was cut short"),
     ("/btw", "Ask an ephemeral side question (not persisted)"),
     // Context
     ("/memory", "Show memory context"),
@@ -86,7 +87,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "/resume",
         "Resume a saved session by id (use /sessions to browse)",
     ),
-    ("/export", "Export current session (json|csv|txt)"),
+    (
+        "/export",
+        "Export current session (json|csv|txt|md) to a file or the clipboard",
+    ),
     // Integrations
     ("/plugins", "Manage plugins and channels"),
     ("/skills", "Manage skills (alias of /plugins)"),

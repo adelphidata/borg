@@ -364,6 +364,7 @@ async fn daemon_client_round_trips_a_turn() {
             text: "hi".into(),
             images: Vec::new(),
             documents: Vec::new(),
+            resume_interrupted: false,
         })
         .await
         .expect("Send must succeed")

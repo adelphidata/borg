@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info_span, instrument, warn};
@@ -28,12 +28,13 @@ use crate::telemetry::BorgMetrics;
 use crate::tool::names as tn;
 #[cfg(test)]
 use crate::tool_handlers;
-use crate::types::{Message, ToolDefinition};
+use crate::types::{Message, MessageContent, Role, ToolDefinition};
 
 pub mod btw;
 mod credentials;
 mod goal_loop;
 mod hooks_dispatch;
+mod interrupted;
 pub mod media_markers;
 mod prompt_assembly;
 mod session_manager;
@@ -942,6 +943,54 @@ impl Agent {
         self.turn_count += 1;
         // Reset recent tool names each user turn so conditional loading
         // only considers tools used in the current turn's agent loop.
+        self.recent_tool_names.clear();
+        self.run_agent_loop(event_tx, cancel).await
+    }
+
+    /// Resume the turn that was cut short, without injecting a user message.
+    ///
+    /// The last history message must be an assistant message ending in an
+    /// interruption marker (`[response interrupted]` and friends). The marker
+    /// is dropped from the **in-memory** history only, so the model continues
+    /// from its own partial text; the persisted row keeps it as the record of
+    /// what happened.
+    ///
+    /// Returns an error naming the next action when there is nothing to
+    /// resume, and leaves the history untouched in that case.
+    #[instrument(skip_all, fields(session_id = %self.session.meta.id, turn_count = self.turn_count))]
+    pub async fn resume_interrupted_turn(
+        &mut self,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let last = self
+            .history
+            .last()
+            .ok_or_else(|| anyhow!("This conversation is empty. Send a message to start it."))?;
+
+        let partial = match (&last.role, last.text_content()) {
+            (&Role::Assistant, Some(text)) => interrupted::strip_interruption_marker(text),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            anyhow!("The last reply finished normally, so there is nothing to resume. Send a message to continue.")
+        })?;
+
+        if partial.trim().is_empty() {
+            return Err(anyhow!(
+                "The interrupted reply produced no text to continue from. Send the request again."
+            ));
+        }
+
+        // In-memory only: the DB row keeps the marker.
+        let Some(last) = self.history.last_mut() else {
+            return Err(anyhow!(
+                "This conversation is empty. Send a message to start it."
+            ));
+        };
+        last.content = Some(MessageContent::Text(partial));
+
+        self.turn_count += 1;
         self.recent_tool_names.clear();
         self.run_agent_loop(event_tx, cancel).await
     }

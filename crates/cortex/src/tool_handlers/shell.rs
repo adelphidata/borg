@@ -1151,17 +1151,7 @@ async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str, code: Option<
     if !ctx.enforce_workspace_root() {
         return;
     }
-    let backend = sandbox::violation::SandboxBackend::current();
-    let Some(violation) = sandbox::violation::classify(backend, code, stderr) else {
-        return;
-    };
-    tracing::info!(
-        backend = backend.as_str(),
-        kind = violation.kind.as_str(),
-        reason = %violation.reason,
-        "sandbox denied an operation"
-    );
-    crate::vitals::record_sandbox_violation(&violation).await;
+    crate::vitals::note_sandbox_denial(code, stderr, "run_shell").await;
 }
 
 /// Decide whether to wrap `run_shell` invocations in a workspace-scoped

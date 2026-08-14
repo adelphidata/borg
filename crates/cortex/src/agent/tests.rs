@@ -2412,3 +2412,148 @@ async fn a_new_turn_clears_a_stale_storage_fault() {
         "a fresh turn starts from a clean slate"
     );
 }
+
+/// Spec: a resume must refuse when the last reply finished normally, and must
+/// leave the history exactly as it found it. Without the refusal the model
+/// would be asked to continue a finished answer, and a mutation-then-refuse
+/// would corrupt the conversation on a mis-typed command.
+#[tokio::test]
+async fn resuming_a_completed_reply_is_refused_without_touching_history() {
+    let mut agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    agent.inject_history_message(Message::user("hello"));
+    agent.inject_history_message(Message::assistant("All done."));
+    let before: Vec<String> = agent
+        .history()
+        .iter()
+        .map(|m| m.text_content().unwrap_or_default().to_string())
+        .collect();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let err = agent
+        .resume_interrupted_turn(tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect_err("a completed reply is not resumable");
+    assert!(
+        err.to_string().contains("nothing to resume"),
+        "the refusal must name the next action: {err}"
+    );
+
+    let after: Vec<String> = agent
+        .history()
+        .iter()
+        .map(|m| m.text_content().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(before, after, "a refused resume must not mutate history");
+}
+
+/// Spec: a marker-only interrupted reply has no partial text to continue from,
+/// so the resume is refused rather than sending the model a turn whose last
+/// message is empty.
+#[tokio::test]
+async fn resuming_a_reply_with_no_partial_text_is_refused() {
+    let mut agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    agent.inject_history_message(Message::user("hello"));
+    agent.inject_history_message(Message::assistant("[response interrupted]"));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let err = agent
+        .resume_interrupted_turn(tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect_err("an empty partial is not resumable");
+    assert!(
+        err.to_string().contains("no text to continue from"),
+        "the refusal must explain why: {err}"
+    );
+}
+
+/// Spec: the headline resume behaviour. The in-memory history must lose the
+/// interruption marker so the model continues from its own partial sentence,
+/// no user message may be injected, and the reply must be appended after the
+/// partial. A "fix" that re-added the marker to the working set would make the
+/// model answer the marker instead of finishing its thought.
+#[tokio::test]
+async fn a_resume_strips_the_marker_and_adds_no_user_message() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\" and here is the rest.\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    std::env::set_var("BORG_RESUME_TEST_KEY", "test-key");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".into());
+    config.llm.model = "resume-test-model".into();
+    config.llm.base_url = Some(format!("{}/v1/chat/completions", server.uri()));
+    config.llm.api_key_env = "BORG_RESUME_TEST_KEY".into();
+    config.llm.max_retries = 0;
+    // The budget gate reads live usage from the developer's own database, so
+    // pin it out of the way — this test is about the resume path.
+    config.budget.monthly_token_limit = 0;
+
+    let mut agent = minimal_test_agent(config);
+    agent.history.push(Message::user("write me a plan"));
+    agent
+        .history
+        .push(Message::assistant("Step one is\n\n[response interrupted]"));
+    let turns_before = agent.turn_count;
+
+    let (tx, mut rx) = mpsc::channel(256);
+    agent
+        .resume_interrupted_turn(tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("an interrupted reply must be resumable");
+
+    while let Ok(evt) = rx.try_recv() {
+        if let AgentEvent::Error(e) = &evt {
+            panic!("the resume must not surface an error: {e}");
+        }
+    }
+    let texts: Vec<&str> = agent
+        .history
+        .iter()
+        .map(|m| m.text_content().unwrap_or_default())
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("[response interrupted]")),
+        "the working set must not carry the marker back to the model: {texts:?}"
+    );
+    assert_eq!(
+        agent
+            .history
+            .iter()
+            .filter(|m| matches!(m.role, Role::User))
+            .count(),
+        1,
+        "a resume must not inject a user message: {texts:?}"
+    );
+    assert_eq!(
+        agent.history[1].text_content(),
+        Some("Step one is"),
+        "the partial text must survive, marker-free"
+    );
+    assert!(
+        texts
+            .last()
+            .is_some_and(|t| t.contains("and here is the rest")),
+        "the continuation must be appended: {texts:?}"
+    );
+    assert_eq!(
+        agent.turn_count,
+        turns_before + 1,
+        "a resume is a turn and must be counted as one"
+    );
+}

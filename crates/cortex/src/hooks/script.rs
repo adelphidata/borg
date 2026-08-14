@@ -479,6 +479,11 @@ fn run_subprocess(
     // (and holding our pipes) past the deadline.
     crate::util::process_tree::spawn_in_own_group_std(&mut cmd);
     let mut child = cmd.spawn().map_err(SubprocessError::Spawn)?;
+    // Windows counterpart to that process group. Deliberately *not*
+    // kill-on-close: a hook that finishes normally may have detached a helper
+    // on purpose (`some-daemon &`), and that helper must outlive it. Only the
+    // timeout path below terminates the job.
+    let job = mcp::job_object::contain(child.id(), "hook", mcp::job_object::OnClose::Leave);
 
     // Feed stdin from its own thread and let the handle drop, closing the pipe so
     // a hook blocked on `cat` sees EOF. A hook that exits without reading its
@@ -501,7 +506,15 @@ fn run_subprocess(
 
     let outcome = match crate::util::process_tree::wait_or_kill_group(&mut child, timeout) {
         Ok(status) => Ok(status.code().unwrap_or(-1)),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(SubprocessError::Timeout),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // `wait_or_kill_group` already signalled the unix process group.
+            // On Windows the job is the only thing that reaches the tree, and
+            // a timed-out hook forfeits the "detached helpers survive" grace.
+            if let Some(job) = &job {
+                job.terminate();
+            }
+            Err(SubprocessError::Timeout)
+        }
         Err(e) => Err(SubprocessError::Io(e)),
     };
 

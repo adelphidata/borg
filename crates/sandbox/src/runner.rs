@@ -262,6 +262,38 @@ pub async fn run_sandboxed_script(
     name: &str,
     input_json: &str,
 ) -> Result<(bool, String)> {
+    let output = run_sandboxed_script_detailed(
+        runtime,
+        script_path,
+        work_dir,
+        sandbox_policy,
+        timeout_ms,
+        extra_env,
+        name,
+        input_json,
+    )
+    .await?;
+    Ok(output.into_result_string())
+}
+
+/// As [`run_sandboxed_script`], but keeping the exit code and stderr apart.
+///
+/// [`ScriptOutput::into_result_string`] folds both into one human-readable
+/// string, which is all a tool response needs but not enough to classify a
+/// sandbox denial — [`crate::violation::classify`] wants the raw stderr and the
+/// exit status separately.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip_all)]
+pub async fn run_sandboxed_script_detailed(
+    runtime: &str,
+    script_path: &Path,
+    work_dir: &Path,
+    sandbox_policy: SandboxPolicy,
+    timeout_ms: u64,
+    extra_env: &[(String, String)],
+    name: &str,
+    input_json: &str,
+) -> Result<ScriptOutput> {
     let runner = ScriptRunner {
         runtime,
         script_path,
@@ -272,8 +304,7 @@ pub async fn run_sandboxed_script(
         name,
     };
 
-    let output = runner.run(input_json).await?;
-    Ok(output.into_result_string())
+    runner.run(input_json).await
 }
 
 /// Validate that a script path stays within its base directory.

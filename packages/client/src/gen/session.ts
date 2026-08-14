@@ -38,6 +38,12 @@ export interface SendRequest {
    * part. Non-text bytes are refused daemon-side.
    */
   documents: InlineDocument[];
+  /**
+   * Resume the turn that was cut short instead of starting a new one. The
+   * agent continues from its own partial reply; `text`, `images`, and
+   * `documents` must be empty.
+   */
+  resumeInterrupted: boolean;
 }
 
 export interface InlineDocument {
@@ -685,7 +691,7 @@ export const OpenResponse: MessageFns<OpenResponse> = {
 };
 
 function createBaseSendRequest(): SendRequest {
-  return { sessionId: "", text: "", images: [], documents: [] };
+  return { sessionId: "", text: "", images: [], documents: [], resumeInterrupted: false };
 }
 
 export const SendRequest: MessageFns<SendRequest> = {
@@ -701,6 +707,9 @@ export const SendRequest: MessageFns<SendRequest> = {
     }
     for (const v of message.documents) {
       InlineDocument.encode(v!, writer.uint32(34).fork()).join();
+    }
+    if (message.resumeInterrupted !== false) {
+      writer.uint32(40).bool(message.resumeInterrupted);
     }
     return writer;
   },
@@ -744,6 +753,14 @@ export const SendRequest: MessageFns<SendRequest> = {
           message.documents.push(InlineDocument.decode(reader, reader.uint32()));
           continue;
         }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.resumeInterrupted = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -765,6 +782,11 @@ export const SendRequest: MessageFns<SendRequest> = {
       documents: globalThis.Array.isArray(object?.documents)
         ? object.documents.map((e: any) => InlineDocument.fromJSON(e))
         : [],
+      resumeInterrupted: isSet(object.resumeInterrupted)
+        ? globalThis.Boolean(object.resumeInterrupted)
+        : isSet(object.resume_interrupted)
+        ? globalThis.Boolean(object.resume_interrupted)
+        : false,
     };
   },
 
@@ -782,6 +804,9 @@ export const SendRequest: MessageFns<SendRequest> = {
     if (message.documents?.length) {
       obj.documents = message.documents.map((e) => InlineDocument.toJSON(e));
     }
+    if (message.resumeInterrupted !== false) {
+      obj.resumeInterrupted = message.resumeInterrupted;
+    }
     return obj;
   },
 
@@ -794,6 +819,7 @@ export const SendRequest: MessageFns<SendRequest> = {
     message.text = object.text ?? "";
     message.images = object.images?.map((e) => InlineImage.fromPartial(e)) || [];
     message.documents = object.documents?.map((e) => InlineDocument.fromPartial(e)) || [];
+    message.resumeInterrupted = object.resumeInterrupted ?? false;
     return message;
   },
 };

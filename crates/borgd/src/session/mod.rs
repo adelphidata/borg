@@ -124,6 +124,22 @@ struct TurnState {
     forwarder: Option<JoinHandle<()>>,
 }
 
+/// What a started turn feeds the backend.
+///
+/// Both arms share every part of the turn-installation critical section —
+/// serialization against the prior forwarder, the baseline seq, the deadline
+/// watcher — so only the backend call itself differs.
+enum TurnKind {
+    /// An ordinary user turn.
+    Send {
+        text: String,
+        images: Vec<backend::InlineImage>,
+        text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
+    },
+    /// Continue the reply that was cut short, with no new user message.
+    Resume,
+}
+
 impl SessionHost {
     /// Wrap a backend in a host. Caller is responsible for inserting the
     /// returned host into the [`SessionRegistry`].
@@ -355,6 +371,34 @@ impl SessionHost {
         text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
         deadline: Option<std::time::Instant>,
     ) -> (CancellationToken, u64) {
+        self.start_turn_of(
+            TurnKind::Send {
+                text,
+                images,
+                text_file_bridge,
+            },
+            deadline,
+        )
+        .await
+    }
+
+    /// Resume the turn that was cut short, with no new user message.
+    ///
+    /// Identical to [`Self::start_turn`] in every respect the caller can see —
+    /// same serialization, same baseline seq, same deadline watcher — so a
+    /// resume streams back exactly like an ordinary turn.
+    pub async fn start_resume_turn(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> (CancellationToken, u64) {
+        self.start_turn_of(TurnKind::Resume, deadline).await
+    }
+
+    async fn start_turn_of(
+        &self,
+        kind: TurnKind,
+        deadline: Option<std::time::Instant>,
+    ) -> (CancellationToken, u64) {
         let cancel = CancellationToken::new();
         let inner = self.inner.clone();
         let cancel_for_task = cancel.clone();
@@ -409,16 +453,30 @@ impl SessionHost {
 
         // Backend turn — runs concurrently with the forwarder above.
         let backend_handle = tokio::spawn(async move {
-            inner
-                .backend
-                .run_turn(
+            match kind {
+                TurnKind::Send {
                     text,
                     images,
-                    event_tx_for_backend,
-                    cancel_for_task,
                     text_file_bridge,
-                )
-                .await;
+                } => {
+                    inner
+                        .backend
+                        .run_turn(
+                            text,
+                            images,
+                            event_tx_for_backend,
+                            cancel_for_task,
+                            text_file_bridge,
+                        )
+                        .await;
+                }
+                TurnKind::Resume => {
+                    inner
+                        .backend
+                        .resume_turn(event_tx_for_backend, cancel_for_task)
+                        .await;
+                }
+            }
         });
 
         if let Some(deadline) = deadline {

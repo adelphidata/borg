@@ -42,7 +42,9 @@
 )]
 
 pub mod errors;
+pub mod job_object;
 pub mod manifest;
+pub mod process_group;
 pub mod protocol;
 pub mod registry;
 pub mod security;

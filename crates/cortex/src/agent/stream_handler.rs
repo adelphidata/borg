@@ -387,7 +387,10 @@ impl Agent {
         // next turn (and any later resume) sees that the response was cut
         // short, not a normal completion.
         if let Some(err) = stream_error {
-            let marker = format!("[stream interrupted: {err}]");
+            let marker = format!(
+                "[stream interrupted: {}]",
+                super::interrupted::one_line(&err)
+            );
             let content = if text_content.trim().is_empty() {
                 marker.clone()
             } else {
@@ -442,7 +445,10 @@ impl Agent {
         event_tx: &mpsc::Sender<AgentEvent>,
     ) {
         let trailer = match stream_error {
-            Some(err) => format!("[stream interrupted: {err}; incomplete tool calls discarded]"),
+            Some(err) => format!(
+                "[stream interrupted: {}; incomplete tool calls discarded]",
+                super::interrupted::one_line(&err)
+            ),
             None => "[incomplete tool calls discarded]".to_string(),
         };
         let content = if text_content.is_empty() {

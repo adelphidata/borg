@@ -26,6 +26,18 @@ async-trait = { workspace = true }
 # Watchdog reaper for orphaned stdio MCP servers: getppid/kill/killpg/signal.
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Job objects: the Windows counterpart to a process group, used to contain a
+# stdio MCP server's descendants so they die with it.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES` pointer, so windows-sys
+    # gates it behind Win32_Security even though we always pass null.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

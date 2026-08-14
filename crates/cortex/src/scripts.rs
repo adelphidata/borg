@@ -407,7 +407,7 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
         )
     };
 
-    let (ok, output) = sandbox::runner::run_sandboxed_script(
+    let script_output = sandbox::runner::run_sandboxed_script_detailed(
         &runtime,
         &entrypoint_path,
         &script_dir,
@@ -418,6 +418,13 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
         args_json,
     )
     .await?;
+
+    // Agent-written tools are the untrusted code the sandbox exists for, so a
+    // denial here is the one most worth having in the vitals chain. Classify
+    // before `into_result_string` folds the exit code and stderr together.
+    note_sandbox_denial(&script_output).await;
+
+    let (ok, output) = script_output.into_result_string();
 
     // Record execution (open DB again after the await)
     match Database::open().await {
@@ -434,6 +441,14 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
     } else {
         Ok(format!("Script '{name}' exited with error:\n{output}"))
     }
+}
+
+/// File a sandbox denial from an agent-written tool into the vitals chain.
+///
+/// Observability only: the script has already failed by the time this runs.
+async fn note_sandbox_denial(output: &sandbox::runner::ScriptOutput) {
+    crate::vitals::note_sandbox_denial(output.exit_code, &output.stderr, "agent-written tool")
+        .await;
 }
 
 /// Delete a script: remove DB entry first, then files (safer ordering).

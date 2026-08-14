@@ -869,6 +869,27 @@ pub async fn record_sandbox_violation(violation: &sandbox::violation::SandboxVio
     }
 }
 
+/// Classify a subprocess's exit and stderr and, if the sandbox denied it,
+/// file the violation.
+///
+/// The single classify-and-record seam. Callers pass raw subprocess output;
+/// a run the sandbox did not deny classifies to `None` and records nothing,
+/// so this is safe on every path. `context` names the lane in the log line.
+pub async fn note_sandbox_denial(code: Option<i32>, stderr: &str, context: &str) {
+    let backend = sandbox::violation::SandboxBackend::current();
+    let Some(violation) = sandbox::violation::classify(backend, code, stderr) else {
+        return;
+    };
+    tracing::info!(
+        backend = backend.as_str(),
+        kind = violation.kind.as_str(),
+        reason = %violation.reason,
+        context,
+        "sandbox denied an operation"
+    );
+    record_sandbox_violation(&violation).await;
+}
+
 // ── Tests ──
 
 #[cfg(test)]

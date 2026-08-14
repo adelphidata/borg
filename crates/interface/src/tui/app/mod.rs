@@ -347,6 +347,37 @@ where
     }
 }
 
+/// Where a `/export` should put the rendered transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportDestination {
+    /// A timestamped file in the current directory — the name the daemon
+    /// suggests. This is what a bare `/export` does.
+    DefaultFile,
+    /// An explicit path from the command line. `~` and relative paths are
+    /// resolved before use; an existing file is never overwritten.
+    File(std::path::PathBuf),
+    /// The system clipboard, for pasting straight into an issue or a message.
+    Clipboard,
+}
+
+/// Parse the destination half of `/export [format] [destination]`.
+///
+/// `clipboard` is a reserved word here; everything else is a path. That means
+/// a file genuinely named `clipboard` needs `./clipboard`, which is a fair
+/// trade for not needing a flag on the common case.
+pub fn parse_export_destination(raw: &str) -> ExportDestination {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ExportDestination::DefaultFile;
+    }
+    if trimmed.eq_ignore_ascii_case("clipboard") {
+        return ExportDestination::Clipboard;
+    }
+    ExportDestination::File(std::path::PathBuf::from(
+        cortex::util::unix_ext::expand_tilde(trimmed),
+    ))
+}
+
 pub enum AppAction {
     Continue,
     Quit,
@@ -354,6 +385,12 @@ pub enum AppAction {
     SendMessage {
         input: String,
         images: Vec<super::composer::ImageAttachment>,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    },
+    /// Continue the reply that was cut short, with no new user message
+    /// (`/resume-turn`). Streams back exactly like [`AppAction::SendMessage`].
+    ResumeInterruptedTurn {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     },
@@ -426,9 +463,10 @@ pub enum AppAction {
         id: String,
         format: cortex::export::ExportFormat,
     },
-    /// Export the currently-loaded session (via `/export [format]`).
+    /// Export the currently-loaded session (via `/export [format] [dest]`).
     ExportCurrentSession {
         format: cortex::export::ExportFormat,
+        destination: ExportDestination,
     },
     /// Signal that a full-screen surface has just opened (large popup or the
     /// transcript pager). The event loop reconciles to alt-screen on the next
@@ -1102,6 +1140,26 @@ impl<'a> App<'a> {
             event_tx,
             cancel,
         })
+    }
+
+    /// Set up the streaming UI for a resumed turn and return the action that
+    /// asks the daemon for it.
+    ///
+    /// No user cell: the point of a resume is that the user said nothing new.
+    /// The daemon refuses when the last reply finished normally, and that
+    /// refusal arrives as an ordinary turn error.
+    pub fn begin_resume_turn(&mut self) -> AppAction {
+        self.cells.push(HistoryCell::assistant(String::new(), true));
+
+        let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
+        self.event_rx = Some(event_rx);
+
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+
+        self.enter_streaming();
+
+        AppAction::ResumeInterruptedTurn { event_tx, cancel }
     }
 
     /// Pop the next queued message (FIFO) for dispatch.

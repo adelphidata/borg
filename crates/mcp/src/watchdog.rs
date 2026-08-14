@@ -215,7 +215,10 @@ mod unix {
         // flush stdio and unwind, short enough that daemon shutdown doesn't stall.
         const SIGTERM_GRACE_POLLS: u32 = 15;
         const SIGTERM_GRACE_POLL: Duration = Duration::from_millis(20);
-        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        // Both signals go through the shared helper: macOS can refuse the
+        // group call with EPERM, and dropping that result left the server's
+        // descendants running after daemon shutdown.
+        crate::process_group::signal_group_or_members(pgid, libc::SIGTERM);
         for _ in 0..SIGTERM_GRACE_POLLS {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 let _ = child.wait();
@@ -223,7 +226,7 @@ mod unix {
             }
             std::thread::sleep(SIGTERM_GRACE_POLL);
         }
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        crate::process_group::signal_group_or_members(pgid, libc::SIGKILL);
         let _ = child.wait();
     }
 

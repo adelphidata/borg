@@ -363,9 +363,31 @@ impl DaemonClient {
                 // The TUI attaches files by path, which `fs_read` already
                 // handles — inline documents are a web/desktop affordance.
                 documents: Vec::new(),
+                resume_interrupted: false,
             })
             .await
             .context("Session.Send failed")?
+            .into_inner();
+        Ok(stream)
+    }
+
+    /// Resume the turn that was cut short, with no new user message. Streams
+    /// back exactly like [`Self::send_message`].
+    pub async fn resume_interrupted_turn(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Streaming<AgentEvent>> {
+        let stream = self
+            .session
+            .send(SendRequest {
+                session_id: session_id.to_string(),
+                text: String::new(),
+                images: Vec::new(),
+                documents: Vec::new(),
+                resume_interrupted: true,
+            })
+            .await
+            .context("Session.Send (resume) failed")?
             .into_inner();
         Ok(stream)
     }

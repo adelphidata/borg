@@ -397,6 +397,7 @@ define_settings! {
         // ── Per-session goals (/goal) ──
         "goals.enabled" => goals.enabled, parsed(bool);
         "goals.default_token_budget" => goals.default_token_budget, opt_parsed(i64);
+        "goals.max_token_budget" => goals.max_token_budget, opt_parsed(i64);
         "goals.gate_timeout_ms" => goals.gate_timeout_ms, parsed(u64);
         "goals.gate_max_attempts" => goals.gate_max_attempts, parsed(i64);
 
