@@ -10,7 +10,8 @@ mod retry;
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
     body_indicates_cloudflare_block, body_indicates_context_overflow,
-    body_indicates_expired_credential, body_indicates_no_allowed_providers, body_mentions_model,
+    body_indicates_expired_credential, body_indicates_image_unsupported,
+    body_indicates_no_allowed_providers, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
@@ -77,6 +78,11 @@ pub enum FailoverReason {
     /// The requested model id isn't available on this provider (404 with
     /// "model" in the body) — fast-fail, don't retry.
     ModelNotFound,
+    /// The model cannot accept image input, so a multimodal request is
+    /// undeliverable as sent (OpenRouter answers "No endpoints found that
+    /// support image input" with a 404). The recovery is to drop the image
+    /// parts and re-send text-only, not to rotate keys or abort the turn.
+    ImageUnsupported,
     /// Unclassified error.
     Unknown,
 }
@@ -95,6 +101,7 @@ impl fmt::Display for FailoverReason {
             Self::ContextOverflow => write!(f, "context_overflow"),
             Self::PayloadTooLarge => write!(f, "payload_too_large"),
             Self::ModelNotFound => write!(f, "model_not_found"),
+            Self::ImageUnsupported => write!(f, "image_unsupported"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -257,6 +264,10 @@ impl LlmError {
             FailoverReason::ModelNotFound
                 | FailoverReason::AuthPermanent
                 | FailoverReason::PayloadTooLarge
+                // Re-sending the same multimodal body to the same model can
+                // only fail the same way; the recovery is the image-strip
+                // retry the client performs before it consults this.
+                | FailoverReason::ImageUnsupported
         )
     }
 }
@@ -384,6 +395,16 @@ pub(crate) fn classify_status(
                 }
             }
         }
+        // Image rejection first: the body may also mention the model (which
+        // would otherwise read as `ModelNotFound` and abort the turn), yet the
+        // model id is fine — only the pixels are undeliverable.
+        400 | 404 if body_indicates_image_unsupported(body) => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} returned {status} (image input unsupported): {safe}"
+            ),
+            reason: FailoverReason::ImageUnsupported,
+            status: Some(status.as_u16()),
+        },
         404 if body_indicates_no_allowed_providers(body) => LlmError::Fatal {
             source: anyhow::anyhow!(
                 "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {safe}"
@@ -909,6 +930,62 @@ mod tests {
         // model slug went stale.
         assert!(err.is_fast_fail());
         assert!(err.should_fallback());
+    }
+
+    #[test]
+    fn classify_404_image_input_is_image_unsupported() {
+        // Verbatim OpenRouter body for a screenshot sent to a text-only model.
+        // Misclassifying this aborts the turn (and every later turn, since the
+        // image stays in the history) instead of re-sending without pixels.
+        let body =
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#;
+        let err = classify_status(reqwest::StatusCode::NOT_FOUND, body, Provider::OpenRouter);
+        assert_eq!(err.reason(), FailoverReason::ImageUnsupported);
+        // Same slot, same payload → same answer. The client's image-strip
+        // retry is the recovery, not a plain retry.
+        assert!(err.is_fast_fail());
+        // Round-trips through the text classifier the UI and agent loop use.
+        assert_eq!(
+            classify_error_text(&err.to_string()),
+            Some(FailoverReason::ImageUnsupported)
+        );
+    }
+
+    #[test]
+    fn image_rejection_beats_model_not_found_when_the_body_says_both() {
+        // The model id is fine here — only the pixels are undeliverable.
+        // Reading this as ModelNotFound would cool a healthy slot and fail over.
+        let body = r#"{"error":{"message":"The model gpt-4o-mini does not support image input"}}"#;
+        let err = classify_status(reqwest::StatusCode::NOT_FOUND, body, Provider::OpenRouter);
+        assert_eq!(err.reason(), FailoverReason::ImageUnsupported);
+
+        // Same phrasing arriving as a 400 (OpenAI-compat backends) classifies
+        // identically rather than as an unrecoverable Format error.
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::ImageUnsupported);
+    }
+
+    #[test]
+    fn ordinary_bodies_mentioning_images_are_not_image_rejections() {
+        // Half a match must not fire: stripping pixels a capable model could
+        // read would silently blind it.
+        for (status, body) in [
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"invalid image_url: could not decode base64"}}"#,
+            ),
+            (
+                reqwest::StatusCode::NOT_FOUND,
+                r#"{"error":{"message":"No endpoints found for this model"}}"#,
+            ),
+        ] {
+            let err = classify_status(status, body, Provider::OpenRouter);
+            assert_ne!(
+                err.reason(),
+                FailoverReason::ImageUnsupported,
+                "body wrongly read as an image rejection: {body}"
+            );
+        }
     }
 
     #[test]

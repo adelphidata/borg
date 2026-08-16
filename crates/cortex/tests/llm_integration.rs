@@ -876,3 +876,170 @@ async fn vertex_claude_uses_gcp_bearer_and_vertex_anthropic_body() {
     }
     std::env::remove_var("BORG_GCP_METADATA_TOKEN_URL");
 }
+
+// ── Test: a model that cannot read images ──
+
+/// Build a user message carrying an inline image alongside its text — the
+/// shape a `browse screenshot` tool result takes on the wire.
+fn message_with_image(text: &str) -> Vec<Message> {
+    use cortex::types::{ContentPart, MediaData};
+    vec![Message {
+        role: Role::User,
+        content: Some(MessageContent::Parts(vec![
+            ContentPart::Text(text.to_string()),
+            ContentPart::ImageBase64 {
+                media: MediaData {
+                    mime_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                    filename: Some("screenshot.png".into()),
+                },
+            },
+        ])),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+        seq: None,
+    }]
+}
+
+/// A provider that rejects image input must not abort the turn: the client
+/// drops the pixels and re-sends, so the user gets an answer instead of
+/// "openrouter returned 404 ... No endpoints found that support image input".
+#[tokio::test]
+async fn image_rejection_strips_the_image_and_completes_the_turn() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+            r#"{"choices":[{"delta":{"content":"the page says hi"}}]}"#,
+            "[DONE]",
+        ])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    // Unique model id: the "this model can't read images" verdict is
+    // remembered process-wide, so tests must not share a key.
+    let mut config = test_config(&server.uri());
+    config.llm.model = "test/no-vision-single-turn".into();
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+
+    client
+        .stream_chat(&message_with_image("what is on this page?"), None, tx)
+        .await
+        .expect("image rejection must be recovered, not propagated");
+
+    let events = collect_events(rx).await;
+    assert!(
+        events.contains(&"text:the page says hi".to_string()),
+        "expected the retried response, got: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.starts_with("error:")),
+        "no error should surface: {events:?}"
+    );
+
+    let received = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        received.len(),
+        2,
+        "expected one retry, got {}",
+        received.len()
+    );
+    let first: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json");
+    assert!(
+        first.to_string().contains("image_url"),
+        "first attempt should have carried the image"
+    );
+    let second: serde_json::Value = serde_json::from_slice(&received[1].body).expect("json");
+    let second_text = second.to_string();
+    assert!(
+        !second_text.contains("image_url"),
+        "retry must not resend the image: {second_text}"
+    );
+    assert!(
+        second_text.contains("image omitted"),
+        "retry must tell the model it is blind: {second_text}"
+    );
+}
+
+/// The image lives in the conversation history, so the *next* turn re-sends it.
+/// Once the provider's verdict is known the client strips pre-emptively —
+/// otherwise every following turn 404s, which is what users hit in practice.
+#[tokio::test]
+async fn later_turns_strip_images_without_a_second_rejection() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            "[DONE]",
+        ])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.llm.model = "test/no-vision-across-turns".into();
+    let mut client = LlmClient::new(&config).await.expect("client");
+
+    let history = message_with_image("screenshot this");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&history, None, tx)
+        .await
+        .expect("first turn recovers");
+    let _ = collect_events(rx).await;
+
+    // Second turn: same history (the screenshot is still in it) plus a
+    // text-only follow-up — through a *fresh* client, because borgd builds one
+    // per turn. The verdict has to outlive the client that learned it.
+    let mut next_turn = history.clone();
+    next_turn.extend(user_message("now summarize it"));
+    let mut client2 = LlmClient::new(&config).await.expect("client");
+    let (tx2, rx2) = mpsc::channel(64);
+    client2
+        .stream_chat(&next_turn, None, tx2)
+        .await
+        .expect("second turn must not fail on the stale image");
+    let events = collect_events(rx2).await;
+    assert!(
+        events.contains(&"text:ok".to_string()),
+        "second turn produced no answer: {events:?}"
+    );
+
+    let received = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        received.len(),
+        3,
+        "second turn must cost no extra rejection round-trip"
+    );
+    let last: serde_json::Value = serde_json::from_slice(&received[2].body).expect("json");
+    assert!(
+        !last.to_string().contains("image_url"),
+        "stale image re-sent on a later turn: {last}"
+    );
+}

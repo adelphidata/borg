@@ -652,49 +652,18 @@ pub(crate) async fn handle(
     Ok(downgrade_for_non_vision_model(out, config))
 }
 
-/// Whether the configured main model accepts image input. Unknown/unset
-/// providers default to `true` — matching [`Provider::supports_vision`]'s
-/// "avoid false negatives that would silently downgrade multimodal" stance,
-/// so we never wrongly strip a screenshot from a model that could see it.
-fn main_model_supports_vision(config: &Config) -> bool {
-    let raw = config.llm.provider.as_deref().unwrap_or("").trim();
-    if raw.is_empty() {
-        return true;
-    }
-    match raw.parse::<crate::llm::provider::Provider>() {
-        Ok(provider) => provider.supports_vision(&config.llm.model),
-        Err(_) => true,
-    }
-}
-
 /// Replace a multimodal (image-bearing) computer_use result with a text-only
-/// one when the main model can't accept images. Vision-capable models — and
-/// any already-text result — pass through untouched. The returned text keeps
-/// the driver's own summary and prepends an actionable note so the model
-/// doesn't mistake "image silently dropped" for "nothing to see".
+/// one when the main model can't accept images, keeping the driver's own
+/// summary. Shared with the other image-producing tools — see
+/// [`crate::tool::vision`].
 fn downgrade_for_non_vision_model(out: ToolOutput, config: &Config) -> ToolOutput {
-    let ToolOutput::Multimodal { text, parts } = &out else {
-        return out;
-    };
-    let has_image = parts
-        .iter()
-        .any(|p| matches!(p, ContentPart::ImageBase64 { .. }));
-    if !has_image || main_model_supports_vision(config) {
-        return out;
-    }
-    let summary = if text.trim().is_empty() {
-        "(no text detail)".to_string()
-    } else {
-        text.clone()
-    };
-    ToolOutput::Text(format!(
-        "Note: computer_use captured a screenshot, but the active model \
-         ({}) does not support image input, so the pixels were dropped. Switch \
-         to a vision-capable model for desktop computer use, or use `capture` \
-         with `mode: \"ax\"` for a text-only accessibility tree. Captured text \
-         summary:\n{summary}",
-        config.llm.model
-    ))
+    crate::tool::vision::downgrade_for_non_vision_model(
+        out,
+        config,
+        "computer_use captured a screenshot",
+        "Switch to a vision-capable model for desktop computer use, or use \
+         `capture` with `mode: \"ax\"` for a text-only accessibility tree.",
+    )
 }
 
 /// Test seam: the handler logic without the production driver. Production
@@ -1855,6 +1824,7 @@ async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::vision::main_model_supports_vision;
     use std::sync::Mutex;
 
     /// In-memory driver: pops queued responses in FIFO order. The recorded
@@ -4023,18 +3993,6 @@ sleep 60"#,
             matches!(out, ToolOutput::Multimodal { .. }),
             "vision model must keep the image: {out:?}"
         );
-    }
-
-    #[test]
-    fn unknown_provider_defaults_to_vision_capable() {
-        // Unset/unknown provider must NOT strip images — mirrors
-        // Provider::supports_vision's "avoid false negatives" stance.
-        let mut config = Config::default();
-        config.llm.provider = None;
-        config.llm.model = "some-model".into();
-        assert!(main_model_supports_vision(&config));
-        config.llm.provider = Some("not-a-real-provider".into());
-        assert!(main_model_supports_vision(&config));
     }
 
     #[test]

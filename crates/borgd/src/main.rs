@@ -64,7 +64,12 @@ async fn async_main() -> Result<()> {
             (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
         });
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // chromiumoxide/tungstenite warn on every CDP event their enums don't model
+    // ("WS Invalid message: data did not match any variant"), which is normal
+    // Chrome-version drift and not a browser-tool failure. Silenced by default
+    // so `daemon.log` stays readable; `RUST_LOG` still overrides.
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide=error,tungstenite=error"));
     cortex::telemetry::install_subscriber(
         otel_layers,
         env_filter,

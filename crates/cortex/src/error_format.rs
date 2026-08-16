@@ -34,6 +34,8 @@ pub enum ErrorCategory {
     ContextOverflow,
     /// Request timed out.
     Timeout,
+    /// The model cannot accept image input, so a screenshot could not be sent.
+    ImageUnsupported,
     /// Unclassified error.
     Unknown,
 }
@@ -48,6 +50,7 @@ impl fmt::Display for ErrorCategory {
             Self::Transport => write!(f, "transport"),
             Self::ContextOverflow => write!(f, "context_overflow"),
             Self::Timeout => write!(f, "timeout"),
+            Self::ImageUnsupported => write!(f, "image_unsupported"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -69,6 +72,7 @@ impl std::str::FromStr for ErrorCategory {
             "transport" => Self::Transport,
             "context_overflow" => Self::ContextOverflow,
             "timeout" => Self::Timeout,
+            "image_unsupported" => Self::ImageUnsupported,
             "unknown" => Self::Unknown,
             _ => return Err(()),
         })
@@ -115,6 +119,7 @@ pub fn classify_error(raw: &str) -> ErrorCategory {
         // A dropped or refused connection is exactly "couldn't reach you" —
         // no transport-detail sniffing needed, the class already says it.
         Some(FailoverReason::ConnectionLost) => ErrorCategory::Transport,
+        Some(FailoverReason::ImageUnsupported) => ErrorCategory::ImageUnsupported,
         Some(FailoverReason::ModelNotFound)
         | Some(FailoverReason::Format)
         | Some(FailoverReason::Unknown)
@@ -211,6 +216,12 @@ pub fn format_friendly_error(raw: &str) -> String {
             "The request to the AI provider timed out. Please try again.".to_string()
         }
 
+        ErrorCategory::ImageUnsupported => {
+            "The current model cannot read images, so the screenshot could not be sent. \
+             Switch to a model that supports images, or ask for the page text instead."
+                .to_string()
+        }
+
         ErrorCategory::Unknown => {
             // For unknown errors, give a safe generic message
             // Truncate to avoid leaking huge error blobs
@@ -240,6 +251,16 @@ struct ActionHint {
 }
 
 const ACTION_HINTS: &[ActionHint] = &[
+    ActionHint {
+        category: ErrorCategory::ImageUnsupported,
+        context: ErrorContext::Tui,
+        hint: "Use /model to pick a model that reads images.",
+    },
+    ActionHint {
+        category: ErrorCategory::ImageUnsupported,
+        context: ErrorContext::Gateway,
+        hint: "Ask for the page text instead, or switch to a model that reads images.",
+    },
     ActionHint {
         category: ErrorCategory::RateLimit,
         context: ErrorContext::Tui,
@@ -381,6 +402,38 @@ fn extract_transport_detail(raw: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    /// A model that can't read images must produce plain-language guidance
+    /// with a next action, not the raw 404 body.
+    #[test]
+    fn image_rejection_message_names_the_next_action() {
+        let raw = "openrouter returned 404 Not Found (image input unsupported): \
+                   {\"error\":{\"message\":\"No endpoints found that support image input\"}}";
+        let msg = format_error_with_context(raw, ErrorContext::Tui);
+        assert!(
+            !msg.contains("404") && !msg.contains("endpoints"),
+            "raw provider body leaked to the user: {msg}"
+        );
+        assert!(msg.contains("cannot read images"), "got: {msg}");
+        assert!(msg.contains("/model"), "TUI hint missing: {msg}");
+
+        let gateway = format_error_with_context(raw, ErrorContext::Gateway);
+        assert!(
+            !gateway.contains("/model"),
+            "slash command leaked to a chat channel: {gateway}"
+        );
+        assert!(gateway.contains("page text"), "got: {gateway}");
+    }
+
+    /// The category token is persisted (compaction-outage latch) and read back.
+    #[test]
+    fn image_unsupported_category_token_round_trips() {
+        let parsed: ErrorCategory = ErrorCategory::ImageUnsupported
+            .to_string()
+            .parse()
+            .expect("token must parse back");
+        assert_eq!(parsed, ErrorCategory::ImageUnsupported);
+    }
+
     /// Table-driven classifier check. Each row pins a real provider/transport
     /// message against the category the user-facing layer relies on for
     /// branching (retry vs. surface vs. abort). Collapsed from 18 near-
@@ -396,6 +449,18 @@ mod tests {
             (
                 "Rate limit exceeded for this model",
                 ErrorCategory::RateLimit,
+            ),
+            // ImageUnsupported — the raw provider body must classify too,
+            // since it reaches the UI verbatim when a retry can't recover.
+            (
+                "openrouter returned 404 Not Found (image input unsupported): \
+                 {\"error\":{\"message\":\"No endpoints found that support image input\"}}",
+                ErrorCategory::ImageUnsupported,
+            ),
+            (
+                "openrouter returned 404 Not Found: {\"error\":{\"message\":\"No endpoints \
+                 found that support image input\",\"code\":404}}",
+                ErrorCategory::ImageUnsupported,
             ),
             // Billing
             (

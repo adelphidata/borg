@@ -583,6 +583,40 @@ pub struct LlmClient {
     /// [`Self::for_auxiliary`]; primary/interactive clients are `None` and are
     /// never gated.
     aux_concurrency: Option<u32>,
+    /// Set once this client has seen the provider answer "this model cannot
+    /// accept image input", so a single call retries the strip at most once.
+    /// The verdict is also recorded in [`IMAGE_REJECTED_MODELS`] for the rest
+    /// of the process.
+    images_rejected: bool,
+}
+
+/// `provider::model` pairs the wire has reported as unable to accept image
+/// input. [`Provider::supports_vision`] cannot know this up front for
+/// aggregators — OpenRouter routes hundreds of models behind one provider id
+/// and answers a text-only one with a 404 — so the verdict is learned at
+/// runtime and remembered.
+///
+/// Process-wide rather than per-client because a client is rebuilt per turn
+/// while the offending screenshot stays in the conversation history: without
+/// this, every later turn pays another rejected round-trip. Cleared only by a
+/// restart, which is also the recovery if a model later gains vision support.
+static IMAGE_REJECTED_MODELS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Whether `(provider, model)` has already been reported as image-incapable.
+fn images_known_rejected(provider: Provider, model: &str) -> bool {
+    IMAGE_REJECTED_MODELS
+        .lock()
+        .map(|s| s.contains(&format!("{provider}::{model}")))
+        .unwrap_or(false)
+}
+
+/// Record that `(provider, model)` rejected image input.
+fn remember_image_rejection(provider: Provider, model: &str) {
+    if let Ok(mut set) = IMAGE_REJECTED_MODELS.lock() {
+        set.insert(format!("{provider}::{model}"));
+    }
 }
 
 /// Normalize a Gemini OpenAI-compat base URL by ensuring it resolves to the
@@ -1126,6 +1160,7 @@ impl LlmClient {
             cost_event_sink: None,
             cost_event_context: None,
             aux_concurrency: None,
+            images_rejected: false,
         })
     }
 
@@ -1938,13 +1973,16 @@ impl LlmClient {
             None => None,
         };
 
-        // Strip images for non-vision models (safety net)
-        let messages = if !self.provider.supports_vision(&self.llm_config.model) {
+        // Strip images for non-vision models (safety net). `images_rejected`
+        // carries a provider verdict from an earlier call in this session, so
+        // an image already in the history doesn't 404 the turn again.
+        let mut messages = if !self.provider.supports_vision(&self.llm_config.model)
+            || images_known_rejected(self.provider, &self.llm_config.model)
+        {
             strip_images(messages)
         } else {
             messages.to_vec()
         };
-        let messages = &messages;
 
         // Reject models that don't support tool calling — Borg requires tools
         if !self.provider.supports_tools(&self.llm_config.model) {
@@ -2079,13 +2117,39 @@ impl LlmClient {
 
                 // ClaudeCli is streaming-only, so it's dispatched here before
                 // consulting the shared `wire_path` classifier.
-                let result = if matches!(self.provider, Provider::ClaudeCli) {
-                    self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
+                let mut result = if matches!(self.provider, Provider::ClaudeCli) {
+                    self.stream_chat_claude_cli_inner(&messages, tools, &tx, &cancel)
                         .await
                 } else {
-                    self.stream_http_transport_inner(messages, tools, &tx, &cancel)
+                    self.stream_http_transport_inner(&messages, tools, &tx, &cancel)
                         .await
                 };
+
+                // "This model can't accept images" is not a broken request —
+                // the pixels are simply undeliverable. Drop them (leaving a
+                // note in their place so the model knows it is blind) and
+                // re-send immediately, rather than aborting the turn. Costs no
+                // retry budget: the payload changed, so this is a new request,
+                // not a retry of the failed one.
+                if !self.images_rejected
+                    && matches!(&result, Err(e) if e.reason() == FailoverReason::ImageUnsupported)
+                {
+                    self.images_rejected = true;
+                    remember_image_rejection(self.provider, &self.llm_config.model);
+                    warn!(
+                        target: "cortex::llm",
+                        model = %self.llm_config.model,
+                        "provider rejected image input; re-sending this turn without images"
+                    );
+                    messages = strip_images(&messages);
+                    result = if matches!(self.provider, Provider::ClaudeCli) {
+                        self.stream_chat_claude_cli_inner(&messages, tools, &tx, &cancel)
+                            .await
+                    } else {
+                        self.stream_http_transport_inner(&messages, tools, &tx, &cancel)
+                            .await
+                    };
+                }
 
                 // Lease drop happens here as we re-bind below; report outcome
                 // to the pool by id before the lease's Drop returns it.
@@ -2886,6 +2950,15 @@ impl LlmClient {
         let req_id = short_request_id();
         let max_provider_attempts = 1 + self.provider_slots.len();
         let mut last_error: Option<String> = None;
+        // Mirrors the streaming path: honor a provider verdict already learned
+        // in this session, and learn one here if it arrives.
+        let mut messages: Vec<Message> = if !self.provider.supports_vision(&self.llm_config.model)
+            || images_known_rejected(self.provider, &self.llm_config.model)
+        {
+            strip_images(messages)
+        } else {
+            messages.to_vec()
+        };
 
         for _provider_attempt in 0..max_provider_attempts {
             let max_retries = self.llm_config.max_retries;
@@ -2939,7 +3012,23 @@ impl LlmClient {
                     None
                 };
 
-                let result = self.chat_once(messages, tools, &req_id).await;
+                let mut result = self.chat_once(&messages, tools, &req_id).await;
+
+                // See the streaming path: undeliverable pixels are stripped and
+                // the request re-sent once, instead of failing the turn.
+                if !self.images_rejected
+                    && matches!(&result, Err(e) if e.reason() == FailoverReason::ImageUnsupported)
+                {
+                    self.images_rejected = true;
+                    remember_image_rejection(self.provider, &self.llm_config.model);
+                    warn!(
+                        target: "cortex::llm",
+                        model = %self.llm_config.model,
+                        "provider rejected image input; re-sending this request without images"
+                    );
+                    messages = strip_images(&messages);
+                    result = self.chat_once(&messages, tools, &req_id).await;
+                }
 
                 match result {
                     Ok(message) => {

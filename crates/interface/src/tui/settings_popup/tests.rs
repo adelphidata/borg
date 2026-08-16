@@ -987,7 +987,11 @@ fn a_value_that_fits_is_right_aligned_untouched() {
 fn multibyte_values_are_measured_in_columns_not_bytes() {
     let (value, padding) = layout_row_value(40, 10, "\u{2713}", 2, false);
     assert_eq!(value, "\u{2713}");
-    assert_eq!(10 + padding + 1 + 2, 40, "\u{2713} is one column, not three");
+    assert_eq!(
+        10 + padding + 1 + 2,
+        40,
+        "\u{2713} is one column, not three"
+    );
 }
 
 /// Guards the global slash-interceptor's gating predicate. `/` is a valid

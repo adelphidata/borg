@@ -697,7 +697,14 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
     })
 }
 
+/// Placeholder left where an image was removed. Silence would leave the model
+/// believing it had looked at something; naming the omission lets it say so and
+/// pick a text-only path (`get_text`, `snapshot`, `capture mode: "ax"`).
+pub(super) const IMAGE_OMITTED_NOTICE: &str =
+    "[image omitted: the active model does not accept image input]";
+
 /// Strip image content parts from messages when model doesn't support vision.
+/// Each removed image leaves [`IMAGE_OMITTED_NOTICE`] in its place.
 /// Simplifies `Parts([Text])` → `Text` after stripping.
 pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
     messages
@@ -707,14 +714,13 @@ pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
                 Some(crate::types::MessageContent::Parts(parts)) => {
                     let filtered: Vec<crate::types::ContentPart> = parts
                         .iter()
-                        .filter(|p| {
-                            !matches!(
-                                p,
-                                crate::types::ContentPart::ImageBase64 { .. }
-                                    | crate::types::ContentPart::ImageUrl { .. }
-                            )
+                        .map(|p| match p {
+                            crate::types::ContentPart::ImageBase64 { .. }
+                            | crate::types::ContentPart::ImageUrl { .. } => {
+                                crate::types::ContentPart::Text(IMAGE_OMITTED_NOTICE.to_string())
+                            }
+                            other => other.clone(),
                         })
-                        .cloned()
                         .collect();
 
                     if filtered.is_empty() {
@@ -742,4 +748,91 @@ pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod strip_images_tests {
+    use super::*;
+    use crate::types::{ContentPart, MediaData, MessageContent};
+
+    fn image_part() -> ContentPart {
+        ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".into(),
+                data: "aGk=".into(),
+                filename: Some("screenshot.png".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn image_parts_become_a_named_omission_not_silence() {
+        // Dropping the pixels without a word leaves the model answering as if
+        // it had looked at the page.
+        let msg = Message {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text("here is the page".into()),
+                image_part(),
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+        };
+        let out = strip_images(&[msg]);
+        let Some(MessageContent::Parts(parts)) = &out[0].content else {
+            panic!("expected parts, got {:?}", out[0].content);
+        };
+        assert_eq!(parts.len(), 2, "notice must replace the image: {parts:?}");
+        assert!(
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+            "image survived: {parts:?}"
+        );
+        assert!(
+            matches!(&parts[1], ContentPart::Text(t) if t == IMAGE_OMITTED_NOTICE),
+            "expected the omission notice, got {:?}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn image_only_message_collapses_to_the_notice_text() {
+        let msg = Message {
+            role: Role::User,
+            content: Some(MessageContent::Parts(vec![image_part()])),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+        };
+        let out = strip_images(&[msg]);
+        assert!(
+            matches!(&out[0].content, Some(MessageContent::Text(t)) if t == IMAGE_OMITTED_NOTICE),
+            "got {:?}",
+            out[0].content
+        );
+    }
+
+    #[test]
+    fn text_messages_and_tool_calls_pass_through_untouched() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some(MessageContent::Text("no pixels here".into())),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: Some("t".into()),
+            seq: Some(7),
+        };
+        let out = strip_images(std::slice::from_ref(&msg));
+        assert!(
+            matches!(&out[0].content, Some(MessageContent::Text(t)) if t == "no pixels here"),
+            "got {:?}",
+            out[0].content
+        );
+        assert_eq!(out[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(out[0].seq, Some(7));
+    }
 }

@@ -102,6 +102,45 @@ pub async fn handle_text_to_speech(
     }
 }
 
+/// Build the tool output for a captured page screenshot.
+///
+/// Split out from the handler so the vision gate is testable without a real
+/// browser: a text-only main model must be told the pixels were dropped rather
+/// than have them silently removed at the LLM layer, which leaves the model
+/// answering as if it had looked at the page.
+fn screenshot_output(
+    desc: &str,
+    saved_path: Option<&std::path::Path>,
+    png_bytes: &[u8],
+    config: &Config,
+) -> ToolOutput {
+    let text = match saved_path {
+        Some(p) => format!("{desc}\nSaved to: {}", p.display()),
+        None => desc.to_string(),
+    };
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png_bytes);
+    let out = ToolOutput::Multimodal {
+        text,
+        parts: vec![
+            ContentPart::Text(desc.to_string()),
+            ContentPart::ImageBase64 {
+                media: MediaData {
+                    mime_type: "image/png".to_string(),
+                    data: b64,
+                    filename: Some("screenshot.png".to_string()),
+                },
+            },
+        ],
+    };
+    crate::tool::vision::downgrade_for_non_vision_model(
+        out,
+        config,
+        "browse captured a page screenshot",
+        "Switch to a vision-capable model to read screenshots, or use the \
+         `get_text` / `snapshot` actions for a text view of the page.",
+    )
+}
+
 #[instrument(skip_all, fields(tool.name = "browser"))]
 pub async fn handle_browser(
     args: &serde_json::Value,
@@ -336,28 +375,12 @@ pub async fn handle_browser(
                         Some(path)
                     });
 
-                    let text = match &saved_path {
-                        Some(p) => format!("{desc}\nSaved to: {}", p.display()),
-                        None => desc.clone(),
-                    };
-
-                    let b64 = base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
+                    Ok(screenshot_output(
+                        &desc,
+                        saved_path.as_deref(),
                         &png_bytes,
-                    );
-                    Ok(ToolOutput::Multimodal {
-                        text,
-                        parts: vec![
-                            ContentPart::Text(desc),
-                            ContentPart::ImageBase64 {
-                                media: MediaData {
-                                    mime_type: "image/png".to_string(),
-                                    data: b64,
-                                    filename: Some("screenshot.png".to_string()),
-                                },
-                            },
-                        ],
-                    })
+                        config,
+                    ))
                 }
                 Err(e) => Ok(ToolOutput::Text(format!("Error: {e}"))),
             }
@@ -529,6 +552,71 @@ pub async fn handle_browser(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 1x1 PNG stand-in — `screenshot_output` never decodes the bytes.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+
+    fn config_with_model(provider: &str, model: &str) -> Config {
+        let mut config = Config::default();
+        config.llm.provider = Some(provider.into());
+        config.llm.model = model.into();
+        config
+    }
+
+    #[test]
+    fn screenshot_reaches_a_vision_model_as_pixels() {
+        let out = screenshot_output(
+            "Full page screenshot",
+            Some(std::path::Path::new("/tmp/shot.png")),
+            PNG,
+            &config_with_model("anthropic", "claude-sonnet-5"),
+        );
+        let ToolOutput::Multimodal { text, parts } = out else {
+            panic!("vision model must receive the image: {out:?}");
+        };
+        assert!(text.contains("Saved to: /tmp/shot.png"), "got: {text}");
+        assert!(
+            parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+            "image part missing: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn screenshot_for_a_text_only_model_becomes_an_explained_text_result() {
+        // Regression: the pixels used to travel to the provider and 404 the
+        // turn ("No endpoints found that support image input"), and the
+        // screenshot stayed in history so every later turn failed too.
+        let out = screenshot_output(
+            "Full page screenshot",
+            Some(std::path::Path::new("/tmp/shot.png")),
+            PNG,
+            &config_with_model("groq", "llama-3.1-8b-instant"),
+        );
+        match out {
+            ToolOutput::Text(t) => {
+                assert!(t.contains("does not support image input"), "got: {t}");
+                assert!(t.contains("get_text"), "no text-only remedy named: {t}");
+                assert!(t.contains("Saved to: /tmp/shot.png"), "path lost: {t}");
+            }
+            other => panic!("text-only model must not receive pixels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn screenshot_without_a_saved_path_still_reports_the_description() {
+        let out = screenshot_output(
+            "Screenshot of element: body",
+            None,
+            PNG,
+            &config_with_model("anthropic", "claude-sonnet-5"),
+        );
+        let ToolOutput::Multimodal { text, .. } = out else {
+            panic!("expected multimodal: {out:?}");
+        };
+        assert_eq!(text, "Screenshot of element: body");
+    }
 
     #[tokio::test]
     async fn handle_generate_image_disabled() {

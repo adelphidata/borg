@@ -53,6 +53,7 @@ pub(crate) mod text_to_speech;
 pub(crate) mod transcribe_audio;
 pub(crate) mod update_goal;
 pub(crate) mod video_analyze;
+pub(crate) mod vision;
 pub(crate) mod vision_analyze;
 pub(crate) mod web_fetch;
 pub(crate) mod web_search;

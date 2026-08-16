@@ -199,6 +199,29 @@ pub(super) fn body_indicates_cloudflare_block(body: &str) -> bool {
 /// found" even though both return 404. Example body:
 ///   {"error":{"message":"No allowed providers are available for the selected
 ///   model.","code":404,"metadata":{"available_providers":[...]}}}
+/// True when the provider rejected the request because the *model* cannot
+/// accept image input — distinct from a wrong model id even though OpenRouter
+/// reports both as 404. Example body:
+///   {"error":{"message":"No endpoints found that support image input","code":404}}
+///
+/// Both halves must match: an image phrase AND a rejection phrase. A bare
+/// "image" needle would fire on ordinary prose (an `image_url` mentioned in a
+/// harmless 400) and strip pixels a capable model could have read.
+pub(super) fn body_indicates_image_unsupported(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let mentions_image = lower.contains("image input")
+        || lower.contains("image_url")
+        || lower.contains("image content")
+        || lower.contains("image parts")
+        || lower.contains("multimodal");
+    let rejects = lower.contains("no endpoints")
+        || lower.contains("not support")
+        || lower.contains("unsupported")
+        || lower.contains("does not accept")
+        || lower.contains("not enabled");
+    mentions_image && rejects
+}
+
 pub(super) fn body_indicates_no_allowed_providers(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("no allowed providers") || lower.contains("available_providers")
@@ -237,6 +260,9 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
     }
     if lower.contains("(payload too large)") {
         return Some(FailoverReason::PayloadTooLarge);
+    }
+    if lower.contains("(image input unsupported)") || body_indicates_image_unsupported(lower) {
+        return Some(FailoverReason::ImageUnsupported);
     }
     if lower.contains("(auth permanent)") {
         return Some(FailoverReason::AuthPermanent);
