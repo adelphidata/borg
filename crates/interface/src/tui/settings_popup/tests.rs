@@ -943,6 +943,53 @@ fn text_row_enter_seeds_buffer_with_raw_value() {
     }
 }
 
+/// Regression: pasting a long API key into a Text row used to render as
+/// `API key env varOPENROUTER_API_KEYsk-or-v1-…` — label and value ran
+/// together and the value spilled past the popup edge.
+#[test]
+fn a_long_edited_value_is_elided_and_never_touches_the_label() {
+    const ROW: usize = 60;
+    let label = "  API key env var"; // 17 columns
+    let pasted = "OPENROUTER_API_KEYsk-or-v1-1ea4beaf9e875080b01f08acf335f4d203edce2f";
+
+    let (value, padding) = layout_row_value(ROW, label.len(), pasted, 2, true);
+    let value_width = UnicodeWidthStr::width(value.as_str());
+
+    assert!(padding >= ROW_GAP, "label and value must stay separated");
+    assert!(
+        label.len() + padding + value_width + 2 <= ROW,
+        "row overflowed: label={} pad={padding} value={value_width}",
+        label.len()
+    );
+    // Editing keeps the tail, so the characters just typed stay on screen.
+    assert!(value.starts_with('\u{2026}'), "got: {value}");
+    assert!(pasted.ends_with(value.trim_start_matches('\u{2026}')));
+}
+
+#[test]
+fn a_browsed_value_keeps_its_head() {
+    let (value, _) = layout_row_value(40, 10, "deepseek/deepseek-v4-flash-preview", 2, false);
+    assert!(value.starts_with("deepseek/"), "got: {value}");
+    assert!(value.ends_with('\u{2026}'), "got: {value}");
+    assert!(UnicodeWidthStr::width(value.as_str()) <= 40 - 10 - 2 - ROW_GAP);
+}
+
+#[test]
+fn a_value_that_fits_is_right_aligned_untouched() {
+    let (value, padding) = layout_row_value(40, 10, "0.7", 2, false);
+    assert_eq!(value, "0.7");
+    assert_eq!(10 + padding + 3 + 2, 40, "value must sit flush right");
+}
+
+/// The customized marker and the check/cross glyphs are multi-byte; byte
+/// lengths would misplace every row that carries one.
+#[test]
+fn multibyte_values_are_measured_in_columns_not_bytes() {
+    let (value, padding) = layout_row_value(40, 10, "\u{2713}", 2, false);
+    assert_eq!(value, "\u{2713}");
+    assert_eq!(10 + padding + 1 + 2, 40, "\u{2713} is one column, not three");
+}
+
 /// Guards the global slash-interceptor's gating predicate. `/` is a valid
 /// character inside many setting values (paths, URLs, `OPENROUTER_API_KEY`-
 /// style env names with no slashes are fine, but values like

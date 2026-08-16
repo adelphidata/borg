@@ -131,6 +131,26 @@ pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
     &s[..end]
 }
 
+/// Keep the *last* `max_width` display columns of `s` (grapheme-safe,
+/// width-aware). The mirror of [`truncate_str_to_width`]: use it when the tail
+/// carries the meaning, e.g. an edit buffer whose caret sits at the end.
+pub fn truncate_str_to_width_end(s: &str, max_width: usize) -> &str {
+    if max_width == 0 {
+        return "";
+    }
+    let mut used = 0usize;
+    let mut start = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_w > max_width {
+            break;
+        }
+        start = idx;
+        used += ch_w;
+    }
+    &s[start..]
+}
+
 /// Truncate a slash-separated path to fit `max_width` display columns by
 /// replacing middle segments with `…`. Keeps as many leading and trailing
 /// segments as possible. Falls back to a plain ellipsis truncation if even
@@ -320,6 +340,23 @@ mod tests {
     fn format_json_compact_returns_none_for_non_json() {
         assert!(format_json_compact("hello world").is_none());
         assert!(format_json_compact("error: something broke").is_none());
+    }
+
+    #[test]
+    fn truncate_str_to_width_end_keeps_the_tail() {
+        assert_eq!(truncate_str_to_width_end("sk-or-v1-abcdef", 6), "abcdef");
+        // Fits already — returned whole.
+        assert_eq!(truncate_str_to_width_end("abc", 10), "abc");
+        assert_eq!(truncate_str_to_width_end("abc", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_to_width_end_never_splits_a_wide_char() {
+        // "世" is 2 columns: a 3-column budget can only carry one of them plus
+        // the trailing ASCII, never a half glyph.
+        let out = truncate_str_to_width_end("你好世界x", 3);
+        assert_eq!(out, "界x");
+        assert!(UnicodeWidthStr::width(out) <= 3);
     }
 
     #[test]

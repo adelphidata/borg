@@ -19,8 +19,55 @@ use crate::daemon_client::DaemonClient;
 use crate::onboarding::{models_for_provider, PROVIDERS};
 
 use super::app::{AppAction, PopupHandler};
+use super::line_utils::{truncate_str_to_width, truncate_str_to_width_end};
 use super::popup_utils;
 use super::theme;
+use unicode_width::UnicodeWidthStr;
+
+/// Minimum columns kept between a row's label and its value, so the two never
+/// run together when the value is long.
+const ROW_GAP: usize = 1;
+
+/// Fit a row value into `budget` display columns.
+///
+/// An overflowing value is elided rather than allowed to spill: rows being
+/// edited keep their *tail* (the characters just typed and the caret), every
+/// other row keeps its head, which is the part that identifies the value.
+fn fit_row_value(value: &str, budget: usize, keep_tail: bool) -> String {
+    if UnicodeWidthStr::width(value) <= budget {
+        return value.to_string();
+    }
+    if budget <= 1 {
+        return "\u{2026}".repeat(budget);
+    }
+    if keep_tail {
+        format!("\u{2026}{}", truncate_str_to_width_end(value, budget - 1))
+    } else {
+        format!("{}\u{2026}", truncate_str_to_width(value, budget - 1))
+    }
+}
+
+/// Lay out one settings row: elide `value` to the columns the label leaves,
+/// and return it with the padding that right-aligns it.
+///
+/// Whenever the label and the customized marker themselves fit, the result
+/// satisfies `label_width + padding + value_width + suffix_width <= row_width`
+/// with at least [`ROW_GAP`] columns of padding — so a long value can neither
+/// touch the label nor spill past the popup edge.
+fn layout_row_value(
+    row_width: usize,
+    label_width: usize,
+    value: &str,
+    suffix_width: usize,
+    keep_tail: bool,
+) -> (String, usize) {
+    let budget = row_width.saturating_sub(label_width + suffix_width + ROW_GAP);
+    let fitted = fit_row_value(value, budget, keep_tail);
+    let padding = row_width
+        .saturating_sub(label_width + UnicodeWidthStr::width(fitted.as_str()) + suffix_width)
+        .max(ROW_GAP);
+    (fitted, padding)
+}
 
 // TUI popup uses the core-side types directly so there's a single registry
 // describing every setting, its kind, and its display metadata.
@@ -925,12 +972,20 @@ impl SettingsPopup {
                 value.clone()
             };
 
-            let customized_suffix = if is_customized { " \u{25CF}" } else { "" };
-            let label_width = inner.width.saturating_sub(4) as usize;
+            let suffix_width = if is_customized { 2 } else { 0 }; // " \u{25CF}"
+            let row_width = inner.width.saturating_sub(4) as usize;
             let label = format!("  {}", entry.label);
-            let val_with_suffix = format!("{display_value}{customized_suffix}");
-            let val_len = val_with_suffix.len();
-            let padding = label_width.saturating_sub(label.len() + val_len);
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            // A long value (a pasted API key, a deep path) must never run into
+            // the label or spill past the popup edge.
+            let is_editing = is_selected && matches!(self.mode, EditMode::Editing { .. });
+            let (display_value, padding) = layout_row_value(
+                row_width,
+                label_width,
+                &display_value,
+                suffix_width,
+                is_editing,
+            );
 
             let base_style = if is_selected {
                 theme::popup_selected()
@@ -939,7 +994,7 @@ impl SettingsPopup {
             };
 
             let mut spans = vec![
-                Span::styled(label.clone(), base_style),
+                Span::styled(label, base_style),
                 Span::styled(format!("{:>pad$}", "", pad = padding), base_style),
                 Span::styled(display_value, base_style),
             ];

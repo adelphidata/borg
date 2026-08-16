@@ -168,10 +168,13 @@ pub fn render_status_message(
         };
         let status_y = inner.y + inner.height - offset_from_bottom;
         let status_area = Rect::new(inner.x, status_y, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {msg}"), style))),
-            status_area,
+        // One row only — elide instead of letting a long confirmation (a key,
+        // a path, an error) run off the edge mid-character.
+        let line = super::line_utils::truncate_line_with_ellipsis(
+            Line::from(Span::styled(format!(" {msg}"), style)),
+            inner.width as usize,
         );
+        frame.render_widget(Paragraph::new(line), status_area);
     }
 }
 
