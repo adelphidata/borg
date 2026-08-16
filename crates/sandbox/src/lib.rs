@@ -36,6 +36,8 @@ pub mod constants;
 pub mod paths;
 /// Sandbox policy definition and command wrapping.
 pub mod policy;
+/// Signalling a child's whole process group, with a per-member macOS fallback.
+pub mod process_group;
 /// Script runner with sandboxed subprocess execution.
 pub mod runner;
 /// macOS Seatbelt profile generation.

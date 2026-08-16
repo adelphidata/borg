@@ -84,6 +84,13 @@ pub(crate) struct AddArgs {
     #[arg(long, requires = "client_cert")]
     pub client_key: Option<String>,
 
+    /// Extra certificate authorities to trust for this server, as a PEM bundle
+    /// (HTTP / SSE only). `~` is expanded. Use this when the server sits behind
+    /// a TLS-inspecting proxy whose CA is not in the system trust store. The
+    /// bundle is added to the built-in roots, never replacing them.
+    #[arg(long)]
+    pub ca_cert: Option<String>,
+
     /// Initial handshake timeout (ms).
     #[arg(long, default_value_t = 60_000)]
     pub connect_timeout_ms: u64,
@@ -365,6 +372,7 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
     }
     let client_cert = args.client_cert.clone();
     let client_key = args.client_key.clone();
+    let ca_cert = args.ca_cert.clone();
     Ok(if is_sse {
         TransportSpec::Sse {
             url,
@@ -372,6 +380,7 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
             auth,
             client_cert,
             client_key,
+            ca_cert,
         }
     } else {
         TransportSpec::Http {
@@ -380,6 +389,7 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
             auth,
             client_cert,
             client_key,
+            ca_cert,
         }
     })
 }
@@ -569,6 +579,7 @@ fn preset_to_config(name: &str, fs_root: Option<&str>) -> Result<McpServerConfig
                 auth: HttpAuthSpec::None,
                 client_cert: None,
                 client_key: None,
+                ca_cert: None,
             },
             rate_limit_per_minute: 60,
             rate_limit_burst: 10,
@@ -697,6 +708,7 @@ mod tests {
             max_tools: 1,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -725,6 +737,7 @@ mod tests {
             max_tools: 1,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -755,6 +768,7 @@ mod tests {
             max_tools: 1,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();
@@ -785,6 +799,7 @@ mod tests {
             max_tools: 1,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
             force: false,
         };
         let t = build_transport(&args).unwrap();
@@ -824,6 +839,7 @@ mod tests {
             max_tools: 1,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
             force: false,
         };
         let err = build_transport(&args).unwrap_err();

@@ -2060,6 +2060,115 @@ fn load_all_skills_no_duplicates() {
     );
 }
 
+/// Spec: a skill may name the model its work belongs on, and the agent must
+/// be told the one mechanism that can honour it. A model cannot switch itself
+/// mid-turn, so a bare "Model: X" line would be unactionable trivia.
+#[test]
+fn a_declared_model_reaches_the_prompt_as_a_delegation_instruction() {
+    let content = "---\nname: bulk-extract\ndescription: Pull fields out of many files\nmodel: claude-haiku-4-5-20251001\n---\n\nBody text.\n";
+    let (manifest, body) = parse_skill_md(content).unwrap();
+    assert_eq!(manifest.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+
+    let skill = Skill {
+        manifest,
+        body,
+        source: SkillSource::User,
+        available: true,
+        disabled: false,
+        references: Vec::new(),
+        scripts: Vec::new(),
+    };
+    let rendered = skill.format_for_prompt();
+    assert!(
+        rendered.contains("claude-haiku-4-5-20251001"),
+        "the declared model must reach the prompt: {rendered}"
+    );
+    assert!(
+        rendered.contains("spawn_agent"),
+        "the prompt must name the mechanism that can honour it: {rendered}"
+    );
+    assert!(
+        rendered.contains("Body text."),
+        "the skill body must still render: {rendered}"
+    );
+}
+
+/// Spec: a skill that declares nothing must render exactly as before — the
+/// note is per-skill, not a banner every skill pays prompt budget for.
+#[test]
+fn a_skill_without_a_model_gains_no_delegation_note() {
+    let content = "---\nname: plain\ndescription: Does a thing\n---\n\nBody text.\n";
+    let (manifest, body) = parse_skill_md(content).unwrap();
+    assert!(manifest.model.is_none());
+
+    let skill = Skill {
+        manifest,
+        body,
+        source: SkillSource::User,
+        available: true,
+        disabled: false,
+        references: Vec::new(),
+        scripts: Vec::new(),
+    };
+    assert!(!skill.format_for_prompt().contains("spawn_agent"));
+}
+
+/// Spec: an author who leaves the key in place with no value has declared
+/// nothing. Carrying `Some("")` through would ask `spawn_agent` for the model
+/// named "".
+#[test]
+fn a_blank_model_key_is_not_a_declaration() {
+    let content = "---\nname: blank\ndescription: Does a thing\nmodel: \"   \"\n---\n\nBody.\n";
+    let (manifest, _) = parse_skill_md(content).unwrap();
+    assert!(manifest.model.is_none());
+}
+
+/// Spec: a skill directory may itself be a symlink — that is how an author
+/// keeps a skill in a checkout elsewhere, and it must keep working. What must
+/// not work is a file *beneath* it pointing back out: `scripts/` entries
+/// execute, so a symlink to a payload outside the skill would run under that
+/// skill's name.
+#[cfg(unix)]
+#[test]
+fn supporting_files_may_not_resolve_outside_the_skill_directory() {
+    use crate::skills::loader::contained_path;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let real_skill = tmp.path().join("checkout").join("my-skill");
+    std::fs::create_dir_all(real_skill.join("scripts")).unwrap();
+    let outside = tmp.path().join("payload.sh");
+    std::fs::write(&outside, "#!/bin/bash\necho pwned").unwrap();
+
+    // The skill is discovered through a symlink, the way an out-of-tree skill is.
+    let discovered = tmp.path().join("my-skill");
+    std::os::unix::fs::symlink(&real_skill, &discovered).unwrap();
+    let root = std::fs::canonicalize(&discovered).unwrap();
+
+    // A genuine file under the (symlinked) skill directory still resolves.
+    let honest = real_skill.join("scripts").join("build.sh");
+    std::fs::write(&honest, "#!/bin/bash\n").unwrap();
+    assert!(
+        contained_path(&root, &discovered.join("scripts").join("build.sh")).is_some(),
+        "a real file inside a symlinked skill directory must still load"
+    );
+
+    // A script symlinked out of the skill must not.
+    let escape = real_skill.join("scripts").join("deploy.sh");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    assert!(
+        contained_path(&root, &escape).is_none(),
+        "a script resolving outside the skill directory must be refused"
+    );
+
+    // A dangling symlink is unreadable, and unreadable must not mean allowed.
+    let dangling = real_skill.join("scripts").join("gone.sh");
+    std::os::unix::fs::symlink(tmp.path().join("no-such-file"), &dangling).unwrap();
+    assert!(
+        contained_path(&root, &dangling).is_none(),
+        "an unresolvable path must be refused, not admitted"
+    );
+}
+
 #[test]
 fn core_skills_have_core_category() {
     let skills =

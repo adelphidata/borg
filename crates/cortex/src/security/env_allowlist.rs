@@ -396,6 +396,26 @@ pub fn apply_filtered_env_std(
     }
 }
 
+/// Name of the variable carrying the session a command was spawned from.
+///
+/// Lets hooks, skill scripts, and the operator's own tooling correlate their
+/// work with the conversation that triggered it — the id is otherwise only a
+/// tool argument and never crosses into the child.
+pub const SESSION_ID_ENV: &str = "BORG_SESSION_ID";
+
+/// Stamp [`SESSION_ID_ENV`] onto a command, replacing any inherited value.
+///
+/// Must be called *after* [`apply_filtered_env`]: `env_clear` would otherwise
+/// drop it, and an ambient `BORG_SESSION_ID` from the operator's shell would
+/// name some other conversation. A session-less caller (a scheduled task, a
+/// probe) leaves the variable unset rather than setting it empty, so scripts
+/// can test for presence.
+pub fn apply_session_id(cmd: &mut tokio::process::Command, session_id: Option<&str>) {
+    if let Some(id) = session_id.filter(|id| !id.is_empty()) {
+        cmd.env(SESSION_ID_ENV, id);
+    }
+}
+
 /// Build a HashMap of env vars suitable for a `portable_pty::CommandBuilder`.
 /// Same semantics as [`apply_filtered_env`] but returns the map instead of
 /// mutating a `Command`, since `CommandBuilder` has a different API surface.
@@ -743,6 +763,62 @@ mod tests {
         assert!(
             stdout.contains(&format!("{extra_name}={extra_value}")),
             "extras must override the filter; child env was:\n{stdout}"
+        );
+    }
+
+    /// Spec: a command must be able to tell which conversation spawned it, and
+    /// the value it sees must be *ours*. `apply_filtered_env` strips the parent
+    /// env, so the stamp has to land after it; and a `BORG_SESSION_ID` carried
+    /// in from anywhere else must never win, or a script would attribute its
+    /// work to some other session.
+    ///
+    /// The competing value arrives through the skill-credential extras — the
+    /// one channel that survives `env_clear` — rather than through
+    /// `std::env::set_var`, which would race every other test in this process.
+    #[tokio::test]
+    async fn session_id_reaches_the_child_and_overrides_an_inherited_value() {
+        let extras = HashMap::from([(
+            SESSION_ID_ENV.to_string(),
+            "session-from-somewhere-else".to_string(),
+        )]);
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("env");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        apply_filtered_env(&mut cmd, &extras);
+        apply_session_id(&mut cmd, Some("session-under-test"));
+
+        let output = cmd.output().await.expect("spawn sh failed");
+
+        let stdout = std::str::from_utf8(&output.stdout).expect("sh wrote non-UTF-8");
+        assert!(
+            stdout.contains(&format!("{SESSION_ID_ENV}=session-under-test")),
+            "the child must see the spawning session's id; child env was:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("session-from-somewhere-else"),
+            "an inherited session id must not survive; child env was:\n{stdout}"
+        );
+    }
+
+    /// Spec: a session-less caller (a scheduled task, a probe) must leave the
+    /// variable unset so a script can test for presence, rather than seeing an
+    /// empty string that looks like a real id.
+    #[tokio::test]
+    async fn a_session_less_command_gets_no_session_variable() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("env");
+        cmd.stdout(std::process::Stdio::piped());
+        apply_filtered_env(&mut cmd, &HashMap::new());
+        apply_session_id(&mut cmd, None);
+        apply_session_id(&mut cmd, Some(""));
+
+        let output = cmd.output().await.expect("spawn sh failed");
+        let stdout = std::str::from_utf8(&output.stdout).expect("sh wrote non-UTF-8");
+        assert!(
+            !stdout.contains(SESSION_ID_ENV),
+            "no session means no variable; child env was:\n{stdout}"
         );
     }
 }

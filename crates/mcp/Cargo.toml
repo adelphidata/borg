@@ -21,6 +21,9 @@ url = { workspace = true }
 reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 async-trait = { workspace = true }
+# Process-group signalling (`process_group`), shared with the sandboxed script
+# runner so both paths use one macOS EPERM fallback.
+sandbox = { path = "../sandbox" }
 
 [target.'cfg(unix)'.dependencies]
 # Watchdog reaper for orphaned stdio MCP servers: getppid/kill/killpg/signal.

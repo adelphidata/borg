@@ -25,6 +25,9 @@ pub enum SessionAction {
         id: String,
         format: cortex::export::ExportFormat,
     },
+    Archive {
+        id: String,
+    },
 }
 
 /// Export formats offered by the popup, in `f`-key cycle order.
@@ -130,6 +133,19 @@ impl SessionsPopup {
                     None
                 }
             }
+            KeyCode::Char('a') => {
+                // Drop the row immediately and stay open: archiving is a
+                // housekeeping pass over several sessions, and re-opening the
+                // popup after each one would make that tedious. The daemon is
+                // the source of truth — a refused archive is reported in the
+                // transcript, and the next `/sessions` re-reads the list.
+                if self.cursor >= self.sessions.len() {
+                    return None;
+                }
+                let session = self.sessions.remove(self.cursor);
+                self.cursor = self.cursor.min(self.sessions.len().saturating_sub(1));
+                Some(SessionAction::Archive { id: session.id })
+            }
             KeyCode::Char('f') => {
                 self.format_idx = (self.format_idx + 1) % EXPORT_FORMATS.len();
                 None
@@ -196,7 +212,7 @@ impl SessionsPopup {
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
         let footer = format!(
-            " Enter: load  e: export ({})  f: format  Esc: close",
+            " Enter: load  e: export ({})  f: format  a: archive  Esc: close",
             self.selected_format().as_str()
         );
         popup_utils::render_footer(frame, inner, &footer);
@@ -218,6 +234,7 @@ impl PopupHandler for SessionsPopup {
             Some(SessionAction::Export { id, format }) => {
                 Ok(Some(AppAction::ExportSession { id, format }))
             }
+            Some(SessionAction::Archive { id }) => Ok(Some(AppAction::ArchiveSession { id })),
             None => Ok(None),
         }
     }

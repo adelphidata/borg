@@ -273,7 +273,7 @@ fn non_mutating_tools_allowed_in_plan_mode() {
 /// Build a minimal in-memory `Agent` for unit tests that exercise prompt /
 /// section assembly. No DB, network, or sub-agent control — just enough state
 /// for the section builders to run.
-fn minimal_test_agent(config: Config) -> Agent {
+pub(super) fn minimal_test_agent(config: Config) -> Agent {
     let session = Session::new();
     let session_id = session.meta.id.clone();
     Agent {

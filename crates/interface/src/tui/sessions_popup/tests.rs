@@ -154,6 +154,49 @@ fn e_key_on_empty_returns_none() {
     assert!(result.is_none());
 }
 
+/// Spec: archiving is a housekeeping pass over a list. The row must leave the
+/// popup at once and the popup must stay open, so the next session can be
+/// archived without reopening `/sessions`.
+#[test]
+fn a_key_archives_the_selected_row_and_keeps_the_popup_open() {
+    let mut popup = make_popup_with_sessions(3);
+    popup.handle_key(key(KeyCode::Down)); // select session-1
+
+    match popup.handle_key(key(KeyCode::Char('a'))) {
+        Some(SessionAction::Archive { id }) => assert_eq!(id, "session-1"),
+        other => panic!("expected Archive, got {other:?}"),
+    }
+
+    assert!(popup.is_visible(), "archiving must not dismiss the popup");
+    let remaining: Vec<&str> = popup.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        remaining,
+        vec!["session-0", "session-2"],
+        "the archived row must disappear from the listing"
+    );
+}
+
+/// Spec: the cursor must stay addressable after the row under it is removed.
+/// Archiving the last row otherwise leaves the cursor past the end, and the
+/// next `a` would index out of bounds.
+#[test]
+fn archiving_the_last_row_leaves_the_cursor_in_range() {
+    let mut popup = make_popup_with_sessions(2);
+    popup.handle_key(key(KeyCode::Down)); // select the last row
+
+    popup.handle_key(key(KeyCode::Char('a')));
+    assert_eq!(popup.sessions.len(), 1);
+    assert!(popup.cursor < popup.sessions.len());
+
+    // The remaining row still archives cleanly rather than panicking.
+    match popup.handle_key(key(KeyCode::Char('a'))) {
+        Some(SessionAction::Archive { id }) => assert_eq!(id, "session-0"),
+        other => panic!("expected Archive, got {other:?}"),
+    }
+    assert!(popup.sessions.is_empty());
+    assert!(popup.handle_key(key(KeyCode::Char('a'))).is_none());
+}
+
 #[test]
 fn hidden_popup_ignores_keys() {
     let mut popup = make_popup_with_sessions(2);

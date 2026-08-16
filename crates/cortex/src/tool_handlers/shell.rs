@@ -734,6 +734,7 @@ pub async fn handle_run_shell_with_context(
     // provider keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ...) would
     // be visible to any `env` / `printenv` in the agent's shell.
     crate::security::env_allowlist::apply_filtered_env(&mut cmd, &filtered_creds);
+    crate::security::env_allowlist::apply_session_id(&mut cmd, ctx.session_id());
     // Lead a new process group so a timeout can signal the whole tree. Without
     // it `kill_on_drop` reaps only the shell, and anything it backgrounded
     // keeps running past the command that spawned it.
@@ -911,6 +912,7 @@ pub async fn run_gate_command(
         .stderr(std::process::Stdio::piped());
     cmd.current_dir(&cwd_path);
     crate::security::env_allowlist::apply_filtered_env(&mut cmd, &Default::default());
+    crate::security::env_allowlist::apply_session_id(&mut cmd, ctx.session_id());
     crate::util::process_tree::spawn_in_own_group(&mut cmd);
 
     let mut child = match cmd.kill_on_drop(true).spawn() {
@@ -1038,6 +1040,7 @@ async fn start_session(
         .stderr(std::process::Stdio::piped());
     cmd.current_dir(&cwd_path);
     crate::security::env_allowlist::apply_filtered_env(&mut cmd, filtered_creds);
+    crate::security::env_allowlist::apply_session_id(&mut cmd, ctx.session_id());
     // Lead a new process group so `kill` can signal the whole tree (the shell
     // plus anything it spawned), not just the direct child — otherwise an
     // interrupted session can leak descendants and their sandbox bookkeeping.
@@ -1245,6 +1248,11 @@ async fn run_in_pty(
     builder.env_clear();
     for (key, val) in crate::security::env_allowlist::build_filtered_env(env) {
         builder.env(key, val);
+    }
+    // After the filter, so an ambient value from the operator's shell cannot
+    // name a different conversation than the one this PTY belongs to.
+    if let Some(id) = ctx.session_id().filter(|id| !id.is_empty()) {
+        builder.env(crate::security::env_allowlist::SESSION_ID_ENV, id);
     }
 
     let mut child = pair

@@ -35,6 +35,22 @@ pub struct ScriptRunner<'a> {
     pub name: &'a str,
 }
 
+/// SIGKILL the process group led by `pid`, reaching descendants the script
+/// backgrounded before it timed out.
+///
+/// Best-effort: a group that has already exited is not an error. `None` means
+/// the child was reaped before we could read its pid, so there is no group left
+/// to name.
+fn kill_process_group(pid: Option<u32>) {
+    match pid {
+        #[cfg(unix)]
+        Some(pid) => crate::process_group::signal_group_or_members(pid as i32, libc::SIGKILL),
+        #[cfg(not(unix))]
+        Some(_) => {}
+        None => {}
+    }
+}
+
 impl<'a> ScriptRunner<'a> {
     /// Build a sandboxed command, spawn it, and write input to stdin.
     fn spawn_child(&self, label: &str) -> Result<(tokio::process::Child, std::time::Duration)> {
@@ -80,6 +96,14 @@ impl<'a> ScriptRunner<'a> {
             cmd.env(key, val);
         }
 
+        // `kill_on_drop` only reaches the direct child. A script that
+        // backgrounds work (`foo &`) leaves those descendants running when the
+        // timeout fires. On Linux the bwrap PID namespace collapses the tree
+        // for us, but macOS Seatbelt has no namespace — so lead a fresh process
+        // group here and signal the whole group on the timeout paths below.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         let child = cmd.kill_on_drop(true).spawn().with_context(|| {
             format!(
                 "Failed to spawn '{}' (runtime: {})",
@@ -106,12 +130,23 @@ impl<'a> ScriptRunner<'a> {
     #[instrument(skip_all, fields(sandbox.name = %self.name))]
     pub async fn run(&self, input_json: &str) -> Result<ScriptOutput> {
         let (mut child, timeout) = self.spawn_child("")?;
+        let pid = child.id();
         self.write_stdin(&mut child, input_json).await;
 
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| anyhow::anyhow!("'{}' timed out after {}ms", self.name, self.timeout_ms))?
-            .context("Failed to wait for script process")?;
+        // Pinned rather than passed by value: on expiry the future — and with
+        // it the unreaped child — is still alive, so the group signal lands
+        // before anything can reap the pid and let the pgid be recycled.
+        let output = {
+            let wait = child.wait_with_output();
+            tokio::pin!(wait);
+            match tokio::time::timeout(timeout, &mut wait).await {
+                Ok(result) => result.context("Failed to wait for script process")?,
+                Err(_) => {
+                    kill_process_group(pid);
+                    bail!("'{}' timed out after {}ms", self.name, self.timeout_ms);
+                }
+            }
+        };
 
         Ok(ScriptOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -127,6 +162,7 @@ impl<'a> ScriptRunner<'a> {
         F: FnMut(&str, bool) + Send,
     {
         let (mut child, timeout) = self.spawn_child("streaming")?;
+        let pid = child.id();
         self.write_stdin(&mut child, input_json).await;
 
         let stdout_pipe = child.stdout.take();
@@ -201,10 +237,19 @@ impl<'a> ScriptRunner<'a> {
             child.wait().await
         };
 
-        let status = tokio::time::timeout(timeout, streaming_future)
-            .await
-            .map_err(|_| anyhow::anyhow!("'{}' timed out after {}ms", self.name, self.timeout_ms))?
-            .context("Failed to wait for script process")?;
+        // Pinned for the same reason as in `run`: the group must be signalled
+        // while the child is still unreaped. Scoped so the future — and the
+        // output buffers it borrows — are released before they are read below.
+        let status = {
+            tokio::pin!(streaming_future);
+            match tokio::time::timeout(timeout, &mut streaming_future).await {
+                Ok(result) => result.context("Failed to wait for script process")?,
+                Err(_) => {
+                    kill_process_group(pid);
+                    bail!("'{}' timed out after {}ms", self.name, self.timeout_ms);
+                }
+            }
+        };
 
         let truncation_note = format!(
             "\n[output truncated at {}MB]",
@@ -608,6 +653,69 @@ mod tests {
         assert!(
             err.contains("timed out"),
             "expected timeout error, got: {err}"
+        );
+    }
+
+    /// Spec: a timed-out script must not leave the work it backgrounded
+    /// running. `kill_on_drop` alone reaches only the direct child, and macOS
+    /// Seatbelt has no PID namespace to collapse the rest of the tree — so
+    /// without the process group the `sleep 300` here outlives the timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_timeout_reaps_backgrounded_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = dir.path().join("background.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nsleep 300 &\necho $! > '{}'\nsleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let work_dir = dir.path().to_string_lossy().to_string();
+        let runner = ScriptRunner {
+            runtime: "bash",
+            script_path: &script,
+            work_dir: dir.path(),
+            // The script must be able to report the grandchild's pid back to us.
+            sandbox_policy: SandboxPolicy {
+                fs_read: vec![work_dir.clone()],
+                fs_write: vec![work_dir],
+                ..Default::default()
+            },
+            timeout_ms: 1500,
+            extra_env: &[],
+            name: "background-test",
+        };
+
+        let result = runner.run("{}").await;
+        assert!(result.is_err(), "the script should have timed out");
+
+        let recorded = std::fs::read_to_string(&pid_file)
+            .expect("the script must have recorded its grandchild's pid");
+        let grandchild: i32 = recorded.trim().parse().expect("a pid");
+
+        // SIGKILL delivery is asynchronous, so poll rather than probe once.
+        let mut alive = true;
+        for _ in 0..100 {
+            // SAFETY: FFI call to `kill` with signal 0 — an existence probe
+            // that delivers nothing and cannot affect the target.
+            if unsafe { libc::kill(grandchild, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !alive,
+            "grandchild {grandchild} survived the timeout's group kill"
         );
     }
 

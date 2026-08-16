@@ -310,6 +310,12 @@ pub enum TransportSpec {
         /// Path to the client private key PEM, when separate from `client_cert`.
         #[serde(default)]
         client_key: Option<String>,
+        /// Path to a PEM bundle of extra certificate authorities to trust for
+        /// this server. `~` is expanded. Added to the built-in roots, never
+        /// replacing them — this makes a corporate TLS-inspecting proxy usable
+        /// without turning verification off anywhere.
+        #[serde(default)]
+        ca_cert: Option<String>,
     },
     /// Server-Sent Events flavour of MCP HTTP.
     Sse {
@@ -327,6 +333,9 @@ pub enum TransportSpec {
         /// Path to the client private key PEM, when separate from `client_cert`.
         #[serde(default)]
         client_key: Option<String>,
+        /// Extra certificate authorities to trust (see [`TransportSpec::Http`]).
+        #[serde(default)]
+        ca_cert: Option<String>,
     },
 }
 
@@ -371,6 +380,7 @@ impl McpServerConfig {
                 auth,
                 client_cert,
                 client_key,
+                ca_cert,
             } => mcp::manifest::Transport::Http {
                 url: {
                     // `url` never goes through `resolve_secret_placeholders`,
@@ -382,6 +392,7 @@ impl McpServerConfig {
                 headers: resolve_secret_map(headers, cfg, &format!("mcp.servers.{name}.headers"))?,
                 auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
+                ca_cert_path: ca_cert.as_deref().map(crate::util::unix_ext::expand_tilde),
             },
             TransportSpec::Sse {
                 url,
@@ -389,6 +400,7 @@ impl McpServerConfig {
                 auth,
                 client_cert,
                 client_key,
+                ca_cert,
             } => mcp::manifest::Transport::Sse {
                 url: {
                     // `url` never goes through `resolve_secret_placeholders`,
@@ -400,6 +412,7 @@ impl McpServerConfig {
                 headers: resolve_secret_map(headers, cfg, &format!("mcp.servers.{name}.headers"))?,
                 auth: resolve_auth(auth, cfg, name)?,
                 client_identity: resolve_client_identity(client_cert, client_key)?,
+                ca_cert_path: ca_cert.as_deref().map(crate::util::unix_ext::expand_tilde),
             },
         };
         warn_on_hidden_whitespace(name, &transport);
@@ -803,6 +816,7 @@ mod tests {
                 token: "tok\t".to_string(),
             },
             client_identity: None,
+            ca_cert_path: None,
         };
         assert_eq!(
             hidden_whitespace_fields(&http),
@@ -1014,6 +1028,7 @@ mod tests {
                 auth: HttpAuthSpec::None,
                 client_cert: Some("~/certs/client.pem".to_string()),
                 client_key: Some("~/certs/client.key".to_string()),
+                ca_cert: None,
             },
             connect_timeout_ms: 60_000,
             call_timeout_ms: 120_000,
@@ -1029,6 +1044,7 @@ mod tests {
         match m.transport {
             mcp::manifest::Transport::Http {
                 client_identity: Some(id),
+                ca_cert_path: None,
                 ..
             } => {
                 assert_eq!(
@@ -1044,6 +1060,45 @@ mod tests {
         }
     }
 
+    /// Spec: the CA bundle path must reach the wire manifest with `~`
+    /// expanded. A home-relative path that arrives unexpanded resolves against
+    /// the daemon's cwd, so the transport reports a missing file for a bundle
+    /// the operator can see on disk.
+    #[test]
+    fn resolve_to_manifest_carries_the_ca_bundle_with_tilde_expansion() {
+        let server = McpServerConfig {
+            enabled: true,
+            transport: TransportSpec::Http {
+                url: "https://mcp.example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuthSpec::None,
+                client_cert: None,
+                client_key: None,
+                ca_cert: Some("~/certs/corp-proxy-ca.pem".to_string()),
+            },
+            connect_timeout_ms: 60_000,
+            call_timeout_ms: 120_000,
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+            tools: mcp::manifest::ToolFilter::default(),
+            cache_tools: true,
+        };
+        let m = server
+            .resolve_to_manifest("behind-proxy", &Config::default())
+            .unwrap();
+        let home = dirs::home_dir().unwrap();
+        match m.transport {
+            mcp::manifest::Transport::Http {
+                ca_cert_path: Some(path),
+                // A CA bundle is server trust, not a client credential — it
+                // must not imply mutual TLS.
+                client_identity: None,
+                ..
+            } => assert_eq!(path, home.join("certs/corp-proxy-ca.pem").to_string_lossy()),
+            other => panic!("expected Http transport with a CA bundle, got {other:?}"),
+        }
+    }
+
     #[test]
     fn client_key_without_cert_is_rejected() {
         let server = McpServerConfig {
@@ -1054,6 +1109,7 @@ mod tests {
                 auth: HttpAuthSpec::None,
                 client_cert: None,
                 client_key: Some("/etc/borg/client.key".to_string()),
+                ca_cert: None,
             },
             connect_timeout_ms: 60_000,
             call_timeout_ms: 120_000,

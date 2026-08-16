@@ -25,6 +25,11 @@ rand = { workspace = true }
 # protocol module is unit-tested on every runner, not just Windows.
 base64 = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Process-group containment for timed-out sandboxed scripts: killpg/kill/getpgid
+# (plus proc_listallpids for the macOS per-member fallback).
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

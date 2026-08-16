@@ -463,6 +463,13 @@ pub enum AppAction {
         id: String,
         format: cortex::export::ExportFormat,
     },
+    /// Archive a specific session by id (from the `/sessions` popup).
+    ///
+    /// Soft-hide, never a delete — `borg sessions list --archived` still finds
+    /// the row and `borg sessions unarchive` restores it.
+    ArchiveSession {
+        id: String,
+    },
     /// Export the currently-loaded session (via `/export [format] [dest]`).
     ExportCurrentSession {
         format: cortex::export::ExportFormat,

@@ -50,6 +50,150 @@ struct SearchState {
     last_query_committed: String,
 }
 
+/// Identity of a cell as far as rendering is concerned: the variant, its text,
+/// and the flags that change how that text is drawn.
+///
+/// Hashing beats comparing cell counts because the app edits cells that are not
+/// the last one — thinking deltas land at `len - 2`, a tool result is marked
+/// complete or collapsed long after it was pushed, a plan is restated in place,
+/// and loading another session swaps the whole vector without necessarily
+/// shortening it. None of that shows up in a length or a count.
+///
+/// It is much cheaper than the render it guards: hashing walks the bytes once,
+/// where rendering re-parses, re-wraps and re-allocates every line.
+fn cell_fingerprint(cell: &HistoryCell) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(cell).hash(&mut h);
+    match cell {
+        HistoryCell::User { text }
+        | HistoryCell::Heartbeat { text }
+        | HistoryCell::System { text }
+        | HistoryCell::Thinking { text }
+        | HistoryCell::MentionCard { label: text } => text.hash(&mut h),
+        HistoryCell::Assistant {
+            text, streaming, ..
+        } => {
+            text.hash(&mut h);
+            streaming.hash(&mut h);
+        }
+        HistoryCell::ToolStart {
+            name,
+            args,
+            completed,
+            ..
+        } => {
+            name.hash(&mut h);
+            args.hash(&mut h);
+            completed.hash(&mut h);
+        }
+        HistoryCell::ToolResult {
+            output,
+            is_error,
+            duration_ms,
+            display_label,
+            tool_name,
+            args_json,
+            collapsed,
+        } => {
+            output.hash(&mut h);
+            is_error.hash(&mut h);
+            duration_ms.hash(&mut h);
+            display_label.hash(&mut h);
+            tool_name.hash(&mut h);
+            args_json.hash(&mut h);
+            collapsed.hash(&mut h);
+        }
+        HistoryCell::ShellApproval { command, status } => {
+            command.hash(&mut h);
+            std::mem::discriminant(status).hash(&mut h);
+        }
+        HistoryCell::Card { lines } => {
+            for line in lines {
+                for span in &line.spans {
+                    span.content.hash(&mut h);
+                }
+            }
+        }
+        HistoryCell::DoctorWarning { warnings } => warnings.hash(&mut h),
+        HistoryCell::ToolStreaming { lines, dropped } => {
+            lines.hash(&mut h);
+            dropped.hash(&mut h);
+        }
+        HistoryCell::Plan { steps } => {
+            for step in steps {
+                step.title.hash(&mut h);
+                std::mem::discriminant(&step.status).hash(&mut h);
+            }
+        }
+        HistoryCell::Separator { label } => label.hash(&mut h),
+    }
+    h.finish()
+}
+
+/// One cached cell: what it rendered to (by line count) and what it looked like
+/// when it was rendered.
+#[derive(Debug)]
+struct CachedCell {
+    fingerprint: u64,
+    /// How many entries of [`LineCache::lines`] this cell contributed.
+    lines: usize,
+}
+
+/// Rendered lines for the settled part of the transcript.
+///
+/// Re-rendering every history cell on every frame is O(transcript): each cell
+/// re-wraps and re-styles its text, so a long session pays for its whole
+/// history to repaint a scroll of one line. Instead every cell before the final
+/// one is rendered once and kept, and each kept cell carries a
+/// [`cell_fingerprint`] so a cell that changed after it was cached — collapsed,
+/// completed, appended to, replaced outright — is detected and re-rendered.
+/// Comparing fingerprints is cheap; re-wrapping is not.
+///
+/// The final cell is excluded from the cache entirely: it is the one a running
+/// turn mutates most, and re-rendering one cell per frame is bounded work.
+#[derive(Debug, Default)]
+struct LineCache {
+    lines: Vec<Line<'static>>,
+    /// The leading cells `lines` was built from, in order.
+    cells: Vec<CachedCell>,
+    /// Width those cells were wrapped at.
+    width: u16,
+}
+
+impl LineCache {
+    /// Bring the cache up to `stable_cells` of `cells`.
+    ///
+    /// Drops everything from the first cell that no longer matches what was
+    /// cached (and everything, on a width change — a rewrap invalidates every
+    /// line), then renders the rest.
+    fn sync(&mut self, cells: &[HistoryCell], stable_cells: usize, width: u16) {
+        if self.width != width {
+            self.lines.clear();
+            self.cells.clear();
+            self.width = width;
+        }
+        let checked = self.cells.len().min(stable_cells);
+        let keep = (0..checked)
+            .find(|&i| self.cells[i].fingerprint != cell_fingerprint(&cells[i]))
+            .unwrap_or(checked);
+        if keep < self.cells.len() {
+            let kept_lines = self.cells[..keep].iter().map(|c| c.lines).sum();
+            self.lines.truncate(kept_lines);
+            self.cells.truncate(keep);
+        }
+        for cell in &cells[self.cells.len()..stable_cells] {
+            let rendered = cell.render(width, None);
+            self.cells.push(CachedCell {
+                fingerprint: cell_fingerprint(cell),
+                lines: rendered.len(),
+            });
+            self.lines.extend(rendered);
+        }
+    }
+}
+
 /// Scrollable transcript overlay with `/`-search.
 #[derive(Debug, Default)]
 pub struct TranscriptPager {
@@ -61,6 +205,8 @@ pub struct TranscriptPager {
     /// Last viewport height (paragraph inner area) for PageUp/PageDown jumps.
     last_viewport_height: usize,
     search: Option<SearchState>,
+    /// Rendered lines for every cell except the last. See [`LineCache`].
+    cache: LineCache,
 }
 
 impl TranscriptPager {
@@ -227,22 +373,33 @@ impl TranscriptPager {
         let inner = block.inner(area);
         frame.render_widget(&block, area);
 
-        // Render every history cell into a flat line vector.
-        let mut all_lines: Vec<Line<'static>> = Vec::with_capacity(cells.len() * 4);
-        for cell in cells {
-            for line in cell.render(inner.width, None) {
-                all_lines.push(line);
-            }
-        }
+        // Everything but the final cell is rendered once and reused; the final
+        // cell is re-rendered each frame because a running turn mutates it in
+        // place. So a frame costs one cell plus the viewport, not the whole
+        // transcript.
+        let stable_cells = cells.len().saturating_sub(1);
+        self.cache.sync(cells, stable_cells, inner.width);
+        let tail: Vec<Line<'static>> = cells[stable_cells..]
+            .iter()
+            .flat_map(|cell| cell.render(inner.width, None))
+            .collect();
 
-        self.last_content_height = all_lines.len();
+        let total_lines = self.cache.lines.len() + tail.len();
+        let line_at = |i: usize| -> &Line<'static> {
+            match i.checked_sub(self.cache.lines.len()) {
+                Some(tail_i) => &tail[tail_i],
+                None => &self.cache.lines[i],
+            }
+        };
+
+        self.last_content_height = total_lines;
         self.last_viewport_height = inner.height as usize;
 
         // Recompute search matches when the committed query changes.
         if let Some(state) = self.search.as_mut() {
             if !state.editing && state.last_query_committed == state.query {
                 // Re-derive matches against current line set in case transcript grew.
-                state.matches = Self::find_matches(&all_lines, &state.query);
+                state.matches = Self::find_matches_in(total_lines, &line_at, &state.query);
                 if state.current >= state.matches.len() {
                     state.current = 0;
                 }
@@ -250,19 +407,19 @@ impl TranscriptPager {
         }
 
         // Resolve usize::MAX sentinel to bottom-of-content.
-        let max_off = self.max_scroll_offset(all_lines.len());
+        let max_off = self.max_scroll_offset(total_lines);
         if self.scroll_offset > max_off {
             self.scroll_offset = max_off;
         }
 
         let viewport = inner.height as usize;
         let start = self.scroll_offset;
-        let end = (start + viewport).min(all_lines.len());
+        let end = (start + viewport).min(total_lines);
 
         // Highlight only the visible slice — O(viewport × matches_in_window),
         // not O(full_transcript). Membership lookups go through a HashSet so
         // a transcript with thousands of matches stays cheap to render.
-        let mut visible: Vec<Line<'static>> = all_lines[start..end].to_vec();
+        let mut visible: Vec<Line<'static>> = (start..end).map(|i| line_at(i).clone()).collect();
         if let Some(state) = self.search.as_ref() {
             if !state.query.is_empty() {
                 let q_lower = state.query.to_lowercase();
@@ -306,21 +463,32 @@ impl TranscriptPager {
         }
     }
 
+    #[cfg(test)]
     fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
+        Self::find_matches_in(lines.len(), &|i| &lines[i], query)
+    }
+
+    /// [`Self::find_matches`] over a line sequence that is not contiguous in
+    /// memory — the pager's lines live in the cache and the live tail, and
+    /// joining them into one vector every frame is exactly the allocation the
+    /// cache exists to avoid.
+    fn find_matches_in<'a>(
+        len: usize,
+        line_at: &dyn Fn(usize) -> &'a Line<'static>,
+        query: &str,
+    ) -> Vec<usize> {
         if query.is_empty() {
             return Vec::new();
         }
         let needle = query.to_lowercase();
-        lines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, line)| {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                if text.to_lowercase().contains(&needle) {
-                    Some(i)
-                } else {
-                    None
-                }
+        (0..len)
+            .filter(|&i| {
+                let text: String = line_at(i)
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                text.to_lowercase().contains(&needle)
             })
             .collect()
     }
@@ -427,6 +595,163 @@ mod tests {
 
     fn shift(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn cell(text: &str) -> HistoryCell {
+        HistoryCell::assistant(text.to_string(), false)
+    }
+
+    /// Lines a from-scratch render would produce, as plain text.
+    fn expected_text(cells: &[HistoryCell], width: u16) -> Vec<String> {
+        cells
+            .iter()
+            .flat_map(|c| c.render(width, None))
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    fn cached_text(cache: &LineCache) -> Vec<String> {
+        cache
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect()
+    }
+
+    /// Spec: appending to the transcript must only render what was appended.
+    /// The reused prefix has to be indistinguishable from a fresh render, or
+    /// the pager shows stale text.
+    #[test]
+    fn cache_extends_without_re_rendering_the_prefix() {
+        let mut cells = vec![cell("first"), cell("second")];
+        let mut cache = LineCache::default();
+        cache.sync(&cells, cells.len(), 40);
+        let after_first = cache.lines.len();
+        assert_eq!(cached_text(&cache), expected_text(&cells, 40));
+
+        cells.push(cell("third"));
+        cache.sync(&cells, cells.len(), 40);
+        assert!(
+            cache.lines.len() > after_first,
+            "the appended cell must be rendered"
+        );
+        assert_eq!(cached_text(&cache), expected_text(&cells, 40));
+        assert_eq!(cache.cells.len(), 3);
+    }
+
+    /// Spec: a width change rewraps every line, so the cache cannot be reused.
+    /// Keeping it would leave the transcript wrapped to the old terminal width
+    /// after a resize.
+    #[test]
+    fn cache_rebuilds_when_the_width_changes() {
+        let cells = vec![cell(
+            "a much longer line of assistant prose that will wrap differently at each width",
+        )];
+        let mut cache = LineCache::default();
+        cache.sync(&cells, cells.len(), 80);
+        let wide = cached_text(&cache);
+
+        cache.sync(&cells, cells.len(), 24);
+        let narrow = cached_text(&cache);
+
+        assert_ne!(wide, narrow, "the test text must actually rewrap");
+        assert_eq!(
+            narrow,
+            expected_text(&cells, 24),
+            "after a resize the cache must match a fresh render at the new width"
+        );
+    }
+
+    /// Spec: `/new` and loading another session replace the cells rather than
+    /// appending. A cache that only ever grows would keep showing the previous
+    /// conversation above the new one.
+    #[test]
+    fn cache_rebuilds_when_the_transcript_is_replaced() {
+        let old = vec![cell("old one"), cell("old two"), cell("old three")];
+        let mut cache = LineCache::default();
+        cache.sync(&old, old.len(), 40);
+
+        let new = vec![cell("brand new")];
+        cache.sync(&new, new.len(), 40);
+
+        assert_eq!(cached_text(&cache), expected_text(&new, 40));
+        assert_eq!(cache.cells.len(), 1);
+        assert!(
+            !cached_text(&cache).iter().any(|l| l.contains("old")),
+            "the replaced transcript must be gone: {:?}",
+            cached_text(&cache)
+        );
+    }
+
+    /// Spec: a cached cell that the app mutates in place must be re-rendered.
+    /// Thinking deltas land at `len - 2`, so the mutated cell is inside the
+    /// cached prefix — without a per-cell check the pager would freeze the
+    /// reasoning block at whatever it said on the first frame.
+    #[test]
+    fn cache_re_renders_a_cell_mutated_in_place() {
+        let mut cells = vec![
+            HistoryCell::Thinking {
+                text: "thinking so far".to_string(),
+            },
+            cell("live tail"),
+        ];
+        let mut cache = LineCache::default();
+        cache.sync(&cells, 1, 40);
+        assert_eq!(cached_text(&cache), expected_text(&cells[..1], 40));
+
+        if let HistoryCell::Thinking { text } = &mut cells[0] {
+            text.push_str(" and quite a lot more reasoning after that");
+        }
+        cache.sync(&cells, 1, 40);
+
+        assert_eq!(
+            cached_text(&cache),
+            expected_text(&cells[..1], 40),
+            "an in-place edit to a cached cell must be picked up"
+        );
+        assert!(
+            cached_text(&cache)
+                .join(" ")
+                .contains("reasoning after that"),
+            "the appended text must reach the pager: {:?}",
+            cached_text(&cache)
+        );
+    }
+
+    /// Spec: loading another session replaces the cells. When the replacement
+    /// is *longer* than what was cached, nothing shrinks — so a length-only
+    /// check would keep the previous conversation's lines on screen.
+    #[test]
+    fn cache_rebuilds_when_a_longer_transcript_replaces_the_old_one() {
+        let old = vec![cell("old one"), cell("old two")];
+        let mut cache = LineCache::default();
+        cache.sync(&old, old.len(), 40);
+
+        let new = vec![cell("new one"), cell("new two"), cell("new three")];
+        cache.sync(&new, new.len(), 40);
+
+        assert_eq!(cached_text(&cache), expected_text(&new, 40));
+        assert!(
+            !cached_text(&cache).iter().any(|l| l.contains("old")),
+            "the replaced transcript must be gone: {:?}",
+            cached_text(&cache)
+        );
+    }
+
+    /// Spec: the final cell is excluded from the cache because a running turn
+    /// mutates it in place — no cell count or width change would reveal that.
+    #[test]
+    fn the_final_cell_is_never_cached() {
+        let cells = vec![cell("settled"), cell("still streaming")];
+        let mut cache = LineCache::default();
+        cache.sync(&cells, cells.len().saturating_sub(1), 40);
+
+        assert_eq!(cache.cells.len(), 1);
+        assert_eq!(cached_text(&cache), expected_text(&cells[..1], 40));
+        assert!(
+            !cached_text(&cache).iter().any(|l| l.contains("streaming")),
+            "the live cell must be re-rendered each frame, not cached"
+        );
     }
 
     #[test]

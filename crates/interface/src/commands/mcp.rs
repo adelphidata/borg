@@ -20,7 +20,10 @@ pub(crate) enum McpAction {
     /// List configured MCP servers and their live status.
     List,
     /// Add a configured MCP server (writes a `mcp.servers` entry).
-    Add(super::mcp_client::AddArgs),
+    ///
+    /// Boxed: `AddArgs` carries every transport, TLS, and rate-limit knob, so
+    /// inlining it would size every other variant of this enum after it.
+    Add(Box<super::mcp_client::AddArgs>),
     /// Add a configured MCP server from a built-in preset (time / filesystem / github / notion).
     AddPreset(super::mcp_client::AddPresetArgs),
     /// Remove a configured MCP server.
@@ -39,7 +42,7 @@ pub(crate) async fn dispatch_mcp(action: Option<McpAction>) -> Result<()> {
     match action.unwrap_or(McpAction::Stdio) {
         McpAction::Stdio => run_stdio().await,
         McpAction::List => super::mcp_client::list().await,
-        McpAction::Add(a) => super::mcp_client::add(a).await,
+        McpAction::Add(a) => super::mcp_client::add(*a).await,
         McpAction::AddPreset(a) => super::mcp_client::add_preset(a).await,
         McpAction::Remove(a) => super::mcp_client::remove(a).await,
         McpAction::Enable(a) => super::mcp_client::enable(a, true).await,

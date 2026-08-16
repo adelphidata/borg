@@ -77,7 +77,27 @@ enum HookHandlerConfig {
         command: String,
         #[serde(default)]
         timeout: Option<u64>,
+        /// Run in the background instead of holding up the operation that
+        /// fired the hook. Notifications, metrics pushes, and desktop toasts
+        /// are the cases: they have nothing to say about whether the work
+        /// should proceed, but a synchronous one adds its whole runtime to
+        /// every matching tool call.
+        #[serde(default, rename = "async")]
+        run_async: bool,
     },
+}
+
+/// How many background hooks may run at once, process-wide.
+///
+/// A cap rather than a queue: hooks fire per tool call, so a slow background
+/// hook on a busy matcher would otherwise accumulate processes without bound.
+/// Over the cap the hook is dropped with a warning — a skipped notification is
+/// recoverable, a fork bomb is not.
+const MAX_CONCURRENT_BACKGROUND_HOOKS: usize = 4;
+
+fn background_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_BACKGROUND_HOOKS))
 }
 
 // hooks.json-compatible event names; keep in sync if HookPoint variants change.
@@ -115,6 +135,10 @@ pub struct ScriptHook {
     matcher: Option<Regex>,
     command: String,
     timeout: Duration,
+    /// Run detached from the operation that fired it. A background hook can
+    /// never block, rewrite, or otherwise steer that operation — it always
+    /// reports `Continue` immediately.
+    background: bool,
 }
 
 impl ScriptHook {
@@ -213,7 +237,11 @@ impl ScriptHook {
                             continue;
                         }
                     };
-                    let HookHandlerConfig::Command { command, timeout } = cfg;
+                    let HookHandlerConfig::Command {
+                        command,
+                        timeout,
+                        run_async,
+                    } = cfg;
                     if command.trim().is_empty() {
                         tracing::warn!(
                             "hooks: empty command at {}[{}][{}] in {}",
@@ -225,12 +253,37 @@ impl ScriptHook {
                         continue;
                     }
                     let timeout_secs = timeout.unwrap_or(60).clamp(1, 600);
+                    let name = format!("{event_name}[{gi}][{hi}]");
+                    // Two events cannot honour `async`, and silently accepting
+                    // it there would leave the operator with a hook that looks
+                    // configured and does nothing they expect.
+                    let background = match (run_async, point) {
+                        (true, HookPoint::BeforeToolCall) => {
+                            tracing::warn!(
+                                "hooks: {name} is PreToolUse with \"async\": true — a background \
+                                 hook cannot block a tool call, and honouring it would silently \
+                                 disable the gate this event exists for. It runs synchronously; \
+                                 move the work to PostToolUse if it should not block."
+                            );
+                            false
+                        }
+                        (true, HookPoint::SessionEnd) => {
+                            tracing::warn!(
+                                "hooks: {name} is SessionEnd with \"async\": true — the session \
+                                 is torn down before a background hook could finish, so it runs \
+                                 synchronously."
+                            );
+                            false
+                        }
+                        (run_async, _) => run_async,
+                    };
                     hooks.push(ScriptHook {
-                        name: format!("{event_name}[{gi}][{hi}]"),
+                        name,
                         points: vec![point],
                         matcher: matcher.clone(),
                         command,
                         timeout: Duration::from_secs(timeout_secs),
+                        background,
                     });
                 }
             }
@@ -380,6 +433,40 @@ impl Hook for ScriptHook {
         // `with_panic_guard` provided when the body ran inline.
         let hook = self.clone();
         let ctx = ctx.clone();
+
+        if self.background {
+            // Before the slot, not after: `execute_inner` checks the matcher,
+            // so a background hook with a narrow matcher would otherwise burn
+            // one of the four slots and a spawn on every tool call it does not
+            // apply to.
+            if !self.matches_tool(&ctx) {
+                return HookAction::Continue;
+            }
+            // Bounded, and never awaited: the caller resumes now and the
+            // hook's own timeout still bounds the child. Its action is
+            // discarded by construction — a hook the operator asked not to
+            // wait for must not steer what it could not delay.
+            let Ok(permit) = background_slots().try_acquire() else {
+                tracing::warn!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "background_slots_exhausted",
+                    "skipping background hook: {MAX_CONCURRENT_BACKGROUND_HOOKS} already running"
+                );
+                return HookAction::Continue;
+            };
+            permit.forget();
+            let name = self.name.clone();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || hook.execute_inner(&ctx)).await;
+                background_slots().add_permits(1);
+                if let Err(e) = outcome {
+                    tracing::warn!("background hook {name} failed to run ({e})");
+                }
+            });
+            return HookAction::Continue;
+        }
+
         match tokio::task::spawn_blocking(move || hook.execute_inner(&ctx)).await {
             Ok(action) => action,
             Err(e) => {
@@ -397,6 +484,7 @@ impl std::fmt::Debug for ScriptHook {
             .field("points", &self.points)
             .field("has_matcher", &self.matcher.is_some())
             .field("timeout", &self.timeout)
+            .field("background", &self.background)
             .finish()
     }
 }
@@ -644,6 +732,7 @@ mod tests {
             matcher: None,
             command: command.to_string(),
             timeout: Duration::from_secs(5),
+            background: false,
         }
     }
 
@@ -1195,6 +1284,7 @@ mod tests {
                 matcher: Some(Regex::new(matcher).expect("valid regex")),
                 command: command.to_string(),
                 timeout: Duration::from_secs(5),
+                background: false,
             }
         }
 
@@ -1425,6 +1515,115 @@ mod tests {
             let hooks = ScriptHook::load_from_file(&path);
             assert_eq!(hooks.len(), 1);
             assert_eq!(hooks[0].command, "y");
+        }
+
+        /// Poll for `marker` until it appears, up to `limit`.
+        async fn marker_appears(marker: &Path, limit: Duration) -> bool {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                if marker.exists() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+
+        /// Spec: `"async": true` means the caller does not wait — and the hook
+        /// still runs, with its exit code discarded. Asserting only on the
+        /// returned `Continue` would pass even if the hook were dropped on the
+        /// floor, so the marker file is what proves it really executed.
+        #[tokio::test]
+        async fn a_background_hook_runs_detached_and_never_steers() {
+            let dir = tmp();
+            let marker = dir.path().join("ran");
+            let mut hook = make_hook(
+                &format!("sleep 0.3; touch {}; exit 2", marker.display()),
+                HookPoint::AfterToolCall,
+            );
+            hook.background = true;
+            let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
+
+            let start = Instant::now();
+            let action = hook.execute(&ctx).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(action, HookAction::Continue),
+                "a discarded exit code must never steer the operation"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "the caller must resume immediately, elapsed={elapsed:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "the caller resumed after the hook finished — it was not detached"
+            );
+            assert!(
+                marker_appears(&marker, Duration::from_secs(10)).await,
+                "the detached hook never ran"
+            );
+        }
+
+        /// Spec: the matcher is checked before a slot is taken. There are only
+        /// four background slots process-wide, so a narrowly-matched hook that
+        /// spawned on every tool call would starve the ones that do apply.
+        #[tokio::test]
+        async fn a_background_hook_that_does_not_match_never_spawns() {
+            let dir = tmp();
+            let marker = dir.path().join("ran");
+            let mut hook = make_hook(
+                &format!("touch {}", marker.display()),
+                HookPoint::AfterToolCall,
+            );
+            hook.background = true;
+            hook.matcher = Some(Regex::new("^fs_write$").expect("regex"));
+            let ctx = make_tool_result_ctx(HookPoint::AfterToolCall, "run_shell", false);
+
+            assert!(matches!(hook.execute(&ctx).await, HookAction::Continue));
+            assert!(
+                !marker_appears(&marker, Duration::from_secs(1)).await,
+                "a hook whose matcher excludes the tool must not run"
+            );
+        }
+
+        /// Spec: `async` must survive the config round-trip, and the two events
+        /// that cannot honour it must be corrected at load time rather than
+        /// leaving the operator with a hook that quietly does the wrong thing.
+        #[test]
+        fn async_is_parsed_and_refused_where_it_cannot_work() {
+            let dir = tmp();
+            let body = r#"{"hooks":{
+                "PostToolUse": [{"hooks":[{"type":"command","command":"notify","async":true}]}],
+                "PreToolUse":  [{"hooks":[{"type":"command","command":"gate","async":true}]}],
+                "SessionEnd":  [{"hooks":[{"type":"command","command":"flush","async":true}]}],
+                "Stop":        [{"hooks":[{"type":"command","command":"plain"}]}]
+            }}"#;
+            let path = write_hooks_file(dir.path(), body);
+            let hooks = ScriptHook::load_from_file(&path);
+
+            let by_command = |cmd: &str| {
+                hooks
+                    .iter()
+                    .find(|h| h.command == cmd)
+                    .unwrap_or_else(|| panic!("{cmd} hook must load"))
+                    .background
+            };
+            assert!(by_command("notify"), "PostToolUse honours async");
+            assert!(
+                !by_command("gate"),
+                "PreToolUse must stay synchronous — honouring async would silently \
+                 disable the gate a nonzero exit is supposed to apply"
+            );
+            assert!(
+                !by_command("flush"),
+                "SessionEnd cannot run detached — the session is gone before it finishes"
+            );
+            assert!(
+                !by_command("plain"),
+                "omitting async keeps hooks synchronous"
+            );
         }
 
         #[tokio::test]

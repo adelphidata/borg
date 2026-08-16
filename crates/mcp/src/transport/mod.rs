@@ -61,6 +61,7 @@ pub async fn open(
             headers,
             auth,
             client_identity,
+            ca_cert_path,
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
@@ -71,6 +72,7 @@ pub async fn open(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
+                ca_cert_path: ca_cert_path.clone(),
                 max_response_bytes: 0,
             };
             let t = http::open(cfg).await?;
@@ -81,6 +83,7 @@ pub async fn open(
             headers,
             auth,
             client_identity,
+            ca_cert_path,
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
@@ -91,6 +94,7 @@ pub async fn open(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
+                ca_cert_path: ca_cert_path.clone(),
             };
             let t = sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))

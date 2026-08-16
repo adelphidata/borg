@@ -21,6 +21,21 @@ pub mod names {
     pub const LLM_REQUESTS: &str = "borg.llm.requests";
     pub const LLM_DURATION: &str = "borg.llm.duration";
     pub const LLM_TOKENS: &str = "borg.llm.tokens";
+    /// Counter for LLM request re-attempts, labelled by `kind`:
+    /// `retry` (same provider, same request — including the ones taken after a
+    /// lost connection) and `failover` (switched to a fallback slot).
+    /// `borg.llm.requests` counts turns, so a retry storm is invisible there.
+    ///
+    /// Fed from the streaming path only; the non-streaming HTTP retry loop has
+    /// no event channel and reports nothing, so the sum covers streaming
+    /// traffic — which is every interactive turn.
+    ///
+    /// The kinds are disjoint, so summing them gives total re-attempts. Why a
+    /// connection-lost retry is not its own kind: the reconnect notice is
+    /// emitted *before* the backoff sleep and the loop then starts the next
+    /// attempt, so counting both would count one re-attempt twice. The cause
+    /// is in the logs; the counter stays summable.
+    pub const LLM_RETRIES: &str = "borg.llm.retries";
     pub const TOOL_EXECUTIONS: &str = "borg.tool.executions";
     pub const TOOL_DURATION: &str = "borg.tool.duration";
     pub const TOOL_REPEATS_BLOCKED: &str = "borg.tool.repeats_blocked";
@@ -267,6 +282,8 @@ pub struct BorgMetrics {
     pub llm_requests: Counter<u64>,
     pub llm_duration: Histogram<f64>,
     pub llm_tokens: Counter<u64>,
+    /// LLM request re-attempts, labelled by `kind` (retry/failover).
+    pub llm_retries: Counter<u64>,
     pub tool_executions: Counter<u64>,
     pub tool_duration: Histogram<f64>,
     /// Counter for tool calls blocked because they were the Nth+ identical
@@ -344,6 +361,10 @@ impl BorgMetrics {
             llm_tokens: meter
                 .u64_counter(names::LLM_TOKENS)
                 .with_description("Total LLM tokens used")
+                .build(),
+            llm_retries: meter
+                .u64_counter(names::LLM_RETRIES)
+                .with_description("LLM request re-attempts by kind (retry/failover)")
                 .build(),
             tool_executions: meter
                 .u64_counter(names::TOOL_EXECUTIONS)
@@ -424,6 +445,22 @@ impl BorgMetrics {
             let pct = (after_tokens as f64 / budget as f64) * 100.0;
             self.context_occupancy.record(pct.min(100.0), &[]);
         }
+    }
+
+    /// Record an LLM request re-attempt. `kind` is `"retry"` (same provider,
+    /// same request) or `"failover"` (switched to a fallback slot) — the two
+    /// are disjoint, so they sum to total re-attempts.
+    ///
+    /// Do not add a kind for connection-lost retries. The reconnect notice is
+    /// emitted before the backoff and the loop then starts the next attempt,
+    /// which is already counted as `"retry"`; a second kind there counts one
+    /// re-attempt twice and breaks the sum.
+    ///
+    /// The first attempt of a request is not a retry — `borg.llm.requests`
+    /// already counts it, and double-counting would hide the storm this metric
+    /// exists to show.
+    pub fn record_llm_retry(&self, kind: &'static str) {
+        self.llm_retries.add(1, &[KeyValue::new("kind", kind)]);
     }
 
     /// Record a harness boot. `harness` is e.g. `"borgd"` or `"tui"`.
@@ -622,7 +659,7 @@ pub mod wasm_metrics {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
@@ -633,7 +670,7 @@ mod tests {
 
     /// Stand up an isolated meter provider whose exports are captured by an
     /// in-memory exporter.
-    fn test_metrics() -> (
+    pub(crate) fn test_metrics() -> (
         SdkMeterProvider,
         opentelemetry::metrics::Meter,
         InMemoryMetricExporter,
@@ -651,7 +688,7 @@ mod tests {
     }
 
     /// Force-flush the provider and return the exported `ResourceMetrics`.
-    fn collect(
+    pub(crate) fn collect(
         provider: &SdkMeterProvider,
         exporter: &InMemoryMetricExporter,
     ) -> Vec<ResourceMetrics> {
@@ -662,7 +699,7 @@ mod tests {
     }
 
     /// Walks every metric across every scope and invokes `f` once per match.
-    fn with_metric<F: FnMut(&AggregatedMetrics)>(
+    pub(crate) fn with_metric<F: FnMut(&AggregatedMetrics)>(
         rms: &[ResourceMetrics],
         name: &str,
         mut f: F,
@@ -738,6 +775,30 @@ mod tests {
             .iter()
             .find(|kv| kv.key.as_str() == key)
             .map(|kv| kv.value.to_string())
+    }
+
+    /// Sum a u64 Sum metric's data points grouped by one attribute's value.
+    /// Used where a metric's whole point is that it splits into labelled
+    /// series, so a single total would not prove anything.
+    pub(crate) fn sum_points_by_attr(
+        rms: &[ResourceMetrics],
+        name: &str,
+        key: &str,
+    ) -> std::collections::HashMap<String, u64> {
+        let mut by_value: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let hits = with_metric(rms, name, |data| match data {
+            AggregatedMetrics::U64(MetricData::Sum(s)) => {
+                for dp in s.data_points() {
+                    let attrs: Vec<KeyValue> = dp.attributes().cloned().collect();
+                    if let Some(v) = attr_value(&attrs, key) {
+                        *by_value.entry(v).or_default() += dp.value();
+                    }
+                }
+            }
+            other => panic!("{name}: expected u64 sum, got {other:?}"),
+        });
+        assert!(hits > 0, "missing metric: {name}");
+        by_value
     }
 
     /// Collect the attributes of the single data point of a u64 Sum metric.
@@ -879,6 +940,36 @@ mod tests {
         assert_eq!(u64_sum_for(&after, names::LIFECYCLE_SHUTDOWNS), 1);
         let attrs = sole_sum_attrs(&after, names::LIFECYCLE_SHUTDOWNS);
         assert_eq!(attr_value(&attrs, "harness").as_deref(), Some("tui"));
+    }
+
+    /// Spec: a retry storm has to be separable from ordinary traffic, so each
+    /// re-attempt must land on its own `kind` series rather than being summed
+    /// into one opaque total (or into `borg.llm.requests`, which counts the
+    /// requests themselves).
+    #[test]
+    fn llm_retries_are_labelled_by_kind() {
+        let (provider, meter, exporter) = test_metrics();
+        let m = BorgMetrics::from_meter(&meter);
+
+        m.record_llm_retry("retry");
+        m.record_llm_retry("retry");
+        m.record_llm_retry("retry");
+        m.record_llm_retry("failover");
+
+        let rms = collect(&provider, &exporter);
+        assert_eq!(
+            u64_sum_for(&rms, names::LLM_RETRIES),
+            4,
+            "every re-attempt must be counted"
+        );
+        assert!(
+            !has_metric(&rms, names::LLM_REQUESTS),
+            "a retry is not a new request; double-counting hides the storm"
+        );
+
+        let kinds = sum_points_by_attr(&rms, names::LLM_RETRIES, "kind");
+        assert_eq!(kinds.get("retry"), Some(&3));
+        assert_eq!(kinds.get("failover"), Some(&1));
     }
 
     #[test]

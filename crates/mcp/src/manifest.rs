@@ -62,6 +62,10 @@ pub enum Transport {
         /// Optional client certificate presented during the TLS handshake
         /// (mutual TLS). `None` for the common server-auth-only case.
         client_identity: Option<ClientIdentity>,
+        /// Path to a PEM bundle of extra certificate authorities to trust for
+        /// this server. Added to the built-in roots, never replacing them, so
+        /// this cannot be used to weaken verification for anything else.
+        ca_cert_path: Option<String>,
     },
     /// Server-Sent Events flavour of MCP HTTP.
     Sse {
@@ -73,6 +77,8 @@ pub enum Transport {
         auth: HttpAuth,
         /// Optional client certificate for mutual TLS (see [`Transport::Http`]).
         client_identity: Option<ClientIdentity>,
+        /// Extra certificate authorities to trust (see [`Transport::Http`]).
+        ca_cert_path: Option<String>,
     },
 }
 

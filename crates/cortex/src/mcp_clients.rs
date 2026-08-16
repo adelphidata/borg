@@ -2365,6 +2365,7 @@ async fn open_transport(
             headers,
             auth,
             client_identity,
+            ca_cert_path,
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
@@ -2381,6 +2382,7 @@ async fn open_transport(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
+                ca_cert_path: ca_cert_path.clone(),
                 max_response_bytes,
             };
             let t = mcp::transport::http::open(cfg).await?;
@@ -2391,6 +2393,7 @@ async fn open_transport(
             headers,
             auth,
             client_identity,
+            ca_cert_path,
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
@@ -2401,6 +2404,7 @@ async fn open_transport(
                 timeout: manifest.call_timeout,
                 policy,
                 client_identity: client_identity.clone(),
+                ca_cert_path: ca_cert_path.clone(),
             };
             let t = mcp::transport::sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))
@@ -3359,6 +3363,7 @@ mod tests {
                 auth: Default::default(),
                 client_cert: None,
                 client_key: None,
+                ca_cert: None,
             },
             ..stdio_cfg("srv", &[], &[])
         };
@@ -3485,6 +3490,7 @@ mod tests {
                     auth: Default::default(),
                     client_cert: None,
                     client_key: None,
+                    ca_cert: None,
                 },
                 connect_timeout_ms: 60_000,
                 call_timeout_ms: 120_000,
@@ -3521,6 +3527,7 @@ mod tests {
                     auth: Default::default(),
                     client_cert: None,
                     client_key: None,
+                    ca_cert: None,
                 },
                 connect_timeout_ms: 60_000,
                 call_timeout_ms: 120_000,

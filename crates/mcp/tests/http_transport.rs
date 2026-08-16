@@ -160,6 +160,7 @@ fn config(url: String) -> HttpConfig {
             allow_local_network: true,
         },
         client_identity: None,
+        ca_cert_path: None,
         max_response_bytes: 0,
     }
 }

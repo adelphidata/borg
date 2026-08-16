@@ -38,10 +38,10 @@ use protocols::admin::{
     PluginInstallResponse, ReloadRequest, ReloadResponse, RemoveCredentialRequest,
     RemoveProviderRequest, ResetCredentialsRequest, RevokedClientToken, ScheduledTask,
     ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
-    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey, SettingMutation,
-    SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList,
-    WebhookRef,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList,
+    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
+    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
+    TunnelStatusReply, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -818,6 +818,14 @@ rpc_wrappers! {
     /// Fetch a single session's transcript.
     admin fn get_session(id: &str) -> SessionDetail =
         get_session("Admin.GetSession", SessionRef { id: id.to_string() });
+
+    /// Archive (soft-hide) a session, or restore it. Never deletes — an
+    /// archived row is still reachable via `borg sessions list --archived`.
+    admin fn set_session_archived(id: &str, archived: bool) =
+        set_session_archived("Admin.SetSessionArchived", SessionArchiveMutation {
+            id: id.to_string(),
+            archived,
+        });
 
     // ── Session-state RPCs ────────────
 

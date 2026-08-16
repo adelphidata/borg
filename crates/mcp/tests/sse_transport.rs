@@ -154,6 +154,7 @@ impl SseFixture {
                 allow_local_network: true,
             },
             client_identity: None,
+            ca_cert_path: None,
         }
     }
 }
@@ -228,6 +229,7 @@ async fn open_times_out_when_endpoint_event_missing() {
             allow_local_network: true,
         },
         client_identity: None,
+        ca_cert_path: None,
     };
     let res = open(cfg, Duration::from_millis(300)).await;
     let err = match res {
@@ -265,6 +267,7 @@ async fn open_refuses_url_pointing_at_metadata_service_even_with_local_network_a
             allow_local_network: true,
         },
         client_identity: None,
+        ca_cert_path: None,
     };
     let res = open(cfg, Duration::from_secs(1)).await;
     let err = match res {

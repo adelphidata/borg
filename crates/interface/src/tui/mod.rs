@@ -1446,6 +1446,40 @@ async fn run_event_loop(
             AppAction::ExportSession { id, format } => {
                 handle_export(app, client, &id, format).await;
             }
+            AppAction::ArchiveSession { id } => {
+                // Archiving a live session closes it daemon-side. Doing that to
+                // the conversation on screen would end the turn the user is in
+                // the middle of, so refuse and name the alternative.
+                // A failed lookup must not turn the guard off: defaulting to
+                // "no current session" is exactly the case where archiving
+                // would close the conversation on screen.
+                let current = match client.get_state(session_id).await {
+                    Ok(s) => s.agent_session_id,
+                    Err(e) => {
+                        app.push_system_message(format!(
+                            "Could not check which session you are in, so nothing was archived: {e}"
+                        ));
+                        continue;
+                    }
+                };
+                if !current.is_empty() && current == id {
+                    app.push_system_message(
+                        "That is the session you are in. Start another one first, then archive this."
+                            .to_string(),
+                    );
+                    continue;
+                }
+                match client.set_session_archived(&id, true).await {
+                    Ok(_) => app.push_system_message(format!(
+                        "Archived session {}. Restore it with `borg sessions unarchive {}`.",
+                        crate::commands::short_id(&id),
+                        crate::commands::short_id(&id)
+                    )),
+                    Err(e) => {
+                        app.push_system_message(format!("Could not archive that session: {e}"))
+                    }
+                }
+            }
             AppAction::ExportCurrentSession {
                 format,
                 destination,

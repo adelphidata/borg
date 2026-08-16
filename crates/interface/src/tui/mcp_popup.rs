@@ -263,6 +263,7 @@ mod tests {
                     auth: Default::default(),
                     client_cert: None,
                     client_key: None,
+                    ca_cert: None,
                 },
                 true,
             ),

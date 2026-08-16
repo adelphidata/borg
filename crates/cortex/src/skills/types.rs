@@ -93,6 +93,17 @@ pub struct SkillManifest {
     /// Per-dependency install instructions keyed by dependency name.
     #[serde(default)]
     pub install: std::collections::HashMap<String, InstallSpec>,
+    /// Model this skill's work should run on, when it is worth running
+    /// somewhere other than the session's model — a bulk extraction that only
+    /// needs a cheap model, or a proof step that needs the strongest one.
+    ///
+    /// Advisory, not a switch: the session's own model never changes
+    /// mid-turn. It is surfaced to the agent, which delegates by passing the
+    /// value to `spawn_agent`'s `model` override. A blank value is dropped at
+    /// parse time so an empty `model:` key cannot produce a request for the
+    /// model named "".
+    #[serde(default)]
+    pub model: Option<String>,
     /// Plugin category for unified UI grouping (e.g., "developer", "utilities").
     #[serde(default)]
     pub category: Option<String>,
@@ -252,6 +263,23 @@ impl Skill {
         }
     }
 
+    /// One line telling the agent how to honour a `model:` declaration, or
+    /// empty when the skill did not declare one.
+    ///
+    /// Phrased as an instruction with the mechanism named, because the model
+    /// cannot switch its own model mid-turn — delegating is the only way to
+    /// act on this, and a bare "Model: X" line reads as trivia it can ignore.
+    fn model_delegation_note(&self) -> String {
+        match &self.manifest.model {
+            Some(model) => format!(
+                "\nThis skill declares model `{model}`. Run its work through \
+                 `spawn_agent` with `model` set to `{model}` rather than doing \
+                 it inline, unless the user asked for something else."
+            ),
+            None => String::new(),
+        }
+    }
+
     /// Format the full skill body for system prompt injection.
     pub fn format_for_prompt(&self) -> String {
         self.format_at_level(SkillLoadLevel::Full)
@@ -287,8 +315,12 @@ impl Skill {
             }
             SkillLoadLevel::Full => {
                 format!(
-                    "## Skill: {} [{}, {}]\n\n{}\n",
-                    self.manifest.name, source, status, self.body
+                    "## Skill: {} [{}, {}]{}\n\n{}\n",
+                    self.manifest.name,
+                    source,
+                    status,
+                    self.model_delegation_note(),
+                    self.body
                 )
             }
         }
@@ -400,6 +432,17 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String)> {
         if requires_empty {
             manifest.requires.bins = prereqs.commands;
             manifest.requires.env = prereqs.env_vars;
+        }
+    }
+
+    // A blank `model:` is the author leaving the key in place, not a request
+    // for the model named "". Drop it here so nothing downstream has to
+    // re-check emptiness before passing it to `spawn_agent`.
+    if let Some(model) = &manifest.model {
+        if model.trim().is_empty() {
+            manifest.model = None;
+        } else {
+            manifest.model = Some(model.trim().to_string());
         }
     }
 

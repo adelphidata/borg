@@ -46,6 +46,9 @@ pub struct HttpConfig {
     pub policy: HttpPolicy,
     /// Optional client certificate for mutual TLS. Loaded at connect time.
     pub client_identity: Option<crate::manifest::ClientIdentity>,
+    /// Optional PEM bundle of extra certificate authorities to trust, added to
+    /// the built-in roots. Loaded at connect time.
+    pub ca_cert_path: Option<String>,
     /// Hard cap on a single response body, enforced *while streaming* so a
     /// hostile/compromised server can't OOM the process by streaming a huge
     /// chunked body before any downstream truncation runs. 0 means "unset" and
@@ -70,6 +73,7 @@ pub(crate) fn build_client(
     timeout: Duration,
     pins: &[(String, Vec<SocketAddr>)],
     client_identity: Option<&crate::manifest::ClientIdentity>,
+    ca_cert_path: Option<&str>,
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .timeout(timeout)
@@ -89,9 +93,37 @@ pub(crate) fn build_client(
     if let Some(identity) = client_identity {
         builder = builder.identity(load_client_identity(identity)?);
     }
+    if let Some(path) = ca_cert_path {
+        for cert in load_extra_ca_certs(path)? {
+            // Added, never substituted: the built-in roots stay in place, so
+            // trusting a corporate proxy for this one server cannot weaken
+            // verification of anything else.
+            builder = builder.add_root_certificate(cert);
+        }
+    }
     builder
         .build()
         .map_err(|e| McpError::Connect(format!("reqwest build failed: {e}")))
+}
+
+/// Parse a PEM bundle of certificate authorities to add to the trust store.
+///
+/// A bundle usually holds a chain (leaf CA plus its issuers), so every
+/// certificate in the file is loaded. An unreadable file, unparseable PEM, or
+/// a bundle with no certificates in it is a hard error — silently connecting
+/// with the default roots would produce a confusing verification failure
+/// later, or worse, appear to work while ignoring what the operator asked for.
+fn load_extra_ca_certs(path: &str) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path)
+        .map_err(|e| McpError::Connect(format!("failed to read CA bundle '{path}': {e}")))?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| McpError::Connect(format!("invalid CA bundle '{path}': {e}")))?;
+    if certs.is_empty() {
+        return Err(McpError::Connect(format!(
+            "CA bundle '{path}' contains no certificates"
+        )));
+    }
+    Ok(certs)
 }
 
 /// Load a client certificate + key into a `reqwest::Identity` for mutual TLS.
@@ -129,6 +161,7 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         config.timeout,
         &resolved.pins,
         config.client_identity.as_ref(),
+        config.ca_cert_path.as_deref(),
     )?;
     let max_response_bytes = if config.max_response_bytes == 0 {
         DEFAULT_MAX_RESPONSE_BYTES
@@ -411,7 +444,7 @@ mod tests {
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: Some(key_path.to_string_lossy().into_owned()),
         };
-        build_client(Duration::from_secs(5), &[], Some(&identity))
+        build_client(Duration::from_secs(5), &[], Some(&identity), None)
             .expect("valid client identity should build a client");
     }
 
@@ -429,7 +462,7 @@ mod tests {
             cert_path: combined_path.to_string_lossy().into_owned(),
             key_path: None,
         };
-        build_client(Duration::from_secs(5), &[], Some(&identity))
+        build_client(Duration::from_secs(5), &[], Some(&identity), None)
             .expect("combined cert+key PEM should build a client");
     }
 
@@ -441,7 +474,7 @@ mod tests {
             cert_path: "/nonexistent/borg-test/client.crt".to_string(),
             key_path: None,
         };
-        let err = build_client(Duration::from_secs(5), &[], Some(&identity))
+        let err = build_client(Duration::from_secs(5), &[], Some(&identity), None)
             .expect_err("missing cert file must error");
         match err {
             McpError::Connect(msg) => assert!(
@@ -461,7 +494,7 @@ mod tests {
             cert_path: cert_path.to_string_lossy().into_owned(),
             key_path: None,
         };
-        let err = build_client(Duration::from_secs(5), &[], Some(&identity))
+        let err = build_client(Duration::from_secs(5), &[], Some(&identity), None)
             .expect_err("malformed PEM must error");
         match err {
             McpError::Connect(msg) => assert!(
@@ -476,7 +509,72 @@ mod tests {
     fn build_client_without_identity_still_builds() {
         // Regression guard: the common server-auth-only path (no client cert)
         // must keep working after the mTLS plumbing was added.
-        build_client(Duration::from_secs(5), &[], None).expect("no-identity client should build");
+        build_client(Duration::from_secs(5), &[], None, None)
+            .expect("no-identity client should build");
+    }
+
+    /// Spec: a configured CA bundle that cannot be used must fail the connect,
+    /// not fall through to the default roots. Falling through would either
+    /// produce an unverifiable-certificate error the operator cannot connect to
+    /// their config, or — worse — appear to work while ignoring what they asked
+    /// for.
+    #[test]
+    fn an_unusable_ca_bundle_fails_the_connect() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = build_client(
+            Duration::from_secs(5),
+            &[],
+            None,
+            Some("/nonexistent/borg-test/ca.pem"),
+        )
+        .expect_err("a missing CA bundle must error");
+        match err {
+            McpError::Connect(msg) => {
+                assert!(msg.contains("failed to read CA bundle"), "got: {msg}")
+            }
+            e => panic!("expected Connect error, got {e:?}"),
+        }
+
+        // A readable file with no certificate in it is the subtler failure:
+        // reqwest reports an empty list rather than an error, so an unguarded
+        // implementation would build a client with the default roots.
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "# just a comment, no certificates here\n").unwrap();
+        let err = build_client(
+            Duration::from_secs(5),
+            &[],
+            None,
+            Some(&empty.to_string_lossy()),
+        )
+        .expect_err("a certificate-free bundle must error");
+        match err {
+            McpError::Connect(msg) => assert!(
+                msg.contains("no certificates") || msg.contains("invalid CA bundle"),
+                "got: {msg}"
+            ),
+            e => panic!("expected Connect error, got {e:?}"),
+        }
+    }
+
+    /// Spec: a valid bundle is *added* to the trust store. The built-in roots
+    /// must survive, or trusting a corporate proxy for one server would break
+    /// every public endpoint that server's transport talks to.
+    #[test]
+    fn a_valid_ca_bundle_builds_a_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        let ca = rcgen::generate_simple_self_signed(vec!["proxy.internal".to_string()])
+            .expect("generate test CA");
+        std::fs::write(&ca_path, ca.cert.pem()).unwrap();
+
+        build_client(
+            Duration::from_secs(5),
+            &[],
+            None,
+            Some(&ca_path.to_string_lossy()),
+        )
+        .expect("a valid CA bundle must build a client");
     }
 
     /// Bind a one-shot plaintext HTTP server on loopback that answers the first
@@ -517,6 +615,7 @@ mod tests {
                 allow_local_network: true,
             },
             client_identity: None,
+            ca_cert_path: None,
             max_response_bytes,
         }
     }

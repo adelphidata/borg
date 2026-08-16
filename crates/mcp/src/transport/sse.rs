@@ -36,6 +36,9 @@ pub struct SseConfig {
     pub policy: HttpPolicy,
     /// Optional client certificate for mutual TLS. Loaded at connect time.
     pub client_identity: Option<crate::manifest::ClientIdentity>,
+    /// Optional PEM bundle of extra certificate authorities to trust, added to
+    /// the built-in roots. Loaded at connect time.
+    pub ca_cert_path: Option<String>,
 }
 
 /// Connected SSE transport.
@@ -78,6 +81,7 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
         config.timeout,
         &sse_resolved.pins,
         config.client_identity.as_ref(),
+        config.ca_cert_path.as_deref(),
     )?;
 
     let mut req = client
@@ -160,6 +164,7 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
         config.timeout,
         &combined_pins,
         config.client_identity.as_ref(),
+        config.ca_cert_path.as_deref(),
     )?;
 
     // Spawn the pump for the remaining lifetime of the stream.

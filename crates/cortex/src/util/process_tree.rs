@@ -78,13 +78,13 @@ pub(crate) fn wait_or_kill_group(
 /// Best-effort: `ESRCH` (the group is already gone) is ignored — the caller's
 /// `wait` is what actually reaps the direct child.
 ///
-/// Delegates to [`mcp::process_group::signal_group_or_members`], which retries
-/// per-member when macOS refuses the group call with `EPERM`. Signalling the
-/// group and dropping the result silently left every descendant alive on
-/// Borg's primary platform.
+/// Delegates to [`sandbox::process_group::signal_group_or_members`], which
+/// retries per-member when macOS refuses the group call with `EPERM`.
+/// Signalling the group and dropping the result silently left every descendant
+/// alive on Borg's primary platform.
 #[cfg(unix)]
 pub(crate) fn signal_group(pgid: i32, sig: i32) {
-    mcp::process_group::signal_group_or_members(pgid, sig);
+    sandbox::process_group::signal_group_or_members(pgid, sig);
 }
 
 /// SIGKILL the process group led by `pid`, for the abandon path where there is

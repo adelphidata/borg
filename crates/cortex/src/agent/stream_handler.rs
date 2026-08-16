@@ -213,6 +213,7 @@ impl Agent {
                 // model that actually served the response, keeping the model's
                 // self-identification truthful during a primary outage.
                 tracing::info!(provider = %provider, model = %model, "LLM failover; syncing prompt model identity");
+                self.metrics.record_llm_retry("failover");
                 // Fallback activation targets a different provider/model —
                 // give the stale-stream breaker a clean slate so the fallback
                 // isn't short-circuited by the primary's streak.
@@ -223,6 +224,12 @@ impl Agent {
                 // Liveness only — forward it so a sub-agent's stall watchdog
                 // sees that a request is in flight. A retry storm or a long
                 // prefill emits nothing else for minutes.
+                //
+                // Attempt 0 is the request itself, already counted by
+                // `borg.llm.requests`; only the re-attempts are retries.
+                if attempt > 0 {
+                    self.metrics.record_llm_retry("retry");
+                }
                 if event_tx
                     .send(AgentEvent::LlmAttemptStarted { attempt })
                     .await
@@ -238,6 +245,10 @@ impl Agent {
                 // The wait is about to be seconds-to-a-minute long. Forward it
                 // so the surface can name the pause; without this the turn
                 // just goes quiet and reads as a hang.
+                // Not counted in `borg.llm.retries`: this notice precedes the
+                // backoff, and the attempt it announces is counted when
+                // `AttemptStarted` arrives. Counting here too would report one
+                // re-attempt as two.
                 warn!("LLM connection lost; reconnecting in {delay_secs}s (attempt {attempt})");
                 if event_tx
                     .send(AgentEvent::LlmReconnecting {
@@ -466,6 +477,67 @@ mod tests {
     use super::{wedged_session_error, StreamHealth, MAX_CONSECUTIVE_STALE_STREAMS};
 
     const AGENT_RS_SRC: &str = include_str!("stream_handler.rs");
+
+    /// Spec: `borg.llm.retries` must count each re-attempt exactly once, so the
+    /// kinds stay summable.
+    ///
+    /// `Reconnecting` is emitted *before* the backoff and the retry loop then
+    /// starts the next attempt, which `AttemptStarted` reports — so counting
+    /// the notice as well scores one re-attempt twice. This drives both arms
+    /// in the order the loop emits them.
+    #[tokio::test]
+    async fn a_reconnect_notice_is_not_counted_as_a_second_re_attempt() {
+        use crate::internal_tag_filter::InternalTagFilter;
+        use crate::llm::StreamEvent;
+        use crate::telemetry::{names, tests as metrics_test, BorgMetrics};
+
+        let (provider, meter, exporter) = metrics_test::test_metrics();
+        let mut agent = crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+        agent.metrics = BorgMetrics::from_meter(&meter);
+
+        // Kept alive: a dropped receiver would make every send fail, and the
+        // arms under test would still be reached — a silent weakening.
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let mut tag_filter = InternalTagFilter::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None;
+        let mut truncated = false;
+
+        // What the loop really emits for one connection-lost retry: the
+        // notice, then the attempt it was announcing.
+        for event in [
+            StreamEvent::AttemptStarted { attempt: 0 },
+            StreamEvent::Reconnecting {
+                attempt: 0,
+                delay_secs: 3,
+            },
+            StreamEvent::AttemptStarted { attempt: 1 },
+        ] {
+            agent
+                .handle_stream_event(
+                    event,
+                    &mut tag_filter,
+                    &mut tool_calls,
+                    &mut stream_error,
+                    &mut truncated,
+                    &event_tx,
+                )
+                .await;
+        }
+
+        let rms = metrics_test::collect(&provider, &exporter);
+        let kinds = metrics_test::sum_points_by_attr(&rms, names::LLM_RETRIES, "kind");
+        assert_eq!(
+            kinds.get("retry"),
+            Some(&1),
+            "one re-attempt must score once, not once per event announcing it"
+        );
+        assert_eq!(
+            kinds.get("reconnect"),
+            None,
+            "a reconnect kind would double-count the attempt AttemptStarted already reports"
+        );
+    }
 
     // -- stale-stream circuit breaker --
 

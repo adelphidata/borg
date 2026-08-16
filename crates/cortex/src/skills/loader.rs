@@ -47,6 +47,22 @@ pub(super) fn load_builtin_skill(
     })
 }
 
+/// Resolve `path` and return it only if it stays inside `root`.
+///
+/// `root` must already be canonical. A skill directory is allowed to *be* a
+/// symlink — that is how an author keeps a skill in a checkout elsewhere — but
+/// an individual file beneath it must not point back out. Without this check a
+/// `scripts/deploy.sh` symlinked at `/etc/cron.d/…`, or at another skill's
+/// scripts directory, loads under this skill's name and runs with whatever
+/// trust the operator granted it.
+///
+/// Returns `None` for anything that cannot be resolved (a broken symlink, a
+/// racing delete) — unreadable is treated as not-contained, never as allowed.
+pub(super) fn contained_path(root: &std::path::Path, path: &std::path::Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(path).ok()?;
+    resolved.starts_with(root).then_some(resolved)
+}
+
 /// Returns the path to the user skills directory (`~/.borg/skills/`).
 pub fn skills_dir() -> Result<PathBuf> {
     Config::skills_dir()
@@ -157,6 +173,18 @@ pub fn load_all_skills(
                                         );
                                     }
 
+                                    // The directory itself may be a symlink into a
+                                    // checkout elsewhere; resolve it so supporting
+                                    // files can be tested against where they really
+                                    // load from, not where they were discovered.
+                                    let Ok(source_dir) = std::fs::canonicalize(&skill_dir) else {
+                                        warn!(
+                                            "Skipping skill '{name}': cannot resolve {}",
+                                            skill_dir.display()
+                                        );
+                                        continue;
+                                    };
+
                                     // References are loaded before validation so the
                                     // security scan sees them too — an injection payload
                                     // hides just as well in a reference file as in the body.
@@ -166,17 +194,30 @@ pub fn load_all_skills(
                                         if let Ok(ref_entries) = std::fs::read_dir(&refs_dir) {
                                             for ref_entry in ref_entries.flatten() {
                                                 let ref_path = ref_entry.path();
-                                                if ref_path.extension().is_some_and(|e| e == "md") {
-                                                    if let Ok(ref_content) =
-                                                        std::fs::read_to_string(&ref_path)
-                                                    {
-                                                        let ref_name = ref_path
-                                                            .file_name()
-                                                            .unwrap_or_default()
-                                                            .to_string_lossy()
-                                                            .to_string();
-                                                        references.push((ref_name, ref_content));
-                                                    }
+                                                if !ref_path.extension().is_some_and(|e| e == "md")
+                                                {
+                                                    continue;
+                                                }
+                                                let Some(ref_path) =
+                                                    contained_path(&source_dir, &ref_path)
+                                                else {
+                                                    warn!(
+                                                        "Skill '{name}': ignoring reference \
+                                                         '{}' — it resolves outside the skill \
+                                                         directory",
+                                                        ref_path.display()
+                                                    );
+                                                    continue;
+                                                };
+                                                if let Ok(ref_content) =
+                                                    std::fs::read_to_string(&ref_path)
+                                                {
+                                                    let ref_name = ref_path
+                                                        .file_name()
+                                                        .unwrap_or_default()
+                                                        .to_string_lossy()
+                                                        .to_string();
+                                                    references.push((ref_name, ref_content));
                                                 }
                                             }
                                         }
@@ -210,7 +251,24 @@ pub fn load_all_skills(
                                         if let Ok(script_entries) = std::fs::read_dir(&scripts_dir)
                                         {
                                             for script_entry in script_entries.flatten() {
-                                                scripts.push(script_entry.path());
+                                                // Defence in depth, not a boundary:
+                                                // the agent runs skill scripts by path
+                                                // through `run_shell`, which this does
+                                                // not gate. It keeps a symlinked-out
+                                                // script from being *advertised* as
+                                                // part of the skill.
+                                                match contained_path(
+                                                    &source_dir,
+                                                    &script_entry.path(),
+                                                ) {
+                                                    Some(script) => scripts.push(script),
+                                                    None => warn!(
+                                                        "Skill '{name}': ignoring script '{}' \
+                                                         — it resolves outside the skill \
+                                                         directory",
+                                                        script_entry.path().display()
+                                                    ),
+                                                }
                                             }
                                         }
                                     }

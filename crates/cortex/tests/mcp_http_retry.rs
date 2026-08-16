@@ -46,6 +46,7 @@ async fn http_startup_retries_transient_503_up_to_the_configured_bound() {
             auth: HttpAuthSpec::None,
             client_cert: None,
             client_key: None,
+            ca_cert: None,
         },
         connect_timeout_ms: 2_000,
         call_timeout_ms: 2_000,
