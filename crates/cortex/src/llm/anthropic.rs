@@ -700,8 +700,13 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
 /// Placeholder left where an image was removed. Silence would leave the model
 /// believing it had looked at something; naming the omission lets it say so and
 /// pick a text-only path (`get_text`, `snapshot`, `capture mode: "ax"`).
-pub(super) const IMAGE_OMITTED_NOTICE: &str =
-    "[image omitted: the active model does not accept image input]";
+///
+/// Deliberately worded so it does *not* trip
+/// [`crate::llm::llm_error::classify_error_text`]'s image-rejection needles:
+/// the notice travels inside the request body, and proxies that echo the
+/// offending prompt back in a 4xx would otherwise make an unrelated error look
+/// like a fresh image rejection.
+pub(super) const IMAGE_OMITTED_NOTICE: &str = "[image omitted: this model reads text only]";
 
 /// Strip image content parts from messages when model doesn't support vision.
 /// Each removed image leaves [`IMAGE_OMITTED_NOTICE`] in its place.

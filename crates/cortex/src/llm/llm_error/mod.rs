@@ -978,6 +978,17 @@ mod tests {
                 reqwest::StatusCode::NOT_FOUND,
                 r#"{"error":{"message":"No endpoints found for this model"}}"#,
             ),
+            // The image is at fault, not the model. Reading these as a
+            // capability verdict would blind a vision-capable model for the
+            // whole process over one bad file.
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"unsupported mimetype for image_url: image/tiff"}}"#,
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"message":"image_url too large: unsupported above 20MB"}}"#,
+            ),
         ] {
             let err = classify_status(status, body, Provider::OpenRouter);
             assert_ne!(

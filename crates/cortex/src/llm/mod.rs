@@ -1973,7 +1973,12 @@ impl LlmClient {
             None => None,
         };
 
-        // Strip images for non-vision models (safety net). `images_rejected`
+        // One strip-and-resend per call: a client outlives the turn that
+        // learned the verdict and may have failed over to a different model
+        // since, so a stale `true` must not deny the next call its retry.
+        self.images_rejected = false;
+
+        // Strip images for non-vision models (safety net). `IMAGE_REJECTED_MODELS`
         // carries a provider verdict from an earlier call in this session, so
         // an image already in the history doesn't 404 the turn again.
         let mut messages = if !self.provider.supports_vision(&self.llm_config.model)
@@ -2950,8 +2955,10 @@ impl LlmClient {
         let req_id = short_request_id();
         let max_provider_attempts = 1 + self.provider_slots.len();
         let mut last_error: Option<String> = None;
-        // Mirrors the streaming path: honor a provider verdict already learned
-        // in this session, and learn one here if it arrives.
+        // Mirrors the streaming path: one strip-and-resend per call, honor a
+        // provider verdict already learned in this session, and learn one here
+        // if it arrives.
+        self.images_rejected = false;
         let mut messages: Vec<Message> = if !self.provider.supports_vision(&self.llm_config.model)
             || images_known_rejected(self.provider, &self.llm_config.model)
         {

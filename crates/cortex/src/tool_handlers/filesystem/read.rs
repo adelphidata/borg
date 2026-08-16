@@ -318,7 +318,7 @@ pub fn handle_read_file_with_context(
             raw_bytes.len()
         );
 
-        return Ok(ToolOutput::Multimodal {
+        let out = ToolOutput::Multimodal {
             text: summary.clone(),
             parts: vec![
                 ContentPart::Text(summary),
@@ -332,7 +332,16 @@ pub fn handle_read_file_with_context(
                     },
                 },
             ],
-        });
+        };
+        // Same gate the screenshot tools use: pixels handed to a text-only
+        // model are dropped at the LLM layer, leaving it answering as if it
+        // had looked at the file.
+        return Ok(crate::tool::vision::downgrade_for_non_vision_model(
+            out,
+            config,
+            "fs_read loaded an image file",
+            "Switch to a vision-capable model to view images.",
+        ));
     }
 
     // Text file: read raw content (no line-number gutter). Emitting a per-line
@@ -469,6 +478,37 @@ mod tests {
             ToolOutput::Text(s) => assert!(s.contains("not found")),
             _ => panic!("expected Text"),
         }
+    }
+
+    /// Reading an image under a text-only model must explain the drop rather
+    /// than ship pixels the provider will reject ("No endpoints found that
+    /// support image input"), which used to fail the turn and every later one.
+    #[test]
+    fn handle_read_file_image_downgrades_for_a_text_only_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfake").unwrap();
+
+        let mut config = Config::default();
+        config.llm.provider = Some("groq".into());
+        config.llm.model = "llama-3.1-8b-instant".into();
+        match handle_read_file(&json!({"path": path.to_string_lossy()}), &config).unwrap() {
+            ToolOutput::Text(s) => {
+                assert!(s.contains("does not support image input"), "got: {s}");
+                assert!(s.contains("shot.png"), "file name lost: {s}");
+            }
+            other => panic!("text-only model must not receive pixels: {other:?}"),
+        }
+
+        config.llm.provider = Some("anthropic".into());
+        config.llm.model = "claude-sonnet-5".into();
+        assert!(
+            matches!(
+                handle_read_file(&json!({"path": path.to_string_lossy()}), &config).unwrap(),
+                ToolOutput::Multimodal { .. }
+            ),
+            "vision model must still receive the image"
+        );
     }
 
     #[test]

@@ -194,11 +194,24 @@ pub(super) fn body_indicates_cloudflare_block(body: &str) -> bool {
         && (lower.contains("you have been blocked") || lower.contains("attention required"))
 }
 
-/// True when an OpenRouter 404 body indicates the account's provider filters
-/// blocked every upstream that serves the model — distinct from "model not
-/// found" even though both return 404. Example body:
-///   {"error":{"message":"No allowed providers are available for the selected
-///   model.","code":404,"metadata":{"available_providers":[...]}}}
+/// Phrases that mean "the image you sent is bad", not "this model is blind".
+/// A malformed, oversized, or undownloadable image can carry both an image
+/// needle and a rejection needle ("unsupported mimetype for image_url"), and
+/// misreading it as a model capability verdict would blind a vision-capable
+/// model for the rest of the process over one corrupt file.
+const MALFORMED_IMAGE_NEEDLES: &[&str] = &[
+    "decode",
+    "corrupt",
+    "malformed",
+    "image format",
+    "mimetype",
+    "mime type",
+    "media type",
+    "too large",
+    "download",
+    "fetch the image",
+];
+
 /// True when the provider rejected the request because the *model* cannot
 /// accept image input — distinct from a wrong model id even though OpenRouter
 /// reports both as 404. Example body:
@@ -206,7 +219,9 @@ pub(super) fn body_indicates_cloudflare_block(body: &str) -> bool {
 ///
 /// Both halves must match: an image phrase AND a rejection phrase. A bare
 /// "image" needle would fire on ordinary prose (an `image_url` mentioned in a
-/// harmless 400) and strip pixels a capable model could have read.
+/// harmless 400) and strip pixels a capable model could have read. Bodies that
+/// blame the image itself (see [`MALFORMED_IMAGE_NEEDLES`]) are excluded for
+/// the same reason.
 pub(super) fn body_indicates_image_unsupported(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     let mentions_image = lower.contains("image input")
@@ -219,9 +234,15 @@ pub(super) fn body_indicates_image_unsupported(body: &str) -> bool {
         || lower.contains("unsupported")
         || lower.contains("does not accept")
         || lower.contains("not enabled");
-    mentions_image && rejects
+    let blames_the_image = MALFORMED_IMAGE_NEEDLES.iter().any(|n| lower.contains(n));
+    mentions_image && rejects && !blames_the_image
 }
 
+/// True when an OpenRouter 404 body indicates the account's provider filters
+/// blocked every upstream that serves the model — distinct from "model not
+/// found" even though both return 404. Example body:
+///   {"error":{"message":"No allowed providers are available for the selected
+///   model.","code":404,"metadata":{"available_providers":[...]}}}
 pub(super) fn body_indicates_no_allowed_providers(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("no allowed providers") || lower.contains("available_providers")
