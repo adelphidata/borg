@@ -50,22 +50,28 @@ impl NativeChannel for TwilioChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
-        // Verify signature if auth token is available
-        if let Some(ref auth_token) = self.auth_token {
-            if let Some(ref public_url) = self.config.gateway.public_url {
-                let webhook_url = format!("{public_url}/webhook/twilio");
-                crate::twilio::verify::verify_twilio_signature(
-                    headers,
-                    &webhook_url,
-                    body,
-                    auth_token,
-                )?;
-            } else {
-                anyhow::bail!(
-                    "Twilio signature verification unavailable: gateway.public_url not configured"
-                );
-            }
-        }
+        // Fail closed: an unverified Twilio POST carries an attacker-chosen
+        // `From`, which is the whole sender identity, so a missing auth token
+        // must refuse rather than skip the check.
+        crate::verify_common::require_verification_secret(
+            "twilio",
+            self.auth_token.as_deref(),
+            "TWILIO_AUTH_TOKEN",
+        )?;
+        // Non-empty past the check above; an empty token would only make the
+        // signature comparison fail, which stays closed either way.
+        let auth_token = self.auth_token.as_deref().unwrap_or_default();
+        // Twilio signs the full request URL, so the public URL is part of the
+        // credential here rather than a convenience setting.
+        let Some(ref public_url) = self.config.gateway.public_url else {
+            anyhow::bail!(
+                "Twilio inbound webhook refused: gateway.public_url is not set, and \
+                 Twilio's signature covers the request URL — set it to the address \
+                 Twilio posts to (failing closed)."
+            )
+        };
+        let webhook_url = format!("{public_url}/webhook/twilio");
+        crate::twilio::verify::verify_twilio_signature(headers, &webhook_url, body, auth_token)?;
 
         let mut parsed = super::parse::parse_webhook(body)?;
 
@@ -194,5 +200,69 @@ mod tests {
         let back: TwilioResponseContext = serde_json::from_value(json).unwrap();
         assert_eq!(back.channel_type, "whatsapp");
         assert_eq!(back.sender, "+1234567890");
+    }
+
+    fn channel(auth_token: Option<&str>, public_url: Option<&str>) -> TwilioChannel {
+        let mut config = Config::default();
+        config.gateway.public_url = public_url.map(str::to_string);
+        TwilioChannel {
+            client: Arc::new(super::TwilioClient::new("AC-sid", "token").unwrap()),
+            auth_token: auth_token.map(str::to_string),
+            phone_number: Some("+15550000000".to_string()),
+            whatsapp_number: None,
+            config,
+        }
+    }
+
+    /// The `From` number in a Twilio POST is the entire sender identity, and
+    /// Borg routes per sender. Without the auth token the signature was simply
+    /// not checked, so anyone posting to the endpoint could claim any number.
+    /// Both halves of the credential are required, because Twilio signs the
+    /// request URL as well as the body.
+    #[tokio::test]
+    async fn twilio_refuses_inbound_when_it_cannot_verify_the_signature() {
+        let health = Arc::new(RwLock::new(crate::health::ChannelHealthRegistry::default()));
+        let config = Config::default();
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        let body = "From=%2B15551234567&Body=whoami";
+
+        // No auth token: refused, naming the missing credential.
+        let msg = match channel(None, Some("https://borg.example"))
+            .handle_webhook(&HeaderMap::new(), body, &ctx)
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unverifiable Twilio POST must be refused"),
+        };
+        assert!(
+            msg.contains("TWILIO_AUTH_TOKEN"),
+            "the refusal must name the missing credential: {msg}"
+        );
+
+        // Token present but no public URL: the signature covers the URL, so
+        // this is equally unverifiable and must not fall through to accepting.
+        let msg = match channel(Some("tok"), None)
+            .handle_webhook(&HeaderMap::new(), body, &ctx)
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing public_url must not skip verification"),
+        };
+        assert!(
+            msg.contains("public_url"),
+            "the refusal must name what to configure: {msg}"
+        );
+
+        // Fully configured but unsigned: refused by the signature check.
+        assert!(
+            channel(Some("tok"), Some("https://borg.example"))
+                .handle_webhook(&HeaderMap::new(), body, &ctx)
+                .await
+                .is_err(),
+            "an unsigned request must fail verification"
+        );
     }
 }

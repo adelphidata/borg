@@ -867,6 +867,141 @@ pub(crate) fn pipeline_segments(command: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Why a command's exit code does not describe the work the caller cares about.
+///
+/// A shell reports the status of the *last* command it ran, so
+/// `cargo test | tee log` exits with `tee`'s 0 however badly the tests went,
+/// and `cargo test || true` exits with `true`'s 0. Both shapes turn a real
+/// failure into a clean exit with no error anywhere in the status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MaskedExit {
+    /// The command ends in a pipe into a consumer that only passes text
+    /// through (`tee`, `tail`, `head`, …), so the exit code is the consumer's.
+    PassthroughPipe {
+        /// Basename of the consumer whose status the shell actually reported.
+        consumer: String,
+    },
+    /// The command ends in `|| <cheap fallback>` (`echo`, `true`, `:`), so a
+    /// failure upstream is converted into the fallback's clean exit.
+    OrFallback,
+}
+
+impl MaskedExit {
+    /// One clause naming whose status the exit code really is, for embedding
+    /// in a hint or a gate-failure message.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::PassthroughPipe { consumer } => format!(
+                "the exit code is `{consumer}`'s status, not that of the command before the pipe"
+            ),
+            Self::OrFallback => {
+                "the exit code is the `||` fallback's status, not that of the command before it"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Consumers whose own exit status says nothing about what fed them.
+const PASSTHROUGH_CONSUMERS: &[&str] = &[
+    "tee", "tail", "head", "cat", "less", "more", "wc", "sort", "uniq", "nl", "column",
+];
+
+/// Fallbacks cheap enough that `cmd || <fallback>` is a status-swallowing
+/// idiom rather than real recovery.
+const CHEAP_FALLBACKS: &[&str] = &["echo", "printf", "true", ":"];
+
+/// How this command's exit status is masked, or `None` when the status is
+/// genuinely the status of the work.
+///
+/// Only the final executed command is examined, because that is the one whose
+/// status the shell reports: `a | tee f` reports `tee`, `a || true` reports
+/// `true`. Anything else (a bare command, `a && b`, a pipe into a real
+/// program) is left alone, so this never second-guesses a status it cannot
+/// prove wrong.
+pub(crate) fn masked_exit_shape(command: &str) -> Option<MaskedExit> {
+    let (operator, last) = last_top_level_step(command)?;
+    // `set -o pipefail` makes the pipeline report the first failing stage, so
+    // `set -o pipefail; cargo test | tee log` really does carry the test's
+    // status. Calling that masked would reject a perfectly good quality gate.
+    if operator == "|" && command.contains("pipefail") {
+        return None;
+    }
+    let head = head_token(last)?;
+    match operator {
+        "|" if PASSTHROUGH_CONSUMERS.contains(&head) => Some(MaskedExit::PassthroughPipe {
+            consumer: head.to_string(),
+        }),
+        "||" if CHEAP_FALLBACKS.contains(&head) => Some(MaskedExit::OrFallback),
+        _ => None,
+    }
+}
+
+/// The operator introducing the last top-level step and that step's text.
+///
+/// Quote- and escape-aware so a `|` inside `grep 'a|b'` or an `echo "x || y"`
+/// operand is not mistaken for a control operator. Returns `None` when the
+/// command is a single step with no trailing operator.
+fn last_top_level_step(command: &str) -> Option<(&str, &str)> {
+    let bytes = command.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut last: Option<(&str, usize)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        let operator = match c {
+            b'&' if bytes.get(i + 1) == Some(&b'&') => "&&",
+            b'|' if bytes.get(i + 1) == Some(&b'|') => "||",
+            b'|' => "|",
+            b';' | b'\n' => ";",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        i += operator.len();
+        last = Some((operator, i));
+    }
+    let (operator, start) = last?;
+    Some((operator, command[start..].trim()))
+}
+
+/// Basename of a step's first word, skipping leading `VAR=value` assignments.
+/// `None` for an empty step or one that is only assignments.
+fn head_token(step: &str) -> Option<&str> {
+    step.split_whitespace()
+        .find(|token| !(token.contains('=') && !token.starts_with(['=', '/', '.'])))
+        .map(|token| {
+            std::path::Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(token)
+        })
+}
+
 /// Every pipeline stage of `command`, plus the stages of any script it carries
 /// inline — `bash -o pipefail -c "…"`, `sh -lc '…'`, `eval '…'`, `trap '…' EXIT`
 /// — flattened into one list and de-obfuscated.
@@ -1987,6 +2122,99 @@ mod git_self_checkout_tests {
             reason.contains("worktree"),
             "the message must offer the supported alternative: {reason}"
         );
+    }
+}
+
+#[cfg(test)]
+mod masked_exit_tests {
+    use super::*;
+
+    /// The shapes a shell takes an exit status from, and the ones it does not.
+    /// A status is only called masked when the *last* command the shell ran is
+    /// a passthrough consumer or a cheap `||` fallback — everything else, up to
+    /// and including a pipe into a real program, keeps its status trusted.
+    #[test]
+    fn masked_shapes_are_recognized_without_over_firing() {
+        // (command, expected consumer for a pipe / "||" for a fallback / "" for none)
+        let cases: &[(&str, &str)] = &[
+            // Passthrough pipes: the shell reports the consumer.
+            ("cargo test 2>&1 | tee /tmp/borg-test.log", "tee"),
+            ("cargo build | tail -20", "tail"),
+            ("make -j8 2>&1 | head -50", "head"),
+            ("pytest | /usr/bin/cat", "cat"),
+            ("cargo test | wc -l", "wc"),
+            // Cheap `||` fallbacks: the shell reports the fallback.
+            ("cargo build || true", "||"),
+            ("cargo test || echo FAILED", "||"),
+            ("cargo test || :", "||"),
+            // Trusted: the status really is the work's.
+            ("cargo build", ""),
+            ("cargo build --release 2>&1", ""),
+            ("cargo build && cargo test", ""),
+            // A pipe into a real program: that program's status is meaningful.
+            ("cargo test | grep -q ok", ""),
+            ("cat log | rg FAILED", ""),
+            // `||` into real recovery is not a swallowed status.
+            ("cargo build || cargo clean", ""),
+            // Operators inside quotes are operands, not control operators.
+            ("echo 'a | tail'", ""),
+            ("rg \"x || true\" src", ""),
+            ("grep -r 'a|b' .", ""),
+            // An escaped pipe is literal too.
+            ("echo a \\| tail", ""),
+            // Only the final step matters: the masking pipe is not the last one.
+            ("cargo build | tee log; cargo test", ""),
+            // `pipefail` hands the pipeline the first failing stage's status,
+            // so the pipe no longer masks anything.
+            ("set -o pipefail; cargo test 2>&1 | tee log", ""),
+            // …but it says nothing about `||`, which still swallows.
+            ("set -o pipefail; cargo test || true", "||"),
+        ];
+        for (command, expected) in cases {
+            match (masked_exit_shape(command), *expected) {
+                (None, "") => {}
+                (Some(shape), "") => {
+                    panic!("{command:?} must keep its exit status trusted, got {shape:?}")
+                }
+                (None, want) => panic!("{command:?} must be masked by {want}, got none"),
+                (Some(MaskedExit::OrFallback), "||") => {}
+                (Some(MaskedExit::PassthroughPipe { consumer }), want) => assert_eq!(
+                    consumer, want,
+                    "{command:?} should report {want} as the masking consumer"
+                ),
+                (Some(shape), want) => panic!("{command:?} wanted {want}, got {shape:?}"),
+            }
+        }
+    }
+
+    /// The description names whose status the exit code really is, because a
+    /// caller that only says "this may be masked" leaves the reader guessing
+    /// which half of the command to re-run.
+    #[test]
+    fn description_names_the_command_the_status_came_from() {
+        let pipe = masked_exit_shape("cargo test | tee log").expect("masked");
+        assert!(
+            pipe.describe().contains("`tee`"),
+            "pipe description must name the consumer: {}",
+            pipe.describe()
+        );
+        let fallback = masked_exit_shape("cargo test || true").expect("masked");
+        assert!(
+            fallback.describe().contains("`||`"),
+            "fallback description must name the operator: {}",
+            fallback.describe()
+        );
+    }
+
+    /// Leading `VAR=value` assignments are not the command, so a masking shape
+    /// behind them is still found (and a step of only assignments is not one).
+    #[test]
+    fn env_assignments_do_not_hide_the_head_command() {
+        assert!(matches!(
+            masked_exit_shape("cargo test | RUST_LOG=off tee log"),
+            Some(MaskedExit::PassthroughPipe { .. })
+        ));
+        assert_eq!(masked_exit_shape("cargo test | FOO=bar"), None);
     }
 }
 

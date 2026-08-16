@@ -363,13 +363,41 @@ async fn snapshot_live_db(db_path: &Path, work_dir: &Path) -> Result<PathBuf> {
         .await
         .context("snapshot: open source database")?;
     let conn = db.connect().context("snapshot: connect")?;
+    // Wait for a writer instead of failing the instant one holds the lock: a
+    // running borgd writes often enough that an unbounded-zero timeout turns a
+    // routine backup into a coin flip. Bounded, so a wedged writer surfaces as
+    // a timeout rather than hanging the command.
+    conn.busy_timeout(SNAPSHOT_BUSY_TIMEOUT)
+        .context("snapshot: set busy_timeout")?;
     // Escape single quotes for the SQL string literal. The destination is
     // our own tempdir path, but tempdirs can live under arbitrary prefixes.
     let dest_sql = dest.to_string_lossy().replace('\'', "''");
     conn.execute(&format!("VACUUM INTO '{dest_sql}'"), ())
         .await
-        .context("snapshot: VACUUM INTO")?;
+        .map_err(|e| snapshot_error(anyhow::Error::from(e)))?;
     Ok(dest)
+}
+
+/// How long the snapshot waits for a concurrent writer before giving up.
+///
+/// Longer than the 5s CLI default: `VACUUM INTO` needs a read lock for the
+/// whole copy, and a busy daemon can hold the write lock across several turns'
+/// worth of short transactions.
+const SNAPSHOT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Turn a snapshot failure into one the operator can act on.
+///
+/// A raw `database is locked` from libsql names no cause and no next step; the
+/// cause is almost always the daemon, and stopping it is the fix.
+fn snapshot_error(err: anyhow::Error) -> anyhow::Error {
+    if crate::db::is_lock_contention(&err) {
+        return err.context(
+            "snapshot: the database stayed locked by another process for 30s — \
+             stop the daemon with `borg service stop` (or wait for the running \
+             turn to finish) and run the backup again",
+        );
+    }
+    err.context("snapshot: VACUUM INTO")
 }
 
 fn append_dir_filtered<W: Write>(
@@ -605,6 +633,39 @@ impl<W: Write> Write for ShaWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backup that loses to the daemon must say so and name the fix. The raw
+    /// libsql text is `database is locked`, which tells the operator neither
+    /// what holds it nor what to do, so they retry into the same failure.
+    #[test]
+    fn a_locked_database_reports_the_daemon_and_the_fix() {
+        let locked = anyhow::Error::from(libsql::Error::SqliteFailure(
+            5, // SQLITE_BUSY
+            "database is locked".to_string(),
+        ));
+        let reported = format!("{:#}", snapshot_error(locked));
+        assert!(
+            reported.contains("borg service stop"),
+            "must name the next step: {reported}"
+        );
+        assert!(
+            reported.contains("locked"),
+            "must keep the cause: {reported}"
+        );
+
+        // Anything else keeps its own context rather than being blamed on a
+        // lock — a disk-full backup told to stop the daemon wastes the fix.
+        let full = anyhow::Error::from(libsql::Error::SqliteFailure(
+            13, // SQLITE_FULL
+            "database or disk is full".to_string(),
+        ));
+        let reported = format!("{:#}", snapshot_error(full));
+        assert!(
+            !reported.contains("borg service stop"),
+            "a disk-full failure is not lock contention: {reported}"
+        );
+        assert!(reported.contains("VACUUM INTO"), "{reported}");
+    }
 
     /// The cross-device restore fallback must reproduce the staged tree
     /// faithfully — a symlink silently dropped (the old behavior: neither the

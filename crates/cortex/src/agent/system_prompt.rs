@@ -367,10 +367,12 @@ impl Agent {
 
     /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
     pub(super) async fn build_environment_section(&self) -> String {
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let mut s = String::new();
         s.push_str("<environment>\n");
-        s.push_str(&format!("Current Time: {now}\n"));
+        s.push_str(&format!(
+            "Current Time: {}\n",
+            crate::util::time::current_time_line(self.config.user.timezone.as_deref())
+        ));
         s.push_str(&format!(
             "Working directory: {}\n",
             self.execution_context.workspace_cwd().display()

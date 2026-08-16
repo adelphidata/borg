@@ -362,6 +362,25 @@ impl Agent {
             std::time::Duration::from_millis(self.config.goals.gate_timeout_ms.max(1_000));
 
         for gate in &gates {
+            // A gate stored before the add-time check, or edited in the DB by
+            // hand, can carry a command whose exit code is always 0. Running it
+            // would report a pass it never earned, so stop the goal for the
+            // operator instead — retries cannot fix the command's shape.
+            if let Some(reason) = crate::goals::gates::unverifiable_reason(&gate.command) {
+                tracing::warn!(
+                    ordinal = gate.ordinal,
+                    command = %gate.command,
+                    "goal gate: exit status cannot be attributed to the command"
+                );
+                return GateVerdict::Exhausted {
+                    ordinal: gate.ordinal,
+                    message: format!(
+                        "Goal paused: quality gate {} (`{}`) cannot be verified — {reason} \
+                         Fix it with `/goal gate remove {}` and add it again.",
+                        gate.ordinal, gate.command, gate.ordinal
+                    ),
+                };
+            }
             // Replay a known failure against an unchanged workspace instead of
             // re-running it: the result cannot differ, and a full test suite
             // per turn is minutes of wall clock for no information.

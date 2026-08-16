@@ -353,7 +353,13 @@ impl Database {
     ///
     /// Ordinals are assigned as `max + 1` rather than `count + 1` so a removal
     /// followed by an add cannot collide with a surviving row.
+    /// A command whose exit code cannot describe the check is rejected here
+    /// rather than stored: every surface that adds a gate reaches this call, so
+    /// an always-passing gate never gets written in the first place.
     pub async fn add_goal_gate(&self, session_id: &str, command: &str) -> Result<GoalGate> {
+        if let Some(reason) = crate::goals::gates::unverifiable_reason(command) {
+            anyhow::bail!(reason);
+        }
         let now = now_unix();
         let mut rows = self
             .conn
@@ -784,6 +790,32 @@ mod tests {
         let db = db_with_session("s").await;
         db.add_goal_gate("s", "a").await.unwrap();
         assert!(!db.remove_goal_gate("s", 99).await.unwrap());
+        assert_eq!(db.list_goal_gates("s").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_could_never_fail_is_not_stored() {
+        // `cargo test | tee log` exits with tee's 0 whatever the suite did, so
+        // storing it would give the goal a check that always passes. Every
+        // surface adding a gate lands here, so the refusal has to be at this
+        // seam and nothing may be written.
+        let db = db_with_session("s").await;
+        let err = db
+            .add_goal_gate("s", "cargo test 2>&1 | tee /tmp/borg-test.log")
+            .await
+            .expect_err("an always-passing gate must be refused");
+        assert!(
+            err.to_string().contains("never fail"),
+            "refusal must say why: {err}"
+        );
+        assert!(
+            db.list_goal_gates("s").await.unwrap().is_empty(),
+            "a refused gate must not be persisted"
+        );
+        // The verifiable form of the same check is still accepted.
+        db.add_goal_gate("s", "cargo test")
+            .await
+            .expect("a bare command is a real gate");
         assert_eq!(db.list_goal_gates("s").await.unwrap().len(), 1);
     }
 

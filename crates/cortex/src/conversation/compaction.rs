@@ -39,6 +39,18 @@ pub fn render_compaction_marker(body: &str) -> Message {
     ))
 }
 
+/// Flatten the summarized region into one text blob for anchor harvesting.
+///
+/// Reads the same messages the summarizer was given, so the index can only ever
+/// contain identifiers that were genuinely in the compacted region.
+fn summarizer_region_text(middle: &[Message]) -> String {
+    middle
+        .iter()
+        .filter_map(|m| m.text_content())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A plan for compacting a message history: which head/tail slices to
 /// preserve and which middle range to summarize.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,11 +388,21 @@ pub async fn compact_history_v2(
     // chain-of-thought can't compound across iterative summaries.
     let middle = sanitize_for_summarizer(&history[plan.head_end..plan.tail_start]);
 
+    // Lift the anchor section off the prior summary before it goes back to the
+    // summarizer. Its whole purpose is to hold identifiers the model must not
+    // rewrite, so re-submitting it invites exactly the paraphrase it exists to
+    // prevent — and spends the word budget re-transcribing what we can append
+    // deterministically afterwards.
+    let (prior_body, carried_anchors) = match previous_summary.as_deref() {
+        Some(prior) => super::anchors::split_anchor_section(prior),
+        None => (String::new(), Vec::new()),
+    };
+    let prior_body = (!prior_body.trim().is_empty()).then_some(prior_body);
+
     // Bail out without mutating history if the summarizer gave us nothing
     // usable — better to let the next turn try again than to drop the
     // middle with no context at all. Shares the v1 path's let-else abort.
-    let summary_body = match summarize_with_llm_v2(&middle, previous_summary.as_deref(), llm).await
-    {
+    let summary_body = match summarize_with_llm_v2(&middle, prior_body.as_deref(), llm).await {
         Ok(s) => s,
         Err(failure) => {
             warn!("compact_history_v2: no usable summary, leaving history untouched");
@@ -393,6 +415,16 @@ pub async fn compact_history_v2(
         // The provider answered — a bad response, not an outage.
         return Err(SummarizeFailure::Transient);
     }
+
+    // Append the exact identifiers this region carried. Harvested by regex
+    // from the same messages the summarizer saw, so the facts with no semantic
+    // redundancy — SHAs, issue numbers, paths, error text — survive at full
+    // fidelity whatever the summarizer chose to keep. Done after the call so
+    // no model ever gets the chance to rewrite them.
+    let summary_body = format!(
+        "{summary_body}{}",
+        super::anchors::build_anchor_index(&summarizer_region_text(&middle), &carried_anchors)
+    );
 
     // Sanitize the summary body to strip any XML tag boundaries the LLM may
     // have injected (e.g. a stray `</compaction_summary>` inside a code
@@ -1048,6 +1080,155 @@ mod tests {
             "trace in Parts must be stripped"
         );
         assert!(a2.contains("Answer: 42"), "Parts answer must survive");
+    }
+
+    /// Serve one canned SSE summary and return the base URL to point a client at.
+    ///
+    /// The summarizer's own output is the variable under test here: it is made
+    /// deliberately lossy so the assertions can tell what the fold preserved
+    /// from a model that dropped everything specific.
+    fn serve_one_summary(summary: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 65536];
+                let _ = sock.read(&mut buf);
+                let body = serde_json::json!({"choices":[{"delta":{"content": summary}}]});
+                let sse = format!("data: {body}\n\ndata: [DONE]\n\n");
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                         Connection: close\r\n\r\n{sse}"
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1/chat/completions")
+    }
+
+    async fn client_returning(summary: &'static str) -> LlmClient {
+        let mut config = crate::config::Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "test-model".to_string();
+        config.llm.base_url = Some(serve_one_summary(summary));
+        config.llm.max_retries = 0;
+        LlmClient::new(&config).await.expect("client builds")
+    }
+
+    /// The failure this guards: a summarizer that writes a fluent, plausible
+    /// summary and quietly drops every identifier in it. Prose can be
+    /// re-derived from context; a commit SHA, an issue number, and the path
+    /// that was edited cannot. They must reach the marker whatever the model
+    /// chose to write, because nothing downstream can tell that they are gone.
+    #[tokio::test]
+    async fn identifiers_reach_the_marker_even_when_the_summarizer_drops_them() {
+        let mut history: Vec<Message> = Vec::new();
+        history.push(make_user("Please fix the crash."));
+        for i in 0..8 {
+            history.push(make_user(&format!(
+                "Turn {i}: investigating #87403 in crates/cortex/src/llm/gemini.rs, \
+                 reproduced at commit 9b987f73ab with plenty of filler text to spend budget."
+            )));
+            history.push(make_assistant(&format!(
+                "Reply {i}: still seeing NotFoundError, adding more words so this history \
+                 comfortably exceeds the compaction budget for the planner."
+            )));
+        }
+        let total = history_tokens(&history);
+        let tight_budget = (total as f64 / 0.90) as usize;
+
+        // A summary that is entirely non-specific — exactly the failure mode.
+        let mut llm = client_returning(
+            "## Goal\nFix a crash.\n\n## Progress\n**Done** Investigated the issue \
+             and found the bug in a source file.",
+        )
+        .await;
+        let mut previous: Option<String> = None;
+        let dropped = compact_history_v2(&mut history, tight_budget, 1, &mut previous, &mut llm)
+            .await
+            .expect("summarizer returned a summary");
+        assert!(dropped > 0, "precondition: the fold must have run");
+
+        let marker = history
+            .iter()
+            .find(|m| is_compaction_marker(m))
+            .expect("a marker must be spliced in");
+        let text = marker.text_content().expect("marker text");
+        for identifier in [
+            "#87403",
+            "crates/cortex/src/llm/gemini.rs",
+            "9b987f73ab",
+            "NotFoundError",
+        ] {
+            assert!(
+                text.contains(identifier),
+                "the fold lost {identifier}, which the summary never carried: {text}"
+            );
+        }
+        // The pointer back to the archived rows ships with them, so a model
+        // missing a detail looks it up instead of inventing one.
+        assert!(text.contains("memory_search"), "recovery pointer: {text}");
+        // What is handed to the next compaction must be what the model sees,
+        // or the marker and the replayed checkpoint would disagree.
+        assert_eq!(
+            previous.as_deref().map(str::trim),
+            Some(
+                text.trim_start_matches(COMPACTION_MARKER_HEADING)
+                    .trim_start()
+                    .trim_start_matches(COMPACTION_MARKER_OPEN)
+                    .trim_end_matches(COMPACTION_MARKER_CLOSE)
+                    .trim()
+            ),
+            "the stored summary must match the spliced marker body"
+        );
+    }
+
+    /// A second compaction must not re-submit the anchor section to the model:
+    /// that is the one part of the summary that exists because it must never be
+    /// paraphrased. It is lifted off before the call and re-appended after, so
+    /// identifiers found in the first pass survive a pass that never mentions
+    /// them again.
+    #[tokio::test]
+    async fn anchors_survive_a_second_compaction_that_never_mentions_them() {
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..8 {
+            history.push(make_user(&format!(
+                "Later turn {i}: unrelated work on the settings table, wordy enough to \
+                 push this history over the compaction budget on its own."
+            )));
+            history.push(make_assistant(&format!(
+                "Later reply {i}: acknowledged, continuing with more filler text here."
+            )));
+        }
+        let total = history_tokens(&history);
+        let tight_budget = (total as f64 / 0.90) as usize;
+
+        // Stands in for the first pass's output: a body plus a banked index.
+        let mut previous = Some(format!(
+            "## Goal\nFix the crash.\n\n{}\nissues/PRs: #87403\ncommits: 9b987f73ab\n",
+            super::super::anchors::ANCHOR_HEADING
+        ));
+        let mut llm = client_returning("## Goal\nFix the crash.\n\n## Progress\nMoved on.").await;
+        compact_history_v2(&mut history, tight_budget, 0, &mut previous, &mut llm)
+            .await
+            .expect("second compaction summarizes");
+
+        let stored = previous.expect("a summary is stored");
+        assert!(
+            stored.contains("#87403") && stored.contains("9b987f73ab"),
+            "anchors from the first pass must survive a pass that never repeats them: {stored}"
+        );
+        assert_eq!(
+            stored
+                .matches(super::super::anchors::ANCHOR_HEADING)
+                .count(),
+            1,
+            "the section must be replaced, not stacked: {stored}"
+        );
     }
 
     /// A summarizer that fails — here a provider whose endpoint refuses the

@@ -786,7 +786,10 @@ pub async fn handle_run_shell_with_context(
             note_sandbox_denial(ctx, &stderr, code).await;
             let mut result =
                 format!("Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
-            if code != Some(0) {
+            // A clean exit is scanned too when the command's shape means the
+            // shell took that status from a pipe consumer or a `||` fallback
+            // rather than from the work itself.
+            if code != Some(0) || crate::policy::masked_exit_shape(command).is_some() {
                 // Concatenate only the bounded head of each stream, not the
                 // full outputs: the hint scanner reads at most its scan
                 // window anyway, so a full-output copy is pure allocation
@@ -800,7 +803,7 @@ pub async fn handle_run_shell_with_context(
                     crate::tool_handlers::hints::shell_failure_hint(command, code, &combined)
                 {
                     result.push_str("\nhint: ");
-                    result.push_str(hint);
+                    result.push_str(&hint);
                 }
             }
             Ok(result)
@@ -1357,7 +1360,7 @@ async fn run_in_pty(
                 &combined,
             ) {
                 result.push_str("\nhint: ");
-                result.push_str(hint);
+                result.push_str(&hint);
             }
             Ok(result)
         }

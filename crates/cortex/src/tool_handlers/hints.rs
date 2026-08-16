@@ -81,18 +81,64 @@ const SHELL_HINTS: &[ShellHint] = &[
     },
 ];
 
+/// Banners no build or test tool prints unless something actually failed.
+///
+/// Deliberately tool-specific rather than a bare "error" search: this list is
+/// only consulted for commands that exited 0, where the whole question is
+/// whether the visible output contradicts a clean status. A generic needle
+/// would fire on any output that merely quotes an error.
+const FAILURE_BANNERS: &[&str] = &[
+    "error[E",                           // rustc
+    "error: could not compile",          // cargo
+    "error: aborting due to",            // rustc summary
+    "test result: FAILED",               // cargo test / nextest
+    "Traceback (most recent call last)", // python
+    "short test summary info",           // pytest
+    "npm ERR!",                          // npm
+    "BUILD FAILED",                      // gradle / xcodebuild
+    "compilation terminated.",           // gcc / clang
+    "FAILED: ",                          // ninja
+    "make: ***",                         // make
+    "]: ***",                            // make[N]: ***
+];
+
+/// Heads whose output legitimately *contains* failure banners: a search or a
+/// file read that turns up the word `error[E` has not failed. Excluded so the
+/// masked-success check never fires on `rg 'error\[E' … | head`.
+const CONTENT_HEADS: &[&str] = &[
+    "grep",
+    "rg",
+    "ag",
+    "find",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "jq",
+    "awk",
+    "sed",
+    "strings",
+    "journalctl",
+    "dmesg",
+    "echo",
+    "printf",
+];
+
 /// Return the hint for the first failure shape matching this command's
-/// outcome, or `None` for clean (exit 0) or unrecognized results. `output` is
-/// the combined stdout+stderr; only its first [`SCAN_BYTES`] are scanned.
+/// outcome, or `None` for clean or unrecognized results. `output` is the
+/// combined stdout+stderr; only its first [`SCAN_BYTES`] are scanned.
+///
+/// Exit 0 earns a hint in exactly one case — see [`masked_success_hint`].
 pub(crate) fn shell_failure_hint(
     command: &str,
     exit_code: Option<i32>,
     output: &str,
-) -> Option<&'static str> {
+) -> Option<std::borrow::Cow<'static, str>> {
     if exit_code == Some(0) {
-        // A clean exit never earns a hint, even if the output happens to
-        // quote a failure-shaped string (`echo "Permission denied"`).
-        return None;
+        // A clean exit normally earns no hint, even if the output happens to
+        // quote a failure-shaped string (`echo "Permission denied"`) — the
+        // one exception is a status the shell never took from the real work.
+        return masked_success_hint(command, output).map(std::borrow::Cow::Owned);
     }
     let head = output_head(output);
     SHELL_HINTS
@@ -102,7 +148,41 @@ pub(crate) fn shell_failure_hint(
             Shape::Exit(code) => exit_code == Some(code),
             Shape::GrepNoMatches => exit_code == Some(1) && last_segment_head_is_grep(command),
         })
-        .map(|row| row.hint)
+        .map(|row| std::borrow::Cow::Borrowed(row.hint))
+}
+
+/// Hint for an exit 0 that the shell took from something other than the work.
+///
+/// `cargo test 2>&1 | tee log` exits with `tee`'s 0 however the tests went, and
+/// the model reads exit 0 as a strong success signal — so a failed build can be
+/// reported as a passing one. Both halves must hold before this fires: the
+/// command shape must be able to mask a status *and* the output must carry a
+/// tool-specific failure banner. The exit code itself is never rewritten; this
+/// only tells the model not to trust it.
+fn masked_success_hint(command: &str, output: &str) -> Option<String> {
+    let shape = crate::policy::masked_exit_shape(command)?;
+    if first_head_is_content_producer(command) {
+        return None;
+    }
+    let head = output_head(output);
+    if !FAILURE_BANNERS.iter().any(|banner| head.contains(banner)) {
+        return None;
+    }
+    Some(format!(
+        "exit 0 is not evidence of success here — {}, and the output carries failure \
+         banners. Treat this run as FAILED and re-run the command bare to get its real \
+         exit code.",
+        shape.describe()
+    ))
+}
+
+/// Whether the command *starts* with a search or file-read tool, whose output
+/// naturally quotes failure banners it did not produce.
+fn first_head_is_content_producer(command: &str) -> bool {
+    crate::policy::pipeline_segments(command)
+        .first()
+        .and_then(|segment| segment.split_whitespace().next())
+        .is_some_and(|head| CONTENT_HEADS.contains(&head_token_base(head)))
 }
 
 /// First [`SCAN_BYTES`] of the output, cut back to a char boundary.
@@ -235,6 +315,77 @@ mod tests {
         let out = "sh: cc: command not found\nerror[E9999]: fake\n";
         let hint = shell_failure_hint("cc x.c", Some(127), out).expect("hint");
         assert!(hint.contains("PATH"), "earlier row must win: {hint}");
+    }
+
+    /// A masked exit 0 only earns a hint when BOTH halves hold: the shell took
+    /// its status from a passthrough consumer or a `||` fallback, AND the
+    /// output carries a real build/test failure banner. Either half alone
+    /// leaves the clean status alone.
+    #[test]
+    fn masked_exit_zero_needs_both_a_masking_shape_and_a_failure_banner() {
+        const CARGO_FAIL: &str = "error[E0308]: mismatched types\nerror: could not compile `x`\n";
+        // (command, output, should hint)
+        let cases: &[(&str, &str, bool)] = &[
+            // Both halves: the canonical `| tee` and `| tail` build runs.
+            ("cargo test 2>&1 | tee /tmp/borg-test.log", CARGO_FAIL, true),
+            ("cargo build | tail -20", CARGO_FAIL, true),
+            ("cargo build || echo failed", CARGO_FAIL, true),
+            (
+                "pytest | tee out",
+                "=== short test summary info ===\n",
+                true,
+            ),
+            ("npm run build | tee out", "npm ERR! build failed\n", true),
+            ("make | tee out", "make: *** [all] Error 2\n", true),
+            // Masking shape but a genuinely clean build: no hint.
+            ("cargo build | tee log", "Finished dev profile\n", false),
+            ("cargo test || true", "test result: ok. 12 passed\n", false),
+            // Failure banner but no masking shape: exit 0 is trustworthy.
+            ("cargo build", CARGO_FAIL, false),
+            ("cargo build && cargo test", CARGO_FAIL, false),
+            // Pipe into a real program, not a passthrough consumer.
+            ("cargo build | grep -q Finished", CARGO_FAIL, false),
+            // A search whose OUTPUT quotes failure banners has not failed.
+            ("rg 'error\\[E' src | head -20", CARGO_FAIL, false),
+            ("cat build.log | tail -50", CARGO_FAIL, false),
+        ];
+        for (command, output, want_hint) in cases {
+            let hint = shell_failure_hint(command, Some(0), output);
+            assert_eq!(
+                hint.is_some(),
+                *want_hint,
+                "masked-success verdict wrong for {command:?} with output {output:?}: {hint:?}"
+            );
+        }
+    }
+
+    /// The hint has to be actionable: it names what the exit code actually
+    /// measured and tells the model to re-run bare, so the model does not just
+    /// learn "something is off" and retry the same masked command.
+    #[test]
+    fn masked_success_hint_names_the_consumer_and_the_next_step() {
+        let hint = shell_failure_hint(
+            "cargo test 2>&1 | tee /tmp/borg-test.log",
+            Some(0),
+            "error: could not compile `cortex`\n",
+        )
+        .expect("masked exit 0 must earn a hint");
+        assert!(hint.contains("tee"), "must name the consumer: {hint}");
+        assert!(hint.contains("FAILED"), "must reverse the verdict: {hint}");
+        assert!(hint.contains("bare"), "must name the next step: {hint}");
+    }
+
+    /// A real failure keeps its own diagnostic hint: the masked-success path
+    /// must not shadow the table for non-zero exits.
+    #[test]
+    fn nonzero_exit_still_gets_its_table_hint_when_piped() {
+        let hint = shell_failure_hint(
+            "cargo build | tee log",
+            Some(101),
+            "error[E0308]: mismatched types\n",
+        )
+        .expect("hint");
+        assert!(hint.contains("error[E"), "table hint expected: {hint}");
     }
 
     /// The scan is bounded: a failure banner buried past the scan window does

@@ -44,6 +44,14 @@ impl NativeChannel for TeamsChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
+        // Fail closed: refuse inbound activities when no app secret is
+        // configured, rather than trusting a sender identity that is just
+        // attacker-controlled JSON. Matches Slack/Discord/Telegram.
+        crate::verify_common::require_verification_secret(
+            "teams",
+            self.app_secret.as_deref(),
+            "TEAMS_APP_SECRET",
+        )?;
         let parsed = super::handle_teams_webhook(
             headers,
             body,
@@ -213,5 +221,62 @@ mod tests {
         let back: TeamsResponseContext = serde_json::from_value(json).unwrap();
         assert_eq!(back.service_url, "https://smba.trafficmanager.net/amer/");
         assert_eq!(back.conversation_id, "conv1");
+    }
+
+    fn channel(app_secret: Option<&str>) -> TeamsChannel {
+        TeamsChannel {
+            client: Arc::new(super::TeamsClient::new("app-id", "app-secret").unwrap()),
+            app_secret: app_secret.map(str::to_string),
+            dedup: Arc::new(Mutex::new(ActivityDeduplicator::default())),
+            config: cortex::config::Config::default(),
+        }
+    }
+
+    /// Every field Teams sends — including who the message is from — is
+    /// attacker-controlled JSON until the signature proves otherwise. With no
+    /// app secret configured the old code skipped verification and processed
+    /// the activity anyway, so anyone who found the URL could drive the agent
+    /// as the owner. Refuse instead, and say which credential is missing.
+    #[tokio::test]
+    async fn an_unconfigured_app_secret_refuses_the_activity() {
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+        let config = cortex::config::Config::default();
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        let activity = r#"{"type":"message","text":"whoami","from":{"id":"attacker"},
+            "conversation":{"id":"c1"},"serviceUrl":"https://evil.example"}"#;
+
+        let msg = match channel(None)
+            .handle_webhook(&HeaderMap::new(), activity, &ctx)
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unsigned activity must be refused when no secret is set"),
+        };
+        assert!(
+            msg.contains("TEAMS_APP_SECRET"),
+            "the refusal must name the missing credential: {msg}"
+        );
+
+        // A blank secret is the same hole wearing a value.
+        assert!(
+            channel(Some("   "))
+                .handle_webhook(&HeaderMap::new(), activity, &ctx)
+                .await
+                .is_err(),
+            "a blank app secret must not count as configured"
+        );
+
+        // Configured but wrong/absent signature: still refused, now by the
+        // signature check rather than the configuration guard.
+        assert!(
+            channel(Some("s3cr3t"))
+                .handle_webhook(&HeaderMap::new(), activity, &ctx)
+                .await
+                .is_err(),
+            "an unsigned activity must fail verification"
+        );
     }
 }

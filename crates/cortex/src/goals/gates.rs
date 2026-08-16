@@ -83,6 +83,23 @@ pub(crate) fn failure_prompt(gate: &GoalGate, exit_code: i64, output: &str) -> S
     )
 }
 
+/// Why this gate command's exit code could never prove the check passed, or
+/// `None` when the status is the work's own.
+///
+/// A gate is only worth anything because exit 0 means the check passed. A
+/// command ending in `| tee log` or `|| true` exits 0 no matter what happened,
+/// so it is a gate that always passes — worse than no gate, because it reads
+/// like verification. The message names the shape and the one-line fix.
+pub(crate) fn unverifiable_reason(command: &str) -> Option<String> {
+    let shape = crate::policy::masked_exit_shape(command)?;
+    Some(format!(
+        "this gate can never fail: {}. A gate passes on exit 0, so it would pass \
+         however the check went. Drop the trailing pipe or `||` and let the command \
+         report its own status.",
+        shape.describe()
+    ))
+}
+
 /// Message shown when a gate burns through its retry budget.
 pub(crate) fn exhausted_message(gate: &GoalGate, max_attempts: i64) -> String {
     format!(
@@ -188,6 +205,50 @@ mod tests {
         g.last_exit_code = Some(0);
         g.last_fingerprint = Some("abc".into());
         assert!(!can_replay_failure(&g, Some("abc")));
+    }
+
+    /// A gate exists to make exit 0 mean "the check passed". A command whose
+    /// status the shell takes from a pipe consumer or a `||` fallback passes
+    /// unconditionally, so it must be rejected rather than trusted — this is
+    /// the shape a model reaches for after being told to `tee` its test runs.
+    #[test]
+    fn always_passing_gate_commands_are_rejected() {
+        // (command, must be rejected)
+        let cases: &[(&str, bool)] = &[
+            ("cargo test 2>&1 | tee /tmp/borg-test.log", true),
+            ("cargo test | tail -20", true),
+            ("cargo test || true", true),
+            ("cargo clippy -- -D warnings || echo failed", true),
+            // Verifiable gates: the status is the check's own.
+            ("cargo test", false),
+            ("cargo fmt --check && cargo clippy -- -D warnings", false),
+            ("cargo test 2>&1", false),
+            // A pipe into a real predicate still decides pass/fail honestly.
+            ("cargo test | grep -q 'test result: ok'", false),
+        ];
+        for (command, rejected) in cases {
+            assert_eq!(
+                unverifiable_reason(command).is_some(),
+                *rejected,
+                "wrong verdict for gate command {command:?}"
+            );
+        }
+    }
+
+    /// The rejection has to be actionable: it names why the gate is useless and
+    /// what to change, or the operator just re-adds the same command.
+    #[test]
+    fn rejection_explains_the_shape_and_the_fix() {
+        let reason = unverifiable_reason("cargo test | tee log").expect("rejected");
+        assert!(reason.contains("`tee`"), "must name the consumer: {reason}");
+        assert!(
+            reason.contains("never fail"),
+            "must say why the gate is useless: {reason}"
+        );
+        assert!(
+            reason.contains("pipe"),
+            "must name what to remove: {reason}"
+        );
     }
 
     #[test]

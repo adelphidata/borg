@@ -686,6 +686,12 @@ pub(crate) async fn handle_with_driver(
     if let Some(reason) = check_denylist(args) {
         return Ok(ToolOutput::Text(format!("Error: {reason}")));
     }
+    // Input goes where `pid` says, not where `app` says. A model that reaches
+    // for both and gets them out of step would otherwise type into whatever
+    // the stale pid names, and report success doing it.
+    if let Some(reason) = check_input_target(args, driver).await {
+        return Ok(ToolOutput::Text(format!("Error: {reason}")));
+    }
     let result = match args.action {
         ComputerUseAction::Capture => return capture(args, driver).await,
         ComputerUseAction::ListApps => return list_apps(driver).await,
@@ -714,6 +720,94 @@ pub(crate) async fn handle_with_driver(
     } else {
         Ok(primary)
     }
+}
+
+/// Actions that deliver input to the process named by `pid`.
+///
+/// `app` is a *targeting* argument for `capture` and `focus_app` only; on these
+/// it is not consulted, so a mismatch between the two is silent misdelivery.
+const INPUT_ACTIONS: &[ComputerUseAction] = &[
+    ComputerUseAction::Click,
+    ComputerUseAction::DoubleClick,
+    ComputerUseAction::RightClick,
+    ComputerUseAction::MiddleClick,
+    ComputerUseAction::Drag,
+    ComputerUseAction::Scroll,
+    ComputerUseAction::Type,
+    ComputerUseAction::Key,
+    ComputerUseAction::SetValue,
+];
+
+/// Whether a `list_windows` app name and a model's `app` query denote the same
+/// application. Matched in both directions because the driver reports localized
+/// and decorated names — `Google-chrome` for a query of `chrome`, and `Code`
+/// for a query of `Visual Studio Code`.
+fn app_names_agree(listed: &str, query: &str) -> bool {
+    let listed = listed.to_lowercase();
+    let query = query.to_lowercase();
+    listed.contains(&query) || query.contains(&listed)
+}
+
+/// Refuse an input action whose `app` and `pid` name different applications.
+///
+/// The click/type family posts to `pid`; `app` on those calls is ignored. A
+/// model that carries a stale `pid` from an earlier capture while naming the
+/// app it means will silently drive the wrong window and be told it worked —
+/// so when the pair provably disagree, refuse and hand back the ids that would
+/// have been right, which keeps the recovery one call long.
+///
+/// Fails open wherever a mismatch cannot be *proven*: no `app` given, no `pid`
+/// given, an unlistable desktop, or a pid that owns no on-screen window (a
+/// menu-only or background process is a legitimate target). Only a pid that
+/// demonstrably belongs to a different app is refused.
+async fn check_input_target(args: &ComputerUseArgs, driver: &dyn Driver) -> Option<String> {
+    if !INPUT_ACTIONS.contains(&args.action) {
+        return None;
+    }
+    let query = args
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())?;
+    let pid = args.pid?;
+    // An unlistable desktop proves nothing, so it must not become a refusal:
+    // failing here would turn a transient driver hiccup into a blocked click on
+    // every call that names both `app` and `pid`.
+    let entries = match list_window_entries(driver).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not list windows to cross-check the input target; proceeding");
+            return None;
+        }
+    };
+    if entries
+        .iter()
+        .any(|e| e.pid == pid && app_names_agree(&e.app, query))
+    {
+        return None;
+    }
+    // An unknown pid is not a mismatch we can prove — leave it to the driver.
+    let current = entries.iter().find(|e| e.pid == pid)?;
+    let action = &args.action;
+    let fix = match entries.iter().find(|e| app_names_agree(&e.app, query)) {
+        Some(target) => format!(
+            "Retry with pid {} and window_id {} to reach {}.",
+            target.pid, target.window_id, target.app
+        ),
+        None => format!(
+            "No on-screen window matches '{query}'. On-screen apps: {}.",
+            entries
+                .iter()
+                .map(|e| e.app.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Some(format!(
+        "computer_use.{action:?} would go to {} (pid {pid}), not '{query}' — input actions target \
+         `pid`, and `app` is only used by capture/focus_app. {fix}",
+        current.app
+    ))
 }
 
 /// Returns `Some(reason)` when arg combinations are structurally invalid
@@ -2054,6 +2148,133 @@ mod tests {
                 base64: png_b64_of_size(64, 64),
             }],
         }
+    }
+
+    /// Input posts to `pid`; `app` is read only by capture/focus_app. A model
+    /// that names the app it means while carrying a stale pid from an earlier
+    /// capture would type into the wrong window and be told it worked. When the
+    /// pair provably disagree, refuse — and hand back the ids that would have
+    /// been right, so the recovery is one call rather than a hunt.
+    #[tokio::test]
+    async fn input_to_a_pid_that_is_not_the_named_app_is_refused_with_the_right_ids() {
+        let driver = FakeDriver::new(vec![windows_listing()]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.text = Some("hello".into());
+        args.pid = Some(2446); // Code
+        args.app = Some("Chrome".into()); // …but the model means Chrome
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(text.starts_with("Error:"), "must refuse: {text}");
+        assert!(text.contains("Code"), "must name the wrong target: {text}");
+        assert!(
+            text.contains("20922") && text.contains("2542"),
+            "must hand back Chrome's pid and window_id: {text}"
+        );
+        // The keystrokes must never have been sent.
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the listing may run: {calls:?}");
+        assert_eq!(calls[0].0, "list_windows");
+    }
+
+    /// The guard must not fire on agreement, or every correct call would pay a
+    /// refusal. Driver names are localized and decorated, so a query matching
+    /// either direction counts as the same app.
+    #[tokio::test]
+    async fn input_to_a_matching_app_and_pid_proceeds() {
+        // "chrome" vs the listed "Google Chrome" — query inside listed name.
+        let driver = FakeDriver::new(vec![
+            windows_listing(),
+            DriverResponse {
+                content: vec![DriverContent::Text("typed".into())],
+            },
+        ]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.text = Some("hello".into());
+        args.pid = Some(20922);
+        args.app = Some("chrome".into());
+        handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls[1].0, "type_text", "the keystrokes must be delivered");
+    }
+
+    /// A mismatch has to be *proven*. An unknown pid (a background or
+    /// menu-only process owns no on-screen window) is a legitimate target, and
+    /// refusing it would break working flows to guard a guess.
+    #[tokio::test]
+    async fn an_unlisted_pid_is_not_treated_as_a_mismatch() {
+        let driver = FakeDriver::new(vec![
+            windows_listing(),
+            DriverResponse {
+                content: vec![DriverContent::Text("clicked".into())],
+            },
+        ]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(999_999); // owns no on-screen window
+        args.app = Some("Chrome".into());
+        args.x = Some(10);
+        args.y = Some(20);
+        handle_with_driver(&args, &driver).await.unwrap();
+        assert_eq!(driver.calls.lock().unwrap()[1].0, "click");
+    }
+
+    /// A desktop we cannot list proves nothing either way. The guard must fail
+    /// open there: turning a transient `list_windows` failure into a refusal
+    /// would block every click that names both `app` and `pid` for as long as
+    /// the driver is unhappy, on calls that were very likely correct.
+    #[tokio::test]
+    async fn a_failing_window_listing_does_not_block_the_input() {
+        // No queued responses at all: `list_windows` errors, and so does the
+        // click that follows. The click having been *attempted* is the proof
+        // that the guard did not swallow it.
+        let driver = FakeDriver::new(vec![]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(2446);
+        args.app = Some("Chrome".into());
+        args.x = Some(10);
+        args.y = Some(20);
+        let _ = handle_with_driver(&args, &driver).await;
+        let calls = driver.calls.lock().unwrap();
+        let methods: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec!["list_windows", "click"],
+            "an unlistable desktop must not stop the click"
+        );
+    }
+
+    /// Without `app` there is nothing to contradict, so the guard must stay out
+    /// of the way — and must not spend a `list_windows` round-trip finding that
+    /// out on every single click.
+    #[tokio::test]
+    async fn input_without_an_app_argument_skips_the_check_entirely() {
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text("clicked".into())],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.pid = Some(2446);
+        args.x = Some(10);
+        args.y = Some(20);
+        handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no listing call may be made: {calls:?}");
+        assert_eq!(calls[0].0, "click");
+    }
+
+    /// `app` is a real targeting argument for capture and focus_app, so those
+    /// must keep resolving it rather than being refused for disagreeing with a
+    /// pid they are about to replace.
+    #[tokio::test]
+    async fn capture_still_targets_by_app_name() {
+        let driver = FakeDriver::new(vec![windows_listing(), png_image_response()]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.pid = Some(2446); // Code
+        args.app = Some("Chrome".into());
+        handle_with_driver(&args, &driver).await.unwrap();
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls[1].1["window_id"], 2542, "app= must win for capture");
     }
 
     #[tokio::test]

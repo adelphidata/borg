@@ -1018,7 +1018,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
         .await
         .unwrap_or_default();
-    let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
 
     let system = format!(
         "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
@@ -1420,7 +1420,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
                 .await
                 .unwrap_or_default();
-            let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+            let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
             let system = format!(
                 "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
                  # Heartbeat\nYou are running a proactive heartbeat check-in. \

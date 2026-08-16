@@ -14,6 +14,7 @@
 //! - [`event`] — the first-class session event log (`SessionEvent`) and the
 //!   projection functions that reconstruct working state from it.
 
+mod anchors;
 mod compaction;
 mod event;
 mod history;

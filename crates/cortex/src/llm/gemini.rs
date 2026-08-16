@@ -428,17 +428,67 @@ pub(crate) fn sanitize_schema_for_gemini(value: &mut Value) {
     }
 }
 
+/// Largest `maxOutputTokens` the thinking-capable Gemini models accept.
+const GEMINI_MAX_OUTPUT_TOKENS: u32 = 65_535;
+
+/// Room left for visible content above a known thinking budget, matching the
+/// headroom the Anthropic path already reserves.
+const GEMINI_THINKING_HEADROOM_TOKENS: u32 = 1_024;
+
+/// `maxOutputTokens` for a request, raised so thinking cannot consume the whole
+/// budget.
+///
+/// Gemini bills thought tokens against `maxOutputTokens`, unlike Anthropic
+/// where the thinking budget sits under a separate ceiling. A configured cap of
+/// 16K with `thinking = High` therefore asks the model to spend its entire
+/// output allowance on thoughts and return nothing — the turn comes back empty
+/// with no error. The cap is only ever raised, never lowered, so an operator
+/// who deliberately asked for a larger one keeps it.
+///
+/// The trade-off is deliberate: with thinking on, `llm.max_tokens` stops being
+/// a cost lever, because the two settings are in direct conflict and returning
+/// nothing is the worse failure. Raising costs nothing by itself —
+/// `maxOutputTokens` is a limit, not a reservation, and only 2.5/3 models reach
+/// this path, both of which accept the ceiling. The override is logged so it is
+/// findable under `RUST_LOG=debug` rather than silent.
+fn max_output_tokens(configured: u32, thinking_budget: Option<i32>, thinking_on: bool) -> u32 {
+    if !thinking_on {
+        return configured;
+    }
+    // A known positive budget tells us exactly how much room the thoughts need.
+    // A dynamic budget (-1) and Gemini 3's opaque `thinkingLevel` do not, so
+    // fall back to the model ceiling.
+    let needed = match thinking_budget {
+        Some(budget) if budget > 0 => u32::try_from(budget)
+            .unwrap_or(GEMINI_MAX_OUTPUT_TOKENS)
+            .saturating_add(GEMINI_THINKING_HEADROOM_TOKENS)
+            .min(GEMINI_MAX_OUTPUT_TOKENS),
+        _ => GEMINI_MAX_OUTPUT_TOKENS,
+    };
+    if needed > configured {
+        tracing::debug!(
+            configured,
+            raised_to = needed,
+            thinking_budget,
+            "raising Gemini maxOutputTokens: thoughts bill against it, so llm.max_tokens \
+             would leave no room for a visible reply"
+        );
+    }
+    configured.max(needed)
+}
+
 fn generation_config(request: &TransportRequest<'_>) -> Value {
     let cfg = &request.llm_config;
     let mut obj = serde_json::Map::new();
     obj.insert("temperature".into(), json!(cfg.temperature));
-    obj.insert("maxOutputTokens".into(), json!(cfg.max_tokens));
 
     // Thinking: Gemini 3 takes `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH"),
     // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic). Other
     // model families (1.5, etc.) get no thinkingConfig — they don't
     // support it and Google rejects requests that include it.
     let level = cfg.effective_thinking(request.model);
+    let mut thinking_budget = None;
+    let mut thinking_on = false;
     if level.is_enabled() {
         let model_lc = request.model.to_ascii_lowercase();
         let is_gemini_3 = model_lc.contains("gemini-3");
@@ -448,16 +498,24 @@ fn generation_config(request: &TransportRequest<'_>) -> Value {
                 .gemini_3_level()
                 .map(|s| json!({ "thinkingLevel": s }))
         } else if is_gemini_2_5 {
-            level
-                .gemini_2_5_budget()
-                .map(|b| json!({ "thinkingBudget": b }))
+            thinking_budget = level.gemini_2_5_budget();
+            thinking_budget.map(|b| json!({ "thinkingBudget": b }))
         } else {
             None
         };
         if let Some(t) = thinking_cfg {
             obj.insert("thinkingConfig".into(), t);
+            thinking_on = true;
         }
     }
+    obj.insert(
+        "maxOutputTokens".into(),
+        json!(max_output_tokens(
+            cfg.max_tokens,
+            thinking_budget,
+            thinking_on
+        )),
+    );
 
     Value::Object(obj)
 }
@@ -1196,6 +1254,60 @@ mod tests {
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"], -1,
             "Adaptive must hit Gemini's dynamic-thinking sentinel"
+        );
+    }
+
+    /// Gemini charges thought tokens against `maxOutputTokens`, so a cap at or
+    /// below the thinking budget leaves nothing for the answer and the turn
+    /// comes back empty with no error. The cap must clear the budget whenever
+    /// thinking is on, and must never shrink what the operator configured.
+    #[test]
+    fn thinking_raises_the_output_cap_above_the_thought_budget() {
+        // (configured cap, thinking budget, thinking on, expected cap)
+        let cases: &[(u32, Option<i32>, bool, u32)] = &[
+            // Thinking off: the configured cap is sent untouched.
+            (4_096, None, false, 4_096),
+            (4_096, Some(16_384), false, 4_096),
+            // A known budget: room for the thoughts plus content headroom.
+            (4_096, Some(16_384), true, 16_384 + 1_024),
+            (1_024, Some(512), true, 512 + 1_024),
+            // A cap that already clears the budget is left alone.
+            (60_000, Some(2_048), true, 60_000),
+            (4_096, Some(512), true, 4_096),
+            // An unknowable spend (dynamic budget, or Gemini 3's opaque
+            // level) has to assume the worst, since guessing low is the bug.
+            (4_096, Some(-1), true, GEMINI_MAX_OUTPUT_TOKENS),
+            (4_096, None, true, GEMINI_MAX_OUTPUT_TOKENS),
+            // Never above what the API accepts.
+            (4_096, Some(i32::MAX), true, GEMINI_MAX_OUTPUT_TOKENS),
+        ];
+        for (configured, budget, on, expected) in cases {
+            assert_eq!(
+                max_output_tokens(*configured, *budget, *on),
+                *expected,
+                "cap {configured} with budget {budget:?} (thinking={on})"
+            );
+        }
+    }
+
+    /// The raised cap has to reach the wire, not just the helper: this is the
+    /// assertion that fails if `generation_config` ever writes `maxOutputTokens`
+    /// before deciding whether thinking is on.
+    #[test]
+    fn build_request_sends_the_raised_cap_when_thinking_is_on() {
+        let mut cfg = default_cfg();
+        cfg.max_tokens = 4_096;
+        cfg.thinking = crate::config::ThinkingLevel::High;
+        let body = build_gemini_request(&make_request_for_model(
+            "gemini-2.5-pro",
+            &[Message::user("hi")],
+            &cfg,
+        ));
+        let gc = &body["generationConfig"];
+        assert_eq!(gc["thinkingConfig"]["thinkingBudget"], 16_384);
+        assert_eq!(
+            gc["maxOutputTokens"], 17_408,
+            "a 4096 cap under a 16384 thought budget leaves no room for an answer"
         );
     }
 

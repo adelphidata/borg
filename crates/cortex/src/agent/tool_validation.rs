@@ -35,11 +35,12 @@ pub(crate) enum RepeatDecision {
 /// exponential backoff → hard block. Counts strictly-consecutive matches: a
 /// differing call resets the streak.
 ///
-/// Equality is byte-exact on the raw `arguments` string — no whitespace or
-/// JSON-key-order normalization. A stuck LLM that emits the same canonical
-/// payload every iteration will be caught; one that randomizes whitespace
-/// will not. Trade-off accepted to keep the guard cheap and avoid
-/// hashing-vs-parsing correctness questions.
+/// Equality is on the *canonical* form of the `arguments` JSON — keys sorted,
+/// insignificant whitespace dropped — so a model that re-emits the same call
+/// with reordered keys or reflowed formatting is still caught. Arguments that
+/// are not valid JSON fall back to byte-exact comparison of the raw string,
+/// which is the best available answer for a payload with no structure to
+/// normalize.
 ///
 /// Defends against the stuck-LLM failure mode: an agent looping on the same
 /// call burns rate-guard quota and pollutes context until the request
@@ -53,6 +54,22 @@ pub(crate) struct ToolCallRepeatTracker {
     identical_call_max: u32,
     backoff_initial_ms: u64,
     backoff_max_ms: u64,
+}
+
+/// The `arguments` string reduced to a form where two payloads the tool would
+/// read identically compare equal.
+///
+/// Re-serializing a parsed value drops insignificant whitespace and — because
+/// `serde_json::Map` is a `BTreeMap` here — emits keys in sorted order. Without
+/// this, a model that re-emits the same call with its keys swapped reads as
+/// progress and the repeat guard never trips. Unparseable arguments keep their
+/// raw text: there is no structure to normalize, and byte equality is still the
+/// right answer for them.
+fn canonical_arguments(args: &str) -> std::borrow::Cow<'_, str> {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(value) => std::borrow::Cow::Owned(value.to_string()),
+        Err(_) => std::borrow::Cow::Borrowed(args),
+    }
 }
 
 impl Default for ToolCallRepeatTracker {
@@ -84,7 +101,7 @@ impl ToolCallRepeatTracker {
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
-        args.hash(&mut hasher);
+        canonical_arguments(args).hash(&mut hasher);
         let sig = hasher.finish();
         if self.last_signature == Some(sig) {
             self.consecutive_count = self.consecutive_count.saturating_add(1);
@@ -521,6 +538,87 @@ pub(super) fn has_unresolved_tool_calls(history: &[Message]) -> bool {
 mod tests {
     use super::*;
     use crate::types::{FunctionCall, Role, ToolCall};
+
+    /// The guard exists to stop a model repeating one call forever. A model
+    /// that re-emits the same call with its JSON keys in a different order, or
+    /// reformatted, is repeating — comparing raw bytes would read each variant
+    /// as a fresh call and let the loop run to the iteration ceiling instead.
+    #[test]
+    fn reordered_and_reformatted_arguments_count_as_the_same_call() {
+        let cfg = LoopGuardConfig {
+            identical_call_max: 3,
+            ..LoopGuardConfig::default()
+        };
+        let mut tracker = ToolCallRepeatTracker::new(&cfg);
+        // The same call three ways: sorted, reordered, and reflowed.
+        assert_eq!(
+            tracker.observe("run_shell", r#"{"command":"ls","timeout_ms":5}"#),
+            RepeatDecision::Allow
+        );
+        assert!(matches!(
+            tracker.observe("run_shell", r#"{"timeout_ms":5,"command":"ls"}"#),
+            RepeatDecision::Backoff(_)
+        ));
+        assert_eq!(
+            tracker.observe(
+                "run_shell",
+                "{\n  \"command\": \"ls\",\n  \"timeout_ms\": 5\n}"
+            ),
+            RepeatDecision::Block,
+            "three spellings of one call must reach the cap"
+        );
+    }
+
+    /// Canonicalization must not collapse calls that differ for real: a guard
+    /// that blocked a genuinely different argument would stall useful work.
+    #[test]
+    fn genuinely_different_arguments_still_reset_the_streak() {
+        let mut tracker = ToolCallRepeatTracker::default();
+        assert_eq!(
+            tracker.observe("run_shell", r#"{"command":"ls"}"#),
+            RepeatDecision::Allow
+        );
+        assert_eq!(
+            tracker.observe("run_shell", r#"{"command":"pwd"}"#),
+            RepeatDecision::Allow,
+            "a different command is not a repeat"
+        );
+        // Same JSON, different tool: also not a repeat.
+        assert_eq!(
+            tracker.observe("read_file", r#"{"command":"pwd"}"#),
+            RepeatDecision::Allow
+        );
+        // Values that merely look similar as text stay distinct.
+        assert_eq!(
+            tracker.observe("run_shell", r#"{"n":1}"#),
+            RepeatDecision::Allow
+        );
+        assert_eq!(
+            tracker.observe("run_shell", r#"{"n":"1"}"#),
+            RepeatDecision::Allow,
+            "a string is not its numeric lookalike"
+        );
+    }
+
+    /// Arguments that are not JSON have no structure to normalize, so they must
+    /// still be compared byte-exact rather than silently all hashing alike.
+    #[test]
+    fn unparseable_arguments_fall_back_to_raw_comparison() {
+        assert_eq!(canonical_arguments("not json"), "not json");
+        let mut tracker = ToolCallRepeatTracker::default();
+        assert_eq!(tracker.observe("t", "not json"), RepeatDecision::Allow);
+        assert!(
+            matches!(tracker.observe("t", "not json"), RepeatDecision::Backoff(_)),
+            "identical unparseable arguments are still a repeat"
+        );
+        let mut tracker = ToolCallRepeatTracker::default();
+        assert_eq!(tracker.observe("t", "garbage a"), RepeatDecision::Allow);
+        assert_eq!(
+            tracker.observe("t", "garbage b"),
+            RepeatDecision::Allow,
+            "different unparseable arguments must not collapse together"
+        );
+    }
 
     fn assistant_with_tools(ids: &[&str]) -> Message {
         let calls = ids
