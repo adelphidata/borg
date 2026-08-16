@@ -848,10 +848,6 @@ async fn handle_export_to(
     app.push_system_message(format!("Exported session {} → {}", short, path.display()));
 }
 
-/// Put `text` on the system clipboard.
-///
-/// Separate from the caller so the "no clipboard here" case (SSH, most CI
-/// shells) surfaces as a message naming the file fallback, not a bare error.
 /// The clipboard handle, kept alive for the life of the process.
 ///
 /// On X11 and Wayland the clipboard is owned by a *running* process: the
@@ -861,6 +857,10 @@ async fn handle_export_to(
 /// care, but they share the path.
 static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
 
+/// Put `text` on the system clipboard.
+///
+/// Separate from the caller so the "no clipboard here" case (SSH, most CI
+/// shells) surfaces as a message naming the file fallback, not a bare error.
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut held = CLIPBOARD
         .lock()
