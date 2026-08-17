@@ -44,8 +44,42 @@ fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// Subdirectory under [`std::env::temp_dir`] where recordings land.
+/// Directory name for voice scratch files (recordings, TTS output, cached
+/// beeps).
 pub const TEMP_SUBDIR: &str = "borg_voice";
+
+/// The directory voice scratch files land in, created owner-only.
+///
+/// Prefers `~/.borg/cache/borg_voice` over `$TMPDIR`: these files are captured
+/// microphone audio and synthesized speech, and `/tmp` is world-writable on a
+/// shared host. That let any local user read a recording at the umask default,
+/// and — because the directory name is fixed — pre-plant `borg_voice` as a
+/// symlink so every write landed wherever they chose. Under the data dir the
+/// parent is already 0700.
+///
+/// Falls back to `$TMPDIR` when no data dir is resolvable, since a missing
+/// scratch directory would take voice down entirely. Either way the directory
+/// itself is tightened to 0700 and the files inside are written owner-only.
+pub fn voice_scratch_dir() -> Result<PathBuf> {
+    let base = crate::config::Config::data_dir()
+        .map(|home| crate::paths::subdir(&home, crate::paths::BorgSubdir::Cache))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join(TEMP_SUBDIR);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create voice scratch dir at {}", dir.display()))?;
+    // Only meaningful on the `$TMPDIR` fallback — under the data dir the
+    // parent already denies everyone else — but cheap, and it closes the gap
+    // for a pre-existing world-readable directory either way.
+    #[cfg(unix)]
+    if let Err(e) = crate::util::unix_ext::set_unix_mode(&dir, 0o700) {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "could not tighten the voice scratch dir to 0700 — recordings may be readable by other local users"
+        );
+    }
+    Ok(dir)
+}
 
 /// One decision from the silence FSM per audio chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,21 +259,34 @@ pub fn rms_i16(samples: &[i16]) -> u16 {
     rms.clamp(0.0, u16::MAX as f64) as u16
 }
 
-/// Write captured int16 mono PCM frames to a WAV file in
-/// `temp_dir/borg_voice/`. Returns the path.
+/// Write captured int16 mono PCM frames to a WAV file in the voice scratch
+/// directory. Returns the path.
 pub fn write_wav(samples: &[i16], sample_rate_hz: u32) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(TEMP_SUBDIR);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create voice tmp dir at {}", dir.display()))?;
+    let dir = voice_scratch_dir()?;
+    // `create_private_new` is exclusive by design, so a name collision fails
+    // the capture instead of silently overwriting. `%f` renders nanoseconds
+    // but the host clock resolves to microseconds at best, so two recordings
+    // finalized in the same tick — parallel voice loops, or two borg
+    // processes — would land on the same name. The pid and a per-process
+    // sequence make the name unique without depending on clock resolution.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f");
-    let path = dir.join(format!("recording_{stamp}.wav"));
+    let path = dir.join(format!(
+        "recording_{stamp}_{}_{seq}.wav",
+        std::process::id()
+    ));
     let spec = WavSpec {
         channels: 1,
         sample_rate: sample_rate_hz,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut writer = WavWriter::create(&path, spec)
+    // Create the file ourselves so the recording is owner-only from the first
+    // byte; `WavWriter::create` would open it at the umask default.
+    let file = crate::util::unix_ext::create_private_new(&path)
+        .with_context(|| format!("failed to create WAV file at {}", path.display()))?;
+    let mut writer = WavWriter::new(std::io::BufWriter::new(file), spec)
         .with_context(|| format!("failed to open WAV writer at {}", path.display()))?;
     for s in samples {
         writer.write_sample(*s).context("write WAV sample")?;

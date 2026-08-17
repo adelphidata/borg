@@ -940,7 +940,12 @@ pub(crate) fn build_openai_request(
         messages: repair_message_sequence(&sanitize_openai_messages(request.messages)),
         tools,
         temperature: request.llm_config.temperature,
-        max_tokens: request.llm_config.max_tokens,
+        // Gemini bills thought tokens against the output cap on this wire too,
+        // so a Gemini slug reached through OpenRouter or a compat relay needs
+        // the same raise the native path applies — otherwise thinking consumes
+        // the whole allowance and the turn comes back empty with no error.
+        // A no-op for every other model.
+        max_tokens: super::gemini::openai_compat_max_tokens(request.model, request.llm_config),
         stream,
         reasoning_effort,
         prompt_cache_key: request.prompt_cache_key.map(str::to_string),
@@ -2275,6 +2280,75 @@ mod tests {
         assert_eq!(params["properties"]["id"]["minLength"], 1);
         assert_eq!(params["properties"]["id"]["maxLength"], 36);
         assert_eq!(params["properties"]["tags"]["maxItems"], 4);
+    }
+
+    /// Gemini bills thought tokens against the output cap, so a thinking-on
+    /// Gemini slug reached through an OpenAI-compatible host (OpenRouter, a
+    /// compat relay) must carry the raised cap the native path already sends.
+    /// Left at the configured 16K, high thinking consumes the whole allowance
+    /// and the turn returns empty with no error — a silent failure, not a 400.
+    #[test]
+    fn build_openai_request_raises_gemini_output_cap_when_thinking_is_on() {
+        let messages = vec![Message::user("hi")];
+        let mut thinking_cfg = LlmConfig::default();
+        thinking_cfg.thinking = crate::config::ThinkingLevel::High;
+        let configured = thinking_cfg.max_tokens;
+
+        let gemini = TransportRequest {
+            provider: Provider::OpenRouter,
+            model: "google/gemini-3-pro-preview",
+            messages: &messages,
+            tools: None,
+            llm_config: &thinking_cfg,
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&gemini, false).expect("gemini body");
+        let sent = body["max_tokens"].as_u64().expect("max_tokens on the wire");
+        assert!(
+            sent > u64::from(configured),
+            "thinking Gemini must get headroom above the configured {configured}, got {sent}"
+        );
+
+        // The raise is Gemini-specific: every other model keeps the operator's
+        // cap, which is a real cost lever there.
+        let other = TransportRequest {
+            provider: Provider::OpenRouter,
+            model: "anthropic/claude-sonnet-4",
+            messages: &messages,
+            tools: None,
+            llm_config: &thinking_cfg,
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&other, false).expect("anthropic body");
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(u64::from(configured)),
+            "a non-Gemini model must keep the configured cap: {body}"
+        );
+
+        // Thinking off is the same: nothing bills against the cap, so nothing
+        // is raised even for Gemini.
+        let off = LlmConfig::default();
+        let gemini_off = TransportRequest {
+            provider: Provider::OpenRouter,
+            model: "google/gemini-3-pro-preview",
+            messages: &messages,
+            tools: None,
+            llm_config: &off,
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&gemini_off, false).expect("gemini-off body");
+        assert_eq!(
+            body["max_tokens"].as_u64(),
+            Some(u64::from(off.max_tokens)),
+            "thinking-off Gemini must keep the configured cap: {body}"
+        );
     }
 
     #[test]

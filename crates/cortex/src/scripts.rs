@@ -72,13 +72,10 @@ fn write_key_file(path: &Path, key: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, &hex)?;
-    // Set permissions to 0600 on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // Owner-only from the first byte, and never through a symlink. Writing
+    // first and tightening afterwards would publish the encryption key at the
+    // umask default for the length of the write.
+    crate::util::unix_ext::replace_private(path, hex.as_bytes())?;
     Ok(())
 }
 

@@ -372,8 +372,21 @@ pub fn handle_read_file_with_context(
                 {
                     return Ok(converted);
                 }
-                return Ok(ToolOutput::Text(format!(
-                    "Error reading file: {e}. The file may be binary."
+                // Only `InvalidData` means "these bytes are not text". Every
+                // other kind (permission denied, I/O error, ENOMEM) is a real
+                // failure, and calling it binary would send the model chasing
+                // a decoder for a file it simply may not read.
+                if e.kind() != std::io::ErrorKind::InvalidData {
+                    return Ok(ToolOutput::Text(format!("Error reading file: {e}")));
+                }
+                // Name the type instead of stopping at "may be binary".
+                // The bare refusal points at a recovery the model may not
+                // have — in a filesystem-only toolset it hunts for openers
+                // that do not exist. "PNG image data, 4.1 KB" answers
+                // what-is-this in the read that refused it.
+                tracing::debug!(error = %e, path = %canonical.display(), "read_file: not UTF-8 text");
+                return Ok(ToolOutput::Text(super::binary::describe_binary_file(
+                    &canonical,
                 )));
             }
         }
@@ -589,7 +602,7 @@ mod tests {
                     "must never serve replacement-char mojibake as content: {s}"
                 );
                 assert!(
-                    s.contains("binary") || s.contains("Error reading file"),
+                    s.to_lowercase().contains("binary"),
                     "non-UTF-8 file must be flagged unreadable/binary, got: {s}"
                 );
                 assert!(
@@ -609,6 +622,71 @@ mod tests {
                     s, "café — 日本語\n",
                     "valid multibyte UTF-8 must read as-is"
                 )
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    /// A refused binary read must say what the file *is*. The extension guard
+    /// cannot help here — the name claims text — so only the content sniff
+    /// keeps the model from hunting for an opener it does not have.
+    #[test]
+    fn handle_read_file_names_the_binary_type_behind_a_text_extension() {
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let disguised = dir.path().join("report.txt");
+        std::fs::write(
+            &disguised,
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00",
+        )
+        .unwrap();
+        let result =
+            handle_read_file(&json!({"path": disguised.to_string_lossy()}), &config).unwrap();
+        match result {
+            ToolOutput::Text(s) => {
+                assert!(
+                    s.contains("PNG image data"),
+                    "must name the sniffed type, not just 'may be binary': {s}"
+                );
+                assert!(
+                    !s.contains("may be binary"),
+                    "the vague dead-end message must be gone: {s}"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    /// An unreadable file is not a binary file. Reporting "Binary file
+    /// (unknown binary, N bytes)" for a permission error hides the one fact
+    /// that would let the model or the user recover, and sends it looking for
+    /// a decoder instead of a `chmod`.
+    #[cfg(unix)]
+    #[test]
+    fn handle_read_file_reports_the_io_error_instead_of_calling_it_binary() {
+        // Root bypasses the permission bits, so the case cannot be staged.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("locked.txt");
+        std::fs::write(&unreadable, b"plain text the caller may not read").unwrap();
+        crate::util::unix_ext::set_unix_mode(&unreadable, 0o000).unwrap();
+
+        let result =
+            handle_read_file(&json!({"path": unreadable.to_string_lossy()}), &config).unwrap();
+        match result {
+            ToolOutput::Text(s) => {
+                assert!(
+                    !s.contains("Binary file"),
+                    "a permission error must not be reported as binary content: {s}"
+                );
+                assert!(
+                    s.contains("Error reading file"),
+                    "the real I/O error must survive: {s}"
+                );
             }
             _ => panic!("expected Text"),
         }

@@ -477,36 +477,68 @@ fn max_output_tokens(configured: u32, thinking_budget: Option<i32>, thinking_on:
     configured.max(needed)
 }
 
+/// Resolve the `thinkingConfig` a model wants, paired with the explicit 2.5
+/// budget when one is known.
+///
+/// `None` means this model spends no output tokens on thoughts — either
+/// thinking is off, or the family takes no `thinkingConfig` at all (1.5 and
+/// friends, which Google rejects the field on).
+///
+/// Kept separate from [`generation_config`] because the OpenAI-compatible wire
+/// needs the same answer without the native request shape: a Gemini slug routed
+/// through OpenRouter or a compat relay bills thoughts against `max_tokens`
+/// exactly the same way, and answering that question twice is how the two paths
+/// drift apart.
+fn thinking_config(model: &str, cfg: &crate::config::LlmConfig) -> Option<(Value, Option<i32>)> {
+    let level = cfg.effective_thinking(model);
+    if !level.is_enabled() {
+        return None;
+    }
+    // A compat host prefixes the vendor (`google/gemini-3-pro`), so match on a
+    // substring rather than the whole slug.
+    let model_lc = model.to_ascii_lowercase();
+    if model_lc.contains("gemini-3") {
+        // Gemini 3 takes an opaque `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH") —
+        // no numeric budget to read.
+        let wire = level
+            .gemini_3_level()
+            .map(|s| json!({ "thinkingLevel": s }))?;
+        Some((wire, None))
+    } else if model_lc.contains("gemini-2.5") {
+        // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic).
+        let budget = level.gemini_2_5_budget();
+        let wire = budget.map(|b| json!({ "thinkingBudget": b }))?;
+        Some((wire, budget))
+    } else {
+        None
+    }
+}
+
+/// The output-token cap to send on the *OpenAI-compatible* wire for `model`.
+///
+/// `Provider::Gemini` takes the native path, but the same models arrive through
+/// OpenRouter and OpenAI-compatible relays, and Google bills thought tokens
+/// against the output cap on that surface too. Without this the compat path
+/// keeps the configured 16K, thinking eats it, and the turn returns empty —
+/// the identical failure the native path already fixed. Non-Gemini models are
+/// returned untouched.
+pub(crate) fn openai_compat_max_tokens(model: &str, cfg: &crate::config::LlmConfig) -> u32 {
+    match thinking_config(model, cfg) {
+        Some((_, budget)) => max_output_tokens(cfg.max_tokens, budget, true),
+        None => cfg.max_tokens,
+    }
+}
+
 fn generation_config(request: &TransportRequest<'_>) -> Value {
     let cfg = &request.llm_config;
     let mut obj = serde_json::Map::new();
     obj.insert("temperature".into(), json!(cfg.temperature));
 
-    // Thinking: Gemini 3 takes `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH"),
-    // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic). Other
-    // model families (1.5, etc.) get no thinkingConfig — they don't
-    // support it and Google rejects requests that include it.
-    let level = cfg.effective_thinking(request.model);
-    let mut thinking_budget = None;
-    let mut thinking_on = false;
-    if level.is_enabled() {
-        let model_lc = request.model.to_ascii_lowercase();
-        let is_gemini_3 = model_lc.contains("gemini-3");
-        let is_gemini_2_5 = model_lc.contains("gemini-2.5");
-        let thinking_cfg: Option<Value> = if is_gemini_3 {
-            level
-                .gemini_3_level()
-                .map(|s| json!({ "thinkingLevel": s }))
-        } else if is_gemini_2_5 {
-            thinking_budget = level.gemini_2_5_budget();
-            thinking_budget.map(|b| json!({ "thinkingBudget": b }))
-        } else {
-            None
-        };
-        if let Some(t) = thinking_cfg {
-            obj.insert("thinkingConfig".into(), t);
-            thinking_on = true;
-        }
+    let resolved = thinking_config(request.model, cfg);
+    let thinking_budget = resolved.as_ref().and_then(|(_, budget)| *budget);
+    let thinking_on = resolved.is_some();
+    if let Some((wire, _)) = resolved {
+        obj.insert("thinkingConfig".into(), wire);
     }
     obj.insert(
         "maxOutputTokens".into(),

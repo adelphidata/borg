@@ -204,7 +204,8 @@ pub fn stop_playback() {
 }
 
 // Beep cues: 880 Hz single beep on record start, 660 Hz double beep on record stop.
-// Synthesized once per process and cached to `$TMPDIR/borg_voice/` so playback
+// Synthesized once per process and cached in the voice scratch dir (see
+// `voice_capture::voice_scratch_dir`) so playback
 // is a cheap `afplay`/`ffplay`/`aplay` invocation.
 //
 // Beeps run on a detached `tokio::spawn` so the voice loop never blocks
@@ -352,12 +353,14 @@ impl Beeper {
 }
 
 fn ensure_beep_file(name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("borg_voice");
-    std::fs::create_dir_all(&dir).context("create beep cache dir")?;
+    let dir = crate::media::voice_capture::voice_scratch_dir().context("create beep cache dir")?;
     let path = dir.join(name);
     // Always rewrite — cheap (a few KB) and avoids stale corrupt files
-    // surviving a borg upgrade that changed the synth.
-    std::fs::write(&path, bytes).context("write beep wav")?;
+    // surviving a borg upgrade that changed the synth. The name is fixed, so
+    // the rewrite goes through the symlink-refusing replace: a plain
+    // `fs::write` here was an unconditional, every-invocation write primitive
+    // aimed at whatever a planted link pointed to.
+    crate::util::unix_ext::replace_private(&path, bytes).context("write beep wav")?;
     Ok(path)
 }
 

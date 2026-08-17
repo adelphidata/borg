@@ -11,6 +11,7 @@
 //! - [`completion`] — workspace-scoped prefix completion for client file
 //!   pickers, answering to the same containment and blocklist rules.
 
+mod binary;
 mod blocked;
 mod completion;
 mod document;

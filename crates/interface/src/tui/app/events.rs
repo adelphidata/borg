@@ -894,11 +894,12 @@ pub(super) fn clamp_at_char_boundary(s: &str, max: usize) -> &str {
 }
 
 fn write_tmp_audio(bytes: &[u8], ext: &str) -> anyhow::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("borg_voice");
-    std::fs::create_dir_all(&dir)?;
+    let dir = cortex::media::voice_capture::voice_scratch_dir()?;
     let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f");
     let path = dir.join(format!("tts_{stamp}.{ext}"));
-    std::fs::write(&path, bytes)?;
+    // Owner-only, and never through a symlink — synthesized speech is the
+    // user's conversation read aloud.
+    cortex::util::unix_ext::replace_private(&path, bytes)?;
     Ok(path)
 }
 

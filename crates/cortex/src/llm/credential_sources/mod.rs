@@ -121,7 +121,6 @@ pub(crate) fn short_label_fingerprint(token: &str) -> String {
 /// crate so `codex.rs` and future sources can share it.
 pub(crate) fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
     use anyhow::Context;
-    use std::io::Write;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
@@ -132,37 +131,27 @@ pub(crate) fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()
             .unwrap_or("credentials")
     ));
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .with_context(|| format!("open {} for write", tmp.display()))?;
-        f.write_all(contents.as_bytes())
+        // The temp name is predictable and sits in a directory the operator
+        // may share, so it is created exclusively, owner-only, and never
+        // through a symlink. Refresh tokens are bearer credentials: the old
+        // create-then-chmod order published them at the umask default for the
+        // length of the write, and a link planted at the temp path redirected
+        // the write outright. A stale temp from a crashed run is cleared
+        // first — `replace_private` unlinks a real file but refuses a link.
+        let f = crate::util::unix_ext::replace_private(&tmp, contents.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
-        if let Err(e) = f.sync_all() {
-            tracing::warn!(
+        // fsync the handle we just wrote through: durability is separate from
+        // the write above, and a failure here is worth naming rather than
+        // swallowing. Reopening by path would give a read-only descriptor
+        // (fsync on one is not portable) and could sync a different inode.
+        match f.sync_all() {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(
                 target: "cortex::llm::credential_sources",
                 path = %tmp.display(),
                 error = %e,
                 "fsync of rotated credentials failed — write may not be durable"
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // 0o600: refresh tokens are bearer credentials. A chmod failure
-            // is rare but not silent — without this log a parallel-CLI race
-            // can leave the file group/world-readable until the next
-            // `warn_if_world_readable` pass.
-            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-                tracing::warn!(
-                    target: "cortex::llm::credential_sources",
-                    path = %tmp.display(),
-                    error = %e,
-                    "chmod 600 on rotated credentials failed — refresh token may be world-readable"
-                );
-            }
+            ),
         }
     }
     std::fs::rename(&tmp, path)

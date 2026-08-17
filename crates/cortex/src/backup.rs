@@ -53,6 +53,11 @@ const EXCLUDED_NAMES: &[&str] = &[
     "borgd.sock",
     "logs",
     "backups",
+    // Derived scratch, and some of it is sensitive: `cache/borg_voice` holds
+    // captured microphone audio and synthesized speech between capture and
+    // cleanup, and `cache/shell-spill` holds command output. None of it is
+    // state a restore needs, and a portable tarball is the wrong place for it.
+    "cache",
     "borg.db",
     "borg.db-wal",
     "borg.db-shm",
