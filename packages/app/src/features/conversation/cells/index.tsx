@@ -3,7 +3,7 @@ import { Brackets, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
-import { formatTokens } from "../../../lib/format";
+import { formatElapsed, formatTokens } from "../../../lib/format";
 import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
 
@@ -45,13 +45,29 @@ function ShellConfirmCell({
   );
 }
 
-/** Per-turn token accounting, deliberately quiet. */
+/**
+ * Per-turn time and token accounting, deliberately quiet.
+ *
+ * The elapsed time leads, because "how long did that take" is the question a
+ * user asks without being taught to. Token counts are omitted when the turn
+ * never reported any, so the line never claims a turn cost zero.
+ */
 function UsageCell({ cell }: { cell: Cell & { kind: "usage" } }) {
   const cached = cell.cacheRead + cell.cacheWrite;
+  const tokens = cell.input + cell.output > 0;
+  // Nothing to report is nothing to render: the transcript lays its cells out
+  // with a gap, so an empty footer is a blank band with no line in it.
+  if (cell.elapsedMs === undefined && !tokens) return null;
   return (
     <div className="px-1 text-[11px] leading-none text-ink3">
-      {formatTokens(cell.input)} in · {formatTokens(cell.output)} out
-      {cached > 0 && <> · {formatTokens(cached)} cached</>}
+      {cell.elapsedMs !== undefined && formatElapsed(cell.elapsedMs)}
+      {cell.elapsedMs !== undefined && tokens && " · "}
+      {tokens && (
+        <>
+          {formatTokens(cell.input)} in · {formatTokens(cell.output)} out
+          {cached > 0 && <> · {formatTokens(cached)} cached</>}
+        </>
+      )}
     </div>
   );
 }

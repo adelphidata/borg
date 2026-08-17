@@ -19,6 +19,7 @@ export const CHORDS: Readonly<Record<string, string>> = {
   "command-palette": "mod+k",
   "new-conversation": "mod+n",
   "search-sessions": "mod+shift+f",
+  "find-in-conversation": "mod+f",
   "open-settings": "mod+,",
   "toggle-activity": "mod+j",
   "cancel-turn": "escape",

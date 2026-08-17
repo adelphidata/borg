@@ -75,6 +75,7 @@ export function installApplicationMenu(): void {
     {
       label: "View",
       submenu: [
+        action("Find in Conversation…", "find-in-conversation"),
         action("Find Conversation…", "search-sessions"),
         action("Command Palette…", "command-palette"),
         { type: "separator" },

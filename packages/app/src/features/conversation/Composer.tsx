@@ -12,6 +12,7 @@ import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
 import { collectAttachments } from "./attachments";
+import { appendPastedText, composerOwnsPaste } from "./documentPaste";
 import { publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
@@ -277,6 +278,35 @@ export function Composer({
     }
     setError(errors[0]);
   }, []);
+
+  /**
+   * Paste anywhere on the page and it lands in the composer.
+   *
+   * Registered on the document because the target is, by definition, not this
+   * box. Text is appended and the caret follows it to the end, so the next
+   * keystroke continues the pasted line rather than landing in front of it.
+   */
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (!e.clipboardData || !composerOwnsPaste(e.target)) return;
+      const files = Array.from(e.clipboardData.files);
+      const text = e.clipboardData.getData("text/plain");
+      if (files.length === 0 && text === "") return;
+      e.preventDefault();
+      if (files.length > 0) void addFiles(files);
+      if (text !== "") setDraft((prev) => appendPastedText(prev, text));
+      // After the state commit, or the caret would be placed in the old value.
+      requestAnimationFrame(() => {
+        const el = textarea.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+        setCaret(el.value.length);
+      });
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [addFiles, textarea]);
 
   const forget = (urls: (string | undefined)[]) => {
     const real = urls.filter((u): u is string => u !== undefined);

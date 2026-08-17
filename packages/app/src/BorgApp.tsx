@@ -1,6 +1,14 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArchiveIcon, Menu, Sidebar, TabBar, ThemeProvider, useIsMobile } from "@borg/ui";
+import {
+  ArchiveIcon,
+  Menu,
+  Sidebar,
+  TabBar,
+  ThemeProvider,
+  useIsMobile,
+  usePauseAnimationsWhenHidden,
+} from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { ConversationPage } from "./features/conversation/ConversationPage";
@@ -14,6 +22,7 @@ import {
   sessionActivity,
   subscribeActivity,
 } from "./features/sessions/activityStore";
+import { subscribeUnread, unreadVersion } from "./features/sessions/unreadStore";
 import { useMenuEscape } from "./features/sessions/SessionRowMenu";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
@@ -56,6 +65,7 @@ function KeyboardLayer() {
 
 function Shell({ platform }: { platform: Platform }) {
   const isMobile = useIsMobile();
+  usePauseAnimationsWhenHidden();
   const navigate = useNavigate();
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
@@ -67,12 +77,17 @@ function Shell({ platform }: { platform: Platform }) {
   // One subscription for the whole app; every list reads the store it fills.
   useSessionActivityFeed();
   useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
+  // And the read marks, so opening a conversation drops its dot here at once
+  // rather than on the next refetch. Lighting a dot still waits for one: the
+  // mark is derived against `updatedUnixTs`, and this list only re-reads that
+  // on navigation.
+  useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)
     .map((s) => ({
       id: s.id,
       title: rowTitle(s.title, Number(s.messageCount), s.id),
-      activity: sessionActivity(s.id, Number(s.messageCount)),
+      activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
     }));
 
   // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`

@@ -13,6 +13,7 @@
  */
 
 import { draftKeyFor, draftTitle, readDraft } from "../conversation/draftStore";
+import { isSessionUnread } from "./unreadStore";
 
 const working = new Set<string>();
 const listeners = new Set<() => void>();
@@ -71,20 +72,23 @@ export function resetActivity(): void {
 /**
  * What a session row's dot should say, or `undefined` for no dot at all.
  *
- * Only two states earn a mark. "Working" is the one a person actually waits
- * on. "Draft" answers the question a list of same-looking rows raises — which
- * of these did I start and never send? Everything else is settled, and a dot
- * on every row would mean nothing.
+ * Only three states earn a mark. "Working" is the one a person actually waits
+ * on. "Unread" is what that becomes when the answer lands somewhere the user
+ * was not looking. "Draft" answers the question a list of same-looking rows
+ * raises — which of these did I start and never send? Everything else is
+ * settled, and a dot on every row would mean nothing.
  */
-export type SessionActivity = "working" | "draft";
+export type SessionActivity = "working" | "unread" | "draft";
 
 export function sessionActivity(
   sessionId: string,
   messageCount: number,
+  updatedAt: number,
 ): SessionActivity | undefined {
   // Working wins: a session can hold an unsent draft in one window while a
   // turn runs in another, and the turn is the news.
   if (isSessionWorking(sessionId)) return "working";
+  if (isSessionUnread(sessionId, updatedAt)) return "unread";
   // A conversation with history is not a draft, whatever sits in its composer.
   if (messageCount > 0) return undefined;
   return draftTitle(readDraft(draftKeyFor(sessionId))) === "" ? undefined : "draft";

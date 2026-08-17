@@ -7,6 +7,7 @@ import {
   subscribeActivity,
   type SessionActivity,
 } from "./activityStore";
+import { subscribeUnread, unreadVersion } from "./unreadStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 export interface SessionRow {
@@ -84,7 +85,7 @@ function toRow(s: adminPb.SessionSummary): SessionRow {
 export function resolveTitles(sessions: SessionRow[]): SessionRow[] {
   return sessions.map((s) => {
     const title = rowTitle(s.title, s.messageCount, s.id);
-    const activity = sessionActivity(s.id, s.messageCount);
+    const activity = sessionActivity(s.id, s.messageCount, s.updatedAt);
     return title === s.title && activity === s.activity ? s : { ...s, title, activity };
   });
 }
@@ -158,12 +159,15 @@ export function useSessions(deps: unknown[] = []): Sessions {
   const drafts = useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
   // Same shape for the working set: a turn starting elsewhere lights this row.
   const activity = useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
+  // And for the read marks, so opening a conversation clears its dot in the
+  // list beside it rather than on the next refetch.
+  const read = useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
   const groups = useMemo(
     () => groupSessions(filterSessions(resolveTitles(sessions), search), Date.now()),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `drafts` and
-    // `activity` are version counters: they name no value used here, they only
-    // say one changed.
-    [sessions, search, drafts, activity],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `drafts`,
+    // `activity` and `read` are version counters: they name no value used
+    // here, they only say one changed.
+    [sessions, search, drafts, activity, read],
   );
 
   return {

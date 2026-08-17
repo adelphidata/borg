@@ -6,7 +6,7 @@
  * running. Callers pass a tone rather than a colour class — a page inventing
  * `bg-amber-400` is how a status vocabulary stops meaning anything.
  */
-export type DotTone = "ok" | "alert" | "busy" | "working" | "draft" | "paused" | "idle";
+export type DotTone = "ok" | "alert" | "busy" | "working" | "unread" | "draft" | "paused" | "idle";
 
 const TONES: Record<DotTone, string> = {
   ok: "bg-neon shadow-(--glow)",
@@ -20,6 +20,13 @@ const TONES: Record<DotTone, string> = {
    * without any motion.
    */
   working: "bg-neon",
+  /**
+   * Something arrived here that nobody has read. The state `working` becomes
+   * when the turn lands, so the two are never on at once and the halo is the
+   * whole transition: Borg was busy, now it is your turn. Bigger than the
+   * settled dot because this is the one mark that asks for something.
+   */
+  unread: "bg-neon ring-2 ring-neon/30",
   /** Started and never sent. The quietest mark the vocabulary has. */
   draft: "border border-ink3 bg-transparent",
   /** Stopped, but resumable. */

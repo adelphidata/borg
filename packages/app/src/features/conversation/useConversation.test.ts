@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { session as sessionPb } from "@borg/client";
-import { historyCells, reduceEvent, type Cell } from "./useConversation";
+import { historyCells, reduceEvent, stampTurnDuration, type Cell } from "./useConversation";
 
 /** Builds an AgentEvent with just the variant under test set. */
 function event(kind: Partial<sessionPb.AgentEvent>): sessionPb.AgentEvent {
@@ -106,6 +106,45 @@ describe("reduceEvent — usage", () => {
       { usage: { inputTokens: 2, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 } },
     ]);
     expect(cells.filter((c) => c.kind === "usage")).toHaveLength(2);
+  });
+});
+
+describe("stampTurnDuration", () => {
+  const usage = (input: number): Cell => ({
+    kind: "usage",
+    input,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
+
+  it("stamps the usage line this turn produced", () => {
+    const cells: Cell[] = [
+      { kind: "user", text: "hi" },
+      { kind: "assistant", text: "hello" },
+      usage(9),
+    ];
+    expect(stampTurnDuration(cells, 1_500)[2]).toEqual({ ...usage(9), elapsedMs: 1_500 });
+  });
+
+  it("leaves a previous turn's footer alone", () => {
+    // The bug this guards: stamping the last usage line anywhere in the
+    // transcript would re-time an old turn whenever a new one reported none.
+    const cells: Cell[] = [
+      { kind: "user", text: "first" },
+      usage(1),
+      { kind: "user", text: "second" },
+      { kind: "assistant", text: "answer" },
+    ];
+    const stamped = stampTurnDuration(cells, 900);
+    expect(stamped[1]).toEqual(usage(1));
+    expect(stamped[4]).toEqual({ ...usage(0), elapsedMs: 900 });
+  });
+
+  it("adds no footer to a send that never came back", () => {
+    // Time spent waiting for nothing is not worth a line of its own.
+    const cells: Cell[] = [{ kind: "user", text: "hi" }];
+    expect(stampTurnDuration(cells, 4_000)).toEqual(cells);
   });
 });
 

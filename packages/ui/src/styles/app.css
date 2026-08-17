@@ -116,6 +116,31 @@
   a:hover {
     color: var(--ink);
   }
+  /*
+   * A page nobody can see should not be animating. The attribute is set by
+   * `usePauseAnimationsWhenHidden`; the browser resumes each animation where it
+   * parked, so returning to the window shows no restart.
+   */
+  html[data-hidden="true"] * {
+    animation-play-state: paused !important;
+  }
+}
+
+/*
+ * Find-in-conversation matches. Painted through the custom highlight registry
+ * (see `findInTranscript.ts`), so these rules style ranges rather than markup —
+ * there is no element to give a class to. The active match is a second registry
+ * entry rather than a modifier, and being declared last is what makes it win.
+ */
+/* Text stays `ink` in both: the neon is the marker, and inverting the text as
+   well is what makes one theme or the other unreadable. */
+::highlight(borg-find) {
+  background-color: color-mix(in srgb, var(--neon) 26%, transparent);
+  color: var(--ink);
+}
+::highlight(borg-find-current) {
+  background-color: color-mix(in srgb, var(--neon) 62%, transparent);
+  color: var(--ink);
 }
 
 /*

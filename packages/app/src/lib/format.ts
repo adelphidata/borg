@@ -48,6 +48,26 @@ export function plural(n: number, word: string): string {
   return `${n} ${word.endsWith("s") ? `${word}es` : `${word}s`}`;
 }
 
+/**
+ * A short elapsed time for a footer: "0.8s", "12.4s", "2m 05s", "1h 04m".
+ *
+ * Tighter than `formatDuration` on purpose — this one sits next to a token
+ * count on one line, where "45 seconds" would be the longest thing on it.
+ */
+export function formatElapsed(ms: number): string {
+  const exact = Math.max(0, ms) / 1000;
+  // Rounded before the branch, not inside it: 59.99s formats to one decimal as
+  // "60.0s", which is a minute spelled the way the sub-minute case spells it.
+  if (Math.round(exact * 10) < 600) return `${exact.toFixed(1)}s`;
+  // Round to whole seconds first, then split: rounding each part on its own
+  // lets 59.7s become "59m 60s".
+  const secs = Math.round(exact);
+  if (secs < 3_600) return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
+  const mins = Math.round((secs % 3_600) / 60);
+  if (mins === 60) return `${Math.floor(secs / 3_600) + 1}h 00m`;
+  return `${Math.floor(secs / 3_600)}h ${String(mins).padStart(2, "0")}m`;
+}
+
 /** A rounded, human duration: "2 hours", "45 seconds". */
 export function formatDuration(secs: number): string {
   if (secs >= 86_400) return plural(Math.floor(secs / 86_400), "day");

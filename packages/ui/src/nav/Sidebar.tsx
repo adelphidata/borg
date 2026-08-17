@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import { LogoIcon } from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
+import { Truncated } from "../components/Truncated";
 import type { AppRoute, NavUser, RecentItem } from "../types";
 
 export interface SidebarProps {
@@ -79,6 +80,17 @@ function Rule({ className = "mb-4" }: { className?: string }) {
 }
 
 /**
+ * What each dot means to a reader who cannot see it. A sidebar row carries the
+ * title and nothing else, so unlike the sessions page there is no text here for
+ * a label to repeat.
+ */
+const DOT_LABELS: Record<NonNullable<RecentItem["activity"]>, string> = {
+  working: "Working",
+  unread: "Unread reply",
+  draft: "Unsent draft",
+};
+
+/**
  * One recent conversation. The archive control only materializes on hover or
  * keyboard focus: eight rows each carrying a permanent × would read as a list
  * of delete buttons rather than a list of conversations.
@@ -109,15 +121,8 @@ function RecentRow({
         })
       }
     >
-      {item.activity && (
-        <StatusDot
-          tone={item.activity}
-          label={item.activity === "working" ? "Working" : "Unsent draft"}
-        />
-      )}
-      <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-        {item.title}
-      </span>
+      {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
+      <Truncated className="min-w-0 flex-1">{item.title}</Truncated>
       <button
         type="button"
         aria-label={`Archive ${item.title}`}

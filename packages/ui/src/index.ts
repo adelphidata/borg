@@ -13,11 +13,13 @@ export { BackLink } from "./components/BackLink";
 export { Badge } from "./components/Badge";
 export { Brackets } from "./components/Brackets";
 export { CodeBlock } from "./components/CodeBlock";
+export { FindBar, type FindBarProps } from "./components/FindBar";
 export { Markdown } from "./components/Markdown";
 export { MobileTitle } from "./components/MobileTitle";
 export { PageChrome } from "./components/PageChrome";
 export { Pill } from "./components/Pill";
 export { StatusDot, type DotTone } from "./components/StatusDot";
+export { Truncated } from "./components/Truncated";
 export { Meter } from "./components/Meter";
 export { Menu, clampToViewport, type MenuAction, type MenuProps } from "./components/Menu";
 export {
@@ -72,4 +74,5 @@ export {
 } from "./lib/theme";
 export type { Theme, ThemePreference } from "./lib/theme";
 export { useIsMobile } from "./lib/useIsMobile";
+export { usePauseAnimationsWhenHidden } from "./lib/pauseWhenHidden";
 export { STORAGE_KEYS } from "./lib/storageKeys";

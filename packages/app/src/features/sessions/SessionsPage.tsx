@@ -8,6 +8,7 @@ import {
   SearchIcon,
   SETTINGS_SCROLL_DESKTOP_PADDING,
   StatusDot,
+  Truncated,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
@@ -15,6 +16,14 @@ import { DaemonState } from "../../components/DaemonState";
 import { useKeybind } from "../../lib/keybinds";
 import { SessionRowMenu, sessionRowActions, useMenuEscape } from "./SessionRowMenu";
 import { useSessions, type SessionRow } from "./useSessions";
+import type { SessionActivity } from "./activityStore";
+
+/** What each dot means to a reader who cannot see it. */
+const DOT_LABELS: Record<SessionActivity, string | undefined> = {
+  working: undefined,
+  unread: "Unread reply",
+  draft: "Unsent draft",
+};
 
 function Row({
   session,
@@ -89,16 +98,15 @@ function Row({
       className="group flex cursor-pointer items-center gap-2 rounded-[9px] px-3 py-2.5 hover:bg-surface3"
     >
       {/* "Working" is already spelled out in the line below, so labelling the
-          dot too would make a screen reader say it twice. "Unsent draft" is
-          not written anywhere, so that one keeps its label. */}
+          dot too would make a screen reader say it twice. The other two are
+          not written anywhere, so those keep their labels. */}
       {session.activity && (
-        <StatusDot
-          tone={session.activity}
-          label={session.activity === "draft" ? "Unsent draft" : undefined}
-        />
+        <StatusDot tone={session.activity} label={DOT_LABELS[session.activity]} />
       )}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13.5px] leading-[1.35] text-ink">{session.title}</div>
+        <Truncated className="block text-[13.5px] leading-[1.35] text-ink">
+          {session.title}
+        </Truncated>
         <div className="mt-[3px] text-[11px] leading-none text-ink3">
           {session.activity === "working"
             ? "Working…"

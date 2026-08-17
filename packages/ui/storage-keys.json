@@ -3,5 +3,6 @@
   "onboarded": "borg.onboarded",
   "settings": "borg.settings",
   "token": "borg.token",
-  "skillRecency": "borg.skillRecency"
+  "skillRecency": "borg.skillRecency",
+  "unread": "borg.unread"
 }

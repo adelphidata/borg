@@ -43,7 +43,15 @@ export type Cell =
       done: boolean;
       stderr: boolean;
     }
-  | { kind: "usage"; input: number; output: number; cacheRead: number; cacheWrite: number }
+  | {
+      kind: "usage";
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      /** Wall-clock time the turn took, stamped when it completes. */
+      elapsedMs?: number;
+    }
   | { kind: "sub-agent"; agentId: string; nickname: string; status: string }
   | { kind: "notice"; text: string }
   | { kind: "error"; text: string }
@@ -211,6 +219,31 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
   return base;
 }
 
+/**
+ * Records how long the turn that just ended took.
+ *
+ * The time joins the footer the turn already has rather than arriving as a
+ * badge of its own — one quiet line per turn, not two. A turn whose usage never
+ * reported (a cancel, an error, a provider that omits it) grows the footer for
+ * the time alone, and `UsageCell` then prints no token counts.
+ *
+ * Only a footer belonging to *this* turn is stamped: anything after the last
+ * user cell is this turn's, and an earlier one is left alone.
+ */
+export function stampTurnDuration(cells: Cell[], elapsedMs: number): Cell[] {
+  const lastIndexOf = (kind: Cell["kind"]) => {
+    for (let i = cells.length - 1; i >= 0; i -= 1) if (cells[i]?.kind === kind) return i;
+    return -1;
+  };
+  const turnStart = lastIndexOf("user");
+  const at = lastIndexOf("usage");
+  if (at > turnStart) return cells.map((c, i) => (i === at ? { ...c, elapsedMs } : c));
+  // Nothing came back at all — a send that failed before the agent spoke. Time
+  // spent waiting for nothing is not worth a line of its own.
+  if (turnStart === cells.length - 1) return cells;
+  return [...cells, { kind: "usage", input: 0, output: 0, cacheRead: 0, cacheWrite: 0, elapsedMs }];
+}
+
 /** One row of persisted history, as `Admin.GetSession` returns it. */
 export interface HistoryRow {
   role: string;
@@ -358,6 +391,13 @@ export function useConversation(target: string | undefined): Conversation {
    * at open — is what stops a reconnect from replaying the whole turn.
    */
   const lastSeq = useRef(0);
+  /**
+   * When the turn in flight started, or undefined between turns.
+   *
+   * Armed at submit rather than at the first event: the wait for the provider to
+   * answer is part of what the user sat through, and it is often most of it.
+   */
+  const turnStartedAt = useRef<number | undefined>(undefined);
 
   const opened = useQuery(
     async (borg) => {
@@ -367,6 +407,7 @@ export function useConversation(target: string | undefined): Conversation {
       setBusy(false);
       setSendError(undefined);
       setStreamError(undefined);
+      turnStartedAt.current = undefined;
 
       let resumeId = target === "new" ? undefined : target;
       if (resumeId === undefined && target === undefined) {
@@ -416,9 +457,22 @@ export function useConversation(target: string | undefined): Conversation {
       lastSeq.current = Math.max(lastSeq.current, Number(event.eventSeq));
       setStreamError(undefined);
       if (event.turnComplete || event.error) setBusy(false);
-      if (event.preparing) setBusy(true);
+      // A turn the daemon started on its own — a resumed one, or a scheduled
+      // wake — has no submit to arm the clock, so the first event does it.
+      if (event.preparing) {
+        setBusy(true);
+        turnStartedAt.current ??= Date.now();
+      }
       if (event.planUpdated) setPlan(event.planUpdated.steps);
       setCells((prev) => reduceEvent(prev, event));
+      if (event.turnComplete || event.error) {
+        const startedAt = turnStartedAt.current;
+        turnStartedAt.current = undefined;
+        if (startedAt !== undefined) {
+          const elapsedMs = Date.now() - startedAt;
+          setCells((prev) => stampTurnDuration(prev, elapsedMs));
+        }
+      }
     },
     [sessionId],
   );
@@ -444,6 +498,7 @@ export function useConversation(target: string | undefined): Conversation {
       ]);
       setBusy(true);
       setSendError(undefined);
+      turnStartedAt.current = Date.now();
       // The turn's events arrive on the Stream subscription above.
       borg.session.send(
         { sessionId, text, ...splitAttachments(attachments) },
@@ -452,6 +507,7 @@ export function useConversation(target: string | undefined): Conversation {
           onError: (error) => {
             setSendError(asBorgError(error));
             setBusy(false);
+            turnStartedAt.current = undefined;
           },
         },
       );

@@ -47,7 +47,7 @@ export interface RecentItem {
    * them — the dot is there to pick two rows out of a list, not to decorate
    * every row.
    */
-  activity?: "working" | "draft";
+  activity?: "working" | "unread" | "draft";
 }
 
 /** Signed-in identity shown in the sidebar footer. */

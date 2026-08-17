@@ -1,12 +1,14 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { AgentsIcon, PageChrome, useIsMobile } from "@borg/ui";
+import { AgentsIcon, FindBar, PageChrome, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
 import { DaemonState } from "../../components/DaemonState";
 import { useKeybind } from "../../lib/keybinds";
+import { markSessionSeen } from "../sessions/unreadStore";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
 import { draftKeyFor } from "./draftStore";
+import { useFindInTranscript } from "./useFindInTranscript";
 import { useFollowBottom } from "./followBottom";
 import { ChangedFilesCard } from "./cells/ChangedFilesCard";
 import { PlanPanel } from "./cells/PlanPanel";
@@ -112,6 +114,16 @@ export function ConversationPage() {
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
+  // Search over the mounted transcript. The revision is what tells it to
+  // re-derive: every streamed token replaces text nodes its ranges point into.
+  // A turn settling counts too — token appends mutate the last cell in place,
+  // so the counts alone never move while a reply streams.
+  const find = useFindInTranscript(contentRef, `${visible.length}:${cells.length}:${busy}`);
+  useKeybind("find-in-conversation", find.show, { inInputs: true });
+  // Escape belongs to the find bar while it is open — registered after the
+  // composer's own binding, and the keyboard layer runs the frontmost one.
+  useKeybind("cancel-turn", find.close, { enabled: find.open, inInputs: true });
+
   // Follow the newest content, but only while the user is actually down there.
   const { pinned, missed, jumpToLatest } = useFollowBottom(scrollRef, contentRef, target);
 
@@ -124,6 +136,13 @@ export function ConversationPage() {
   // carries the text across as the id lands; this only follows it.
   const agentSessionId = opened.state === "ready" ? opened.data.agentSessionId : "";
   const draftKey = agentSessionId ? draftKeyFor(agentSessionId) : draftKeyFor(target ?? "latest");
+
+  // Having this conversation on screen is what reading it means, so the mark
+  // is renewed as the transcript grows and once more when the turn settles —
+  // watching an answer arrive must not leave the row asking to be read.
+  useEffect(() => {
+    markSessionSeen(agentSessionId);
+  }, [agentSessionId, cells.length, busy]);
 
   return (
     <PageChrome
@@ -150,63 +169,84 @@ export function ConversationPage() {
         ) : undefined
       }
     >
-      <div
-        ref={scrollRef}
-        className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
-      >
+      {/* `relative` so the find bar can float over the transcript: inside the
+          scroller it would scroll away with the text it is searching. */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        {find.open && (
+          <div data-find-skip>
+            <FindBar
+              query={find.query}
+              onQueryChange={find.setQuery}
+              count={find.count}
+              position={find.position}
+              onNext={find.next}
+              onPrevious={find.previous}
+              onClose={find.close}
+              // Only when history is genuinely out of reach. Revealing it is one
+              // deliberate step, not the default — that budget is why a long
+              // conversation opens at all.
+              onSearchAll={hiddenCount > 0 ? () => setCutIndex(0) : undefined}
+            />
+          </div>
+        )}
         <div
-          ref={contentRef}
-          className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
-            isMobile ? "px-[22px]" : "px-[30px]"
-          }`}
+          ref={scrollRef}
+          className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
         >
-          <DaemonState query={opened} label="the conversation">
-            {() => (
-              <>
-                {cells.length === 0 && (
-                  <div className="pt-10 text-center text-[14.5px] leading-[1.62] text-pretty text-ink3">
-                    Nothing here yet. Ask Borg anything.
-                  </div>
-                )}
-                {hiddenCount > 0 && (
-                  <button
-                    type="button"
-                    onClick={showEarlier}
-                    className="mx-auto cursor-pointer rounded-full border border-line bg-surface2 px-3.5 py-1.5 text-[11.5px] leading-none text-ink3 hover:text-ink"
-                  >
-                    Show earlier messages
-                  </button>
-                )}
-                {visible.map((item) =>
-                  item.type === "run" ? (
-                    <ToolRunCell key={item.key} tools={item.tools} live={item.live} />
-                  ) : (
-                    <TranscriptCell
-                      key={item.index}
-                      cell={item.cell}
-                      respond={respond}
-                      ordinal={ordinals[item.index]!}
-                      editable={item.cell.kind === "user" && !busy}
-                      onEdit={editAndResend}
-                    />
-                  ),
-                )}
-                {/* Only once the turn settles: mid-turn the tool rows narrate,
-                    and a card rebuilt on every patch would thrash. */}
-                {!busy && (edits.length > 0 || uncounted > 0) && (
-                  <ChangedFilesCard edits={edits} uncounted={uncounted} />
-                )}
-                {busy && (
-                  <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
-                )}
-                {sendError && (
-                  <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2">
-                    {describeSendFailure(sendError)}
-                  </div>
-                )}
-              </>
-            )}
-          </DaemonState>
+          <div
+            ref={contentRef}
+            className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
+              isMobile ? "px-[22px]" : "px-[30px]"
+            }`}
+          >
+            <DaemonState query={opened} label="the conversation">
+              {() => (
+                <>
+                  {cells.length === 0 && (
+                    <div className="pt-10 text-center text-[14.5px] leading-[1.62] text-pretty text-ink3">
+                      Nothing here yet. Ask Borg anything.
+                    </div>
+                  )}
+                  {hiddenCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={showEarlier}
+                      className="mx-auto cursor-pointer rounded-full border border-line bg-surface2 px-3.5 py-1.5 text-[11.5px] leading-none text-ink3 hover:text-ink"
+                    >
+                      Show earlier messages
+                    </button>
+                  )}
+                  {visible.map((item) =>
+                    item.type === "run" ? (
+                      <ToolRunCell key={item.key} tools={item.tools} live={item.live} />
+                    ) : (
+                      <TranscriptCell
+                        key={item.index}
+                        cell={item.cell}
+                        respond={respond}
+                        ordinal={ordinals[item.index]!}
+                        editable={item.cell.kind === "user" && !busy}
+                        onEdit={editAndResend}
+                      />
+                    ),
+                  )}
+                  {/* Only once the turn settles: mid-turn the tool rows narrate,
+                      and a card rebuilt on every patch would thrash. */}
+                  {!busy && (edits.length > 0 || uncounted > 0) && (
+                    <ChangedFilesCard edits={edits} uncounted={uncounted} />
+                  )}
+                  {busy && (
+                    <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
+                  )}
+                  {sendError && (
+                    <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2">
+                      {describeSendFailure(sendError)}
+                    </div>
+                  )}
+                </>
+              )}
+            </DaemonState>
+          </div>
         </div>
       </div>
 
