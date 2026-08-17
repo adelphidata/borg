@@ -104,7 +104,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 wasmparser = "0.244"
 wasmtime = "36"
 tonic = { version = "0.13", features = ["tls-ring"] }
-tonic-build = "0.13"
+tonic-build = "0.14"
 tonic-web = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 time = { version = "0.3", features = ["macros"] }
