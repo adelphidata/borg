@@ -23,7 +23,9 @@ use windows_sys::Win32::Foundation::{
     HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, TRUE,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile, OPEN_EXISTING};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, ReadFile, WriteFile, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+};
 use windows_sys::Win32::System::Pipes::{CreatePipe, WaitNamedPipeW};
 use windows_sys::Win32::System::Threading::TerminateProcess;
 
@@ -188,6 +190,13 @@ pub fn connect_control_client(name: &str) -> io::Result<OwnedPipe> {
     for _ in 0..50 {
         // SAFETY: wname null-terminated; null SA; OPEN_EXISTING for a
         // client connect. GENERIC_READ|WRITE for the duplex channel.
+        //
+        // SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION caps what the pipe
+        // server may do with our identity. Omitting SQOS lets the server call
+        // `ImpersonateNamedPipeClient` and then *act as* this caller; at the
+        // identification level it can only read who we are, which is all the
+        // peer check needs. Cheap to state explicitly rather than inherit
+        // whatever the default turns out to be.
         let h = unsafe {
             CreateFileW(
                 wname.as_ptr(),
@@ -195,7 +204,7 @@ pub fn connect_control_client(name: &str) -> io::Result<OwnedPipe> {
                 0,
                 ptr::null(),
                 OPEN_EXISTING,
-                0,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 ptr::null_mut(),
             )
         };

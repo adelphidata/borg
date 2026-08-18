@@ -58,6 +58,11 @@ const EXCLUDED_NAMES: &[&str] = &[
     // cleanup, and `cache/shell-spill` holds command output. None of it is
     // state a restore needs, and a portable tarball is the wrong place for it.
     "cache",
+    // `$EDITOR` scratch buffers (`paths::editor_dir`). Same reasoning as
+    // `cache`: transient, never state a restore needs, and it holds a message
+    // the user had not yet sent. It is also live while the user is editing, so
+    // a buffer can vanish under the walk mid-archive.
+    "editor",
     "borg.db",
     "borg.db-wal",
     "borg.db-shm",
@@ -874,6 +879,9 @@ mod tests {
             "backups",
             "backups/borg-backup-1.tar.zst",
             "subdir/.lock",
+            // $EDITOR scratch: the user's unsent message, live while they type.
+            "editor",
+            "editor/borg-ab12.md",
             // The database and its WAL/SHM siblings never enter via the raw
             // walk — only via the VACUUM INTO snapshot.
             "borg.db",

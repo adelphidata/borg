@@ -72,6 +72,24 @@ pub(super) struct AssistantRenderCache {
     committed_byte_len: usize,
 }
 
+/// Convert every line ending in pasted text to a single `\n`.
+///
+/// Terminals disagree on what a pasted line break looks like: some send `\r\n`,
+/// some send a bare `\r`. [`sanitize_user_text`] drops `\r` outright, which is
+/// right when rendering a stored message but wrong at the paste boundary — a
+/// bare `\r` would silently weld two pasted lines together. Normalizing first
+/// means `\r\n` collapses to one `\n` (not two) and a lone `\r` survives as a
+/// line break.
+///
+/// Returns a borrow when there is no `\r` to rewrite, which is the common case.
+pub(super) fn normalize_pasted_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // `\r\n` before bare `\r`, or the pair would become two line breaks.
+    std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 /// Strip terminal control sequences from user-authored text so a pasted or
 /// persisted CSI sequence can't repaint the terminal or corrupt native
 /// scrollback. Removes CSI sequences (`\x1b[` … final byte in `@..=~`) and any

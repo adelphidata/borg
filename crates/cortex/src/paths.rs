@@ -50,9 +50,29 @@ pub enum BorgSubdir {
     Backups,
     /// `cache/` — re-derivable caches (embedding, compiled WASM modules).
     Cache,
+    /// `editor/` — `$EDITOR` scratch buffers for the composer handoff.
+    Editor,
+    // A new variant needs a name in `as_str` (the compiler enforces that) and
+    // an entry in `ALL` (it does not) — add both.
 }
 
 impl BorgSubdir {
+    /// Every variant, so callers and tests enumerate one list instead of
+    /// hand-maintaining copies that drift when a variant is added.
+    pub const ALL: &'static [Self] = &[
+        Self::Memory,
+        Self::Skills,
+        Self::Scripts,
+        Self::Channels,
+        Self::Tools,
+        Self::Logs,
+        Self::Sessions,
+        Self::Secrets,
+        Self::Backups,
+        Self::Cache,
+        Self::Editor,
+    ];
+
     /// Stable on-disk name. Never rename — operators have these in scripts.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -66,6 +86,7 @@ impl BorgSubdir {
             Self::Secrets => "secrets",
             Self::Backups => "backups",
             Self::Cache => "cache",
+            Self::Editor => "editor",
         }
     }
 }
@@ -174,24 +195,25 @@ pub fn kek_file_path(home: &Path) -> PathBuf {
     subdir(home, BorgSubdir::Secrets).join("kek.enc")
 }
 
+/// `$BORG_HOME/editor` — scratch buffers for `$EDITOR` handoff.
+///
+/// Deliberately inside `$BORG_HOME` rather than the system temp dir. A buffer
+/// holds the user's unsent message, and the sandbox grants a writable `/tmp`,
+/// so a buffer left there is readable and rewritable by any sandboxed command
+/// while the user is still composing. `$BORG_HOME` is deny-write as a whole;
+/// `SandboxPolicy::with_borg_dir_protected` additionally deny-reads this
+/// directory by name, since deny-read there is per-leaf and not blanket.
+pub fn editor_dir(home: &Path) -> PathBuf {
+    subdir(home, BorgSubdir::Editor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn subdir_names_are_lowercase_kebab_or_single_word() {
-        for kind in [
-            BorgSubdir::Memory,
-            BorgSubdir::Skills,
-            BorgSubdir::Scripts,
-            BorgSubdir::Channels,
-            BorgSubdir::Tools,
-            BorgSubdir::Logs,
-            BorgSubdir::Sessions,
-            BorgSubdir::Secrets,
-            BorgSubdir::Backups,
-            BorgSubdir::Cache,
-        ] {
+        for kind in BorgSubdir::ALL.iter().copied() {
             let s = kind.as_str();
             assert!(!s.is_empty(), "subdir name must not be empty");
             assert!(
@@ -204,20 +226,8 @@ mod tests {
 
     #[test]
     fn subdir_names_are_unique() {
-        let all = [
-            BorgSubdir::Memory,
-            BorgSubdir::Skills,
-            BorgSubdir::Scripts,
-            BorgSubdir::Channels,
-            BorgSubdir::Tools,
-            BorgSubdir::Logs,
-            BorgSubdir::Sessions,
-            BorgSubdir::Secrets,
-            BorgSubdir::Backups,
-            BorgSubdir::Cache,
-        ];
         let mut seen = std::collections::HashSet::new();
-        for kind in all {
+        for kind in BorgSubdir::ALL.iter().copied() {
             assert!(
                 seen.insert(kind.as_str()),
                 "duplicate subdir name {:?}",

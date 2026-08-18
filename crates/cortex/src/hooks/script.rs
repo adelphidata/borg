@@ -562,6 +562,15 @@ fn run_subprocess(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Hooks are the last agent-spawned subprocess site that still inherited the
+    // daemon's whole environment — every provider API key the credential pool
+    // loaded, plus `BORG_KEK_PASSPHRASE`. A hook is ordinary shell, frequently
+    // copied from someone else's config, and its stdout is captured and logged,
+    // so `env`/`set -x` inside one was a direct path from the keyring to
+    // `~/.borg/logs/`. Same closed-set filter the shell tool already uses.
+    // A hook that genuinely needs a credential must read it from the secret
+    // store, not from whatever happened to be in the daemon's environment.
+    crate::security::env_allowlist::apply_filtered_env_std(&mut cmd, &HashMap::new());
     // Own process group so the timeout path below can kill the hook's whole
     // tree — `child.kill()` alone leaves backgrounded grandchildren running
     // (and holding our pipes) past the deadline.
@@ -1695,6 +1704,67 @@ mod tests {
             assert_eq!(code, 0);
             let captured = std::fs::read_to_string(&out).expect("hook should have written stdin");
             assert_eq!(captured, r#"{"event":"SessionStart","turn":7}"#);
+        }
+
+        /// Serializes the one test below that mutates the process-global env.
+        /// Nothing else in this module touches it, and the names it sets are
+        /// deliberately unique to this test, so a private lock is enough.
+        fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Spec: a hook must not see the daemon's credentials. The daemon env
+        /// holds every provider key the credential pool loaded plus
+        /// `BORG_KEK_PASSPHRASE`, and a hook's stdout is captured and written
+        /// to `~/.borg/logs/`, so an inherited key is one `env` away from disk.
+        /// The name is checked as well as the value: a hook that reads
+        /// `${…_API_KEY}` must get nothing, not a shortened secret.
+        ///
+        /// The probe names are private to this test on purpose. A real provider
+        /// name (`OPENROUTER_API_KEY`) is saved, overwritten and restored by
+        /// `config::tests::secrets_llm` under *its* lock, and is commonly
+        /// exported on a developer's host — setting or clearing it here would
+        /// flake those tests in both directions. The allowlist's own suite
+        /// covers the real provider names.
+        #[test]
+        fn hook_env_excludes_daemon_credentials_but_keeps_process_basics() {
+            let _lock = hook_env_lock();
+            let dir = tmp();
+            let out = dir.path().join("env.txt");
+            // SAFETY: these two names are used nowhere else in the workspace,
+            // and `hook_env_lock` serializes this test against itself.
+            std::env::set_var("HOOK_PROBE_PROVIDER_API_KEY", "leak_value_must_not_appear");
+            std::env::set_var("BORG_KEK_PASSPHRASE", "kek_leak_must_not_appear");
+
+            let command = format!("env > {}", out.display());
+            let result = run_subprocess(&command, "{}", Duration::from_secs(10));
+
+            std::env::remove_var("HOOK_PROBE_PROVIDER_API_KEY");
+            std::env::remove_var("BORG_KEK_PASSPHRASE");
+
+            let (code, _) = result.expect("hook must run");
+            assert_eq!(code, 0);
+            let captured = std::fs::read_to_string(&out).expect("hook should have written env");
+            for leaked in [
+                "leak_value_must_not_appear",
+                "kek_leak_must_not_appear",
+                "HOOK_PROBE_PROVIDER_API_KEY",
+                "BORG_KEK_PASSPHRASE",
+            ] {
+                assert!(
+                    !captured.contains(leaked),
+                    "{leaked} reached the hook env:\n{captured}"
+                );
+            }
+            // The filter must not leave the hook unable to run: `sh` needs
+            // PATH to resolve `env` at all, so its absence would have failed
+            // the spawn above, but assert it explicitly so a future narrowing
+            // of the allowlist fails here with a clear reason.
+            assert!(
+                captured.lines().any(|l| l.starts_with("PATH=")),
+                "hooks still need PATH:\n{captured}"
+            );
         }
 
         /// The `$1` convention must keep working alongside stdin — borg's own

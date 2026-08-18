@@ -337,12 +337,16 @@ impl SandboxPolicy {
     /// the credential/key material inside it, consuming self.
     ///
     /// The whole `~/.borg` is write-protected. For reads we deny the specific
-    /// secret stores (`secrets/`, `identity/`, `borg.db`) rather than all of
-    /// `~/.borg`, because the sandboxed tool's own directory lives under
-    /// `~/.borg/tools/<tool>` and is bound in explicitly. These deny-read
+    /// secret stores (`secrets/`, `identity/`, `borg.db`, `editor/`) rather
+    /// than all of `~/.borg`, because the sandboxed tool's own directory lives
+    /// under `~/.borg/tools/<tool>` and is bound in explicitly. These deny-read
     /// entries are emitted last by the backends, so they win even under a broad
     /// `fs_read` (e.g. the `trusted` profile's `/`), closing the gap where a
     /// sandboxed tool could `cat ~/.borg/secrets/kek.enc` and exfiltrate it.
+    ///
+    /// `editor/` holds `$EDITOR` scratch buffers — the user's unsent message.
+    /// It is deny-read for the same reason: the text is the user's, not the
+    /// model's, until they send it.
     pub fn with_borg_dir_protected(mut self) -> Self {
         let borg_dir = dirs::home_dir()
             .map(|h| format!("{}/.borg", h.display()))
@@ -355,7 +359,7 @@ impl SandboxPolicy {
             self.deny_write.push(borg_dir.clone());
         }
 
-        for sensitive in ["secrets", "identity", "borg.db"] {
+        for sensitive in ["secrets", "identity", "borg.db", "editor"] {
             let path = format!("{borg_dir}/{sensitive}");
             if !self.deny_read.iter().any(|p| p == &path) {
                 self.deny_read.push(path);
@@ -852,9 +856,16 @@ mod tests {
     fn with_borg_dir_protected_denies_read_of_secret_stores() {
         // M2/M1: the credential/key material inside ~/.borg must be deny-read,
         // not just deny-write, so a sandboxed tool can't exfiltrate kek.enc /
-        // borg.db even under a broad fs_read.
+        // borg.db even under a broad fs_read. `editor/` joins them: it holds
+        // the $EDITOR scratch buffer, i.e. the user's unsent message, which is
+        // theirs and not the model's until they send it.
         let protected = SandboxPolicy::default().with_borg_dir_protected();
-        for suffix in ["/.borg/secrets", "/.borg/identity", "/.borg/borg.db"] {
+        for suffix in [
+            "/.borg/secrets",
+            "/.borg/identity",
+            "/.borg/borg.db",
+            "/.borg/editor",
+        ] {
             assert!(
                 protected.deny_read.iter().any(|p| p.ends_with(suffix)),
                 "deny_read missing {suffix}: {:?}",

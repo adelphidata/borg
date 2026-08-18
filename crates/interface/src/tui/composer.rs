@@ -364,10 +364,13 @@ impl<'a> Composer<'a> {
     pub fn handle_paste(&mut self, text: &str) {
         self.history.reset();
         self.paste_burst.flush_immediate();
+        // Fold `\r\n` and bare `\r` into `\n` before sanitizing, which drops
+        // `\r` and would otherwise join two pasted lines into one.
+        let text = super::history::normalize_pasted_newlines(text);
         // Strip terminal control sequences so a pasted CSI can't corrupt the
         // composer's live echo or, later, native scrollback.
         self.textarea
-            .insert_str(&*super::history::sanitize_user_text(text));
+            .insert_str(&*super::history::sanitize_user_text(&text));
     }
 
     /// Called on each tick to flush any paste-burst buffer.
@@ -1045,6 +1048,27 @@ mod tests {
         let mut c = Composer::new();
         c.handle_paste("line 1\nline 2\nline 3");
         assert_eq!(c.text(), "line 1\nline 2\nline 3");
+    }
+
+    /// Spec: every line ending a terminal can send in a bracketed paste must
+    /// land as exactly one line break. `\r\n` must not become two (the pair is
+    /// one ending), and a bare `\r` must not vanish — dropping it welds the
+    /// lines around it together, silently corrupting the pasted text.
+    #[test]
+    fn handle_paste_normalizes_every_line_ending_to_one_newline() {
+        let cases: &[(&str, &str)] = &[
+            ("crlf\r\nsecond", "crlf\nsecond"),
+            ("bare cr\rsecond", "bare cr\nsecond"),
+            ("lf\nsecond", "lf\nsecond"),
+            ("mixed\r\na\rb\nc", "mixed\na\nb\nc"),
+            ("trailing\r\n", "trailing\n"),
+            ("\r\nleading", "\nleading"),
+        ];
+        for (input, want) in cases.iter().copied() {
+            let mut c = Composer::new();
+            c.handle_paste(input);
+            assert_eq!(c.text(), want, "paste of {input:?}");
+        }
     }
 
     #[test]

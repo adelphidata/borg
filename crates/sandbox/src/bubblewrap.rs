@@ -23,6 +23,11 @@ impl BwrapVersion {
     pub fn supports_unshare_user(&self) -> bool {
         (self.major, self.minor) >= (0, 2)
     }
+
+    /// Returns true if this version supports `--cap-drop` (added in 0.3.0).
+    pub fn supports_cap_drop(&self) -> bool {
+        (self.major, self.minor) >= (0, 3)
+    }
 }
 
 /// Detect the installed bwrap version by running `bwrap --version`.
@@ -208,6 +213,18 @@ pub fn build_bwrap_args_versioned(
     let supports_die = version.is_none_or(BwrapVersion::supports_die_with_parent);
     if supports_die {
         args.push("--die-with-parent".to_string());
+    }
+
+    // Surrender every Linux capability before the command runs. A sandboxed
+    // process needs none of them, and dropping the bounding set closes the
+    // gap where a setuid or file-capability binary reachable through a bind
+    // regains privilege inside the namespace — CAP_SYS_ADMIN there would let
+    // it remount the very `--ro-bind`s and tmpfs overlays that enforce
+    // `deny_read`/`deny_write`. Emitted last so it stays adjacent to the
+    // command bwrap execs.
+    let supports_cap_drop = version.is_none_or(BwrapVersion::supports_cap_drop);
+    if supports_cap_drop {
+        args.extend(["--cap-drop".to_string(), "ALL".to_string()]);
     }
 
     args
@@ -485,22 +502,24 @@ mod tests {
     #[test]
     fn version_feature_cutoffs_table() {
         // Spec: feature predicates fire at the exact cutoff version.
-        // --die-with-parent landed in 0.1.8; --unshare-user landed in 0.2.0.
-        // A regression that shifts a cutoff (e.g. wrong inequality) flips
-        // exactly one row here. Table-driven so a new gate is one row, not
-        // a new test function.
-        let cases: &[(u32, u32, u32, bool, bool)] = &[
-            // major, minor, patch, die_with_parent, unshare_user
-            (0, 1, 5, false, false),
-            (0, 1, 7, false, false),
-            (0, 1, 8, true, false), // die-with-parent cutoff
-            (0, 1, 9, true, false),
-            (0, 2, 0, true, true), // unshare-user cutoff
-            (0, 3, 9, true, true),
-            (0, 4, 0, true, true),
-            (0, 6, 2, true, true),
+        // --die-with-parent landed in 0.1.8; --unshare-user landed in 0.2.0;
+        // --cap-drop landed in 0.3.0. A regression that shifts a cutoff
+        // (e.g. wrong inequality) flips exactly one row here. Table-driven so
+        // a new gate is one row, not a new test function.
+        let cases: &[(u32, u32, u32, bool, bool, bool)] = &[
+            // major, minor, patch, die_with_parent, unshare_user, cap_drop
+            (0, 1, 5, false, false, false),
+            (0, 1, 7, false, false, false),
+            (0, 1, 8, true, false, false), // die-with-parent cutoff
+            (0, 1, 9, true, false, false),
+            (0, 2, 0, true, true, false), // unshare-user cutoff
+            (0, 2, 9, true, true, false),
+            (0, 3, 0, true, true, true), // cap-drop cutoff
+            (0, 3, 9, true, true, true),
+            (0, 4, 0, true, true, true),
+            (0, 6, 2, true, true, true),
         ];
-        for (major, minor, patch, want_die, want_unshare) in cases.iter().copied() {
+        for (major, minor, patch, want_die, want_unshare, want_cap_drop) in cases.iter().copied() {
             let v = BwrapVersion {
                 major,
                 minor,
@@ -516,7 +535,75 @@ mod tests {
                 want_unshare,
                 "unshare_user: {major}.{minor}.{patch}"
             );
+            assert_eq!(
+                v.supports_cap_drop(),
+                want_cap_drop,
+                "cap_drop: {major}.{minor}.{patch}"
+            );
         }
+    }
+
+    /// Spec: the sandboxed command must run with no Linux capabilities. Without
+    /// `--cap-drop ALL` a setuid or file-capability binary reachable through a
+    /// bind can regain privilege inside the namespace, and CAP_SYS_ADMIN there
+    /// is enough to remount the `--ro-bind`s and tmpfs overlays that carry
+    /// `deny_read`/`deny_write`. The flag must also be the last option, so bwrap
+    /// still parses it as an option rather than part of the command.
+    #[test]
+    fn build_args_drops_all_capabilities_before_the_command() {
+        for version in [
+            Some(BwrapVersion {
+                major: 0,
+                minor: 3,
+                patch: 0,
+            }),
+            Some(BwrapVersion {
+                major: 0,
+                minor: 6,
+                patch: 2,
+            }),
+            // Undetectable version: assume a modern bwrap rather than
+            // silently running with capabilities intact.
+            None,
+        ] {
+            let args = build_bwrap_args_versioned(
+                &default_policy(),
+                Path::new(TEST_TOOL_DIR),
+                version.as_ref(),
+            );
+            let idx = args
+                .iter()
+                .position(|a| a == "--cap-drop")
+                .unwrap_or_else(|| panic!("--cap-drop missing for {version:?}: {args:?}"));
+            assert_eq!(
+                args.get(idx + 1).map(String::as_str),
+                Some("ALL"),
+                "--cap-drop must take ALL for {version:?}"
+            );
+            assert_eq!(
+                idx + 2,
+                args.len(),
+                "--cap-drop ALL must be the final option for {version:?}: {args:?}"
+            );
+        }
+    }
+
+    /// Spec: bwrap builds before 0.3.0 reject `--cap-drop`, so emitting it there
+    /// would fail every tool call instead of hardening it. Those hosts keep the
+    /// pre-existing behavior.
+    #[test]
+    fn build_args_omits_cap_drop_on_bwrap_without_support() {
+        let version = BwrapVersion {
+            major: 0,
+            minor: 2,
+            patch: 9,
+        };
+        let args =
+            build_bwrap_args_versioned(&default_policy(), Path::new(TEST_TOOL_DIR), Some(&version));
+        assert!(
+            !args.iter().any(|a| a == "--cap-drop"),
+            "0.2.9 predates --cap-drop: {args:?}"
+        );
     }
 
     /// Spec: `--unshare-pid` must be emitted WITHOUT `--as-pid-1`. The flag's
