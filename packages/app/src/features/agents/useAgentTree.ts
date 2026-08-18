@@ -1,11 +1,81 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { admin as adminPb } from "@borg/client";
+import { GrpcStatus, type admin as adminPb } from "@borg/client";
 import { asBorgError, useBorg, useMutation, useServerStream } from "../../lib/useDaemon";
+
+/** What an agent's wire status means for the reader. */
+export type AgentLiveness = "live" | "done" | "failed" | "unknown";
+
+/**
+ * Sorts a wire status into the four things a reader can do about it.
+ *
+ * Whitelisted rather than defaulted: a status this build has never heard of
+ * reads as a problem, never as a quiet finished row. Treating the unknown as
+ * benign is how a stalled agent comes to look identical to a completed one.
+ */
+export function classifyStatus(status: string): AgentLiveness {
+  switch (status) {
+    case "running":
+    case "pending_init":
+    case "paused":
+      return "live";
+    case "completed":
+      return "done";
+    case "errored":
+    case "shutdown":
+      return "failed";
+    default:
+      return "unknown";
+  }
+}
 
 /** Statuses that mean the agent is still doing something. */
 export function isLive(status: string): boolean {
-  return status === "running" || status === "pending_init" || status === "paused";
+  return classifyStatus(status) === "live";
 }
+
+/** What went wrong, in words, or undefined while nothing has. */
+export function failureReason(agent: adminPb.AgentEntry): string | undefined {
+  const reason = agent.error?.trim() ?? "";
+  switch (classifyStatus(agent.status)) {
+    case "live":
+    case "done":
+      return undefined;
+    case "failed":
+      if (agent.status === "shutdown" && reason === "") return "Stopped by Borg.";
+      if (reason === "") return "Stopped without reporting a reason.";
+      // The stall watchdog writes a machine-shaped line; lead with what it
+      // means rather than with the word "stalled:".
+      return reason.startsWith("stalled:")
+        ? `Stalled — ${reason.slice("stalled:".length).trim()}`
+        : reason;
+    case "unknown":
+      return `Unrecognized status "${agent.status}" — treating it as stopped.`;
+  }
+}
+
+/** How a status reads in the panel. */
+export function statusLabel(agent: adminPb.AgentEntry): string {
+  switch (agent.status) {
+    case "running":
+      return "Running";
+    case "pending_init":
+      return "Queued";
+    case "paused":
+      return "Paused";
+    case "completed":
+      return "Done";
+    case "errored":
+      return agent.error?.startsWith("stalled:") ? "Stalled" : "Failed";
+    case "shutdown":
+      return "Stopped";
+    default:
+      return "Unknown";
+  }
+}
+
+/** How often to re-ask for the tree while the delta stream is unavailable. */
+export const POLL_ACTIVE_MS = 3_000;
+export const POLL_IDLE_MS = 15_000;
 
 export interface AgentTree {
   agents: adminPb.AgentEntry[];
@@ -77,7 +147,7 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
     void refresh();
   }, [refresh]);
 
-  useServerStream<adminPb.AgentTreeEvent>(
+  const stream = useServerStream<adminPb.AgentTreeEvent>(
     (borg, handlers) => {
       if (sessionId === undefined) return () => {};
       return borg.admin.subscribeAgentTreeEvents({ id: sessionId }, handlers);
@@ -105,6 +175,34 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
     [sessionId],
   );
 
+  const active = agents.some((a) => a.depth > 0 && isLive(a.status));
+
+  // The daemon does not serve the delta stream yet, so without this the panel
+  // shows one snapshot taken at mount and never moves again — an agent that
+  // stalls looks exactly like one still working. Polling covers the gap and
+  // should go the day `SubscribeAgentTreeEvents` starts answering.
+  const streamServed = stream.status === "open";
+  useEffect(() => {
+    if (streamServed || sessionId === undefined) return;
+    const id = setInterval(() => void refresh(), active ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    return () => clearInterval(id);
+  }, [streamServed, sessionId, active, refresh]);
+
+  // An unimplemented stream is not worth a red banner on every session — it is
+  // the signal to poll instead, which is what the effect above does.
+  const streamError =
+    stream.status === "error" && stream.error?.code !== GrpcStatus.Unimplemented
+      ? stream.error?.message
+      : undefined;
+
+  /** A control the daemon has not implemented is a gap, not a gRPC fault. */
+  const controlError = (failure: { code: number; message: string } | undefined) =>
+    failure === undefined
+      ? undefined
+      : failure.code === GrpcStatus.Unimplemented
+        ? "Borg's daemon cannot do this yet."
+        : failure.message;
+
   const pauseMutation = useMutation((borg, id: string) => borg.admin.pauseAgent({ agentId: id }));
   const resumeMutation = useMutation((borg, id: string) => borg.admin.resumeAgent({ agentId: id }));
   // Kill the subtree, not the node: orphaned children keep burning tokens with
@@ -117,10 +215,13 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
     agents,
     goal,
     gates,
-    active: agents.some((a) => a.depth > 0 && isLive(a.status)),
+    active,
     pause: (id) => void pauseMutation.run(id),
     resume: (id) => void resumeMutation.run(id),
     kill: (id) => void killMutation.run(id),
-    error: error ?? (pauseMutation.error ?? resumeMutation.error ?? killMutation.error)?.message,
+    error:
+      error ??
+      streamError ??
+      controlError(pauseMutation.error ?? resumeMutation.error ?? killMutation.error),
   };
 }

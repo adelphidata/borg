@@ -145,3 +145,26 @@ describe("the kebab", () => {
     expect(onRowClick).not.toHaveBeenCalled();
   });
 });
+
+describe("an archived row's actions", () => {
+  it("offers Restore in the slot Archive occupies, not beside it", () => {
+    // A conversation that can be put away but not brought back is a one-way
+    // door; a row that grows an extra action for the rare case is clutter.
+    const props = { ...handlers(), onRestore: vi.fn(), archived: true };
+
+    const actions = sessionRowActions(props);
+    const restore = actions.find((a) => a.id === "restore");
+    restore?.onSelect();
+
+    expect(actions.map((a) => a.id)).toEqual(["rename", "export", "restore"]);
+    expect(restore?.label).toBe("Restore");
+    expect(props.onRestore).toHaveBeenCalledTimes(1);
+    expect(props.onArchive).not.toHaveBeenCalled();
+  });
+
+  it("keeps Archive on a row that is not archived", () => {
+    const actions = sessionRowActions({ ...handlers(), onRestore: vi.fn() });
+
+    expect(actions.map((a) => a.id)).toEqual(["rename", "export", "archive"]);
+  });
+});

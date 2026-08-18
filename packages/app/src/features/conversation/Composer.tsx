@@ -13,9 +13,10 @@ import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
 import { collectAttachments } from "./attachments";
 import { appendPastedText, composerOwnsPaste } from "./documentPaste";
-import { publishDraft } from "./draftStore";
+import { draftTitle, publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
+import { mergeQueued } from "./queuedTurn";
 import { slashQuery } from "./slashToken";
 import type { Attachment } from "./useConversation";
 import { usePathCompletions } from "./usePathCompletions";
@@ -49,6 +50,13 @@ function useAutoGrow(value: string) {
 
 interface ComposerProps {
   busy: boolean;
+  /**
+   * True while the turn is parked on a prompt only the user can answer. What is
+   * typed then is held back and sent as the next turn, because the daemon
+   * drains steers at tool boundaries and the agent is not at one — it is
+   * waiting. Absent means no prompt is open.
+   */
+  awaitingInput?: boolean;
   /** Persists the draft per session so switching conversations does not lose it. */
   draftKey: string;
   /**
@@ -77,6 +85,7 @@ interface ComposerProps {
  */
 export function Composer({
   busy,
+  awaitingInput = false,
   draftKey,
   conversationKey,
   sessionId,
@@ -87,6 +96,13 @@ export function Composer({
   const isMobile = useIsMobile();
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /**
+   * What was typed while a prompt was open, waiting for the turn to end.
+   *
+   * One entry, never a stack — a second submission merges into it. Its previews
+   * stay minted, because returning it to the box has to return the chips too.
+   */
+  const [queued, setQueued] = useState<{ text: string; attachments: Attachment[] }>();
   const [error, setError] = useState<string>();
   const [dragging, setDragging] = useState(false);
   const textarea = useAutoGrow(draft);
@@ -99,6 +115,12 @@ export function Composer({
   // the previous images every time a new one is added, blanking the thumbnails
   // still on screen.
   const objectUrls = useRef<string[]>([]);
+  /** The conversation on screen right now, for work that outlives a render. */
+  const conversationKeyRef = useRef(conversationKey);
+  conversationKeyRef.current = conversationKey;
+  /** Read by effects that must not re-run when the queue changes. */
+  const queuedRef = useRef<{ text: string; attachments: Attachment[] } | undefined>(undefined);
+  queuedRef.current = queued;
   useEffect(
     () => () => {
       for (const url of objectUrls.current) URL.revokeObjectURL(url);
@@ -112,7 +134,11 @@ export function Composer({
   // answers, where the text has already been moved across for us.
   useEffect(() => {
     const restored = sessionStorage.getItem(draftKey) ?? "";
-    setDraft(restored);
+    // Queued text is mirrored into the stored draft so a reload cannot lose it.
+    // On the one key change that happens mid-conversation — provisional id to
+    // real id — restoring it would put the same text in the box *and* leave it
+    // queued, and it would send twice.
+    setDraft(restored === queuedRef.current?.text ? "" : restored);
     // A restored draft is not a keystroke. A stored `/new` that popped a menu
     // on session switch would put a command under Enter without anyone asking.
     setSlashDismissed(slashQuery(restored) !== null);
@@ -133,16 +159,24 @@ export function Composer({
     for (const url of objectUrls.current) URL.revokeObjectURL(url);
     objectUrls.current = [];
     setAttachments([]);
+    // The queue belongs to the turn it was typed into. Nothing is lost by
+    // dropping it here: its text is mirrored into that conversation's stored
+    // draft below, so coming back restores it into the box.
+    setQueued(undefined);
     setError(undefined);
   }, [conversationKey]);
 
   useEffect(() => {
-    if (draft === "") sessionStorage.removeItem(draftKey);
-    else sessionStorage.setItem(draftKey, draft);
+    // Queued text is still this conversation's draft as far as everything
+    // outside the composer is concerned — the session lists name unsent rows
+    // after it, and a reload should hand it back rather than swallow it.
+    const stored = draft !== "" ? draft : (queued?.text ?? "");
+    if (stored === "") sessionStorage.removeItem(draftKey);
+    else sessionStorage.setItem(draftKey, stored);
     // Session lists render beside this box and name unsent rows after it;
     // same-tab writes raise no storage event, so tell them directly.
-    publishDraft(draftKey, draft);
-  }, [draft, draftKey]);
+    publishDraft(draftKey, stored);
+  }, [draft, draftKey, queued?.text]);
 
   // `/` opens the same command list ⌘K renders. The chord is the shortcut for
   // people who know it exists; the slash is how everyone else finds out.
@@ -230,7 +264,7 @@ export function Composer({
     () => {
       if (pathOpen) setPathDismissed(true);
       else if (slashOpen) setSlashDismissed(true);
-      else onCancel();
+      else stop();
     },
     { enabled: busy || slashOpen || pathOpen, inInputs: true },
   );
@@ -268,16 +302,27 @@ export function Composer({
     command.run();
   };
 
-  const addFiles = useCallback(async (files: readonly File[]) => {
-    if (files.length === 0) return;
-    const { attachments: added, errors } = await collectAttachments(files);
-    if (added.length > 0) {
-      // Only images mint one; a document has nothing to preview.
-      objectUrls.current.push(...added.flatMap((a) => (a.previewUrl ? [a.previewUrl] : [])));
-      setAttachments((prev) => [...prev, ...added]);
-    }
-    setError(errors[0]);
-  }, []);
+  const addFiles = useCallback(
+    async (files: readonly File[]) => {
+      if (files.length === 0) return;
+      const forConversation = conversationKey;
+      const { attachments: added, errors } = await collectAttachments(files);
+      // Reading and downscaling take long enough for the user to have moved on.
+      // The cleanup that runs on a conversation change has already been and
+      // gone, so anything arriving now would never be revoked.
+      if (forConversation !== conversationKeyRef.current) {
+        for (const a of added) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+        return;
+      }
+      if (added.length > 0) {
+        // Only images mint one; a document has nothing to preview.
+        objectUrls.current.push(...added.flatMap((a) => (a.previewUrl ? [a.previewUrl] : [])));
+        setAttachments((prev) => [...prev, ...added]);
+      }
+      setError(errors[0]);
+    },
+    [conversationKey],
+  );
 
   /**
    * Paste anywhere on the page and it lands in the composer.
@@ -340,7 +385,19 @@ export function Composer({
     }
     const text = draft.trim();
     if (text === "" && attachments.length === 0) return;
-    if (busy) {
+    if (awaitingInput) {
+      // Held, not steered: the agent is parked on the prompt above, so a steer
+      // would sit in a channel nobody is draining and surface much later as a
+      // synthetic mid-turn message.
+      setQueued((prev) =>
+        prev
+          ? {
+              text: mergeQueued(prev.text, text),
+              attachments: [...prev.attachments, ...attachments],
+            }
+          : { text, attachments },
+      );
+    } else if (busy) {
       onSteer(text);
     } else {
       onSend(text, attachments);
@@ -350,9 +407,41 @@ export function Composer({
     setDraft("");
     // The bytes are already read and on their way; only the previews are left
     // to release, and the sent turn renders a count rather than thumbnails.
-    forget(attachments.map((a) => a.previewUrl));
+    // Queued previews are the exception — they have to survive to be handed
+    // back if the queue is returned to the box.
+    if (!awaitingInput) forget(attachments.map((a) => a.previewUrl));
     setAttachments([]);
     setError(undefined);
+  };
+
+  /**
+   * Sends the queue once the turn ends.
+   *
+   * Gated on `busy` alone, deliberately not on `awaitingInput`: while a prompt
+   * is parked `busy` is true, so this cannot fire early, and a turn that errors
+   * out leaving an unanswered prompt cell behind cannot strand the queue
+   * forever. `onSend` sets `busy` synchronously, so it cannot fire twice.
+   */
+  useEffect(() => {
+    if (busy || !queued) return;
+    onSend(queued.text, queued.attachments);
+    forget(queued.attachments.map((a) => a.previewUrl));
+    setQueued(undefined);
+  }, [busy, queued, onSend]);
+
+  /** Hands the queue back to the box. Cancelling must not bin what was typed. */
+  const restoreQueued = () => {
+    const pending = queuedRef.current;
+    if (!pending) return;
+    setDraft((prev) => appendPastedText(prev, pending.text));
+    setAttachments((prev) => [...prev, ...pending.attachments]);
+    setQueued(undefined);
+  };
+
+  /** Stop: drop the turn, and give back anything waiting behind it. */
+  const stop = () => {
+    restoreQueued();
+    onCancel();
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -410,6 +499,25 @@ export function Composer({
     <div className={`flex-none ${isMobile ? "px-[18px] pt-3.5 pb-3" : "px-[30px] pt-4 pb-[26px]"}`}>
       <div className={`mx-auto max-w-[660px] ${isMobile ? "px-[22px]" : ""}`}>
         {error && <div className="mb-2 px-1 text-[11.5px] leading-[1.5] text-alert">{error}</div>}
+
+        {/* Where the held text waits. Same chip vocabulary as an attachment,
+            because it is the same idea: something staged, not yet sent. It
+            exists only while something is queued — no toggle, no setting. */}
+        {queued && (
+          <div className="mb-2 flex items-center px-1">
+            <span className="flex h-[26px] max-w-full items-center gap-1.5 rounded-[8px] border border-line2 bg-surface px-2 text-[12px] text-ink2">
+              <span className="truncate">Sends next · {draftTitle(queued.text)}</span>
+              <button
+                type="button"
+                aria-label="Return to composer"
+                onClick={restoreQueued}
+                className="flex flex-none cursor-pointer items-center border-0 bg-transparent p-0 text-ink3 hover:text-ink"
+              >
+                <CloseIcon size={11} />
+              </button>
+            </span>
+          </div>
+        )}
 
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -531,7 +639,11 @@ export function Composer({
             ref={textarea}
             rows={1}
             className="min-w-0 flex-1 resize-none border-0 bg-transparent py-1.5 text-[14.5px] leading-[1.4] text-ink outline-none select-text placeholder:text-ink3"
-            placeholder={busy ? "Steer Borg…" : "Ask Borg anything"}
+            // Says what Enter will do before it is pressed — the whole reason
+            // holding the text back does not read as swallowing it.
+            placeholder={
+              awaitingInput ? "Send after this…" : busy ? "Steer Borg…" : "Ask Borg anything"
+            }
             // Focus never leaves the box, so the row Enter would take is only
             // announced if the box names it. No `role="combobox"`: that would
             // replace the textarea's own role, and it is a text box first.
@@ -563,7 +675,7 @@ export function Composer({
             }}
           />
           {busy && draft.trim() === "" ? (
-            <Pill variant="danger" square onClick={onCancel}>
+            <Pill variant="danger" square onClick={stop}>
               Stop
             </Pill>
           ) : (

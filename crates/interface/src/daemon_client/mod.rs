@@ -33,11 +33,11 @@ use protocols::admin::{
     GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HandoffFailRequest,
     HandoffRequest as AdminHandoffRequest, HandoffStatusReply, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost,
-    OnboardingState, PairingApproval, PairingFilter, PairingRequestList, PluginInstallRequest,
-    PluginInstallResponse, ReloadRequest, ReloadResponse, RemoveCredentialRequest,
-    RemoveProviderRequest, ResetCredentialsRequest, RevokedClientToken, ScheduledTask,
-    ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
+    ListCredentialsRequest, ListSessionsRequest, LogActivityRequest, MonthlyTokenTotal,
+    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
+    PluginInstallRequest, PluginInstallResponse, ReloadRequest, ReloadResponse,
+    RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest, RevokedClientToken,
+    ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
     ScheduledTaskRunList, ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList,
     SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
     SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
@@ -812,8 +812,10 @@ rpc_wrappers! {
         });
 
     /// List recent sessions. Live sessions are tagged `(live)` in the title.
+    /// Archived sessions are excluded; `borg sessions list --archived` reads
+    /// the database directly.
     admin fn list_sessions() -> SessionList =
-        list_sessions("Admin.ListSessions", AdminEmpty {});
+        list_sessions("Admin.ListSessions", ListSessionsRequest::default());
 
     /// Fetch a single session's transcript.
     admin fn get_session(id: &str) -> SessionDetail =

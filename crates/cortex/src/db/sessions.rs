@@ -936,6 +936,99 @@ impl Database {
         Ok(updated > 0)
     }
 
+    /// Message counts for many sessions in one query.
+    ///
+    /// The per-session [`Self::count_session_messages`] is fine for one row and
+    /// ruinous for a listing: a hundred sessions meant a hundred round trips
+    /// before a listing could be rendered. Sessions with no messages are absent
+    /// from the map rather than present as zero.
+    pub async fn count_session_messages_batch(
+        &self,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, usize>> {
+        let mut out = HashMap::new();
+        if session_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=session_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let args: Vec<libsql::Value> = session_ids
+            .iter()
+            .map(|id| libsql::Value::Text(id.clone()))
+            .collect();
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT session_id, COUNT(*) FROM messages \
+                     WHERE session_id IN ({placeholders}) GROUP BY session_id"
+                ),
+                args,
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            out.insert(id, count.max(0) as usize);
+        }
+        Ok(out)
+    }
+
+    /// The newest conversational message of each of many sessions, as
+    /// `(role, content)`.
+    ///
+    /// Only rows a person said or read: `event_kind` rows are lifecycle
+    /// bookkeeping (compaction checkpoints, fork markers) and tool results are
+    /// machine output, and either one rendered into a conversation list reads
+    /// as leaked JSON. A session whose only rows are those is simply absent.
+    pub async fn last_message_previews(
+        &self,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, (String, String)>> {
+        let mut out = HashMap::new();
+        if session_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=session_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let args: Vec<libsql::Value> = session_ids
+            .iter()
+            .map(|id| libsql::Value::Text(id.clone()))
+            .collect();
+        // The inner query picks one id per session — the highest, which is the
+        // newest since `messages.id` is an autoincrement — and the outer one
+        // reads those rows. Filtering in both halves matters: filtering only
+        // outside would pick the newest row and then discard it when it turned
+        // out to be a tool result, leaving the session with no preview at all.
+        let predicate = "session_id IN ({placeholders}) AND event_kind IS NULL \
+             AND content IS NOT NULL AND TRIM(content) <> '' \
+             AND role IN ('user', 'assistant')";
+        let predicate = predicate.replace("{placeholders}", &placeholders);
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT session_id, role, content FROM messages \
+                     WHERE {predicate} \
+                       AND id IN (SELECT MAX(id) FROM messages WHERE {predicate} \
+                                  GROUP BY session_id)"
+                ),
+                [args.clone(), args].concat(),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let role: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            out.insert(id, (role, content));
+        }
+        Ok(out)
+    }
+
     /// Count messages in a session.
     pub async fn count_session_messages(&self, session_id: &str) -> Result<usize> {
         let mut rows = self
@@ -1206,6 +1299,136 @@ mod tests {
 
     async fn test_db() -> Database {
         Database::test_db().await
+    }
+
+    /// A listing renders one line per session, and that line must come from
+    /// something a person said. A tool result or a compaction checkpoint
+    /// rendered there reads as leaked JSON, and the newest row is very often
+    /// one of those — so picking the newest row and filtering afterwards would
+    /// leave the busiest sessions with no preview at all.
+    #[tokio::test]
+    async fn last_message_previews_skip_tool_and_lifecycle_rows() {
+        let db = test_db().await;
+        for id in ["chatty", "quiet", "tools-only"] {
+            db.upsert_session(id, 1, 10, 0, "m", "")
+                .await
+                .expect("seed");
+        }
+        db.insert_message("chatty", "user", Some("first"), None, None, None, None)
+            .await
+            .expect("user row");
+        db.insert_message(
+            "chatty",
+            "assistant",
+            Some("second"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("assistant row");
+        // Newest row in the session, and exactly what must not be quoted.
+        db.insert_message(
+            "chatty",
+            "tool",
+            Some("{\"ok\":true}"),
+            None,
+            Some("c1"),
+            None,
+            None,
+        )
+        .await
+        .expect("tool row");
+        db.append_session_event(
+            "chatty",
+            "assistant",
+            Some("compaction"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("{}"),
+        )
+        .await
+        .expect("event row");
+        db.insert_message(
+            "tools-only",
+            "tool",
+            Some("output"),
+            None,
+            Some("c2"),
+            None,
+            None,
+        )
+        .await
+        .expect("tool row");
+
+        let previews = db
+            .last_message_previews(&[
+                "chatty".to_string(),
+                "quiet".to_string(),
+                "tools-only".to_string(),
+            ])
+            .await
+            .expect("previews");
+
+        assert_eq!(
+            previews.get("chatty"),
+            Some(&("assistant".to_string(), "second".to_string())),
+            "the newest thing a person would recognise, not the newest row"
+        );
+        assert!(
+            !previews.contains_key("quiet"),
+            "a session with no messages has nothing to preview"
+        );
+        assert!(
+            !previews.contains_key("tools-only"),
+            "a session of pure tool output must be absent, not quoted"
+        );
+    }
+
+    /// The listing hot path counts messages for every row it returns. One
+    /// query per row meant a hundred round trips before a list could render.
+    #[tokio::test]
+    async fn count_session_messages_batch_matches_the_per_session_count() {
+        let db = test_db().await;
+        for id in ["a", "b", "empty"] {
+            db.upsert_session(id, 1, 10, 0, "m", "")
+                .await
+                .expect("seed");
+        }
+        for _ in 0..3 {
+            db.insert_message("a", "user", Some("x"), None, None, None, None)
+                .await
+                .expect("row");
+        }
+        db.insert_message("b", "user", Some("y"), None, None, None, None)
+            .await
+            .expect("row");
+
+        let counts = db
+            .count_session_messages_batch(&["a".to_string(), "b".to_string(), "empty".to_string()])
+            .await
+            .expect("counts");
+
+        assert_eq!(
+            counts.get("a").copied(),
+            Some(db.count_session_messages("a").await.unwrap())
+        );
+        assert_eq!(counts.get("b").copied(), Some(1));
+        assert!(
+            !counts.contains_key("empty"),
+            "a session with no messages is absent rather than zero"
+        );
+        assert!(
+            db.count_session_messages_batch(&[])
+                .await
+                .expect("empty")
+                .is_empty(),
+            "an empty listing must not build a query with no placeholders"
+        );
     }
 
     /// The workspace resolver must scope by git repo root first (any cwd

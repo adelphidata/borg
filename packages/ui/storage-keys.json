@@ -4,5 +4,5 @@
   "settings": "borg.settings",
   "token": "borg.token",
   "skillRecency": "borg.skillRecency",
-  "unread": "borg.unread"
+  "unread": "borg.unread.v2"
 }

@@ -41,6 +41,11 @@ export interface CommandContext {
   settings: Map<string, DaemonSetting> | undefined;
   saveSetting: (key: string, value: string) => void;
   sessions: CommandSession[];
+  /**
+   * Clears every unread dot, or undefined when none are lit. A row that would
+   * do nothing is a row that teaches nothing, so it simply is not offered.
+   */
+  markAllRead?: () => void;
   /** Empty on a surface with no prompt box — skill rows need one to write into. */
   skills: CommandSkill[];
   /** Skill names most-recently-used first, from `skillRecency`. */
@@ -109,6 +114,14 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
       run: () => ctx.dispatch("new-conversation"),
     },
   ];
+  if (ctx.markAllRead) {
+    actions.push({
+      id: "action:mark-read",
+      label: "Mark all conversations read",
+      keywords: "unread dots clear inbox",
+      run: ctx.markAllRead,
+    });
+  }
 
   const go: Command[] = routes.map((route) => ({
     id: `route:${route.id}`,

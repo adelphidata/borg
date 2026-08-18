@@ -234,3 +234,24 @@ describe("buildCommands", () => {
     });
   });
 });
+
+describe("marking every conversation read", () => {
+  it("is not offered when no dot is lit", () => {
+    // A row that would do nothing is a row that teaches nothing.
+    const ids = buildCommands(context(), ROUTES).map((c) => c.id);
+
+    expect(ids).not.toContain("action:mark-read");
+  });
+
+  it("clears the dots when something is unread", () => {
+    const markAllRead = vi.fn();
+
+    const row = buildCommands(context({ markAllRead }), ROUTES).find(
+      (c) => c.id === "action:mark-read",
+    );
+    row?.run();
+
+    expect(row?.label).toBe("Mark all conversations read");
+    expect(markAllRead).toHaveBeenCalledTimes(1);
+  });
+});

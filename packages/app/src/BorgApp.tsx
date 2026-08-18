@@ -22,7 +22,12 @@ import {
   sessionActivity,
   subscribeActivity,
 } from "./features/sessions/activityStore";
-import { subscribeUnread, unreadVersion } from "./features/sessions/unreadStore";
+import {
+  markAllSessionsRead,
+  observeSessions,
+  subscribeUnread,
+  unreadVersion,
+} from "./features/sessions/unreadStore";
 import { useMenuEscape } from "./features/sessions/SessionRowMenu";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
@@ -70,7 +75,22 @@ function Shell({ platform }: { platform: Platform }) {
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
   // warnings appear without a reload.
-  const sessions = useQuery((borg) => borg.admin.listSessions({}), [location.key]);
+  const sessions = useQuery(
+    async (borg) => {
+      const list = await borg.admin.listSessions({});
+      // Read marks are written in the daemon's units, so every listing tells the
+      // store what those units currently are.
+      observeSessions(
+        list.sessions.map((s) => ({
+          id: s.id,
+          updatedAt: Number(s.updatedUnixTs),
+          messageCount: Number(s.messageCount),
+        })),
+      );
+      return list;
+    },
+    [location.key],
+  );
   // Same naming rule as the full list: an unsent session is called after what
   // has been typed into it. The version counter re-renders as that changes.
   useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
@@ -79,8 +99,8 @@ function Shell({ platform }: { platform: Platform }) {
   useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
   // And the read marks, so opening a conversation drops its dot here at once
   // rather than on the next refetch. Lighting a dot still waits for one: the
-  // mark is derived against `updatedUnixTs`, and this list only re-reads that
-  // on navigation.
+  // mark is compared against the listing's own figures, and this list only
+  // re-reads those on navigation.
   useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
   const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
     .slice(0, 8)

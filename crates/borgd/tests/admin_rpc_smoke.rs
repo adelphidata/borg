@@ -30,8 +30,8 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ScheduledTaskCreate, ScheduledTaskUpdate, SessionArchiveMutation, SessionRef,
-    SessionTitleMutation,
+    ListSessionsRequest, ScheduledTaskCreate, ScheduledTaskUpdate, SessionArchiveMutation,
+    SessionRef, SessionTitleMutation,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
@@ -776,7 +776,7 @@ async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it()
         list.sessions.into_iter().map(|s| s.id).collect::<Vec<_>>()
     };
     let before = ids(admin
-        .list_sessions(AdminEmpty {})
+        .list_sessions(ListSessionsRequest::default())
         .await
         .expect("list")
         .into_inner());
@@ -793,7 +793,7 @@ async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it()
         .await
         .expect("archive");
     let after = ids(admin
-        .list_sessions(AdminEmpty {})
+        .list_sessions(ListSessionsRequest::default())
         .await
         .expect("list")
         .into_inner());
@@ -826,7 +826,7 @@ async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it()
         .await
         .expect("unarchive");
     let restored = ids(admin
-        .list_sessions(AdminEmpty {})
+        .list_sessions(ListSessionsRequest::default())
         .await
         .expect("list")
         .into_inner());
@@ -843,6 +843,131 @@ async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it()
         missed.code(),
         tonic::Code::NotFound,
         "a typo'd id must report NotFound, not a silent success"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_surfaces_archived_rows_only_when_asked() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("active-one", 1, 20, 0, "m", "Active")
+            .await
+            .expect("seed active");
+        db.upsert_session("put-away", 1, 10, 0, "m", "Put away")
+            .await
+            .expect("seed archived");
+    }
+    admin
+        .set_session_archived(SessionArchiveMutation {
+            id: "put-away".into(),
+            archived: true,
+        })
+        .await
+        .expect("archive");
+
+    // The default listing is unchanged: this is what the CLI and the TUI ask
+    // for, and archiving has to keep hiding from it.
+    let default = admin
+        .list_sessions(ListSessionsRequest::default())
+        .await
+        .expect("default list")
+        .into_inner();
+    assert!(
+        !default.sessions.iter().any(|s| s.id == "put-away"),
+        "an archived session must stay out of the default listing"
+    );
+
+    // Asking for them is what makes an unarchive possible at all: without the
+    // row there is no id for a client to restore.
+    let with_archived = admin
+        .list_sessions(ListSessionsRequest {
+            include_archived: true,
+        })
+        .await
+        .expect("archived list")
+        .into_inner();
+    let archived_row = with_archived
+        .sessions
+        .iter()
+        .find(|s| s.id == "put-away")
+        .expect("archived session must be listed when asked for");
+    assert!(
+        archived_row.archived,
+        "an archived row must say so, or a client cannot offer Restore instead of Archive"
+    );
+    assert!(
+        with_archived
+            .sessions
+            .iter()
+            .any(|s| s.id == "active-one" && !s.archived),
+        "asking for archived rows must not flag the active ones"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_previews_the_last_thing_said() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("chatty", 1, 30, 0, "m", "Chatty")
+            .await
+            .expect("seed");
+        db.insert_message(
+            "chatty",
+            "user",
+            Some("deploy the thing"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("user row");
+        db.insert_message(
+            "chatty",
+            "assistant",
+            Some("Deployed.\n\nEverything is green."),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("assistant row");
+    }
+
+    let list = admin
+        .list_sessions(ListSessionsRequest::default())
+        .await
+        .expect("list")
+        .into_inner();
+    let row = list
+        .sessions
+        .iter()
+        .find(|s| s.id == "chatty")
+        .expect("seeded session must be listed");
+
+    assert_eq!(
+        row.last_message_preview, "Deployed. Everything is green.",
+        "the preview must be one flat line, so a list row cannot grow to three"
+    );
+    assert_eq!(row.last_message_role, "assistant");
+    assert_eq!(
+        row.message_count, 2,
+        "the batched count must still be right"
     );
 }
 
@@ -919,7 +1044,7 @@ async fn archiving_a_live_session_closes_its_host_and_a_missing_one_closes_nothi
         "the host must be finalized once, not dropped or closed twice"
     );
     let listed = admin
-        .list_sessions(AdminEmpty {})
+        .list_sessions(ListSessionsRequest::default())
         .await
         .expect("list")
         .into_inner()
@@ -1157,7 +1282,7 @@ async fn turn_activity_is_reported_by_both_the_listing_and_the_feed() {
         let mut admin = admin.clone();
         async move {
             admin
-                .list_sessions(AdminEmpty {})
+                .list_sessions(ListSessionsRequest::default())
                 .await
                 .expect("list")
                 .into_inner()

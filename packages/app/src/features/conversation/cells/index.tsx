@@ -1,6 +1,7 @@
 import { memo, useState } from "react";
 import { Brackets, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
+import { classifyStatus } from "../../agents/useAgentTree";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
 import { formatElapsed, formatTokens } from "../../../lib/format";
@@ -72,11 +73,19 @@ function UsageCell({ cell }: { cell: Cell & { kind: "usage" } }) {
   );
 }
 
+/**
+ * A sub-agent's progress, inline.
+ *
+ * Nothing in the daemon emits `SubAgentUpdate` today, so this is unreachable in
+ * practice; the activity panel is where sub-agents are actually watched. It
+ * classifies its status the same way regardless, so the two can never disagree
+ * about what a status means once the event does start arriving.
+ */
 function SubAgentCell({ cell }: { cell: Cell & { kind: "sub-agent" } }) {
-  const running = cell.status.toLowerCase() === "running";
+  const liveness = classifyStatus(cell.status.toLowerCase());
   return (
     <div className="flex items-center gap-2 rounded-[10px] border border-line2 px-4 py-2.5">
-      <StatusDot tone={running ? "busy" : "idle"} />
+      <StatusDot tone={liveness === "live" ? "busy" : liveness === "done" ? "idle" : "alert"} />
       <span className="text-[11px] leading-none font-medium tracking-[0.08em] text-ink3 uppercase">
         Agent
       </span>

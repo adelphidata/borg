@@ -9,6 +9,9 @@ fn make_session(id: &str, title: &str) -> SessionSummary {
         message_count: 5,
         pinned: false,
         turn_active: false,
+        archived: false,
+        last_message_preview: String::new(),
+        last_message_role: String::new(),
     }
 }
 

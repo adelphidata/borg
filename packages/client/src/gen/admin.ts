@@ -400,6 +400,20 @@ export interface SessionList {
   sessions: SessionSummary[];
 }
 
+/**
+ * Options for a session listing. Empty means the default listing, which is
+ * what an old client sends and what every caller wanted before archived rows
+ * could be asked for.
+ */
+export interface ListSessionsRequest {
+  /**
+   * Include archived sessions, flagged as such. Archiving is a soft hide and
+   * this listing is what it hides from, so a client that means to offer a way
+   * back has to ask for them.
+   */
+  includeArchived: boolean;
+}
+
 export interface SessionSummary {
   id: string;
   title: string;
@@ -417,6 +431,21 @@ export interface SessionSummary {
    * the deltas, and a listing reconciles anything a dropped stream missed.
    */
   turnActive: boolean;
+  /**
+   * True when this session is archived. Only ever set when the request asked
+   * for archived rows — the default listing has none to flag.
+   */
+  archived: boolean;
+  /**
+   * One line of the newest conversational message, normalized and capped by
+   * the daemon so every surface shows the same string, and passed through the
+   * same secret redaction an export uses. Empty when the session has only tool
+   * results or lifecycle events — a fresh fork, for instance, which carries no
+   * rows of its own.
+   */
+  lastMessagePreview: string;
+  /** Who said it: "user" or "assistant". Empty alongside an empty preview. */
+  lastMessageRole: string;
 }
 
 export interface SessionRef {
@@ -5460,8 +5489,82 @@ export const SessionList: MessageFns<SessionList> = {
   },
 };
 
+function createBaseListSessionsRequest(): ListSessionsRequest {
+  return { includeArchived: false };
+}
+
+export const ListSessionsRequest: MessageFns<ListSessionsRequest> = {
+  encode(message: ListSessionsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.includeArchived !== false) {
+      writer.uint32(8).bool(message.includeArchived);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ListSessionsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseListSessionsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.includeArchived = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ListSessionsRequest {
+    return {
+      includeArchived: isSet(object.includeArchived)
+        ? globalThis.Boolean(object.includeArchived)
+        : isSet(object.include_archived)
+        ? globalThis.Boolean(object.include_archived)
+        : false,
+    };
+  },
+
+  toJSON(message: ListSessionsRequest): unknown {
+    const obj: any = {};
+    if (message.includeArchived !== false) {
+      obj.includeArchived = message.includeArchived;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ListSessionsRequest>, I>>(base?: I): ListSessionsRequest {
+    return ListSessionsRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ListSessionsRequest>, I>>(object: I): ListSessionsRequest {
+    const message = createBaseListSessionsRequest();
+    message.includeArchived = object.includeArchived ?? false;
+    return message;
+  },
+};
+
 function createBaseSessionSummary(): SessionSummary {
-  return { id: "", title: "", messageCount: 0, updatedUnixTs: 0, pinned: false, turnActive: false };
+  return {
+    id: "",
+    title: "",
+    messageCount: 0,
+    updatedUnixTs: 0,
+    pinned: false,
+    turnActive: false,
+    archived: false,
+    lastMessagePreview: "",
+    lastMessageRole: "",
+  };
 }
 
 export const SessionSummary: MessageFns<SessionSummary> = {
@@ -5483,6 +5586,15 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     }
     if (message.turnActive !== false) {
       writer.uint32(48).bool(message.turnActive);
+    }
+    if (message.archived !== false) {
+      writer.uint32(56).bool(message.archived);
+    }
+    if (message.lastMessagePreview !== "") {
+      writer.uint32(66).string(message.lastMessagePreview);
+    }
+    if (message.lastMessageRole !== "") {
+      writer.uint32(74).string(message.lastMessageRole);
     }
     return writer;
   },
@@ -5542,6 +5654,30 @@ export const SessionSummary: MessageFns<SessionSummary> = {
           message.turnActive = reader.bool();
           continue;
         }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.archived = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.lastMessagePreview = reader.string();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.lastMessageRole = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5571,6 +5707,17 @@ export const SessionSummary: MessageFns<SessionSummary> = {
         : isSet(object.turn_active)
         ? globalThis.Boolean(object.turn_active)
         : false,
+      archived: isSet(object.archived) ? globalThis.Boolean(object.archived) : false,
+      lastMessagePreview: isSet(object.lastMessagePreview)
+        ? globalThis.String(object.lastMessagePreview)
+        : isSet(object.last_message_preview)
+        ? globalThis.String(object.last_message_preview)
+        : "",
+      lastMessageRole: isSet(object.lastMessageRole)
+        ? globalThis.String(object.lastMessageRole)
+        : isSet(object.last_message_role)
+        ? globalThis.String(object.last_message_role)
+        : "",
     };
   },
 
@@ -5594,6 +5741,15 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     if (message.turnActive !== false) {
       obj.turnActive = message.turnActive;
     }
+    if (message.archived !== false) {
+      obj.archived = message.archived;
+    }
+    if (message.lastMessagePreview !== "") {
+      obj.lastMessagePreview = message.lastMessagePreview;
+    }
+    if (message.lastMessageRole !== "") {
+      obj.lastMessageRole = message.lastMessageRole;
+    }
     return obj;
   },
 
@@ -5608,6 +5764,9 @@ export const SessionSummary: MessageFns<SessionSummary> = {
     message.updatedUnixTs = object.updatedUnixTs ?? 0;
     message.pinned = object.pinned ?? false;
     message.turnActive = object.turnActive ?? false;
+    message.archived = object.archived ?? false;
+    message.lastMessagePreview = object.lastMessagePreview ?? "";
+    message.lastMessageRole = object.lastMessageRole ?? "";
     return message;
   },
 };
@@ -13283,7 +13442,7 @@ export const AdminDefinition = {
     /** Sessions. */
     listSessions: {
       name: "ListSessions",
-      requestType: Empty as typeof Empty,
+      requestType: ListSessionsRequest as typeof ListSessionsRequest,
       requestStream: false,
       responseType: SessionList as typeof SessionList,
       responseStream: false,

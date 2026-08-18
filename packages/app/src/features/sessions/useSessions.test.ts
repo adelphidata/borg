@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { draftKeyFor, publishDraft } from "../conversation/draftStore";
 import { applyActivity, resetActivity } from "./activityStore";
-import { filterSessions, groupSessions, resolveTitles, type SessionRow } from "./useSessions";
+import {
+  filterSessions,
+  groupSessions,
+  partitionArchived,
+  resolveTitles,
+  rowSubtitle,
+  type SessionRow,
+} from "./useSessions";
 
 /** 2026-08-09 14:00 local — the reference "now" for every case below. */
 const NOW = new Date(2026, 7, 9, 14, 0, 0).getTime();
@@ -133,5 +140,49 @@ describe("resolveTitles", () => {
     expect(working[0]).not.toBe(settled[0]);
     expect(working[0]!.activity).toBe("working");
     resetActivity();
+  });
+});
+
+describe("partitionArchived", () => {
+  it("splits the put-away conversations out, keeping recency order", () => {
+    const rows: SessionRow[] = [
+      { id: "a", title: "A", messageCount: 2, updatedAt: 300 },
+      { id: "b", title: "B", messageCount: 1, updatedAt: 200, archived: true },
+      { id: "c", title: "C", messageCount: 4, updatedAt: 100 },
+    ];
+
+    const { active, archived } = partitionArchived(rows);
+
+    expect(active.map((r) => r.id)).toEqual(["a", "c"]);
+    expect(archived.map((r) => r.id)).toEqual(["b"]);
+  });
+});
+
+describe("rowSubtitle", () => {
+  const base: SessionRow = { id: "s1", title: "Deploy", messageCount: 6, updatedAt: 100 };
+
+  it("counts up while a turn runs, ahead of anything else the row could say", () => {
+    applyActivity("s1", true, 1_000);
+
+    expect(rowSubtitle({ ...base, activity: "working", preview: "on it" }, 4_000)).toBe(
+      "Working… 3.0s",
+    );
+  });
+
+  it("shows the last thing said when nothing is running", () => {
+    expect(rowSubtitle({ ...base, preview: "shipped it", previewRole: "assistant" }, 0)).toBe(
+      "shipped it",
+    );
+  });
+
+  it("says who spoke when the last word was the user's", () => {
+    expect(rowSubtitle({ ...base, preview: "ship it", previewRole: "user" }, 0)).toBe(
+      "You: ship it",
+    );
+  });
+
+  it("falls back to the count for a session with nothing quotable", () => {
+    expect(rowSubtitle(base, 0)).toBe("6 messages");
+    expect(rowSubtitle({ ...base, messageCount: 1 }, 0)).toBe("1 message");
   });
 });

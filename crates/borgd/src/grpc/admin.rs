@@ -28,8 +28,8 @@ use protocols::admin::{
     GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HandoffClaimRequest, HandoffClaimResponse,
     HandoffFailRequest, HandoffRequest, HandoffStatusReply, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    KeychainRef, ListCredentialsRequest, LogActivityRequest, McpReloadFailure, MessageView,
-    MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairCredentialRequest,
+    KeychainRef, ListCredentialsRequest, ListSessionsRequest, LogActivityRequest, McpReloadFailure,
+    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairCredentialRequest,
     PairCredentialResponse, PairingApproval, PairingFilter, PairingRequestList,
     PluginInstallRequest, PluginInstallResponse, ReloadRequest, ReloadResponse,
     RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
@@ -62,6 +62,33 @@ fn display_text(role: &str, content: String) -> String {
     } else {
         content
     }
+}
+
+/// Longest preview a session row can carry. Long enough to recognise the
+/// conversation, short enough that the daemon is not shipping transcripts to
+/// anything that only asked for a list.
+const PREVIEW_MAX_CHARS: usize = 140;
+
+/// One line of a message, safe to render in a list.
+///
+/// Normalized here rather than in each client so the desktop, the browser and
+/// the TUI cannot disagree about what a session's last line was. Redacted for
+/// the same reason an export is: a pasted key rendering in a conversation list
+/// is the one place nobody thinks to look for it.
+fn preview_line(content: &str) -> String {
+    let redacted = cortex::security::secrets::redact_secrets(content);
+    let flattened = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Leading markdown is scaffolding, not what was said.
+    let trimmed = flattened
+        .trim_start_matches("```")
+        .trim_start_matches('#')
+        .trim_start_matches('>')
+        .trim();
+    if trimmed.chars().count() <= PREVIEW_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(PREVIEW_MAX_CHARS).collect();
+    format!("{}…", cut.trim_end())
 }
 
 /// Boxed session-activity stream; the `Admin::SubscribeSessionActivityStream`
@@ -337,7 +364,11 @@ impl Admin for AdminSvc {
         Ok(Response::new(Empty {}))
     }
 
-    async fn list_sessions(&self, _req: Request<Empty>) -> Result<Response<SessionList>, TStatus> {
+    async fn list_sessions(
+        &self,
+        req: Request<ListSessionsRequest>,
+    ) -> Result<Response<SessionList>, TStatus> {
+        let include_archived = req.into_inner().include_archived;
         // Combine in-memory live sessions with the most recent persisted ones.
         let live: std::collections::HashSet<String> =
             self.registry.live_ids().into_iter().collect();
@@ -345,15 +376,22 @@ impl Admin for AdminSvc {
             let db = Database::open().await?;
             // Over-fetch: archived rows are dropped below, and taking exactly
             // 100 here would let them eat the page budget and silently shrink
-            // the listing. `borg sessions list --archived` surfaces the rest.
-            let rows = db.list_sessions(300).await?;
-            let mut sessions = Vec::with_capacity(rows.len());
+            // the listing. Asking for the archived ones doubles the reach,
+            // since nothing is discarded to make room any more.
+            let fetch = if include_archived { 600 } else { 300 };
+            let rows = db.list_sessions(fetch).await?;
+            // Two budgets rather than one: an old archive must not crowd active
+            // conversations out of the page it was only invited to as an aside.
+            let mut active_taken = 0usize;
+            let mut archived_taken = 0usize;
+            let mut kept = Vec::with_capacity(rows.len());
             for r in rows {
                 // Archiving is a soft hide, and this listing is what it hides
                 // from: `borg sessions list` and the TUI session picker both
                 // render this response. A live session is never hidden — it
                 // would vanish from the picker mid-conversation.
-                if r.archived_at.is_some() && !live.contains(&r.id) {
+                let archived = r.archived_at.is_some() && !live.contains(&r.id);
+                if archived && !include_archived {
                     continue;
                 }
                 // The page budget must never hide a pin: once 100 rows are
@@ -361,10 +399,33 @@ impl Admin for AdminSvc {
                 // guarantees pinned rows are present past the recency window;
                 // dropping them here would recreate the vanishing-pin bug one
                 // layer up.
-                if sessions.len() >= 100 && !r.pinned {
+                let taken = if archived {
+                    &mut archived_taken
+                } else {
+                    &mut active_taken
+                };
+                if *taken >= 100 && !r.pinned {
                     continue;
                 }
-                let count = db.count_session_messages(&r.id).await.unwrap_or(0);
+                *taken += 1;
+                kept.push((r, archived));
+            }
+            // One query each for counts and previews rather than two per row:
+            // a hundred sessions used to mean a hundred round trips before the
+            // list could render at all.
+            let ids: Vec<String> = kept.iter().map(|(r, _)| r.id.clone()).collect();
+            let counts = db
+                .count_session_messages_batch(&ids)
+                .await
+                .unwrap_or_default();
+            let previews = db.last_message_previews(&ids).await.unwrap_or_default();
+            let mut sessions = Vec::with_capacity(kept.len());
+            for (r, archived) in kept {
+                let count = counts.get(&r.id).copied().unwrap_or(0);
+                let (last_message_role, last_message_preview) = previews
+                    .get(&r.id)
+                    .map(|(role, content)| (role.clone(), preview_line(content)))
+                    .unwrap_or_default();
                 let mut title = r.title.clone();
                 if live.contains(&r.id) && !title.contains("(live)") {
                     title = format!("{title} (live)");
@@ -380,6 +441,9 @@ impl Admin for AdminSvc {
                     updated_unix_ts: r.updated_at as u64,
                     pinned: r.pinned,
                     turn_active,
+                    archived,
+                    last_message_preview,
+                    last_message_role,
                 });
             }
             anyhow::Ok(sessions)

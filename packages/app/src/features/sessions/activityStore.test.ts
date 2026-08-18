@@ -8,6 +8,7 @@ import {
   resetActivity,
   sessionActivity,
   subscribeActivity,
+  sessionWorkingSince,
 } from "./activityStore";
 import { markSessionSeen, resetUnread } from "./unreadStore";
 
@@ -121,26 +122,63 @@ describe("sessionActivity", () => {
   });
 
   it("reports a reply that landed since this device last looked", () => {
-    const now = Date.now();
-    markSessionSeen("s7", now - 60_000);
-    expect(sessionActivity("s7", 4, Math.floor(now / 1000))).toBe("unread");
+    const now = Math.floor(Date.now() / 1000);
+    markSessionSeen("s7", { ts: now - 60, count: 2 });
+    expect(sessionActivity("s7", 4, now)).toBe("unread");
   });
 
   it("prefers the running turn over the unread mark", () => {
     // Mid-turn the row should say Borg is working, not that there is something
     // to read: the answer is still arriving.
-    const now = Date.now();
-    markSessionSeen("s8", now - 60_000);
+    const now = Math.floor(Date.now() / 1000);
+    markSessionSeen("s8", { ts: now - 60, count: 2 });
     applyActivity("s8", true);
-    expect(sessionActivity("s8", 4, Math.floor(now / 1000))).toBe("working");
+    expect(sessionActivity("s8", 4, now)).toBe("working");
   });
 
   it("prefers the unread mark over the draft", () => {
     // A conversation with an unsent line in its composer that Borg has since
     // answered: the answer is the news, not the half-typed follow-up.
-    const now = Date.now();
+    const now = Math.floor(Date.now() / 1000);
     publishDraft(draftKeyFor("s9"), "half a thought");
-    markSessionSeen("s9", now - 60_000);
-    expect(sessionActivity("s9", 0, Math.floor(now / 1000))).toBe("unread");
+    // Read before any listing covered it, so the timestamp is what decides.
+    markSessionSeen("s9", { ts: now - 60, count: -1 });
+    expect(sessionActivity("s9", 0, now)).toBe("unread");
+  });
+});
+
+describe("how long a turn has been running", () => {
+  it("reports the daemon's own start time, not when the client heard about it", () => {
+    applyActivity("s10", true, 1_700_000_000_000);
+
+    expect(sessionWorkingSince("s10")).toBe(1_700_000_000_000);
+  });
+
+  it("falls back to now when the event carried no stamp", () => {
+    // An older daemon leaves `emitted_at_unix` at zero; a turn dated 1970 would
+    // render as an elapsed time of fifty-six years.
+    const before = Date.now();
+    applyActivity("s11", true, 0);
+
+    expect(sessionWorkingSince("s11")).toBeGreaterThanOrEqual(before);
+  });
+
+  it("keeps a running turn's start time across a reconnect", () => {
+    // The regression this guards: the reconcile listing replaces the whole set
+    // on every reconnect, and refilling from scratch blinked a long turn's
+    // elapsed count back to zero whenever the socket hiccupped.
+    applyActivity("s12", true, 1_700_000_000_000);
+
+    replaceActivity(["s12", "s13"]);
+
+    expect(sessionWorkingSince("s12")).toBe(1_700_000_000_000);
+    expect(sessionWorkingSince("s13")).toBeGreaterThan(1_700_000_000_000);
+  });
+
+  it("forgets a turn that ended", () => {
+    applyActivity("s14", true, 1_700_000_000_000);
+    applyActivity("s14", false);
+
+    expect(sessionWorkingSince("s14")).toBeUndefined();
   });
 });

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { session as sessionPb } from "@borg/client";
-import { historyCells, reduceEvent, stampTurnDuration, type Cell } from "./useConversation";
+import {
+  contextUsed,
+  historyCells,
+  reduceEvent,
+  stampTurnDuration,
+  type Cell,
+} from "./useConversation";
 
 /** Builds an AgentEvent with just the variant under test set. */
 function event(kind: Partial<sessionPb.AgentEvent>): sessionPb.AgentEvent {
@@ -270,5 +276,31 @@ describe("historyCells", () => {
         stderr: false,
       },
     ]);
+  });
+});
+
+describe("contextUsed", () => {
+  it("counts only the top-level components", () => {
+    expect(
+      contextUsed([
+        { tokens: 1_000, detail: false },
+        { tokens: 400, detail: true },
+        { tokens: 600, detail: true },
+        { tokens: 250, detail: false },
+      ]),
+    ).toBe(1_250);
+  });
+
+  it("sums the wire's bigint token counts", () => {
+    expect(
+      contextUsed([
+        { tokens: 9_007_199n, detail: false },
+        { tokens: 1n, detail: false },
+      ]),
+    ).toBe(9_007_200);
+  });
+
+  it("is zero when every component itemizes a parent", () => {
+    expect(contextUsed([{ tokens: 500, detail: true }])).toBe(0);
   });
 });

@@ -17,7 +17,7 @@ service Admin {
   rpc UnsetSetting(SettingKey) returns (Empty);
 
   // Sessions.
-  rpc ListSessions(Empty) returns (SessionList);
+  rpc ListSessions(ListSessionsRequest) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
   rpc SetSessionArchived(SessionArchiveMutation) returns (Empty);
   rpc SetSessionTitle(SessionTitleMutation) returns (Empty);
@@ -497,6 +497,15 @@ message SettingsSnapshot { repeated SettingEntry entries = 1; }
 message SessionList {
   repeated SessionSummary sessions = 1;
 }
+// Options for a session listing. Empty means the default listing, which is
+// what an old client sends and what every caller wanted before archived rows
+// could be asked for.
+message ListSessionsRequest {
+  // Include archived sessions, flagged as such. Archiving is a soft hide and
+  // this listing is what it hides from, so a client that means to offer a way
+  // back has to ask for them.
+  bool include_archived = 1;
+}
 message SessionSummary {
   string id = 1;
   string title = 2;
@@ -510,6 +519,17 @@ message SessionSummary {
   // snapshot half of the activity feed — `SubscribeSessionActivity` carries
   // the deltas, and a listing reconciles anything a dropped stream missed.
   bool turn_active = 6;
+  // True when this session is archived. Only ever set when the request asked
+  // for archived rows — the default listing has none to flag.
+  bool archived = 7;
+  // One line of the newest conversational message, normalized and capped by
+  // the daemon so every surface shows the same string, and passed through the
+  // same secret redaction an export uses. Empty when the session has only tool
+  // results or lifecycle events — a fresh fork, for instance, which carries no
+  // rows of its own.
+  string last_message_preview = 8;
+  // Who said it: "user" or "assistant". Empty alongside an empty preview.
+  string last_message_role = 9;
 }
 message SessionRef { string id = 1; }
 // Archive (soft-hide) one session, or restore it. Archiving never deletes —

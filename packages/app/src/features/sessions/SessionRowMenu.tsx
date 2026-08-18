@@ -5,25 +5,41 @@ import { useKeybind } from "../../lib/keybinds";
 export interface SessionRowMenuProps {
   onRename: () => void;
   onArchive: () => void;
+  /** Brings an archived conversation back. Offered in place of Archive. */
+  onRestore?: () => void;
   onExport: (format: string) => void;
+  /** Whether this row is already archived. */
+  archived?: boolean;
 }
 
 /** Builds the row's actions once, so the kebab and right-click can never differ. */
 export function sessionRowActions({
   onRename,
   onArchive,
+  onRestore,
   onExport,
+  archived = false,
 }: SessionRowMenuProps): MenuAction[] {
   return [
     { id: "rename", label: "Rename", icon: <PencilIcon size={13} />, onSelect: onRename },
     { id: "export", label: "Export…", onSelect: () => onExport("md") },
-    {
-      id: "archive",
-      label: "Archive",
-      icon: <ArchiveIcon size={13} />,
-      onSelect: onArchive,
-      dividerBefore: true,
-    },
+    // The same slot either way: a row never grows an action, it changes the one
+    // it has, so the menu is the same shape wherever the conversation sits.
+    archived
+      ? {
+          id: "restore",
+          label: "Restore",
+          icon: <ArchiveIcon size={13} />,
+          onSelect: onRestore ?? (() => {}),
+          dividerBefore: true,
+        }
+      : {
+          id: "archive",
+          label: "Archive",
+          icon: <ArchiveIcon size={13} />,
+          onSelect: onArchive,
+          dividerBefore: true,
+        },
   ];
 }
 

@@ -3,7 +3,9 @@ import { useNavigate, useParams } from "react-router-dom";
 import { AgentsIcon, FindBar, PageChrome, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
 import { DaemonState } from "../../components/DaemonState";
+import { formatElapsed } from "../../lib/format";
 import { useKeybind } from "../../lib/keybinds";
+import { useTick } from "../../lib/useTick";
 import { markSessionSeen } from "../sessions/unreadStore";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
@@ -33,6 +35,8 @@ export function ConversationPage() {
     cells,
     plan,
     busy,
+    awaitingInput,
+    turnStartedAt,
     sendError,
     streamError,
     streamOutageSustained,
@@ -45,6 +49,9 @@ export function ConversationPage() {
     fork,
     context,
   } = useConversation(target);
+
+  // A live count of the wait, ticking only while there is a wait to count.
+  const now = useTick(1_000, busy && turnStartedAt !== undefined);
 
   // The daemon rewinds by user-message ordinal, so each user cell needs its
   // position among user cells rather than its index in the list.
@@ -236,7 +243,12 @@ export function ConversationPage() {
                     <ChangedFilesCard edits={edits} uncounted={uncounted} />
                   )}
                   {busy && (
-                    <div className="px-1 text-[12px] leading-none text-ink3">Borg is thinking…</div>
+                    <div className="px-1 text-[12px] leading-none text-ink3">
+                      Borg is thinking…
+                      {turnStartedAt !== undefined && (
+                        <span className="text-ink3"> {formatElapsed(now - turnStartedAt)}</span>
+                      )}
+                    </div>
                   )}
                   {sendError && (
                     <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2">
@@ -296,6 +308,7 @@ export function ConversationPage() {
 
       <Composer
         busy={busy}
+        awaitingInput={awaitingInput}
         draftKey={draftKey}
         conversationKey={target ?? "latest"}
         sessionId={liveSessionId}

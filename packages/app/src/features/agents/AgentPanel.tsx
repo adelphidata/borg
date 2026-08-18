@@ -10,13 +10,20 @@ import {
 } from "@borg/ui";
 import type { admin as adminPb } from "@borg/client";
 import { formatTokens } from "../../lib/format";
-import { isLive, useAgentTree } from "./useAgentTree";
+import { classifyStatus, failureReason, isLive, statusLabel, useAgentTree } from "./useAgentTree";
 
 function statusTone(status: string): DotTone {
-  if (status === "running") return "busy";
-  if (status === "errored") return "alert";
   if (status === "paused") return "paused";
-  return "idle";
+  switch (classifyStatus(status)) {
+    case "live":
+      return "busy";
+    case "done":
+      return "idle";
+    // A status nobody recognizes is a problem until proven otherwise.
+    case "failed":
+    case "unknown":
+      return "alert";
+  }
 }
 
 function AgentRow({
@@ -31,6 +38,7 @@ function AgentRow({
   onKill: () => void;
 }) {
   const live = isLive(agent.status);
+  const reason = failureReason(agent);
   const metrics = agent.metrics;
   const tokens = metrics ? Number(metrics.inputTokens) + Number(metrics.outputTokens) : 0;
 
@@ -46,12 +54,14 @@ function AgentRow({
           {agent.nickname || agent.role || agent.id}
         </div>
         <div className="mt-[2px] truncate text-[11px] leading-none text-ink3">
-          {agent.status}
+          {statusLabel(agent)}
           {tokens > 0 && <> · {formatTokens(tokens)} tok</>}
           {metrics && metrics.toolCalls > 0n && <> · {Number(metrics.toolCalls)} calls</>}
         </div>
-        {agent.status === "errored" && agent.error && (
-          <div className="mt-1 text-[11px] leading-[1.4] text-alert">{agent.error}</div>
+        {/* Every way of stopping badly gets a line. An agent that went quiet
+            with nothing to say is exactly the case worth naming. */}
+        {reason !== undefined && (
+          <div className="mt-1 text-[11px] leading-[1.4] text-alert">{reason}</div>
         )}
       </div>
       {live && agent.depth > 0 && (

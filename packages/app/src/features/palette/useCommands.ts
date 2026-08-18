@@ -4,6 +4,7 @@ import { useTheme } from "@borg/ui";
 import { dispatchKeybind, hintFor } from "../../lib/keybinds";
 import { useQuery } from "../../lib/useDaemon";
 import { useSettings } from "../../lib/settings";
+import { isSessionUnread, markAllSessionsRead } from "../sessions/unreadStore";
 import { routes } from "../../routes";
 import { buildCommands } from "./commands";
 import type { Command } from "./score";
@@ -138,6 +139,19 @@ export function useCommands({
     return merged;
   }, [snapshot, pending]);
 
+  // Read rows for the sessions the palette already fetched, in the daemon's own
+  // units — the same figures the dots are derived from.
+  const readRows = useMemo(
+    () =>
+      (sessions.state === "ready" ? sessions.data : []).map((s) => ({
+        id: s.id,
+        updatedAt: Number(s.updatedUnixTs),
+        messageCount: Number(s.messageCount),
+      })),
+    [sessions.state, sessions.data],
+  );
+  const anyUnread = readRows.some((r) => isSessionUnread(r.id, r.updatedAt, r.messageCount));
+
   const commands = useMemo<Command[]>(
     () =>
       !active
@@ -150,6 +164,7 @@ export function useCommands({
               settings: effective,
               saveSetting,
               sessions: sessions.state === "ready" ? sessions.data : [],
+              markAllRead: anyUnread ? () => markAllSessionsRead(readRows) : undefined,
               skills: skills.state === "ready" ? skills.data : [],
               skillRecency,
               noteSkillUse: noteSkill,
@@ -167,6 +182,8 @@ export function useCommands({
       navigate,
       sessions.state,
       sessions.data,
+      readRows,
+      anyUnread,
       skills.state,
       skills.data,
       skillRecency,

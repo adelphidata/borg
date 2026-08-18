@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BorgError, session as sessionPb } from "@borg/client";
 import {
   asBorgError,
@@ -10,6 +10,8 @@ import {
 } from "../../lib/useDaemon";
 import { splitAttachments } from "./attachments";
 import { draftKeyFor, moveDraft } from "./draftStore";
+import { awaitingInput as awaitingInputOf, retirePrompts } from "./queuedTurn";
+import { createTurnClock } from "./turnClock";
 
 /** An image riding along with a turn. */
 export interface Attachment {
@@ -325,6 +327,18 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
   return cells;
 }
 
+/**
+ * Total context tokens in use.
+ *
+ * `detail` rows itemize a parent that already counts their tokens, so including
+ * them would double-count and report an impossible total.
+ */
+export function contextUsed(
+  components: readonly { tokens: bigint | number; detail: boolean }[],
+): number {
+  return components.filter((c) => !c.detail).reduce((sum, c) => sum + Number(c.tokens), 0);
+}
+
 export interface Conversation {
   /** Open + state + history, routed through DaemonState by the page. */
   opened: QueryResult<{ title: string; model: string; agentSessionId: string }>;
@@ -340,6 +354,17 @@ export interface Conversation {
   plan: PlanStep[];
   /** True while a turn is running. */
   busy: boolean;
+  /**
+   * True while the turn is parked on a prompt only the user can answer. The
+   * composer queues what it is given instead of steering it into a channel
+   * nobody is draining.
+   */
+  awaitingInput: boolean;
+  /**
+   * When the turn in flight started, for a live elapsed counter. Undefined
+   * between turns.
+   */
+  turnStartedAt: number | undefined;
   sendError: BorgError | undefined;
   /** Set when the event stream dropped; the hook retries on its own. */
   streamError: BorgError | undefined;
@@ -382,6 +407,7 @@ export function useConversation(target: string | undefined): Conversation {
   const borg = useBorg();
   const [sessionId, setSessionId] = useState<string>();
   const [cells, setCells] = useState<Cell[]>([]);
+  const awaitingInput = useMemo(() => awaitingInputOf(cells), [cells]);
   const [plan, setPlan] = useState<PlanStep[]>([]);
   const [busy, setBusy] = useState(false);
   const [sendError, setSendError] = useState<BorgError>();
@@ -394,10 +420,26 @@ export function useConversation(target: string | undefined): Conversation {
   /**
    * When the turn in flight started, or undefined between turns.
    *
-   * Armed at submit rather than at the first event: the wait for the provider to
-   * answer is part of what the user sat through, and it is often most of it.
+   * Started at submit rather than at the first event: the wait for the provider
+   * to answer is part of what the user sat through, and it is often most of it.
+   * The ref is the source of truth — the stream callback reads it synchronously
+   * — and the state mirror exists only so the page can render a live counter.
    */
-  const turnStartedAt = useRef<number | undefined>(undefined);
+  const clock = useRef(createTurnClock());
+  const [turnStartedAt, setTurnStartedAt] = useState<number | undefined>(undefined);
+  const startTurnClock = useCallback((at: number = Date.now()) => {
+    clock.current.start(at);
+    setTurnStartedAt(clock.current.startedAt());
+  }, []);
+  const armTurnClock = useCallback((at: number = Date.now()) => {
+    clock.current.arm(at);
+    setTurnStartedAt(clock.current.startedAt());
+  }, []);
+  const stopTurnClock = useCallback((at: number = Date.now()) => {
+    const elapsedMs = clock.current.stop(at);
+    setTurnStartedAt(undefined);
+    return elapsedMs;
+  }, []);
 
   const opened = useQuery(
     async (borg) => {
@@ -407,7 +449,8 @@ export function useConversation(target: string | undefined): Conversation {
       setBusy(false);
       setSendError(undefined);
       setStreamError(undefined);
-      turnStartedAt.current = undefined;
+      setContext(undefined);
+      stopTurnClock();
 
       let resumeId = target === "new" ? undefined : target;
       if (resumeId === undefined && target === undefined) {
@@ -461,15 +504,16 @@ export function useConversation(target: string | undefined): Conversation {
       // wake — has no submit to arm the clock, so the first event does it.
       if (event.preparing) {
         setBusy(true);
-        turnStartedAt.current ??= Date.now();
+        armTurnClock();
       }
       if (event.planUpdated) setPlan(event.planUpdated.steps);
       setCells((prev) => reduceEvent(prev, event));
       if (event.turnComplete || event.error) {
-        const startedAt = turnStartedAt.current;
-        turnStartedAt.current = undefined;
-        if (startedAt !== undefined) {
-          const elapsedMs = Date.now() - startedAt;
+        // The turn that raised any open prompt is over, so retire them: a cell
+        // left waiting keeps the composer queueing instead of steering.
+        setCells(retirePrompts);
+        const elapsedMs = stopTurnClock();
+        if (elapsedMs !== undefined) {
           setCells((prev) => stampTurnDuration(prev, elapsedMs));
         }
       }
@@ -490,7 +534,10 @@ export function useConversation(target: string | undefined): Conversation {
   }, [state.status, state.error, sessionId]);
 
   const send = useCallback(
-    (text: string, attachments: Attachment[] = []) => {
+    // `startedAt` lets a caller that had work to do first — the rewind an
+    // edit-and-resend waits on — bill that wait to the turn the user is
+    // watching. The public signature takes two arguments; the third is internal.
+    (text: string, attachments: Attachment[] = [], startedAt: number = Date.now()) => {
       if (!sessionId) return;
       setCells((prev) => [
         ...prev,
@@ -498,7 +545,7 @@ export function useConversation(target: string | undefined): Conversation {
       ]);
       setBusy(true);
       setSendError(undefined);
-      turnStartedAt.current = Date.now();
+      startTurnClock(startedAt);
       // The turn's events arrive on the Stream subscription above.
       borg.session.send(
         { sessionId, text, ...splitAttachments(attachments) },
@@ -507,12 +554,12 @@ export function useConversation(target: string | undefined): Conversation {
           onError: (error) => {
             setSendError(asBorgError(error));
             setBusy(false);
-            turnStartedAt.current = undefined;
+            stopTurnClock();
           },
         },
       );
     },
-    [borg, sessionId],
+    [borg, sessionId, startTurnClock, stopTurnClock],
   );
 
   const steerMutation = useMutation((borg, text: string) =>
@@ -531,22 +578,44 @@ export function useConversation(target: string | undefined): Conversation {
       // user message and replays it as `steerReceived` on this same stream, so
       // a local echo renders the turn twice and — worse — shifts every later
       // user cell's ordinal away from the one `rewindToNthUserMessage` counts.
+      //
+      // A steer that lands between turns starts one, which the daemon reports
+      // via `preparing` a moment later; arm now so that gap is counted. `arm`,
+      // not `start`: a mid-turn steer must not restart the turn's clock.
+      armTurnClock();
       void steerMutation.run(text);
     },
-    [steerMutation.run],
+    [armTurnClock, steerMutation.run],
   );
-  const cancel = useCallback(() => void cancelMutation.run(undefined), [cancelMutation.run]);
+  const cancel = useCallback(() => {
+    // A cancelled turn leaves nobody waiting on its prompts, so retire them —
+    // live Allow/Deny pills wired to an abandoned prompt id are a dead end.
+    setCells(retirePrompts);
+    void cancelMutation.run(undefined);
+  }, [cancelMutation.run]);
 
-  const [context, setContext] = useState<{ used: number; window: number }>();
+  /**
+   * The context meter, tagged with the session it describes.
+   *
+   * One ConversationPage instance serves every `/c/:id`, so switching
+   * conversations changes `target` without remounting — and `getContextBreakdown`
+   * for the session just left can resolve after the next one is on screen. The
+   * tag is what stops that answer from rendering.
+   */
+  const [context, setContext] = useState<{
+    sessionId: string;
+    used: number;
+    window: number;
+  }>();
   const contextMutation = useMutation(async (borg) => {
     if (!sessionId) return undefined;
-    const breakdown = await borg.session.getContextBreakdown({ sessionId });
-    // `detail` rows itemize a parent that already counts their tokens, so
-    // including them would double-count and report an impossible total.
-    const used = breakdown.components
-      .filter((c) => !c.detail)
-      .reduce((sum, c) => sum + Number(c.tokens), 0);
-    setContext({ used, window: Number(breakdown.contextWindow) });
+    const forSession = sessionId;
+    const breakdown = await borg.session.getContextBreakdown({ sessionId: forSession });
+    setContext({
+      sessionId: forSession,
+      used: contextUsed(breakdown.components),
+      window: Number(breakdown.contextWindow),
+    });
     return breakdown;
   });
   const refreshContext = useCallback(
@@ -568,6 +637,9 @@ export function useConversation(target: string | undefined): Conversation {
   const editAndResend = useCallback(
     (nthUserMessage: number, text: string) => {
       if (!sessionId) return;
+      // The rewind round-trip is time the user spends watching a resent turn do
+      // nothing, so the clock starts here rather than after it resolves.
+      const startedAt = Date.now();
       // Rewind FIRST. `useMutation.run` reports failure as `undefined` rather
       // than rejecting, so resending unconditionally would append the rewritten
       // turn to a history the daemon never truncated — a duplicate turn on a
@@ -580,7 +652,7 @@ export function useConversation(target: string | undefined): Conversation {
           const cut = prev.findIndex((c) => c.kind === "user" && seen++ === nthUserMessage);
           return cut === -1 ? prev : prev.slice(0, cut);
         });
-        send(text);
+        send(text, [], startedAt);
       });
     },
     [rewindMutation.run, send, sessionId],
@@ -629,6 +701,8 @@ export function useConversation(target: string | undefined): Conversation {
     cells,
     plan,
     busy,
+    awaitingInput,
+    turnStartedAt,
     sendError,
     streamError,
     streamOutageSustained: state.sustained,
@@ -639,7 +713,11 @@ export function useConversation(target: string | undefined): Conversation {
     editAndResend,
     compact: () => compactMutation.run(undefined),
     fork: () => forkMutation.run(undefined).then((r) => r?.forkedAgentSessionId),
-    context,
+    // Never hand back a meter belonging to a session that is no longer shown.
+    context:
+      context && context.sessionId === sessionId
+        ? { used: context.used, window: context.window }
+        : undefined,
     refreshContext,
   };
 }

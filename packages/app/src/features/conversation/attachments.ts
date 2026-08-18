@@ -144,6 +144,81 @@ export function rejectionReason(file: File): string | null {
   return null;
 }
 
+/** Longest edge of a composer thumbnail, in CSS pixels times a retina factor. */
+export const PREVIEW_MAX_EDGE = 320;
+
+/**
+ * Below this, decoding the image twice costs more than the paint it saves.
+ */
+export const PREVIEW_SKIP_BYTES = 256 * 1024;
+
+/**
+ * The thumbnail's dimensions: the same picture, no larger than `maxEdge`.
+ *
+ * Never upscales — a 40-pixel icon blown up to 320 is worse than the icon —
+ * and hands back what it was given if the dimensions are nonsense, so a
+ * bad decode falls through to the full-size path rather than dividing by zero.
+ */
+export function previewSize(
+  width: number,
+  height: number,
+  maxEdge = PREVIEW_MAX_EDGE,
+): { width: number; height: number } {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return { width, height };
+  }
+  const longest = Math.max(width, height);
+  if (longest <= maxEdge) return { width, height };
+  const scale = maxEdge / longest;
+  return { width: Math.round(width * scale), height: Math.round(height * scale) };
+}
+
+/**
+ * An object URL for the composer chip, downscaled when that is worth doing.
+ *
+ * A 10 MB photo behind a 52-pixel chip is decoded and painted at full size,
+ * which is what froze the composer on a drop. The bytes on the wire are
+ * untouched — this is the preview only.
+ *
+ * Fails open at every step: no `createImageBitmap`, no 2D context (jsdom), or
+ * a decode that throws all fall back to the plain object URL, which is exactly
+ * what this did before. Exactly one URL is minted either way, because the
+ * composer's revoke bookkeeping tracks what it is handed.
+ */
+async function previewUrlFor(file: File): Promise<string> {
+  if (file.size <= PREVIEW_SKIP_BYTES || typeof createImageBitmap !== "function") {
+    return URL.createObjectURL(file);
+  }
+  let bitmap: ImageBitmap | undefined;
+  try {
+    bitmap = await createImageBitmap(file);
+    const { width, height } = previewSize(bitmap.width, bitmap.height);
+    // Asked once and remembered: `canvas instanceof OffscreenCanvas` would
+    // throw where the constructor does not exist at all, which is exactly the
+    // browser the element fallback is here for.
+    const offscreen = typeof OffscreenCanvas === "function";
+    const canvas = offscreen
+      ? new OffscreenCanvas(width, height)
+      : Object.assign(document.createElement("canvas"), { width, height });
+    const ctx = canvas.getContext("2d") as
+      OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
+    if (!ctx) return URL.createObjectURL(file);
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    const blob = offscreen
+      ? await (canvas as OffscreenCanvas).convertToBlob({ type: "image/webp", quality: 0.82 })
+      : await new Promise<Blob | null>((resolve) =>
+          (canvas as HTMLCanvasElement).toBlob(resolve, "image/webp", 0.82),
+        );
+    return blob ? URL.createObjectURL(blob) : URL.createObjectURL(file);
+  } catch {
+    return URL.createObjectURL(file);
+  } finally {
+    // The decoded bitmap is the largest allocation here and is not collected
+    // promptly on its own.
+    bitmap?.close?.();
+  }
+}
+
 /**
  * Reads a pasted or dropped file into the raw bytes the wire wants.
  *
@@ -160,7 +235,7 @@ export async function toAttachment(file: File): Promise<Attachment> {
     mimeType: file.type,
     data: new Uint8Array(buffer),
     filename: file.name || (isImage ? "pasted-image" : "pasted.txt"),
-    previewUrl: isImage ? URL.createObjectURL(file) : undefined,
+    previewUrl: isImage ? await previewUrlFor(file) : undefined,
   };
 }
 

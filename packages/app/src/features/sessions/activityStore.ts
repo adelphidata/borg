@@ -15,7 +15,8 @@
 import { draftKeyFor, draftTitle, readDraft } from "../conversation/draftStore";
 import { isSessionUnread } from "./unreadStore";
 
-const working = new Set<string>();
+/** Session id to when its turn started, in ms. */
+const working = new Map<string, number>();
 const listeners = new Set<() => void>();
 let version = 0;
 
@@ -24,10 +25,20 @@ function notify() {
   for (const listener of listeners) listener();
 }
 
-/** Folds in one transition from the activity feed. */
-export function applyActivity(sessionId: string, turnActive: boolean): void {
+/**
+ * Folds in one transition from the activity feed.
+ *
+ * `startedAtMs` is the daemon's own stamp for the transition, so a row that
+ * counts up agrees with the transcript beside it. A zero — an event from a
+ * daemon that did not stamp one — falls back to now.
+ */
+export function applyActivity(
+  sessionId: string,
+  turnActive: boolean,
+  startedAtMs: number = Date.now(),
+): void {
   if (turnActive === working.has(sessionId)) return;
-  if (turnActive) working.add(sessionId);
+  if (turnActive) working.set(sessionId, startedAtMs || Date.now());
   else working.delete(sessionId);
   notify();
 }
@@ -42,14 +53,23 @@ export function applyActivity(sessionId: string, turnActive: boolean): void {
 export function replaceActivity(sessionIds: readonly string[]): void {
   const next = new Set(sessionIds);
   if (next.size === working.size && [...next].every((id) => working.has(id))) return;
+  // Each surviving turn keeps the moment it started. A reconnect is not a new
+  // turn, and refilling from scratch would blink a four-minute turn back to
+  // zero every time the socket hiccupped.
+  const carried = [...next].map((id): [string, number] => [id, working.get(id) ?? Date.now()]);
   working.clear();
-  for (const id of next) working.add(id);
+  for (const [id, startedAt] of carried) working.set(id, startedAt);
   notify();
 }
 
 /** True while a turn runs in this session. */
 export function isSessionWorking(sessionId: string): boolean {
   return working.has(sessionId);
+}
+
+/** When this session's turn started, or undefined when none is running. */
+export function sessionWorkingSince(sessionId: string): number | undefined {
+  return working.get(sessionId);
 }
 
 /** Subscribes to every change in the working set. Returns the unsubscribe. */
@@ -88,7 +108,7 @@ export function sessionActivity(
   // Working wins: a session can hold an unsent draft in one window while a
   // turn runs in another, and the turn is the news.
   if (isSessionWorking(sessionId)) return "working";
-  if (isSessionUnread(sessionId, updatedAt)) return "unread";
+  if (isSessionUnread(sessionId, updatedAt, messageCount)) return "unread";
   // A conversation with history is not a draft, whatever sits in its composer.
   if (messageCount > 0) return undefined;
   return draftTitle(readDraft(draftKeyFor(sessionId))) === "" ? undefined : "draft";

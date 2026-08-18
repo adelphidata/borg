@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { dispatchKeybind, resetKeybinds } from "../../lib/keybinds";
 import type { Command } from "../palette/score";
 import { Composer } from "./Composer";
-import { draftKeyFor, moveDraft } from "./draftStore";
+import { draftKeyFor, moveDraft, readDraft } from "./draftStore";
 
 /**
  * The command list reaches the composer through the daemon-backed hook the
@@ -573,5 +573,108 @@ describe("attaching a document", () => {
 
     expect(screen.queryByText("notes.md")).toBeNull();
     expect(screen.getByAltText("shot.png")).toBeTruthy();
+  });
+});
+
+describe("typing while Borg waits on a prompt", () => {
+  /** The composer as the page renders it while an Allow/Deny sits above. */
+  function awaiting() {
+    const props = {
+      busy: true,
+      awaitingInput: true,
+      draftKey: draftKeyFor("sess-1"),
+      conversationKey: "sess-1",
+      onSend: vi.fn<(text: string, attachments: unknown[]) => void>(),
+      onSteer: vi.fn<(text: string) => void>(),
+      onCancel: vi.fn<() => void>(),
+    };
+    return { props, ...render(<Composer {...props} />) };
+  }
+
+  /** Types `text` and presses Enter. */
+  function submit(text: string) {
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.keyDown(box, { key: "Enter" });
+  }
+
+  it("holds the text instead of steering it into a channel nobody drains", () => {
+    const { props } = awaiting();
+
+    submit("also check the logs");
+
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+    expect(screen.getByText(/Sends next/)).toBeTruthy();
+  });
+
+  it("sends the held text once the turn ends", () => {
+    const { props, rerender } = awaiting();
+    submit("also check the logs");
+
+    rerender(<Composer {...props} busy={false} awaitingInput={false} />);
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    expect(props.onSend.mock.calls[0][0]).toBe("also check the logs");
+    expect(screen.queryByText(/Sends next/)).toBeNull();
+  });
+
+  it("merges a second submission into the one entry", () => {
+    const { props, rerender } = awaiting();
+    submit("also check the logs");
+    submit("and the config");
+
+    rerender(<Composer {...props} busy={false} awaitingInput={false} />);
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    expect(props.onSend.mock.calls[0][0]).toBe("also check the logs\nand the config");
+  });
+
+  it("gives the text back rather than binning it", () => {
+    const { props, rerender } = awaiting();
+    submit("also check the logs");
+
+    fireEvent.click(screen.getByLabelText("Return to composer"));
+
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "also check the logs");
+    rerender(<Composer {...props} busy={false} awaitingInput={false} />);
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it("returns the held text when the turn is stopped, and never sends it", () => {
+    const { props, rerender } = awaiting();
+    submit("also check the logs");
+
+    fireEvent.click(screen.getByText("Stop"));
+
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "also check the logs");
+    rerender(<Composer {...props} busy={false} awaitingInput={false} />);
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it("returns the held text when Escape cancels the turn", () => {
+    const { props } = awaiting();
+    submit("also check the logs");
+
+    act(() => dispatchKeybind("cancel-turn"));
+
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "also check the logs");
+  });
+
+  it("keeps the held text recoverable as this conversation's draft", () => {
+    awaiting();
+
+    submit("also check the logs");
+
+    expect(readDraft(draftKeyFor("sess-1"))).toBe("also check the logs");
+  });
+
+  it("names what Enter will do before it is pressed", () => {
+    awaiting();
+
+    expect(screen.getByRole("textbox")).toHaveProperty("placeholder", "Send after this…");
   });
 });

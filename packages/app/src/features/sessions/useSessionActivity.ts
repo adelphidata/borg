@@ -58,7 +58,10 @@ export function useSessionActivityFeed(): void {
     (borg, handlers) => borg.admin.subscribeSessionActivity({}, handlers),
     (event) => {
       sinceListing.current?.set(event.sessionId, event.turnActive);
-      applyActivity(event.sessionId, event.turnActive);
+      // The daemon's stamp for the transition, so an elapsed count is measured
+      // from when the turn really started rather than from when this client
+      // heard about it.
+      applyActivity(event.sessionId, event.turnActive, Number(event.emittedAtUnix) * 1000);
     },
   );
 
