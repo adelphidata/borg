@@ -5,9 +5,15 @@ use crate::skills::{load_all_skills, Skill};
 
 use super::require_str_param;
 
-pub fn handle_list_skills(config: &Config) -> Result<String> {
+/// Render the skill catalog.
+///
+/// `workspace` must be the session's workspace root when there is one: the
+/// project tier is loaded into the system prompt from there, and a listing
+/// that omitted it would tell the operator a skill the checkout injected does
+/// not exist. `None` only for callers that genuinely have no session.
+pub fn handle_list_skills(config: &Config, workspace: Option<&std::path::Path>) -> Result<String> {
     let resolved_creds = config.resolve_credentials();
-    let skills = load_all_skills(&resolved_creds, &config.skills)?;
+    let skills = load_all_skills(&resolved_creds, &config.skills, workspace)?;
     if skills.is_empty() {
         Ok("No skills installed.".to_string())
     } else {
@@ -24,10 +30,11 @@ pub fn handle_list(
     args: &serde_json::Value,
     config: &Config,
     agent_control: Option<&crate::multi_agent::AgentControl>,
+    workspace: Option<&std::path::Path>,
 ) -> Result<String> {
     let what = require_str_param(args, "what")?;
     match what {
-        "skills" => handle_list_skills(config),
+        "skills" => handle_list_skills(config, workspace),
         "channels" => handle_list_channels(config),
         "agents" => {
             if let Some(ctrl) = agent_control {
@@ -98,7 +105,7 @@ mod tests {
     fn list_unknown_what() {
         let config = Config::default();
         let args = json!({"what": "unknown"});
-        let result = handle_list(&args, &config, None).unwrap();
+        let result = handle_list(&args, &config, None, None).unwrap();
         assert!(result.contains("Unknown list target"));
     }
 
@@ -106,7 +113,7 @@ mod tests {
     fn list_missing_what() {
         let config = Config::default();
         let args = json!({});
-        let result = handle_list(&args, &config, None);
+        let result = handle_list(&args, &config, None, None);
         assert!(result.is_err());
     }
 
@@ -114,7 +121,7 @@ mod tests {
     fn list_agents_without_control() {
         let config = Config::default();
         let args = json!({"what": "agents"});
-        let result = handle_list(&args, &config, None).unwrap();
+        let result = handle_list(&args, &config, None, None).unwrap();
         assert!(result.contains("not enabled"));
     }
 
@@ -123,8 +130,8 @@ mod tests {
         let config = Config::default();
         let args = json!({"what": "skills"});
         // handle_list("skills") must route to handle_list_skills and return its output.
-        let routed = handle_list(&args, &config, None).unwrap();
-        let direct = handle_list_skills(&config).unwrap();
+        let routed = handle_list(&args, &config, None, None).unwrap();
+        let direct = handle_list_skills(&config, None).unwrap();
         assert_eq!(
             routed, direct,
             "handle_list(\"skills\") should return the same output as handle_list_skills"
@@ -138,7 +145,7 @@ mod tests {
     #[test]
     fn list_skills_output_contains_skill_names() {
         let config = Config::default();
-        let output = handle_list_skills(&config).unwrap();
+        let output = handle_list_skills(&config, None).unwrap();
         assert!(
             output.contains("] slack ("),
             "output should list slack skill, got:\n{output}"
@@ -159,7 +166,7 @@ mod tests {
         let config = Config::default();
         let args = json!({"what": "channels"});
         // handle_list("channels") must route to handle_list_channels and return its output.
-        let routed = handle_list(&args, &config, None).unwrap();
+        let routed = handle_list(&args, &config, None, None).unwrap();
         let direct = handle_list_channels(&config).unwrap();
         assert_eq!(
             routed, direct,

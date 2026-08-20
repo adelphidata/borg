@@ -13,6 +13,13 @@ impl Database {
     /// nothing to upgrade *from* — `SCHEMA_SQL` is the single source of truth
     /// for the shape, and a new table or column belongs there, not in a
     /// follow-on migration.
+    ///
+    /// The one thing a follow-on migration is still for: reconciling a
+    /// database that was already stamped before the column was added to
+    /// `SCHEMA_SQL`. Every developer and pre-release install has one, and it
+    /// never re-runs this function, so a column added here alone would exist
+    /// on fresh databases and be missing on every existing one. See
+    /// [`Database::migrate_v2`].
     pub(super) async fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_SQL.as_str()).await?;
         self.seed_default_tasks().await?;
@@ -22,6 +29,43 @@ impl Database {
         self.seed_default_budget().await?;
         self.seed_bundled_rate_cards().await?;
         Ok(())
+    }
+
+    /// Reconcile `scheduled_tasks` with the columns `SCHEMA_SQL` declares.
+    ///
+    /// `migrate_v1` only ever runs against a database that has no stamp, so a
+    /// column added to `SCHEMA_SQL` afterwards is missing from every database
+    /// created before that edit — and every query naming it fails there while
+    /// passing on a fresh one. Adding the column here is idempotent: the
+    /// `PRAGMA` check means it is a no-op on a database that already has it,
+    /// including one freshly built from `SCHEMA_SQL`.
+    pub(super) async fn migrate_v2(&self) -> Result<()> {
+        if !self.column_exists("scheduled_tasks", "continuity").await? {
+            self.conn
+                .execute(
+                    "ALTER TABLE scheduled_tasks \
+                     ADD COLUMN continuity INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `table` currently has a column named `column`.
+    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        // `PRAGMA table_info` does not accept a bound parameter for the table
+        // name; every caller passes a literal from this module.
+        let mut rows = self
+            .conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            if row.get::<String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
@@ -395,6 +439,10 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     pre_run_timeout_ms INTEGER NOT NULL DEFAULT {PRE_RUN_DEFAULT_TIMEOUT_MS},
     bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0,
     min_interval_secs INTEGER,
+    -- 1 when each run should see what the previous runs produced. Opt-in:
+    -- carrying prior output costs context on every fire, and most scheduled
+    -- tasks are stateless by design.
+    continuity INTEGER NOT NULL DEFAULT 0,
     last_response_hash TEXT,
     model TEXT,
     model_provider TEXT,

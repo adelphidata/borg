@@ -119,6 +119,23 @@ loop {
 }
 ```
 
+### Bump the counter only for work actually done
+
+A liveness counter is worth exactly as much as the claim it makes. The
+scheduled-task dispatcher (`borgd::scheduler`) bumps its counter only on a tick
+that reached a dispatch decision: it claimed the due tasks, or found another
+tick already holding the lock, or found the daemon paused. A tick that could
+not get that far — the tick lock would not open because the process is out of
+file descriptors, or the data dir is read-only — bumps nothing, backs off
+exponentially, and lets the counter go stale so the watchdog restarts the
+subsystem. A restart is also what frees leaked descriptors.
+
+Bumping at the top of a loop instead is the failure this avoids: the loop keeps
+ticking, keeps reporting itself alive, and never dispatches a task again. The
+counter says "healthy" while nothing runs, and the watchdog that exists for
+exactly this case never fires. A guard test in `scheduler.rs` pins the bump
+below the first decision point.
+
 The aborted task surfaces to the supervisor as `JoinError::is_cancelled()`
 without the shared cancel token set — the supervisor treats this as a
 restart (counts toward the degraded-state cap so persistent stalls

@@ -2630,13 +2630,11 @@ async fn run_session_task(
             } => {
                 let raw_result = session.call_tool(&original_name, args).await;
                 // Classify transport-level failures so the session tears down
-                // cleanly rather than looping with a wedged transport. The
-                // streamable-HTTP transport surfaces 404-on-stale-session-id
-                // as `TransportClosed`; without a teardown here the next
-                // dispatch would POST without the session id, the server
-                // would reject every subsequent `tools/call`, and the LLM
-                // would see opaque "no live session" errors until the daemon
-                // restarted. Marking the session dead drops it from
+                // cleanly rather than looping with a wedged transport: a dead
+                // subprocess, a reset socket, a deterministic 4xx. A
+                // streamable-HTTP session the server has forgotten does *not*
+                // reach here — that transport re-handshakes and retries on
+                // its own. Marking the session dead drops it from
                 // `SESSION_TX` so future dispatches fail fast and the
                 // operator sees one clear error per call.
                 let transport_dead =
@@ -2663,13 +2661,13 @@ async fn run_session_task(
                 drain_peer_side_traffic(&mut session, &server_name, &registry, &filter, &builtin)
                     .await;
 
-                // Transport-level failure (e.g. streamable-HTTP 404 on a
-                // stale session id). Tear down: remove our sender from the
-                // global map and drop the session. Future dispatches will
-                // fail fast with "no live session" — an operator-readable
-                // error — instead of looping with a wedged transport.
-                // Re-init requires the operator to `borg settings set` or
-                // restart the daemon; auto-reconnect lives in a follow-up.
+                // Transport-level failure the transport could not recover
+                // from itself. Tear down: remove our sender from the global
+                // map and drop the session. Future dispatches will fail fast
+                // with "no live session" — an operator-readable error —
+                // instead of looping with a wedged transport. Re-init
+                // requires the operator to `borg settings set` or restart the
+                // daemon; auto-reconnect lives in a follow-up.
                 if transport_dead {
                     // This branch is entered only on a transport-level
                     // teardown, so the kind is fixed to match

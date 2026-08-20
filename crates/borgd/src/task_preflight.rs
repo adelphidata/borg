@@ -197,6 +197,7 @@ mod tests {
             model_provider: None,
             monitor_mode: false,
             last_pre_run_hash: None,
+            continuity: false,
         }
     }
 

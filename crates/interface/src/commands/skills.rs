@@ -122,7 +122,16 @@ async fn load_skills() -> Result<Vec<cortex::skills::Skill>> {
     // skill against the wrong baseline would let the operator believe a change
     // landed when the daemon's effective config is something else entirely.
     let config = cortex::config::Config::load_from_db().await?;
-    cortex::skills::load_all_skills(&std::collections::HashMap::new(), &config.skills)
+    // The CLI's working directory is the operator's workspace, so the project
+    // tier belongs in this listing. Without it, `borg skills list` would
+    // report a skill the checkout injects into every prompt as absent — the
+    // one place someone would look to audit exactly that.
+    let workspace = std::env::current_dir().ok();
+    cortex::skills::load_all_skills(
+        &std::collections::HashMap::new(),
+        &config.skills,
+        workspace.as_deref(),
+    )
 }
 
 async fn run_list() -> Result<()> {

@@ -191,7 +191,15 @@ pub(crate) fn build_anthropic_request(
         .find(|m| m.role == Role::System)
         .and_then(|m| m.text_content().map(String::from));
 
-    let anthropic_messages = build_anthropic_messages(request.messages);
+    // Repair before converting, exactly as the OpenAI-compatible path does.
+    // Anthropic requires every `tool_use` id to be unique *within one
+    // request*, and history no longer guarantees that: a server that reuses
+    // one id for every call now keeps both pairings (which is what lets the
+    // model see its own results at all), so the uniqueness the wire needs has
+    // to be restored here. `repair_message_sequence` renames the later
+    // occurrence and its paired result rather than dropping either.
+    let repaired = repair_message_sequence(request.messages);
+    let anthropic_messages = build_anthropic_messages(&repaired);
     let anthropic_tools: Option<Vec<serde_json::Value>> = request.tools.map(|ts| {
         ts.iter()
             .map(|t| {
@@ -279,12 +287,7 @@ pub(crate) fn parse_openai_sse_line(
             let mut events = Vec::new();
 
             if let Some(usage) = chunk.usage {
-                let cached_input_tokens = usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.cached_tokens)
-                    .or(usage.cached_tokens)
-                    .unwrap_or(0);
+                let cached_input_tokens = usage.cached_read_tokens();
                 let provider_cost_usd = extract_provider_cost_usd(&usage);
                 if provider == "openrouter" && provider_cost_usd.is_none() {
                     let raw_usage = serde_json::from_str::<serde_json::Value>(data)
@@ -304,7 +307,7 @@ pub(crate) fn parse_openai_sse_line(
                     completion_tokens: usage.completion_tokens.unwrap_or(0),
                     total_tokens: usage.total_tokens.unwrap_or(0),
                     cached_input_tokens,
-                    cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+                    cache_creation_tokens: usage.cache_creation_tokens(),
                     provider: provider.to_string(),
                     model: model.to_string(),
                     provider_cost_usd,
@@ -645,13 +648,8 @@ impl Transport for OpenAiCompatTransport {
             prompt_tokens: usage.prompt_tokens.unwrap_or(0),
             completion_tokens: usage.completion_tokens.unwrap_or(0),
             total_tokens: usage.total_tokens.unwrap_or(0),
-            cached_input_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.cached_tokens)
-                .or(usage.cached_tokens)
-                .unwrap_or(0),
-            cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            cached_input_tokens: usage.cached_read_tokens(),
+            cache_creation_tokens: usage.cache_creation_tokens(),
             provider: provider.to_string(),
             model: model.to_string(),
             provider_cost_usd: extract_provider_cost_usd(&usage),

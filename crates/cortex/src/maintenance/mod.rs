@@ -22,6 +22,7 @@ use crate::doctor::{run_diagnostics_with_registry, DiagnosticCheck, RemediationK
 use crate::process_registry::{compile_never_kill_patterns, AutoReapPolicy, ProcessRegistry};
 
 mod budget;
+mod db_quarantine_prune;
 mod embeddings;
 mod fs_setup;
 mod fts;
@@ -33,6 +34,7 @@ pub use fs_setup::{ensure_data_subdirs, ensure_global_index};
 pub use gateway_recovery::recover_gateway_if_abandoned;
 
 use budget::BudgetTracker;
+use db_quarantine_prune::{prune_corrupt_db_copies, CORRUPT_DB_COPIES_KEPT};
 use embeddings::{repair_embedding_backlog, EMBEDDING_CACHE_TTL_SECS};
 use issues::{group_issues_by_remediation, issue_snapshots, RepairExecution};
 use log_prune::{
@@ -54,6 +56,10 @@ pub struct MaintenanceReport {
     pub log_bytes_truncated: u64,
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
+    /// Quarantined `borg.db.corrupt-*` copies deleted. `0` when none were
+    /// present, which is the normal case.
+    #[serde(default)]
+    pub corrupt_db_copies_deleted: usize,
     pub stalled_tasks_healed: usize,
     #[serde(default)]
     pub wedged_runs_recovered: usize,
@@ -380,6 +386,21 @@ pub async fn run_daily_maintenance_with_registry(
             Ok(n) => report.log_bytes_truncated = n,
             Err(e) => tracing::warn!("maintenance: log truncation failed: {e}"),
         }
+    }
+
+    // 2b. Prune quarantined database copies. Recovery renames an unopenable
+    // `borg.db` aside and creates a fresh one; nothing else ever deletes
+    // those. A daemon restart-looping against a persistently unopenable file
+    // writes one full-size copy per restart, and the disk they all share is
+    // the one the live database needs.
+    match Config::data_dir() {
+        Ok(data_dir) => match prune_corrupt_db_copies(&data_dir, CORRUPT_DB_COPIES_KEPT) {
+            Ok(n) => report.corrupt_db_copies_deleted = n,
+            Err(e) => tracing::warn!("maintenance: corrupt-db copy pruning failed: {e}"),
+        },
+        Err(e) => tracing::warn!(
+            "maintenance: cannot resolve the data dir, skipping corrupt-db pruning: {e}"
+        ),
     }
 
     // 3. Prune activity-log rows beyond retention window.
@@ -1041,6 +1062,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .unwrap();
         db.conn()
@@ -1250,6 +1272,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .unwrap();
         for _ in 0..50 {
@@ -1479,6 +1502,7 @@ mod command_gate_scan_tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("seed task");

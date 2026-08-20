@@ -33,6 +33,9 @@ use tokio::sync::Mutex;
 /// Per-request server state. Captures the headers (so the test can assert
 /// the client echoed `Mcp-Session-Id`) and controls the response body /
 /// status / session-id-to-emit on a per-call basis.
+/// One scripted reply: `(status, body, session-id to emit)`.
+type ScriptedReply = (u16, Value, Option<String>);
+
 #[derive(Clone, Default)]
 struct ServerLog {
     /// Headers from every POST so far.
@@ -52,6 +55,11 @@ struct ServerLog {
     /// balancer's sticky-session / affinity cookie; the client jar should
     /// store it and echo it on subsequent requests.
     next_set_cookie: Arc<Mutex<Option<String>>>,
+    /// Scripted `(status, body, session-id)` replies, consumed in order and
+    /// taking precedence over the single-shot fields above. Needed for
+    /// exchanges that span several round trips — a 404 answered by a
+    /// re-handshake is four POSTs, not one.
+    script: Arc<Mutex<std::collections::VecDeque<ScriptedReply>>>,
 }
 
 impl ServerLog {
@@ -68,6 +76,13 @@ impl ServerLog {
 
     async fn emit_session_id(&self, sid: &str) {
         *self.next_session_id.lock().await = Some(sid.to_string());
+    }
+
+    async fn script_reply(&self, status: u16, body: Value, session_id: Option<&str>) {
+        self.script
+            .lock()
+            .await
+            .push_back((status, body, session_id.map(str::to_string)));
     }
 
     async fn emit_set_cookie(&self, cookie: &str) {
@@ -89,11 +104,19 @@ async fn rpc_handler(
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     state.bodies.lock().await.push(parsed);
 
-    let status = state
-        .next_status
-        .swap(200, std::sync::atomic::Ordering::SeqCst);
+    let scripted = state.script.lock().await.pop_front();
+    let status = match &scripted {
+        Some((status, _, _)) => *status,
+        None => state
+            .next_status
+            .swap(200, std::sync::atomic::Ordering::SeqCst),
+    };
     let mut resp_headers = HeaderMap::new();
-    if let Some(sid) = state.next_session_id.lock().await.take() {
+    if let Some(sid) = scripted
+        .as_ref()
+        .and_then(|(_, _, sid)| sid.clone())
+        .or(state.next_session_id.lock().await.take())
+    {
         resp_headers.insert(
             MCP_SESSION_ID_HEADER,
             HeaderValue::from_str(&sid).expect("bad session id header"),
@@ -110,12 +133,15 @@ async fn rpc_handler(
         );
     }
 
-    let body_value = state
-        .next_response
-        .lock()
-        .await
-        .take()
-        .unwrap_or_else(|| json!({}));
+    let body_value = match scripted {
+        Some((_, body, _)) => body,
+        None => state
+            .next_response
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| json!({})),
+    };
     let body_str = body_value.to_string();
 
     let mut resp = (
@@ -264,12 +290,11 @@ async fn affinity_cookie_is_stored_and_echoed_on_subsequent_requests() {
 }
 
 #[tokio::test]
-async fn session_id_is_dropped_on_404_so_caller_can_reinitialize() {
-    // Spec: when the server returns 404 with a stale session id (server
-    // restarted, session GC'd, …), the transport must drop the cached id
-    // and surface `TransportClosed` so the supervisor opens a fresh
-    // transport. Without this branch a server-side restart would loop
-    // forever sending invalid session ids.
+async fn a_404_reinitializes_the_session_and_retries_the_request() {
+    // Spec: a 404 means the server forgot this session — it restarted, or the
+    // session TTL lapsed while we were idle. The remedy is to initialize
+    // again, transparently, and carry on. Tearing the transport down instead
+    // makes every server restart cost the operator a daemon restart.
     let (url, server, _shutdown) = spawn_fixture().await;
     let mut transport = open(config(url)).await.expect("open");
 
@@ -284,22 +309,154 @@ async fn session_id_is_dropped_on_404_so_caller_can_reinitialize() {
     let _ = transport.recv().await.expect("recv 1");
     assert_eq!(transport.session_id(), Some("session-X"));
 
-    // Now flip the server to 404 — the cached session id should be dropped
-    // and the next call should return a TransportClosed error.
+    // 404 on the next call, then a healthy re-handshake, then the retry.
+    server.script_reply(404, json!({}), None).await;
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "result": {"protocolVersion": "2025-06-18"}}),
+            Some("session-Y"),
+        )
+        .await;
+    server.script_reply(200, json!({}), None).await;
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}),
+            None,
+        )
+        .await;
+
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .await
+        .expect("a 404 must be recovered, not surfaced");
+    let msg = transport
+        .recv()
+        .await
+        .expect("recv after recovery")
+        .expect("the retried request's response must reach the caller");
+    assert_eq!(msg.id, Some(2), "the caller must get its own response back");
+    assert_eq!(
+        transport.session_id(),
+        Some("session-Y"),
+        "the transport must adopt the id from the fresh session",
+    );
+
+    let bodies = server.bodies.lock().await.clone();
+    let methods: Vec<&str> = bodies
+        .iter()
+        .filter_map(|b| b.get("method").and_then(|m| m.as_str()))
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "initialize",
+            "tools/list",
+            "initialize",
+            "notifications/initialized",
+            "tools/list"
+        ],
+        "recovery must be a full handshake followed by exactly one retry",
+    );
+}
+
+#[tokio::test]
+async fn a_second_404_after_reinitializing_is_terminal() {
+    // The bound that keeps recovery from spinning: a server that 404s the
+    // session it just handed us is broken, and the caller must hear about it.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
+    server.emit_session_id("session-X").await;
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect("send 1");
+    let _ = transport.recv().await.expect("recv 1");
+
+    server.script_reply(404, json!({}), None).await;
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "result": {}}),
+            Some("session-Y"),
+        )
+        .await;
+    server.script_reply(200, json!({}), None).await;
+    server.script_reply(404, json!({}), None).await;
+
+    let err = transport
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .await
+        .expect_err("a server that 404s its own fresh session must fail the call");
+    // The variant matters, not just the wording: the session supervisor keys
+    // its teardown on `TransportClosed`. Leaking `SessionExpired` would leave
+    // a broken server marked alive, and every later call would repeat this
+    // whole handshake and fail — the wedged-transport loop the teardown
+    // exists to prevent.
+    assert!(
+        matches!(err, McpError::TransportClosed(_)),
+        "recovery failure must be terminal for the supervisor; got: {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_404_with_no_session_of_ours_names_the_endpoint() {
+    // Without a session id in play, a 404 is the URL being wrong. Re-running
+    // the handshake against a path that does not exist would only repeat the
+    // same 404, so this must fail fast and say why.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
     server
         .next_status
         .store(404, std::sync::atomic::Ordering::SeqCst);
     let err = transport
-        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
         .await
-        .expect_err("send must fail on 404 with stale session id");
+        .expect_err("a 404 with no session must fail");
     assert!(
-        format!("{err}").to_ascii_lowercase().contains("session"),
-        "error must name the session-id invalidation; got: {err}",
+        format!("{err}").contains("endpoint"),
+        "the error must point at the endpoint URL; got: {err}",
     );
+}
+
+#[tokio::test]
+async fn the_negotiated_protocol_version_is_echoed_on_later_requests() {
+    // Spec: every post-handshake request identifies the revision it was
+    // agreed under. Sending a "latest known" constant instead makes the
+    // header and the handshake body disagree, and a conforming server then
+    // judges the request against rules the client never agreed to.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
     assert!(
-        transport.session_id().is_none(),
-        "transport must clear cached session id after 404",
+        transport.protocol_version().is_none(),
+        "nothing is negotiated before the handshake",
+    );
+    transport.set_protocol_version("2025-11-25");
+
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await
+        .expect("send");
+
+    let headers = server.next_request_headers().await;
+    let sent = headers
+        .get("MCP-Protocol-Version")
+        .expect("the negotiated version must be sent on every later request")
+        .to_str()
+        .expect("header must be ascii");
+    assert_eq!(
+        sent, "2025-11-25",
+        "the header must carry the negotiated value, not a latest-known constant",
     );
 }
 

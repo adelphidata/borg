@@ -3080,6 +3080,77 @@ fn openrouter_sse_populates_cache_creation_tokens() {
 }
 
 #[test]
+fn sse_usage_reads_cache_tokens_under_every_provider_spelling() {
+    // An operator pointing `llm.base_url` at a DeepSeek-direct or
+    // Anthropic-shaped endpoint still lands on the OpenAI-compatible
+    // transport. Those responses spell the cache fields differently, and
+    // reading only the OpenAI spelling reports zero cached tokens — the
+    // turn looks uncached and its cost is overstated.
+    struct Case {
+        name: &'static str,
+        usage: &'static str,
+        cached_read: u64,
+        cache_write: u64,
+    }
+    let cases = [
+        Case {
+            name: "openai nested details",
+            usage: r#""prompt_tokens_details":{"cached_tokens":700}"#,
+            cached_read: 700,
+            cache_write: 0,
+        },
+        Case {
+            name: "anthropic flat fields",
+            usage: r#""cache_read_input_tokens":800,"cache_creation_input_tokens":90"#,
+            cached_read: 800,
+            cache_write: 90,
+        },
+        Case {
+            name: "deepseek direct",
+            usage: r#""prompt_cache_hit_tokens":640"#,
+            cached_read: 640,
+            cache_write: 0,
+        },
+        Case {
+            name: "kimi/moonshot top-level",
+            usage: r#""cached_tokens":512"#,
+            cached_read: 512,
+            cache_write: 0,
+        },
+        Case {
+            name: "anthropic per-ttl cache-write breakdown",
+            usage: r#""cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":12}"#,
+            cached_read: 0,
+            cache_write: 42,
+        },
+        Case {
+            name: "cache write alias",
+            usage: r#""cache_write_input_tokens":77"#,
+            cached_read: 0,
+            cache_write: 77,
+        },
+    ];
+
+    for case in cases {
+        let line = format!(
+            r#"data: {{"choices":[],"usage":{{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,{}}}}}"#,
+            case.usage
+        );
+        let usage = parse_openrouter_usage_from_sse(&line);
+        assert_eq!(
+            usage.cached_input_tokens, case.cached_read,
+            "cached reads for {}",
+            case.name
+        );
+        assert_eq!(
+            usage.cache_creation_tokens, case.cache_write,
+            "cache writes for {}",
+            case.name
+        );
+    }
+}
+
+#[test]
 fn openrouter_sse_without_cache_creation_field_reports_zero() {
     // Negative case: when the field is absent (e.g. non-Claude
     // OpenRouter models, or Claude responses with no cache write on this
@@ -4050,4 +4121,104 @@ async fn for_auxiliary_tags_every_return_path_and_new_tags_none() {
         primary.aux_concurrency, None,
         "primary/interactive clients must not be gated by the aux limit"
     );
+}
+
+/// Spec: no `tool_use` id may appear twice in one Anthropic request.
+///
+/// Anthropic rejects a duplicate id outright, and history deliberately keeps
+/// both pairings when a server reuses one id for every call — that is what
+/// lets the model see its own tool results at all. The uniqueness the wire
+/// requires therefore has to be restored at the transport, by renaming the
+/// later pair rather than dropping it.
+#[test]
+fn an_anthropic_request_never_carries_a_repeated_tool_use_id() {
+    use crate::types::{FunctionCall, Message, Role, ToolCall};
+
+    let call = |args: &str| ToolCall {
+        id: "same".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "run_shell".to_string(),
+            arguments: args.to_string(),
+        },
+    };
+    let assistant_with = |tc: ToolCall| Message {
+        role: Role::Assistant,
+        content: None,
+        tool_calls: Some(vec![tc]),
+        tool_call_id: None,
+        timestamp: None,
+        seq: None,
+    };
+    let messages = vec![
+        Message::user("do a two-step task"),
+        assistant_with(call(r#"{"command":"step one"}"#)),
+        Message::tool_result("same", "one done"),
+        assistant_with(call(r#"{"command":"step two"}"#)),
+        Message::tool_result("same", "two done"),
+    ];
+
+    // Go through the real request builder, not the repair helper directly:
+    // the property under test is that the *transport* restores uniqueness,
+    // and calling the helper here would pass even if it were never wired in.
+    let llm_config = crate::config::LlmConfig::default();
+    let request = transport::TransportRequest {
+        provider: crate::llm::Provider::Anthropic,
+        model: "claude-sonnet-5",
+        messages: &messages,
+        tools: None,
+        llm_config: &llm_config,
+        prompt_cache_key: None,
+        system_stable_prefix: None,
+        cost_events_enabled: false,
+    };
+    let body = transport::build_anthropic_request(&request, false);
+    let wire = serde_json::to_string(&body).expect("serializable");
+    let built: Vec<serde_json::Value> = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .expect("request carries messages");
+
+    let mut ids: Vec<String> = Vec::new();
+    for m in &built {
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                ids.push(
+                    b.get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert_eq!(ids.len(), 2, "both calls must survive; wire: {wire}");
+    assert_ne!(
+        ids[0], ids[1],
+        "a repeated tool_use id is rejected by the provider; wire: {wire}"
+    );
+
+    // And each result must still answer its own call, or the model reads the
+    // second step's output as the first step's.
+    let mut result_ids: Vec<String> = Vec::new();
+    for m in &built {
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                result_ids.push(
+                    b.get("tool_use_id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert_eq!(result_ids, ids, "each result must pair with its own call");
 }

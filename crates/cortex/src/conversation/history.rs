@@ -74,74 +74,67 @@ const SYNTHETIC_RESULT_TEXT: &str = "[tool call aborted — no result received]"
 /// Normalize conversation history to prevent API errors.
 ///
 /// Ensures structural invariants:
-/// 1. Every tool call ID appears at most once (drop later duplicates).
-/// 2. Every tool call has a corresponding tool result (synthesize if missing).
-/// 3. Every tool result has a corresponding tool call (remove orphans).
-/// 4. Every tool result ID appears at most once (keep the first real result,
-///    falling back to the first synthetic placeholder).
+/// 1. Every tool call is answered by exactly one tool result (one is
+///    synthesized when the real result is missing).
+/// 2. Every tool result answers an outstanding tool call — a result that
+///    answers nothing is a replay artifact and is removed.
+/// 3. Duplicate call IDs *within a single assistant message* collapse to one.
 ///
-/// This is called before sending to the LLM to prevent malformed conversations
-/// that can cause API rejections — strict providers reject any payload where
-/// a tool_call_id appears twice, on either the call or the result side.
+/// Pairing is tracked by *outstanding* call, not by "every ID ever seen".
+/// `tool_call_id` is not globally unique in practice: some servers emit one
+/// constant ID for every call they ever return. Under a seen-once rule the
+/// second real result of such a session looks like a duplicate and is
+/// deleted, so from the second call onward the model never sees any result —
+/// it announces its next action and the turn dies with the work unfinished.
+/// A call arms its ID, its result consumes it, and a later call is free to
+/// arm the same ID again.
+///
+/// This is called before sending to the LLM to prevent malformed
+/// conversations that can cause API rejections — strict providers reject any
+/// payload where a `tool_call_id` appears twice while still unanswered, and
+/// reject a result that follows no call.
 pub fn normalize_history(history: &mut Vec<Message>) {
-    dedup_tool_calls(history);
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    // Armed call IDs awaiting a result, in arm order, each with the index in
+    // `out` of the assistant message that armed it.
+    let mut outstanding: Vec<(String, usize)> = Vec::new();
+    // Per ID, where the result that consumed it landed in `out`. Used only to
+    // upgrade a synthetic placeholder to the real result that arrives after
+    // it (a previous normalize pass can persist the placeholder). Cleared
+    // when the ID is armed again, so it never spans two pairings.
+    let mut consumed_at: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
-    let call_ids: HashSet<String> = history
-        .iter()
-        .filter_map(|m| m.tool_calls.as_ref())
-        .flat_map(|tcs| tcs.iter().map(|tc| tc.id.clone()))
-        .collect();
-
-    let result_ids: HashSet<String> = history
-        .iter()
-        .filter_map(|m| m.tool_call_id.as_ref())
-        .cloned()
-        .collect();
-
-    let missing: Vec<(usize, String)> = history
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| m.tool_calls.as_ref().map(|tcs| (i, tcs)))
-        .flat_map(|(i, tcs)| {
-            tcs.iter()
-                .filter(|tc| !result_ids.contains(&tc.id))
-                .map(move |tc| (i, tc.id.clone()))
-        })
-        .collect();
-
-    // Insert synthetic results after their assistant message (in reverse to
-    // preserve indices).
-    for (assistant_idx, call_id) in missing.into_iter().rev() {
-        let synthetic = Message::tool_result(&call_id, SYNTHETIC_RESULT_TEXT);
-        let insert_at = (assistant_idx + 1).min(history.len());
-        history.insert(insert_at, synthetic);
-    }
-
-    history.retain(|m| {
-        if let Some(ref tid) = m.tool_call_id {
-            call_ids.contains(tid)
-        } else {
-            true
+    for msg in std::mem::take(history) {
+        if let Some(id) = msg.tool_call_id.clone() {
+            if let Some(pos) = outstanding.iter().position(|(oid, _)| *oid == id) {
+                outstanding.remove(pos);
+                consumed_at.insert(id, out.len());
+                out.push(msg);
+            } else if let Some(&at) = consumed_at.get(&id) {
+                // The pairing already closed. Only a real result replacing the
+                // placeholder we synthesized for it is worth keeping.
+                if is_synthetic_result(&out[at]) && !is_synthetic_result(&msg) {
+                    out[at] = msg;
+                } else {
+                    warn_dropped_result(&id);
+                }
+            } else {
+                warn_dropped_result(&id);
+            }
+            continue;
         }
-    });
 
-    dedup_tool_results(history);
-}
+        // Anything that is not a tool result closes the pairing window: flush
+        // a placeholder for every call still unanswered so each one sits
+        // directly after its own assistant message's result block.
+        flush_outstanding(&mut out, &mut outstanding, &mut consumed_at);
 
-/// Drop repeated tool-call IDs from assistant messages, keeping the first
-/// occurrence — later duplicates are replay/retry artifacts, and the first
-/// call is the one whose result the model actually saw. An assistant message
-/// left with no calls and no content is removed entirely (providers reject
-/// empty assistant turns).
-fn dedup_tool_calls(history: &mut Vec<Message>) {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut idx = 0;
-    while idx < history.len() {
-        let mut emptied = false;
-        if let Some(tcs) = history[idx].tool_calls.as_mut() {
-            let had_calls = !tcs.is_empty();
+        let mut msg = msg;
+        if let Some(tcs) = msg.tool_calls.as_mut() {
+            let mut seen_here: HashSet<String> = HashSet::new();
             tcs.retain(|tc| {
-                let fresh = seen.insert(tc.id.clone());
+                let fresh = seen_here.insert(tc.id.clone());
                 if !fresh {
                     tracing::warn!(
                         call_id = %tc.id,
@@ -150,74 +143,53 @@ fn dedup_tool_calls(history: &mut Vec<Message>) {
                 }
                 fresh
             });
-            if had_calls && tcs.is_empty() {
-                // Every call in this message was a duplicate.
-                history[idx].tool_calls = None;
-                emptied = history[idx].content.is_none();
-            }
-        }
-        if emptied {
-            history.remove(idx);
-        } else {
-            idx += 1;
-        }
-    }
-}
-
-/// Collapse repeated tool-result IDs to one result per ID: the first
-/// non-synthetic result if any exists (a real result outranks a placeholder
-/// synthesized on an earlier normalize pass), otherwise the first occurrence.
-/// The surviving content always lands in the *earliest* slot — strict
-/// providers require a tool result to directly follow its assistant
-/// `tool_calls` message, so a later real result must not keep its own,
-/// possibly distant, position.
-fn dedup_tool_results(history: &mut Vec<Message>) {
-    let is_synthetic = |m: &Message| m.text_content().is_some_and(|t| t == SYNTHETIC_RESULT_TEXT);
-
-    // First pass: per result ID, the earliest slot and the winning content.
-    let mut first_slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut winner: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, m) in history.iter().enumerate() {
-        let Some(id) = m.tool_call_id.as_ref() else {
-            continue;
-        };
-        match winner.get(id) {
-            None => {
-                first_slot.insert(id.clone(), i);
-                winner.insert(id.clone(), i);
-            }
-            Some(&w) => {
-                if is_synthetic(&history[w]) && !is_synthetic(m) {
-                    winner.insert(id.clone(), i);
+            if tcs.is_empty() {
+                // An empty `tool_calls` array is itself rejectable, so carry
+                // the message on its content alone — or drop it if it has
+                // none, since an empty assistant turn is rejectable too.
+                msg.tool_calls = None;
+                if msg.content.is_none() {
+                    continue;
                 }
             }
         }
+
+        let idx = out.len();
+        if let Some(tcs) = msg.tool_calls.as_ref() {
+            for tc in tcs {
+                consumed_at.remove(&tc.id);
+                outstanding.push((tc.id.clone(), idx));
+            }
+        }
+        out.push(msg);
     }
 
-    // Move a later-positioned winner's content into the earliest slot.
-    for (id, &w) in &winner {
-        let f = first_slot[id];
-        if w != f {
-            history[f] = history[w].clone();
-        }
-    }
+    flush_outstanding(&mut out, &mut outstanding, &mut consumed_at);
+    *history = out;
+}
 
-    // Second pass: drop every occurrence outside the earliest slot.
-    let mut i = 0usize;
-    history.retain(|m| {
-        let keep = match m.tool_call_id.as_ref() {
-            Some(id) => first_slot.get(id) == Some(&i),
-            None => true,
-        };
-        if !keep {
-            tracing::warn!(
-                call_id = m.tool_call_id.as_deref().unwrap_or(""),
-                "normalize_history: dropping duplicate tool result"
-            );
-        }
-        i += 1;
-        keep
-    });
+fn warn_dropped_result(id: &str) {
+    tracing::warn!(
+        call_id = %id,
+        "normalize_history: dropping tool result with no outstanding call"
+    );
+}
+
+fn is_synthetic_result(m: &Message) -> bool {
+    m.text_content().is_some_and(|t| t == SYNTHETIC_RESULT_TEXT)
+}
+
+/// Answer every still-outstanding call with a placeholder, appended in arm
+/// order so each lands after its own assistant message.
+fn flush_outstanding(
+    out: &mut Vec<Message>,
+    outstanding: &mut Vec<(String, usize)>,
+    consumed_at: &mut std::collections::HashMap<String, usize>,
+) {
+    for (id, _) in outstanding.drain(..) {
+        consumed_at.insert(id.clone(), out.len());
+        out.push(Message::tool_result(&id, SYNTHETIC_RESULT_TEXT));
+    }
 }
 
 #[cfg(test)]
@@ -364,7 +336,10 @@ mod tests {
                 expected_results: vec![("c1", "late real output")],
             },
             Case {
-                name: "duplicate calls across assistant messages keep first, pairing stays 1:1",
+                // A server that reuses one id for every call it ever returns
+                // must keep every pairing: the second call is real work, not
+                // a replay of the first.
+                name: "a reused id across assistant messages keeps both pairings",
                 input: vec![
                     make_user("q"),
                     make_tool_call_msg("", "c1", "run_shell"),
@@ -372,8 +347,8 @@ mod tests {
                     make_tool_call_msg("", "c1", "run_shell"),
                     make_tool_result("c1", "out2"),
                 ],
-                expected_call_ids: vec!["c1"],
-                expected_results: vec![("c1", "out1")],
+                expected_call_ids: vec!["c1", "c1"],
+                expected_results: vec![("c1", "out1"), ("c1", "out2")],
             },
             Case {
                 name: "duplicate calls within one assistant message",
@@ -437,32 +412,111 @@ mod tests {
     }
 
     #[test]
-    fn normalize_removes_assistant_message_emptied_by_call_dedup() {
-        // A content-less assistant message whose only tool call is a duplicate
-        // must be dropped entirely — an empty assistant turn is as rejectable
-        // as the duplicate id itself.
+    fn normalize_removes_content_less_assistant_message_with_no_calls() {
+        // An empty `tool_calls` array on a content-less assistant message is
+        // rejectable twice over: providers refuse both the empty array and
+        // the empty turn. The message must not survive normalization.
+        let mut history = vec![
+            make_user("q"),
+            Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: Some(vec![]),
+                tool_call_id: None,
+                timestamp: None,
+                seq: None,
+            },
+            make_assistant("done"),
+        ];
+        normalize_history(&mut history);
+
+        assert_eq!(history.len(), 2, "the empty assistant turn must be dropped");
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.content.is_none() && m.tool_call_id.is_none()),
+            "no content-less, call-less message may remain"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_every_result_when_one_id_is_reused_for_all_calls() {
+        // Regression: a server that returns a single constant tool_call_id for
+        // every call it ever makes (some local runtimes do) must not lose its
+        // results. Under a seen-once rule the model stops seeing tool output
+        // from the second call onward and the task is abandoned mid-way.
+        let mut history = vec![make_user("do a 3-step task")];
+        for step in 0..3 {
+            history.push(make_tool_call_msg("", "same", "run_shell"));
+            history.push(make_tool_result("same", &format!("step{step}")));
+        }
+        normalize_history(&mut history);
+
+        let results: Vec<&str> = history
+            .iter()
+            .filter(|m| m.tool_call_id.is_some())
+            .map(|m| m.text_content().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            results,
+            vec!["step0", "step1", "step2"],
+            "every step's output must reach the model"
+        );
+        assert!(
+            !results.contains(&SYNTHETIC_RESULT_TEXT),
+            "no real result may be replaced by a placeholder"
+        );
+    }
+
+    #[test]
+    fn normalize_drops_a_replayed_result_that_answers_nothing() {
+        // The protection the outstanding-call rule must preserve: a result
+        // re-emitted after its call was already answered is a retry artifact.
         let mut history = vec![
             make_user("q"),
             make_tool_call_msg("", "c1", "run_shell"),
             make_tool_result("c1", "out"),
-            make_tool_call_msg("", "c1", "run_shell"),
+            make_tool_result("c1", "out replayed"),
+            make_assistant("done"),
         ];
         normalize_history(&mut history);
 
-        let empty_assistant = history
+        let results: Vec<&str> = history
             .iter()
-            .any(|m| m.role == Role::Assistant && m.content.is_none() && m.tool_calls.is_none());
-        assert!(
-            !empty_assistant,
-            "emptied assistant message must be removed"
+            .filter(|m| m.tool_call_id.is_some())
+            .map(|m| m.text_content().unwrap_or(""))
+            .collect();
+        assert_eq!(results, vec!["out"], "the replay must be dropped");
+    }
+
+    #[test]
+    fn normalize_synthesizes_for_a_reused_id_whose_first_call_went_unanswered() {
+        // The first call never got a result, then the same id was armed
+        // again. The first must still be answered — by a placeholder — so the
+        // second call's real result is not mistaken for the first's.
+        let mut history = vec![
+            make_user("q"),
+            make_tool_call_msg("", "same", "run_shell"),
+            make_tool_call_msg("", "same", "run_shell"),
+            make_tool_result("same", "real output"),
+        ];
+        normalize_history(&mut history);
+
+        let results: Vec<&str> = history
+            .iter()
+            .filter(|m| m.tool_call_id.is_some())
+            .map(|m| m.text_content().unwrap_or(""))
+            .collect();
+        assert_eq!(results, vec![SYNTHETIC_RESULT_TEXT, "real output"]);
+        assert_eq!(
+            history
+                .iter()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flat_map(|tcs| tcs.iter())
+                .count(),
+            2,
+            "both calls must survive"
         );
-        let call_count = history
-            .iter()
-            .filter_map(|m| m.tool_calls.as_ref())
-            .flat_map(|tcs| tcs.iter())
-            .filter(|tc| tc.id == "c1")
-            .count();
-        assert_eq!(call_count, 1);
     }
 
     // -- undo_last_turn --

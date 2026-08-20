@@ -122,6 +122,14 @@ pub trait Transport: Send {
 
     /// Best-effort graceful shutdown.
     async fn close(&mut self) -> Result<()>;
+
+    /// Record the protocol version agreed during `initialize`.
+    ///
+    /// Transports that carry the version out-of-band (streamable HTTP puts it
+    /// in a header on every later request) override this. Stdio and anything
+    /// else that only ever speaks the handshake body ignores it, hence the
+    /// default no-op.
+    fn set_protocol_version(&mut self, _version: &str) {}
 }
 
 /// Allowlist of env vars that may be inherited by stdio MCP subprocesses.

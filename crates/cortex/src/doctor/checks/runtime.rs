@@ -609,6 +609,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");
@@ -656,6 +657,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         }
     }
 

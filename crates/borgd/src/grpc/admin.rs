@@ -803,7 +803,7 @@ impl Admin for AdminSvc {
         // declared binary, so it belongs off the runtime's worker threads.
         let listings = tokio::task::spawn_blocking(move || {
             let resolved = config.resolve_credentials();
-            let skills = cortex::skills::load_all_skills(&resolved, &config.skills)?;
+            let skills = cortex::skills::load_all_skills(&resolved, &config.skills, None)?;
             anyhow::Ok(cortex::skills::offerable_skills(&skills))
         })
         .await

@@ -29,6 +29,12 @@ pub enum SkillSource {
     BuiltIn,
     /// Loaded from the user's `~/.borg/skills/` directory.
     User,
+    /// Loaded from the current workspace (`.borg/skills/`, `.agents/skills/`).
+    ///
+    /// Same trust posture as `User` — both are author-controlled files that
+    /// go through the security scan — but the origin matters to the operator:
+    /// a project skill arrived with a `git pull`, not by their own hand.
+    Project,
 }
 
 /// Runtime requirements that must be satisfied for a skill to be available.
@@ -212,11 +218,12 @@ impl Skill {
         Some(format!("{shown} (+{extra} more)"))
     }
 
-    /// Returns a display label for the skill's source ("built-in" or "user").
+    /// Returns a display label for the skill's source.
     pub fn source_label(&self) -> &'static str {
         match self.source {
             SkillSource::BuiltIn => "built-in",
             SkillSource::User => "user",
+            SkillSource::Project => "project",
         }
     }
 

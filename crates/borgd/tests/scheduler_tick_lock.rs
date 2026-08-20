@@ -61,6 +61,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");

@@ -1369,6 +1369,7 @@ Rules:
             self.credentials_cached(),
             &self.config.skills,
             &user_request,
+            Some(self.execution_context.workspace_root()),
         );
         match result {
             Ok((ctx, report)) => {
@@ -1568,7 +1569,9 @@ Rules:
                 // won't be allowed.
                 return Ok(None);
             }
-            HookAction::Continue => {}
+            // Argument rewrites are a tool-call concern; this dispatch point
+            // carries no tool call for one to apply to.
+            HookAction::Modify { .. } | HookAction::Continue => {}
         }
 
         // Sliced before `system_prompt` is moved into the message. Taken from the

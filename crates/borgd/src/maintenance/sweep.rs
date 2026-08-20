@@ -147,21 +147,37 @@ async fn advance_stale_tasks(db: &Database) -> usize {
     let mut advanced = 0;
     for task in &stale_tasks {
         let age = now - task.next_run.unwrap_or(0);
-        if age > STALE_TASK_THRESHOLD_SECS {
-            tracing::warn!(
-                "Skipping stale task '{}' ({}d overdue)",
-                task.name,
-                age / 86_400
+        if age <= STALE_TASK_THRESHOLD_SECS {
+            continue;
+        }
+        // One-shot tasks are not what this suppression is for. Advancing a
+        // recurring task skips the occurrences missed while the daemon was
+        // down, which is the intent; advancing a one-shot marks it
+        // `completed` with `next_run = NULL`, so a task the user explicitly
+        // asked for is closed as done having never run once. Let it fire
+        // late instead — late is what the user wants from a reminder they
+        // are only now getting a machine back for.
+        if task.schedule_type == cortex::tasks::SCHEDULE_TYPE_ONCE {
+            tracing::info!(
+                task = %task.name,
+                overdue_days = age / 86_400,
+                "one-shot task is overdue; running it late rather than closing it unrun",
             );
-            if let Err(e) = cortex::tasks::advance_next_run(task, db).await {
-                tracing::warn!(
-                    error = %e,
-                    task = %task.name,
-                    "advance_next_run on stale task failed",
-                );
-            } else {
-                advanced += 1;
-            }
+            continue;
+        }
+        tracing::warn!(
+            "Skipping stale task '{}' ({}d overdue)",
+            task.name,
+            age / 86_400
+        );
+        if let Err(e) = cortex::tasks::advance_next_run(task, db).await {
+            tracing::warn!(
+                error = %e,
+                task = %task.name,
+                "advance_next_run on stale task failed",
+            );
+        } else {
+            advanced += 1;
         }
     }
     advanced
@@ -195,6 +211,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create_task");
@@ -306,6 +323,78 @@ mod tests {
             next_run_of(&db, "fresh").await,
             Some(fresh_ts),
             "fresh task must not be touched"
+        );
+    }
+
+    async fn seed_once_task(db: &Database, id: &str, next_run: Option<i64>) {
+        db.create_task(&NewTask {
+            id,
+            name: id,
+            prompt: "noop",
+            schedule_type: "once",
+            schedule_expr: "2026-01-01T00:00:00Z",
+            timezone: "UTC",
+            next_run,
+            max_retries: Some(0),
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        })
+        .await
+        .expect("create_task");
+    }
+
+    #[tokio::test]
+    async fn a_long_overdue_one_shot_is_left_to_run_late() {
+        // The bug: `advance_next_run` on a one-shot sets status=completed and
+        // next_run=NULL. Feeding overdue one-shots through the stale-task
+        // suppression therefore closed a task the user asked for as "done"
+        // having never run it once — with only a log line to show for it.
+        let db = test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        seed_once_task(&db, "reminder", Some(now - 30 * 86_400)).await;
+
+        let advanced = advance_stale_tasks(&db).await;
+
+        assert_eq!(advanced, 0, "a one-shot must not be advanced");
+        let task = db
+            .get_task_by_id("reminder")
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_ne!(
+            task.status, "completed",
+            "a task that never ran must not be marked completed"
+        );
+        assert_eq!(
+            task.next_run,
+            Some(now - 30 * 86_400),
+            "it must stay due so the next tick runs it late"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_overdue_recurring_task_is_still_advanced() {
+        // The suppression this preserves: a recurring task must not replay
+        // every occurrence missed while the daemon was down.
+        let db = test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        seed_interval_task(&db, "nightly", Some(now - 30 * 86_400)).await;
+
+        let advanced = advance_stale_tasks(&db).await;
+
+        assert_eq!(advanced, 1);
+        let next = next_run_of(&db, "nightly").await.expect("still armed");
+        assert!(
+            next > now - 86_400,
+            "a recurring task must be re-armed near now, got {next}"
         );
     }
 }

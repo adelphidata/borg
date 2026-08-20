@@ -123,6 +123,7 @@ async fn seed_stalled_cron_task(db: &Database, id: &str, overdue_secs: i64) {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     })
     .await
     .expect("create stalled task");

@@ -112,6 +112,54 @@ pub(crate) async fn report_prior_unclean_exit(
     Some(heartbeat_at)
 }
 
+/// Longest a failing tick will wait before trying again. Past this the
+/// watchdog has had ample time to notice the missing liveness bumps.
+const MAX_TICK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether an IO error is the process running out of file descriptors.
+///
+/// Worth naming specifically: it is self-inflicted, it makes every later tick
+/// fail identically, and the fix is an operator action rather than a retry.
+fn is_fd_exhaustion(e: &anyhow::Error) -> bool {
+    // EMFILE (per-process) and ENFILE (system-wide). `ErrorKind` has no
+    // stable variant for either, so match the raw codes off the underlying
+    // IO error wherever it sits in the chain.
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(24) | Some(23)))
+}
+
+/// How long to wait before retrying after a tick that could not dispatch.
+///
+/// Exponential from the loop interval, capped. A scheduler hammering a
+/// resource it has already exhausted only makes the exhaustion worse.
+fn tick_backoff_delay(consecutive_failures: u32) -> std::time::Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(8);
+    DAEMON_LOOP_INTERVAL
+        .saturating_mul(1u32 << shift)
+        .min(MAX_TICK_BACKOFF)
+}
+
+/// Wait out the backoff, or return early if the daemon is shutting down.
+///
+/// Returns `true` when shutdown was requested. The wait has to be
+/// cancellable: at the cap it is five minutes, and the loop only checks the
+/// shutdown token at the top of its `select!`. An uncancellable sleep would
+/// hold a SIGTERM for that long — and since the shutdown arm is what releases
+/// the daemon lock and stamps the clean-exit timestamp, the process would
+/// almost certainly be killed first and the next boot would report an unclean
+/// exit that never happened.
+async fn backoff_after_failed_tick(
+    consecutive_failures: u32,
+    shutdown: &CancellationToken,
+) -> bool {
+    let delay = tick_backoff_delay(consecutive_failures);
+    tokio::select! {
+        _ = shutdown.cancelled() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
 /// Run the dispatcher loop until `shutdown` fires. Returns when shutdown is
 /// observed — caller should drain any remaining permits.
 pub async fn run(
@@ -170,6 +218,10 @@ pub async fn run(
     let mut last_tick_wall = std::time::Instant::now();
     let mut last_stalled_scan = std::time::Instant::now();
     let mut lock_refresh_failures: u32 = 0;
+    // Consecutive ticks that could not reach a dispatch decision. Drives the
+    // backoff below and, by withholding the liveness bump, lets the
+    // supervisor's watchdog restart a scheduler that is stuck.
+    let mut tick_failures: u32 = 0;
     // Emergency-stop edge tracker: log once per engagement, not per tick.
     let mut pause_gate = cortex::emergency_pause::PauseGate::new();
 
@@ -199,10 +251,14 @@ pub async fn run(
             _ = interval.tick() => {}
         }
 
-        // Liveness heartbeat for the supervisor's stall watchdog. Any
-        // monotonic change counts; the watchdog only compares successive
-        // reads.
-        liveness.fetch_add(1, Ordering::Relaxed);
+        // NOTE: the liveness heartbeat is deliberately NOT bumped here.
+        // Bumping at the top of the loop reports "alive" before anything has
+        // been attempted, so a scheduler that ticks forever without ever
+        // dispatching — fd exhaustion at the tick lock, a read-only data dir —
+        // looks perfectly healthy to the watchdog and silently runs nothing.
+        // Every path that actually reached a dispatch decision bumps it
+        // instead; the failure paths do not, so the watchdog restarts the
+        // subsystem, which is also what frees leaked descriptors.
 
         let elapsed = last_tick_wall.elapsed();
         last_tick_wall = std::time::Instant::now();
@@ -237,6 +293,37 @@ pub async fn run(
             }
         }
 
+        // Emergency stop (`borg pause`): skip the entire claim+dispatch arm
+        // while engaged. `claim_due_tasks` is never called, so `next_run`
+        // stays due and every run is deferred — not lost — until resume.
+        // The lock refresh and drift recovery deliberately keep running:
+        // pause halts NEW agent work only, and maintenance is not agent work.
+        // The stalled scan, however, runs *after* this gate: it re-arms
+        // overdue recurring tasks to their next occurrence and records the
+        // skipped fires as missed, which is exactly the "deferred, not lost"
+        // promise above being broken by the pause outlasting the scan's
+        // grace window. The read goes straight to the DB (fail-safe:
+        // corrupt/unreadable flag ⇒ paused) so a CLI write from another
+        // process gates the very next tick.
+        if cortex::emergency_pause::is_engaged(&db).await {
+            if let Some(cortex::emergency_pause::PauseTransition::Engaged) =
+                pause_gate.observe(true)
+            {
+                tracing::warn!(
+                    "emergency pause engaged — scheduled-task dispatch suspended; \
+                     due runs are deferred until `borg resume`"
+                );
+            }
+            // A deliberate no-dispatch is a healthy tick.
+            liveness.fetch_add(1, Ordering::Relaxed);
+            tick_failures = 0;
+            continue;
+        } else if let Some(cortex::emergency_pause::PauseTransition::Released) =
+            pause_gate.observe(false)
+        {
+            tracing::info!("emergency pause released — scheduled-task dispatch resumed");
+        }
+
         if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
             last_stalled_scan = std::time::Instant::now();
             let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS).await;
@@ -247,30 +334,6 @@ pub async fn run(
                     "stalled-task scan made repairs",
                 );
             }
-        }
-
-        // Emergency stop (`borg pause`): skip the entire claim+dispatch arm
-        // while engaged. `claim_due_tasks` is never called, so `next_run`
-        // stays due and every run is deferred — not lost — until resume.
-        // The lock refresh, liveness bump, and stalled/drift recovery above
-        // deliberately keep running: pause halts NEW agent work only, and
-        // maintenance is not agent work. The read goes straight to the DB
-        // (fail-safe: corrupt/unreadable flag ⇒ paused) so a CLI write from
-        // another process gates the very next tick.
-        if cortex::emergency_pause::is_engaged(&db).await {
-            if let Some(cortex::emergency_pause::PauseTransition::Engaged) =
-                pause_gate.observe(true)
-            {
-                tracing::warn!(
-                    "emergency pause engaged — scheduled-task dispatch suspended; \
-                     due runs are deferred until `borg resume`"
-                );
-            }
-            continue;
-        } else if let Some(cortex::emergency_pause::PauseTransition::Released) =
-            pause_gate.observe(false)
-        {
-            tracing::info!("emergency pause released — scheduled-task dispatch resumed");
         }
 
         // Claim+dispatch critical section. The non-blocking tick lock makes
@@ -295,14 +358,36 @@ pub async fn run(
                     path = %tick_lock_file.display(),
                     "scheduler tick skipped — another tick holds the lock"
                 );
+                // Contention means some other tick is doing the work; this
+                // loop is healthy.
+                liveness.fetch_add(1, Ordering::Relaxed);
+                tick_failures = 0;
                 continue;
             }
             Err(e) => {
+                // NOT contention: the lock file could not be opened at all.
+                // Descriptor exhaustion is the case that matters, because it
+                // is self-inflicted, silent, and persistent — every later
+                // tick fails the same way.
+                tick_failures = tick_failures.saturating_add(1);
+                let exhausted = is_fd_exhaustion(&e);
                 tracing::warn!(
                     error = %e,
                     path = %tick_lock_file.display(),
-                    "scheduler tick lock open failed; skipping iteration"
+                    consecutive_failures = tick_failures,
+                    fd_exhaustion = exhausted,
+                    "scheduler tick lock open failed; no task can be dispatched this tick"
                 );
+                if exhausted && tick_failures == 1 {
+                    tracing::error!(
+                        "scheduler cannot open its tick lock: the process is out of file \
+                         descriptors. No scheduled task will run until this clears. Raise the \
+                         open-file limit (`ulimit -n`) for the daemon."
+                    );
+                }
+                // A shutdown during the wait falls through to the loop
+                // top, where the `select!` runs the shutdown arm.
+                backoff_after_failed_tick(tick_failures, &shutdown).await;
                 continue;
             }
         };
@@ -320,8 +405,29 @@ pub async fn run(
                     fut.await;
                 }
             }
-            Err(e) => tracing::warn!("Failed to claim due tasks: {e}"),
+            Err(e) => {
+                // The database refused the claim: nothing was dispatched, so
+                // this tick did not do its job. Counting it keeps a
+                // persistently unusable DB from reading as a healthy loop.
+                tick_failures = tick_failures.saturating_add(1);
+                tracing::warn!(
+                    consecutive_failures = tick_failures,
+                    "Failed to claim due tasks: {e}"
+                );
+                // This also skips the retry and celebration passes below for
+                // this tick. Deliberate: they use the same database that just
+                // refused the claim, so they would fail too — and each failure
+                // would be logged as if it were an independent problem.
+                // A shutdown during the wait falls through to the loop
+                // top, where the `select!` runs the shutdown arm.
+                backoff_after_failed_tick(tick_failures, &shutdown).await;
+                continue;
+            }
         }
+
+        // A tick that reached and completed the claim did its job.
+        liveness.fetch_add(1, Ordering::Relaxed);
+        tick_failures = 0;
 
         // Retries.
         match db.get_tasks_pending_retry(now).await {
@@ -459,5 +565,128 @@ mod unclean_exit_tests {
             .expect("open db");
         db.acquire_daemon_lock(100, 2_000).await.expect("acquire");
         assert_eq!(report_prior_unclean_exit(&db, 100, 5_000).await, None);
+    }
+}
+
+#[cfg(test)]
+mod tick_health_tests {
+    use super::*;
+
+    // ── failed-tick classification ──
+
+    #[test]
+    fn descriptor_exhaustion_is_recognized_through_the_error_chain() {
+        // Why it is worth naming: it is self-inflicted, every later tick
+        // fails identically, and the fix is an operator action rather than a
+        // retry. The lock error arrives wrapped, so matching only the
+        // top-level error would miss it.
+        for (code, expected) in [(24, true), (23, true), (2, false), (13, false)] {
+            let io = std::io::Error::from_raw_os_error(code);
+            let wrapped = anyhow::Error::new(io).context("open scheduler tick lock");
+            assert_eq!(
+                is_fd_exhaustion(&wrapped),
+                expected,
+                "raw os error {code} classified wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_io_failure_is_not_mistaken_for_descriptor_exhaustion() {
+        let err = anyhow::anyhow!("database is locked");
+        assert!(!is_fd_exhaustion(&err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_failures_back_off_and_stay_bounded() {
+        // A scheduler hammering a resource it has already exhausted only
+        // makes the exhaustion worse — but the wait must not grow without
+        // limit either, or a recovered daemon sits idle for hours.
+        assert_eq!(
+            tick_backoff_delay(1),
+            DAEMON_LOOP_INTERVAL,
+            "the first retry waits one interval"
+        );
+        assert!(
+            tick_backoff_delay(3) > tick_backoff_delay(1),
+            "successive failures must wait longer"
+        );
+        assert_eq!(
+            tick_backoff_delay(1000),
+            MAX_TICK_BACKOFF,
+            "the wait must be capped, not unbounded"
+        );
+
+        // The wait must be cancellable. At the cap it is five minutes, and the
+        // shutdown arm is what releases the daemon lock and stamps the
+        // clean-exit timestamp — a SIGTERM held that long means the process is
+        // killed first and the next boot reports an unclean exit that never
+        // happened.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let start = tokio::time::Instant::now();
+        let interrupted = backoff_after_failed_tick(1000, &cancel).await;
+        assert!(interrupted, "a cancelled token must cut the wait short");
+        assert!(
+            start.elapsed() < MAX_TICK_BACKOFF,
+            "shutdown must not wait out the full backoff"
+        );
+    }
+
+    /// Guard: the liveness counter must not be bumped before the tick has
+    /// reached a dispatch decision.
+    ///
+    /// This is the whole defect. Bumping at the top of the loop reports
+    /// "alive" before anything has been attempted, so a scheduler that cannot
+    /// dispatch a single task — descriptors exhausted, data dir read-only —
+    /// keeps ticking, keeps looking healthy, and the watchdog that exists to
+    /// restart it never fires. The property cannot be expressed in the type
+    /// system: it is about *where* a statement sits relative to the failure
+    /// paths, and the pause gate is the first point at which the tick has
+    /// decided anything.
+    #[test]
+    fn liveness_is_never_bumped_before_the_tick_reaches_a_decision() {
+        let src = include_str!("scheduler.rs");
+        let body = src
+            .split_once("_ = interval.tick() => {}")
+            .expect("scheduler loop shape changed")
+            .1;
+        let first_decision = body
+            .find("emergency_pause::is_engaged")
+            .expect("pause gate not found");
+        let first_bump = body
+            .find("liveness.fetch_add")
+            .expect("liveness bump not found");
+        assert!(
+            first_bump > first_decision,
+            "the liveness bump must come after the tick has reached a dispatch \
+             decision — bumping earlier hides a scheduler that dispatches nothing"
+        );
+    }
+
+    /// Guard: the stalled-task scan must run after the emergency-pause gate.
+    ///
+    /// `heal_stalled_tasks` re-arms overdue recurring tasks to their next
+    /// occurrence and records the skipped fires as missed. Running it while
+    /// paused turns the documented "deferred, not lost" promise into silent
+    /// loss for any pause longer than the scan's grace window.
+    #[test]
+    fn the_stalled_scan_runs_after_the_pause_gate() {
+        let src = include_str!("scheduler.rs");
+        let body = src
+            .split_once("_ = interval.tick() => {}")
+            .expect("scheduler loop shape changed")
+            .1;
+        let pause_gate = body
+            .find("emergency_pause::is_engaged")
+            .expect("pause gate not found");
+        let scan = body
+            .find("sweep::stalled_scan")
+            .expect("stalled scan not found");
+        assert!(
+            scan > pause_gate,
+            "a paused daemon must heal nothing — the scan would re-arm the very \
+             runs the pause promised to defer"
+        );
     }
 }

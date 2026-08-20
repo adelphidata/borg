@@ -1097,7 +1097,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     /// True when the stamp matches this binary exactly, so migrations can be
     /// skipped.
@@ -1170,8 +1170,9 @@ impl Database {
         }
 
         self.migrate_v1().await?;
+        self.migrate_v2().await?;
         const _: () = assert!(
-            Database::CURRENT_VERSION == 1,
+            Database::CURRENT_VERSION == 2,
             "add the new migrate_vN call above and bump this constant",
         );
 

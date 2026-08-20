@@ -150,6 +150,7 @@ impl DispatchHarness {
             // Keeps test runtime bounded if the preamble hangs.
             pre_run_timeout_ms: Some(5_000),
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create due prompt task");
@@ -180,6 +181,7 @@ impl DispatchHarness {
             pre_run_cwd: None,
             pre_run_timeout_ms: Some(5_000),
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create monitor task");

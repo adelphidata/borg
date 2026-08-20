@@ -43,7 +43,7 @@ pub fn collect_required_env_vars(
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
 ) -> std::collections::HashSet<String> {
-    match load_all_skills(resolved_creds, skills_config) {
+    match load_all_skills(resolved_creds, skills_config, None) {
         Ok(skills) => skills
             .iter()
             .flat_map(|s| s.manifest.requires.env.iter().cloned())

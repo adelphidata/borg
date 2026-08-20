@@ -220,7 +220,7 @@ impl ReadOnlyToolHandler for ListTool {
         // `agent_control = None`: MCP can't list spawned sub-agents
         // without a live agent loop. The core handler returns a clear
         // error in that case for `kind=agents`, which is fine.
-        let result = cortex::tool_handlers::handle_list(&remapped, &config, None)
+        let result = cortex::tool_handlers::handle_list(&remapped, &config, None, None)
             .map_err(|e| McpError::internal(format!("list failed: {e}")))?;
         Ok(serde_json::Value::String(result))
     }

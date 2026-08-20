@@ -279,6 +279,7 @@ impl Agent {
                     self.credentials_cached(),
                     &self.config.skills,
                     &user_request,
+                    Some(self.execution_context.workspace_root()),
                 )?;
                 self.warn_skill_budget_loss(&report);
                 self.caches
@@ -956,6 +957,7 @@ mod scheduled_tasks_snapshot_tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");

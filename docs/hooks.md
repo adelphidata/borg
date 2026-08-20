@@ -29,7 +29,7 @@ Restart `borgd` (or any `borg` command that respawns it). Hooks are discovered w
 | `SessionStart` | Once when a new session begins. |
 | `SessionEnd` | When a session ends, including explicit session close. |
 | `UserPromptSubmit` | Before the agent starts processing a user message. |
-| `PreToolUse` | Before executing any tool call. Non-zero exit **skips** the tool call; the hook's stderr becomes the block reason the model sees. |
+| `PreToolUse` | Before executing any tool call. Non-zero exit **skips** the tool call; the hook's stderr becomes the block reason the model sees. On exit 0 the hook can rewrite the call's arguments — see [Rewriting a tool call](#rewriting-a-tool-call-pretooluse). |
 | `PostToolUse` | After a tool call completes. Observer — exit code ignored. |
 | `Stop` | After a full agent turn completes. |
 
@@ -64,11 +64,64 @@ A hook that never reads stdin is fine: borg closes the pipe and ignores the resu
 
 `tool` is `null` for events that aren't tool-related.
 
+On `PreToolUse` the `tool` object also carries the call's arguments, so a hook
+can inspect what is about to run. The same object appears twice: `args` is the
+canonical spelling, `tool_input` is the Claude Code one.
+
+```json
+{
+  "event": "PreToolUse",
+  "session_id": "s_abc",
+  "turn": 4,
+  "tool": {
+    "name": "run_shell",
+    "is_error": false,
+    "args": { "command": "ls" },
+    "tool_input": { "command": "ls" }
+  }
+}
+```
+
+## Rewriting a tool call (`PreToolUse`)
+
+A `PreToolUse` hook can change the arguments instead of blocking the call.
+Exit `0` and print a decision object on **stdout**:
+
+```sh
+# Force every shell command to run in a fixed directory.
+echo '{"action":"modify","args":{"cwd":"/srv/work"}}'
+```
+
+Claude Code's spelling works too:
+
+```sh
+echo '{"decision":"modify","tool_input":{"cwd":"/srv/work"}}'
+```
+
+Rules:
+
+- The object is merged **over** the model's arguments, one level deep. Fields
+  you do not mention are untouched; to change one field of a nested object,
+  supply that whole object.
+- Several hooks can each rewrite a different field. When two hooks write the
+  same field, the later hook wins.
+- The rewrite is applied before every other gate, so plan mode, the repeat
+  guard, and the rate limiter all judge the call that actually runs.
+- A block beats a rewrite: a hook that exits non-zero skips the call whatever
+  its stdout said.
+- The transcript records the arguments the model produced, not the rewritten
+  ones. Only the executed call uses the rewrite. If you are debugging a hook,
+  read its own log rather than the conversation.
+- Anything else on stdout is ignored. A hook that prints progress, prints JSON
+  that is not a decision object, or asks to modify without supplying arguments
+  runs the call unchanged and logs a warning. A hook can never break the call
+  it was inspecting.
+
 ## Exit-code semantics
 
 | Event | Zero exit | Non-zero exit | Timeout |
 |---|---|---|---|
-| `PreToolUse` | Tool runs | **Tool is skipped** (stderr surfaced as the reason; exit code if stderr is empty) | **Tool is skipped** (reason says the hook timed out) |
+| `PreToolUse` | Tool runs, with the arguments the hook's stdout asked for (if any) | **Tool is skipped** (stderr surfaced as the reason; exit code if stderr is empty) | **Tool is skipped** (reason says the hook timed out) |
 | All others | Continue | Continue (warn logged) | Continue (warn logged) |
 
 Fail-open on PreToolUse **spawn** failures (e.g. typoed command path): a broken hook should never block every tool call. Fail-closed on PreToolUse **timeouts**: a hung hook on a tool-gating event aborts the call to avoid ambiguous state.
@@ -80,7 +133,7 @@ Hooks **cannot break the agent.** Every failure path resolves to a safe default 
 - Missing / unreadable / malformed `hooks.json` → zero hooks loaded, agent runs normally.
 - Unknown event names, invalid matcher regex, missing `command` field → that entry is dropped, other hooks still load.
 - Subprocess spawn failure, timeout, non-zero exit, non-UTF-8 output, panic inside the runner → logged, action defaults to `Continue` (or `Skip` for PreToolUse on timeout/non-zero).
-- Hook output is capped at 8 KiB per stream. Stdout is discarded; stderr is logged, and on a PreToolUse block its first 2000 characters are surfaced to the model as the reason (after secret redaction).
+- Hook output is capped at 8 KiB per stream. Stdout is read only for a `PreToolUse` decision object and otherwise ignored; stderr is logged, and on a PreToolUse block its first 2000 characters are surfaced to the model as the reason (after secret redaction).
 - A hook that backgrounds a process (`some-daemon &`) leaks the output pipe to that process. Borg stops waiting on the pipe once the hook itself exits, so `timeout` still holds — but that hook's stderr may not make it into the log. Redirect it (`some-daemon >/dev/null 2>&1 &`) if you care.
 
 Check `~/.borg/logs/daemon.log` and `~/.borg/logs/daemon.err` for hook warnings.

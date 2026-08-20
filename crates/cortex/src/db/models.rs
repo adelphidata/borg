@@ -153,6 +153,13 @@ pub struct ScheduledTaskRow {
     /// Heartbeat populates this from `heartbeat.min_interval_secs` so two
     /// firings can't land within the configured window.
     pub min_interval_secs: Option<i64>,
+    /// Whether each run should see what the previous runs produced.
+    ///
+    /// Off by default: carrying prior output costs context on every fire, and
+    /// most scheduled tasks are stateless by design ("summarize today's
+    /// mail"). On, the task can notice what changed since last time and
+    /// avoid repeating itself.
+    pub continuity: bool,
     /// Hash of the most recent delivered response. The heartbeat dispatch
     /// path checks this before broadcasting to suppress accidental repeats
     /// (model said the same thing twice). `[SILENT]` runs do NOT update
@@ -678,6 +685,9 @@ pub struct NewTask<'a> {
     /// to enforce `heartbeat.min_interval_secs` at dispatch time. None for
     /// regular tasks.
     pub min_interval_secs: Option<i64>,
+    /// Whether each run should see what the previous runs produced. See
+    /// [`ScheduledTaskRow::continuity`].
+    pub continuity: bool,
 }
 
 /// Parameters for enqueuing a delivery.

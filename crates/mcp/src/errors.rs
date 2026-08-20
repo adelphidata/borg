@@ -41,6 +41,15 @@ pub enum McpError {
         msg: String,
     },
 
+    /// The server no longer recognizes our streamable-HTTP session (`404`).
+    ///
+    /// Internal to the HTTP transport, which answers it by re-running the
+    /// `initialize` handshake and retrying the request once. It reaches a
+    /// caller only when there was no session to lose, which means the
+    /// endpoint URL itself is wrong.
+    #[error("session expired: {0}")]
+    SessionExpired(String),
+
     /// Tool call exceeded its per-call timeout.
     #[error("timeout after {ms}ms")]
     Timeout {
@@ -118,6 +127,7 @@ impl McpError {
             McpError::Auth(_) => "auth",
             McpError::TransportClosed(_) => "transport_closed",
             McpError::TransientHttp { .. } => "transient_http",
+            McpError::SessionExpired(_) => "session_expired",
             McpError::Timeout { .. } => "timeout",
             McpError::RateLimited { .. } => "rate_limited",
             McpError::SchemaRejected { .. } => "schema_rejected",

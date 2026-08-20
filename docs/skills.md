@@ -50,6 +50,38 @@ User-created skills live at `~/.borg/skills/<name>/SKILL.md`. The agent creates 
 
 User skills must use a unique name. Built-in name collisions are rejected by the loader.
 
+## Project skills
+
+A repository can ship its own skills, so instructions for working on that repo
+travel with it instead of every teammate installing them by hand. They are read
+from the session's workspace:
+
+- `<workspace>/.borg/skills/<name>/SKILL.md`
+- `<workspace>/.agents/skills/<name>/SKILL.md` — the cross-tool convention, so a
+  repo that already ships skills for another agent harness works unchanged.
+
+Precedence is **built-in > project > user**. A project skill shadows a personal
+skill of the same name, because it describes how to work on *this* checkout. It
+can never shadow a built-in.
+
+Project skills go through the same security scan as user skills, and there is no
+prompt to approve them — the scan is the boundary. A skill whose content scans as
+high-risk (prompt injection, credential exfiltration, invisible-unicode
+smuggling) is excluded from the catalog, from `skill_list`, and from invocation.
+A flagged one loads wrapped in an injection warning. This matters more here than
+for user skills: a repo arrives with a `git pull`, not by your own hand, and its
+skills change every time you pull.
+
+Only a session that has a workspace loads them. `borgd`'s own working directory
+is not any session's workspace, so no workspace means no project skills rather
+than a guess at which repo was meant.
+
+Turn the tier off entirely with:
+
+```sh
+borg settings set skills.project_discovery false
+```
+
 ## SKILL.md format
 
 ```markdown

@@ -46,14 +46,27 @@ pub(super) struct StallWatchdog {
     idle_cycles: u32,
     stalled_emitted: bool,
     stale_threshold: u32,
+    /// Tool calls started but not yet answered. Counted rather than flagged:
+    /// a child can run several calls at once, so one `ToolResult` must not
+    /// close the window while its siblings are still running.
+    tools_in_flight: u32,
+    /// Ticks elapsed since the *first* of the current batch of calls started.
+    /// Deliberately not reset by a later call in the same batch — otherwise a
+    /// child issuing back-to-back calls re-arms the window forever and the
+    /// bound stops being a bound.
+    tool_cycles: u32,
+    tool_grace_cycles: u32,
 }
 
 impl StallWatchdog {
-    pub(super) fn new(stale_threshold: u32) -> Self {
+    pub(super) fn new(stale_threshold: u32, tool_grace_cycles: u32) -> Self {
         Self {
             idle_cycles: 0,
             stalled_emitted: false,
             stale_threshold: stale_threshold.max(1),
+            tools_in_flight: 0,
+            tool_cycles: 0,
+            tool_grace_cycles,
         }
     }
 
@@ -89,7 +102,12 @@ impl StallWatchdog {
     ///   could never fire. This exclusion is the whole point of the watchdog;
     ///   do not "fix" it by resetting on every event.
     /// - `ToolExecuting` — "a tool started" is precisely the state that then
-    ///   hangs.
+    ///   hangs. It does not reset the idle counter. It does open a *bounded*
+    ///   grace window (`tool_grace_cycles`) during which ticks are not
+    ///   counted as idle, because a quiet build or a long test suite emits
+    ///   nothing at all while it works and `run_shell` is exempt from the
+    ///   builtin tool deadline. The window is finite, so a tool that hangs
+    ///   past it is still cancelled — later, never not at all.
     pub(super) fn on_event(&mut self, event: &AgentEvent) -> bool {
         let is_progress = matches!(
             event,
@@ -107,11 +125,33 @@ impl StallWatchdog {
             self.idle_cycles = 0;
             self.stalled_emitted = false;
         }
+        match event {
+            // A call is outstanding from here until its result arrives. The
+            // elapsed counter starts only on the transition from "nothing
+            // running" — a second call joining an already-open window inherits
+            // the time the first has already used.
+            AgentEvent::ToolExecuting { .. } => {
+                if self.tools_in_flight == 0 {
+                    self.tool_cycles = 0;
+                }
+                self.tools_in_flight = self.tools_in_flight.saturating_add(1);
+            }
+            AgentEvent::ToolResult { .. } => {
+                self.tools_in_flight = self.tools_in_flight.saturating_sub(1);
+            }
+            _ => {}
+        }
         is_progress
     }
 
     /// Advance one heartbeat interval.
     pub(super) fn on_tick(&mut self) -> TickOutcome {
+        // A tool call still inside its grace window holds the idle counter
+        // where it is — the child is not quiet, its tool is.
+        if self.tools_in_flight > 0 && self.tool_cycles < self.tool_grace_cycles {
+            self.tool_cycles = self.tool_cycles.saturating_add(1);
+            return TickOutcome::Quiet;
+        }
         self.idle_cycles = self.idle_cycles.saturating_add(1);
         if !self.stalled_emitted && self.idle_cycles >= self.stale_threshold {
             self.stalled_emitted = true;
@@ -137,6 +177,7 @@ mod tests {
     use super::*;
 
     const THRESHOLD: u32 = 3;
+    const TOOL_GRACE: u32 = 4;
 
     fn thinking() -> AgentEvent {
         AgentEvent::ThinkingDelta("reasoning…".to_string())
@@ -155,7 +196,7 @@ mod tests {
     fn thinking_only_stream_never_trips_stall_watchdog() {
         // A reasoning model can emit nothing but thinking tokens for minutes.
         // Killing it mid-reason destroys real work and reports it as a hang.
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         for i in 0..(THRESHOLD + STALL_GRACE_CYCLES + 5) {
             w.on_event(&thinking());
             assert_eq!(
@@ -171,7 +212,7 @@ mod tests {
         // The deliberate exclusion: a hung shell flooding stdout must still
         // be caught. This fails if someone widens `on_event` to reset on
         // every event.
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         let mut outcomes = Vec::new();
         for _ in 0..(THRESHOLD + STALL_GRACE_CYCLES) {
             assert!(
@@ -196,7 +237,7 @@ mod tests {
     fn usage_event_resets_idle_counter() {
         // A tool-call-only turn emits no text and no thinking; `Usage` is the
         // only proof the provider round-trip completed.
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         for _ in 0..(THRESHOLD - 1) {
             assert_eq!(w.on_tick(), TickOutcome::Quiet);
         }
@@ -222,7 +263,7 @@ mod tests {
 
     #[test]
     fn progress_inside_grace_window_recovers_and_can_rearm() {
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         for _ in 0..(THRESHOLD - 1) {
             assert_eq!(w.on_tick(), TickOutcome::Quiet);
         }
@@ -246,7 +287,7 @@ mod tests {
         // arrives. Before `LlmAttemptStarted` counted, that silence was
         // indistinguishable from a frozen child and the child was cancelled
         // with a stall error while the transport was working normally.
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         for i in 0..(THRESHOLD + STALL_GRACE_CYCLES + 5) {
             assert!(
                 w.on_event(&AgentEvent::LlmAttemptStarted { attempt: i }),
@@ -261,7 +302,7 @@ mod tests {
         // The marker fires once per attempt, not on a timer. A child that
         // opens one request and then genuinely wedges must still be caught —
         // otherwise the exclusion list above is meaningless.
-        let mut w = StallWatchdog::new(THRESHOLD);
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
         assert!(w.on_event(&AgentEvent::LlmAttemptStarted { attempt: 0 }));
         let mut outcomes = Vec::new();
         for _ in 0..(THRESHOLD + STALL_GRACE_CYCLES) {
@@ -294,5 +335,152 @@ mod tests {
 
         // A zero interval is clamped to 1s rather than dividing by zero.
         assert_eq!(effective_stale_cycles(1, 0, 3_000), 4);
+    }
+
+    #[test]
+    fn a_silent_long_tool_call_is_not_counted_as_idle() {
+        // A quiet build emits ToolExecuting and then nothing until it
+        // finishes. Without the grace window it is cancelled mid-work.
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
+        w.on_event(&AgentEvent::ToolExecuting {
+            tool_call_id: "c1".to_string(),
+            name: "run_shell".to_string(),
+            args: "{}".to_string(),
+        });
+        for tick in 0..TOOL_GRACE {
+            assert_eq!(
+                w.on_tick(),
+                TickOutcome::Quiet,
+                "tick {tick} inside the tool grace window must stay quiet"
+            );
+        }
+        assert_eq!(w.idle_cycles(), 0, "grace ticks must not accrue as idle");
+
+        w.on_event(&AgentEvent::ToolResult {
+            tool_call_id: "c1".to_string(),
+            name: "run_shell".to_string(),
+            result: "done".to_string(),
+        });
+        assert_eq!(w.on_tick(), TickOutcome::Quiet);
+    }
+
+    #[test]
+    fn a_tool_that_outlives_its_grace_window_still_stalls_and_cancels() {
+        // The bound is what keeps the watchdog useful: a wedged tool is
+        // cancelled late, not never.
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
+        w.on_event(&AgentEvent::ToolExecuting {
+            tool_call_id: "c1".to_string(),
+            name: "run_shell".to_string(),
+            args: "{}".to_string(),
+        });
+        for _ in 0..TOOL_GRACE {
+            assert_eq!(w.on_tick(), TickOutcome::Quiet);
+        }
+        // Grace spent: the ordinary countdown resumes from zero.
+        let mut outcomes = Vec::new();
+        for _ in 0..(THRESHOLD + STALL_GRACE_CYCLES) {
+            outcomes.push(w.on_tick());
+        }
+        assert!(
+            outcomes.contains(&TickOutcome::EmitStalled),
+            "a tool past its grace window must still be reported stalled"
+        );
+        assert_eq!(
+            outcomes.last(),
+            Some(&TickOutcome::Cancel),
+            "and must still be cancelled"
+        );
+    }
+
+    #[test]
+    fn tool_output_alone_never_extends_the_grace_window() {
+        // The exclusion that makes the watchdog work: a hung `yes` streams
+        // forever and must not buy itself more time.
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
+        w.on_event(&AgentEvent::ToolExecuting {
+            tool_call_id: "c1".to_string(),
+            name: "run_shell".to_string(),
+            args: "{}".to_string(),
+        });
+        let mut ticks = 0;
+        loop {
+            w.on_event(&AgentEvent::ToolOutputDelta {
+                tool_call_id: "c1".to_string(),
+                name: "run_shell".to_string(),
+                delta: "y\n".to_string(),
+                is_stderr: false,
+            });
+            if w.on_tick() == TickOutcome::Cancel {
+                break;
+            }
+            ticks += 1;
+            assert!(ticks < 100, "a stdout-spewing tool must still be cancelled");
+        }
+    }
+
+    fn executing(id: &str) -> AgentEvent {
+        AgentEvent::ToolExecuting {
+            tool_call_id: id.to_string(),
+            name: "run_shell".to_string(),
+            args: "{}".to_string(),
+        }
+    }
+
+    fn finished(id: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            tool_call_id: id.to_string(),
+            name: "run_shell".to_string(),
+            result: "done".to_string(),
+        }
+    }
+
+    #[test]
+    fn back_to_back_tool_calls_cannot_re_arm_the_grace_window_forever() {
+        // The bound has to be a bound. If each new call reset the elapsed
+        // counter, a child looping over tool calls would never accrue an idle
+        // cycle and the watchdog could never fire — which is the failure the
+        // watchdog exists to catch.
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
+        let mut ticks = 0;
+        loop {
+            w.on_event(&executing(&format!("c{ticks}")));
+            if w.on_tick() == TickOutcome::Cancel {
+                break;
+            }
+            ticks += 1;
+            assert!(
+                ticks < 100,
+                "a child issuing endless tool calls must still be cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn one_finished_call_does_not_close_the_window_on_its_siblings() {
+        // Parallel tool calls: the first result must not expose the others to
+        // the idle counter while they are still legitimately running.
+        let mut w = StallWatchdog::new(THRESHOLD, TOOL_GRACE);
+        w.on_event(&executing("a"));
+        w.on_event(&executing("b"));
+        w.on_event(&finished("a"));
+
+        assert_eq!(
+            w.on_tick(),
+            TickOutcome::Quiet,
+            "call b is still running, so this tick is not idle"
+        );
+        assert_eq!(w.idle_cycles(), 0, "no idle cycle may be charged yet");
+
+        w.on_event(&finished("b"));
+        // Both done: the ordinary countdown resumes.
+        let mut outcomes = Vec::new();
+        for _ in 0..(THRESHOLD + STALL_GRACE_CYCLES) {
+            outcomes.push(w.on_tick());
+        }
+        assert!(
+            outcomes.contains(&TickOutcome::EmitStalled),
+            "with nothing in flight the watchdog must resume counting"
+        );
     }
 }

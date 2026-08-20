@@ -168,7 +168,7 @@ impl PluginsPopup {
         }
 
         let resolved_creds = config.resolve_credentials();
-        if let Ok(skills) = cortex::skills::load_all_skills(&resolved_creds, &config.skills) {
+        if let Ok(skills) = cortex::skills::load_all_skills(&resolved_creds, &config.skills, None) {
             for skill in skills {
                 if skill.is_hidden() {
                     continue;

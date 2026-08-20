@@ -62,6 +62,9 @@ pub(super) async fn create_scheduled_task(
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            // Not on the RPC surface yet; the `schedule` tool is where
+            // continuity is chosen today.
+            continuity: false,
         };
         db.create_task(&new_task).await?;
         anyhow::Ok(db.list_tasks().await?.into_iter().find(|t| t.id == id))

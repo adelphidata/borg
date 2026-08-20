@@ -176,6 +176,7 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         inbox: VecDeque::new(),
         session_id: None,
         max_response_bytes,
+        protocol_version: None,
     })
 }
 
@@ -184,6 +185,15 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
 /// every subsequent request. A server that returns 404 after the id was
 /// once valid invalidates our cached id and we re-initialize transparently.
 pub const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+
+/// Header carrying the protocol version agreed during `initialize`.
+///
+/// The spec requires it on every request after the handshake, and a
+/// conforming server routes the request by it. It must carry the *negotiated*
+/// value, never a "latest known" constant: a header and body that disagree
+/// about the revision get the request rejected against its own envelope
+/// rules.
+pub const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 
 /// Connected HTTP transport.
 ///
@@ -205,6 +215,10 @@ pub struct HttpTransport {
     inbox: VecDeque<Message>,
     session_id: Option<String>,
     max_response_bytes: usize,
+    /// Version agreed at `initialize`, echoed on every later request. `None`
+    /// until the handshake completes — the handshake itself declares its
+    /// version in the body.
+    protocol_version: Option<String>,
 }
 
 impl HttpTransport {
@@ -218,11 +232,18 @@ impl HttpTransport {
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
-}
 
-#[async_trait]
-impl Transport for HttpTransport {
-    async fn send(&mut self, msg: Value) -> Result<()> {
+    /// The negotiated protocol version, once the handshake has set it.
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
+    }
+
+    /// POST one JSON-RPC message and return the decoded response messages.
+    ///
+    /// Split out of [`Transport::send`] so the 404 re-initialize path can
+    /// drive its own handshake exchange through exactly the same request
+    /// construction, status handling, and body cap.
+    async fn post(&mut self, msg: &Value) -> Result<Vec<Message>> {
         let mut req = self
             .client
             .post(self.url.clone())
@@ -242,7 +263,10 @@ impl Transport for HttpTransport {
         if let Some(sid) = &self.session_id {
             req = req.header(MCP_SESSION_ID_HEADER, sid);
         }
-        let mut resp = req.json(&msg).send().await.map_err(|e| {
+        if let Some(version) = &self.protocol_version {
+            req = req.header(MCP_PROTOCOL_VERSION_HEADER, version);
+        }
+        let mut resp = req.json(msg).send().await.map_err(|e| {
             // A connect/timeout failure (server not yet listening, momentary
             // network blip) is transient and retryable on the idempotent startup
             // path; any other send failure tears the transport down.
@@ -264,20 +288,9 @@ impl Transport for HttpTransport {
                 truncate(&body, 200)
             )));
         }
-        // 404 with a stale session id means "session not found, re-init."
-        // Drop the cached id and surface a TransportClosed so the supervisor
-        // (one level up) discards this transport and opens a fresh one.
-        // Without this branch a server-side restart would loop forever
-        // sending invalid session ids.
-        if status == reqwest::StatusCode::NOT_FOUND && self.session_id.is_some() {
-            tracing::info!(
-                server = %self.server_name,
-                "MCP session id rejected (404); will re-initialize",
-            );
-            self.session_id = None;
-            return Err(McpError::TransportClosed(format!(
-                "{}: session id invalidated (404); transport torn down — \
-                 re-init requires daemon restart",
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(McpError::SessionExpired(format!(
+                "{}: session not found (404)",
                 self.server_name
             )));
         }
@@ -335,11 +348,130 @@ impl Transport for HttpTransport {
         }
         // Streamable HTTP framing: either one JSON object, or newline-delimited
         // JSON objects when the server batches a response + notifications.
+        let mut messages = Vec::new();
         for line in body.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            let msg = crate::protocol::decode_line(line)?;
-            self.inbox.push_back(msg);
+            messages.push(crate::protocol::decode_line(line)?);
         }
+        Ok(messages)
+    }
+
+    /// Map a failure seen *during* 404 recovery to a terminal one.
+    ///
+    /// A `SessionExpired` here is not the recoverable case the caller already
+    /// handled — it is the server rejecting the session it just handed us.
+    /// Returning it unchanged would defeat the supervisor's teardown, which
+    /// matches on `TransportClosed`, and would silently change the audited
+    /// `error_kind`. Every other error passes through as-is.
+    fn terminal_recovery_failure(e: McpError) -> McpError {
+        match e {
+            McpError::SessionExpired(detail) => McpError::TransportClosed(format!(
+                "{detail} — the server rejected the session it had just issued"
+            )),
+            other => other,
+        }
+    }
+
+    /// Re-run the `initialize` handshake after the server forgot our session.
+    ///
+    /// A server restart invalidates the session id, and the spec's answer is
+    /// to initialize again — not to tear the client down. The exchange
+    /// carries a sentinel request id that never collides with the session's
+    /// own monotonic counter, because its response is consumed here and never
+    /// reaches the inbox.
+    async fn reinitialize(&mut self) -> Result<()> {
+        self.session_id = None;
+        self.protocol_version = None;
+        let init = serde_json::json!({
+            "jsonrpc": crate::protocol::JSONRPC_VERSION,
+            "id": REINIT_REQUEST_ID,
+            "method": crate::protocol::methods::INITIALIZE,
+            "params": {
+                "protocolVersion": crate::protocol::MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": crate::protocol::ClientInfo::standard(),
+            },
+        });
+        let replies = self.post(&init).await?;
+        let negotiated = replies.iter().find_map(|m| {
+            m.result
+                .as_ref()
+                .and_then(|v| v.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        self.set_protocol_version(
+            negotiated
+                .as_deref()
+                .unwrap_or(crate::protocol::MCP_PROTOCOL_VERSION),
+        );
+
+        // Per spec the handshake is only complete after this notification.
+        let notif = serde_json::json!({
+            "jsonrpc": crate::protocol::JSONRPC_VERSION,
+            "method": crate::protocol::methods::INITIALIZED_NOTIFICATION,
+        });
+        self.post(&notif).await?;
         Ok(())
+    }
+}
+
+/// Request id used by the transport's own re-initialize exchange. Far above
+/// any id a session counter reaches, and its response never enters the inbox,
+/// so it cannot be confused with a session request.
+const REINIT_REQUEST_ID: u64 = u64::MAX;
+
+#[async_trait]
+impl Transport for HttpTransport {
+    async fn send(&mut self, msg: Value) -> Result<()> {
+        let messages = match self.post(&msg).await {
+            Ok(messages) => messages,
+            Err(McpError::SessionExpired(_)) if self.session_id.is_some() => {
+                // The server forgot this session — a restart, or a TTL that
+                // expired while we were idle. The spec's remedy is to
+                // initialize again, so do that here instead of tearing the
+                // transport down and making the operator restart the daemon.
+                // Exactly one attempt: a server that 404s its own fresh
+                // session is broken, and retrying would spin.
+                tracing::info!(
+                    server = %self.server_name,
+                    "MCP session id rejected (404); re-initializing",
+                );
+                // Recovery gets exactly one attempt, and a 404 anywhere inside
+                // it means the server rejected the session it just issued.
+                // That must surface as `TransportClosed`, because that is what
+                // the supervisor keys its teardown on — leaking
+                // `SessionExpired` would leave the session marked alive and
+                // every later call would repeat this whole handshake and fail,
+                // forever.
+                self.reinitialize()
+                    .await
+                    .map_err(Self::terminal_recovery_failure)?;
+                self.post(&msg)
+                    .await
+                    .map_err(Self::terminal_recovery_failure)?
+            }
+            Err(McpError::SessionExpired(detail)) => {
+                // 404 with no session id of ours in play is the endpoint
+                // itself being wrong, not a stale session.
+                return Err(McpError::TransportClosed(format!(
+                    "{detail} — the endpoint URL may be wrong"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        self.inbox.extend(messages);
+        Ok(())
+    }
+
+    fn set_protocol_version(&mut self, version: &str) {
+        if self.protocol_version.as_deref() != Some(version) {
+            tracing::debug!(
+                server = %self.server_name,
+                version,
+                "MCP protocol version negotiated",
+            );
+        }
+        self.protocol_version = Some(version.to_string());
     }
 
     async fn recv(&mut self) -> Result<Option<Message>> {

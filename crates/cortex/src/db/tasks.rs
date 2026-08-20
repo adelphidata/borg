@@ -10,7 +10,7 @@ use libsql::params;
 const CONSECUTIVE_FAILURE_WINDOW: i64 = 64;
 
 /// Column list shared by all scheduled-task SELECT queries.
-const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash";
+const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash, continuity";
 
 /// Returns true if `pid` is alive on this host. `kill(pid, 0)` only probes —
 /// 0 means alive; ESRCH means dead; any other errno (e.g. EPERM) is treated
@@ -68,6 +68,7 @@ fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
         model_provider: row.get::<Option<String>>(25)?,
         monitor_mode: row.get::<Option<i64>>(26)?.unwrap_or(0) != 0,
         last_pre_run_hash: row.get::<Option<String>>(27)?,
+        continuity: row.get::<Option<i64>>(28)?.unwrap_or(0) != 0,
     })
 }
 
@@ -83,10 +84,21 @@ impl Database {
             .pre_run_timeout_ms
             .unwrap_or(crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS as i64);
         self.conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-            params!(task.id, task.name, task.prompt, task.schedule_type, task.schedule_expr, task.timezone, task.next_run, now, max_retries, timeout_ms, task.delivery_channel, task.delivery_target, task.allowed_tools, task.task_type, task.pre_run_command, task.pre_run_cwd, pre_run_timeout_ms, task.min_interval_secs),
+            "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs, continuity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            params!(task.id, task.name, task.prompt, task.schedule_type, task.schedule_expr, task.timezone, task.next_run, now, max_retries, timeout_ms, task.delivery_channel, task.delivery_target, task.allowed_tools, task.task_type, task.pre_run_command, task.pre_run_cwd, pre_run_timeout_ms, task.min_interval_secs, i64::from(task.continuity)),
         ).await?;
+        Ok(())
+    }
+
+    /// Turn run-to-run continuity on or off for a task.
+    pub async fn set_task_continuity(&self, task_id: &str, continuity: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET continuity = ?1 WHERE id = ?2",
+                params!(i64::from(continuity), task_id),
+            )
+            .await?;
         Ok(())
     }
 
@@ -674,6 +686,17 @@ impl Database {
                 params!(task_id, started_at, note, crate::tasks::RUN_STATUS_MISSED),
             )
             .await?;
+        // Also stamp the task row. `task_runs` is history nobody reads unless
+        // they ask for it, while `last_error` is the field the system prompt,
+        // the heartbeat health nudge, and `borg doctor` all surface — so
+        // without this a job that quietly stopped running is invisible until
+        // the user notices its effects are missing.
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET last_error = ?1 WHERE id = ?2",
+                params!(format!("missed run: {note}"), task_id),
+            )
+            .await?;
         Ok(())
     }
 
@@ -1174,6 +1197,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");
@@ -1231,6 +1255,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");
@@ -1480,6 +1505,7 @@ mod delivery_failure_tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");

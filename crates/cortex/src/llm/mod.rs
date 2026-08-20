@@ -337,6 +337,15 @@ struct StreamChunk {
 
 #[derive(Debug, Deserialize)]
 struct StreamUsage {
+    /// Prompt tokens.
+    ///
+    /// Deliberately NOT aliased to Anthropic's `input_tokens`: serde rejects a
+    /// payload carrying a field and its alias as a duplicate, and that failure
+    /// drops the whole usage record rather than one field. `prompt_tokens` is
+    /// present on essentially every payload that reaches this wire, so the
+    /// alias would turn a relay that helpfully emits both spellings into a
+    /// total loss of accounting. The cache fields below are aliased because
+    /// a provider emits exactly one of those spellings.
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
@@ -345,15 +354,31 @@ struct StreamUsage {
     /// surface a top-level `cached_tokens` instead.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default)]
+    /// Top-level cached-read count. The aliases are the same spellings
+    /// [`crate::llm::anthropic::normalize_cache_tokens`] accepts: an
+    /// Anthropic-shaped or DeepSeek-direct usage object reaches this
+    /// OpenAI-compatible transport whenever an operator points `base_url` at
+    /// such an endpoint, and without them those turns report zero cache
+    /// reads and understate cost.
+    #[serde(
+        default,
+        alias = "cache_read_input_tokens",
+        alias = "cached_input_tokens",
+        alias = "prompt_cache_hit_tokens"
+    )]
     cached_tokens: Option<u64>,
     /// OpenRouter passes Anthropic's `cache_creation_input_tokens` field
     /// through verbatim when the upstream model is Claude. Without
     /// extracting it here, the cache *write* tokens charged on the first
     /// turn after a marker change would never reach the cost-event
     /// pipeline and cache spend would be invisible.
-    #[serde(default)]
+    #[serde(default, alias = "cache_write_input_tokens")]
     cache_creation_input_tokens: Option<u64>,
+    /// Anthropic's newer per-TTL breakdown, which replaces the flat
+    /// `cache_creation_input_tokens` on some responses. Summed only when the
+    /// flat field is absent.
+    #[serde(default)]
+    cache_creation: Option<CacheCreationBreakdown>,
     /// OpenRouter's streaming usage chunk reports the dollar total under
     /// `total_cost`; older / non-streaming shapes use `cost`. Accept both
     /// so cost-event attribution stays `openrouter_usage` instead of
@@ -365,6 +390,44 @@ struct StreamUsage {
     /// absent — without it we mis-attribute as `unknown`.
     #[serde(default)]
     cost_details: Option<CostDetails>,
+}
+
+impl StreamUsage {
+    /// Cached *read* tokens, trying every spelling a provider might use.
+    fn cached_read_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .or(self.cached_tokens)
+            .unwrap_or(0)
+    }
+
+    /// Cache *write* tokens: the flat field when present, otherwise the sum
+    /// of the per-TTL breakdown.
+    fn cache_creation_tokens(&self) -> u64 {
+        self.cache_creation_input_tokens
+            .or_else(|| {
+                self.cache_creation
+                    .as_ref()
+                    .map(CacheCreationBreakdown::total)
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// Anthropic's per-TTL cache-write breakdown.
+#[derive(Debug, Deserialize)]
+struct CacheCreationBreakdown {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<u64>,
+}
+
+impl CacheCreationBreakdown {
+    fn total(&self) -> u64 {
+        self.ephemeral_5m_input_tokens.unwrap_or(0) + self.ephemeral_1h_input_tokens.unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Deserialize)]

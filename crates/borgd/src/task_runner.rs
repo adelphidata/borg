@@ -128,6 +128,7 @@ pub async fn spawn_task_execution(
     let pre_run_timeout_ms = task.pre_run_timeout_ms;
     let monitor_mode = task.monitor_mode;
     let last_pre_run_hash = task.last_pre_run_hash.clone();
+    let continuity = task.continuity;
 
     tokio::spawn(async move {
         // Liveness registration for the wedged-run recovery sweep: while
@@ -239,6 +240,7 @@ pub async fn spawn_task_execution(
             pre_run_timeout_ms,
             monitor_mode,
             last_pre_run_hash,
+            continuity,
             executor,
         };
 
@@ -626,6 +628,9 @@ struct TaskExecContext {
     monitor_mode: bool,
     /// Stored baseline hash of the last pre-run output that reached the LLM.
     last_pre_run_hash: Option<String>,
+    /// Carry what previous runs of this task produced into this run's turn.
+    /// See `ScheduledTaskRow::continuity`.
+    continuity: bool,
     /// Session executor for agentic turns (heartbeat remediation). `None` on
     /// paths that only run cheap tool-less tasks (tests, manual triggers).
     executor: Option<Arc<DaemonSessionExecutor>>,
@@ -743,6 +748,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         pre_run_timeout_ms: _,
         monitor_mode: _,
         last_pre_run_hash: _,
+        continuity: _,
         executor: _,
     } = ctx;
     let cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -992,6 +998,57 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
     }
 }
 
+/// How many previous runs a continuity-enabled task sees.
+///
+/// Enough to notice a trend, few enough that a daily task does not spend its
+/// whole context window on its own history.
+const CONTINUITY_RUNS: usize = 3;
+
+/// Longest slice of a previous run's result that is replayed. A run that
+/// produced pages of output is still useful in summary, and the current run's
+/// own work is what the context is for.
+const CONTINUITY_RESULT_CHARS: usize = 2_000;
+
+/// Replay prior runs as alternating turns, oldest first.
+///
+/// Only runs that produced a result are replayed: a failed or missed run has
+/// nothing to say about the subject, and presenting its error as though the
+/// model had said it would be a lie about its own history.
+///
+/// Each replayed result is wrapped in a `<prior_run_output>` element rather
+/// than handed over as bare assistant text. A scheduled task's output
+/// routinely contains material it fetched — web pages, mail bodies, MCP
+/// results — and replaying that as the model's own words would strip the XML
+/// trust boundary that the injection defences rely on. The same reason
+/// `pre_run_command` output ships inside `<preprocessed_context>`.
+fn continuity_messages(
+    runs: &[cortex::db::TaskRunRow],
+    task_prompt: &str,
+) -> Vec<cortex::types::Message> {
+    let mut out = Vec::new();
+    for run in runs.iter().rev() {
+        let Some(result) = run.result.as_deref().filter(|r| !r.trim().is_empty()) else {
+            continue;
+        };
+        out.push(cortex::types::Message::user(task_prompt));
+        out.push(cortex::types::Message::assistant(format!(
+            "<prior_run_output>\n{}\n</prior_run_output>",
+            truncate_for_continuity(result)
+        )));
+    }
+    out
+}
+
+/// Truncate on a char boundary, marking that it happened so the model does
+/// not read the cut as the end of what it said.
+fn truncate_for_continuity(result: &str) -> String {
+    if result.chars().count() <= CONTINUITY_RESULT_CHARS {
+        return result.to_string();
+    }
+    let kept: String = result.chars().take(CONTINUITY_RESULT_CHARS).collect();
+    format!("{kept}\n[earlier run's output truncated]")
+}
+
 async fn execute_prompt_task(ctx: &TaskExecContext) {
     let TaskExecContext {
         task_name,
@@ -1012,6 +1069,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         pre_run_timeout_ms,
         monitor_mode,
         last_pre_run_hash,
+        continuity,
         executor: _,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
@@ -1143,10 +1201,27 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         task_prompt.clone()
     };
 
-    let messages = vec![
-        cortex::types::Message::system(system),
-        cortex::types::Message::user(&user_msg),
-    ];
+    let mut messages = vec![cortex::types::Message::system(system)];
+    // Continuity: replay what previous runs of this same task produced, so
+    // the model can report what changed rather than restating the same
+    // findings every fire. Off by default because it costs context on every
+    // run and most scheduled tasks are stateless.
+    if *continuity {
+        match cortex::db::Database::open().await {
+            Ok(db) => match db.task_run_history(task_id, CONTINUITY_RUNS).await {
+                Ok(runs) => messages.extend(continuity_messages(&runs, task_prompt)),
+                Err(e) => tracing::warn!(
+                    task = %task_name,
+                    "continuity: could not read prior runs, running without them: {e}"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                task = %task_name,
+                "continuity: DB open failed, running without prior runs: {e}"
+            ),
+        }
+    }
+    messages.push(cortex::types::Message::user(&user_msg));
 
     let mut llm = match LlmClient::for_auxiliary(config).await {
         // Stable per-task cache/routing key: the same scheduled task sends a
@@ -2215,6 +2290,7 @@ mod scheduled_model_tests {
             model_provider: provider.map(str::to_string),
             monitor_mode: false,
             last_pre_run_hash: None,
+            continuity: false,
         }
     }
 
@@ -3055,6 +3131,132 @@ mod pre_run_tests {
             outcome.stdout.contains("PATH="),
             "PATH must survive the filter: {}",
             outcome.stdout
+        );
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+
+    fn run(result: Option<&str>, status: &str) -> cortex::db::TaskRunRow {
+        cortex::db::TaskRunRow {
+            id: 1,
+            task_id: "t".to_string(),
+            started_at: 0,
+            duration_ms: 0,
+            result: result.map(str::to_string),
+            error: None,
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn prior_runs_are_replayed_oldest_first_as_real_turns() {
+        // The point of continuity: the model must be able to say what
+        // changed, which it can only do if it can see what it said before —
+        // and in the order it said it.
+        let runs = vec![
+            run(Some("newest"), "completed"),
+            run(Some("middle"), "completed"),
+            run(Some("oldest"), "completed"),
+        ];
+
+        let msgs = continuity_messages(&runs, "check my PRs");
+
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "check my PRs",
+                "<prior_run_output>\noldest\n</prior_run_output>",
+                "check my PRs",
+                "<prior_run_output>\nmiddle\n</prior_run_output>",
+                "check my PRs",
+                "<prior_run_output>\nnewest\n</prior_run_output>",
+            ],
+            "history must read oldest-first, with each result inside its trust boundary"
+        );
+        assert!(
+            msgs.iter()
+                .step_by(2)
+                .all(|m| m.role == cortex::types::Role::User),
+            "each replayed turn must open with the task's own prompt"
+        );
+        assert!(
+            msgs.iter()
+                .skip(1)
+                .step_by(2)
+                .all(|m| m.role == cortex::types::Role::Assistant),
+            "each prior result must be attributed to the assistant, not the user"
+        );
+    }
+
+    #[test]
+    fn runs_that_produced_nothing_are_not_replayed() {
+        // A failed or missed run has nothing to say about the subject.
+        // Replaying its blank as an assistant turn would put words in the
+        // model's mouth that it never said.
+        let runs = vec![
+            run(None, "failed"),
+            run(Some("   "), "completed"),
+            run(Some("real output"), "completed"),
+        ];
+
+        let msgs = continuity_messages(&runs, "check my PRs");
+
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "check my PRs",
+                "<prior_run_output>\nreal output\n</prior_run_output>"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_prior_runs_means_no_extra_turns() {
+        assert!(continuity_messages(&[], "check my PRs").is_empty());
+    }
+
+    #[test]
+    fn a_long_prior_result_is_truncated_and_says_so() {
+        // A run that produced pages of output must not crowd out the run
+        // that is happening now — and the cut has to be visible, or the
+        // model reads a mid-sentence stop as the end of what it said.
+        let long = "x".repeat(CONTINUITY_RESULT_CHARS * 3);
+        let out = truncate_for_continuity(&long);
+
+        assert!(out.chars().count() < long.chars().count());
+        assert!(
+            out.contains("truncated"),
+            "a silent cut reads as the whole answer"
+        );
+        assert_eq!(
+            truncate_for_continuity("short"),
+            "short",
+            "output within the budget must be passed through untouched"
+        );
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        // A byte-wise cut through a multi-byte char would panic or produce
+        // mojibake. Assert the cut actually happened, on a char boundary.
+        let long = "é".repeat(CONTINUITY_RESULT_CHARS * 2);
+        let out = truncate_for_continuity(&long);
+
+        assert!(out.contains("truncated"), "the input must have been cut");
+        let kept = out.split('\n').next().unwrap_or_default();
+        assert_eq!(
+            kept.chars().count(),
+            CONTINUITY_RESULT_CHARS,
+            "exactly the budgeted number of characters must survive"
+        );
+        assert!(
+            kept.chars().all(|c| c == 'é'),
+            "no character may be split by the cut"
         );
     }
 }

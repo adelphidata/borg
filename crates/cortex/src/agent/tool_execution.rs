@@ -31,17 +31,7 @@ use super::{Agent, AgentEvent};
 const GOALS_DISABLED_ERROR: &str = r#"{"error":"goals are disabled"}"#;
 const DATABASE_UNAVAILABLE_ERROR: &str = r#"{"error":"database unavailable"}"#;
 
-/// Wall-clock deadline applied to a single builtin tool handler future.
-///
-/// Cancellation between calls already exists (the `CancellationToken` checks
-/// in `run_tool_calls`), but nothing bounded a single handler: a wedged
-/// network fetch or hung subprocess wait could stall the turn forever. 300s
-/// comfortably clears the slowest legitimate bounded builtins (web fetch,
-/// browser navigation, media transcription) while still guaranteeing the
-/// turn eventually makes progress.
-const BUILTIN_TOOL_DEADLINE: Duration = Duration::from_secs(300);
-
-/// Tools exempt from [`BUILTIN_TOOL_DEADLINE`], by name:
+/// Tools exempt from the builtin wall-clock deadline, by name:
 ///
 /// - `run_shell` — self-bounds via `timeout_ms` / `tools.default_timeout_ms`,
 ///   and a caller may legitimately request a budget above 300s (long builds).
@@ -60,14 +50,19 @@ const DEADLINE_EXEMPT_TOOLS: &[&str] = &[
     crate::tool::names::WAIT_FOR_AGENT,
 ];
 
-/// Deadline for one handler invocation of tool `name`; `None` means the tool
-/// is exempt and runs unbounded (it either self-bounds or is legitimately
-/// long-running — see [`DEADLINE_EXEMPT_TOOLS`]).
-fn builtin_tool_deadline(name: &str) -> Option<Duration> {
-    if name.starts_with("mcp_") || DEADLINE_EXEMPT_TOOLS.contains(&name) {
+/// Deadline for one handler invocation of tool `name`, from
+/// `tools.builtin_deadline_ms`. `None` means the tool runs unbounded: it is
+/// exempt by name (see [`DEADLINE_EXEMPT_TOOLS`]) or the operator disabled
+/// the deadline with `0`.
+///
+/// Cancellation between calls already exists (the `CancellationToken` checks
+/// in `run_tool_calls`), but nothing bounds a single handler: a wedged
+/// network fetch or hung subprocess wait would stall the turn forever.
+fn builtin_tool_deadline(name: &str, deadline_ms: u64) -> Option<Duration> {
+    if deadline_ms == 0 || name.starts_with("mcp_") || DEADLINE_EXEMPT_TOOLS.contains(&name) {
         None
     } else {
-        Some(BUILTIN_TOOL_DEADLINE)
+        Some(Duration::from_millis(deadline_ms))
     }
 }
 
@@ -236,26 +231,38 @@ impl Agent {
             }
 
             let name = &tool_call.function.name;
-            let args = &tool_call.function.arguments;
+            let args = tool_call.function.arguments.as_str();
 
             let hook_ctx = self.hook_ctx(
                 HookPoint::BeforeToolCall,
                 HookData::ToolCall {
                     name: name.clone(),
-                    args: args.clone(),
+                    args: args.to_string(),
                 },
             );
-            if let HookAction::Skip { reason } = self.hook_registry.dispatch(&hook_ctx).await {
-                // Surface the hook's explanation (its stderr) to the model —
-                // through the same redaction/truncation as any tool output,
-                // since hook scripts can echo anything.
-                let msg = match reason {
-                    Some(r) => self.truncate_and_redact(&r),
-                    None => "[tool call skipped by hook]".to_string(),
-                };
-                self.skip_tool_call(&tool_call.id, &msg).await;
-                continue;
+            // A hook can rewrite the arguments. The rewrite is applied here,
+            // before every gate below, so plan mode, the loop guard, and the
+            // rate limiter all judge the call that actually runs.
+            let mut rewritten_args: Option<String> = None;
+            match self.hook_registry.dispatch(&hook_ctx).await {
+                HookAction::Skip { reason } => {
+                    // Surface the hook's explanation (its stderr) to the model —
+                    // through the same redaction/truncation as any tool output,
+                    // since hook scripts can echo anything.
+                    let msg = match reason {
+                        Some(r) => self.truncate_and_redact(&r),
+                        None => "[tool call skipped by hook]".to_string(),
+                    };
+                    self.skip_tool_call(&tool_call.id, &msg).await;
+                    continue;
+                }
+                HookAction::Modify { args: new_args } => {
+                    tracing::debug!("PreToolUse hook rewrote arguments for '{name}'");
+                    rewritten_args = Some(new_args);
+                }
+                HookAction::Continue | HookAction::InjectContext(_) => {}
             }
+            let args: &str = rewritten_args.as_deref().unwrap_or(args);
 
             // Plan mode: block mutating tool calls
             if self
@@ -334,14 +341,14 @@ impl Agent {
                 .send(AgentEvent::ToolExecuting {
                     tool_call_id: tool_call.id.clone(),
                     name: name.clone(),
-                    args: args.clone(),
+                    args: args.to_string(),
                 })
                 .await;
 
             let tool_start = Instant::now();
             let tool_output = run_with_deadline(
                 name,
-                builtin_tool_deadline(name),
+                builtin_tool_deadline(name, self.config.tools.builtin_deadline_ms),
                 self.execute_tool(name, args, event_tx, &tool_call.id, cancel)
                     .instrument(info_span!("tool.execute", tool.name = %name)),
             )
@@ -447,7 +454,7 @@ impl Agent {
             }
 
             let name = tool_call.function.name.clone();
-            let args = tool_call.function.arguments.clone();
+            let mut args = tool_call.function.arguments.clone();
 
             let hook_ctx = self.hook_ctx(
                 HookPoint::BeforeToolCall,
@@ -456,15 +463,25 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if let HookAction::Skip { reason } = self.hook_registry.dispatch(&hook_ctx).await {
-                // Same reason-surfacing (and redaction) as the sequential path.
-                slots.push(Slot::Skipped {
-                    reason: match reason {
-                        Some(r) => self.truncate_and_redact(&r),
-                        None => "[tool call skipped by hook]".into(),
-                    },
-                });
-                continue;
+            // Same hook contract as the sequential path: a block skips the
+            // call, a rewrite replaces its arguments before any later gate
+            // sees them.
+            match self.hook_registry.dispatch(&hook_ctx).await {
+                HookAction::Skip { reason } => {
+                    // Same reason-surfacing (and redaction) as the sequential path.
+                    slots.push(Slot::Skipped {
+                        reason: match reason {
+                            Some(r) => self.truncate_and_redact(&r),
+                            None => "[tool call skipped by hook]".into(),
+                        },
+                    });
+                    continue;
+                }
+                HookAction::Modify { args: new_args } => {
+                    tracing::debug!("PreToolUse hook rewrote arguments for '{name}' (parallel)");
+                    args = new_args;
+                }
+                HookAction::Continue | HookAction::InjectContext(_) => {}
             }
 
             if self
@@ -550,7 +567,7 @@ impl Agent {
                     let start = Instant::now();
                     let result = run_with_deadline(
                         &name_clone,
-                        builtin_tool_deadline(&name_clone),
+                        builtin_tool_deadline(&name_clone, config.tools.builtin_deadline_ms),
                         dispatch_parallel_safe_tool(
                             &name_clone,
                             &args_clone,
@@ -766,9 +783,17 @@ impl Agent {
                 crate::tool::memory_search::handle(args, &self.config).await
             }
             crate::tool::Tool::List(args) => {
-                crate::tool::list::handle(args, &self.config, self.agent_control.as_ref())
+                crate::tool::list::handle(
+                    args,
+                    &self.config,
+                    self.agent_control.as_ref(),
+                    Some(self.execution_context.workspace_root()),
+                )
             }
-            crate::tool::Tool::ListSkills => crate::tool::list::handle_list_skills(&self.config),
+            crate::tool::Tool::ListSkills => crate::tool::list::handle_list_skills(
+                &self.config,
+                Some(self.execution_context.workspace_root()),
+            ),
             crate::tool::Tool::ListChannels => crate::tool::list::handle_list_channels(&self.config),
             crate::tool::Tool::SearchTools(args) => Ok(crate::tool::search_tools::handle(args)),
             crate::tool::Tool::ApplyPatch(args) => {
@@ -1042,7 +1067,10 @@ pub(super) async fn dispatch_parallel_safe_tool(
             .await
             .map(ToolOutput::Text),
         crate::tool::Tool::ListSkills => {
-            crate::tool::list::handle_list_skills(config).map(ToolOutput::Text)
+            // The parallel-safe path carries no execution context, so the
+            // project tier cannot be resolved here; the sequential path above
+            // is where a session's own catalog is rendered.
+            crate::tool::list::handle_list_skills(config, None).map(ToolOutput::Text)
         }
         crate::tool::Tool::ListChannels => {
             crate::tool::list::handle_list_channels(config).map(ToolOutput::Text)
@@ -1158,7 +1186,30 @@ mod deadline_tests {
     /// Exemption policy: self-bounding / legitimately-long tools and MCP
     /// tools run unbounded; everything else gets the 300s deadline.
     #[test]
+    fn builtin_deadline_follows_the_configured_value() {
+        // The deadline is a setting, not a constant: an operator running a
+        // slow local model or a fast CI box must be able to move it, and `0`
+        // must switch it off rather than mean "expire immediately".
+        assert_eq!(
+            builtin_tool_deadline("web_fetch", 45_000),
+            Some(Duration::from_millis(45_000)),
+            "a configured deadline must reach the bounded tools"
+        );
+        assert_eq!(
+            builtin_tool_deadline("web_fetch", 0),
+            None,
+            "0 must disable the deadline, not expire instantly"
+        );
+        assert_eq!(
+            builtin_tool_deadline("run_shell", 45_000),
+            None,
+            "an exempt tool stays exempt at any configured value"
+        );
+    }
+
+    #[test]
     fn deadline_exemptions_honored() {
+        const CONFIGURED: u64 = crate::constants::TOOLS_BUILTIN_DEADLINE_MS;
         for exempt in [
             "run_shell",
             "request_user_input",
@@ -1167,7 +1218,7 @@ mod deadline_tests {
             "mcp_github_search",
         ] {
             assert_eq!(
-                builtin_tool_deadline(exempt),
+                builtin_tool_deadline(exempt, CONFIGURED),
                 None,
                 "'{exempt}' must be exempt from the wall-clock deadline"
             );
@@ -1180,8 +1231,8 @@ mod deadline_tests {
             "computer_use",
         ] {
             assert_eq!(
-                builtin_tool_deadline(bounded),
-                Some(BUILTIN_TOOL_DEADLINE),
+                builtin_tool_deadline(bounded, CONFIGURED),
+                Some(Duration::from_millis(CONFIGURED)),
                 "'{bounded}' must be bounded by the wall-clock deadline"
             );
         }

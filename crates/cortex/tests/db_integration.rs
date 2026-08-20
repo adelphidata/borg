@@ -106,6 +106,7 @@ async fn task_lifecycle_with_runs() {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     };
 
     db.create_task(&task).await.expect("create task");
@@ -260,4 +261,221 @@ async fn migration_idempotency() {
         let sessions = db.list_sessions(10).await.expect("list after insert");
         assert_eq!(sessions.len(), 2);
     }
+}
+
+/// A missed fire must reach the surfaces that report task health.
+///
+/// A `task_runs` row alone is history nobody reads unless they go looking.
+/// `last_error` is what the system prompt's `<scheduled_tasks>` snapshot, the
+/// heartbeat `task_health` augmenter, and `borg doctor` all read — so without
+/// stamping it, a job that quietly stopped firing stays invisible until the
+/// user notices its output has been missing for days.
+#[tokio::test]
+async fn a_missed_run_reaches_the_surfaces_that_report_task_health() {
+    let db = Database::test_db().await;
+    let now = chrono::Utc::now().timestamp();
+    let task = NewTask {
+        id: "nightly",
+        name: "Nightly summary",
+        prompt: "Summarize",
+        schedule_type: "interval",
+        schedule_expr: "24h",
+        timezone: "UTC",
+        next_run: Some(now),
+        max_retries: Some(0),
+        timeout_ms: Some(60_000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+        continuity: false,
+    };
+    db.create_task(&task).await.expect("create task");
+    assert!(
+        db.tasks_with_last_error()
+            .await
+            .expect("query")
+            .iter()
+            .all(|t| t.id != "nightly"),
+        "precondition: the task starts healthy"
+    );
+
+    db.record_missed_run("nightly", now, "daemon was down")
+        .await
+        .expect("record missed run");
+
+    let failing = db.tasks_with_last_error().await.expect("query");
+    let row = failing
+        .iter()
+        .find(|t| t.id == "nightly")
+        .expect("a missed run must surface on the task row");
+    let err = row.last_error.as_deref().unwrap_or_default();
+    assert!(
+        err.contains("missed"),
+        "the reason must say the run was missed, got: {err}"
+    );
+    assert!(
+        err.contains("daemon was down"),
+        "the caller's explanation must survive, got: {err}"
+    );
+
+    let runs = db.task_run_history("nightly", 5).await.expect("history");
+    assert_eq!(
+        runs.first().map(|r| r.status.as_str()),
+        Some("missed"),
+        "the run-history row must still be written too"
+    );
+}
+
+/// Continuity round-trips through the schema and is opt-in.
+///
+/// Off by default matters: carrying prior output costs context on every fire,
+/// and most scheduled tasks are stateless. A default that silently grew every
+/// task's prompt would be a cost regression nobody asked for.
+#[tokio::test]
+async fn task_continuity_defaults_off_and_round_trips() {
+    let db = Database::test_db().await;
+    let now = chrono::Utc::now().timestamp();
+    let base = NewTask {
+        id: "plain",
+        name: "Plain",
+        prompt: "Summarize",
+        schedule_type: "interval",
+        schedule_expr: "24h",
+        timezone: "UTC",
+        next_run: Some(now),
+        max_retries: Some(0),
+        timeout_ms: Some(60_000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+        continuity: false,
+    };
+    db.create_task(&base).await.expect("create plain");
+    db.create_task(&NewTask {
+        id: "tracking",
+        name: "Tracking",
+        continuity: true,
+        ..base
+    })
+    .await
+    .expect("create tracking");
+
+    let plain = db
+        .get_task_by_id("plain")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(!plain.continuity, "continuity must be opt-in");
+    let tracking = db
+        .get_task_by_id("tracking")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(tracking.continuity, "the flag must survive the round trip");
+
+    db.set_task_continuity("plain", true)
+        .await
+        .expect("enable continuity");
+    assert!(
+        db.get_task_by_id("plain")
+            .await
+            .expect("read")
+            .expect("exists")
+            .continuity,
+        "update must be able to turn it on"
+    );
+
+    db.set_task_continuity("tracking", false)
+        .await
+        .expect("disable continuity");
+    assert!(
+        !db.get_task_by_id("tracking")
+            .await
+            .expect("read")
+            .expect("exists")
+            .continuity,
+        "update must be able to turn it off again"
+    );
+}
+
+/// A database stamped before `continuity` existed must gain the column.
+///
+/// This is the whole reason `migrate_v2` exists, and it is the one path no
+/// other test covers: every other test builds a fresh database from
+/// `SCHEMA_SQL`, where the column is already present, so the `ALTER` branch
+/// never runs. Without the migration, `continuity` would exist on new
+/// installs and be missing on every database created before it — and every
+/// query naming the column would fail there while passing here.
+#[tokio::test]
+async fn an_older_database_gains_the_continuity_column_on_open() {
+    let tmp = tempfile::NamedTempFile::new().expect("create temp db file");
+    let path = tmp.path().to_path_buf();
+
+    // Build the pre-`continuity` shape: open normally, then drop the column
+    // back off and rewind the stamp so the next open looks like an install
+    // that predates the change.
+    {
+        let db = Database::open_at(&path).await.expect("open db");
+        db.conn()
+            .execute("ALTER TABLE scheduled_tasks DROP COLUMN continuity", ())
+            .await
+            .expect("drop the column to simulate an older database");
+        db.set_meta("schema_version", "1")
+            .await
+            .expect("rewind the stamp");
+    }
+
+    let db = Database::open_at(&path).await.expect("reopen db");
+
+    // The column is back, and a task created through the normal path reads
+    // its documented default rather than erroring on a missing column.
+    let now = chrono::Utc::now().timestamp();
+    db.create_task(&NewTask {
+        id: "legacy",
+        name: "Legacy",
+        prompt: "Summarize",
+        schedule_type: "interval",
+        schedule_expr: "24h",
+        timezone: "UTC",
+        next_run: Some(now),
+        max_retries: Some(0),
+        timeout_ms: Some(60_000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+        continuity: false,
+    })
+    .await
+    .expect("an upgraded database must accept a task insert");
+
+    let task = db
+        .get_task_by_id("legacy")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert!(!task.continuity, "the recovered column must default to off");
+
+    // And the upgrade must be idempotent: opening again must not fail trying
+    // to add a column that is already there.
+    drop(db);
+    let db = Database::open_at(&path).await.expect("third open");
+    assert!(
+        db.get_task_by_id("legacy").await.expect("read").is_some(),
+        "a second upgrade pass must leave the data alone"
+    );
 }

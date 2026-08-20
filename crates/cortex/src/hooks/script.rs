@@ -308,8 +308,20 @@ impl ScriptHook {
 
     fn build_payload(&self, ctx: &HookContext) -> String {
         let tool = match &ctx.data {
-            HookData::ToolCall { name, .. } => {
-                Some(serde_json::json!({ "name": name, "is_error": false }))
+            HookData::ToolCall { name, args } => {
+                // `args` is the tool's own serialized JSON. Pass it as a
+                // parsed object when it is one, so a hook can read a field
+                // without re-parsing a string; fall back to the raw text so a
+                // non-object payload still reaches the hook. `tool_input` is
+                // the Claude Code spelling of the same field.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!(args));
+                Some(serde_json::json!({
+                    "name": name,
+                    "is_error": false,
+                    "args": parsed,
+                    "tool_input": parsed,
+                }))
             }
             HookData::ToolResult { name, is_error, .. } => {
                 Some(serde_json::json!({ "name": name, "is_error": *is_error }))
@@ -325,20 +337,63 @@ impl ScriptHook {
         .to_string()
     }
 
+    /// Interpret a successful hook's stdout.
+    ///
+    /// Exit 0 means "allow", and that stays the default: anything that is not
+    /// a recognized JSON decision object is ignored, so hooks that simply
+    /// print progress keep working unchanged. The one recognized decision is
+    /// a `PreToolUse` argument rewrite, in either the canonical spelling
+    /// (`{"action":"modify","args":{…}}`) or the Claude Code-compatible one
+    /// (`{"decision":"modify","tool_input":{…}}`).
+    ///
+    /// A malformed rewrite warns and falls through to `Continue` — a hook can
+    /// never break the tool call it was inspecting.
+    fn parse_success_stdout(&self, ctx: &HookContext, stdout: &str) -> HookAction {
+        if stdout.is_empty() || !self.is_pre_tool() {
+            return HookAction::Continue;
+        }
+        let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(stdout)
+        else {
+            return HookAction::Continue;
+        };
+        let verb = obj
+            .get("action")
+            .or_else(|| obj.get("decision"))
+            .and_then(|v| v.as_str());
+        if verb != Some("modify") {
+            return HookAction::Continue;
+        }
+        if !matches!(ctx.data, HookData::ToolCall { .. }) {
+            return HookAction::Continue;
+        }
+        match obj.get("args").or_else(|| obj.get("tool_input")) {
+            Some(serde_json::Value::Object(args)) => HookAction::Modify {
+                args: serde_json::Value::Object(args.clone()).to_string(),
+            },
+            _ => {
+                tracing::warn!(
+                    hook = %self.name,
+                    "hook asked to modify a tool call but supplied no args object; running the call unchanged"
+                );
+                HookAction::Continue
+            }
+        }
+    }
+
     fn execute_inner(&self, ctx: &HookContext) -> HookAction {
         if !self.matches_tool(ctx) {
             return HookAction::Continue;
         }
         let payload = self.build_payload(ctx);
         let started = Instant::now();
-        let result = run_subprocess(&self.command, &payload, self.timeout);
+        let result = run_subprocess(&self.command, &payload, self.timeout, self.is_pre_tool());
         let duration_ms = started.elapsed().as_millis();
         // Completion trace on *every* arm, success included — a slow-but-OK hook
         // is otherwise invisible (only failures used to log). Low-cardinality
         // metadata only; command text, payload, stdout, and stderr are
         // deliberately excluded because they can carry secrets/PII.
         match result {
-            Ok((0, _)) => {
+            Ok((0, stdout, _)) => {
                 tracing::debug!(
                     hook = %self.name,
                     point = ?ctx.point,
@@ -346,9 +401,9 @@ impl ScriptHook {
                     duration_ms,
                     "hook completed"
                 );
-                HookAction::Continue
+                self.parse_success_stdout(ctx, &stdout)
             }
-            Ok((code, stderr)) => {
+            Ok((code, _, stderr)) => {
                 tracing::warn!(
                     hook = %self.name,
                     point = ?ctx.point,
@@ -549,11 +604,19 @@ const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// `try_wait` never returns `Some`, and a perfectly good hook is SIGKILLed at the
 /// deadline and reported as a timeout. The same reasoning applies in reverse to
 /// the stdin write.
+/// Run a hook.
+///
+/// `wants_stdout` says whether the caller can act on the child's stdout — true
+/// only for `PreToolUse`, the one event whose stdout carries a decision. When
+/// false the stdout pipe is still drained (that is what keeps a chatty child
+/// unblocked), but the caller does not wait around for a hook that leaked the
+/// pipe to a background process.
 fn run_subprocess(
     command: &str,
     payload: &str,
     timeout: Duration,
-) -> Result<(i32, String), SubprocessError> {
+    wants_stdout: bool,
+) -> Result<(i32, String, String), SubprocessError> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -625,9 +688,27 @@ fn run_subprocess(
     // Abandon the threads instead; each exits on its own once the last writer
     // closes, and none of them touch state the caller still owns.
     drop(stdin_writer);
-    // stdout is drained (to unblock the child) but never surfaced; hooks
-    // communicate via side effects, exit codes, and stderr.
-    drop(stdout_drain);
+    // stdout carries a hook's structured decision (see
+    // `ScriptHook::parse_success_stdout`); draining it is also what keeps a
+    // chatty child unblocked.
+    //
+    // Try first without blocking. A hook that backgrounds anything leaks the
+    // write end of stdout to a grandchild, so the drain thread never reaches
+    // EOF and the timed wait always burns its full grace — and this runs
+    // synchronously on a runtime worker, on `PreToolUse`, for every tool call.
+    // The wait is worth paying only when the caller can act on the content,
+    // which is exactly when a decision is possible.
+    let mut stdout_text = String::new();
+    if let Some(rx) = stdout_drain {
+        let received = match rx.try_recv() {
+            Ok(buf) => Some(buf),
+            Err(_) if wants_stdout => rx.recv_timeout(STREAM_DRAIN_GRACE).ok(),
+            Err(_) => None,
+        };
+        if let Some(buf) = received {
+            stdout_text = String::from_utf8_lossy(&buf).trim().to_string();
+        }
+    }
     // stderr is both logged and returned to the caller: on a PreToolUse veto
     // it becomes the block reason the model sees.
     let mut stderr_text = String::new();
@@ -640,7 +721,7 @@ fn run_subprocess(
         }
     }
 
-    outcome.map(|code| (code, stderr_text))
+    outcome.map(|code| (code, stdout_text, stderr_text))
 }
 
 /// Read a child pipe to EOF on a dedicated thread, retaining at most
@@ -1661,7 +1742,7 @@ mod tests {
             let pid_file = dir.path().join("grandchild.pid");
             let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
             let result = tokio::task::spawn_blocking(move || {
-                run_subprocess(&command, "{}", Duration::from_secs(1))
+                run_subprocess(&command, "{}", Duration::from_secs(1), true)
             })
             .await
             .expect("join");
@@ -1695,10 +1776,11 @@ mod tests {
             let dir = tmp();
             let out = dir.path().join("stdin-payload.json");
             let command = format!("cat > {}", out.display());
-            let (code, _) = run_subprocess(
+            let (code, _stdout, _stderr) = run_subprocess(
                 &command,
                 r#"{"event":"SessionStart","turn":7}"#,
                 Duration::from_secs(10),
+                true,
             )
             .expect("hook must run");
             assert_eq!(code, 0);
@@ -1738,12 +1820,12 @@ mod tests {
             std::env::set_var("BORG_KEK_PASSPHRASE", "kek_leak_must_not_appear");
 
             let command = format!("env > {}", out.display());
-            let result = run_subprocess(&command, "{}", Duration::from_secs(10));
+            let result = run_subprocess(&command, "{}", Duration::from_secs(10), true);
 
             std::env::remove_var("HOOK_PROBE_PROVIDER_API_KEY");
             std::env::remove_var("BORG_KEK_PASSPHRASE");
 
-            let (code, _) = result.expect("hook must run");
+            let (code, _stdout, _stderr) = result.expect("hook must run");
             assert_eq!(code, 0);
             let captured = std::fs::read_to_string(&out).expect("hook should have written env");
             for leaked in [
@@ -1774,10 +1856,11 @@ mod tests {
             let dir = tmp();
             let out = dir.path().join("arg-payload.json");
             let command = format!("printf '%s' \"$1\" > {}", out.display());
-            let (code, _) = run_subprocess(
+            let (code, _stdout, _stderr) = run_subprocess(
                 &command,
                 r#"{"event":"SessionEnd"}"#,
                 Duration::from_secs(10),
+                true,
             )
             .expect("hook must run");
             assert_eq!(code, 0);
@@ -1795,12 +1878,14 @@ mod tests {
             // blocks, but well under `ARG_MAX` — the payload also rides on argv,
             // and a megabyte there fails the spawn outright.
             let big_payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(128 * 1024));
-            let (code, _) = run_subprocess("exit 0", &big_payload, Duration::from_secs(10))
-                .expect("broken pipe must not be reported as a subprocess error");
+            let (code, _stdout, _stderr) =
+                run_subprocess("exit 0", &big_payload, Duration::from_secs(10), true)
+                    .expect("broken pipe must not be reported as a subprocess error");
             assert_eq!(code, 0);
 
-            let (code, _) = run_subprocess("exit 3", &big_payload, Duration::from_secs(10))
-                .expect("broken pipe must not mask a nonzero exit either");
+            let (code, _stdout, _stderr) =
+                run_subprocess("exit 3", &big_payload, Duration::from_secs(10), true)
+                    .expect("broken pipe must not mask a nonzero exit either");
             assert_eq!(code, 3);
         }
 
@@ -1810,10 +1895,11 @@ mod tests {
         /// misreported as a timeout.
         #[test]
         fn hook_writing_more_than_the_pipe_buffer_does_not_time_out() {
-            let (code, _) = run_subprocess(
+            let (code, _stdout, _stderr) = run_subprocess(
                 "printf 'x%.0s' $(seq 1 200000); exit 0",
                 "{}",
                 Duration::from_secs(20),
+                true,
             )
             .expect("a chatty hook must complete, not time out");
             assert_eq!(code, 0, "chatty hook should report its real exit code");
@@ -1827,8 +1913,9 @@ mod tests {
         #[test]
         fn hook_that_backgrounds_a_process_returns_within_its_timeout() {
             let started = Instant::now();
-            let (code, _) = run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1))
-                .expect("a hook that exits promptly must not be reported as failed");
+            let (code, _stdout, _stderr) =
+                run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1), true)
+                    .expect("a hook that exits promptly must not be reported as failed");
             let elapsed = started.elapsed();
             assert_eq!(code, 0, "the hook's own exit status must be reported");
             assert!(
@@ -1836,6 +1923,128 @@ mod tests {
                 "returned after {elapsed:?}; the leaked pipe held it for the \
                  background process's lifetime instead of honoring the timeout"
             );
+        }
+    }
+
+    mod modify_directive {
+        use super::*;
+
+        fn tool_ctx(args: &str) -> HookContext {
+            HookContext {
+                point: HookPoint::BeforeToolCall,
+                session_id: "s_abc".to_string(),
+                turn_count: 1,
+                data: HookData::ToolCall {
+                    name: "run_shell".to_string(),
+                    args: args.to_string(),
+                },
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn pre_tool_payload_carries_the_call_arguments() {
+            // A hook that cannot see the arguments cannot judge the call. The
+            // payload must carry them under both the canonical and the
+            // Claude Code-compatible spelling.
+            let hook = make_hook(
+                r#"python3 -c "import json,sys; p=json.loads(sys.argv[1]); sys.exit(0 if p['tool']['args']['command']=='ls' and p['tool']['tool_input']['command']=='ls' else 3)" "$1""#,
+                HookPoint::BeforeToolCall,
+            );
+            let action = hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await;
+            assert!(
+                matches!(action, HookAction::Continue),
+                "hook could not read the arguments out of its payload: {action:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn canonical_modify_shape_rewrites_the_arguments() {
+            let hook = make_hook(
+                r#"echo '{"action":"modify","args":{"command":"ls -la"}}'"#,
+                HookPoint::BeforeToolCall,
+            );
+            match hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await {
+                HookAction::Modify { args } => {
+                    assert_eq!(args, r#"{"command":"ls -la"}"#);
+                }
+                other => panic!("expected a rewrite, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn claude_code_modify_shape_rewrites_the_arguments() {
+            let hook = make_hook(
+                r#"echo '{"decision":"modify","tool_input":{"command":"ls -la"}}'"#,
+                HookPoint::BeforeToolCall,
+            );
+            match hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await {
+                HookAction::Modify { args } => {
+                    assert_eq!(args, r#"{"command":"ls -la"}"#);
+                }
+                other => panic!("expected a rewrite, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ordinary_stdout_is_not_a_decision() {
+            // Hooks that just print progress predate this feature and must
+            // keep working untouched.
+            for chatty in [
+                "echo hello world",
+                r#"echo '{"unrelated":true}'"#,
+                r#"echo '{"action":"allow"}'"#,
+                r#"echo 'not json {'"#,
+            ] {
+                let hook = make_hook(chatty, HookPoint::BeforeToolCall);
+                let action = hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await;
+                assert!(
+                    matches!(action, HookAction::Continue),
+                    "'{chatty}' must not be read as a decision, got {action:?}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_modify_without_args_runs_the_call_unchanged() {
+            // Fail-safe: a malformed rewrite must never break the tool call
+            // the hook was only inspecting.
+            let hook = make_hook(r#"echo '{"action":"modify"}'"#, HookPoint::BeforeToolCall);
+            let action = hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await;
+            assert!(matches!(action, HookAction::Continue), "got {action:?}");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_nonzero_exit_blocks_even_when_stdout_asks_to_modify() {
+            // Block outranks rewrite: the call is not running, so its
+            // arguments are moot.
+            let hook = make_hook(
+                r#"echo '{"action":"modify","args":{"command":"wipe"}}'; echo 'denied' >&2; exit 1"#,
+                HookPoint::BeforeToolCall,
+            );
+            let action = hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await;
+            assert!(
+                matches!(action, HookAction::Skip { .. }),
+                "a blocking hook must not be able to rewrite instead: {action:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_non_tool_point_ignores_modify() {
+            // There is no call to rewrite at a session/prompt point.
+            let hook = make_hook(
+                r#"echo '{"action":"modify","args":{"command":"ls -la"}}'"#,
+                HookPoint::SessionStart,
+            );
+            let ctx = HookContext {
+                point: HookPoint::SessionStart,
+                session_id: "s_abc".to_string(),
+                turn_count: 1,
+                data: HookData::SessionStart {
+                    session_id: "s_abc".to_string(),
+                },
+            };
+            let action = hook.execute(&ctx).await;
+            assert!(matches!(action, HookAction::Continue), "got {action:?}");
         }
     }
 }

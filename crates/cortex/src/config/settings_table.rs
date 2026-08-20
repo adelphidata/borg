@@ -101,6 +101,7 @@ define_settings! {
 
         // ── Skills ──
         "skills.enabled" => skills.enabled, parsed(bool);
+        "skills.project_discovery" => skills.project_discovery, parsed(bool);
         "skills.max_context_tokens" => skills.max_context_tokens, parsed(usize);
         // skills.budget_pct is custom — see `custom_apply` block below.
 
@@ -197,6 +198,7 @@ define_settings! {
 
         // ── Tools ──
         "tools.default_timeout_ms" => tools.default_timeout_ms, parsed(u64);
+        "tools.builtin_deadline_ms" => tools.builtin_deadline_ms, parsed(u64);
         "tools.conditional_loading" => tools.conditional_loading, parsed(bool);
         "tools.compact_schemas" => tools.compact_schemas, parsed(bool);
         "tools.policy.profile" => tools.policy.profile, string;
@@ -281,6 +283,7 @@ define_settings! {
         "agents.delegation_provider" => agents.delegation_provider, opt_string;
         "agents.heartbeat_interval_secs" => agents.heartbeat_interval_secs, parsed(u64);
         "agents.heartbeat_stale_cycles" => agents.heartbeat_stale_cycles, parsed(u32);
+        "agents.tool_stale_cycles" => agents.tool_stale_cycles, parsed(u32);
 
         // ── Debug ──
         "debug.llm_logging" => debug.llm_logging, parsed(bool);

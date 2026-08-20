@@ -565,6 +565,14 @@ impl Default for EvolutionConfig {
 pub struct ToolsConfig {
     /// Default timeout in milliseconds for tool execution.
     pub default_timeout_ms: u64,
+    /// Wall-clock deadline in milliseconds for a single builtin tool handler.
+    ///
+    /// Bounds a handler that would otherwise stall the turn forever (a wedged
+    /// network fetch, a hung subprocess wait). Tools that self-bound or are
+    /// legitimately long-running — `run_shell`, `request_user_input`, the
+    /// delegation tools, and everything MCP — are exempt regardless of this
+    /// value. `0` disables the deadline for every remaining builtin.
+    pub builtin_deadline_ms: u64,
     /// Tool approval/deny policy configuration.
     #[serde(default)]
     pub policy: super::security::ToolPolicyConfig,
@@ -582,6 +590,7 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             default_timeout_ms: constants::TOOLS_DEFAULT_TIMEOUT_MS,
+            builtin_deadline_ms: constants::TOOLS_BUILTIN_DEADLINE_MS,
             policy: super::security::ToolPolicyConfig::default(),
             conditional_loading: true,
             compact_schemas: true,
@@ -957,6 +966,17 @@ pub struct SkillsConfig {
     /// Per-skill overrides keyed by skill name.
     #[serde(default)]
     pub entries: HashMap<String, SkillEntryConfig>,
+    /// Load skills the current workspace ships (`.borg/skills/`,
+    /// `.agents/skills/`) in addition to the user's own.
+    ///
+    /// On by default: a repo's skills describe how to work on that repo, and
+    /// the security scan every on-disk skill already goes through is what
+    /// keeps a cloned repo from talking the agent into something — a skill
+    /// that scans as high-risk is excluded outright, and a flagged one is
+    /// wrapped in an injection warning. Turn this off to ignore the tier
+    /// entirely.
+    #[serde(default = "default_true")]
+    pub project_discovery: bool,
 }
 
 impl Default for SkillsConfig {
@@ -966,6 +986,7 @@ impl Default for SkillsConfig {
             max_context_tokens: constants::SKILLS_MAX_CONTEXT_TOKENS,
             budget_pct: Some(0.02),
             entries: HashMap::new(),
+            project_discovery: true,
         }
     }
 }
@@ -1259,6 +1280,17 @@ pub struct MultiAgentConfig {
     /// after which the child publishes a `StalledChild` event so the operator
     /// can intervene.
     pub heartbeat_stale_cycles: u32,
+    /// Heartbeat intervals a single in-flight tool call may run before the
+    /// stall watchdog starts counting it as idle.
+    ///
+    /// A tool that produces no events while it works — a quiet build, a long
+    /// test suite, a large download — would otherwise be indistinguishable
+    /// from a wedged child, and `run_shell` is deliberately exempt from the
+    /// builtin tool deadline so those are exactly the calls that run long.
+    /// The extension is bounded rather than unlimited: once a call outlives
+    /// it, the ordinary stale/grace countdown resumes, so a genuinely hung
+    /// tool is still cancelled.
+    pub tool_stale_cycles: u32,
 }
 
 impl Default for MultiAgentConfig {
@@ -1280,6 +1312,9 @@ impl Default for MultiAgentConfig {
             delegation_provider: None,
             heartbeat_interval_secs: 30,
             heartbeat_stale_cycles: 15,
+            // 60 x 30s = 30 minutes of headroom for one tool call, on top of
+            // the ordinary stale + grace window.
+            tool_stale_cycles: 60,
         }
     }
 }

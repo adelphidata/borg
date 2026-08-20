@@ -989,6 +989,7 @@ mod tests {
             pre_run_timeout_ms: 0,
             bypass_quiet_hours_once: false,
             min_interval_secs: None,
+            continuity: false,
             last_response_hash: None,
             model: None,
             model_provider: None,
@@ -1367,6 +1368,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create task");

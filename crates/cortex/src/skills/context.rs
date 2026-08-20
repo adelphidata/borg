@@ -71,13 +71,14 @@ pub fn load_skills_context(
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
     user_request: &str,
+    workspace: Option<&std::path::Path>,
 ) -> Result<(String, SkillBudgetReport)> {
     let mut report = SkillBudgetReport {
         budget_tokens: max_tokens,
         ..Default::default()
     };
 
-    let skills = load_all_skills(resolved_creds, skills_config)?;
+    let skills = load_all_skills(resolved_creds, skills_config, workspace)?;
 
     if skills.is_empty() {
         return Ok((String::new(), report));

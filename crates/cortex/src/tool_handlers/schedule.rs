@@ -236,6 +236,7 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
     // Monitor mode dedups on the pre_run output hash — without a
     // pre_run_command there is nothing to hash and every run would fire,
     // so refuse at create time instead of persisting a no-op flag.
+    let continuity = optional_bool_param(args, "continuity", false);
     let monitor_mode = optional_bool_param(args, "monitor_mode", false);
     if monitor_mode && pre_run_command.is_none() {
         return Ok(
@@ -263,6 +264,7 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
                 pre_run_cwd: pre_run_cwd.as_deref(),
                 pre_run_timeout_ms,
                 min_interval_secs: None,
+                continuity,
             })
             .await
         {
@@ -372,6 +374,7 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
     let monitor_mode = args
         .get("monitor_mode")
         .and_then(serde_json::Value::as_bool);
+    let continuity = args.get("continuity").and_then(serde_json::Value::as_bool);
     with_db(move |db| async move {
         // Enabling monitor_mode only makes sense on a task with a
         // pre_run_command — its output hash is what decides whether the run
@@ -409,6 +412,13 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
                     if let Err(e) = db.update_task_pre_run_hash(&task_id, None).await {
                         return Ok(format!(
                             "Error: task {task_id} updated but clearing the monitor baseline failed: {e}"
+                        ));
+                    }
+                }
+                if let Some(c) = continuity {
+                    if let Err(e) = db.set_task_continuity(&task_id, c).await {
+                        return Ok(format!(
+                            "Error: task {task_id} updated but setting continuity failed: {e}"
                         ));
                     }
                 }
@@ -696,6 +706,9 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
                 pre_run_cwd: None,
                 pre_run_timeout_ms: None,
                 min_interval_secs: None,
+                // A command job has no LLM turn, so there is no context for
+                // continuity to carry.
+                continuity: false,
             })
             .await
         {
@@ -861,6 +874,7 @@ mod tests {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("seed task");

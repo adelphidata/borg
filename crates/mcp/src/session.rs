@@ -196,6 +196,26 @@ impl SessionActor {
             .request_typed(methods::INITIALIZE, Some(serde_json::to_value(params)?))
             .await?;
 
+        // Adopt whatever revision the server answered with. A server is free
+        // to negotiate down, and later requests have to identify themselves
+        // by the agreed value — declaring one revision in the handshake body
+        // and a different one afterwards gets the request rejected against
+        // rules it never agreed to. A server that answers with a revision we
+        // do not know still gets its own value echoed back: it chose it, and
+        // second-guessing that is how the two sides end up disagreeing.
+        let negotiated = result
+            .protocol_version
+            .clone()
+            .unwrap_or_else(|| crate::protocol::MCP_PROTOCOL_VERSION.to_string());
+        if negotiated != crate::protocol::MCP_PROTOCOL_VERSION {
+            tracing::warn!(
+                requested = crate::protocol::MCP_PROTOCOL_VERSION,
+                negotiated = %negotiated,
+                "MCP server negotiated a different protocol version",
+            );
+        }
+        self.transport.set_protocol_version(&negotiated);
+
         // Per spec, send `notifications/initialized` (a notification, no `id`)
         // before issuing further requests.
         let notif = json!({

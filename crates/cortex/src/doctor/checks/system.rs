@@ -54,7 +54,7 @@ pub(in crate::doctor) fn check_sandbox(checks: &mut Vec<DiagnosticCheck>) {
 
 pub(in crate::doctor) async fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     let resolved_creds = config.resolve_credentials();
-    match load_all_skills(&resolved_creds, &config.skills) {
+    match load_all_skills(&resolved_creds, &config.skills, None) {
         Ok(skills) => {
             let available = skills.iter().filter(|s| s.available).count();
             let total = skills.len();

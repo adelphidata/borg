@@ -543,7 +543,8 @@ fn run_sub_agent(
         // before the first heartbeat fires, not race the spawn.
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat_tick.tick().await;
-        let mut watchdog = super::stall::StallWatchdog::new(stale_threshold);
+        let mut watchdog =
+            super::stall::StallWatchdog::new(stale_threshold, agents_config.tool_stale_cycles);
         let mut stall_error: Option<String> = None;
 
         // Track apply_patch calls that have NOT yet had a ToolResult: the

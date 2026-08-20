@@ -182,6 +182,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create wedged task");
@@ -230,6 +231,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
             min_interval_secs: None,
+            continuity: false,
         })
         .await
         .expect("create t1");

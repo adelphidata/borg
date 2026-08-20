@@ -201,7 +201,7 @@ impl ReadOnlyToolHandler for ListHandler {
         if arguments.get("what").and_then(|v| v.as_str()) == Some("agents") {
             return Err(McpError::invalid_params("`agents` is not exposed over MCP"));
         }
-        cortex::tool_handlers::handle_list(&arguments, &self.config, None)
+        cortex::tool_handlers::handle_list(&arguments, &self.config, None, None)
             .map(serde_json::Value::String)
             .map_err(|e| McpError::internal(format!("list failed: {e}")))
     }

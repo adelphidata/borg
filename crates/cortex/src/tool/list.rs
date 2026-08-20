@@ -27,12 +27,16 @@ pub(crate) fn handle(
     args: &ListArgs,
     config: &Config,
     agent_control: Option<&AgentControl>,
+    workspace: Option<&std::path::Path>,
 ) -> Result<String> {
-    tool_handlers::handle_list(&args.to_value(), config, agent_control)
+    tool_handlers::handle_list(&args.to_value(), config, agent_control, workspace)
 }
 
-pub(crate) fn handle_list_skills(config: &Config) -> Result<String> {
-    tool_handlers::handle_list_skills(config)
+pub(crate) fn handle_list_skills(
+    config: &Config,
+    workspace: Option<&std::path::Path>,
+) -> Result<String> {
+    tool_handlers::handle_list_skills(config, workspace)
 }
 
 pub(crate) fn handle_list_channels(config: &Config) -> Result<String> {

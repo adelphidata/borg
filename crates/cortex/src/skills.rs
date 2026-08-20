@@ -15,7 +15,8 @@ pub use types::{
 
 mod loader;
 pub use loader::{
-    install_default_skills, load_all_skills, reload_user_skills, skills_dir, SkillsReloadReport,
+    install_default_skills, load_all_skills, project_skills_dirs, reload_user_skills, skills_dir,
+    SkillsReloadReport,
 };
 #[cfg(test)]
 use loader::{is_skill_disabled, load_builtin_skill};

@@ -459,7 +459,7 @@ async fn handle_usage(db: &Database, config: &Config, session_id: &str) -> Strin
 
 fn handle_skills(config: &Config) -> String {
     let resolved_creds = config.resolve_credentials();
-    match cortex::skills::load_all_skills(&resolved_creds, &config.skills) {
+    match cortex::skills::load_all_skills(&resolved_creds, &config.skills, None) {
         Ok(skills) if skills.is_empty() => "No skills installed.".to_string(),
         Ok(skills) => {
             let mut lines = vec![format!("Skills ({}):", skills.len())];

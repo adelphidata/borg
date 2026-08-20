@@ -300,6 +300,7 @@ fn create_task_with_delivery_config() {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     })
     .expect("create");
     let task = db.get_task_by_id("t1").expect("get").expect("some");
@@ -330,6 +331,7 @@ fn create_task_with_allowed_tools() {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     })
     .expect("create");
     let task = db.get_task_by_id("t-tools").expect("get").expect("some");
@@ -373,6 +375,7 @@ fn allowed_tools_survives_list_tasks() {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     })
     .expect("create");
     let tasks = db.list_tasks().expect("list");
@@ -1298,6 +1301,7 @@ fn create_task_persists_and_reads_back_pre_run_fields() {
         pre_run_cwd: Some("/tmp"),
         pre_run_timeout_ms: Some(15_000),
         min_interval_secs: None,
+        continuity: false,
     })
     .expect("create");
 
@@ -1359,6 +1363,7 @@ fn claim_due_tasks_clears_bypass_quiet_hours_once() {
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
         min_interval_secs: None,
+        continuity: false,
     })
     .expect("create");
 

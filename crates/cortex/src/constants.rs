@@ -95,6 +95,11 @@ pub const CHANNEL_DEFAULT_MAX_CONCURRENT: usize = 5;
 /// Default timeout for tool execution (30s).
 pub const TOOLS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Default wall-clock deadline for one builtin tool handler (300s). Clears
+/// the slowest legitimate bounded builtins — web fetch, browser navigation,
+/// media transcription — while still guaranteeing the turn makes progress.
+pub const TOOLS_BUILTIN_DEADLINE_MS: u64 = 300_000;
+
 /// Default timeout for user script execution (60s).
 pub const SCRIPTS_DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
