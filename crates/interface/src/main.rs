@@ -213,6 +213,14 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::sessions::SessionsAction>,
     },
+    /// Send a message to a running session and print its reply
+    Send {
+        /// Session id (or a unique prefix) or title
+        target: String,
+        /// The message. Bare words are joined, so quoting is optional.
+        #[arg(required = true, num_args = 1..)]
+        message: Vec<String>,
+    },
     /// Manage isolated git worktrees to code in
     #[command(alias = "wt")]
     Worktree {
@@ -741,6 +749,9 @@ async fn async_main() -> Result<()> {
         Some(Commands::Tunnel { action }) => commands::tunnel::run_tunnel(action).await?,
         Some(Commands::Sessions { action }) => {
             commands::sessions::dispatch_sessions(action).await?
+        }
+        Some(Commands::Send { target, message }) => {
+            commands::send::run(&target, &message.join(" ")).await?
         }
         Some(Commands::Worktree { action }) => commands::worktree::dispatch(action).await?,
         Some(Commands::Service { action }) => commands::misc::dispatch_service(action).await?,
@@ -1913,6 +1924,38 @@ mod tests {
 
     // ── Sessions parse tests ──
     // heal / acp parsing is covered by `parses_no_arg_subcommands_to_correct_variant` above.
+
+    #[test]
+    fn send_joins_bare_words_so_quoting_is_optional() {
+        // `borg send work check the build log` has to mean what it reads as.
+        // Requiring quotes here would be a papercut on the command people
+        // reach for from a shell script, where the message is often built up
+        // from variables.
+        let cli =
+            Cli::try_parse_from(["borg", "send", "my-session", "check", "the", "build", "log"])
+                .expect("bare words must parse");
+        match cli.command {
+            Some(Commands::Send { target, message }) => {
+                assert_eq!(target, "my-session");
+                assert_eq!(message.join(" "), "check the build log");
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn send_requires_both_a_target_and_a_message() {
+        // A bare `borg send <target>` would otherwise start an empty turn on
+        // somebody's live session.
+        assert!(
+            Cli::try_parse_from(["borg", "send", "my-session"]).is_err(),
+            "a target with no message must be rejected at parse time"
+        );
+        assert!(
+            Cli::try_parse_from(["borg", "send"]).is_err(),
+            "no target at all must be rejected"
+        );
+    }
 
     #[test]
     fn test_parse_sessions_list_with_limit() {

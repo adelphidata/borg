@@ -319,8 +319,12 @@ pub(crate) fn classify_status(
         {
             // Amazon Bedrock answers 401 with "Signature expired" (or an
             // expired STS token) when AWS credentials / a short-lived
-            // AWS_BEARER_TOKEN_BEDROCK have aged out. Borg cannot refresh an
-            // env-provided token in-process, so surface an actionable
+            // AWS_BEARER_TOKEN_BEDROCK have aged out. Credentials that publish
+            // an expiry never reach here — `bedrock::load_region_and_credentials`
+            // steps over a lapsed static source and falls through to the
+            // container/IMDS providers, which renew themselves. What is left is
+            // the genuinely unrecoverable case: a token with no expiry to read
+            // and no in-process way to refresh it, so surface an actionable
             // refresh-your-credentials message. Classify as `Auth` (not
             // `AuthPermanent`): on 401 the pool retires the dead credential, so
             // this still rotates to another AWS profile and, failing that, the

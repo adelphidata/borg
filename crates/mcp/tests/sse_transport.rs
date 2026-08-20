@@ -58,6 +58,10 @@ struct FixtureState {
     /// HTTP status to return from the `POST /messages` handler. Tests flip
     /// this to 500/4xx to exercise the negative paths.
     post_status: Arc<std::sync::atomic::AtomicU16>,
+    /// Exactly what the fixture advertises in its `endpoint` event. Real
+    /// servers send a relative path, but the field is server-controlled and
+    /// may be an absolute URL, so the origin-pin tests set it directly.
+    advertised_endpoint: String,
 }
 
 async fn sse_handler(State(state): State<FixtureState>) -> impl axum::response::IntoResponse {
@@ -72,7 +76,9 @@ async fn sse_handler(State(state): State<FixtureState>) -> impl axum::response::
     };
     let (out_tx, out_rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
     out_tx
-        .send(Ok(Event::default().event("endpoint").data("/messages")))
+        .send(Ok(Event::default()
+            .event("endpoint")
+            .data(state.advertised_endpoint.clone())))
         .await
         .expect("queue endpoint event");
     tokio::spawn(async move {
@@ -98,9 +104,24 @@ async fn messages_handler(
 }
 
 impl SseFixture {
-    /// Spawn an axum SSE+POST server on a random port. Returns the fixture
-    /// plus the `tx` channel the caller can push events onto.
+    /// Spawn an axum SSE+POST server on a random port, advertising the
+    /// relative `/messages` path the way a well-behaved server does.
     async fn spawn() -> (Self, mpsc::Sender<Event>) {
+        Self::spawn_advertising(|_addr| "/messages".to_string()).await
+    }
+
+    /// [`SseFixture::spawn`] with control over the `endpoint` event payload.
+    /// The closure receives the bound address so a test can advertise an
+    /// absolute self-URL; binding happens before the state is built precisely
+    /// so that address is available here.
+    async fn spawn_advertising(
+        advertise: impl FnOnce(SocketAddr) -> String,
+    ) -> (Self, mpsc::Sender<Event>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+
         let (tx, rx) = mpsc::channel::<Event>(64);
         let posted = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let state = FixtureState {
@@ -110,17 +131,14 @@ impl SseFixture {
             post_status: Arc::new(std::sync::atomic::AtomicU16::new(
                 StatusCode::ACCEPTED.as_u16(),
             )),
+            advertised_endpoint: advertise(addr),
         };
 
         let app = Router::new()
             .route("/sse", get(sse_handler))
             .route("/messages", post(messages_handler))
-            .with_state(state.clone());
+            .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -359,4 +377,95 @@ async fn pump_ignores_malformed_frame_and_continues_recv() {
         .expect("eof before frame");
     assert_eq!(msg.id, Some(1));
     assert_eq!(msg.result.unwrap()["recovered"], true);
+}
+
+#[tokio::test]
+async fn open_accepts_absolute_endpoint_on_the_same_origin() {
+    // Spec: the origin pin fixes the *origin*, not the spelling. A server that
+    // advertises its POST URL absolutely rather than as a relative path is
+    // entirely conformant, so it must still connect and round-trip. Without
+    // this test the pin could be tightened to "relative only" and silently
+    // break every server that spells the URL out.
+    let (fixture, _events_tx) =
+        SseFixture::spawn_advertising(|addr| format!("http://{addr}/messages")).await;
+    let mut transport = open(fixture.config(), Duration::from_secs(2))
+        .await
+        .expect("absolute same-origin endpoint must be accepted");
+
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
+        .await
+        .expect("send");
+
+    let posted = fixture.posted.lock().await;
+    assert_eq!(posted.len(), 1, "expected one POST, got {posted:?}");
+    assert_eq!(posted[0]["id"], 7);
+}
+
+#[tokio::test]
+async fn open_refuses_endpoint_event_pointing_at_a_different_origin() {
+    // Spec: the `endpoint` event is server-controlled, and every POST that
+    // follows carries the configured headers — an operator's bearer token or a
+    // `${SECRET:NAME}`-resolved header. A server naming a *different* origin is
+    // asking us to hand those credentials to a third party, so `open()` must
+    // fail closed and never issue the POST.
+    //
+    // The SSRF guard does not cover this: the decoy below is a perfectly
+    // routable address the URL policy is happy to allow. Only the origin
+    // comparison stops it.
+    let (decoy, _decoy_events) = SseFixture::spawn().await;
+    let decoy_authority = decoy
+        .base_url
+        .trim_start_matches("http://")
+        .trim_end_matches("/sse")
+        .to_string();
+    let decoy_posts = decoy.posted.clone();
+
+    let (fixture, _events_tx) =
+        SseFixture::spawn_advertising(move |_addr| format!("http://{decoy_authority}/messages"))
+            .await;
+
+    let mut cfg = fixture.config();
+    cfg.headers.insert(
+        "Authorization".to_string(),
+        "Bearer super-secret-token".to_string(),
+    );
+
+    let err = match open(cfg, Duration::from_secs(2)).await {
+        Ok(_) => panic!("a cross-origin endpoint event must be refused"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("origin"),
+        "error should name the origin mismatch; got: {msg}",
+    );
+
+    // The whole point: the decoy must not have received a credentialed POST.
+    assert!(
+        decoy_posts.lock().await.is_empty(),
+        "no request may reach the third-party origin",
+    );
+}
+
+#[tokio::test]
+async fn open_refuses_endpoint_event_that_only_changes_the_port() {
+    // Spec: the comparison is on the full origin, not just the host. The same
+    // host on a different port is a different server — often a different trust
+    // domain on a shared box — so it must be refused too. A host-only check
+    // would let a co-tenant on 127.0.0.1 collect the bearer token.
+    let (fixture, _events_tx) = SseFixture::spawn_advertising(|addr| {
+        let other_port = addr.port().checked_add(1).unwrap_or(addr.port() - 1);
+        format!("http://127.0.0.1:{other_port}/messages")
+    })
+    .await;
+
+    let err = match open(fixture.config(), Duration::from_secs(2)).await {
+        Ok(_) => panic!("a port change is an origin change and must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("origin"),
+        "error should name the origin mismatch; got: {err}",
+    );
 }

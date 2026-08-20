@@ -41,6 +41,24 @@ pub(crate) const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|
 /// `--git-dir`/`GIT_DIR` use is unaffected.
 const SAFE_BARE_REPOSITORY: &str = "safe.bareRepository=explicit";
 
+/// Blank the credential helper. A helper is a *command* git runs whenever it
+/// wants a credential, and `credential.helper` is settable from a repository's
+/// own `.git/config` — so a cloned tree could otherwise pick the program that
+/// runs the moment any git call touches a remote-ish path. `GIT_TERMINAL_PROMPT=0`
+/// only closes the interactive prompt; it says nothing about helpers.
+const CREDENTIAL_HELPER_OVERRIDE: &str = "credential.helper=";
+/// Blank `core.sshCommand`, which names the binary git execs for transport.
+const SSH_COMMAND_OVERRIDE: &str = "core.sshCommand=";
+/// Blank the external diff driver. `diff.external` runs a program for every
+/// diffed path, and a repository's `.gitattributes` can steer paths at it.
+const DIFF_EXTERNAL_OVERRIDE: &str = "diff.external=";
+/// Refuse git's `ext::` transport, which treats the remote URL as a shell
+/// command to run. Borg runs no `clone`/`fetch` itself today, so nothing here
+/// reaches a transport — this is the guard that keeps it that way if one is
+/// ever added, paired with the `url.*.insteadOf` rewrites that would otherwise
+/// redirect an innocuous-looking URL into `ext::`.
+const PROTOCOL_EXT_OVERRIDE: &str = "protocol.ext.allow=never";
+
 /// Config `-c` overrides prepended to every git invocation so a repository's
 /// own configuration can't execute code while we operate inside its tree.
 /// Returned as a slice, not a fixed-size array: the arity is an implementation
@@ -54,6 +72,14 @@ pub(crate) fn hardened_prelude() -> &'static [&'static str] {
         HOOKS_OVERRIDE,
         "-c",
         SAFE_BARE_REPOSITORY,
+        "-c",
+        CREDENTIAL_HELPER_OVERRIDE,
+        "-c",
+        SSH_COMMAND_OVERRIDE,
+        "-c",
+        DIFF_EXTERNAL_OVERRIDE,
+        "-c",
+        PROTOCOL_EXT_OVERRIDE,
     ]
 }
 
@@ -93,6 +119,16 @@ pub(crate) fn harden_git_command_sync(cmd: &mut std::process::Command) {
     crate::security::env_allowlist::apply_filtered_env_std(cmd, &HashMap::new());
     cmd.stdin(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0");
+
+    // The allowlist also passes through `GIT_DIR`, `GIT_WORK_TREE`,
+    // `GIT_CONFIG_GLOBAL`, and friends, which are left alone on purpose. They
+    // are read from the *operator's* environment, not from anything a
+    // repository controls, so overriding them defends only against an attacker
+    // who already chose how the daemon starts — while pinning
+    // `GIT_CONFIG_GLOBAL` at a null device would discard the operator's
+    // `user.email`, and dropping `GIT_DIR` would break a deliberate setup. The
+    // repository-sourced half of that surface is what the `-c` prelude covers,
+    // and `-c` outranks every config file those variables could name.
 }
 
 /// Run `cmd` under [`GIT_COMMAND_TIMEOUT`], killing the whole process tree if
@@ -1323,6 +1359,22 @@ mod tests {
 
         assert!(overrides.contains(&"core.fsmonitor=false"));
         assert!(overrides.contains(&"safe.bareRepository=explicit"));
+        // The remaining repo-config keys that name a program git will execute.
+        // Each must be blanked, not merely present: an override that set a
+        // value would substitute our own choice of helper for the repo's.
+        for key in ["credential.helper", "core.sshCommand", "diff.external"] {
+            let entry = overrides
+                .iter()
+                .find(|o| o.starts_with(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("{key} must be overridden; got {overrides:?}"));
+            assert_eq!(
+                *entry,
+                format!("{key}="),
+                "{key} must be blanked, not pointed at another program"
+            );
+        }
+        // `ext::` treats the remote URL as a shell command.
+        assert!(overrides.contains(&"protocol.ext.allow=never"));
         // Null target must not point back at a usable directory.
         let hooks = overrides
             .iter()

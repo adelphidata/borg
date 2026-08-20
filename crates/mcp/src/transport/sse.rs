@@ -73,7 +73,8 @@ impl SseTransport {
 /// DNS is resolved once for the SSE URL up-front and pinned into the GET
 /// client; the POST URL advertised by the server is resolved separately
 /// (full async policy re-check) and pinned into the POST client so
-/// rebinding is closed on both sides.
+/// rebinding is closed on both sides. The advertised POST URL must share the
+/// SSE URL's origin — see the check in the body for why.
 pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTransport> {
     let sse_resolved = resolve_endpoint(&config.url, &config.policy).await?;
     let sse_url = sse_resolved.url.clone();
@@ -146,10 +147,32 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
     let post_url_parsed = sse_url
         .join(&endpoint)
         .map_err(|e| McpError::Connect(format!("invalid endpoint url '{endpoint}': {e}")))?;
-    // Full async re-check against policy — a hostile server cannot redirect
-    // us at an internal IP via the `endpoint` event, even if the POST URL
-    // host differs from the SSE host. Resolution is recorded so we can pin
-    // the POST host into the POST client too.
+    // Pin the POST target to the SSE origin. The `endpoint` event is server
+    // controlled and may be an absolute URL, so without this check a hostile or
+    // compromised server names any third-party host and every subsequent POST
+    // carries `config.headers` — the operator's `Authorization: Bearer …` and
+    // any `${SECRET:NAME}` header — straight to it. The policy re-check below
+    // only closes SSRF (private and cloud-metadata addresses); a collector on a
+    // public host is exactly what it lets through. Comparing the full origin
+    // (scheme + host + port) mirrors the LLM side's
+    // `cross_host_safe_redirect_policy`, and like it we fail closed rather than
+    // strip headers: the credentialed request is simply never sent. A
+    // non-special scheme yields an opaque origin that compares unequal to
+    // everything, including itself, so it fails closed too.
+    if post_url_parsed.origin() != sse_url.origin() {
+        return Err(McpError::Connect(format!(
+            "{}: the server's sse endpoint event points at {}, but the server \
+             itself is {} — borg will not send credentialed requests to a \
+             second origin, so the server must advertise its post endpoint on \
+             its own (scheme, host and port must all match)",
+            config.server_name,
+            post_url_parsed.origin().ascii_serialization(),
+            sse_url.origin().ascii_serialization(),
+        )));
+    }
+    // Full async re-check against policy — the origin check above fixes the
+    // host, but the path is still server-chosen and resolution is recorded so
+    // we can pin the POST host into the POST client too.
     let post_resolved = resolve_endpoint(post_url_parsed.as_str(), &config.policy).await?;
     let post_url = post_resolved.url;
 

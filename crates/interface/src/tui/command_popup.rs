@@ -54,6 +54,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/btw", "Ask an ephemeral side question (not persisted)"),
     // Context
     ("/memory", "Show memory context"),
+    ("/pwd", "Show this session's working directory"),
     ("/history", "Show conversation history"),
     ("/logs", "Show activity log"),
     // Diagnostics

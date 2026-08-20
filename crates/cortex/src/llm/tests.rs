@@ -4222,3 +4222,86 @@ fn an_anthropic_request_never_carries_a_repeated_tool_use_id() {
     }
     assert_eq!(result_ids, ids, "each result must pair with its own call");
 }
+
+/// Sets an environment variable and puts the previous value back on drop —
+/// including when a test unwinds, which a hand-rolled restore at the end of the
+/// body does not.
+struct RestoreEnv {
+    name: &'static str,
+    previous: Option<String>,
+}
+
+impl RestoreEnv {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var(name).ok();
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+#[tokio::test]
+// The lock has to span the await: the value under test is read inside
+// `resolve_fallback_slot`, so releasing it first would reopen the race it
+// exists to close. Same trade-off as the bedrock credential tests.
+#[allow(clippy::await_holding_lock)]
+async fn custom_fallback_slot_never_borrows_the_default_provider_key() {
+    // A `custom` endpoint is a URL the operator typed — a self-hosted llama.cpp,
+    // an LM Studio, a colleague's box. Handing it the built-in
+    // `OPENROUTER_API_KEY` default as a bearer credential would mail an
+    // unrelated provider's key to that address. `Config::resolve_provider`
+    // already refuses this for the primary provider; the fallback slot must
+    // refuse it too, both when the name is merely defaulted and when it is
+    // spelled out (the two are indistinguishable once resolved).
+    //
+    // A working key on a *named* provider is the control: the rule has to be
+    // specific to `custom`, or every fallback slot would stop authenticating.
+    // The variable under test *has* to be the real default: the property is
+    // that the built-in default is not borrowed, so a unique per-test name
+    // (this file's usual convention) cannot express it. That makes the shared
+    // lock and the restoring guard load-bearing rather than tidiness — without
+    // the guard, an assertion failure below would leak
+    // "sk-borrowed-by-mistake" into every later test in the process.
+    let _env = crate::constants::default_llm_api_key_env_lock();
+    let key_var = crate::constants::DEFAULT_LLM_API_KEY_ENV;
+    let _restore = RestoreEnv::set(key_var, "sk-borrowed-by-mistake");
+
+    let config = Config::default();
+    let cases: [(&str, Option<&str>, bool); 3] = [
+        // (provider, explicit api_key_env, expect a key)
+        ("custom", None, false),
+        ("custom", Some(key_var), false),
+        ("openrouter", None, true),
+    ];
+
+    for (provider, api_key_env, expect_key) in cases {
+        let fb = crate::config::LlmFallback {
+            provider: provider.to_string(),
+            model: "some-model".to_string(),
+            api_key: None,
+            api_key_env: api_key_env.map(str::to_string),
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: None,
+        };
+        // A `custom` slot with nothing to authenticate with is *refused*
+        // outright rather than silently falling back, so a rejected slot counts
+        // as "did not borrow the key" — the property under test either way.
+        let borrowed = LlmClient::resolve_fallback_slot(&fb, &config)
+            .await
+            .is_ok_and(|slot| slot.keys.iter().any(|k| k == "sk-borrowed-by-mistake"));
+        assert_eq!(
+            borrowed, expect_key,
+            "provider={provider} api_key_env={api_key_env:?}"
+        );
+    }
+}

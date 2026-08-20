@@ -270,9 +270,40 @@ pub(crate) async fn load_region_and_credentials(
 
     // Static sources first — no network, no caching, highest precedence
     // (mirrors the AWS SDK default provider chain).
-    if let Some(credentials) =
-        resolve_env_credentials().or_else(|| resolve_profile_credentials(&profile))
-    {
+    //
+    // `is_fresh` is what keeps this from being a dead end: a static source that
+    // published an expiry and has passed it would otherwise be returned forever,
+    // and every request would fail against a key nothing can renew. Skipping it
+    // lets the chain fall through to the container/IMDS providers, which can.
+    // Sources with no expiry are long-lived and always fresh, so the common case
+    // is unchanged.
+    //
+    // A skip is logged rather than passed over in silence: dropping a
+    // credential the operator explicitly exported is exactly the kind of thing
+    // that must leave a trace, and `lapsed` is what stops the terminal error
+    // below from claiming nothing was found when something was found and was
+    // simply too old to use.
+    let mut lapsed: Option<&'static str> = None;
+    let mut static_credentials = resolve_env_credentials();
+    if static_credentials.as_ref().is_some_and(|c| !c.is_fresh()) {
+        tracing::warn!(
+            "AWS credentials in the environment have expired; continuing down the credential chain"
+        );
+        lapsed = Some("the AWS credentials in the environment");
+        static_credentials = None;
+    }
+    if static_credentials.is_none() {
+        static_credentials = resolve_profile_credentials(&profile);
+        if static_credentials.as_ref().is_some_and(|c| !c.is_fresh()) {
+            tracing::warn!(
+                profile = %profile,
+                "AWS profile credentials have expired; continuing down the credential chain"
+            );
+            lapsed = Some("the AWS profile credentials in ~/.aws");
+            static_credentials = None;
+        }
+    }
+    if let Some(credentials) = static_credentials {
         return Ok((region, credentials));
     }
 
@@ -289,10 +320,26 @@ pub(crate) async fn load_region_and_credentials(
         return Ok((region, store_dynamic_credentials(credentials)));
     }
 
-    bail!(
-        "AWS credential chain did not resolve credentials from env, ~/.aws profiles, \
-         ECS container metadata, or EC2 IMDS"
-    )
+    Err(chain_exhausted_error(lapsed))
+}
+
+/// The error for a credential chain that produced nothing.
+///
+/// Split out and given the lapsed source because the generic wording is a lie
+/// in the case an operator is most likely to hit: `AWS_ACCESS_KEY_ID` *is* set,
+/// so "did not resolve credentials from env" reads as a bug in borg rather than
+/// as "your session token expired, run `aws sso login`".
+fn chain_exhausted_error(lapsed: Option<&str>) -> anyhow::Error {
+    match lapsed {
+        Some(source) => anyhow::anyhow!(
+            "{source} have expired and no other AWS credential source answered — \
+             refresh them with `aws sso login`, or re-export a current session token"
+        ),
+        None => anyhow::anyhow!(
+            "AWS credential chain did not resolve credentials from env, ~/.aws profiles, \
+             ECS container metadata, or EC2 IMDS"
+        ),
+    }
 }
 
 /// Cached temporary credentials from the ECS/IMDS providers. Keyed by nothing —
@@ -752,6 +799,19 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Parse an expiry timestamp published alongside static credentials.
+///
+/// Both `AWS_CREDENTIAL_EXPIRATION` and the credentials file's
+/// `x_security_token_expires` carry RFC 3339. An unparseable value yields
+/// `None` — i.e. "treated as long-lived", which is exactly the behaviour that
+/// existed before expiry was read at all, so a novel spelling degrades to the
+/// old semantics instead of locking the operator out of a working key.
+fn parse_credential_expiry(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
 fn resolve_env_credentials() -> Option<AwsCredentials> {
     let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
         .ok()
@@ -762,11 +822,19 @@ fn resolve_env_credentials() -> Option<AwsCredentials> {
     let session_token = std::env::var("AWS_SESSION_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
+    // Static credentials are usually long-lived, but a `sts assume-role` or
+    // `aws sso` export puts a session token here with a real deadline. Reading
+    // it is what lets the chain step over them once they lapse.
+    let expires_at = std::env::var("AWS_CREDENTIAL_EXPIRATION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .as_deref()
+        .and_then(parse_credential_expiry);
     Some(AwsCredentials {
         access_key_id,
         secret_access_key,
         session_token,
-        expires_at: None,
+        expires_at,
     })
 }
 
@@ -777,7 +845,12 @@ fn resolve_profile_credentials(profile: &str) -> Option<AwsCredentials> {
         access_key_id: section.get("aws_access_key_id")?.clone(),
         secret_access_key: section.get("aws_secret_access_key")?.clone(),
         session_token: section.get("aws_session_token").cloned(),
-        expires_at: None,
+        // The key the AWS CLI writes when it caches temporary credentials into
+        // the shared file.
+        expires_at: section
+            .get("x_security_token_expires")
+            .map(String::as_str)
+            .and_then(parse_credential_expiry),
     })
 }
 
@@ -1599,5 +1672,166 @@ mod tests {
         let cached = cached_dynamic_credentials().expect("dynamic creds cached");
         assert_eq!(cached.access_key_id, "ASIADYNAMIC");
         clear_dynamic_credential_cache_for_tests();
+    }
+
+    #[test]
+    fn credential_expiry_is_read_from_both_static_sources() {
+        // A `sts assume-role` export and an `aws sso login` both leave a
+        // short-lived key in a "static" slot. Reading the deadline they publish
+        // is what lets the chain tell a lapsed key from a long-lived one; an
+        // unreadable or absent value must fall back to "long-lived" so an
+        // unfamiliar spelling can't lock the operator out of a working key.
+        let _lock = super::env_test_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let aws_dir = temp.path().join(".aws");
+        fs::create_dir_all(&aws_dir).expect("create .aws");
+        let _home = EnvGuard::set("HOME", temp.path().to_str().expect("home path"));
+
+        let cases: &[(Option<&str>, Option<DateTime<Utc>>)] = &[
+            (None, None),
+            (Some("not-a-timestamp"), None),
+            (
+                Some("2999-01-01T00:00:00Z"),
+                DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+                    .ok()
+                    .map(|t| t.with_timezone(&Utc)),
+            ),
+        ];
+
+        for (raw, want) in cases.iter().copied() {
+            let _access = EnvGuard::set("AWS_ACCESS_KEY_ID", "ASIAENV");
+            let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "env-secret");
+            let _expiry = match raw {
+                Some(value) => EnvGuard::set("AWS_CREDENTIAL_EXPIRATION", value),
+                None => EnvGuard::remove("AWS_CREDENTIAL_EXPIRATION"),
+            };
+            let from_env = resolve_env_credentials().expect("env credentials");
+            assert_eq!(from_env.expires_at, want, "env expiry for {raw:?}");
+
+            let expiry_line = match raw {
+                Some(value) => format!("x_security_token_expires = {value}\n"),
+                None => String::new(),
+            };
+            fs::write(
+                aws_dir.join("credentials"),
+                format!(
+                    "[default]\naws_access_key_id = ASIAFILE\naws_secret_access_key = s\n{expiry_line}"
+                ),
+            )
+            .expect("write aws credentials");
+            let from_file = resolve_profile_credentials("default").expect("profile credentials");
+            assert_eq!(from_file.expires_at, want, "profile expiry for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_exhausted_chain_says_refresh_when_the_credentials_were_merely_stale() {
+        // Companion to the fall-through below: when nothing further in the
+        // chain answers either, this message is what the operator sees.
+        // Reporting "did not resolve credentials from env" while
+        // `AWS_ACCESS_KEY_ID` is plainly set sends them hunting a phantom bug
+        // instead of running `aws sso login`, which is the actual fix.
+        let stale =
+            chain_exhausted_error(Some("the AWS credentials in the environment")).to_string();
+        assert!(
+            stale.contains("expired") && stale.contains("aws sso login"),
+            "a stale source must name the refresh, not deny the credentials exist: {stale}"
+        );
+        assert!(
+            !stale.contains("did not resolve credentials from env"),
+            "the generic wording contradicts what the operator can see: {stale}"
+        );
+
+        // Control: with nothing found at all the generic listing is correct and
+        // must survive — an unconfigured host is a different problem, and
+        // telling it to refresh a credential it never had is its own dead end.
+        let nothing = chain_exhausted_error(None).to_string();
+        assert!(
+            nothing.contains("ECS container metadata") && !nothing.contains("aws sso login"),
+            "an unconfigured host must not be told to refresh nothing: {nothing}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_credentials_steps_over_a_lapsed_static_source() {
+        // The regression this guards: static sources used to be returned
+        // unconditionally, so an expired STS session token in the environment
+        // was handed to the signer forever and every request failed against a
+        // key nothing in-process could renew. A lapsed static source must fall
+        // through to the container provider, which does renew itself.
+        let _lock = super::env_test_lock();
+        clear_dynamic_credential_cache_for_tests();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/creds"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(creds_json("2999-01-01T00:00:00Z")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = EnvGuard::set("HOME", temp.path().to_str().expect("home path"));
+        // Present, well-formed, and expired — the shape of a stale SSO export.
+        let _access = EnvGuard::set("AWS_ACCESS_KEY_ID", "ASIASTALE");
+        let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "stale-secret");
+        let _sess = EnvGuard::set("AWS_SESSION_TOKEN", "stale-session-token");
+        let _expiry = EnvGuard::set("AWS_CREDENTIAL_EXPIRATION", "2000-01-01T00:00:00Z");
+        let _profile = EnvGuard::remove("AWS_PROFILE");
+        let _region = EnvGuard::set("AWS_REGION", "us-east-1");
+        let _rel = EnvGuard::remove("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        let _authf = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE");
+        let _auth = EnvGuard::remove("AWS_CONTAINER_AUTHORIZATION_TOKEN");
+        let _full = EnvGuard::set(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            &format!("{}/creds", server.uri()),
+        );
+
+        let (_region, creds) = load_region_and_credentials(&Client::new(), None)
+            .await
+            .expect("chain must recover past the lapsed static source");
+        assert_eq!(
+            creds.access_key_id, "ASIADYNAMIC",
+            "expired static credentials must not be signed with"
+        );
+        clear_dynamic_credential_cache_for_tests();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_credentials_still_prefers_unexpired_static_credentials() {
+        // The other side of the same rule: an ordinary long-lived key, and one
+        // whose published expiry is still in the future, both keep their
+        // highest-in-the-chain precedence. Without this the freshness check
+        // could tighten into "never trust env credentials" unnoticed.
+        for expiry in [None, Some("2999-01-01T00:00:00Z")] {
+            let _lock = super::env_test_lock();
+            clear_dynamic_credential_cache_for_tests();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _home = EnvGuard::set("HOME", temp.path().to_str().expect("home path"));
+            let _access = EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIALIVE");
+            let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "live-secret");
+            let _sess = EnvGuard::remove("AWS_SESSION_TOKEN");
+            let _expiry = match expiry {
+                Some(value) => EnvGuard::set("AWS_CREDENTIAL_EXPIRATION", value),
+                None => EnvGuard::remove("AWS_CREDENTIAL_EXPIRATION"),
+            };
+            let _profile = EnvGuard::remove("AWS_PROFILE");
+            let _region = EnvGuard::set("AWS_REGION", "us-east-1");
+            // Pointed at a port nothing is listening on: if the chain wrongly
+            // walked past the static source it would fail rather than silently
+            // resolve somewhere else.
+            let _full = EnvGuard::set(
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "http://127.0.0.1:1/creds",
+            );
+
+            let (_region, creds) = load_region_and_credentials(&Client::new(), None)
+                .await
+                .expect("unexpired static credentials must resolve");
+            assert_eq!(creds.access_key_id, "AKIALIVE", "for expiry {expiry:?}");
+        }
     }
 }

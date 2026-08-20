@@ -35,6 +35,7 @@ impl App<'_> {
         match trimmed {
             "quit" | "exit" | "/exit" => return Some(Ok(AppAction::Quit)),
             "help" | "/help" => return Some(self.cmd_help()),
+            "/pwd" | "/cwd" => return Some(self.cmd_pwd()),
             "/memory" => return Some(self.cmd_memory()),
             "/skills" => return Some(self.cmd_plugins()),
             "/history" => return Some(self.cmd_history()),
@@ -420,6 +421,7 @@ impl App<'_> {
              /resume-turn - Continue a reply that was cut short\n\
              \n  \
              /memory    - Show memory\n  \
+             /pwd       - Show the working directory\n  \
              /history   - Show conversation history\n  \
              /logs      - Show activity log (error|warn|info|debug|all|raw)\n  \
              /doctor    - Run diagnostics\n  \
@@ -491,6 +493,36 @@ impl App<'_> {
             self.push_system_message("Nothing to cancel.".to_string());
             Ok(AppAction::Continue)
         }
+    }
+
+    /// `/pwd` — this client's working directory, and the repo that contains it.
+    ///
+    /// Worth its own command because the answer is not always the directory the
+    /// user launched from: `borg --worktree` puts the client in a sibling
+    /// checkout, and the repo root (not the cwd) is what scopes `--continue`
+    /// and the workspace-relative paths in tool output.
+    ///
+    /// Deliberately *not* described as where the agent writes. The workspace is
+    /// bound daemon-side at `Session.Open`, so a session opened in one
+    /// directory and later resumed from another would make that claim false.
+    /// Reporting what this process can actually see keeps it honest.
+    fn cmd_pwd(&mut self) -> Result<AppAction> {
+        let text = match std::env::current_dir() {
+            Ok(cwd) => {
+                let (cwd, repo_root) = cortex::session::workspace_identity(&cwd);
+                match repo_root {
+                    // Only worth a second line when it differs — in a plain
+                    // directory, or at the top of a repo, one line says it all.
+                    Some(root) if root != cwd => {
+                        format!("{}\nrepository: {}", cwd.display(), root.display())
+                    }
+                    _ => cwd.display().to_string(),
+                }
+            }
+            Err(e) => format!("Cannot read the working directory: {e}"),
+        };
+        self.push_system_message(text);
+        Ok(AppAction::Continue)
     }
 
     fn cmd_memory(&mut self) -> Result<AppAction> {

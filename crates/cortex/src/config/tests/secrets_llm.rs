@@ -321,9 +321,7 @@ fn custom_provider_never_flipped_by_key_prefix() {
 /// var (the built-in `api_key_env` default). Without this they race in the
 /// parallel test runner and observe each other's set/remove.
 fn openrouter_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::constants::default_llm_api_key_env_lock()
 }
 
 #[test]

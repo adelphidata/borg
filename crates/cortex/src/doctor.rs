@@ -154,7 +154,10 @@ impl StepKind {
 
     async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>, probe_network: bool) {
         match self {
-            Self::Provider => checks::provider::check_provider(config, checks),
+            Self::Provider => {
+                checks::provider::check_provider(config, checks);
+                checks::provider::check_endpoint_reachable(config, checks, probe_network).await;
+            }
             Self::Credentials => checks::provider::check_llm_credentials(config, checks).await,
             Self::Settings => checks::system::check_settings(config, checks),
             Self::Secrets => checks::security::check_secrets(config, checks),

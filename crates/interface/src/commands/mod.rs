@@ -17,6 +17,7 @@ pub(crate) mod pairing;
 pub(crate) mod pause;
 pub(crate) mod providers;
 pub(crate) mod revoke;
+pub(crate) mod send;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod skills;

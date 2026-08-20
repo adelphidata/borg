@@ -1438,10 +1438,26 @@ impl LlmClient {
         }
 
         if slot_keys.is_empty() {
+            // Same rule the primary provider gets in `Config::resolve_provider`:
+            // a `Custom` endpoint is a URL the operator typed, so the built-in
+            // `OPENROUTER_API_KEY` default must never become its bearer
+            // credential. Today `Provider::Custom.default_env_var()` is empty
+            // and `fb.api_key_env` defaults to `None`, so this is a no-op — it
+            // is here so the two paths state the same rule rather than one of
+            // them depending on the other's constant staying empty.
+            let default_env_var = if provider == Provider::Custom {
+                ""
+            } else {
+                provider.default_env_var()
+            };
             let env_var = fb
                 .api_key_env
                 .as_deref()
-                .unwrap_or(provider.default_env_var());
+                .filter(|name| {
+                    provider != Provider::Custom
+                        || *name != crate::constants::DEFAULT_LLM_API_KEY_ENV
+                })
+                .unwrap_or(default_env_var);
             if let Ok(key) = std::env::var(env_var) {
                 if !key.is_empty() {
                     slot_keys.push(key);

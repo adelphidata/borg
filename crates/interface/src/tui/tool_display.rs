@@ -621,6 +621,13 @@ mod tests {
     fn detail_ran_emits_shell_prompt() {
         // run_shell tool start emits a `$ <cmd>` echo line under the bullet
         // header so the user sees what's about to run.
+        // The active theme is process-global, and this test reads it twice —
+        // once inside `tool_detail_line` and once in the assertion below. The
+        // theme tests swap it under `TEST_LOCK`, so without taking that lock a
+        // swap landing between the two reads fails this test for no defect.
+        let _theme = crate::tui::themes::active::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cat = ToolDisplayCategory::Ran {
             command: "ls -la".to_string(),
         };

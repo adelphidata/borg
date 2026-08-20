@@ -903,3 +903,17 @@ mod tests {
         assert!(EVOLUTION_EVOLVED_FILE_WRITES_BLOCK <= EVOLUTION_FINAL_FILE_WRITES_BLOCK);
     }
 }
+
+/// Serializes tests that mutate [`DEFAULT_LLM_API_KEY_ENV`] in the process
+/// environment.
+///
+/// It lives beside the constant on purpose: several test modules reach for the
+/// same variable, and two privately-held locks would serialize nothing while
+/// looking like they did. Under a parallel runner one test then observes
+/// another's `set_var`/`remove_var`.
+#[cfg(test)]
+pub(crate) fn default_llm_api_key_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

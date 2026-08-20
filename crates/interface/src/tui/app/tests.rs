@@ -111,6 +111,45 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+#[test]
+fn pwd_reports_the_real_working_directory_under_both_spellings() {
+    // The directory a session writes into is not always the one the user
+    // launched from — `borg --worktree` moves it to a sibling checkout — so
+    // `/pwd` has to answer from the process, never from a remembered string.
+    // `/cwd` is the alias muscle memory reaches for; both must work, and
+    // neither may leave a turn queued.
+    // Compared after the same normalization the command applies. A raw
+    // `current_dir()` differs from the reported path whenever the checkout is
+    // reached through a symlink (`/tmp` on macOS is one), which would fail the
+    // test for a difference that is not a defect.
+    let cwd = std::env::current_dir().expect("cwd");
+    let (expected, _) = cortex::session::workspace_identity(&cwd);
+    for spelling in ["/pwd", "/cwd"] {
+        let mut app = make_app();
+        let before = app.cells.len();
+        let action = app
+            .handle_submit(spelling)
+            .expect("command must be handled");
+        assert!(
+            matches!(action, AppAction::Continue),
+            "{spelling} is a local query and must not start a turn"
+        );
+        assert_eq!(
+            app.cells.len(),
+            before + 1,
+            "{spelling} must answer with exactly one cell"
+        );
+        let text = match app.cells.last() {
+            Some(crate::tui::history::HistoryCell::System { text }) => text.clone(),
+            _ => panic!("{spelling} must answer as a system cell"),
+        };
+        assert!(
+            text.contains(&expected.display().to_string()),
+            "{spelling} must name the actual directory; got: {text}"
+        );
+    }
+}
+
 // /btw routing — popup visibility does not disturb main agent state, late
 // results against a dismissed/superseded popup are discarded.
 
