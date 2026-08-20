@@ -19,7 +19,9 @@ const fold = (events: Partial<sessionPb.AgentEvent>[], now = 0): Cell[] =>
 describe("reduceEvent — text", () => {
   it("merges consecutive text deltas into one assistant cell", () => {
     const cells = fold([{ textDelta: { text: "Hel" } }, { textDelta: { text: "lo" } }]);
-    expect(cells).toEqual([{ kind: "assistant", text: "Hello" }]);
+    // The row is stamped once, at the delta that opened it — a reply does not
+    // restart its clock every time another token lands.
+    expect(cells).toEqual([{ kind: "assistant", text: "Hello", at: 0 }]);
   });
 
   it("starts a fresh assistant cell after a tool call splits the reply", () => {
@@ -35,7 +37,7 @@ describe("reduceEvent — text", () => {
 describe("reduceEvent — thinking", () => {
   it("keeps a reasoning block open while its deltas arrive", () => {
     const cells = fold([{ thinkingDelta: { text: "a" } }, { thinkingDelta: { text: "b" } }]);
-    expect(cells).toEqual([{ kind: "thinking", text: "ab", streaming: true, startedAt: 0 }]);
+    expect(cells).toEqual([{ kind: "thinking", text: "ab", streaming: true, startedAt: 0, at: 0 }]);
   });
 
   it("seals the block and records its duration when the answer starts", () => {
@@ -48,6 +50,8 @@ describe("reduceEvent — thinking", () => {
       streaming: false,
       startedAt: 1_000,
       seconds: 4,
+      // Sealing records how long it ran; it does not move when the row began.
+      at: 1_000,
     });
   });
 
@@ -180,7 +184,7 @@ describe("reduceEvent — pass-through kinds", () => {
 
   it("renders a steer as a user turn", () => {
     expect(fold([{ steerReceived: { text: "actually, stop" } }])).toEqual([
-      { kind: "user", text: "actually, stop" },
+      { kind: "user", text: "actually, stop", at: 0 },
     ]);
   });
 
@@ -188,7 +192,43 @@ describe("reduceEvent — pass-through kinds", () => {
     let cells = reduceEvent([], event({ thinkingDelta: { text: "hm" } }), 0);
     cells = reduceEvent(cells, event({ error: { message: "boom" } }), 3_000);
     expect(cells[0]).toMatchObject({ streaming: false, seconds: 3 });
-    expect(cells[1]).toEqual({ kind: "error", text: "boom" });
+    expect(cells[1]).toEqual({ kind: "error", text: "boom", at: 3_000 });
+  });
+});
+
+describe("transcript timestamps", () => {
+  it("keeps a reply's own start time when a tool splits it into two rows", () => {
+    let cells = reduceEvent([], event({ textDelta: { text: "one" } }), 1_000);
+    cells = reduceEvent(
+      cells,
+      event({ toolExecuting: { toolCallId: "t1", name: "fs_read", argsJson: "{}" } }),
+      2_000,
+    );
+    cells = reduceEvent(cells, event({ textDelta: { text: "two" } }), 3_000);
+
+    // Three rows, three distinct times: the second half of the reply is not
+    // backdated to when the first half started.
+    expect(cells.map((c) => c.at)).toEqual([1_000, 2_000, 3_000]);
+  });
+
+  it("carries a persisted row's time across a reload, in milliseconds", () => {
+    const cells = historyCells([
+      { role: "user", text: "hello", unixTs: 1_755_000_000 },
+      { role: "tool", text: "out", toolCallId: "c1", unixTs: 1_755_000_005 },
+    ]);
+
+    // The daemon counts seconds; every other time in this module is a
+    // millisecond, and mixing them would date the row to 1970.
+    expect(cells.map((c) => c.at)).toEqual([1_755_000_000_000, 1_755_000_005_000]);
+  });
+
+  it("leaves a row with no recorded time unstamped rather than dating it to 1970", () => {
+    const cells = historyCells([
+      { role: "user", text: "old row" },
+      { role: "assistant", text: "older still", unixTs: 0 },
+    ]);
+
+    expect(cells.map((c) => c.at)).toEqual([undefined, undefined]);
   });
 });
 

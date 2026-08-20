@@ -19,6 +19,7 @@ import { TranscriptCell } from "./cells";
 import { groupCells } from "./cells/toolRuns";
 import { INITIAL_BUDGET, budgetCutIndex, cutHidesEverything, revealEarlier } from "./renderBudget";
 import { describeSendFailure } from "./sendFailure";
+import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
 import { useTurnNotifications } from "./useTurnNotifications";
@@ -52,6 +53,19 @@ export function ConversationPage() {
 
   // A live count of the wait, ticking only while there is a wait to count.
   const now = useTick(1_000, busy && turnStartedAt !== undefined);
+
+  // What the turn is waiting on, damped so a run of quick tool calls does not
+  // flash a guess between every pair. The hold is a ref because it is a running
+  // account of what has already been shown, not state the render derives.
+  // Built once, not on every render — `useRef(createActivityHold())` would
+  // allocate a fresh hold per render and throw all but the first away.
+  const holdRef = useRef<ActivityHold>(undefined);
+  holdRef.current ??= createActivityHold();
+  const hold = holdRef as { current: ActivityHold };
+  useEffect(() => {
+    if (!busy) hold.current.reset();
+  }, [busy]);
+  const activity = busy ? hold.current.settle(turnActivity(cells), now) : undefined;
 
   // The daemon rewinds by user-message ordinal, so each user cell needs its
   // position among user cells rather than its index in the list.
@@ -242,9 +256,9 @@ export function ConversationPage() {
                   {!busy && (edits.length > 0 || uncounted > 0) && (
                     <ChangedFilesCard edits={edits} uncounted={uncounted} />
                   )}
-                  {busy && (
+                  {activity?.label !== undefined && (
                     <div className="px-1 text-[12px] leading-none text-ink3">
-                      Borg is thinking…
+                      {activity.label}
                       {turnStartedAt !== undefined && (
                         <span className="text-ink3"> {formatElapsed(now - turnStartedAt)}</span>
                       )}

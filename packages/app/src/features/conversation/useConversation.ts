@@ -31,8 +31,18 @@ export interface Attachment {
   previewUrl?: string;
 }
 
-/** One rendered block in the transcript. */
-export type Cell =
+/**
+ * One rendered block in the transcript.
+ *
+ * `at` is when the row began — the first delta of a reply, the moment a tool was
+ * called, the submit of a prompt — in epoch milliseconds. It is never drawn:
+ * a transcript reads as a conversation, and a column of clock times down the
+ * side turns it into a log. It reaches the user through the row's hover title,
+ * which is the one question the screen genuinely withholds an answer to.
+ */
+export type Cell = CellBody & { at?: number };
+
+type CellBody =
   | { kind: "user"; text: string; attachments?: number }
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string; streaming: boolean; startedAt: number; seconds?: number }
@@ -77,12 +87,12 @@ export interface PlanStep {
   status: string;
 }
 
-function appendAssistant(cells: Cell[], text: string): Cell[] {
+function appendAssistant(cells: Cell[], text: string, now: number): Cell[] {
   const last = cells[cells.length - 1];
   if (last && last.kind === "assistant") {
     return [...cells.slice(0, -1), { ...last, text: last.text + text }];
   }
-  return [...cells, { kind: "assistant", text }];
+  return [...cells, { kind: "assistant", text, at: now }];
 }
 
 /**
@@ -105,7 +115,7 @@ function appendThinking(cells: Cell[], text: string, now: number): Cell[] {
   if (last && last.kind === "thinking" && last.streaming) {
     return [...cells.slice(0, -1), { ...last, text: last.text + text }];
   }
-  return [...cells, { kind: "thinking", text, streaming: true, startedAt: now }];
+  return [...cells, { kind: "thinking", text, streaming: true, startedAt: now, at: now }];
 }
 
 function patchTool(cells: Cell[], id: string, patch: (c: Cell & { kind: "tool" }) => Cell): Cell[] {
@@ -123,7 +133,7 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
   // Everything below ends a reasoning block if one was open.
   const base = sealThinking(cells, now);
 
-  if (event.textDelta) return appendAssistant(base, event.textDelta.text);
+  if (event.textDelta) return appendAssistant(base, event.textDelta.text, now);
   if (event.toolExecuting) {
     return [
       ...base,
@@ -135,6 +145,7 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
         output: "",
         done: false,
         stderr: false,
+        at: now,
       },
     ];
   }
@@ -210,12 +221,17 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
       },
     ];
   }
-  if (event.steerReceived) return [...base, { kind: "user", text: event.steerReceived.text }];
+  if (event.steerReceived)
+    return [...base, { kind: "user", text: event.steerReceived.text, at: now }];
   if (event.historyCompacted) {
-    return [...base, { kind: "notice", text: "Older messages were compacted to save space." }];
+    return [
+      ...base,
+      { kind: "notice", text: "Older messages were compacted to save space.", at: now },
+    ];
   }
-  if (event.systemNotice) return [...base, { kind: "notice", text: event.systemNotice.text }];
-  if (event.error) return [...base, { kind: "error", text: event.error.message }];
+  if (event.systemNotice)
+    return [...base, { kind: "notice", text: event.systemNotice.text, at: now }];
+  if (event.error) return [...base, { kind: "error", text: event.error.message, at: now }];
   // preparing / turnComplete / planUpdated add nothing here — planUpdated
   // drives the pinned plan panel, the other two only move `busy`.
   return base;
@@ -254,6 +270,12 @@ export interface HistoryRow {
   toolCallsJson?: string;
   /** Tool rows: which call this row answers. */
   toolCallId?: string;
+  /**
+   * When the row was written, in epoch *seconds* — the daemon's own unit. Zero
+   * on rows persisted before it was recorded, which is why the cell keeps `at`
+   * optional rather than inventing a time.
+   */
+  unixTs?: number;
 }
 
 /** The `{id, function: {name, arguments}}` shape stored in `tool_calls_json`. */
@@ -291,6 +313,10 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
   const cells: Cell[] = [];
 
   messages.forEach((m, i) => {
+    // Seconds on the wire, milliseconds everywhere in this module. A zero means
+    // the row predates the daemon recording it, and carries no time at all.
+    const at = m.unixTs ? m.unixTs * 1000 : undefined;
+
     if (m.role === "assistant") {
       for (const call of parseToolCalls(m.toolCallsJson)) {
         if (call.id) {
@@ -301,12 +327,12 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
         }
       }
       // An assistant row can be tool calls only, with no prose to show.
-      if (m.text.trim() !== "") cells.push({ kind: "assistant", text: m.text });
+      if (m.text.trim() !== "") cells.push({ kind: "assistant", text: m.text, at });
       return;
     }
 
     if (m.role === "user") {
-      if (m.text.trim() !== "") cells.push({ kind: "user", text: m.text });
+      if (m.text.trim() !== "") cells.push({ kind: "user", text: m.text, at });
       return;
     }
 
@@ -320,6 +346,7 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
         output: m.text,
         done: true,
         stderr: false,
+        at,
       });
     }
   });
@@ -541,7 +568,7 @@ export function useConversation(target: string | undefined): Conversation {
       if (!sessionId) return;
       setCells((prev) => [
         ...prev,
-        { kind: "user", text, attachments: attachments.length || undefined },
+        { kind: "user", text, attachments: attachments.length || undefined, at: startedAt },
       ]);
       setBusy(true);
       setSendError(undefined);

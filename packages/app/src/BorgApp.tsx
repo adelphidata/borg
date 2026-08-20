@@ -11,6 +11,7 @@ import {
 } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
+import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
@@ -129,6 +130,18 @@ function Shell({ platform }: { platform: Platform }) {
   // sidebar because it needs the archive call and the stacked Escape registry,
   // neither of which the design-system package can see.
   const [recentMenu, setRecentMenu] = useState<{ id: string; at: { x: number; y: number } }>();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
+    readSidebarCollapsed(globalThis.localStorage),
+  );
+  // Persist in the handler, not in the updater: React may run an updater
+  // speculatively and throw the render away, and a discarded toggle must not
+  // leave a collapsed sidebar written down.
+  const toggleSidebar = () => {
+    const next = !sidebarCollapsed;
+    writeSidebarCollapsed(globalThis.localStorage, next);
+    setSidebarCollapsed(next);
+  };
+  useKeybind("toggle-sidebar", toggleSidebar);
   useMenuEscape(recentMenu !== undefined, () => setRecentMenu(undefined));
 
   // Attention dots: doctor warnings light Health, pending pairings light
@@ -173,6 +186,8 @@ function Shell({ platform }: { platform: Platform }) {
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
             user={user}
+            collapsed={sidebarCollapsed}
+            onToggleCollapsed={toggleSidebar}
           />
         )}
         <Menu

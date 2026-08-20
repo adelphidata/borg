@@ -1,6 +1,6 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
-import { LogoIcon } from "../components/icons";
+import { ChevronIcon, LogoIcon } from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
 import { Truncated } from "../components/Truncated";
 import type { AppRoute, NavUser, RecentItem } from "../types";
@@ -28,6 +28,13 @@ export interface SidebarProps {
   /** Opens the full, searchable conversation list. */
   onSeeAllConversations: () => void;
   user: NavUser;
+  /**
+   * Narrows the sidebar to its rail. The nav is chrome, and on a small window
+   * it is a third of the screen spent on something the user is not reading.
+   */
+  collapsed?: boolean;
+  /** Toggles `collapsed`. Omit and the sidebar has no collapse control. */
+  onToggleCollapsed?: () => void;
 }
 
 function NavItem({ route }: { route: AppRoute }) {
@@ -151,14 +158,40 @@ export function Sidebar({
   onNewConversation,
   onSeeAllConversations,
   user,
+  collapsed = false,
+  onToggleCollapsed,
 }: SidebarProps) {
+  // The way back has to live on the rail itself. A collapsed sidebar whose only
+  // reopen is a shortcut is a sidebar the user has lost.
+  const toggle = onToggleCollapsed && (
+    <button
+      type="button"
+      aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+      aria-expanded={!collapsed}
+      onClick={onToggleCollapsed}
+      className="flex-none cursor-pointer rounded border-0 bg-transparent p-1 text-ink3 hover:text-ink"
+    >
+      <ChevronIcon size={14} className={collapsed ? "" : "rotate-180"} />
+    </button>
+  );
+
+  if (collapsed) {
+    return (
+      <aside className="flex w-[52px] flex-none flex-col items-center border-r border-line2 bg-surface2 px-2 pt-[18px] pb-4">
+        <LogoIcon size={20} />
+        <div className="pt-4">{toggle}</div>
+      </aside>
+    );
+  }
+
   return (
     <aside className="flex w-[236px] flex-none flex-col border-r border-line2 bg-surface2 px-[14px] pt-[18px] pb-4">
       <div className="flex items-center gap-[11px] px-2 pt-0.5 pb-5">
         <LogoIcon size={20} />
-        <span className="text-[13px] leading-none font-semibold tracking-[0.2em] text-ink">
+        <span className="flex-1 text-[13px] leading-none font-semibold tracking-[0.2em] text-ink">
           BORG
         </span>
+        {toggle}
       </div>
 
       <Rule />

@@ -68,6 +68,26 @@ export function formatElapsed(ms: number): string {
   return `${Math.floor(secs / 3_600)}h ${String(mins).padStart(2, "0")}m`;
 }
 
+/**
+ * When something happened, spelled out for a hover tip: "19 Aug 2026, 14:32:07".
+ *
+ * Long form on purpose. This is the only place a transcript states a wall-clock
+ * time, and it is read deliberately — someone hovering a row wants the date as
+ * well as the minute, and a bare "14:32" cannot say which day it means. The
+ * user's own locale and time zone do the formatting, because the answer is
+ * about when *they* were sitting there.
+ */
+export function formatTimestamp(ms: number): string {
+  return new Date(ms).toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 /** A rounded, human duration: "2 hours", "45 seconds". */
 export function formatDuration(secs: number): string {
   if (secs >= 86_400) return plural(Math.floor(secs / 86_400), "day");

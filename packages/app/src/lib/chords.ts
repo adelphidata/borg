@@ -22,6 +22,7 @@ export const CHORDS: Readonly<Record<string, string>> = {
   "find-in-conversation": "mod+f",
   "open-settings": "mod+,",
   "toggle-activity": "mod+j",
+  "toggle-sidebar": "mod+b",
   "cancel-turn": "escape",
 };
 

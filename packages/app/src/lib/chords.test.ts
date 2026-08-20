@@ -18,6 +18,13 @@ describe("acceleratorFor", () => {
       expect(acceleratorFor(action)).toBeTruthy();
     }
   });
+
+  it("gives no two actions the same chord", () => {
+    // A duplicate is silent: the key still fires, just for whichever action the
+    // registry happens to resolve last, and the other one is simply gone.
+    const chords = Object.values(CHORDS);
+    expect(new Set(chords).size).toBe(chords.length);
+  });
 });
 
 describe("hintFor", () => {

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckIcon, ChevronDownIcon, ChevronIcon, StatusDot } from "@borg/ui";
+import { CheckIcon, ChevronDownIcon, ChevronIcon, StatusDot, Truncated } from "@borg/ui";
 import type { PlanStep } from "../useConversation";
 
 /** Status strings the agent publishes, normalised for display. */
@@ -25,6 +25,10 @@ export function PlanPanel({ steps }: { steps: PlanStep[] }) {
   if (steps.length === 0) return null;
 
   const done = steps.filter((s) => isDone(s.status)).length;
+  // Collapsed, the count alone says how far along the plan is but not what it is
+  // doing, so learning that costs an expand. Naming the step folds the answer
+  // into the header the user is already looking at.
+  const running = steps.find((s) => isActive(s.status));
 
   return (
     <div className="rounded-[10px] border border-line2 bg-surface2">
@@ -38,7 +42,20 @@ export function PlanPanel({ steps }: { steps: PlanStep[] }) {
         <span className="text-[11px] leading-none font-medium tracking-[0.12em] text-ink3 uppercase">
           Plan
         </span>
-        <span className="flex-1 text-right text-[11.5px] leading-none text-ink3">
+        {!open && running && (
+          // `Truncated` has to be the flex item itself: its ellipsis needs a
+          // block box, and wrapping it in a span leaves it inline, where
+          // `overflow`/`text-overflow` do not apply and a long step overflows
+          // the header instead of clipping.
+          <Truncated className="min-w-0 flex-1 text-[11.5px] leading-none text-ink2">
+            {running.text}
+          </Truncated>
+        )}
+        <span
+          className={`text-right text-[11.5px] leading-none text-ink3 ${
+            !open && running ? "flex-none" : "flex-1"
+          }`}
+        >
           {done}/{steps.length}
         </span>
       </button>

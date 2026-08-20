@@ -4,7 +4,7 @@ import type { Cell } from "../useConversation";
 import { classifyStatus } from "../../agents/useAgentTree";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
-import { formatElapsed, formatTokens } from "../../../lib/format";
+import { formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
 import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
 
@@ -210,6 +210,22 @@ export const TranscriptCell = memo(function TranscriptCell({
   editable: boolean;
   onEdit: (nthUserMessage: number, text: string) => void;
 }) {
+  const body = renderCell(cell, respond, ordinal, editable, onEdit);
+  // Only the kinds the reducer stamps carry a time, so the presence of `at`
+  // selects the rows worth asking "when" about — a usage footer or an open
+  // prompt is not one of them. The wrapper is a plain block so the cell inside
+  // lays out exactly as it did before.
+  if (cell.at === undefined) return body;
+  return <div title={formatTimestamp(cell.at)}>{body}</div>;
+});
+
+function renderCell(
+  cell: Cell,
+  respond: (promptId: string, value: string) => void,
+  ordinal: number,
+  editable: boolean,
+  onEdit: (nthUserMessage: number, text: string) => void,
+) {
   switch (cell.kind) {
     case "user":
       return (
@@ -242,4 +258,4 @@ export const TranscriptCell = memo(function TranscriptCell({
     case "input-request":
       return <InputRequestCell cell={cell} respond={respond} />;
   }
-});
+}
