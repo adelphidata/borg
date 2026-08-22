@@ -34,15 +34,62 @@ export interface Connections {
   pendingCount: number;
 }
 
-/** Providers worth offering before any key exists. Display metadata only. */
-export const PROVIDER_CATALOG: { name: string; label: string; blurb: string }[] = [
-  { name: "openrouter", label: "OpenRouter", blurb: "One key, every model behind it." },
-  { name: "anthropic", label: "Anthropic", blurb: "Claude, straight from the source." },
-  { name: "openai", label: "OpenAI", blurb: "GPT models with your own key." },
-  { name: "gemini", label: "Gemini", blurb: "Google's models with an AI Studio key." },
-  { name: "deepseek", label: "DeepSeek", blurb: "Fast, inexpensive reasoning models." },
-  { name: "groq", label: "Groq", blurb: "Open models at very high speed." },
-  { name: "xai", label: "xAI", blurb: "Grok models with your own key." },
+/**
+ * Providers worth offering before any key exists. Display metadata only.
+ *
+ * `keyUrl` is the page that issues the key. Asking someone to paste a
+ * credential without saying where it comes from is the one step of setup a
+ * first-time user cannot finish on their own, so every provider that needs a
+ * key names its source.
+ */
+export const PROVIDER_CATALOG: {
+  name: string;
+  label: string;
+  blurb: string;
+  keyUrl?: string;
+}[] = [
+  {
+    name: "openrouter",
+    label: "OpenRouter",
+    blurb: "One key, every model behind it.",
+    keyUrl: "https://openrouter.ai/keys",
+  },
+  {
+    name: "anthropic",
+    label: "Anthropic",
+    blurb: "Claude, straight from the source.",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+  },
+  {
+    name: "openai",
+    label: "OpenAI",
+    blurb: "GPT models with your own key.",
+    keyUrl: "https://platform.openai.com/api-keys",
+  },
+  {
+    name: "gemini",
+    label: "Gemini",
+    blurb: "Google's models with an AI Studio key.",
+    keyUrl: "https://aistudio.google.com/app/apikey",
+  },
+  {
+    name: "deepseek",
+    label: "DeepSeek",
+    blurb: "Fast, inexpensive reasoning models.",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+  },
+  {
+    name: "groq",
+    label: "Groq",
+    blurb: "Open models at very high speed.",
+    keyUrl: "https://console.groq.com/keys",
+  },
+  {
+    name: "xai",
+    label: "xAI",
+    blurb: "Grok models with your own key.",
+    keyUrl: "https://console.x.ai/",
+  },
   { name: "ollama", label: "Ollama", blurb: "A model running on this machine. Nothing leaves." },
 ];
 

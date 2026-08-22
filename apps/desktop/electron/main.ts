@@ -1,6 +1,7 @@
 import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { registerBoot } from "./boot";
 import { registerBorgIpc } from "./ipc";
 import { installApplicationMenu } from "./menu";
 import { raise, registerNativeIpc } from "./native";
@@ -118,6 +119,13 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     const borg = registerBorgIpc();
     const native = registerNativeIpc(() => mainWindow);
+    // Start the daemon before anything asks it a question. The window opens
+    // immediately either way and shows the wait; nothing here blocks it.
+    const boot = registerBoot({
+      appPath: appRoot,
+      resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
+    });
+    void boot.start();
     // In dev there is no published feed, so checking would only log failures.
     const updater = registerUpdater({ enabled: !isDev && app.isPackaged });
     const quickEntry = registerQuickEntry({
@@ -129,6 +137,7 @@ if (!app.requestSingleInstanceLock()) {
     });
 
     app.once("will-quit", () => {
+      boot.dispose();
       borg.dispose();
       native.dispose();
       updater.dispose();

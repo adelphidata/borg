@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Pill } from "@borg/ui";
-import { usePlatform } from "../lib/platform";
+import { useNative, usePlatform } from "../lib/platform";
 import { signOut } from "../lib/session";
 import type { Query } from "../lib/useDaemon";
 
@@ -23,6 +23,7 @@ export function DaemonState<T>({
   children: (data: T) => ReactNode;
 }) {
   const { kind } = usePlatform();
+  const native = useNative();
 
   if (query.state === "loading") {
     return <div className="text-[13px] leading-none text-ink3">Loading {label}…</div>;
@@ -30,8 +31,12 @@ export function DaemonState<T>({
 
   if (query.state === "error") {
     const { error } = query;
+    // The desktop shell starts the daemon itself, so the remedy there is a
+    // button, not a command someone has to find a terminal for.
     const message = error.isUnavailable
-      ? "Borg is not running. Start it with `borg daemon`."
+      ? kind === "desktop"
+        ? "Borg has stopped running."
+        : "Borg is not running. Start it with `borg daemon`."
       : error.isUnauthenticated
         ? "This token was rejected. Issue a new one with `borg client-token issue web`."
         : error.message;
@@ -42,6 +47,11 @@ export function DaemonState<T>({
           Could not load {label}.
         </div>
         <div className="text-[12.5px] leading-[1.4] text-ink2">{message}</div>
+        {kind === "desktop" && error.isUnavailable && (
+          <Pill variant="primary" onClick={() => native.boot.retry()}>
+            Start Borg
+          </Pill>
+        )}
         {/* Only the browser holds a token, so only it can clear one. */}
         {kind === "web" && error.isUnauthenticated && (
           <Pill variant="danger" onClick={signOut}>

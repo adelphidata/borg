@@ -4,9 +4,11 @@ Electron shell for Borg, packaged as the **Borg** desktop app (macOS, Windows, L
 
 ## Layout
 
-| Path                   | Purpose                                                         |
-| ---------------------- | --------------------------------------------------------------- |
+| Path                   | Purpose                                                          |
+| ---------------------- | ---------------------------------------------------------------- |
 | `electron/main.ts`     | Window creation, dev/prod loading, navigation and link hardening |
+| `electron/daemon.ts`   | Finding, probing, and starting `borgd`                           |
+| `electron/boot.ts`     | Boot status: one attempt, broadcast to windows, retryable        |
 | `electron/ipc.ts`      | Main-process gRPC channel; unary + server-stream forwarding      |
 | `electron/preload.ts`  | Context-bridge `BorgTransport` exposed as `window.borg`          |
 | `electron/channels.ts` | Shared IPC channel names and wire types                          |
@@ -22,6 +24,10 @@ renderer  ──IPC──▶  electron/main  ──gRPC over unix socket──�
 
 The renderer runs context-isolated with `nodeIntegration: false`, so it cannot open a socket itself. `ipc.ts` holds the real channel; `preload.ts` re-exposes it as a `BorgTransport`. Authentication is the socket's file permissions, so there is no sign-in screen.
 
+## Starting the daemon
+
+The window is a view onto `borgd`, so the shell brings `borgd` up rather than reporting its absence. On launch `daemon.ts` connects to `~/.borg/borgd.sock`; if nothing answers it resolves a `borgd` binary — `BORG_DAEMON_BIN`, then the packaged `Resources/bin`, then `target/debug` and `target/release` of a checkout, then `PATH` — and spawns it detached. Each step is published on `borg:native:boot:status`, and `<BootGate/>` in `@borg/app` renders the wait. A boot faster than 400 ms is never shown; a failed one offers **Try again** and **Look around anyway**.
+
 ## Scripts
 
 Beyond the workspace `just` targets:
@@ -31,6 +37,7 @@ Beyond the workspace `just` targets:
 | `bun run build`     | Renderer to `dist/`, main process to `dist-electron/` |
 | `bun run start`     | Build, then launch the production app                 |
 | `bun run typecheck` | `tsc --noEmit`                                        |
+| `bun run test`      | Vitest over the main-process modules (`electron/`)    |
 | `bun run dist`      | Installers via electron-builder into `release/`       |
 | `bun run pack`      | Unpacked build (`--dir`), for packaging smoke tests   |
 

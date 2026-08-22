@@ -29,6 +29,22 @@ export interface UpdateStatus {
   message?: string;
 }
 
+/**
+ * How far the native shell has got in bringing borgd up.
+ *
+ * Only the shell can know this: the daemon cannot report its own absence, and
+ * a surface that reaches it over the network never has to ask.
+ */
+export interface BootStatus {
+  state: "starting" | "ready" | "failed";
+  /** Plain language, shown as-is. Never a path, a command, or a code. */
+  message: string;
+  /** 0–1, monotonic within one attempt. */
+  progress: number;
+  /** True when trying again could plausibly work. */
+  canRetry: boolean;
+}
+
 export interface NativeBridge {
   /**
    * Menu items and global hotkeys arrive here as keybind action ids, so a
@@ -44,6 +60,12 @@ export interface NativeBridge {
   hideWindow(): void;
   /** Dock/taskbar badge. 0 clears it. */
   setBadgeCount(count: number): void;
+  boot: {
+    /** Pushes the current status at once, then every change. */
+    subscribe(handler: (status: BootStatus) => void): () => void;
+    /** Tries the failed boot again. */
+    retry(): void;
+  };
   updates: {
     subscribe(handler: (status: UpdateStatus) => void): () => void;
     check(): void;
@@ -63,6 +85,16 @@ export const NO_NATIVE: NativeBridge = {
   revealSession: noop,
   hideWindow: noop,
   setBadgeCount: noop,
+  // The browser did not start the daemon and cannot: it reached the gateway to
+  // load this page at all, so as far as this surface is concerned Borg is up.
+  // Reporting "ready" immediately is what keeps the boot screen desktop-only.
+  boot: {
+    subscribe: (handler) => {
+      handler({ state: "ready", message: "Ready", progress: 1, canRetry: false });
+      return noop;
+    },
+    retry: noop,
+  },
   updates: {
     subscribe: unsubscribe,
     check: noop,

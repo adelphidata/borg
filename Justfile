@@ -152,10 +152,11 @@ web-lint:
     bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
     bun run --filter '*' typecheck
 
-# Unit-test the shared TypeScript packages (Vitest)
+# Unit-test the TypeScript packages and the Electron main process (Vitest)
 web-test:
     bun run --cwd packages/ui test
     bun run --cwd packages/app test
+    bun run --cwd apps/desktop test
 
 # Build the browser SPA. Run before `cargo build` — borgd embeds apps/web/dist.
 web-build:

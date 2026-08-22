@@ -255,6 +255,11 @@ jobs:
         run: bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
       - name: Typecheck every package
         run: bun run --filter '*' typecheck
+      - name: Unit tests
+        run: |
+          bun run --cwd packages/ui test
+          bun run --cwd packages/app test
+          bun run --cwd apps/desktop test
       - name: Build browser SPA
         run: bun run --cwd apps/web build
       - name: Build desktop app

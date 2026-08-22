@@ -16,6 +16,7 @@ import { ConversationPage } from "./features/conversation/ConversationPage";
 import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
+import { BootGate } from "./features/boot/BootGate";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
 import { QuickEntryPage } from "./features/quick/QuickEntryPage";
 import {
@@ -288,9 +289,11 @@ export function BorgApp({ platform }: { platform: Platform }) {
   return (
     <PlatformProvider platform={platform}>
       <ThemeProvider>
-        <SettingsProvider>
-          <OnboardingGate platform={platform} />
-        </SettingsProvider>
+        <BootGate>
+          <SettingsProvider>
+            <OnboardingGate platform={platform} />
+          </SettingsProvider>
+        </BootGate>
       </ThemeProvider>
     </PlatformProvider>
   );

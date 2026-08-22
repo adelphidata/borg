@@ -59,6 +59,8 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
     if ((await save.run({ provider, apiKey, model })) === true) finish();
   };
 
+  const selected = PROVIDER_CATALOG.find((p) => p.name === provider);
+
   const steps = [
     () => (
       <>
@@ -101,15 +103,29 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
           ))}
         </div>
         {provider && needsApiKey(provider) && (
-          <input
-            autoFocus
-            type="password"
-            className="mt-4 w-full rounded-[9px] border border-line bg-surface2 px-3 py-2.5 text-[13px] text-ink outline-none select-text placeholder:text-ink3"
-            placeholder={`${PROVIDER_CATALOG.find((p) => p.name === provider)?.label} API key`}
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && apiKey.trim() !== "" && setStep(2)}
-          />
+          <>
+            <input
+              autoFocus
+              type="password"
+              className="mt-4 w-full rounded-[9px] border border-line bg-surface2 px-3 py-2.5 text-[13px] text-ink outline-none select-text placeholder:text-ink3"
+              placeholder={`${selected?.label} API key`}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && apiKey.trim() !== "" && setStep(2)}
+            />
+            {/* The one step of setup nobody can finish unaided: where the key
+                comes from. Opens in the system browser on both surfaces. */}
+            {selected?.keyUrl && (
+              <a
+                href={selected.keyUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2.5 inline-block text-[12.5px] leading-none text-ink3 no-underline hover:text-ink"
+              >
+                Get a {selected.label} key ↗
+              </a>
+            )}
+          </>
         )}
         {provider && !needsApiKey(provider) && (
           <p className="mt-4 mb-0 text-[12.5px] leading-[1.5] text-ink3">

@@ -6,6 +6,7 @@ import {
   CHANNELS,
   type StreamEvent,
   type UnaryReply,
+  type WireBootStatus,
   type WireNotification,
   type WireUpdateStatus,
 } from "./channels";
@@ -87,6 +88,18 @@ const native: NativeBridge = {
   },
   setBadgeCount: (count) => {
     void ipcRenderer.invoke(CHANNELS.setBadge, count);
+  },
+  boot: {
+    subscribe: (handler) => {
+      const detach = subscribe<WireBootStatus>(CHANNELS.bootStatus, handler);
+      // Replay whatever the shell has already decided: a window created after
+      // the daemon came up would otherwise never hear a thing.
+      void ipcRenderer.invoke(CHANNELS.bootRead).then((status: WireBootStatus) => handler(status));
+      return detach;
+    },
+    retry: () => {
+      void ipcRenderer.invoke(CHANNELS.bootRetry);
+    },
   },
   updates: {
     subscribe: (handler) => subscribe<WireUpdateStatus>(CHANNELS.updateStatus, handler),
