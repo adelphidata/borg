@@ -262,6 +262,35 @@ export function stampTurnDuration(cells: Cell[], elapsedMs: number): Cell[] {
   return [...cells, { kind: "usage", input: 0, output: 0, cacheRead: 0, cacheWrite: 0, elapsedMs }];
 }
 
+/**
+ * The message a retry may re-run, if any.
+ *
+ * A retry is only ever offered for a turn that produced *nothing*: the user's
+ * message is still the last thing in the transcript, so sending it again adds
+ * one turn where there were none. That narrowness is the whole point. Once the
+ * daemon has answered — even half a sentence, even only to report the error —
+ * it has already written the turn into the session's history, and a client-side
+ * "retry" would send the same message a second time. The transcript would look
+ * clean while the persisted conversation held the message twice, and the model
+ * would read both. Recovering *that* is a rewind or a resume, which is the
+ * daemon's job and not this button's.
+ *
+ * "Produced nothing" is read off client state, so it is strong evidence rather
+ * than proof: a send that failed *after* the daemon accepted the turn, on a
+ * connection too dead to deliver the events, still looks like this. That window
+ * is the residue. Closing it means asking the daemon what it has, which is the
+ * rewind this deliberately is not.
+ *
+ * Attachments also close the door: the transcript keeps their count, not their
+ * bytes, so a resend would carry none while the cell above went on claiming
+ * they were sent.
+ */
+export function retryTarget(cells: Cell[]): string | undefined {
+  const last = cells[cells.length - 1];
+  if (!last || last.kind !== "user" || last.attachments) return undefined;
+  return last.text;
+}
+
 /** One row of persisted history, as `Admin.GetSession` returns it. */
 export interface HistoryRow {
   role: string;
@@ -402,6 +431,11 @@ export interface Conversation {
    */
   streamOutageSustained: boolean;
   send: (text: string, attachments?: Attachment[]) => void;
+  /**
+   * Runs the last user message again, in place of the turn that failed on it.
+   * A no-op mid-turn, and when nothing has been sent yet.
+   */
+  retryLast: () => void;
   /** Mid-turn nudge. Only meaningful while `busy`. */
   steer: (text: string) => void;
   cancel: () => void;
@@ -563,13 +597,21 @@ export function useConversation(target: string | undefined): Conversation {
   const send = useCallback(
     // `startedAt` lets a caller that had work to do first — the rewind an
     // edit-and-resend waits on — bill that wait to the turn the user is
-    // watching. The public signature takes two arguments; the third is internal.
-    (text: string, attachments: Attachment[] = [], startedAt: number = Date.now()) => {
+    // watching. `echo` is how a retry re-runs a turn whose user cell is already
+    // on screen, without printing the same message twice. The public signature
+    // takes two arguments; the rest are internal.
+    (
+      text: string,
+      attachments: Attachment[] = [],
+      startedAt: number = Date.now(),
+      echo: boolean = true,
+    ) => {
       if (!sessionId) return;
-      setCells((prev) => [
-        ...prev,
-        { kind: "user", text, attachments: attachments.length || undefined, at: startedAt },
-      ]);
+      if (echo)
+        setCells((prev) => [
+          ...prev,
+          { kind: "user", text, attachments: attachments.length || undefined, at: startedAt },
+        ]);
       setBusy(true);
       setSendError(undefined);
       startTurnClock(startedAt);
@@ -588,6 +630,22 @@ export function useConversation(target: string | undefined): Conversation {
     },
     [borg, sessionId, startTurnClock, stopTurnClock],
   );
+
+  /**
+   * Sends the last message again, when nothing came back the first time.
+   *
+   * `retryTarget` decides whether there is anything safe to re-run; see it for
+   * why "nothing came back" is the only case. The user's cell is already on
+   * screen and is not echoed again — they wrote the message once, and a retry
+   * is the same message, not a new one.
+   */
+  const retryLast = useCallback(() => {
+    if (busy || !sessionId) return;
+    const text = retryTarget(cells);
+    if (text === undefined) return;
+    setSendError(undefined);
+    send(text, [], Date.now(), false);
+  }, [busy, cells, send, sessionId]);
 
   const steerMutation = useMutation((borg, text: string) =>
     sessionId ? borg.session.steer({ sessionId, text }) : Promise.resolve(undefined),
@@ -734,6 +792,7 @@ export function useConversation(target: string | undefined): Conversation {
     streamError,
     streamOutageSustained: state.sustained,
     send,
+    retryLast,
     steer,
     cancel,
     respond,

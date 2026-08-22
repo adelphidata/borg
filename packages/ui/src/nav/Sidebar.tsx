@@ -35,6 +35,12 @@ export interface SidebarProps {
   collapsed?: boolean;
   /** Toggles `collapsed`. Omit and the sidebar has no collapse control. */
   onToggleCollapsed?: () => void;
+  /**
+   * How many conversations have replied unseen. Read only while collapsed: the
+   * expanded list already marks its own rows, and a second count beside them
+   * would be the same news twice.
+   */
+  unreadCount?: number;
 }
 
 function NavItem({ route }: { route: AppRoute }) {
@@ -160,18 +166,40 @@ export function Sidebar({
   user,
   collapsed = false,
   onToggleCollapsed,
+  unreadCount = 0,
 }: SidebarProps) {
+  // A collapsed rail hides the rows that carry the unread dots, so a reply that
+  // lands while it is narrow arrives in silence. The count rides the one control
+  // still on screen — the way back — so opening the sidebar is both the answer
+  // to "what did I miss" and the thing the badge is pointing at.
+  const badge = collapsed && unreadCount > 0;
   // The way back has to live on the rail itself. A collapsed sidebar whose only
   // reopen is a shortcut is a sidebar the user has lost.
   const toggle = onToggleCollapsed && (
     <button
       type="button"
-      aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+      aria-label={
+        collapsed
+          ? badge
+            ? `Expand sidebar, ${unreadCount} unread`
+            : "Expand sidebar"
+          : "Collapse sidebar"
+      }
       aria-expanded={!collapsed}
       onClick={onToggleCollapsed}
-      className="flex-none cursor-pointer rounded border-0 bg-transparent p-1 text-ink3 hover:text-ink"
+      className="relative flex-none cursor-pointer rounded border-0 bg-transparent p-1 text-ink3 hover:text-ink"
     >
       <ChevronIcon size={14} className={collapsed ? "" : "rotate-180"} />
+      {badge && (
+        // A number, not a dot: "there are replies" is what a dot says, and the
+        // rail already has no way to tell the user how many are waiting.
+        <span
+          aria-hidden
+          className="absolute -top-1 -right-1 flex h-[15px] min-w-[15px] items-center justify-center rounded-full bg-alert px-1 text-[9.5px] leading-none font-semibold text-surface"
+        >
+          {unreadCount > 9 ? "9+" : unreadCount}
+        </span>
+      )}
     </button>
   );
 

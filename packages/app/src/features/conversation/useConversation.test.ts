@@ -4,6 +4,7 @@ import {
   contextUsed,
   historyCells,
   reduceEvent,
+  retryTarget,
   stampTurnDuration,
   type Cell,
 } from "./useConversation";
@@ -342,5 +343,44 @@ describe("contextUsed", () => {
 
   it("is zero when every component itemizes a parent", () => {
     expect(contextUsed([{ tokens: 500, detail: true }])).toBe(0);
+  });
+});
+
+describe("retryTarget", () => {
+  const user = (text: string): Cell => ({ kind: "user", text, at: 0 });
+
+  it("re-runs the message when the send never reached the daemon", () => {
+    // The whole retryable shape: the user's message is still the last thing in
+    // the transcript, so nothing came back and nothing was persisted.
+    const cells: Cell[] = [user("first"), { kind: "assistant", text: "ok", at: 1 }, user("second")];
+    expect(retryTarget(cells)).toBe("second");
+  });
+
+  it("refuses once the daemon has answered, even to report the failure", () => {
+    // The daemon writes a turn into session history as it runs it. Re-sending
+    // the same text from here would put the message in that history twice — the
+    // transcript would look clean while the model read it twice over. Undoing
+    // that is a rewind, not this button.
+    const cells: Cell[] = [user("do the thing"), { kind: "error", text: "429 rate limit", at: 2 }];
+    expect(retryTarget(cells)).toBeUndefined();
+  });
+
+  it("refuses when the turn got as far as a partial reply", () => {
+    const cells: Cell[] = [user("do the thing"), { kind: "assistant", text: "half a rep", at: 1 }];
+    expect(retryTarget(cells)).toBeUndefined();
+  });
+
+  it("refuses to resend a message that carried attachments", () => {
+    // The transcript keeps the count, never the bytes. A resend would carry no
+    // files while the cell above went on claiming it sent two.
+    const cells: Cell[] = [{ kind: "user", text: "look at these", attachments: 2, at: 0 }];
+    expect(retryTarget(cells)).toBeUndefined();
+  });
+
+  it("has nothing to re-run when the user never spoke", () => {
+    // A session that failed on resume: the error is real, but a retry would
+    // have no message to send.
+    expect(retryTarget([{ kind: "error", text: "boom", at: 0 }])).toBeUndefined();
+    expect(retryTarget([])).toBeUndefined();
   });
 });

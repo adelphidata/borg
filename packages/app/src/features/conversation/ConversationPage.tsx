@@ -18,7 +18,7 @@ import { ToolRunCell } from "./cells/ToolRunCell";
 import { TranscriptCell } from "./cells";
 import { groupCells } from "./cells/toolRuns";
 import { INITIAL_BUDGET, budgetCutIndex, cutHidesEverything, revealEarlier } from "./renderBudget";
-import { describeSendFailure } from "./sendFailure";
+import { FailureCard } from "./FailureCard";
 import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
@@ -42,6 +42,7 @@ export function ConversationPage() {
     streamError,
     streamOutageSustained,
     send,
+    retryLast,
     steer,
     cancel,
     respond,
@@ -264,11 +265,9 @@ export function ConversationPage() {
                       )}
                     </div>
                   )}
-                  {sendError && (
-                    <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2">
-                      {describeSendFailure(sendError)}
-                    </div>
-                  )}
+                  {/* The live slot, so this card speaks: it reports what just
+                      happened, unlike the settled failures further up. */}
+                  <FailureCard error={sendError} onRetry={busy ? undefined : retryLast} live />
                 </>
               )}
             </DaemonState>

@@ -103,13 +103,21 @@ function Shell({ platform }: { platform: Platform }) {
   // mark is compared against the listing's own figures, and this list only
   // re-reads those on navigation.
   useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
-  const recents = (sessions.state === "ready" ? sessions.data.sessions : [])
-    .slice(0, 8)
-    .map((s) => ({
-      id: s.id,
-      title: rowTitle(s.title, Number(s.messageCount), s.id),
-      activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
-    }));
+  const listed = (sessions.state === "ready" ? sessions.data.sessions : []).map((s) => ({
+    id: s.id,
+    title: rowTitle(s.title, Number(s.messageCount), s.id),
+    activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
+  }));
+  const recents = listed.slice(0, 8);
+
+  // Counted over the whole listing rather than the eight rows above: the badge
+  // exists for the collapsed rail, where no row is on screen at all, and a
+  // ninth conversation replying is exactly the case nothing else would show.
+  //
+  // A session mid-turn is not counted. `sessionActivity` calls that "working",
+  // and a reply that has not finished arriving is not yet something the user
+  // has missed — it becomes unread when it lands.
+  const unreadCount = listed.filter((r) => r.activity === "unread").length;
 
   // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`
   // brings a conversation back. The daemon also closes the session if it is
@@ -188,6 +196,7 @@ function Shell({ platform }: { platform: Platform }) {
             user={user}
             collapsed={sidebarCollapsed}
             onToggleCollapsed={toggleSidebar}
+            unreadCount={unreadCount}
           />
         )}
         <Menu

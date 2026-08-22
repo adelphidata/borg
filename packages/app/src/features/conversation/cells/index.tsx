@@ -2,6 +2,7 @@ import { memo, useState } from "react";
 import { Brackets, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
 import { classifyStatus } from "../../agents/useAgentTree";
+import { FailureCard } from "../FailureCard";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
 import { formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
@@ -247,12 +248,12 @@ function renderCell(
       return <SubAgentCell cell={cell} />;
     case "notice":
       return <div className="text-center text-[11.5px] leading-[1.5] text-ink3">{cell.text}</div>;
+    // No retry here, deliberately. A turn the daemon reported an error for is a
+    // turn it has already written into the session's history, so re-sending the
+    // message from the client would duplicate it there. The card explains and
+    // hands back the raw text; re-running it is the composer's job.
     case "error":
-      return (
-        <div className="rounded-xl border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.5] text-ink2 select-text">
-          {cell.text}
-        </div>
-      );
+      return <FailureCard error={{ message: cell.text }} />;
     case "shell-confirm":
       return <ShellConfirmCell cell={cell} respond={respond} />;
     case "input-request":
