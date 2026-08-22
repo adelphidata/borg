@@ -5,7 +5,7 @@
 //! file grows unbounded between explicit checkpoints. This module owns
 //! that call.
 //!
-//! The maintenance sweep runs `wal_checkpoint(TRUNCATE)` every time
+//! The maintenance sweep runs `wal_checkpoint(PASSIVE)` every time
 //! (cheap when the WAL is small). Full `VACUUM` is gated behind both an
 //! interval (`maintenance.vacuum_interval_days`) and a fragmentation
 //! signal (>15% of pages on the freelist or >64 MB freelist) — VACUUM
@@ -15,6 +15,24 @@
 use anyhow::{Context, Result};
 
 use super::Database;
+
+/// The only checkpoint mode this process may run against `~/.borg/borg.db`.
+///
+/// `TRUNCATE` (and `RESTART`) take the exclusive checkpoint lock and reset the
+/// WAL. `~/.borg/borg.db` is shared: `borgd` holds a long-lived writer while
+/// every `borg` CLI invocation — from any worktree — opens its own handle and
+/// may run a sweep. A transient opener resetting the WAL under the live writer
+/// is a documented route to btree-page damage concentrated on the hottest
+/// tables, which reads as disk failure and is not.
+///
+/// `PASSIVE` never resets or truncates the WAL and never takes that lock, so it
+/// cannot lose the race; it simply copies whatever frames it can and returns.
+/// The WAL stays bounded by [`crate::db::JOURNAL_SIZE_LIMIT_PRAGMA`] instead.
+///
+/// `TRUNCATE` is correct only on a sole-opener, quiescent connection (offline
+/// maintenance). We do not try to detect that — PASSIVE is the safe default,
+/// and the cost of being wrong in the other direction is only disk slack.
+const WAL_CHECKPOINT_PRAGMA: &str = "PRAGMA wal_checkpoint(PASSIVE)";
 
 /// Meta key storing unix-seconds of the last full VACUUM.
 pub(crate) const META_LAST_VACUUM_AT: &str = "maintenance.last_vacuum_at";
@@ -48,6 +66,20 @@ pub struct WalVacuumOutcome {
     /// - `-1` → VACUUM ran but post-measure failed; metric unavailable.
     /// - When `vacuum_ran=false`, this field is `0` and meaningless.
     pub vacuum_bytes_reclaimed: i64,
+}
+
+/// Run one [`WAL_CHECKPOINT_PRAGMA`] and return the pages it checkpointed.
+///
+/// `wal_checkpoint` answers with `(busy, log_pages, checkpointed_pages)`; the
+/// third column is the count we report. The row is read (and the cursor
+/// dropped) here so no caller has to remember that a pragma returning a result
+/// set must be drained before the next statement takes a lock.
+async fn checkpoint(db: &Database) -> Result<i64> {
+    let mut rows = db.conn().query(WAL_CHECKPOINT_PRAGMA, ()).await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<i64>(2)?),
+        None => Ok(0),
+    }
 }
 
 /// Read `(freelist_count, page_count, page_size)` for fragmentation gating.
@@ -109,24 +141,16 @@ pub(crate) fn should_vacuum(
 pub async fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVacuumOutcome {
     let mut outcome = WalVacuumOutcome::default();
 
-    // 1. Always: WAL checkpoint (TRUNCATE). Returns three integers:
-    //    busy (0/1), log_pages, checkpointed_pages. We surface
-    //    checkpointed_pages as the reclaimed count.
-    let checkpoint_result: Result<i64> = async {
-        let mut rows = db
-            .conn()
-            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
-            .await?;
-        match rows.next().await? {
-            Some(row) => Ok(row.get::<i64>(2)?),
-            None => Ok(0),
-        }
-    }
-    .await;
-    match checkpoint_result {
+    // 1. Always: WAL checkpoint (PASSIVE — see WAL_CHECKPOINT_PRAGMA).
+    //    Returns three integers: busy (0/1), log_pages, checkpointed_pages.
+    //    We surface checkpointed_pages as the reclaimed count. A PASSIVE
+    //    checkpoint that loses the race to a live writer reports busy=1 and
+    //    checkpoints fewer pages — that is the intended graceful outcome,
+    //    not an error, so it is not distinguished here.
+    match checkpoint(db).await {
         Ok(pages) => outcome.wal_checkpoint_pages_reclaimed = pages,
         Err(e) => {
-            tracing::warn!("maintenance: wal_checkpoint(TRUNCATE) failed: {e}");
+            tracing::warn!("maintenance: {WAL_CHECKPOINT_PRAGMA} failed: {e}");
             outcome.wal_checkpoint_pages_reclaimed = -1;
         }
     }
@@ -179,6 +203,19 @@ pub async fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> 
         return outcome;
     }
     outcome.vacuum_ran = true;
+
+    // VACUUM rewrites every page in the database, and on a WAL connection
+    // every one of those pages goes through the WAL. Checkpointing only
+    // *before* VACUUM therefore does nothing about the slack VACUUM itself
+    // creates: without this second pass the sweep can report bytes reclaimed
+    // while the `-wal` file has grown to the size of the whole database.
+    // Best-effort, same as the first pass — this is housekeeping. Uses the
+    // same query-and-drain form as the pre-VACUUM pass: `wal_checkpoint`
+    // returns a row, and leaving that cursor un-finalized is its own class of
+    // bug. Two forms for one pragma is how they drift apart.
+    if let Err(e) = checkpoint(db).await {
+        tracing::warn!("maintenance: post-VACUUM {WAL_CHECKPOINT_PRAGMA} failed: {e}");
+    }
 
     // Re-measure to compute reclaimed bytes. If this read fails, we still
     // mark vacuum_ran=true (the operation succeeded) but use `-1` to

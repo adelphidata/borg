@@ -300,6 +300,21 @@ pub(crate) const SYNCHRONOUS_PRAGMA: &str = if cfg!(target_os = "macos") {
     "PRAGMA synchronous=NORMAL;"
 };
 
+/// Upper bound (bytes) on the `-wal` file once a checkpoint truncates it.
+///
+/// SQLite's default is `-1` — unlimited. Without a limit the WAL is reused in
+/// place after every checkpoint and permanently keeps the high-water mark of
+/// the largest transaction ever run, so a single `VACUUM` on a multi-GB
+/// `~/.borg/borg.db` leaves a multi-GB `borg.db-wal` behind for good.
+///
+/// This is also what makes [`crate::db::wal`]'s `wal_checkpoint(PASSIVE)` safe:
+/// PASSIVE deliberately never resets the WAL, so the size bound has to come
+/// from somewhere else, and `journal_size_limit` is the mechanism that supplies
+/// it without taking the exclusive checkpoint lock. 64 MiB is large enough that
+/// ordinary write bursts never pay a truncate, small enough that the slack is
+/// bounded.
+pub(crate) const JOURNAL_SIZE_LIMIT_PRAGMA: &str = "PRAGMA journal_size_limit=67108864;";
+
 /// Process-global record of the most recent automatic DB recovery. Lets the
 /// boot path and `doctor` surface the event to the user without threading a
 /// return value through the ~40 `Database::open()` call sites. One-shot:
@@ -905,6 +920,27 @@ impl Database {
         conn.execute_batch(SYNCHRONOUS_PRAGMA)
             .await
             .with_context(|| format!("set {SYNCHRONOUS_PRAGMA}"))?;
+        // Bound the WAL's high-water mark on every connection. Best-effort:
+        // a filesystem that refuses the pragma costs disk slack, and slack
+        // must never stop the DB from opening. `journal_size_limit` reports
+        // the limit in effect, so the cursor is drained before the next
+        // statement takes a lock (an open cursor blocks the migration COMMIT).
+        match conn.query(JOURNAL_SIZE_LIMIT_PRAGMA, ()).await {
+            Ok(mut rows) => loop {
+                match rows.next().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    // Bailing here leaves the cursor un-finalized, which is the
+                    // very thing that blocks the migration COMMIT below. Say so
+                    // rather than exiting the loop silently.
+                    Err(e) => {
+                        tracing::warn!("db: draining journal_size_limit result failed: {e}");
+                        break;
+                    }
+                }
+            },
+            Err(e) => tracing::warn!("db: set journal_size_limit failed: {e}"),
+        }
         // Durability barrier at WAL checkpoints on macOS. A plain `fsync()`
         // there does NOT guarantee writes reach stable storage or stay
         // ordered — Apple documents `F_FULLFSYNC` as the only call that does.

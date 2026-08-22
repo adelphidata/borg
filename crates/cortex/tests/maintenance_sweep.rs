@@ -374,3 +374,104 @@ async fn disabled_returns_skipped_report_no_mutations() {
         before, after
     );
 }
+
+/// `journal_size_limit` must be a finite, positive bound on every connection.
+///
+/// SQLite's default is `-1` (unlimited): the WAL is reused in place after a
+/// checkpoint and permanently keeps the high-water mark of the largest
+/// transaction ever run. That default is also what makes the sweep's move to a
+/// `PASSIVE` checkpoint safe — PASSIVE deliberately never resets the WAL, so
+/// this limit is the only thing bounding its size. Drop the pragma and this
+/// test reads back `-1`.
+#[tokio::test]
+async fn every_connection_bounds_the_wal_with_a_finite_journal_size_limit() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let db = Database::open().await.expect("open db");
+
+    let limit = scalar_i64(&db, "PRAGMA journal_size_limit").await;
+
+    assert!(
+        limit > 0,
+        "journal_size_limit must be a finite positive bound, got {limit} \
+         (-1 means unlimited: the WAL would keep its high-water mark forever)"
+    );
+}
+
+/// The sweep must leave the `-wal` file bounded after one transaction far
+/// larger than the limit.
+///
+/// The write has to be a *single* transaction. Many small commits never grow
+/// the WAL — SQLite's automatic checkpoint resets it every ~1000 pages, so a
+/// loop of small inserts passes whatever the limit is and proves nothing. One
+/// big transaction cannot be checkpointed part-way, so the WAL reaches the
+/// transaction's full size and the limit is the only thing that brings it back
+/// down. This is the shape `VACUUM` has, which is the case the fix exists for.
+///
+/// Fails if `journal_size_limit` is unset: an unbounded WAL is reset after the
+/// commit but never truncated, so the file keeps its high-water mark.
+#[tokio::test]
+async fn the_sweep_leaves_the_wal_bounded_after_one_large_transaction() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = isolated_data_dir();
+    let db = Database::open().await.expect("open db");
+
+    // Fixed ceiling, deliberately NOT read back from `PRAGMA
+    // journal_size_limit`: deriving it from the value under test would make
+    // the assertion pass for any limit, including the unlimited `-1` default.
+    // Sits above the 64 MiB limit (so a bounded WAL passes with slack) and
+    // below the transaction size (so an unbounded one fails).
+    const WAL_CEILING_BYTES: u64 = 96 * 1024 * 1024;
+
+    // ~256 KiB per row × 512 rows = ~128 MiB in one transaction: comfortably
+    // past the ceiling, while keeping the temp-disk footprint modest enough
+    // for a CI runner with a small /tmp.
+    let blob = vec![7u8; 256 * 1024];
+    db.conn()
+        .execute("BEGIN", libsql::params![])
+        .await
+        .expect("begin");
+    for i in 0..512 {
+        db.cache_embedding(
+            "openai",
+            "text-embedding-3-small",
+            &format!("wal-burst-{i}"),
+            &blob,
+            4,
+        )
+        .await
+        .expect("cache embedding");
+    }
+    db.conn()
+        .execute("COMMIT", libsql::params![])
+        .await
+        .expect("commit");
+
+    let wal_at_peak = fs::metadata(tmp.path().join("borg.db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        wal_at_peak > WAL_CEILING_BYTES,
+        "precondition: the transaction must push the WAL past the ceiling for \
+         this test to mean anything, but it only reached {wal_at_peak} bytes"
+    );
+
+    run_daily_maintenance(&db, &Config::default())
+        .await
+        .expect("sweep ok");
+
+    let wal_len = fs::metadata(tmp.path().join("borg.db-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    assert!(
+        wal_len <= WAL_CEILING_BYTES,
+        "WAL is {wal_len} bytes after the sweep, above the \
+         {WAL_CEILING_BYTES}-byte ceiling — journal_size_limit is not \
+         bounding it"
+    );
+}

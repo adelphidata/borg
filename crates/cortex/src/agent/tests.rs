@@ -2261,6 +2261,77 @@ async fn tool_output_truncation_clamps_to_model_context_window() {
     );
 }
 
+/// Both branches of the tool-result spill.
+///
+/// Driven through `truncate_redact_and_spill`, which takes the spill directory
+/// as an argument. The env-reading wrapper is deliberately not used: setting
+/// `BORG_HOME` here would race every other test in this binary that *reads*
+/// it, which a mutex cannot fix because the readers do not take one.
+///
+/// Truncation destroys the omitted middle — the model's only route back to it
+/// is re-running the tool, which costs another call and is unsafe for a tool
+/// that is not idempotent. `run_shell` spills its own streams; this is the
+/// conversation-level cap covering every other tool, MCP results above all.
+#[tokio::test]
+async fn tool_results_spill_to_disk_only_when_they_overflow_the_cap() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spill_dir = tmp.path().join("tool-spill");
+
+    // ── Under the cap: nothing was lost, so nothing is written. A file here
+    // would be pure garbage accumulation in the cache dir.
+    let fits_agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    assert_eq!(
+        fits_agent.truncate_redact_and_spill("a short result", Some(&spill_dir)),
+        "a short result"
+    );
+    assert!(
+        !spill_dir.exists(),
+        "an under-cap result must not create the spill directory"
+    );
+
+    // ── Over the cap: the result names a file, and that file holds the whole
+    // output. The marker sits only in the middle, so finding it in the spill
+    // proves the file is the full text and not a copy of the head+tail the
+    // model already got.
+    let mut config = Config::default();
+    config.conversation.tool_output_max_tokens = 10;
+    let agent = Agent::new(config, BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+
+    let raw = format!(
+        "{}MIDDLE_MARKER{}",
+        "abcd ".repeat(400),
+        "efgh ".repeat(400)
+    );
+    let out = agent.truncate_redact_and_spill(&raw, Some(&spill_dir));
+
+    assert!(
+        !out.contains("MIDDLE_MARKER"),
+        "precondition: the marker must fall in the truncated-away middle"
+    );
+
+    let path = out
+        .split("saved to ")
+        .nth(1)
+        .and_then(|tail| tail.split(';').next())
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("over-cap result must name a spill file, got: {out}"));
+
+    let spilled = std::fs::read_to_string(path).expect("spill file must be readable");
+    assert!(
+        spilled.contains("MIDDLE_MARKER"),
+        "the spill must hold the bytes truncation dropped"
+    );
+    assert_eq!(
+        spilled.len(),
+        raw.len(),
+        "the spill must hold the whole result, not the truncated copy"
+    );
+}
+
 // ── session storage exhaustion ────────────────────────────────────────────
 
 /// Build a test agent whose DB is a file-backed database with a page budget

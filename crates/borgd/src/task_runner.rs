@@ -536,6 +536,12 @@ pub(crate) async fn run_pre_run_command(
 /// prompt as `<preprocessed_context>` and persisted with the session. A
 /// pre-run command that echoes its own auth headers (or any token) must not
 /// hand the raw value to the model or the transcript.
+///
+/// Unconditional, and deliberately *not* routed through `RedactionPolicy`:
+/// this is an input-side mask feeding the model, so the operator's
+/// output-redaction toggle must not be able to switch it off. The task's own
+/// output is a genuine output sink and does go through the policy — see
+/// `execute_command_task`.
 fn redact_capture(s: &str) -> String {
     cortex::security::secrets::redact_secrets(s)
 }
@@ -788,6 +794,29 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             } else {
                 format!("{stdout}\n[stderr]\n{stderr}")
             };
+            // Redact once, here, before `combined` is used for anything. It
+            // has three consumers — the `task_runs.result` row and the two
+            // `deliver_task_result` calls below — and the delivery path calls
+            // the Telegram/Slack/Discord clients directly, so it never reaches
+            // the channel-layer redaction chokepoint that covers interactive
+            // replies. A scheduled command that prints a token would otherwise
+            // hand the raw value straight to a chat channel.
+            //
+            // Routed through `RedactionPolicy::apply` rather than
+            // `redact_secrets` so this lane honors the operator toggle and
+            // writes the same `redaction_audit` rows as every other sink.
+            //
+            // The sink is the delivery channel only when delivery will really
+            // happen — both a channel *and* a target. With a channel but no
+            // target the output is merely persisted, so labelling the audit
+            // row `channel:<name>` would claim a send that never occurred.
+            let sink = match (delivery_channel.as_deref(), delivery_target) {
+                (Some(channel), Some(_)) => cortex::output_redaction::OutputSink::Channel(channel),
+                _ => cortex::output_redaction::OutputSink::Log,
+            };
+            let combined = cortex::output_redaction::current_policy()
+                .apply(sink, Some(task_id.as_str()), &combined)
+                .into_owned();
 
             if output.status.success() {
                 match cortex::db::Database::open().await {

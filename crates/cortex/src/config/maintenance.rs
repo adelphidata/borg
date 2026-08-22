@@ -31,7 +31,7 @@ pub struct MaintenanceConfig {
     /// than disappear forever.
     pub security_squelch_ttl_days: u32,
     /// Minimum days between full `VACUUM` rewrites of the SQLite database.
-    /// The maintenance sweep runs `wal_checkpoint(TRUNCATE)` every time;
+    /// The maintenance sweep runs `wal_checkpoint(PASSIVE)` every time;
     /// full VACUUM is gated behind both an interval *and* a fragmentation
     /// signal so we don't lock the DB unnecessarily.
     pub vacuum_interval_days: u32,

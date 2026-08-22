@@ -120,7 +120,7 @@ pub struct MaintenanceReport {
     pub skipped: bool,
     /// Pages reclaimed by the WAL checkpoint that runs every sweep.
     /// `-1` when the checkpoint failed; any non-negative value is a
-    /// real reclamation count from `PRAGMA wal_checkpoint(TRUNCATE)`.
+    /// real reclamation count from `PRAGMA wal_checkpoint(PASSIVE)`.
     #[serde(default)]
     pub wal_checkpoint_pages_reclaimed: i64,
     /// True when the conditional full `VACUUM` ran this sweep.

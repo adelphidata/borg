@@ -196,7 +196,8 @@ impl Agent {
         }
     }
 
-    /// Truncate and optionally redact secrets from raw tool output.
+    /// Truncate and optionally redact secrets from raw tool output, spilling
+    /// the full text to disk when it does not fit.
     ///
     /// The configured `tool_output_max_tokens` (default 10k) is a fixed ceiling
     /// that ignores the model — on a small-context model a single 10k-token
@@ -204,7 +205,36 @@ impl Agent {
     /// clamp the per-result cap to a quarter of the active context window so
     /// one result can never dominate, while large-context models keep the
     /// configured ceiling unchanged.
+    ///
+    /// Truncation alone destroys the omitted middle: the model's only route
+    /// back to it is re-running the tool, which costs another call and is not
+    /// safe for a tool that is not idempotent. `run_shell` already spills its
+    /// own streams; this covers every *other* tool, MCP results above all,
+    /// where a server returning an un-paginated payload otherwise loses
+    /// everything past the cap with no way to recover it.
+    ///
+    /// Redaction runs before truncation now, not after, so the file on disk
+    /// gets the same secret hygiene as the text handed to the model. The cost
+    /// is that the regex pass scans the whole result rather than the ~40 KB
+    /// that survived truncation. That is accepted deliberately: the spill is
+    /// bounded by `SPILL_KEEP_MAX_BYTES`, and writing an unredacted secret to
+    /// a file that lives for 24h is the worse trade.
     pub(super) fn truncate_and_redact(&self, raw: &str) -> String {
+        self.truncate_redact_and_spill(raw, spill_dir().as_deref())
+    }
+
+    /// [`Self::truncate_and_redact`] with the spill directory supplied rather
+    /// than resolved from `BORG_HOME`.
+    ///
+    /// The directory is the one input that would otherwise force a test to
+    /// mutate process-global env, which races every other test in the binary
+    /// that *reads* `BORG_HOME`. Passing it in keeps the cap, redaction and
+    /// spill wiring testable against a tempdir with no env involved.
+    pub(super) fn truncate_redact_and_spill(
+        &self,
+        raw: &str,
+        spill_dir: Option<&std::path::Path>,
+    ) -> String {
         let configured = self.config.conversation.tool_output_max_tokens;
         let window_cap = (self.active_context_window() as usize / 4).max(256);
         let effective = configured.min(window_cap);
@@ -220,7 +250,15 @@ impl Agent {
                 "tool output cap clamped to model context window"
             );
         }
-        self.maybe_redact(truncate_output(raw, effective))
+        let redacted = self.maybe_redact(raw.to_string());
+        let truncated = truncate_output(&redacted, effective);
+        if truncated.len() >= redacted.len() {
+            // Fit the cap — nothing was dropped, so there is nothing to
+            // recover and no reason to touch the disk.
+            return truncated;
+        }
+        let spilled = spill_dir.and_then(|dir| spill_tool_result(dir, &redacted));
+        compose_spilled_result(truncated, redacted.len(), spilled)
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.
@@ -300,6 +338,93 @@ impl Agent {
             return;
         }
         self.history.extend(msgs);
+    }
+}
+
+/// Filename prefix for conversation-level tool spills. Distinct from
+/// `run_shell`'s so the two reapers never delete each other's files.
+const TOOL_SPILL_PREFIX: &str = "tool-spill";
+
+/// Attach the recovery pointer to a truncated result.
+///
+/// `spilled` is `None` when the spill could not be written, in which case the
+/// truncated text stands alone — naming a file that does not exist would send
+/// the model to read a path that errors, which is worse than saying nothing.
+///
+/// Split out from [`Agent::truncate_and_redact`] so the wording and the
+/// no-spill fallback are testable without touching the filesystem or the
+/// process-global `BORG_HOME`.
+fn compose_spilled_result(
+    truncated: String,
+    full_len: usize,
+    spilled: Option<std::path::PathBuf>,
+) -> String {
+    match spilled {
+        Some(path) => format!(
+            "{truncated}\n\n[full result ({full_len} bytes) saved to {}; read or grep that file \
+             instead of re-running the tool]",
+            path.display()
+        ),
+        None => truncated,
+    }
+}
+
+#[cfg(test)]
+mod spill_compose_tests {
+    use super::compose_spilled_result;
+
+    /// A failed spill must leave the truncated text exactly as it was.
+    /// Appending a pointer to a file that was never written would send the
+    /// model to read a path that errors — worse than saying nothing, because
+    /// it costs a tool call to discover.
+    #[test]
+    fn a_failed_spill_adds_no_pointer() {
+        let out = compose_spilled_result("head…tail".to_string(), 9_999, None);
+        assert_eq!(out, "head…tail");
+    }
+
+    /// The pointer must carry both halves the model needs: where the file is,
+    /// and that reading it beats re-running the tool.
+    #[test]
+    fn a_written_spill_names_the_path_and_the_recovery_action() {
+        let out = compose_spilled_result(
+            "head…tail".to_string(),
+            9_999,
+            Some(std::path::PathBuf::from("/tmp/tool-spill-1-2-result.txt")),
+        );
+        assert!(out.starts_with("head…tail"), "must keep the truncated text");
+        assert!(
+            out.contains("/tmp/tool-spill-1-2-result.txt"),
+            "must name the path: {out}"
+        );
+        assert!(
+            out.contains("9999 bytes"),
+            "must state the full size: {out}"
+        );
+        assert!(
+            out.contains("instead of re-running the tool"),
+            "must name the recovery action: {out}"
+        );
+    }
+}
+
+/// `<data_dir>/cache/tool-spill/`. `None` (with a warn) when the data dir
+/// cannot be resolved — the result is still delivered truncated.
+fn spill_dir() -> Option<std::path::PathBuf> {
+    crate::util::spill::spill_dir(TOOL_SPILL_PREFIX, "tool result")
+}
+
+/// Write an over-cap tool result (already redacted) into `dir` and return its
+/// path. `None` on any failure — the result is still delivered truncated, so a
+/// full disk degrades the model's recovery options rather than failing the
+/// tool call.
+fn spill_tool_result(dir: &std::path::Path, redacted: &str) -> Option<std::path::PathBuf> {
+    match crate::util::spill::write_spill_file(dir, TOOL_SPILL_PREFIX, "result", redacted) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            warn!(error = %e, "tool result spill write failed; returning truncated output only");
+            None
+        }
     }
 }
 

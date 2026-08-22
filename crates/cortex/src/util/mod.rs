@@ -12,6 +12,8 @@ pub mod panic_utils;
 pub(crate) mod process_tree;
 /// Retry utilities with exponential backoff.
 pub mod retry;
+/// Disk overflow for tool output too large to put in the conversation.
+pub(crate) mod spill;
 /// Wall-clock helpers.
 pub mod time;
 /// Text truncation with head+tail preservation.

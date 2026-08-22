@@ -53,6 +53,15 @@ const CHOKEPOINTS: &[Chokepoint] = &[
     },
 ];
 
+// `crates/borgd/src/task_runner.rs` is deliberately NOT listed here even
+// though it redacts scheduled-task output before persisting and delivering it.
+// The file also holds `redact_capture`, an *input*-side redaction that masks
+// pre-run stdout before it is injected into the prompt — that one must run
+// whatever the operator's output toggle says, so the "no raw redact_secrets()"
+// rule below cannot apply to this file. Its coverage is behavioral instead:
+// `crates/borgd/tests/task_output_redaction_e2e.rs` runs a real scheduled
+// command that prints a token and asserts the stored row is masked.
+
 fn workspace_root() -> PathBuf {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     here.parent()

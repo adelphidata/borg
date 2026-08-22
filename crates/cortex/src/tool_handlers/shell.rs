@@ -42,13 +42,10 @@ struct HeadTailBuffer {
 }
 
 /// Upper bound on the in-memory full copy retained for the spill file. Beyond
-/// this the spill keeps only the first `SPILL_KEEP_MAX_BYTES` — bounded memory
-/// stays the invariant; the recovery file is best-effort past it.
-const SPILL_KEEP_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-/// Spill files older than this are deleted (best-effort) whenever a new one
-/// is written. They are re-derivable scratch, not records.
-const SPILL_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// this the buffer keeps only the first `SPILL_KEEP_MAX_BYTES` — bounded memory
+/// stays the invariant; the recovery file is best-effort past it. Shared with
+/// every other spill writer so one oversized result cannot fill the cache dir.
+use crate::util::spill::SPILL_KEEP_MAX_BYTES;
 
 impl HeadTailBuffer {
     /// `cap` is the total retained byte budget for this stream. `0` is treated
@@ -138,84 +135,16 @@ impl HeadTailBuffer {
     }
 }
 
-/// Where spill files live: `<data_dir>/cache/shell-spill/`. `None` (with a
-/// warn) when the data dir cannot be resolved — the tool call proceeds with
-/// plain truncation.
+/// Filename prefix for `run_shell` spills. Also the cleanup filter, so this
+/// reaper never touches the conversation-level tool spills sharing the cache
+/// root.
+const SHELL_SPILL_PREFIX: &str = "shell-spill";
+
+/// Where `run_shell` spill files live: `<data_dir>/cache/shell-spill/`. `None`
+/// (with a warn) when the data dir cannot be resolved — the tool call proceeds
+/// with plain truncation.
 fn shell_spill_dir() -> Option<std::path::PathBuf> {
-    match crate::config::Config::data_dir() {
-        Ok(dir) => {
-            Some(crate::paths::subdir(&dir, crate::paths::BorgSubdir::Cache).join("shell-spill"))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "run_shell: cannot resolve data dir for output spill");
-            None
-        }
-    }
-}
-
-/// Best-effort reap of spill files older than `max_age`. Failures are logged
-/// and skipped — cleanup must never block writing the new spill.
-fn cleanup_old_spill_files(dir: &std::path::Path, max_age: Duration) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %dir.display(), "spill cleanup: cannot read dir");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("shell-spill-")
-        {
-            continue;
-        }
-        let expired = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
-            .is_ok_and(|age| age > max_age);
-        if expired {
-            if let Err(e) = std::fs::remove_file(entry.path()) {
-                tracing::warn!(error = %e, path = %entry.path().display(), "spill cleanup failed");
-            }
-        }
-    }
-}
-
-/// Write `content` (already redacted) to a fresh uniquely-named spill file,
-/// reaping expired siblings first. Owner-only permissions on unix: redaction
-/// is pattern-based and can miss, so the file gets the same posture as the
-/// rest of `~/.borg`.
-fn write_spill_file(
-    dir: &std::path::Path,
-    stream_label: &str,
-    content: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    cleanup_old_spill_files(dir, SPILL_MAX_AGE);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = dir.join(format!(
-        "shell-spill-{nanos}-{}-{stream_label}.txt",
-        std::process::id()
-    ));
-    // Owner-only from the moment the file exists: a create-then-chmod would
-    // leave the full command output readable to other local users for the
-    // duration of the write, and redaction is pattern-based enough to miss.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&path)?;
-    std::io::Write::write_all(&mut file, content.as_bytes())?;
-    Ok(path)
+    crate::util::spill::spill_dir(SHELL_SPILL_PREFIX, "run_shell")
 }
 
 /// Finish one output stream: verbatim when it fit the cap; otherwise spill the
@@ -245,7 +174,8 @@ fn finalize_stream_output(
             text.into_owned()
         };
         let redacted = crate::security::secrets::redact_secrets(&text);
-        match write_spill_file(dir, stream_label, &redacted) {
+        match crate::util::spill::write_spill_file(dir, SHELL_SPILL_PREFIX, stream_label, &redacted)
+        {
             Ok(path) => {
                 let coverage = if kept == total {
                     "full output".to_string()
@@ -1826,24 +1756,6 @@ mod tests {
 
         assert_eq!(out, "small\n");
         assert!(!dir.exists(), "no spill dir may be created under the cap");
-    }
-
-    /// Spill files have a bounded lifetime: writing a new one reaps expired
-    /// siblings, and only spill files — the reaper must not eat neighbors.
-    #[test]
-    fn spill_cleanup_reaps_expired_spill_files_only() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let old_spill = tmp.path().join("shell-spill-1-1-stdout.txt");
-        let unrelated = tmp.path().join("keepme.txt");
-        std::fs::write(&old_spill, "old").expect("fixture");
-        std::fs::write(&unrelated, "keep").expect("fixture");
-        // Let mtime age past the (tiny) threshold below.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-
-        super::cleanup_old_spill_files(tmp.path(), std::time::Duration::from_millis(1));
-
-        assert!(!old_spill.exists(), "expired spill must be reaped");
-        assert!(unrelated.exists(), "non-spill files must be untouched");
     }
 
     /// A policy denial must tell the model why and what to do instead. A bare

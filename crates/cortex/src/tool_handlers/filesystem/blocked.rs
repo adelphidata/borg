@@ -1040,6 +1040,40 @@ mod tests {
         }
     }
 
+    /// This guard fragments with `policy::command_fragments`, which drops the
+    /// lines inside an inert heredoc body. A `<<` that is not really a
+    /// redirection must therefore not read as a heredoc opener: an earlier
+    /// version produced a phantom delimiter that matched no terminator and
+    /// dropped every line after it, so a following `tee ~/.borg/hooks.json`
+    /// was invisible here as well as to the catastrophic-command rules.
+    ///
+    /// A body a shell would actually execute must stay visible for the same
+    /// reason.
+    #[test]
+    fn heredoc_handling_cannot_hide_a_control_plane_write() {
+        for cmd in [
+            "echo \"a << b\"\ntee ~/.borg/hooks.json",
+            "# note <<EOF\ntee ~/.borg/hooks.json",
+            "echo $((1 << 3))\ntee ~/.borg/hooks.json",
+            "bash <<EOF\ntee ~/.borg/hooks.json\nEOF",
+            "cat <<EOF | bash\ntee ~/.borg/hooks.json\nEOF",
+        ] {
+            assert!(
+                shell_command_targets_control_plane(cmd),
+                "heredoc handling must not hide a control-plane write: {cmd:?}"
+            );
+        }
+
+        // The converse, so the guard is not just matching the substring: a
+        // genuinely inert body really is treated as text.
+        assert!(
+            !shell_command_targets_control_plane(
+                "cat > notes.txt <<'EOF'\ntee ~/.borg/hooks.json\nEOF"
+            ),
+            "text written into a file must not trip the control-plane guard"
+        );
+    }
+
     #[test]
     fn shell_guard_deletion_does_not_overblock() {
         // Deletion of unrelated paths — including names that merely *contain*
