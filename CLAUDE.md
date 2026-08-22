@@ -64,9 +64,9 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Dev cadence.** Per-edit: `cargo build` + targeted `cargo test -p <crate> <new_test_name>` only. Skip `fmt --check`, `clippy`, full `--workspace` until ship-time (`/ship` runs them). CI re-runs everything. Investigation that needs >3 reads/greps → Explore subagent. Batch independent tool calls in one message.
 
-**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 85% via `cargo llvm-cov --fail-under-lines 85`.
+**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 90% via `cargo llvm-cov --fail-under-lines 90`.
 
-**Coverage.** Keep line coverage above 85%. All new or modified logic must have test coverage.
+**Coverage.** Keep line coverage above 90%. All new or modified code must have corresponding test coverage — no exceptions.
 
 **Autofixing lints.** Prefer `cargo fixit` over `cargo clippy --fix` — it's a drop-in replacement and dramatically faster (up to ~120x on large workspaces). Install with `cargo install cargo-fixit`; it's a local convenience, not wired into CI or the `justfile`. The maintainer is a contributor to it, so bug reports and rough edges are worth surfacing rather than working around.
 

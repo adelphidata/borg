@@ -26,3 +26,7 @@ Feature code must not read `window.borg`. It calls `useNative()`, which hands ba
 - Every server stream in `ipc.ts` must be cancellable and removed from the `streams` map on error and on complete, or a window reload leaks subscriptions.
 - `just desktop-dev` builds the main process once up front. Edits under `electron/` need a restart; only the renderer hot-reloads.
 - `bun run pack` is the cheap check that a packaging change works — `bun run dist` builds full installers and is slow.
+
+## Testing
+
+**Line coverage stays above 90%.** All new or modified code needs corresponding test coverage — main-process modules (`electron/*.ts`) get Vitest units, renderer-facing bridges get tests for the data shapes that cross IPC. A change that adds a channel, a `NativeBridge` capability, or a `NO_NATIVE` no-op is not done until a test covers it.

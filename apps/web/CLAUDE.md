@@ -19,3 +19,7 @@ Local rules only. Workspace layout, the transport seam, build order, and `just` 
 - `dist/.gitkeep` is committed so a clean checkout compiles. Do not delete it or add a `dist/**` ignore rule that removes it.
 - `just web-dev` proxies `/grpc` to `127.0.0.1:7842` and needs a local `borgd`. Without one, calls fail at the proxy, not in app code — check there first.
 - No CDN font or script tags in `index.html`. Fonts come from `@borg/ui/styles/fonts.css`; the SPA must work fully offline.
+
+## Testing
+
+**Line coverage stays above 90%.** All new or modified code needs corresponding test coverage. A change to `TokenGate`, the transport wiring, or any route added here is not done until a test covers it.
