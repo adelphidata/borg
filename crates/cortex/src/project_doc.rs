@@ -23,51 +23,52 @@ const MAX_PROJECT_DOC_BYTES: usize = crate::constants::MAX_PROJECT_DOC_BYTES;
 ///
 /// Returns concatenated contents ordered from root to cwd (root doc first,
 /// most-specific last). Returns `None` if no docs found.
-pub fn discover_project_docs(cwd: &Path) -> Result<Option<String>> {
+pub fn discover_project_docs(
+    cwd: &Path,
+    security: &crate::config::security::SecurityConfig,
+) -> Result<Option<String>> {
     let root = find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let doc_paths = collect_doc_paths(&root, cwd);
+    let doc_groups = collect_doc_candidates(&root, cwd);
 
-    if doc_paths.is_empty() {
+    if doc_groups.is_empty() {
         return Ok(None);
     }
 
     let mut combined = String::new();
     let mut remaining_bytes = MAX_PROJECT_DOC_BYTES;
 
-    for path in &doc_paths {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                // Scan for prompt injection before including in system prompt
-                let safe_content = scan_doc_content(path, &content);
+    for group in &doc_groups {
+        // One directory contributes at most one doc, but a refused `AGENTS.md`
+        // must not take a legitimate `CLAUDE.md` beside it down with it —
+        // otherwise a hostile symlink is a way to *suppress* project rules.
+        let Some((path, content)) = first_readable(group, &root, security) else {
+            continue;
+        };
+        // Scan for prompt injection before including in system prompt
+        let safe_content = scan_doc_content(&path, &content);
 
-                if safe_content.len() > remaining_bytes {
-                    // Truncate to fit byte budget (find a valid UTF-8 boundary)
-                    let truncated =
-                        &safe_content[..floor_char_boundary(&safe_content, remaining_bytes)];
-                    if !combined.is_empty() {
-                        combined.push_str("\n\n---\n\n");
-                    }
-                    // Name the file and tell the agent it can read the rest, so a
-                    // partial doc isn't mistaken for the whole file. The marker is
-                    // an HTML comment so it stays inert in the rendered prompt.
-                    combined.push_str(&format!(
-                        "<!-- {path} (TRUNCATED: exceeded the project-doc budget; \
-                         read the full file with read_file(\"{path}\") if you need \
-                         the omitted content) -->\n{truncated}",
-                        path = path.display(),
-                    ));
-                    break;
-                }
-                if !combined.is_empty() {
-                    combined.push_str("\n\n---\n\n");
-                }
-                combined.push_str(&format!("<!-- {} -->\n{}", path.display(), safe_content));
-                remaining_bytes -= safe_content.len();
+        if safe_content.len() > remaining_bytes {
+            // Truncate to fit byte budget (find a valid UTF-8 boundary)
+            let truncated = &safe_content[..floor_char_boundary(&safe_content, remaining_bytes)];
+            if !combined.is_empty() {
+                combined.push_str("\n\n---\n\n");
             }
-            Err(e) => {
-                tracing::warn!("Failed to read project doc {}: {e}", path.display());
-            }
+            // Name the file and tell the agent it can read the rest, so a
+            // partial doc isn't mistaken for the whole file. The marker is
+            // an HTML comment so it stays inert in the rendered prompt.
+            combined.push_str(&format!(
+                "<!-- {path} (TRUNCATED: exceeded the project-doc budget; \
+                 read the full file with read_file(\"{path}\") if you need \
+                 the omitted content) -->\n{truncated}",
+                path = path.display(),
+            ));
+            break;
         }
+        if !combined.is_empty() {
+            combined.push_str("\n\n---\n\n");
+        }
+        combined.push_str(&format!("<!-- {} -->\n{}", path.display(), safe_content));
+        remaining_bytes -= safe_content.len();
     }
 
     if combined.is_empty() {
@@ -75,6 +76,88 @@ pub fn discover_project_docs(cwd: &Path) -> Result<Option<String>> {
     } else {
         Ok(Some(combined))
     }
+}
+
+/// Read a project doc, refusing any file that resolves outside `root`.
+///
+/// `Path::is_file` follows symlinks, so a repository could ship
+/// `AGENTS.md -> ~/.ssh/id_rsa` and have the key pasted verbatim into the
+/// system prompt — i.e. shipped to the model provider on the next turn. The
+/// docs are read with the operator's own credentials, so the only thing
+/// separating "project instructions" from "arbitrary file on this machine" is
+/// this check.
+///
+/// A symlink that stays inside the project is still honored: monorepos legitimately
+/// point every package's `AGENTS.md` at one shared file. Only the escape is refused.
+/// Non-regular files (fifos, devices) are refused outright — reading one can block
+/// forever, and nothing legitimate ships an `AGENTS.md` fifo.
+///
+/// Known residual: a *hardlink* to an outside file canonicalizes to a path inside
+/// the root and passes the containment check. Git cannot ship a hardlink, so the
+/// delivery path is narrow, and the `blocked_paths` check below is what actually
+/// catches the interesting targets.
+fn read_doc_within_root(
+    path: &Path,
+    root: &Path,
+    security: &crate::config::security::SecurityConfig,
+) -> Result<String> {
+    let resolved = path.canonicalize()?;
+    if !resolved.is_file() {
+        anyhow::bail!("not a regular file: {}", resolved.display());
+    }
+    // `root` is a real directory here (it came from the upward walk), but
+    // canonicalize it too so `/var` vs `/private/var` on macOS compares equal.
+    // Fail closed if it will not resolve: an unresolved root compares unequal
+    // to every canonical path, so continuing would silently drop every doc.
+    let resolved_root = root.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "project root {} could not be resolved, refusing to read docs: {e}",
+            root.display()
+        )
+    })?;
+    if !resolved.starts_with(&resolved_root) {
+        anyhow::bail!(
+            "project doc {} resolves outside the project root ({})",
+            path.display(),
+            resolved.display()
+        );
+    }
+    // Containment is not the same guarantee as "not a secret". A checked-in
+    // `.env`, or a `~/AGENTS.md -> ~/.ssh/id_rsa` in a directory with no `.git`
+    // (where the root falls back to the cwd), both resolve *inside* the root.
+    // `blocked_paths` is the list that already answers this question for
+    // `fs_read`, including the dotted-family rule that covers `.env.local` and
+    // `id_rsa.pem`, and it honors the operator's `allowed_paths` escape hatch.
+    if crate::tool_handlers::is_blocked_path(
+        &resolved,
+        &security.blocked_paths,
+        &security.allowed_paths,
+    ) {
+        anyhow::bail!(
+            "project doc {} resolves to a blocked path ({})",
+            path.display(),
+            resolved.display()
+        );
+    }
+    Ok(std::fs::read_to_string(&resolved)?)
+}
+
+/// Return the first candidate in `group` that passes the safety checks and
+/// reads, along with its contents. Refusals are logged, never silent.
+fn first_readable(
+    group: &[PathBuf],
+    root: &Path,
+    security: &crate::config::security::SecurityConfig,
+) -> Option<(PathBuf, String)> {
+    for candidate in group {
+        match read_doc_within_root(candidate, root, security) {
+            Ok(content) => return Some((candidate.clone(), content)),
+            Err(e) => {
+                tracing::warn!("Skipping project doc {}: {e}", candidate.display());
+            }
+        }
+    }
+    None
 }
 
 /// Scan project doc content for prompt injection and wrap if suspicious.
@@ -116,11 +199,13 @@ fn find_project_root(cwd: &Path) -> Option<PathBuf> {
     crate::git::find_repo_root(cwd)
 }
 
-/// Collect doc file paths from root down to cwd.
+/// Collect candidate doc files from root down to cwd, grouped per directory.
 ///
-/// For each directory on the path from root to cwd, checks for AGENTS.md
-/// then CLAUDE.md (first match wins per directory).
-fn collect_doc_paths(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+/// Each group holds every existing `DOC_FILENAMES` entry in that directory, in
+/// preference order. The caller takes the first one that passes the safety
+/// checks — grouping rather than pre-selecting is what stops a refused
+/// `AGENTS.md` from masking a valid `CLAUDE.md` beside it.
+fn collect_doc_candidates(root: &Path, cwd: &Path) -> Vec<Vec<PathBuf>> {
     // Build list of directories from root down to cwd
     let mut dirs = Vec::new();
     let mut current = cwd.to_path_buf();
@@ -141,18 +226,21 @@ fn collect_doc_paths(root: &Path, cwd: &Path) -> Vec<PathBuf> {
     // Deduplicate (root might appear twice if cwd == root)
     dirs.dedup();
 
-    let mut doc_paths = Vec::new();
+    let mut groups = Vec::new();
     for dir in &dirs {
-        for filename in DOC_FILENAMES {
-            let path = dir.join(filename);
-            if path.is_file() {
-                doc_paths.push(path);
-                break; // First match per directory wins
-            }
+        let group: Vec<PathBuf> = DOC_FILENAMES
+            .iter()
+            .map(|filename| dir.join(filename))
+            // `is_file` follows symlinks, so this only decides candidacy;
+            // `read_doc_within_root` is what decides admissibility.
+            .filter(|path| path.is_file())
+            .collect();
+        if !group.is_empty() {
+            groups.push(group);
         }
     }
 
-    doc_paths
+    groups
 }
 
 #[cfg(test)]
@@ -160,10 +248,173 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Default security config: the real `blocked_paths` list, so tests exercise
+    /// the same rules production uses rather than an empty allow-everything stub.
+    fn sec() -> crate::config::security::SecurityConfig {
+        crate::config::security::SecurityConfig::default()
+    }
+
+    /// `collect_doc_candidates` groups per directory; these tests predate the
+    /// grouping and assert on a flat, root-to-cwd ordered path list. Flatten
+    /// rather than rewrite them — the ordering property is what they pin.
+    fn flatten_candidates(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+        collect_doc_candidates(root, cwd)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Spec: `AGENTS.md` is read with the operator's credentials and pasted into
+    /// the system prompt, so a symlink that escapes the project must not be
+    /// followed — otherwise cloning a repo is enough to ship `~/.ssh/id_rsa` to
+    /// the model provider. `Path::is_file` follows symlinks, so the discovery
+    /// walk alone does not catch this.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_doc_symlinked_outside_the_root_is_not_read() {
+        let outside = TempDir::new().unwrap();
+        let secret_path = outside.path().join("id_rsa");
+        std::fs::write(&secret_path, "BEGIN OPENSSH PRIVATE KEY").unwrap();
+
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&secret_path, repo.path().join("AGENTS.md")).unwrap();
+
+        let result = discover_project_docs(repo.path(), &sec()).unwrap();
+        assert!(
+            !result
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BEGIN OPENSSH PRIVATE KEY"),
+            "escaping symlink leaked into the system prompt: {result:?}"
+        );
+    }
+
+    /// Spec: staying inside the project root is not the same as not being a
+    /// secret. A checked-in `.env` is inside the root, so containment alone
+    /// passes it straight into the system prompt. `blocked_paths` is the list
+    /// that already answers this for `fs_read`, so it must answer it here too.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_doc_symlinked_to_a_blocked_path_inside_the_root_is_not_read() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let dotenv = repo.path().join(".env");
+        std::fs::write(&dotenv, "STRIPE_KEY=sk_live_beefbeef").unwrap();
+        std::os::unix::fs::symlink(&dotenv, repo.path().join("AGENTS.md")).unwrap();
+
+        let result = discover_project_docs(repo.path(), &sec()).unwrap();
+        assert!(
+            !result
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sk_live_beefbeef"),
+            "a blocked path inside the root still leaked: {result:?}"
+        );
+    }
+
+    /// Spec: with no `.git` anywhere the root falls back to the cwd, so running
+    /// from `$HOME` makes `~/.ssh/id_rsa` "inside the root". Containment cannot
+    /// catch this one at all — only the blocked-path check can.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_doc_symlinked_to_a_key_is_refused_even_when_the_root_is_the_cwd() {
+        let home = TempDir::new().unwrap();
+        // Deliberately no `.git`: `find_project_root` returns None and the root
+        // collapses to the cwd, which is what makes the target "contained".
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        let key = home.path().join(".ssh").join("id_rsa");
+        std::fs::write(&key, "BEGIN OPENSSH PRIVATE KEY").unwrap();
+        std::os::unix::fs::symlink(&key, home.path().join("AGENTS.md")).unwrap();
+
+        let result = discover_project_docs(home.path(), &sec()).unwrap();
+        assert!(
+            !result
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BEGIN OPENSSH PRIVATE KEY"),
+            "key leaked through the cwd-as-root fallback: {result:?}"
+        );
+    }
+
+    /// Spec: refusing `AGENTS.md` must not suppress a legitimate `CLAUDE.md`
+    /// beside it. Otherwise a hostile symlink becomes a way to delete the
+    /// project's real instructions from the prompt — a quieter attack than
+    /// reading a secret, and one the fix itself would have introduced.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_doc_does_not_mask_a_valid_sibling() {
+        let outside = TempDir::new().unwrap();
+        let secret_path = outside.path().join("id_rsa");
+        std::fs::write(&secret_path, "BEGIN OPENSSH PRIVATE KEY").unwrap();
+
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&secret_path, repo.path().join("AGENTS.md")).unwrap();
+        std::fs::write(repo.path().join("CLAUDE.md"), "# Real rules\nUse tabs.").unwrap();
+
+        let result = discover_project_docs(repo.path(), &sec()).unwrap().unwrap();
+        assert!(
+            result.contains("Use tabs."),
+            "the valid sibling must still be used: {result}"
+        );
+        assert!(
+            !result.contains("BEGIN OPENSSH PRIVATE KEY"),
+            "and the refused doc must stay out: {result}"
+        );
+    }
+
+    /// Spec: the operator's `allowed_paths` escape hatch is the documented way
+    /// to read a specific `.env`, and it must keep working here — the check
+    /// delegates to `is_blocked_path` precisely so the two agree.
+    #[cfg(unix)]
+    #[test]
+    fn an_operator_allowlisted_path_is_still_readable() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let dotenv = repo.path().join(".env");
+        std::fs::write(&dotenv, "PUBLIC_SETTING=1").unwrap();
+        std::os::unix::fs::symlink(&dotenv, repo.path().join("AGENTS.md")).unwrap();
+
+        let mut security = sec();
+        security.allowed_paths = vec![dotenv
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()];
+
+        let result = discover_project_docs(repo.path(), &security)
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.contains("PUBLIC_SETTING=1"),
+            "allowed_paths must override the block: {result}"
+        );
+    }
+
+    /// Spec: the escape is what is refused, not symlinks as such. A monorepo
+    /// pointing every package's `AGENTS.md` at one shared in-repo file must keep
+    /// working, or the fix above breaks a legitimate layout.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_doc_symlinked_inside_the_root_is_still_read() {
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let shared = repo.path().join("shared-rules.md");
+        std::fs::write(&shared, "# Shared\nUse tabs.").unwrap();
+        std::os::unix::fs::symlink(&shared, repo.path().join("AGENTS.md")).unwrap();
+
+        let result = discover_project_docs(repo.path(), &sec()).unwrap().unwrap();
+        assert!(
+            result.contains("Use tabs."),
+            "in-repo symlink must still be honored: {result}"
+        );
+    }
+
     #[test]
     fn discover_no_docs() {
         let tmp = TempDir::new().unwrap();
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         assert!(result.is_none());
     }
 
@@ -174,7 +425,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         assert!(result.is_some());
         let content = result.unwrap();
         assert!(content.contains("# Project Rules"));
@@ -187,7 +438,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "# Claude Instructions").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("# Claude Instructions"));
     }
@@ -199,7 +450,7 @@ mod tests {
         std::fs::write(tmp.path().join("AGENTS.md"), "agents content").unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "claude content").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         let content = result.unwrap();
         // Should contain agents content but not claude (first match per dir wins)
         assert!(content.contains("agents content"));
@@ -216,7 +467,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("CLAUDE.md"), "web rules").unwrap();
 
-        let result = discover_project_docs(&sub).unwrap();
+        let result = discover_project_docs(&sub, &sec()).unwrap();
         let content = result.unwrap();
         // Root doc should come first
         assert!(content.contains("root rules"));
@@ -234,7 +485,7 @@ mod tests {
         let large = "x".repeat(MAX_PROJECT_DOC_BYTES + 1000);
         std::fs::write(tmp.path().join("AGENTS.md"), &large).unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         let content = result.unwrap();
         // Budget plus the truncation marker (which names the path twice and the
         // read_file hint). Generous headroom keeps this from being brittle.
@@ -277,7 +528,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "root docs").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), tmp.path());
+        let paths = flatten_candidates(tmp.path(), tmp.path());
         assert_eq!(paths.len(), 1);
     }
 
@@ -286,7 +537,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), tmp.path());
+        let paths = flatten_candidates(tmp.path(), tmp.path());
         assert!(paths.is_empty());
     }
 
@@ -296,7 +547,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "content").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap().unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
         assert!(result.contains("<!--"));
         assert!(result.contains("AGENTS.md"));
     }
@@ -311,7 +562,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("CLAUDE.md"), "sub content").unwrap();
 
-        let result = discover_project_docs(&sub).unwrap().unwrap();
+        let result = discover_project_docs(&sub, &sec()).unwrap().unwrap();
         assert!(result.contains("---")); // HR separator between docs
     }
 
@@ -325,7 +576,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("CLAUDE.md"), "leaf").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), &sub);
+        let paths = flatten_candidates(tmp.path(), &sub);
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("AGENTS.md"));
         assert!(paths[1].ends_with("CLAUDE.md"));
@@ -342,7 +593,7 @@ mod tests {
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(leaf.join("CLAUDE.md"), "leaf").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), &leaf);
+        let paths = flatten_candidates(tmp.path(), &leaf);
         assert_eq!(paths.len(), 2);
         // Root doc first, then leaf — middle skipped
         assert!(paths[0].ends_with("AGENTS.md"));
@@ -367,7 +618,7 @@ mod tests {
         std::fs::create_dir_all(&l3).unwrap();
         std::fs::write(l3.join("CLAUDE.md"), "l3").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), &l3);
+        let paths = flatten_candidates(tmp.path(), &l3);
         assert_eq!(paths.len(), 4);
         assert!(paths[0].ends_with("AGENTS.md")); // root
         assert!(paths[1].ends_with("CLAUDE.md")); // l1
@@ -382,7 +633,7 @@ mod tests {
         // No .git directory — find_project_root returns None, discover uses cwd as root
         std::fs::write(tmp.path().join("CLAUDE.md"), "fallback").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), tmp.path());
+        let paths = flatten_candidates(tmp.path(), tmp.path());
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("CLAUDE.md"));
     }
@@ -393,7 +644,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         // Empty file content means the path comment is still generated but
         // the overall string just has the comment — should still return Some
         // because the file exists and was read (even if empty)
@@ -406,7 +657,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "   \n\n  ").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         // Whitespace-only content still gets included with the path comment
         assert!(result.is_some());
     }
@@ -425,7 +676,7 @@ mod tests {
         let second_content = "b".repeat(2000);
         std::fs::write(sub.join("CLAUDE.md"), &second_content).unwrap();
 
-        let result = discover_project_docs(&sub).unwrap().unwrap();
+        let result = discover_project_docs(&sub, &sec()).unwrap().unwrap();
         // First file should be fully present
         assert!(result.contains(&first_content));
         // Second file should be truncated (not all 2000 b's fit)
@@ -450,7 +701,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("CLAUDE.md"), "should not appear").unwrap();
 
-        let result = discover_project_docs(&sub).unwrap().unwrap();
+        let result = discover_project_docs(&sub, &sec()).unwrap().unwrap();
         // Budget is consumed by first file; second should not appear
         assert!(!result.contains("should not appear"));
     }
@@ -461,7 +712,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "instructions").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap().unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
         assert!(result.contains("<!--"));
         assert!(result.contains("CLAUDE.md"));
     }
@@ -472,7 +723,7 @@ mod tests {
         // No .git directory anywhere
         std::fs::write(tmp.path().join("AGENTS.md"), "no git content").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("no git content"));
     }
@@ -486,7 +737,7 @@ mod tests {
 
         // find_project_root uses git::find_repo_root which may or may not
         // detect .git-as-file. Either way, cwd fallback ensures discovery works.
-        let result = discover_project_docs(tmp.path()).unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("worktree content"));
     }
@@ -514,7 +765,7 @@ mod tests {
         std::fs::create_dir_all(&leaf).unwrap();
         std::fs::write(leaf.join("AGENTS.md"), "LEAF").unwrap();
 
-        let result = discover_project_docs(&leaf).unwrap().unwrap();
+        let result = discover_project_docs(&leaf, &sec()).unwrap().unwrap();
         let root_pos = result.find("ROOT").unwrap();
         let mid_pos = result.find("MID").unwrap();
         let leaf_pos = result.find("LEAF").unwrap();
@@ -523,17 +774,41 @@ mod tests {
         assert!(mid_pos < leaf_pos);
     }
 
+    /// Spec: a directory still contributes exactly one doc, and `AGENTS.md`
+    /// still wins over `CLAUDE.md`. Collection now gathers both candidates so a
+    /// refused one can fall through, so the preference is asserted where it now
+    /// lives — in what actually reaches the prompt, not in the candidate list.
     #[test]
-    fn collect_doc_paths_agents_preferred_over_claude_per_dir() {
+    fn agents_md_is_preferred_over_claude_md_in_one_directory() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "from agents").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "from claude").unwrap();
+
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
+        assert!(
+            result.contains("from agents"),
+            "AGENTS.md must win: {result}"
+        );
+        assert!(
+            !result.contains("from claude"),
+            "only one doc per directory may be used: {result}"
+        );
+    }
+
+    /// Spec: both candidates are offered to the reader, in preference order.
+    /// This is what gives the fall-through something to fall through to.
+    #[test]
+    fn both_doc_filenames_are_collected_as_candidates() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "agents").unwrap();
         std::fs::write(tmp.path().join("CLAUDE.md"), "claude").unwrap();
 
-        let paths = collect_doc_paths(tmp.path(), tmp.path());
-        // First-match-wins: only AGENTS.md collected
-        assert_eq!(paths.len(), 1);
-        assert!(paths[0].ends_with("AGENTS.md"));
+        let groups = collect_doc_candidates(tmp.path(), tmp.path());
+        assert_eq!(groups.len(), 1, "one directory, one group: {groups:?}");
+        assert!(groups[0][0].ends_with("AGENTS.md"), "{groups:?}");
+        assert!(groups[0][1].ends_with("CLAUDE.md"), "{groups:?}");
     }
 
     #[test]
@@ -581,7 +856,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap().unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
         assert!(result.contains("<untrusted_content"));
         assert!(result.contains("project_doc:AGENTS.md"));
     }
@@ -592,7 +867,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# Rules\nUse Rust.").unwrap();
 
-        let result = discover_project_docs(tmp.path()).unwrap().unwrap();
+        let result = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
         assert!(!result.contains("<untrusted_content"));
         assert!(result.contains("# Rules"));
     }
@@ -611,7 +886,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_project_docs(&sub).unwrap().unwrap();
+        let result = discover_project_docs(&sub, &sec()).unwrap().unwrap();
         // Root doc should be clean
         assert!(result.contains("# Clean project rules"));
         // Sub doc should be wrapped

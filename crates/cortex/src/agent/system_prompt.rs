@@ -235,9 +235,12 @@ impl Agent {
 
         // Project documentation (AGENTS.md / CLAUDE.md)
         let project_docs = self.caches.project_docs_or_load(|| {
-            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
-                .ok()
-                .flatten()
+            crate::project_doc::discover_project_docs(
+                self.execution_context.workspace_cwd(),
+                &self.config.security,
+            )
+            .ok()
+            .flatten()
         });
         if let Some(ref docs) = project_docs {
             let _ = write!(

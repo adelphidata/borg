@@ -85,6 +85,77 @@ fn push_subpath_rule(
     Ok(())
 }
 
+/// Collect the `literal` deny targets that stop `path` from being renamed out
+/// from under its `deny file-read*` / `deny file-write*` `subpath` rules.
+///
+/// A `subpath` deny is matched against the path the process opens, so it only
+/// protects a file while the file still lives there. If `$HOME` is writable —
+/// the `trusted` profile grants exactly that — then `mv ~/.ssh /tmp/loot`
+/// relocates the whole directory to a path no deny rule mentions, and the next
+/// `cat /tmp/loot/id_rsa` is an ordinary allowed read. Denying `file-write-unlink`
+/// on the protected path *and on each of its ancestor directories* removes the
+/// rename, because a rename needs unlink rights on its source.
+///
+/// The targets are `literal`, never `subpath`: `(deny file-write-unlink (literal
+/// "/Users/me"))` names that one directory, so a sandboxed build is still free to
+/// create and delete files *inside* it. Emitting `subpath` here would make the
+/// tool dir unusable.
+///
+/// It does mean a guarded directory cannot be `rmdir`-ed either — `file-write-unlink`
+/// covers removal as well as rename. So a `deny_read` entry at
+/// `<workspace>/build/secret.txt` leaves `rm -rf build` able to empty the directory
+/// but not to remove it. That is the intended trade: the alternative is letting the
+/// directory be moved somewhere no deny rule names.
+///
+/// The root itself is skipped — it cannot be renamed, and a deny on `/` reads
+/// like a much broader rule than it is.
+fn rename_guard_targets(path: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut current = Some(Path::new(path));
+    while let Some(dir) = current {
+        let text = dir.to_string_lossy();
+        if text == "/" || text.is_empty() {
+            break;
+        }
+        targets.push(text.into_owned());
+        current = dir.parent();
+    }
+    targets
+}
+
+/// Emit the rename guards for every protected path, deduplicated.
+///
+/// Ancestors are shared heavily — every `SENSITIVE_HOME_PATHS` entry contributes
+/// the same `$HOME`, `/Users`, … chain — so without the set a profile repeats one
+/// rule a dozen times.
+fn push_rename_guards(profile: &mut String, protected: &[String]) {
+    let mut seen = std::collections::BTreeSet::new();
+    for path in protected {
+        for target in rename_guard_targets(path) {
+            let resolved = resolve_symlinks_best_effort(Path::new(&target));
+            for form in [target.clone(), resolved] {
+                if !seen.insert(form.clone()) {
+                    continue;
+                }
+                // The protected path itself already passed `validate_seatbelt_path`
+                // via `push_subpath_rule`; an ancestor can still fail it (a
+                // non-ASCII username, say). Skipping a *guard* is not the same
+                // failure as skipping a deny — the deny still stands, this only
+                // leaves the rename open — so warn and keep the rest rather than
+                // refusing to build a sandbox at all.
+                if validate_seatbelt_path(&form).is_err() {
+                    tracing::warn!(
+                        path = %form,
+                        "Seatbelt rename guard skipped: path is not expressible in a profile"
+                    );
+                    continue;
+                }
+                profile.push_str(&format!("(deny file-write-unlink (literal \"{form}\"))\n"));
+            }
+        }
+    }
+}
+
 /// Generate a macOS Seatbelt profile string for sandbox-exec.
 ///
 /// `runtime_bin` is the absolute path to the runtime binary (e.g.
@@ -183,10 +254,23 @@ pub fn generate_profile(
     // failure: on a `$HOME` the validator rejects (e.g. a non-ASCII username),
     // these denies vanished while the broad `(allow file-read*)` above stayed,
     // leaving `~/.ssh` and `~/.aws` readable from inside the sandbox.
+    let mut protected: Vec<String> = Vec::new();
     if let Ok(home_str) = std::env::var("HOME") {
         for sensitive in SENSITIVE_HOME_PATHS {
             let path = format!("{home_str}/{sensitive}");
             push_subpath_rule(&mut profile, "deny", "file-read*", &path)?;
+            // The read deny alone protects the key only while it sits at this
+            // path. `mv ~/.ssh/id_rsa /tmp/loot` needs unlink on the *file*,
+            // which the read deny does not cover and the rename guards below
+            // do not either — they guard directories. `cat /tmp/loot` is then
+            // an ordinary allowed read. `file-write*` also subsumes
+            // `file-link`, so it closes `ln ~/.ssh/id_rsa /tmp/hard` in the
+            // same stroke — a hardlink needs no unlink at all.
+            //
+            // Nothing legitimate writes into `~/.ssh`, `~/.aws`, `~/.gnupg`,
+            // or `~/.config/gh` from inside a sandbox, so this costs nothing.
+            push_subpath_rule(&mut profile, "deny", "file-write*", &path)?;
+            protected.push(path);
         }
     }
 
@@ -194,12 +278,17 @@ pub fn generate_profile(
     // Deny rules are security-critical — invalid paths are hard errors.
     for path in &policy.deny_read {
         push_subpath_rule(&mut profile, "deny", "file-read*", path)?;
+        protected.push(path.clone());
     }
 
     // Deny write access to protected paths (e.g. ~/.borg/).
     for path in &policy.deny_write {
         push_subpath_rule(&mut profile, "deny", "file-write*", path)?;
+        protected.push(path.clone());
     }
+
+    // Last, so these survive last-match-wins against every write allow above.
+    push_rename_guards(&mut profile, &protected);
 
     if policy.network {
         profile.push_str("(allow network*)\n");
@@ -219,6 +308,267 @@ mod tests {
 
     fn default_policy() -> SandboxPolicy {
         SandboxPolicy::default()
+    }
+
+    /// `$HOME` for the tests that assert on the built-in sensitive-path rules,
+    /// or `None` when it is not expressible in a Seatbelt profile (a non-ASCII
+    /// username, say). Those tests would otherwise fail for a reason that has
+    /// nothing to do with the behaviour they pin — the rules are correctly
+    /// skipped with a warning in that case.
+    fn expressible_home() -> Option<String> {
+        let home = std::env::var("HOME").ok()?;
+        validate_seatbelt_path(&home).ok()?;
+        Some(home)
+    }
+
+    /// Spec: a `deny file-read* (subpath "…/.ssh")` rule only protects the key
+    /// while the key still lives at that path. With a writable `$HOME` the
+    /// sandbox can `mv ~/.ssh /tmp/loot` and then read `/tmp/loot/id_rsa`
+    /// through the blanket `(allow file-read*)`. The deny on the directory
+    /// itself is what removes the rename.
+    #[test]
+    fn a_protected_directory_cannot_be_renamed_out_from_under_its_deny() {
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write-unlink (literal \"{home}/.ssh\"))"
+            )),
+            "renaming ~/.ssh must be denied:\n{profile}"
+        );
+    }
+
+    /// Spec: the rename needs unlink rights on its *source*, and moving the home
+    /// directory relocates every sensitive path under it at once. Guarding only
+    /// the leaf leaves `mv ~ /tmp/loot` open.
+    #[test]
+    fn ancestors_of_a_protected_path_are_guarded_against_rename() {
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(&format!("(deny file-write-unlink (literal \"{home}\"))")),
+            "renaming the home directory must be denied:\n{profile}"
+        );
+    }
+
+    /// Spec: the guard is `literal`, not `subpath`. A `subpath` deny on `$HOME`
+    /// would stop a sandboxed build from deleting any of its own files — the
+    /// tool dir included — which is a far larger change than closing the rename.
+    #[test]
+    fn rename_guards_do_not_block_deletes_inside_a_guarded_directory() {
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        assert!(
+            !profile.contains("(deny file-write-unlink (subpath"),
+            "guards must stay literal so ordinary deletes keep working:\n{profile}"
+        );
+    }
+
+    /// Spec: guarding the directory is not enough. `mv ~/.ssh/id_rsa /tmp/loot`
+    /// needs unlink on the *file*, which no rename guard covers, and the read
+    /// deny stops applying the moment the file leaves the path. Verified
+    /// against `sandbox-exec`: with the read deny alone the key moves out and
+    /// `cat` prints it; with this rule both the move and `ln` are refused.
+    #[test]
+    fn sensitive_home_paths_deny_writes_not_only_reads() {
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        assert!(
+            profile.contains(&format!("(deny file-write* (subpath \"{home}/.ssh\"))")),
+            "a read-only deny lets the key be moved or hardlinked out:\n{profile}"
+        );
+    }
+
+    /// Spec: last-match-wins means the sensitive-path write deny is only worth
+    /// anything if it follows the policy's own `fs_write` allows. A profile that
+    /// grants write on `$HOME` (the `trusted` shape) must still refuse `~/.ssh`.
+    #[test]
+    fn the_sensitive_write_deny_outranks_a_broad_write_allow() {
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let policy = SandboxPolicy {
+            fs_write: vec![home.clone()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let allow = profile
+            .find(&format!("(allow file-write* (subpath \"{home}\"))"))
+            .expect("the broad home write allow must be present");
+        let deny = profile
+            .find(&format!("(deny file-write* (subpath \"{home}/.ssh\"))"))
+            .expect("the sensitive write deny must be present");
+        assert!(
+            deny > allow,
+            "the deny must follow the allow or last-match-wins voids it:\n{profile}"
+        );
+    }
+
+    /// Spec: a `deny_write` entry is protected against rename for the same
+    /// reason a `deny_read` entry is — only `deny_read` was covered before.
+    #[test]
+    fn policy_deny_write_paths_also_get_rename_guards() {
+        let policy = SandboxPolicy {
+            deny_write: vec!["/opt/state/ledger".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        for expected in [
+            "(deny file-write-unlink (literal \"/opt/state/ledger\"))",
+            "(deny file-write-unlink (literal \"/opt/state\"))",
+        ] {
+            assert!(profile.contains(expected), "missing {expected}:\n{profile}");
+        }
+    }
+
+    /// Spec: an un-resolved `/tmp/…` guard protects nothing on macOS, where the
+    /// kernel reports `/private/tmp/…`. Both forms must be emitted, the same
+    /// rule `push_subpath_rule` follows for denies.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_guards_cover_both_raw_and_resolved_ancestors() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/tmp/vault/keys".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        assert!(
+            profile.contains("(deny file-write-unlink (literal \"/tmp/vault\"))"),
+            "raw ancestor guard missing:\n{profile}"
+        );
+        assert!(
+            profile.contains("(deny file-write-unlink (literal \"/private/tmp/vault\"))"),
+            "resolved ancestor guard missing — the kernel reports this form:\n{profile}"
+        );
+    }
+
+    /// Spec: guarding a directory also stops it being removed, because
+    /// `file-write-unlink` covers `rmdir` as well as rename. Pinned so the
+    /// trade-off is a decision rather than a surprise: `rm -rf build` can empty
+    /// a guarded directory but not remove it.
+    #[test]
+    fn guarding_a_directory_also_prevents_removing_it() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/ws/build/secret.txt".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        assert!(
+            profile.contains("(deny file-write-unlink (literal \"/ws/build\"))"),
+            "the containing directory must be guarded:\n{profile}"
+        );
+        assert!(
+            !profile.contains("(deny file-write-unlink (subpath \"/ws/build\"))"),
+            "files inside must stay deletable:\n{profile}"
+        );
+    }
+
+    /// Spec: policy-supplied denies get the same treatment as the built-in
+    /// sensitive-home list — the bypass does not care where the deny came from.
+    #[test]
+    fn policy_deny_paths_also_get_rename_guards() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/opt/vault/keys".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        for expected in [
+            "(deny file-write-unlink (literal \"/opt/vault/keys\"))",
+            "(deny file-write-unlink (literal \"/opt/vault\"))",
+            "(deny file-write-unlink (literal \"/opt\"))",
+        ] {
+            assert!(profile.contains(expected), "missing {expected}:\n{profile}");
+        }
+    }
+
+    /// Spec: `/` cannot be renamed, and a deny on it reads like a far broader
+    /// rule than it is. The walk stops before emitting one.
+    #[test]
+    fn the_filesystem_root_gets_no_rename_guard() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/opt/vault/keys".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        assert!(
+            !profile.contains("(deny file-write-unlink (literal \"/\"))"),
+            "the root must not be guarded:\n{profile}"
+        );
+    }
+
+    /// Spec: Seatbelt is last-match-wins, so a guard emitted before a broad
+    /// `file-write*` allow is inert. Every guard must sit after the last allow.
+    #[test]
+    fn rename_guards_are_emitted_after_every_write_allow() {
+        let policy = SandboxPolicy {
+            fs_write: vec!["/opt".to_string()],
+            deny_read: vec!["/opt/vault/keys".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let last_allow = profile
+            .rfind("(allow file-write*")
+            .expect("profile must contain a write allow");
+        let first_guard = profile
+            .find("(deny file-write-unlink")
+            .expect("profile must contain a rename guard");
+        assert!(
+            first_guard > last_allow,
+            "guards must follow every write allow or last-match-wins voids them:\n{profile}"
+        );
+    }
+
+    /// Spec: every sensitive path shares the same `$HOME` / `/Users` chain, so
+    /// the emitted guards must be deduplicated rather than repeated per entry.
+    #[test]
+    fn shared_ancestors_are_emitted_once() {
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let rule = format!("(deny file-write-unlink (literal \"{home}\"))");
+        assert_eq!(
+            profile.matches(&rule).count(),
+            1,
+            "the shared home ancestor must appear once:\n{profile}"
+        );
     }
 
     /// A tool dir that does not exist yet must still be resolved through the

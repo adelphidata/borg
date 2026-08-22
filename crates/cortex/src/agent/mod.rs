@@ -1049,9 +1049,12 @@ impl Agent {
         // calls this lazily; running it here once outside that hot path
         // means the first build_system_prompt call doesn't pay for IO).
         let _ = self.caches.project_docs_or_load(|| {
-            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
-                .ok()
-                .flatten()
+            crate::project_doc::discover_project_docs(
+                self.execution_context.workspace_cwd(),
+                &self.config.security,
+            )
+            .ok()
+            .flatten()
         });
 
         // Background: index extra paths and pending sessions on first run

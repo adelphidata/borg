@@ -1179,6 +1179,8 @@ pub enum DenyReason {
     DaemonLifecycle(&'static str),
     /// Matched the named operator-configured deny glob.
     UserDenyPattern(String),
+    /// Shell payloads nested deeper than [`MAX_SHELL_C_DEPTH`] can unwrap.
+    ExcessiveShellNesting,
 }
 
 impl DenyReason {
@@ -1193,6 +1195,7 @@ impl DenyReason {
             Self::SensitivePathWrite => "sensitive_path_write",
             Self::DaemonLifecycle(_) => "daemon_lifecycle",
             Self::UserDenyPattern(_) => "user_deny_pattern",
+            Self::ExcessiveShellNesting => "excessive_shell_nesting",
         }
     }
 
@@ -1231,6 +1234,11 @@ impl DenyReason {
             Self::UserDenyPattern(pattern) => format!(
                 "it matches the operator-configured deny pattern `{pattern}`. Use a \
                  different command, or ask the user to adjust their policy deny list."
+            ),
+            Self::ExcessiveShellNesting => format!(
+                "it wraps a shell inside a shell more than {MAX_SHELL_C_DEPTH} times, so the \
+                 innermost payload cannot be inspected. Run the innermost command directly \
+                 instead of wrapping it."
             ),
         }
     }
@@ -1385,12 +1393,19 @@ fn catastrophic_deny_reason_at_depth(command: &str, depth: u8) -> Option<DenyRea
         // An `eval` argument or a `trap` action is the same shape of hidden
         // payload — shell source stored as an operand — so it re-enters the
         // check the same way.
-        if depth < MAX_SHELL_C_DEPTH {
-            let nested = shell_inline_script(candidate).or_else(|| operand_shell_source(candidate));
-            if let Some(script) = nested {
-                if let Some(reason) = catastrophic_deny_reason_at_depth(&script, depth + 1) {
-                    return Some(reason);
-                }
+        let nested = shell_inline_script(candidate).or_else(|| operand_shell_source(candidate));
+        if let Some(script) = nested {
+            // Past the cap the payload is still there but we have stopped
+            // looking at it, and every check above only ever saw the wrapper.
+            // Returning `None` here would report "not catastrophic" about a
+            // command nobody inspected, which is exactly how
+            // `sh -c 'sh -c "sh -c …"'` walks a `rm -rf /` past the guard.
+            // Nothing legitimate needs five nested shells, so refuse instead.
+            if depth >= MAX_SHELL_C_DEPTH {
+                return Some(DenyReason::ExcessiveShellNesting);
+            }
+            if let Some(reason) = catastrophic_deny_reason_at_depth(&script, depth + 1) {
+                return Some(reason);
             }
         }
     }
@@ -2222,6 +2237,91 @@ mod masked_exit_tests {
 mod tests {
     use super::*;
 
+    /// Build `sh -c '<payload>'` nested `layers` deep.
+    fn nest_shell(payload: &str, layers: usize) -> String {
+        let mut command = payload.to_string();
+        for _ in 0..layers {
+            command = format!("sh -c {}", shell_words_quote(&command));
+        }
+        command
+    }
+
+    /// Minimal single-quote shell quoting: wrap and escape embedded quotes.
+    fn shell_words_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+
+    /// Spec: within the unwrap budget the payload is inspected, so the wrapper
+    /// count does not change the verdict. This is the baseline the fail-closed
+    /// case below is measured against — without it, that case could pass for
+    /// the wrong reason (everything nested being denied).
+    #[test]
+    fn a_benign_command_survives_nesting_within_the_unwrap_budget() {
+        for layers in 1..=(MAX_SHELL_C_DEPTH as usize) {
+            let command = nest_shell("echo hello", layers);
+            assert!(
+                catastrophic_deny_reason(&command).is_none(),
+                "benign payload denied at {layers} layers: {command}"
+            );
+        }
+    }
+
+    /// Spec: the unwrap budget must fail closed. Past the cap the recursion
+    /// used to return `None` — reporting "not catastrophic" about a payload
+    /// nothing had looked at — so wrapping `rm -rf /` in one shell more than
+    /// the cap walked it straight past the guard.
+    #[test]
+    fn a_payload_nested_past_the_unwrap_budget_is_denied() {
+        let command = nest_shell("rm -rf /", MAX_SHELL_C_DEPTH as usize + 1);
+        assert!(
+            catastrophic_deny_reason(&command).is_some(),
+            "a payload past the unwrap budget must not be reported as safe: {command}"
+        );
+    }
+
+    /// Spec: the fail-closed cap must not start refusing real commands. These
+    /// are shapes that legitimately stack wrappers — `find -exec`, `ssh`,
+    /// `docker run`, `timeout`, `eval` — and every one must stay allowed. If a
+    /// future deobfuscator gets more aggressive and starts consuming recursion
+    /// levels, this is what catches the regression before a user does.
+    #[test]
+    fn realistic_nested_wrapper_shapes_are_not_denied() {
+        let cases = [
+            r#"bash -lc "cd /tmp && sh -c 'echo hi'""#,
+            r#"find . -name '*.rs' -exec sh -c 'echo {}' \;"#,
+            r#"ssh host "sh -c 'systemctl status nginx'""#,
+            r#"docker run img sh -c "bash -c 'echo built'""#,
+            r#"timeout 5 sh -c 'sh -c "echo nested"'"#,
+            r#"eval "sh -c 'echo via eval'""#,
+            r#"sh -c 'trap "echo bye" EXIT; echo work'"#,
+            r#"xargs -I{} sh -c 'echo {}'"#,
+            r#"env FOO=1 bash -c "sh -c 'make build'""#,
+        ];
+        for command in cases {
+            assert!(
+                catastrophic_deny_reason(command).is_none(),
+                "legitimate command denied: {command}"
+            );
+        }
+    }
+
+    /// Spec: the refusal past the cap is about the nesting itself, not a guess
+    /// at the payload — a benign payload wrapped that deep is refused too, and
+    /// the guidance says to unwrap rather than to rephrase.
+    #[test]
+    fn nesting_past_the_unwrap_budget_reports_its_own_reason() {
+        let command = nest_shell("echo hello", MAX_SHELL_C_DEPTH as usize + 1);
+        let reason =
+            catastrophic_deny_reason(&command).expect("nesting past the unwrap budget must deny");
+        assert_eq!(reason, DenyReason::ExcessiveShellNesting);
+        assert_eq!(reason.audit_label(), "excessive_shell_nesting");
+        let guidance = reason.guidance();
+        assert!(
+            guidance.contains("directly"),
+            "guidance must point at running the inner command unwrapped: {guidance}"
+        );
+    }
+
     /// A denial must name its cause and a supported next step — a bare
     /// "denied" only teaches the model to retry blind rephrasings. Each layer
     /// reports a distinct reason, and `deny_reason` can never disagree with
@@ -2295,7 +2395,25 @@ mod tests {
             DenyReason::SensitivePathWrite,
             DenyReason::DaemonLifecycle("kills the daemon"),
             DenyReason::UserDenyPattern("git push*".to_string()),
+            DenyReason::ExcessiveShellNesting,
         ];
+        // The list above is hand-maintained, so it silently drifts when a
+        // variant is added — which is exactly what happened to
+        // `ExcessiveShellNesting`. This match makes the compiler the enforcer:
+        // a new variant fails to build here until it is also listed above.
+        for reason in &variants {
+            match reason {
+                DenyReason::ControlCharacters
+                | DenyReason::DownloadPipedToInterpreter
+                | DenyReason::PipedRecursiveDelete
+                | DenyReason::ContainerDaemonRedirect
+                | DenyReason::CatastrophicPattern(_)
+                | DenyReason::SensitivePathWrite
+                | DenyReason::DaemonLifecycle(_)
+                | DenyReason::UserDenyPattern(_)
+                | DenyReason::ExcessiveShellNesting => {}
+            }
+        }
         for reason in variants {
             let guidance = reason.guidance();
             // Two sentences minimum: the cause, then the recovery step.

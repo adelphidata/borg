@@ -201,6 +201,18 @@ pub fn build_bwrap_args_versioned(
 
     args.push("--unshare-pid".to_string());
 
+    // A private IPC namespace. Without it the sandboxed child shares the host's
+    // System V IPC and POSIX message queues, which are a filesystem-independent
+    // channel: two sandboxed tools — or a sandboxed tool and an unsandboxed
+    // process on the host — can pass data through a shared memory segment that
+    // no bind mount, `deny_read`, or `--unshare-net` rule covers. Nothing borg
+    // runs in a sandbox needs host IPC.
+    //
+    // Unlike `--die-with-parent` and `--cap-drop` this needs no version gate:
+    // `--unshare-ipc` has been present since bwrap's first release, which is
+    // older than the `BwrapVersion` floor the other two check against.
+    args.push("--unshare-ipc".to_string());
+
     // Deliberately NOT `--as-pid-1`. That flag reads like "make bwrap PID 1",
     // but bwrap's own help spells it "Do not install a reaper process": with
     // `--unshare-pid` bwrap ALREADY becomes PID 1 and reaps orphaned
@@ -415,6 +427,39 @@ mod tests {
             !args.contains(&absent_str),
             "missing tool dir must not be bound: {args:?}"
         );
+    }
+
+    /// Spec: System V IPC and POSIX message queues are a side channel that no
+    /// bind mount, `deny_read` rule, or `--unshare-net` covers — a sandboxed
+    /// tool could hand data to a host process through a shared memory segment.
+    /// The namespace is unconditional: unlike `--die-with-parent` and
+    /// `--cap-drop`, `--unshare-ipc` predates every bwrap version we support,
+    /// so gating it on a detected version would only create a hole on old hosts.
+    #[test]
+    fn always_isolates_ipc_regardless_of_bwrap_version() {
+        for version in [
+            None,
+            Some(BwrapVersion {
+                major: 0,
+                minor: 1,
+                patch: 0,
+            }),
+            Some(BwrapVersion {
+                major: 0,
+                minor: 3,
+                patch: 0,
+            }),
+        ] {
+            let args = build_bwrap_args_versioned(
+                &default_policy(),
+                Path::new(TEST_TOOL_DIR),
+                version.as_ref(),
+            );
+            assert!(
+                args.contains(&"--unshare-ipc".to_string()),
+                "IPC isolation missing for {version:?}: {args:?}"
+            );
+        }
     }
 
     #[test]
