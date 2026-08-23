@@ -212,11 +212,140 @@ pub async fn run(cfg: Config) -> Result<()> {
     // The hourly budget reset tick is started by `orchestrator::start`, which
     // owns the supervisor's DB handle — see `budget_tick::run`.
 
-    // Keep the cost bus in step with live config edits. Supervised rather than
-    // bare-spawned: it is a daemon-lifetime loop, and a swallowed panic here
-    // would silently pin cost accounting to boot-time config — every later
-    // `borg settings set` for pricing or budgets would appear to apply and
-    // quietly not.
+    spawn_cost_bus_config_sync(&config_watcher, &cost_event_bus, &orchestrator_token).await;
+
+    migrate_user_timezone().await;
+
+    let extras = start_orchestrator_extras(
+        &registry,
+        &config_watcher,
+        &orchestrator_token,
+        &cost_event_sink,
+        &goal_bus,
+        &grpc_web_slot,
+        &shutdown_tx,
+        &process_registry,
+    )
+    .await;
+
+    let pki = bootstrap_pki(&cfg.borg_home, cfg.listen_tcp.as_deref()).await?;
+    spawn_cert_renewal(&pki, &orchestrator_token).await;
+    let PkiBootstrap {
+        pki_db,
+        ca_cert_pem,
+        ca_key_pem,
+        server_tls_material,
+        mdns_enabled,
+        ..
+    } = pki;
+    let audit = AuditWriter::new(pki_db.clone());
+    // Install the process-global audit writer so library call sites that
+    // can't easily plumb an `AuditWriter` (shell-policy denial path,
+    // settings resolver, …) can emit through the same chain. This must
+    // happen before DAEMON_START so the install order is observable in
+    // tests if it ever regresses.
+    cortex::db::install_global_audit(audit.clone());
+
+    install_redaction_policy(&config_watcher).await?;
+
+    audit
+        .emit(
+            audit_events::DAEMON_START,
+            "system",
+            &json!({"pid": std::process::id()}),
+        )
+        .await;
+
+    // Bootstrap MCP sessions before serving any traffic. `initialize`
+    // returns `Ok(())` immediately when `mcp.enabled = false`, and on
+    // per-server connect failures it logs + writes `mcp_server_failed`
+    // audit rows without aborting daemon start — borg always boots.
+    //
+    // Without this call, configured MCP servers stay dark until an
+    // operator triggers the explicit `reload_from_config` admin RPC.
+    // That was the actual symptom: `mcp.enabled=true` + `borg mcp test`
+    // succeeded standalone (test path is hermetic), but the LLM never
+    // saw `mcp_*` tools because no session was ever installed in the
+    // daemon process.
+    //
+    // Hot-reload runs in a spawned task: when the operator flips
+    // `mcp.enabled` / `mcp.disabled_servers` / `mcp.servers` we
+    // re-`reload_from_config` so the diff lands without a daemon
+    // restart.
+    init_mcp_clients(&initial_core_config, &config_watcher).await;
+
+    // Wire shutdown-signal forwarding now that the audit writer is available.
+    // `forward_signals_to` blocks on the first signal, emits DAEMON_STOP, and
+    // then broadcasts the shutdown so listeners drain.
+    tokio::spawn(forward_signals_to(shutdown_tx.clone(), audit.clone()));
+
+    // Reconcile security posture against live config before serving any
+    // traffic. On a fresh DB this writes the bootstrap event;
+    // on a restart with no config change it's a no-op. Failures are
+    // logged and do NOT block daemon startup — XP writes will fall back
+    // to `Default × 1.00` with `FallbackReason::PostureUndetermined`.
+    reconcile_startup_posture(&pki_db, &registry).await;
+
+    spawn_pairing_listener(&cfg.borg_home, &pki_db, &audit, &ca_cert_pem, &ca_key_pem);
+
+    let services = grpc::build_services_with_extras(
+        registry.clone(),
+        factory,
+        capability_router,
+        cost_event_bus.clone(),
+        extras,
+    );
+
+    // Browser surface: a subset of the services above, wrapped for gRPC-Web.
+    // See `grpc_web::build_grpc_web_router` for why Capability and Pki are out.
+    grpc_web_slot.install(crate::grpc_web::build_grpc_web_router(&services));
+
+    serve_transports(
+        uds,
+        cfg.listen_tcp,
+        &shutdown_tx,
+        &services,
+        &pki_db,
+        &audit,
+        ca_cert_pem,
+        ca_key_pem,
+        &server_tls_material,
+        mdns_enabled,
+    )
+    .await?;
+
+    // Drain-then-finalize. The transports above have stopped, but gateway- and
+    // heartbeat-driven turns run on spawned tasks that no listener waits for —
+    // returning now would drop them mid-stream (losing the turn's tail) and
+    // skip every session's end-of-session work (short-term-memory flush, lease
+    // release). Wait bounded for in-flight turns to settle, THEN close every
+    // live host; a turn still running at the ceiling is cancelled, which
+    // persists its partial tail before the backend finalizes.
+    let closed = registry
+        .shutdown_close_all(
+            crate::session::SHUTDOWN_DRAIN_TIMEOUT,
+            crate::session::SHUTDOWN_DRAIN_POLL,
+        )
+        .await;
+    if closed > 0 {
+        tracing::info!(closed, "session hosts finalized at shutdown");
+    }
+
+    // `_lifecycle` drop records the shutdown counter as this scope unwinds.
+    tracing::info!("borgd shutdown complete");
+    Ok(())
+}
+
+/// Keep the cost bus in step with live config edits. Supervised rather than
+/// bare-spawned: it is a daemon-lifetime loop, and a swallowed panic here
+/// would silently pin cost accounting to boot-time config — every later
+/// `borg settings set` for pricing or budgets would appear to apply and
+/// quietly not.
+async fn spawn_cost_bus_config_sync(
+    config_watcher: &ConfigWatcher,
+    cost_event_bus: &CostEventBus,
+    orchestrator_token: &tokio_util::sync::CancellationToken,
+) {
     match Database::open().await {
         Ok(db) => {
             let db: crate::supervisor::DbHandle = Arc::new(db);
@@ -262,11 +391,13 @@ pub async fn run(cfg: Config) -> Result<()> {
             );
         }
     }
+}
 
-    // Migration for pre-existing installs: if `user.timezone` was never set
-    // (onboarding ran before host-timezone auto-detection landed), detect it
-    // now so heartbeat quiet hours anchor to local time. Idempotent and
-    // write-once — explicit user values are preserved.
+/// Migration for pre-existing installs: if `user.timezone` was never set
+/// (onboarding ran before host-timezone auto-detection landed), detect it
+/// now so heartbeat quiet hours anchor to local time. Idempotent and
+/// write-once — explicit user values are preserved.
+async fn migrate_user_timezone() {
     if let Ok(db) = Database::open().await {
         match db.get_setting("user.timezone").await {
             Ok(None) => {
@@ -282,8 +413,23 @@ pub async fn run(cfg: Config) -> Result<()> {
             Err(e) => tracing::warn!("borgd: read user.timezone failed: {e}"),
         }
     }
+}
 
-    let extras = match CoreConfig::load_from_db().await {
+/// Start the orchestrator subsystems (gateway, heartbeat, task dispatcher)
+/// and assemble the `AdminExtras` wiring for the Admin RPC layer. A config
+/// load failure disables the orchestrator but never blocks daemon start.
+#[allow(clippy::too_many_arguments)]
+async fn start_orchestrator_extras(
+    registry: &SessionRegistry,
+    config_watcher: &ConfigWatcher,
+    orchestrator_token: &tokio_util::sync::CancellationToken,
+    cost_event_sink: &Arc<dyn CostEventSink>,
+    goal_bus: &crate::goal_bus::GoalEventBus,
+    grpc_web_slot: &gateway::webui::GrpcWebSlot,
+    shutdown_tx: &broadcast::Sender<()>,
+    process_registry: &cortex::process_registry::ProcessRegistry,
+) -> grpc::AdminExtras {
+    match CoreConfig::load_from_db().await {
         Ok(core_config) => {
             // Tunnel supervisor — points at the gateway's bind address so
             // the tunnel forwards traffic to the right local origin. The
@@ -341,13 +487,36 @@ pub async fn run(cfg: Config) -> Result<()> {
                 tunnel_supervisor: None,
             }
         }
-    };
-    // ── PKI bootstrap ──
-    //
-    // Mint root CA + server cert on first run; load from DB+keychain on
-    // subsequent starts. We open a daemon-owned `Database` here and wrap it
-    // in `Arc<Mutex>` so the AuditWriter and Pki service share the single
-    // writer with the audit chain.
+    }
+}
+
+/// Everything the PKI bootstrap phase produces for the rest of startup.
+struct PkiBootstrap {
+    /// Shared DB writer for the AuditWriter and Pki service.
+    pki_db: Arc<tokio::sync::Mutex<Database>>,
+    /// Resolved KEK backend for cert-key wrapping.
+    kek: Arc<dyn identity::KekStore>,
+    /// Root CA certificate PEM.
+    ca_cert_pem: String,
+    /// Root CA private-key PEM.
+    ca_key_pem: String,
+    /// SAN DNS names the server cert was minted for.
+    san_dns: Vec<String>,
+    /// Serial of the server cert this process serves.
+    server_serial: i64,
+    /// TLS material for the mTLS TCP listener.
+    server_tls_material: ServerCertMaterial,
+    /// Whether `discovery.mdns_enabled` was set at bootstrap.
+    mdns_enabled: bool,
+}
+
+/// ── PKI bootstrap ──
+///
+/// Mint root CA + server cert on first run; load from DB+keychain on
+/// subsequent starts. We open a daemon-owned `Database` here and wrap it
+/// in `Arc<Mutex>` so the AuditWriter and Pki service share the single
+/// writer with the audit chain.
+async fn bootstrap_pki(borg_home: &Path, listen_tcp: Option<&str>) -> Result<PkiBootstrap> {
     let db_for_pki = Database::open()
         .await
         .context("opening DB for PKI bootstrap")?;
@@ -361,7 +530,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             .await
             .context("loading config for KEK backend selection")?;
         let g = pki_db.lock().await;
-        build_kek_store(&cfg.borg_home, &pki_cfg, &g)
+        build_kek_store(borg_home, &pki_cfg, &g)
             .await
             .context("build KEK store")?
     };
@@ -380,7 +549,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         .await
         .map(|c| c.discovery.mdns_enabled)
         .unwrap_or(false);
-    let san_dns = derive_server_san_with_mdns(cfg.listen_tcp.as_deref(), mdns_enabled, || {
+    let san_dns = derive_server_san_with_mdns(listen_tcp, mdns_enabled, || {
         hostname::get()
             .ok()
             .and_then(|os| os.into_string().ok())
@@ -388,7 +557,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             .filter(|h| !h.is_empty())
     })
     .context("derive server cert SAN")?;
-    let (server_cert_pem, server_key_pem, _server_serial) = {
+    let (server_cert_pem, server_key_pem, server_serial) = {
         let g = pki_db.lock().await;
         ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
             .await
@@ -399,275 +568,264 @@ pub async fn run(cfg: Config) -> Result<()> {
         server_key_pem: server_key_pem.clone(),
         ca_cert_pem: ca_cert_pem.clone(),
     };
+    Ok(PkiBootstrap {
+        pki_db,
+        kek,
+        ca_cert_pem,
+        ca_key_pem,
+        san_dns,
+        server_serial,
+        server_tls_material,
+        mdns_enabled,
+    })
+}
 
-    // Keep the stored leaf fresh while the daemon runs.
-    //
-    // `ensure_server_cert` renews inside a 14-day window, but it only ran here
-    // at startup — so a daemon up past ~76 days (leaf validity is 90) never
-    // renewed, and on day 90 every mTLS handshake began failing until someone
-    // restarted it. Long-lived VPS deployments are exactly the target of the
-    // file-KEK/headless path, so "it'll get restarted eventually" is not a
-    // safe assumption.
-    //
-    // Residual limitation, deliberate: the running server serves the TLS
-    // material captured above, so a renewal here does NOT hot-swap the live
-    // listener — tonic's TLS config is fixed at build time and reworking it
-    // would mean touching the guarded mTLS construction path. What this does
-    // guarantee is that the *stored* cert is always current, so any restart
-    // picks up a valid one, and that the operator is told loudly and early
-    // rather than discovering it as handshake failures.
-    {
-        let renew_db = pki_db.clone();
-        let renew_kek = kek.clone();
-        let renew_ca_cert = ca_cert_pem.clone();
-        let renew_ca_key = ca_key_pem.clone();
-        let renew_san = san_dns.clone();
-        let renew_serving_serial = _server_serial;
-        let renew_token = orchestrator_token.clone();
-        match Database::open().await {
-            Ok(db) => {
-                let sup_db: crate::supervisor::DbHandle = Arc::new(db);
-                crate::supervisor::spawn_supervised(
-                    crate::supervisor::SupervisorConfig::new("server-cert-renewal"),
-                    orchestrator_token.clone(),
-                    sup_db,
-                    move || {
-                        let cancel = renew_token.clone();
-                        let pki_db = renew_db.clone();
-                        let kek = renew_kek.clone();
-                        let ca_cert = renew_ca_cert.clone();
-                        let ca_key = renew_ca_key.clone();
-                        let san = renew_san.clone();
-                        async move {
-                            const CHECK_INTERVAL: std::time::Duration =
-                                std::time::Duration::from_secs(24 * 60 * 60);
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
-                                    _ = tokio::time::sleep(CHECK_INTERVAL) => {}
+/// Keep the stored leaf fresh while the daemon runs.
+///
+/// `ensure_server_cert` renews inside a 14-day window, but it only ran at
+/// startup — so a daemon up past ~76 days (leaf validity is 90) never
+/// renewed, and on day 90 every mTLS handshake began failing until someone
+/// restarted it. Long-lived VPS deployments are exactly the target of the
+/// file-KEK/headless path, so "it'll get restarted eventually" is not a
+/// safe assumption.
+///
+/// Residual limitation, deliberate: the running server serves the TLS
+/// material captured at bootstrap, so a renewal here does NOT hot-swap the
+/// live listener — tonic's TLS config is fixed at build time and reworking it
+/// would mean touching the guarded mTLS construction path. What this does
+/// guarantee is that the *stored* cert is always current, so any restart
+/// picks up a valid one, and that the operator is told loudly and early
+/// rather than discovering it as handshake failures.
+async fn spawn_cert_renewal(
+    pki: &PkiBootstrap,
+    orchestrator_token: &tokio_util::sync::CancellationToken,
+) {
+    let renew_db = pki.pki_db.clone();
+    let renew_kek = pki.kek.clone();
+    let renew_ca_cert = pki.ca_cert_pem.clone();
+    let renew_ca_key = pki.ca_key_pem.clone();
+    let renew_san = pki.san_dns.clone();
+    let renew_serving_serial = pki.server_serial;
+    let renew_token = orchestrator_token.clone();
+    match Database::open().await {
+        Ok(db) => {
+            let sup_db: crate::supervisor::DbHandle = Arc::new(db);
+            crate::supervisor::spawn_supervised(
+                crate::supervisor::SupervisorConfig::new("server-cert-renewal"),
+                orchestrator_token.clone(),
+                sup_db,
+                move || {
+                    let cancel = renew_token.clone();
+                    let pki_db = renew_db.clone();
+                    let kek = renew_kek.clone();
+                    let ca_cert = renew_ca_cert.clone();
+                    let ca_key = renew_ca_key.clone();
+                    let san = renew_san.clone();
+                    async move {
+                        const CHECK_INTERVAL: std::time::Duration =
+                            std::time::Duration::from_secs(24 * 60 * 60);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => return Ok::<(), anyhow::Error>(()),
+                                _ = tokio::time::sleep(CHECK_INTERVAL) => {}
+                            }
+                            let renewed = {
+                                let g = pki_db.lock().await;
+                                ensure_server_cert(&g, kek.as_ref(), &ca_cert, &ca_key, &san).await
+                            };
+                            match renewed {
+                                Ok((_, _, serial)) if serial != renew_serving_serial => {
+                                    tracing::error!(
+                                        new_serial = serial,
+                                        serving_serial = renew_serving_serial,
+                                        "server certificate was renewed, but this process is \
+                                         still serving the previous one — restart borgd to \
+                                         pick it up before the old cert expires"
+                                    );
                                 }
-                                let renewed = {
-                                    let g = pki_db.lock().await;
-                                    ensure_server_cert(&g, kek.as_ref(), &ca_cert, &ca_key, &san)
-                                        .await
-                                };
-                                match renewed {
-                                    Ok((_, _, serial)) if serial != renew_serving_serial => {
-                                        tracing::error!(
-                                            new_serial = serial,
-                                            serving_serial = renew_serving_serial,
-                                            "server certificate was renewed, but this process is \
-                                             still serving the previous one — restart borgd to \
-                                             pick it up before the old cert expires"
-                                        );
-                                    }
-                                    Ok(_) => {
-                                        tracing::debug!("server certificate still current");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "server cert renewal check failed");
-                                    }
+                                Ok(_) => {
+                                    tracing::debug!("server certificate still current");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "server cert renewal check failed");
                                 }
                             }
                         }
-                    },
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "borgd: server-cert renewal check not started (DB unavailable); \
-                     a daemon running past the cert's validity window will fail mTLS handshakes"
-                );
-            }
+                    }
+                },
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "borgd: server-cert renewal check not started (DB unavailable); \
+                 a daemon running past the cert's validity window will fail mTLS handshakes"
+            );
         }
     }
-    let audit = AuditWriter::new(pki_db.clone());
-    // Install the process-global audit writer so library call sites that
-    // can't easily plumb an `AuditWriter` (shell-policy denial path,
-    // settings resolver, …) can emit through the same chain. This must
-    // happen before DAEMON_START so the install order is observable in
-    // tests if it ever regresses.
-    cortex::db::install_global_audit(audit.clone());
+}
 
-    // Install the process-global output-redaction policy. This is what
-    // strips detected secrets from agent output before it reaches a
-    // channel, the TUI transcript, or `~/.borg/logs/`. Gated by the
-    // `security.output_redaction` setting (default true, security-first).
-    // A spawned watcher reinstalls the policy whenever the setting flips
-    // so /settings → toggle takes effect on the next message without a
-    // daemon restart.
-    // `output_redaction::RedactionPolicy::from_db` expects an
-    // `Arc<std::sync::Mutex<Database>>` (its audit closure briefly snapshots
-    // the libsql `Connection` under the sync lock and drops the guard before
-    // awaiting). Open a dedicated handle so we don't have to thread the
-    // wider `tokio::sync::Mutex<Database>` through that closure signature.
+/// Install the process-global output-redaction policy. This is what
+/// strips detected secrets from agent output before it reaches a
+/// channel, the TUI transcript, or `~/.borg/logs/`. Gated by the
+/// `security.output_redaction` setting (default true, security-first).
+/// A spawned watcher reinstalls the policy whenever the setting flips
+/// so /settings → toggle takes effect on the next message without a
+/// daemon restart.
+///
+/// `output_redaction::RedactionPolicy::from_db` expects an
+/// `Arc<std::sync::Mutex<Database>>` (its audit closure briefly snapshots
+/// the libsql `Connection` under the sync lock and drops the guard before
+/// awaiting). Open a dedicated handle so we don't have to thread the
+/// wider `tokio::sync::Mutex<Database>` through that closure signature.
+async fn install_redaction_policy(config_watcher: &ConfigWatcher) -> Result<()> {
     let redaction_db = Database::open()
         .await
         .context("opening DB for redaction policy")?;
     let redaction_db_handle = Arc::new(Mutex::new(redaction_db));
-    {
-        let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
-        cortex::output_redaction::install_global(
-            cortex::output_redaction::RedactionPolicy::from_db(
-                core_cfg.security.output_redaction,
-                redaction_db_handle.clone(),
-            ),
-        );
-        let mut rx = config_watcher.subscribe();
-        let db_for_policy = redaction_db_handle.clone();
-        tokio::spawn(async move {
-            let mut current = core_cfg.security.output_redaction;
-            loop {
-                if rx.changed().await.is_err() {
-                    return;
-                }
-                let next = rx.borrow().security.output_redaction;
-                if next != current {
-                    cortex::output_redaction::install_global(
-                        cortex::output_redaction::RedactionPolicy::from_db(
-                            next,
-                            db_for_policy.clone(),
-                        ),
-                    );
-                    current = next;
-                }
+    let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
+    cortex::output_redaction::install_global(cortex::output_redaction::RedactionPolicy::from_db(
+        core_cfg.security.output_redaction,
+        redaction_db_handle.clone(),
+    ));
+    let mut rx = config_watcher.subscribe();
+    let db_for_policy = redaction_db_handle.clone();
+    tokio::spawn(async move {
+        let mut current = core_cfg.security.output_redaction;
+        loop {
+            if rx.changed().await.is_err() {
+                return;
             }
-        });
-    }
-
-    audit
-        .emit(
-            audit_events::DAEMON_START,
-            "system",
-            &json!({"pid": std::process::id()}),
-        )
-        .await;
-
-    // Bootstrap MCP sessions before serving any traffic. `initialize`
-    // returns `Ok(())` immediately when `mcp.enabled = false`, and on
-    // per-server connect failures it logs + writes `mcp_server_failed`
-    // audit rows without aborting daemon start — borg always boots.
-    //
-    // Without this call, configured MCP servers stay dark until an
-    // operator triggers the explicit `reload_from_config` admin RPC.
-    // That was the actual symptom: `mcp.enabled=true` + `borg mcp test`
-    // succeeded standalone (test path is hermetic), but the LLM never
-    // saw `mcp_*` tools because no session was ever installed in the
-    // daemon process.
-    //
-    // Hot-reload runs in a spawned task: when the operator flips
-    // `mcp.enabled` / `mcp.disabled_servers` / `mcp.servers` we
-    // re-`reload_from_config` so the diff lands without a daemon
-    // restart.
-    {
-        let mcp_cfg = initial_core_config.clone();
-        if let Err(e) = cortex::mcp_clients::initialize(&mcp_cfg).await {
-            tracing::warn!(error = %e, "mcp_clients::initialize failed (continuing without MCP)");
+            let next = rx.borrow().security.output_redaction;
+            if next != current {
+                cortex::output_redaction::install_global(
+                    cortex::output_redaction::RedactionPolicy::from_db(next, db_for_policy.clone()),
+                );
+                current = next;
+            }
         }
-        let mut rx = config_watcher.subscribe();
-        tokio::spawn(async move {
-            loop {
-                if rx.changed().await.is_err() {
-                    return;
-                }
-                let next = rx.borrow().clone();
-                match cortex::mcp_clients::reload_from_config(&next).await {
-                    Ok(report) => {
-                        if !report.added.is_empty()
-                            || !report.removed.is_empty()
-                            || !report.failed.is_empty()
-                        {
-                            tracing::info!(
-                                added = ?report.added,
-                                removed = ?report.removed,
-                                unchanged = report.unchanged,
-                                failed = ?report.failed,
-                                total_tools = report.total_tools,
-                                "mcp_clients: hot-reload applied",
-                            );
-                        }
+    });
+    Ok(())
+}
+
+/// Bootstrap MCP sessions and start the hot-reload watcher. Per-server
+/// connect failures log + audit without aborting daemon start — borg
+/// always boots.
+async fn init_mcp_clients(initial_core_config: &CoreConfig, config_watcher: &ConfigWatcher) {
+    let mcp_cfg = initial_core_config.clone();
+    if let Err(e) = cortex::mcp_clients::initialize(&mcp_cfg).await {
+        tracing::warn!(error = %e, "mcp_clients::initialize failed (continuing without MCP)");
+    }
+    let mut rx = config_watcher.subscribe();
+    tokio::spawn(async move {
+        loop {
+            if rx.changed().await.is_err() {
+                return;
+            }
+            let next = rx.borrow().clone();
+            match cortex::mcp_clients::reload_from_config(&next).await {
+                Ok(report) => {
+                    if !report.added.is_empty()
+                        || !report.removed.is_empty()
+                        || !report.failed.is_empty()
+                    {
+                        tracing::info!(
+                            added = ?report.added,
+                            removed = ?report.removed,
+                            unchanged = report.unchanged,
+                            failed = ?report.failed,
+                            total_tools = report.total_tools,
+                            "mcp_clients: hot-reload applied",
+                        );
                     }
-                    Err(e) => tracing::warn!(error = %e, "mcp_clients hot-reload failed"),
                 }
+                Err(e) => tracing::warn!(error = %e, "mcp_clients hot-reload failed"),
             }
-        });
-    }
-
-    // Wire shutdown-signal forwarding now that the audit writer is available.
-    // `forward_signals_to` blocks on the first signal, emits DAEMON_STOP, and
-    // then broadcasts the shutdown so listeners drain.
-    tokio::spawn(forward_signals_to(shutdown_tx.clone(), audit.clone()));
-
-    // Reconcile security posture against live config before serving any
-    // traffic. On a fresh DB this writes the bootstrap event;
-    // on a restart with no config change it's a no-op. Failures are
-    // logged and do NOT block daemon startup — XP writes will fall back
-    // to `Default × 1.00` with `FallbackReason::PostureUndetermined`.
-    {
-        let g = pki_db.lock().await;
-        let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
-        match cortex::evolution::security::maybe_emit_posture_change(
-            &g,
-            &core_cfg,
-            cortex::evolution::security::PostureSource::DaemonStartReconcile,
-        )
-        .await
-        {
-            Ok(cortex::evolution::security::EmitOutcome::Emitted {
-                state, previous, ..
-            }) => {
-                // Transition is already logged at INFO inside
-                // cortex::evolution::security::emit — only broadcast here.
-                let text = format_posture_transition(previous, state);
-                registry.broadcast_system_notice("posture", &text);
-            }
-            Ok(_) => {} // Unchanged or RateLimited — quiet success.
-            Err(e) => tracing::warn!("posture reconcile on startup failed: {e}"),
         }
-    }
+    });
+}
 
-    // Bootstrap pairing socket (plaintext, on its own UDS path). Always-on
-    // — code-validity gating happens inside the handshake (consume_pairing_code
-    // rejects unknown/expired/used codes). Cheaper than gating socket bind on
-    // active code count and no functional difference.
-    let pair_sock = paths::pairing_socket_path(&cfg.borg_home);
+/// Reconcile security posture against live config before serving any
+/// traffic. On a fresh DB this writes the bootstrap event; on a restart
+/// with no config change it's a no-op. Failures are logged and do NOT
+/// block daemon startup — XP writes will fall back to `Default × 1.00`
+/// with `FallbackReason::PostureUndetermined`.
+async fn reconcile_startup_posture(
+    pki_db: &Arc<tokio::sync::Mutex<Database>>,
+    registry: &SessionRegistry,
+) {
+    let g = pki_db.lock().await;
+    let core_cfg = CoreConfig::load_from_db().await.unwrap_or_default();
+    match cortex::evolution::security::maybe_emit_posture_change(
+        &g,
+        &core_cfg,
+        cortex::evolution::security::PostureSource::DaemonStartReconcile,
+    )
+    .await
+    {
+        Ok(cortex::evolution::security::EmitOutcome::Emitted {
+            state, previous, ..
+        }) => {
+            // Transition is already logged at INFO inside
+            // cortex::evolution::security::emit — only broadcast here.
+            let text = format_posture_transition(previous, state);
+            registry.broadcast_system_notice("posture", &text);
+        }
+        Ok(_) => {} // Unchanged or RateLimited — quiet success.
+        Err(e) => tracing::warn!("posture reconcile on startup failed: {e}"),
+    }
+}
+
+/// Bootstrap pairing socket (plaintext, on its own UDS path). Always-on
+/// — code-validity gating happens inside the handshake (consume_pairing_code
+/// rejects unknown/expired/used codes). Cheaper than gating socket bind on
+/// active code count and no functional difference.
+fn spawn_pairing_listener(
+    borg_home: &Path,
+    pki_db: &Arc<tokio::sync::Mutex<Database>>,
+    audit: &AuditWriter,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) {
+    let pair_sock = paths::pairing_socket_path(borg_home);
     let bootstrap_state = BootstrapState {
         db: pki_db.clone(),
         audit: audit.clone(),
-        ca_cert_pem: ca_cert_pem.clone(),
-        ca_key_pem: ca_key_pem.clone(),
+        ca_cert_pem: ca_cert_pem.to_string(),
+        ca_key_pem: ca_key_pem.to_string(),
     };
-    {
-        let listener = BootstrapListener::new(pair_sock.clone());
-        tokio::spawn(async move {
-            if let Err(e) = listener.serve(bootstrap_state).await {
-                tracing::warn!(error = %e, "pairing bootstrap listener exited");
-            }
-        });
-    }
+    let listener = BootstrapListener::new(pair_sock.clone());
+    tokio::spawn(async move {
+        if let Err(e) = listener.serve(bootstrap_state).await {
+            tracing::warn!(error = %e, "pairing bootstrap listener exited");
+        }
+    });
+}
 
-    let services = grpc::build_services_with_extras(
-        registry.clone(),
-        factory,
-        capability_router,
-        cost_event_bus.clone(),
-        extras,
-    );
-
-    // Browser surface: a subset of the services above, wrapped for gRPC-Web.
-    // See `grpc_web::build_grpc_web_router` for why Capability and Pki are out.
-    grpc_web_slot.install(crate::grpc_web::build_grpc_web_router(&services));
-
+/// Serve the UDS (and optional mTLS TCP) transports until shutdown.
+///
+/// UDS router: filesystem permissions (0600) provide isolation; no TLS,
+/// no auth interceptor. CLI on the same machine connects here.
+///
+/// INVARIANT: every service registered on the UDS router MUST also be
+/// registered on the TCP router — adding a service to only one path silently
+/// exposes (or hides) it depending on which transport is active.
+#[allow(clippy::too_many_arguments)]
+async fn serve_transports(
+    uds: UnixListener,
+    listen_tcp: Option<String>,
+    shutdown_tx: &broadcast::Sender<()>,
+    services: &grpc::Services,
+    pki_db: &Arc<tokio::sync::Mutex<Database>>,
+    audit: &AuditWriter,
+    ca_cert_pem: String,
+    ca_key_pem: String,
+    server_tls_material: &ServerCertMaterial,
+    mdns_enabled: bool,
+) -> Result<()> {
     let uds_stream = UnixListenerStream::new(uds);
 
-    // UDS router: filesystem permissions (0600) provide isolation; no TLS,
-    // no auth interceptor. CLI on the same machine connects here.
-    //
-    // INVARIANT: every service registered here MUST also be registered on the
-    // TCP router below — adding a service to only one path silently exposes
-    // (or hides) it depending on which transport is active.
     let make_uds_router = || {
         tonic::transport::Server::builder()
             .add_service(services.status.clone())
@@ -683,7 +841,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             )))
     };
 
-    if let Some(addr) = cfg.listen_tcp {
+    if let Some(addr) = listen_tcp {
         let parsed: std::net::SocketAddr = addr
             .parse()
             .with_context(|| format!("parsing --listen address `{addr}`"))?;
@@ -700,7 +858,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let verifier = build_verifier(verifier_kind, pki_db.clone(), None)
             .await
             .context("build verifier for TCP listener")?;
-        let tls_cfg = build_server_tls_config(&server_tls_material)
+        let tls_cfg = build_server_tls_config(server_tls_material)
             .context("build server TLS config for TCP listener")?;
 
         let interceptor = auth_interceptor(verifier, audit.clone());
@@ -738,29 +896,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
         tracing::info!(addr = %parsed, "TCP listener with mTLS enabled");
 
-        // mDNS announce — only when enabled AND the bind is non-loopback
-        // (loopback peers can't reach a `.local` advertisement). The
-        // announcer holds an mdns-sd ServiceDaemon that drains on shutdown;
-        // we keep ownership in the function scope so it lives as long as
-        // the listener and we can `shutdown()` it explicitly.
-        let mdns_announcer = if mdns_enabled && !parsed.ip().is_loopback() {
-            match maybe_announce_mdns(
-                server_tls_material.server_cert_pem.as_bytes(),
-                parsed.port(),
-            )
-            .await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
-                        "mdns: announce skipped ({e}); LAN discovery disabled for this run"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let mdns_announcer = start_mdns_announcer(mdns_enabled, parsed, server_tls_material).await;
 
         let mut uds_rx = shutdown_tx.subscribe();
         let mut tcp_rx = shutdown_tx.subscribe();
@@ -786,27 +922,35 @@ pub async fn run(cfg: Config) -> Result<()> {
             .await
             .context("UDS server")?;
     }
-
-    // Drain-then-finalize. The transports above have stopped, but gateway- and
-    // heartbeat-driven turns run on spawned tasks that no listener waits for —
-    // returning now would drop them mid-stream (losing the turn's tail) and
-    // skip every session's end-of-session work (short-term-memory flush, lease
-    // release). Wait bounded for in-flight turns to settle, THEN close every
-    // live host; a turn still running at the ceiling is cancelled, which
-    // persists its partial tail before the backend finalizes.
-    let closed = registry
-        .shutdown_close_all(
-            crate::session::SHUTDOWN_DRAIN_TIMEOUT,
-            crate::session::SHUTDOWN_DRAIN_POLL,
-        )
-        .await;
-    if closed > 0 {
-        tracing::info!(closed, "session hosts finalized at shutdown");
-    }
-
-    // `_lifecycle` drop records the shutdown counter as this scope unwinds.
-    tracing::info!("borgd shutdown complete");
     Ok(())
+}
+
+/// mDNS announce — only when enabled AND the bind is non-loopback
+/// (loopback peers can't reach a `.local` advertisement). The
+/// announcer holds an mdns-sd ServiceDaemon that drains on shutdown;
+/// the caller keeps ownership so it lives as long as the listener and
+/// can `shutdown()` it explicitly.
+async fn start_mdns_announcer(
+    mdns_enabled: bool,
+    parsed: std::net::SocketAddr,
+    server_tls_material: &ServerCertMaterial,
+) -> Option<MdnsAnnouncer> {
+    if mdns_enabled && !parsed.ip().is_loopback() {
+        match maybe_announce_mdns(
+            server_tls_material.server_cert_pem.as_bytes(),
+            parsed.port(),
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("mdns: announce skipped ({e}); LAN discovery disabled for this run");
+                None
+            }
+        }
+    } else {
+        None
+    }
 }
 
 /// Resolve hostname + cert fingerprint + bind IPs and publish an mDNS
