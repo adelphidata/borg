@@ -141,6 +141,76 @@ fn screenshot_output(
     )
 }
 
+/// Lazy-launch (or connect to) a browser session. Backend precedence:
+///   1. An explicit CDP attach URL wins (operator ran `/browser connect`).
+///   2. A remote cloud backend (browserbase / browser_use / firecrawl)
+///      creates a session and hands us its CDP endpoint to connect to.
+///   3. Otherwise launch a local browser for the configured engine.
+async fn open_browser_session(config: &Config) -> anyhow::Result<BrowserSession> {
+    let (mut s, remote) = if let Some(url) = config.browser.cdp_url.as_deref() {
+        (BrowserSession::connect(&config.browser, url).await?, None)
+    } else if config.browser.backend == crate::config::BrowserBackend::CdpAttach {
+        // backend=cdp_attach means "attach to an operator-managed browser",
+        // but no browser.cdp_url is set to attach to. Silently launching a
+        // fresh local Chrome would ignore the operator's intent (a different
+        // profile with no cookies), so surface the misconfiguration.
+        anyhow::bail!(
+            "browser.backend is 'cdp_attach' but browser.cdp_url is not set. \
+             Set browser.cdp_url (or run `/browser connect <url>`), or switch \
+             browser.backend to 'local' to launch a managed browser."
+        )
+    } else {
+        match crate::browser::backends::create_remote_session(
+            &config.browser,
+            &config.security.url_policy,
+        )
+        .await?
+        {
+            Some(remote) => {
+                match BrowserSession::connect(&config.browser, &remote.cdp_url).await {
+                    Ok(s) => (s, Some(remote)),
+                    Err(e) => {
+                        // The provider already created (and is billing) the
+                        // session; release it before surfacing the connect
+                        // error so we don't leak a keep-alive session.
+                        crate::browser::backends::close_remote_session(&config.browser, &remote)
+                            .await;
+                        return Err(e);
+                    }
+                }
+            }
+            None => (BrowserSession::launch(&config.browser).await?, None),
+        }
+    };
+    if let Some(remote) = remote {
+        s.attach_remote(remote);
+    }
+    Ok(s)
+}
+
+/// Explain a failed session open, with a next-action hint matched to the
+/// configured backend.
+fn browser_open_error_hint(config: &Config, e: &anyhow::Error) -> String {
+    if let Some(url) = config.browser.cdp_url.as_deref() {
+        format!(
+            "Error opening browser session via CDP at {url}: {e}\n\
+             Hint: the configured browser may have exited or stopped serving CDP. \
+             Run `/browser disconnect` to revert to headless, or relaunch the browser \
+             with --remote-debugging-port and retry `/browser connect`."
+        )
+    } else if config.browser.backend.is_remote() {
+        format!(
+            "Error opening remote browser session via '{backend}': {e}\n\
+             Hint: verify browser.{backend}_api_key (and, for browserbase, \
+             browser.browserbase_project_id) are set correctly, or switch \
+             browser.backend back to 'local'.",
+            backend = config.browser.backend
+        )
+    } else {
+        format!("Error launching browser: {e}")
+    }
+}
+
 #[instrument(skip_all, fields(tool.name = "browser"))]
 pub async fn handle_browser(
     args: &serde_json::Value,
@@ -209,83 +279,10 @@ pub async fn handle_browser(
         }
     }
 
-    // Lazy-launch (or connect to) a browser session. Backend precedence:
-    //   1. An explicit CDP attach URL wins (operator ran `/browser connect`).
-    //   2. A remote cloud backend (browserbase / browser_use / firecrawl)
-    //      creates a session and hands us its CDP endpoint to connect to.
-    //   3. Otherwise launch a local browser for the configured engine.
     if session.is_none() {
-        let outcome = if let Some(url) = config.browser.cdp_url.as_deref() {
-            BrowserSession::connect(&config.browser, url)
-                .await
-                .map(|s| (s, None))
-        } else if config.browser.backend == crate::config::BrowserBackend::CdpAttach {
-            // backend=cdp_attach means "attach to an operator-managed browser",
-            // but no browser.cdp_url is set to attach to. Silently launching a
-            // fresh local Chrome would ignore the operator's intent (a different
-            // profile with no cookies), so surface the misconfiguration.
-            Err(anyhow::anyhow!(
-                "browser.backend is 'cdp_attach' but browser.cdp_url is not set. \
-                 Set browser.cdp_url (or run `/browser connect <url>`), or switch \
-                 browser.backend to 'local' to launch a managed browser."
-            ))
-        } else {
-            match crate::browser::backends::create_remote_session(
-                &config.browser,
-                &config.security.url_policy,
-            )
-            .await
-            {
-                Ok(Some(remote)) => {
-                    match BrowserSession::connect(&config.browser, &remote.cdp_url).await {
-                        Ok(s) => Ok((s, Some(remote))),
-                        Err(e) => {
-                            // The provider already created (and is billing) the
-                            // session; release it before surfacing the connect
-                            // error so we don't leak a keep-alive session.
-                            crate::browser::backends::close_remote_session(
-                                &config.browser,
-                                &remote,
-                            )
-                            .await;
-                            Err(e)
-                        }
-                    }
-                }
-                Ok(None) => BrowserSession::launch(&config.browser)
-                    .await
-                    .map(|s| (s, None)),
-                Err(e) => Err(e),
-            }
-        };
-        match outcome {
-            Ok((mut s, remote)) => {
-                if let Some(remote) = remote {
-                    s.attach_remote(remote);
-                }
-                *session = Some(s);
-            }
-            Err(e) => {
-                let hint = if let Some(url) = config.browser.cdp_url.as_deref() {
-                    format!(
-                        "Error opening browser session via CDP at {url}: {e}\n\
-                         Hint: the configured browser may have exited or stopped serving CDP. \
-                         Run `/browser disconnect` to revert to headless, or relaunch the browser \
-                         with --remote-debugging-port and retry `/browser connect`."
-                    )
-                } else if config.browser.backend.is_remote() {
-                    format!(
-                        "Error opening remote browser session via '{backend}': {e}\n\
-                         Hint: verify browser.{backend}_api_key (and, for browserbase, \
-                         browser.browserbase_project_id) are set correctly, or switch \
-                         browser.backend back to 'local'.",
-                        backend = config.browser.backend
-                    )
-                } else {
-                    format!("Error launching browser: {e}")
-                };
-                return Ok(ToolOutput::Text(hint));
-            }
+        match open_browser_session(config).await {
+            Ok(s) => *session = Some(s),
+            Err(e) => return Ok(ToolOutput::Text(browser_open_error_hint(config, &e))),
         }
     }
 

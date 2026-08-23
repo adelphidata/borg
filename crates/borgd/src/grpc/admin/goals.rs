@@ -224,178 +224,21 @@ pub(super) async fn set_goal(
         match op {
             GoalMutationOp::Unspecified => unreachable!(),
             GoalMutationOp::Create => {
-                let obj = cortex::goals::validate_objective(&objective)
-                    .map_err(SetGoalError::Invalid)?;
-                let budget = cortex::goals::validate_budget(token_budget, max_budget)
-                    .map_err(SetGoalError::Invalid)?;
-                let inserted = db
-                    .insert_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
-                    .await
-                    .map_err(SetGoalError::Internal)?;
-                let goal = inserted.ok_or_else(|| {
-                    SetGoalError::AlreadyExists("goal already exists for this session".into())
-                })?;
-                Ok(SetGoalOutcome {
-                    goal: Some(goal),
-                    kind: cortex::goals::event_kind::CREATED,
-                })
+                apply_goal_create(&db, &session_id, &objective, token_budget, max_budget).await
             }
             GoalMutationOp::Replace => {
-                let obj = cortex::goals::validate_objective(&objective)
-                    .map_err(SetGoalError::Invalid)?;
-                let budget = cortex::goals::validate_budget(token_budget, max_budget)
-                    .map_err(SetGoalError::Invalid)?;
-                let existed = db
-                    .get_goal(&session_id)
-                    .await
-                    .map_err(SetGoalError::Internal)?
-                    .is_some();
-                let g = db
-                    .replace_goal(&session_id, &obj, cortex::goals::GoalStatus::Active, budget)
-                    .await
-                    .map_err(SetGoalError::Internal)?;
-                Ok(SetGoalOutcome {
-                    goal: Some(g),
-                    kind: if existed {
-                        cortex::goals::event_kind::REPLACED
-                    } else {
-                        cortex::goals::event_kind::CREATED
-                    },
-                })
+                apply_goal_replace(&db, &session_id, &objective, token_budget, max_budget).await
             }
-            GoalMutationOp::SetStatus => {
-                let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
-                    .ok_or_else(|| {
-                        SetGoalError::Invalid(format!(
-                            "status must be one of active|paused|complete (got {status_raw:?}); blocked and budget_limited are system-only"
-                        ))
-                    })?;
-                if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
-                    return Err(SetGoalError::Invalid(
-                        "budget_limited is system-only; cannot be set via RPC".into(),
-                    ));
-                }
-                if matches!(new_status, cortex::goals::GoalStatus::Blocked) {
-                    return Err(SetGoalError::Invalid(
-                        "blocked is agent-only; cannot be set via RPC".into(),
-                    ));
-                }
-                let current = db
-                    .get_goal(&session_id)
-                    .await
-                    .map_err(SetGoalError::Internal)?
-                    .ok_or_else(|| {
-                        SetGoalError::Precondition("no goal set for this session".into())
-                    })?;
-                use cortex::goals::GoalStatus as S;
-                let allowed = matches!(
-                    (current.status, new_status),
-                    (S::Active, S::Paused)
-                        | (S::Paused, S::Active)
-                        | (S::Active, S::Complete)
-                        | (S::Paused, S::Complete)
-                        | (S::BudgetLimited, S::Complete)
-                        // Blocked is set by the agent; the user resumes
-                        // it back to Active or marks it Complete.
-                        | (S::Blocked, S::Active)
-                        | (S::Blocked, S::Complete)
-                );
-                if !allowed {
-                    return Err(SetGoalError::Invalid(format!(
-                        "illegal transition {} -> {}",
-                        current.status.as_str(),
-                        new_status.as_str()
-                    )));
-                }
-                let updated = db
-                    .update_goal(
-                        &session_id,
-                        cortex::db::GoalUpdate {
-                            status: Some(new_status),
-                            expected_goal_id: Some(current.goal_id),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(SetGoalError::Internal)?;
-                let goal = updated.ok_or_else(|| {
-                    SetGoalError::Precondition(
-                        "goal changed concurrently during status update".into(),
-                    )
-                })?;
-                // Returning to Active grants a fresh retry budget. A gate that
-                // exhausted its budget tells the operator to `/goal resume`;
-                // without this the first run after resuming re-reaches the cap
-                // and re-pauses immediately, making that advice a lie.
-                if goal.status == cortex::goals::GoalStatus::Active {
-                    if let Err(e) = db.reset_goal_gate_attempts(&session_id).await {
-                        tracing::warn!("resetting goal gate attempts on resume failed: {e}");
-                    }
-                }
-                let kind = if goal.status == cortex::goals::GoalStatus::Complete {
-                    cortex::goals::event_kind::COMPLETED
-                } else {
-                    cortex::goals::event_kind::STATUS_CHANGED
-                };
-                Ok(SetGoalOutcome {
-                    goal: Some(goal),
-                    kind,
-                })
-            }
+            GoalMutationOp::SetStatus => apply_goal_status(&db, &session_id, &status_raw).await,
             GoalMutationOp::SetBudget => {
-                let budget = cortex::goals::validate_budget(token_budget, max_budget)
-                    .map_err(SetGoalError::Invalid)?;
-                let current = db
-                    .get_goal(&session_id)
-                    .await
-                    .map_err(SetGoalError::Internal)?
-                    .ok_or_else(|| {
-                        SetGoalError::Precondition("no goal set for this session".into())
-                    })?;
-                // Re-evaluate the budget-limit invariant (limited iff the new
-                // budget is finite and already met) so a budget change resumes
-                // or limits the goal instead of silently leaving it stuck. Only
-                // the Active<->BudgetLimited pair is auto-flipped; Paused,
-                // Blocked, and Complete are user/agent states we never override
-                // here. Raising the cap on a BudgetLimited goal is the sole way
-                // to resume it — SetStatus has no BudgetLimited->Active edge.
-                use cortex::goals::GoalStatus as S;
-                let over_budget = budget.is_some_and(|b| current.tokens_used >= b);
-                let new_status = match current.status {
-                    S::Active if over_budget => Some(S::BudgetLimited),
-                    S::BudgetLimited if !over_budget => Some(S::Active),
-                    _ => None,
-                };
-                let updated = db
-                    .update_goal(
-                        &session_id,
-                        cortex::db::GoalUpdate {
-                            token_budget: Some(budget),
-                            status: new_status,
-                            expected_goal_id: Some(current.goal_id),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(SetGoalError::Internal)?;
-                let goal = updated.ok_or_else(|| {
-                    SetGoalError::Precondition(
-                        "goal changed concurrently during budget update".into(),
-                    )
-                })?;
-                Ok(SetGoalOutcome {
-                    goal: Some(goal),
-                    kind: cortex::goals::event_kind::BUDGET_CHANGED,
-                })
+                apply_goal_budget(&db, &session_id, token_budget, max_budget).await
             }
         }
     }
     .await
     .map_err(|e| match e {
         SetGoalError::Invalid(msg) => TStatus::invalid_argument(format!("set_goal: {msg}")),
-        SetGoalError::Precondition(msg) => {
-            TStatus::failed_precondition(format!("set_goal: {msg}"))
-        }
+        SetGoalError::Precondition(msg) => TStatus::failed_precondition(format!("set_goal: {msg}")),
         SetGoalError::AlreadyExists(msg) => TStatus::already_exists(format!("set_goal: {msg}")),
         SetGoalError::Internal(err) => TStatus::internal(format!("set_goal: {err}")),
     })?;
@@ -414,6 +257,190 @@ pub(super) async fn set_goal(
         });
     }
     Ok(Response::new(detail))
+}
+
+/// `SetGoal` op=Create: validate and insert a new goal row.
+async fn apply_goal_create(
+    db: &Database,
+    session_id: &str,
+    objective: &str,
+    token_budget: Option<i64>,
+    max_budget: Option<i64>,
+) -> Result<SetGoalOutcome, SetGoalError> {
+    let obj = cortex::goals::validate_objective(objective).map_err(SetGoalError::Invalid)?;
+    let budget =
+        cortex::goals::validate_budget(token_budget, max_budget).map_err(SetGoalError::Invalid)?;
+    let inserted = db
+        .insert_goal(session_id, &obj, cortex::goals::GoalStatus::Active, budget)
+        .await
+        .map_err(SetGoalError::Internal)?;
+    let goal = inserted.ok_or_else(|| {
+        SetGoalError::AlreadyExists("goal already exists for this session".into())
+    })?;
+    Ok(SetGoalOutcome {
+        goal: Some(goal),
+        kind: cortex::goals::event_kind::CREATED,
+    })
+}
+
+/// `SetGoal` op=Replace: validate and upsert, reporting Created vs Replaced.
+async fn apply_goal_replace(
+    db: &Database,
+    session_id: &str,
+    objective: &str,
+    token_budget: Option<i64>,
+    max_budget: Option<i64>,
+) -> Result<SetGoalOutcome, SetGoalError> {
+    let obj = cortex::goals::validate_objective(objective).map_err(SetGoalError::Invalid)?;
+    let budget =
+        cortex::goals::validate_budget(token_budget, max_budget).map_err(SetGoalError::Invalid)?;
+    let existed = db
+        .get_goal(session_id)
+        .await
+        .map_err(SetGoalError::Internal)?
+        .is_some();
+    let g = db
+        .replace_goal(session_id, &obj, cortex::goals::GoalStatus::Active, budget)
+        .await
+        .map_err(SetGoalError::Internal)?;
+    Ok(SetGoalOutcome {
+        goal: Some(g),
+        kind: if existed {
+            cortex::goals::event_kind::REPLACED
+        } else {
+            cortex::goals::event_kind::CREATED
+        },
+    })
+}
+
+/// `SetGoal` op=SetStatus: enforce the legal transition table and apply.
+async fn apply_goal_status(
+    db: &Database,
+    session_id: &str,
+    status_raw: &str,
+) -> Result<SetGoalOutcome, SetGoalError> {
+    let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim()).ok_or_else(|| {
+        SetGoalError::Invalid(format!(
+            "status must be one of active|paused|complete (got {status_raw:?}); blocked and budget_limited are system-only"
+        ))
+    })?;
+    if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
+        return Err(SetGoalError::Invalid(
+            "budget_limited is system-only; cannot be set via RPC".into(),
+        ));
+    }
+    if matches!(new_status, cortex::goals::GoalStatus::Blocked) {
+        return Err(SetGoalError::Invalid(
+            "blocked is agent-only; cannot be set via RPC".into(),
+        ));
+    }
+    let current = db
+        .get_goal(session_id)
+        .await
+        .map_err(SetGoalError::Internal)?
+        .ok_or_else(|| SetGoalError::Precondition("no goal set for this session".into()))?;
+    use cortex::goals::GoalStatus as S;
+    let allowed = matches!(
+        (current.status, new_status),
+        (S::Active, S::Paused)
+            | (S::Paused, S::Active)
+            | (S::Active, S::Complete)
+            | (S::Paused, S::Complete)
+            | (S::BudgetLimited, S::Complete)
+            // Blocked is set by the agent; the user resumes
+            // it back to Active or marks it Complete.
+            | (S::Blocked, S::Active)
+            | (S::Blocked, S::Complete)
+    );
+    if !allowed {
+        return Err(SetGoalError::Invalid(format!(
+            "illegal transition {} -> {}",
+            current.status.as_str(),
+            new_status.as_str()
+        )));
+    }
+    let updated = db
+        .update_goal(
+            session_id,
+            cortex::db::GoalUpdate {
+                status: Some(new_status),
+                expected_goal_id: Some(current.goal_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(SetGoalError::Internal)?;
+    let goal = updated.ok_or_else(|| {
+        SetGoalError::Precondition("goal changed concurrently during status update".into())
+    })?;
+    // Returning to Active grants a fresh retry budget. A gate that
+    // exhausted its budget tells the operator to `/goal resume`;
+    // without this the first run after resuming re-reaches the cap
+    // and re-pauses immediately, making that advice a lie.
+    if goal.status == cortex::goals::GoalStatus::Active {
+        if let Err(e) = db.reset_goal_gate_attempts(session_id).await {
+            tracing::warn!("resetting goal gate attempts on resume failed: {e}");
+        }
+    }
+    let kind = if goal.status == cortex::goals::GoalStatus::Complete {
+        cortex::goals::event_kind::COMPLETED
+    } else {
+        cortex::goals::event_kind::STATUS_CHANGED
+    };
+    Ok(SetGoalOutcome {
+        goal: Some(goal),
+        kind,
+    })
+}
+
+/// `SetGoal` op=SetBudget: apply the new cap and re-evaluate the
+/// budget-limit invariant.
+async fn apply_goal_budget(
+    db: &Database,
+    session_id: &str,
+    token_budget: Option<i64>,
+    max_budget: Option<i64>,
+) -> Result<SetGoalOutcome, SetGoalError> {
+    let budget =
+        cortex::goals::validate_budget(token_budget, max_budget).map_err(SetGoalError::Invalid)?;
+    let current = db
+        .get_goal(session_id)
+        .await
+        .map_err(SetGoalError::Internal)?
+        .ok_or_else(|| SetGoalError::Precondition("no goal set for this session".into()))?;
+    // Re-evaluate the budget-limit invariant (limited iff the new
+    // budget is finite and already met) so a budget change resumes
+    // or limits the goal instead of silently leaving it stuck. Only
+    // the Active<->BudgetLimited pair is auto-flipped; Paused,
+    // Blocked, and Complete are user/agent states we never override
+    // here. Raising the cap on a BudgetLimited goal is the sole way
+    // to resume it — SetStatus has no BudgetLimited->Active edge.
+    use cortex::goals::GoalStatus as S;
+    let over_budget = budget.is_some_and(|b| current.tokens_used >= b);
+    let new_status = match current.status {
+        S::Active if over_budget => Some(S::BudgetLimited),
+        S::BudgetLimited if !over_budget => Some(S::Active),
+        _ => None,
+    };
+    let updated = db
+        .update_goal(
+            session_id,
+            cortex::db::GoalUpdate {
+                token_budget: Some(budget),
+                status: new_status,
+                expected_goal_id: Some(current.goal_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(SetGoalError::Internal)?;
+    let goal = updated.ok_or_else(|| {
+        SetGoalError::Precondition("goal changed concurrently during budget update".into())
+    })?;
+    Ok(SetGoalOutcome {
+        goal: Some(goal),
+        kind: cortex::goals::event_kind::BUDGET_CHANGED,
+    })
 }
 
 pub(super) async fn clear_goal(
