@@ -1,0 +1,144 @@
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { Sidebar, type SidebarProps } from "./Sidebar";
+import { ChatIcon } from "../components/icons";
+
+function renderSidebar(over: Partial<SidebarProps> = {}) {
+  const props: SidebarProps = {
+    routes: [
+      {
+        id: "chat",
+        path: "/",
+        label: "Chat",
+        tabLabel: "Chat",
+        icon: ChatIcon,
+        page: () => null,
+        section: "primary",
+      },
+      {
+        id: "settings",
+        path: "/settings",
+        label: "Settings",
+        tabLabel: "Settings",
+        icon: ChatIcon,
+        page: () => null,
+        section: "secondary",
+      },
+      {
+        id: "detail",
+        path: "/settings/:id",
+        label: "Setting",
+        tabLabel: "Setting",
+        icon: ChatIcon,
+        page: () => null,
+        section: "secondary",
+        nav: { sidebar: false },
+      },
+    ],
+    recents: [
+      { id: "s1", title: "a past conversation" },
+      { id: "s2", title: "one still running", activity: "working" },
+    ],
+    onOpenRecent: vi.fn(),
+    onArchiveRecent: vi.fn(),
+    onNewConversation: vi.fn(),
+    onSeeAllConversations: vi.fn(),
+    user: { name: "Operator", initials: "OP" },
+    ...over,
+  };
+  render(
+    <MemoryRouter>
+      <Sidebar {...props} />
+    </MemoryRouter>,
+  );
+  return props;
+}
+
+describe("Sidebar recents", () => {
+  it("opens the conversation the row names", () => {
+    const props = renderSidebar();
+    fireEvent.click(screen.getByText("a past conversation"));
+    expect(props.onOpenRecent).toHaveBeenCalledWith("s1");
+  });
+
+  it("archives without opening the conversation being closed", () => {
+    // The × sits inside a row whose own click opens the conversation.
+    const props = renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Archive a past conversation" }));
+    expect(props.onArchiveRecent).toHaveBeenCalledWith("s1");
+    expect(props.onOpenRecent).not.toHaveBeenCalled();
+  });
+
+  it("hands a right-click to the app with the pointer position", () => {
+    const onRecentContextMenu = vi.fn();
+    renderSidebar({ onRecentContextMenu });
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clientX", { value: 210 });
+    Object.defineProperty(event, "clientY", { value: 140 });
+    fireEvent(screen.getByText("one still running"), event);
+
+    expect(onRecentContextMenu).toHaveBeenCalledWith("s2", { x: 210, y: 140 });
+    // The browser menu must not open on top of the app's own.
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("leaves right-click to the browser when the app has no menu", () => {
+    renderSidebar();
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    fireEvent(screen.getByText("a past conversation"), event);
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("says why an archive failed, rather than leaving a dead ×", () => {
+    renderSidebar({ archiveError: "daemon not running" });
+    expect(screen.getByRole("alert").textContent).toContain("daemon not running");
+  });
+
+  it("shows no failure line when nothing failed", () => {
+    renderSidebar();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("marks a conversation's state for a reader who cannot see the dot", () => {
+    renderSidebar({
+      recents: [
+        { id: "a", title: "working one", activity: "working" },
+        { id: "b", title: "unread one", activity: "unread" },
+        { id: "c", title: "draft one", activity: "draft" },
+        { id: "d", title: "settled one" },
+      ],
+    });
+    expect(screen.getByRole("img", { name: "Working" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Unread reply" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Unsent draft" })).toBeTruthy();
+    // A settled conversation gets no mark at all — the dot picks rows out of a
+    // list, it does not decorate every row.
+    expect(screen.getAllByRole("img")).toHaveLength(3);
+  });
+
+  it("reaches the older conversations the capped list leaves out", () => {
+    const props = renderSidebar();
+    fireEvent.click(screen.getByText("Show all…"));
+    expect(props.onSeeAllConversations).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts a fresh conversation", () => {
+    const props = renderSidebar();
+    fireEvent.click(screen.getByText("+ New"));
+    expect(props.onNewConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists only the routes that asked to be in the sidebar", () => {
+    renderSidebar();
+    expect(screen.getByText("Chat")).toBeTruthy();
+    expect(screen.getByText("Settings")).toBeTruthy();
+    expect(screen.queryByText("Setting")).toBeNull();
+  });
+
+  it("names the signed-in user", () => {
+    renderSidebar();
+    expect(screen.getByText("Operator")).toBeTruthy();
+    expect(screen.getByText("OP")).toBeTruthy();
+  });
+});
