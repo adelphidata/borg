@@ -36,7 +36,7 @@ pub use gateway_recovery::recover_gateway_if_abandoned;
 use budget::BudgetTracker;
 use db_quarantine_prune::{prune_corrupt_db_copies, CORRUPT_DB_COPIES_KEPT};
 use embeddings::{repair_embedding_backlog, EMBEDDING_CACHE_TTL_SECS};
-use issues::{group_issues_by_remediation, issue_snapshots, RepairExecution};
+use issues::{group_issues_by_remediation, issue_snapshots, IssueSnapshot, RepairExecution};
 use log_prune::{
     prune_log_files, truncate_oversized_logs, CAPPED_LOG_FILES, LOG_FILE_KEEP_BYTES,
     LOG_FILE_SIZE_CAP_BYTES,
@@ -367,6 +367,66 @@ pub async fn run_daily_maintenance_with_registry(
     let initial_diag = run_diagnostics_with_registry(config, registry).await;
     let initial_issues = issue_snapshots(&initial_diag.checks);
 
+    // 2 + 2b. Prune filesystem logs and quarantined database copies.
+    prune_filesystem_artifacts(config, now, &mut report);
+
+    // 3–4c. Budgeted database retention/pruning steps.
+    apply_db_retention(db, config, now, &mut report, &mut budget).await;
+
+    // 5 + 5_gate. Task healing and the scheduled-command policy scan.
+    heal_scheduled_tasks(db, config, now, &mut report, &mut budget).await;
+
+    // 5_subproc. Subprocess registry sweep.
+    let subprocess_repeat_offender =
+        sweep_subprocess_registry(db, config, registry, now, &mut report, &mut budget).await;
+
+    // 5a–5b. SQLite housekeeping and the gateway recovery probe.
+    run_sqlite_and_gateway_housekeeping(db, config, now, &mut report).await;
+
+    // 6. Bounded auto-remediations.
+    let repair_execution =
+        apply_auto_remediations(db, config, now, &initial_issues, &mut report, &mut budget).await;
+
+    // 7. Re-run diagnostics so the recorded report reflects post-repair state.
+    finalize_diagnostics(
+        db,
+        config,
+        registry,
+        now,
+        subprocess_repeat_offender,
+        repair_execution,
+        &initial_issues,
+        &mut report,
+    )
+    .await;
+
+    // Capture final budget state. `budget_exhausted` is observable to
+    // callers and surfaces on the next sweep as a persistent warning
+    // when it fires twice in a row (existing maintenance_issue_state
+    // plumbing handles the escalation).
+    report.budget_exhausted = budget.is_blown();
+    report.heal_actions_spent = budget.spent;
+    record_budget_exhaustion(db, now, &budget, &mut report).await;
+
+    // 8. Persist the run (best-effort; losing the audit row must not
+    //    block the sweep).
+    if let Err(e) = db.record_doctor_run(&report).await {
+        tracing::warn!("maintenance: failed to record doctor_runs row: {e}");
+    } else if let Err(e) = db
+        .prune_doctor_runs(config.maintenance.doctor_runs_keep as usize)
+        .await
+    {
+        tracing::warn!("maintenance: failed to prune doctor_runs: {e}");
+    }
+
+    tracing::info!("{}", report.activity_line());
+    Ok(report)
+}
+
+/// Steps 2 + 2b: prune filesystem logs, cap append-only log files, and
+/// delete quarantined `borg.db.corrupt-*` copies. Best-effort — a missing
+/// dir is fine; every failure logs and the sweep continues.
+fn prune_filesystem_artifacts(config: &Config, now: i64, report: &mut MaintenanceReport) {
     // 2. Prune filesystem logs. Best-effort — missing dir is fine.
     if let Ok(logs_dir) = Config::logs_dir() {
         let cutoff = now - (config.maintenance.logs_retention_days as i64) * SECS_PER_DAY;
@@ -402,7 +462,18 @@ pub async fn run_daily_maintenance_with_registry(
             "maintenance: cannot resolve the data dir, skipping corrupt-db pruning: {e}"
         ),
     }
+}
 
+/// Steps 3–4c: budgeted database retention and pruning. Each step charges
+/// the heal action budget and is skipped once it is blown; every failure
+/// logs and the sweep continues.
+async fn apply_db_retention(
+    db: &Database,
+    config: &Config,
+    now: i64,
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+) {
     // 3. Prune activity-log rows beyond retention window.
     let activity_cutoff = now - (config.maintenance.activity_retention_days as i64) * SECS_PER_DAY;
     if !budget.is_blown() {
@@ -447,22 +518,7 @@ pub async fn run_daily_maintenance_with_registry(
     //     `DataConfig::should_auto_purge`.
     if !budget.is_blown() && config.data.should_auto_purge() {
         if let Some(cutoff) = config.data.purge_cutoff(now) {
-            match db.purge_messages_before(cutoff).await {
-                Ok(n) => {
-                    report.messages_purged = n;
-                    budget.try_spend(n);
-                }
-                Err(e) => tracing::warn!("maintenance: messages retention purge failed: {e}"),
-            }
-            if !budget.is_blown() {
-                match db.tombstone_audit_events_before(cutoff, now).await {
-                    Ok(n) => {
-                        report.audit_events_tombstoned = n;
-                        budget.try_spend(n);
-                    }
-                    Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
-                }
-            }
+            apply_retention_purge(db, cutoff, now, report, budget).await;
         }
     }
 
@@ -481,7 +537,46 @@ pub async fn run_daily_maintenance_with_registry(
             }
         }
     }
+}
 
+/// Step 4b's mutating half: purge `messages` rows past `cutoff` and
+/// tombstone `audit_log_chain` rows in place. Both are budgeted; every
+/// failure logs and the sweep continues.
+async fn apply_retention_purge(
+    db: &Database,
+    cutoff: i64,
+    now: i64,
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+) {
+    match db.purge_messages_before(cutoff).await {
+        Ok(n) => {
+            report.messages_purged = n;
+            budget.try_spend(n);
+        }
+        Err(e) => tracing::warn!("maintenance: messages retention purge failed: {e}"),
+    }
+    if !budget.is_blown() {
+        match db.tombstone_audit_events_before(cutoff, now).await {
+            Ok(n) => {
+                report.audit_events_tombstoned = n;
+                budget.try_spend(n);
+            }
+            Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
+        }
+    }
+}
+
+/// Steps 5 + 5_gate: heal stalled/wedged scheduled tasks (budgeted) and
+/// warn about scheduled commands the policy gate would refuse (read-only,
+/// unbudgeted). Every failure logs and the sweep continues.
+async fn heal_scheduled_tasks(
+    db: &Database,
+    config: &Config,
+    now: i64,
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+) {
     // 5. Proactively scan for stalled scheduled tasks. This duplicates
     //    what the daemon loop does on a 5-minute cadence, but running it
     //    here covers the case where the daemon isn't running and the user
@@ -516,20 +611,32 @@ pub async fn run_daily_maintenance_with_registry(
     if let Err(e) = warn_denied_command_tasks(db, config).await {
         tracing::warn!("maintenance: scheduled-command policy scan failed: {e}");
     }
+}
 
-    // 5_subproc. Subprocess registry sweep. Three sub-steps:
-    //   1. reap_dead — kill -0 probe on every Running PID; vanished
-    //      ones (daemon crashed mid-spawn, kernel reaped before guard
-    //      fired) move to finished as Dead.
-    //   2. auto_reap — SIGTERM/SIGKILL any non-exempt entry past the
-    //      `process_registry.auto_reap_secs` threshold (default 24h).
-    //      Kind=Browser, pinned entries, and pattern-matched commands
-    //      are exempt. The activity log captures the killed command
-    //      for post-mortem before the entry is moved.
-    //   3. prune_finished — TTL+LRU eviction of completed entries.
-    //
-    // No-op when the caller didn't pass a registry (CLI standalone /
-    // tests). Each sub-action charges the heal_action_budget.
+/// Step 5_subproc: subprocess registry sweep. Three sub-steps:
+///   1. reap_dead — kill -0 probe on every Running PID; vanished
+///      ones (daemon crashed mid-spawn, kernel reaped before guard
+///      fired) move to finished as Dead.
+///   2. auto_reap — SIGTERM/SIGKILL any non-exempt entry past the
+///      `process_registry.auto_reap_secs` threshold (default 24h).
+///      Kind=Browser, pinned entries, and pattern-matched commands
+///      are exempt. The activity log captures the killed command
+///      for post-mortem before the entry is moved.
+///   3. prune_finished — TTL+LRU eviction of completed entries.
+///
+/// No-op when the caller didn't pass a registry (CLI standalone /
+/// tests). Each sub-action charges the heal_action_budget.
+///
+/// Returns true when the same normalized command was auto-reaped on two
+/// consecutive sweeps (the repeat-offender signal).
+async fn sweep_subprocess_registry(
+    db: &Database,
+    config: &Config,
+    registry: Option<&ProcessRegistry>,
+    now: i64,
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+) -> bool {
     let mut subprocess_repeat_offender = false;
     if let Some(reg) = registry {
         if !budget.is_blown() {
@@ -599,7 +706,19 @@ pub async fn run_daily_maintenance_with_registry(
         );
         report.subprocess_long_running = class.warning.len() + class.failing.len();
     }
+    subprocess_repeat_offender
+}
 
+/// Steps 5a–5b: SQLite housekeeping (WAL checkpoint + conditional VACUUM,
+/// bounded FTS5 segment merge) and the gateway recovery probe. None of
+/// these charge the heal action budget; every failure logs and the sweep
+/// continues.
+async fn run_sqlite_and_gateway_housekeeping(
+    db: &Database,
+    config: &Config,
+    now: i64,
+    report: &mut MaintenanceReport,
+) {
     // 5a. WAL checkpoint + conditional full VACUUM. Always runs the
     //     cheap checkpoint after the heavy deletes above; gates full
     //     VACUUM behind both an interval and a fragmentation signal.
@@ -640,16 +759,25 @@ pub async fn run_daily_maintenance_with_registry(
     if let Err(e) = recover_gateway_if_abandoned(db, config).await {
         tracing::warn!("maintenance: gateway recovery probe failed: {e}");
     }
+}
 
-    // 6. Run bounded auto-remediations exactly once per remediation key.
-    //    Budget-blown sweeps skip remediation entirely — the budget is the
-    //    "something is genuinely runaway" backstop, and re-running repairs
-    //    on a stuck row is exactly the failure mode it exists to prevent.
+/// Step 6: run bounded auto-remediations exactly once per remediation key.
+/// Budget-blown sweeps skip remediation entirely — the budget is the
+/// "something is genuinely runaway" backstop, and re-running repairs
+/// on a stuck row is exactly the failure mode it exists to prevent.
+async fn apply_auto_remediations(
+    db: &Database,
+    config: &Config,
+    now: i64,
+    initial_issues: &[IssueSnapshot],
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+) -> RepairExecution {
     let mut repair_execution = RepairExecution::default();
     let grouped = if budget.is_blown() {
         BTreeMap::new()
     } else {
-        group_issues_by_remediation(&initial_issues)
+        group_issues_by_remediation(initial_issues)
     };
     for (key, issues) in grouped {
         // Re-check per key, not just once before the loop. The budget is the
@@ -663,82 +791,160 @@ pub async fn run_daily_maintenance_with_registry(
             );
             break;
         }
-        let result = apply_remediation_key(db, config, key).await;
-        match result {
+        match apply_remediation_key(db, config, key).await {
             Ok(outcome) => {
-                let changed = outcome.changed;
-                if let Some(r) = outcome.embeddings.as_ref() {
-                    report.embeddings_repaired_files += r.repaired_files;
-                    report.embeddings_repaired_chunks += r.repaired_chunks;
-                    budget.try_spend(r.repaired_files);
-                } else if changed {
-                    // Every mutating remediation costs at least one action.
-                    // Only embeddings used to charge, so the other keys were
-                    // effectively unbounded.
-                    budget.try_spend(1);
-                }
-                if let Some(embedding_report) = outcome.embeddings {
-                    for issue in embedding_report.fixed_issue_keys {
-                        repair_execution.fixed_issues.insert(issue);
-                    }
-                    if embedding_report.failed {
-                        for issue in &issues {
-                            repair_execution
-                                .failed_issues
-                                .insert(issue.issue_key.clone());
-                        }
-                    }
-                } else if changed {
-                    for issue in &issues {
-                        repair_execution
-                            .fixed_issues
-                            .insert(issue.issue_key.clone());
-                    }
-                }
-                for issue in &issues {
-                    if let Err(e) = db
-                        .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
-                        .await
-                    {
-                        tracing::warn!("maintenance: issue-state observe failed: {e}");
-                    }
-                    let outcome = if repair_execution.failed_issues.contains(&issue.issue_key) {
-                        "failed"
-                    } else {
-                        "attempted"
-                    };
-                    if let Err(e) = db
-                        .record_issue_auto_fix_attempt(&issue.issue_key, now, outcome)
-                        .await
-                    {
-                        tracing::warn!("maintenance: issue auto-fix attempt record failed: {e}");
-                    }
-                }
+                record_remediation_success(
+                    db,
+                    now,
+                    &issues,
+                    outcome,
+                    report,
+                    budget,
+                    &mut repair_execution,
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!("maintenance: remediation {key} failed: {e}");
-                for issue in &issues {
-                    repair_execution
-                        .failed_issues
-                        .insert(issue.issue_key.clone());
-                    if let Err(se) = db
-                        .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
-                        .await
-                    {
-                        tracing::warn!("maintenance: issue-state observe failed: {se}");
-                    }
-                    if let Err(se) = db
-                        .record_issue_auto_fix_attempt(&issue.issue_key, now, "failed")
-                        .await
-                    {
-                        tracing::warn!("maintenance: issue auto-fix attempt record failed: {se}");
-                    }
-                }
+                record_remediation_failure(db, now, &issues, &mut repair_execution).await;
             }
         }
     }
+    repair_execution
+}
 
-    // 7. Re-run diagnostics so the recorded report reflects post-repair state.
+/// Book-keep one successful remediation: charge the budget, fold the
+/// counts into the report, and record issue-state / auto-fix rows for
+/// every issue the key covered. Every DB failure logs and the sweep
+/// continues.
+#[allow(clippy::too_many_arguments)]
+async fn record_remediation_success(
+    db: &Database,
+    now: i64,
+    issues: &[&IssueSnapshot],
+    outcome: RemediationOutcome,
+    report: &mut MaintenanceReport,
+    budget: &mut BudgetTracker,
+    repair_execution: &mut RepairExecution,
+) {
+    let changed = outcome.changed;
+    if let Some(r) = outcome.embeddings.as_ref() {
+        report.embeddings_repaired_files += r.repaired_files;
+        report.embeddings_repaired_chunks += r.repaired_chunks;
+        budget.try_spend(r.repaired_files);
+    } else if changed {
+        // Every mutating remediation costs at least one action.
+        // Only embeddings used to charge, so the other keys were
+        // effectively unbounded.
+        budget.try_spend(1);
+    }
+    if let Some(embedding_report) = outcome.embeddings {
+        for issue in embedding_report.fixed_issue_keys {
+            repair_execution.fixed_issues.insert(issue);
+        }
+        if embedding_report.failed {
+            for issue in issues {
+                repair_execution
+                    .failed_issues
+                    .insert(issue.issue_key.clone());
+            }
+        }
+    } else if changed {
+        for issue in issues {
+            repair_execution
+                .fixed_issues
+                .insert(issue.issue_key.clone());
+        }
+    }
+    for issue in issues {
+        if let Err(e) = db
+            .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+            .await
+        {
+            tracing::warn!("maintenance: issue-state observe failed: {e}");
+        }
+        let outcome = if repair_execution.failed_issues.contains(&issue.issue_key) {
+            "failed"
+        } else {
+            "attempted"
+        };
+        if let Err(e) = db
+            .record_issue_auto_fix_attempt(&issue.issue_key, now, outcome)
+            .await
+        {
+            tracing::warn!("maintenance: issue auto-fix attempt record failed: {e}");
+        }
+    }
+}
+
+/// Book-keep one failed remediation: mark every covered issue failed and
+/// record issue-state / auto-fix rows. Every DB failure logs and the
+/// sweep continues.
+async fn record_remediation_failure(
+    db: &Database,
+    now: i64,
+    issues: &[&IssueSnapshot],
+    repair_execution: &mut RepairExecution,
+) {
+    for issue in issues {
+        repair_execution
+            .failed_issues
+            .insert(issue.issue_key.clone());
+        if let Err(se) = db
+            .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+            .await
+        {
+            tracing::warn!("maintenance: issue-state observe failed: {se}");
+        }
+        if let Err(se) = db
+            .record_issue_auto_fix_attempt(&issue.issue_key, now, "failed")
+            .await
+        {
+            tracing::warn!("maintenance: issue auto-fix attempt record failed: {se}");
+        }
+    }
+}
+
+/// The open persistent warnings, minus any the user has actively
+/// squelched via `/doctor`. Active squelches drop their findings out of
+/// `persistent_warnings` — that's the user's "I see this, stop nagging"
+/// signal. The squelch expires per `maintenance.security_squelch_ttl_days`,
+/// after which the warning resumes.
+async fn persistent_warnings_unsquelched(db: &Database, now: i64) -> Vec<String> {
+    let active_squelches: std::collections::HashSet<String> = db
+        .doctor_squelch_list_active(now)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| format!("{}:{}", r.category, r.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    db.list_persistent_open_issues()
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| r.issue_key)
+                .filter(|k| !active_squelches.contains(k))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Step 7: re-run diagnostics and fill in the post-repair report fields,
+/// then reconcile issue-state rows (observe, resolve, prune) and read the
+/// persistent-warning list. Every failure logs and the sweep continues.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_diagnostics(
+    db: &Database,
+    config: &Config,
+    registry: Option<&ProcessRegistry>,
+    now: i64,
+    subprocess_repeat_offender: bool,
+    repair_execution: RepairExecution,
+    initial_issues: &[IssueSnapshot],
+    report: &mut MaintenanceReport,
+) {
     let mut diag = run_diagnostics_with_registry(config, registry).await;
     if subprocess_repeat_offender {
         // Two consecutive sweeps auto-reaped the same workload. Surface
@@ -781,7 +987,7 @@ pub async fn run_daily_maintenance_with_registry(
         .filter(|i| i.remediation_kind == RemediationKind::Manual)
         .count();
 
-    for issue in &initial_issues {
+    for issue in initial_issues {
         if let Err(e) = db
             .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
             .await
@@ -809,102 +1015,53 @@ pub async fn run_daily_maintenance_with_registry(
     if let Err(e) = db.prune_resolved_issue_state_before(resolved_cutoff).await {
         tracing::warn!("maintenance: issue-state prune failed: {e}");
     }
-    // Active /doctor squelches drop their findings out of persistent_warnings
-    // — that's the user's "I see this, stop nagging" signal. The squelch
-    // expires per `maintenance.security_squelch_ttl_days`, after which the
-    // warning resumes.
-    let active_squelches: std::collections::HashSet<String> = db
-        .doctor_squelch_list_active(now)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|r| format!("{}:{}", r.category, r.name))
-                .collect()
-        })
-        .unwrap_or_default();
-    report.persistent_warnings = db
-        .list_persistent_open_issues()
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|r| r.issue_key)
-                .filter(|k| !active_squelches.contains(k))
-                .collect()
-        })
-        .unwrap_or_default();
+    report.persistent_warnings = persistent_warnings_unsquelched(db, now).await;
+}
 
-    // Capture final budget state. `budget_exhausted` is observable to
-    // callers and surfaces on the next sweep as a persistent warning
-    // when it fires twice in a row (existing maintenance_issue_state
-    // plumbing handles the escalation).
-    report.budget_exhausted = budget.is_blown();
-    report.heal_actions_spent = budget.spent;
-
-    if budget.is_blown() {
-        tracing::warn!(
-            "maintenance: heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
-            budget.spent,
-            budget.budget,
-        );
-        if let Err(e) = db
-            .log_activity(
-                "warn",
-                "maintenance",
-                &format!(
-                    "heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
-                    budget.spent, budget.budget
-                ),
-                None,
-            )
-            .await
-        {
-            tracing::warn!("maintenance: failed to record budget-exhaust activity row: {e}");
-        }
-        // Surface as an issue so the existing persistent-warning lifecycle
-        // promotes it on the second consecutive exhaust.
-        if let Err(e) = db
-            .upsert_issue_state_observed("Maintenance:heal action budget", now, "warn")
-            .await
-        {
-            tracing::warn!("maintenance: budget issue-state observe failed: {e}");
-        }
-        // Re-read persistent_warnings now that the budget issue may have
-        // been promoted; otherwise the report misses its own escalation
-        // for this sweep.
-        let active_squelches: std::collections::HashSet<String> = db
-            .doctor_squelch_list_active(now)
-            .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|r| format!("{}:{}", r.category, r.name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        report.persistent_warnings = db
-            .list_persistent_open_issues()
-            .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|r| r.issue_key)
-                    .filter(|k| !active_squelches.contains(k))
-                    .collect()
-            })
-            .unwrap_or_default();
+/// Record a blown heal action budget: warn, write the activity-log row,
+/// surface the issue-state entry, and re-read `persistent_warnings` so
+/// the report includes its own escalation this sweep. No-op when the
+/// budget survived. Every failure logs and the sweep continues.
+async fn record_budget_exhaustion(
+    db: &Database,
+    now: i64,
+    budget: &BudgetTracker,
+    report: &mut MaintenanceReport,
+) {
+    if !budget.is_blown() {
+        return;
     }
-
-    // 8. Persist the run (best-effort; losing the audit row must not
-    //    block the sweep).
-    if let Err(e) = db.record_doctor_run(&report).await {
-        tracing::warn!("maintenance: failed to record doctor_runs row: {e}");
-    } else if let Err(e) = db
-        .prune_doctor_runs(config.maintenance.doctor_runs_keep as usize)
+    tracing::warn!(
+        "maintenance: heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
+        budget.spent,
+        budget.budget,
+    );
+    if let Err(e) = db
+        .log_activity(
+            "warn",
+            "maintenance",
+            &format!(
+                "heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
+                budget.spent, budget.budget
+            ),
+            None,
+        )
         .await
     {
-        tracing::warn!("maintenance: failed to prune doctor_runs: {e}");
+        tracing::warn!("maintenance: failed to record budget-exhaust activity row: {e}");
     }
-
-    tracing::info!("{}", report.activity_line());
-    Ok(report)
+    // Surface as an issue so the existing persistent-warning lifecycle
+    // promotes it on the second consecutive exhaust.
+    if let Err(e) = db
+        .upsert_issue_state_observed("Maintenance:heal action budget", now, "warn")
+        .await
+    {
+        tracing::warn!("maintenance: budget issue-state observe failed: {e}");
+    }
+    // Re-read persistent_warnings now that the budget issue may have
+    // been promoted; otherwise the report misses its own escalation
+    // for this sweep.
+    report.persistent_warnings = persistent_warnings_unsquelched(db, now).await;
 }
 
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
