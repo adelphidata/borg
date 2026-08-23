@@ -71,7 +71,10 @@ describe("CompletionList", () => {
 
   it("caps its height so a long list scrolls instead of covering the screen", () => {
     renderList();
-    expect(screen.getByRole("listbox").style.maxHeight).toBe("232px");
+    const box = screen.getByRole("listbox");
+    // The cap only scrolls if overflow is on; a cap without it clips rows.
+    expect(box.style.maxHeight).toBe("232px");
+    expect(box.classList.contains("overflow-y-auto")).toBe(true);
   });
 
   it("chooses on pointer-down and keeps focus in the input", () => {

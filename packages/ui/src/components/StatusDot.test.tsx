@@ -3,16 +3,18 @@ import { render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { StatusDot, type DotTone } from "./StatusDot";
 
-const ALL_TONES: readonly DotTone[] = [
-  "ok",
-  "alert",
-  "busy",
-  "working",
-  "unread",
-  "draft",
-  "paused",
-  "idle",
-];
+// Keyed as a Record so adding a DotTone without extending this table is a
+// compile error — the exhaustive tests below must never silently go stale.
+const ALL_TONES = Object.keys({
+  ok: true,
+  alert: true,
+  busy: true,
+  working: true,
+  unread: true,
+  draft: true,
+  paused: true,
+  idle: true,
+} satisfies Record<DotTone, true>) as DotTone[];
 
 /** The class tokens a dot rendered with `props` ends up with. */
 function tokensOf(props: ComponentProps<typeof StatusDot> = {}): Set<string> {

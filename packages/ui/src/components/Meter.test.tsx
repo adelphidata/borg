@@ -46,7 +46,7 @@ describe("Meter", () => {
   it("appends the caller's className to the track, nothing else", () => {
     const bare = render(<Meter percent={10} />);
     const styled = render(<Meter percent={10} className="mt-2" />);
-    const track = (c: HTMLElement) => c.firstElementChild as HTMLElement;
-    expect(track(styled.container).className).toBe(`${track(bare.container).className}mt-2`);
+    const tokens = (c: HTMLElement) => Array.from((c.firstElementChild as HTMLElement).classList);
+    expect(tokens(styled.container).sort()).toEqual([...tokens(bare.container), "mt-2"].sort());
   });
 });
