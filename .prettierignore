@@ -7,3 +7,4 @@ bun.lock
 crates/
 packages/client/src/gen/
 apps/web/dist/
+coverage/

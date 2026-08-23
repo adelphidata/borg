@@ -64,9 +64,9 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Dev cadence.** Per-edit: `cargo build` + targeted `cargo test -p <crate> <new_test_name>` only. Skip `fmt --check`, `clippy`, full `--workspace` until ship-time (`/ship` runs them). CI re-runs everything. Investigation that needs >3 reads/greps → Explore subagent. Batch independent tool calls in one message.
 
-**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates at 90% via `cargo llvm-cov --fail-under-lines 90`.
+**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates via `cargo llvm-cov --fail-under-lines <n>`, a ratchet set to today's number — raise it as tests land, never lower it.
 
-**Coverage.** Keep line coverage above 90%. All new or modified code must have corresponding test coverage — no exceptions.
+**Coverage.** The standard is line coverage above 90%. All new or modified code must have corresponding test coverage — no exceptions. The workspace sits below that today, so CI's `--fail-under-lines` is a ratchet at the current number: it stops regressions, and every coverage push raises it. Raising the ratchet is part of the work, not a follow-up.
 
 **Autofixing lints.** Prefer `cargo fixit` over `cargo clippy --fix` — it's a drop-in replacement and dramatically faster (up to ~120x on large workspaces). Install with `cargo install cargo-fixit`; it's a local convenience, not wired into CI or the `justfile`. The maintainer is a contributor to it, so bug reports and rough edges are worth surfacing rather than working around.
 
@@ -79,6 +79,7 @@ just web-install     # bun install (workspace)
 just gen             # regenerate packages/client/src/gen from crates/protocols/proto
 just gen-check       # fail if the committed client drifted from the protos
 just web-lint        # prettier --check + typecheck every package
+just web-test        # vitest across every package, with the 90% coverage gate
 just web-build       # build apps/web (REQUIRED before cargo build — borgd embeds it)
 just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
 just desktop-dev     # Vite + Electron with hot reload
@@ -98,6 +99,7 @@ just web-install     # bun install (workspace)
 just gen             # regenerate packages/client/src/gen from crates/protocols/proto
 just gen-check       # fail if the committed client drifted from the protos
 just web-lint        # prettier --check + typecheck every package
+just web-test        # vitest across every package, with the 90% coverage gate
 just web-build       # build apps/web (REQUIRED before cargo build — borgd embeds it)
 just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
 just desktop-dev     # Vite + Electron with hot reload

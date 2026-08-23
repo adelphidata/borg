@@ -152,11 +152,14 @@ web-lint:
     bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
     bun run --filter '*' typecheck
 
-# Unit-test the TypeScript packages and the Electron main process (Vitest)
+# Unit-test the TypeScript packages and the Electron main process (Vitest).
+# Coverage is on: each package's vitest.config carries the 90% threshold, so a
+# change that drops coverage fails here rather than being noticed a month later.
 web-test:
-    bun run --cwd packages/ui test
-    bun run --cwd packages/app test
-    bun run --cwd apps/desktop test
+    bun run --cwd packages/ui test --coverage.enabled
+    bun run --cwd packages/app test --coverage.enabled
+    bun run --cwd apps/desktop test --coverage.enabled
+    bun run --cwd apps/web test --coverage.enabled
 
 # Build the browser SPA. Run before `cargo build` — borgd embeds apps/web/dist.
 web-build:

@@ -22,4 +22,6 @@ Local rules only. Workspace layout, the transport seam, build order, and `just` 
 
 ## Testing
 
-**Line coverage stays above 90%.** All new or modified code needs corresponding test coverage. A change to `TokenGate`, the transport wiring, or any route added here is not done until a test covers it.
+`bun run --cwd apps/web test`. **Line coverage stays above 90%**, enforced by the thresholds in `vitest.config.ts`, and all new or modified code needs corresponding test coverage.
+
+`main.tsx` is excluded: it builds a transport and mounts, which the build already proves and `@borg/app`'s own suite covers. `TokenGate` is where the behaviour is — a stored token passing straight through, a pasted one being trimmed and stored, and an empty one being refused rather than written.

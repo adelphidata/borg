@@ -9,7 +9,8 @@
     ".": "./src/index.ts",
     "./styles/app.css": "./src/styles/app.css",
     "./styles/fonts.css": "./src/styles/fonts.css",
-    "./vite": "./vite.ts"
+    "./vite": "./vite.ts",
+    "./test/matchMedia": "./src/test/matchMedia.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

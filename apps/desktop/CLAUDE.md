@@ -30,4 +30,11 @@ Feature code must not read `window.borg`. It calls `useNative()`, which hands ba
 
 ## Testing
 
-**Line coverage stays above 90%.** All new or modified code needs corresponding test coverage — main-process modules (`electron/*.ts`) get Vitest units, renderer-facing bridges get tests for the data shapes that cross IPC. A change that adds a channel, a `NativeBridge` capability, or a `NO_NATIVE` no-op is not done until a test covers it.
+`bun run --cwd apps/desktop test` (or `just web-test` for every package). The suite runs in node and covers `electron/` only — the renderer is `@borg/app` and has its own jsdom suite.
+
+**Line coverage stays above 90%**, enforced by the thresholds in `vitest.config.mts`. All new or modified code needs corresponding test coverage. A change that adds a channel, a `NativeBridge` capability, or a `NO_NATIVE` no-op is not done until a test covers it.
+
+`electron/test/electron-stub.ts` stands in for the `electron` module: `vi.mock("electron", () => import("./test/electron-stub"))`. Two things about it are load-bearing:
+
+- Its state lives on a `globalThis` singleton. `main.ts` does its wiring at import time, so testing it means re-importing under `vi.resetModules()` — which hands the code under test a *second* copy of the stub. Without the shared store the test would read an empty registry while the code wrote to another one.
+- `ipcMain.handle` really keeps a registry, because the `dispose()` paths are tested by asserting the handler is gone.

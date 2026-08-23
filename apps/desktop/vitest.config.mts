@@ -11,5 +11,11 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["electron/**/*.test.ts"],
+    coverage: {
+      provider: "v8",
+      include: ["electron/**"],
+      exclude: ["electron/test/**", "electron/**/*.test.ts", "electron/channels.ts"],
+      thresholds: { lines: 90, statements: 90, functions: 90, branches: 85 },
+    },
   },
 });
