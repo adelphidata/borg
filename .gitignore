@@ -69,4 +69,5 @@ mutants.out.old/
 
 # StrykerJS mutation-testing artifacts
 .stryker-tmp/
-reports/mutation/
+**/reports/mutation/
+stryker-setup-*.js
