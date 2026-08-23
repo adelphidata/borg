@@ -160,6 +160,7 @@ web-lint:
 # Coverage is on: each package's vitest.config carries the 90% threshold, so a
 # change that drops coverage fails here rather than being noticed a month later.
 web-test:
+    bun run --cwd packages/client test --coverage.enabled
     bun run --cwd packages/ui test --coverage.enabled
     bun run --cwd packages/app test --coverage.enabled
     bun run --cwd apps/desktop test --coverage.enabled
