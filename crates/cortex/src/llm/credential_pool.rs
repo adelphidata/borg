@@ -583,261 +583,40 @@ impl CredentialPool {
         let provider_str = provider.as_str();
 
         // 1. Load suppression set.
-        let mut suppressed: HashSet<(String, String)> = HashSet::new();
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT source_kind, source_value FROM credential_suppressions \
-                     WHERE provider = ?1",
-                    params!(provider_str),
-                )
-                .await?;
-            while let Some(r) = rows.next().await? {
-                suppressed.insert((r.get::<String>(0)?, r.get::<String>(1)?));
-            }
-        }
+        let suppressed = load_suppressions(conn, provider_str).await?;
 
         // 2. Load persisted rows (state-bearing tombstones included).
-        let mut persisted: HashMap<String, PersistedRow> = HashMap::new();
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT fingerprint, id, label, priority, source_json, use_count, \
-                            last_status, last_status_at_ms, last_error_code, last_error_reason, \
-                            last_error_message, last_error_reset_at_ms, removed_at_ms, \
-                            auth_type, expires_at_ms, base_url, extra_json \
-                     FROM credential_pool WHERE provider = ?1",
-                    params!(provider_str),
-                )
-                .await?;
-            while let Some(r) = rows.next().await? {
-                let auth_type_str: String = r.get::<String>(13)?;
-                let auth_type = match auth_type_str.as_str() {
-                    "oauth" => AuthType::OAuth,
-                    _ => AuthType::ApiKey,
-                };
-                let row = PersistedRow {
-                    fingerprint: r.get::<String>(0)?,
-                    id: r.get::<String>(1)?,
-                    label: r.get::<String>(2)?,
-                    priority: r.get::<i64>(3)? as u32,
-                    source_json: r.get::<String>(4)?,
-                    use_count: r.get::<i64>(5)? as u64,
-                    last_status: r.get::<String>(6)?,
-                    last_status_at_ms: r.get::<Option<i64>>(7)?,
-                    last_error_code: r.get::<Option<i64>>(8)?.map(|x| x as u16),
-                    last_error_reason: r.get::<Option<String>>(9)?,
-                    last_error_message: r.get::<Option<String>>(10)?,
-                    last_error_reset_at_ms: r.get::<Option<i64>>(11)?,
-                    removed_at_ms: r.get::<Option<i64>>(12)?,
-                    auth_type,
-                    expires_at_ms: r.get::<Option<i64>>(14)?,
-                    base_url: r.get::<Option<String>>(15)?,
-                    extra_json: r.get::<Option<String>>(16)?,
-                };
-                persisted.insert(row.fingerprint.clone(), row);
-            }
-        }
+        let persisted = load_persisted_rows(conn, provider_str).await?;
 
         // 3. Seed: config entries, then env vars. Suppressed sources skipped.
-        let mut live: Vec<PooledCredential> = Vec::new();
-        let mut seen_fp: HashSet<String> = HashSet::new();
-        let mut next_priority: u32 = 0;
-
-        for entry in &cfg.config_entries {
-            if entry.key.trim().is_empty() {
-                continue;
-            }
-            let source = CredentialSource::Config {
-                name: entry.config_name.clone(),
-            };
-            if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
-                continue;
-            }
-            let fingerprint = fingerprint(&entry.key);
-            if !seen_fp.insert(fingerprint.clone()) {
-                continue;
-            }
-            let label = entry
-                .label
-                .clone()
-                .unwrap_or_else(|| entry.config_name.clone());
-            let cred = reconcile_or_new(
-                &persisted,
-                fingerprint,
-                entry.key.clone(),
-                label,
-                source,
-                next_priority,
-                clock.now_ms(),
-            );
-            next_priority += 1;
-            live.push(cred);
-        }
-
-        for var in &cfg.env_vars {
-            let Ok(val) = std::env::var(var) else {
-                continue;
-            };
-            let val = val.trim().to_string();
-            if val.is_empty() {
-                continue;
-            }
-            let source = CredentialSource::Env { var: var.clone() };
-            if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
-                continue;
-            }
-            let fingerprint = fingerprint(&val);
-            if !seen_fp.insert(fingerprint.clone()) {
-                continue;
-            }
-            let cred = reconcile_or_new(
-                &persisted,
-                fingerprint,
-                val,
-                var.clone(),
-                source,
-                next_priority,
-                clock.now_ms(),
-            );
-            next_priority += 1;
-            live.push(cred);
-        }
+        let mut seed = SeedState::default();
+        seed_config_entries(&cfg, &suppressed, &persisted, clock.as_ref(), &mut seed);
+        seed_env_vars(&cfg, &suppressed, &persisted, clock.as_ref(), &mut seed);
 
         // 3b. Seed: OAuth and custom-endpoint credentials discovered on disk.
-        //     Discoverers are matched per-provider; sources that find nothing
-        //     return Ok(vec![]). Parser errors log + continue — a malformed
-        //     credentials file must never crash pool load.
-        let oauth_home = cfg.oauth_home.clone().or_else(dirs::home_dir);
-        if let Some(home) = oauth_home.as_deref() {
-            for discoverer in crate::llm::credential_sources::discoverers_for(provider) {
-                let discovered = match discoverer.discover(home) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(
-                            target: "cortex::llm::credential_pool",
-                            source = discoverer.name(),
-                            error = %e,
-                            "credential pool: discoverer failed — skipping"
-                        );
-                        continue;
-                    }
-                };
-                for disc in discovered {
-                    // Reject unsafe base_urls before the credential lands in
-                    // the pool — see `is_safe_base_url` for the threat model.
-                    // Auto-seed quietly skips (logs warn); manual `borg auth
-                    // pair` paths surface the error to the operator.
-                    if let Some(url) = disc.base_url.as_deref() {
-                        if !is_safe_base_url(url) {
-                            warn!(
-                                target: "cortex::llm::credential_pool",
-                                source = discoverer.name(),
-                                base_url = url,
-                                "credential pool: rejecting unsafe base_url from discoverer — skipping"
-                            );
-                            continue;
-                        }
-                    }
-                    let source = match discoverer.provider() {
-                        Provider::Custom => CredentialSource::Custom {
-                            name: discoverer.name().to_string(),
-                            base_url: disc.base_url.clone().unwrap_or_default(),
-                        },
-                        _ => CredentialSource::OAuth {
-                            name: discoverer.name().to_string(),
-                        },
-                    };
-                    if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
-                        continue;
-                    }
-                    let fp = fingerprint(&disc.access_token);
-                    if !seen_fp.insert(fp.clone()) {
-                        continue;
-                    }
-                    // Qwen-CLI ships an API key with a base_url override, not
-                    // an OAuth refresh pair. Everything else is OAuth.
-                    let auth_type = if disc.refresh_token.is_some() {
-                        AuthType::OAuth
-                    } else {
-                        AuthType::ApiKey
-                    };
-                    let cred = reconcile_or_new_oauth(
-                        &persisted,
-                        fp,
-                        disc,
-                        source,
-                        auth_type,
-                        next_priority,
-                        clock.now_ms(),
-                    );
-                    next_priority += 1;
-                    live.push(cred);
-                }
-            }
-        }
+        seed_discovered_credentials(
+            provider,
+            &cfg,
+            &suppressed,
+            &persisted,
+            clock.as_ref(),
+            &mut seed,
+        );
+
+        let SeedState {
+            mut live, seen_fp, ..
+        } = seed;
 
         // 4. Carry forward removed-tombstone rows for `borg auth list` history.
-        for (fp, row) in &persisted {
-            if !seen_fp.contains(fp) && row.removed_at_ms.is_some() {
-                if let Ok(source) = serde_json::from_str::<CredentialSource>(&row.source_json) {
-                    live.push(PooledCredential {
-                        id: row.id.clone(),
-                        label: row.label.clone(),
-                        priority: row.priority,
-                        source,
-                        key: String::new(), // no live key — tombstone
-                        fingerprint: fp.clone(),
-                        use_count: row.use_count,
-                        last_status: CredentialStatus::from_db(&row.last_status),
-                        last_status_at_ms: row.last_status_at_ms,
-                        last_error_code: row.last_error_code,
-                        last_error_reason: row.last_error_reason.clone(),
-                        last_error_message: row.last_error_message.clone(),
-                        last_error_reset_at_ms: row.last_error_reset_at_ms,
-                        removed_at_ms: row.removed_at_ms,
-                        auth_type: row.auth_type,
-                        refresh_token: None, // tombstone — never resurrect refresh secret
-                        expires_at_ms: row.expires_at_ms,
-                        base_url: row.base_url.clone(),
-                        extra_json: row.extra_json.clone(),
-                        rate_limit: None,
-                        auth_refresh_grace_used: false,
-                        consecutive_rate_limits: 0,
-                    });
-                }
-            }
-        }
+        carry_forward_tombstones(&persisted, &seen_fp, &mut live);
 
         // 5. Prune persisted rows whose source disappeared from env/config and
         //    that aren't tombstoned (so `borg auth list` still shows manual
         //    removals); the live ones we already reconciled above.
-        let live_fps: HashSet<String> = live.iter().map(|c| c.fingerprint.clone()).collect();
-        let to_prune: Vec<String> = persisted
-            .keys()
-            .filter(|fp| !live_fps.contains(*fp))
-            .cloned()
-            .collect();
-        if !to_prune.is_empty() {
-            for fp in to_prune {
-                conn.execute(
-                    "DELETE FROM credential_pool WHERE provider = ?1 AND fingerprint = ?2",
-                    params!(provider_str, fp),
-                )
-                .await?;
-            }
-        }
+        prune_vanished_rows(conn, provider_str, &persisted, &live).await?;
 
         // 6. Normalize priorities (live first, tombstones at the end).
-        live.sort_by(|a, b| {
-            a.removed_at_ms
-                .is_some()
-                .cmp(&b.removed_at_ms.is_some())
-                .then(a.priority.cmp(&b.priority))
-        });
-        for (i, c) in live.iter_mut().enumerate() {
-            c.priority = i as u32;
-        }
+        normalize_priorities(&mut live);
 
         // 7. Persist (write-through reflects normalized priorities).
         for c in &live {
@@ -2121,6 +1900,331 @@ struct PersistedRow {
     expires_at_ms: Option<i64>,
     base_url: Option<String>,
     extra_json: Option<String>,
+}
+
+/// Accumulator threaded through the seeding phases of `load_with_clock`:
+/// credentials seeded so far, fingerprints already claimed (first source
+/// wins), and the next priority slot.
+#[derive(Default)]
+struct SeedState {
+    live: Vec<PooledCredential>,
+    seen_fp: HashSet<String>,
+    next_priority: u32,
+}
+
+/// Load the operator suppression set for `provider` (step 1 of pool load).
+async fn load_suppressions(
+    conn: &libsql::Connection,
+    provider_str: &str,
+) -> Result<HashSet<(String, String)>> {
+    let mut suppressed: HashSet<(String, String)> = HashSet::new();
+    let mut rows = conn
+        .query(
+            "SELECT source_kind, source_value FROM credential_suppressions \
+             WHERE provider = ?1",
+            params!(provider_str),
+        )
+        .await?;
+    while let Some(r) = rows.next().await? {
+        suppressed.insert((r.get::<String>(0)?, r.get::<String>(1)?));
+    }
+    Ok(suppressed)
+}
+
+/// Load persisted pool rows keyed by fingerprint, state-bearing tombstones
+/// included (step 2 of pool load).
+async fn load_persisted_rows(
+    conn: &libsql::Connection,
+    provider_str: &str,
+) -> Result<HashMap<String, PersistedRow>> {
+    let mut persisted: HashMap<String, PersistedRow> = HashMap::new();
+    let mut rows = conn
+        .query(
+            "SELECT fingerprint, id, label, priority, source_json, use_count, \
+                    last_status, last_status_at_ms, last_error_code, last_error_reason, \
+                    last_error_message, last_error_reset_at_ms, removed_at_ms, \
+                    auth_type, expires_at_ms, base_url, extra_json \
+             FROM credential_pool WHERE provider = ?1",
+            params!(provider_str),
+        )
+        .await?;
+    while let Some(r) = rows.next().await? {
+        let row = parse_persisted_row(&r)?;
+        persisted.insert(row.fingerprint.clone(), row);
+    }
+    Ok(persisted)
+}
+
+/// Decode one `credential_pool` row in the column order of the SELECT in
+/// [`load_persisted_rows`].
+fn parse_persisted_row(r: &libsql::Row) -> Result<PersistedRow> {
+    let auth_type_str: String = r.get::<String>(13)?;
+    let auth_type = match auth_type_str.as_str() {
+        "oauth" => AuthType::OAuth,
+        _ => AuthType::ApiKey,
+    };
+    Ok(PersistedRow {
+        fingerprint: r.get::<String>(0)?,
+        id: r.get::<String>(1)?,
+        label: r.get::<String>(2)?,
+        priority: r.get::<i64>(3)? as u32,
+        source_json: r.get::<String>(4)?,
+        use_count: r.get::<i64>(5)? as u64,
+        last_status: r.get::<String>(6)?,
+        last_status_at_ms: r.get::<Option<i64>>(7)?,
+        last_error_code: r.get::<Option<i64>>(8)?.map(|x| x as u16),
+        last_error_reason: r.get::<Option<String>>(9)?,
+        last_error_message: r.get::<Option<String>>(10)?,
+        last_error_reset_at_ms: r.get::<Option<i64>>(11)?,
+        removed_at_ms: r.get::<Option<i64>>(12)?,
+        auth_type,
+        expires_at_ms: r.get::<Option<i64>>(14)?,
+        base_url: r.get::<Option<String>>(15)?,
+        extra_json: r.get::<Option<String>>(16)?,
+    })
+}
+
+/// Seed config-block credentials (step 3 of pool load). Empty keys,
+/// suppressed sources, and duplicate fingerprints are skipped.
+fn seed_config_entries(
+    cfg: &PoolLoadConfig,
+    suppressed: &HashSet<(String, String)>,
+    persisted: &HashMap<String, PersistedRow>,
+    clock: &dyn Clock,
+    seed: &mut SeedState,
+) {
+    for entry in &cfg.config_entries {
+        if entry.key.trim().is_empty() {
+            continue;
+        }
+        let source = CredentialSource::Config {
+            name: entry.config_name.clone(),
+        };
+        if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
+            continue;
+        }
+        let fingerprint = fingerprint(&entry.key);
+        if !seed.seen_fp.insert(fingerprint.clone()) {
+            continue;
+        }
+        let label = entry
+            .label
+            .clone()
+            .unwrap_or_else(|| entry.config_name.clone());
+        let cred = reconcile_or_new(
+            persisted,
+            fingerprint,
+            entry.key.clone(),
+            label,
+            source,
+            seed.next_priority,
+            clock.now_ms(),
+        );
+        seed.next_priority += 1;
+        seed.live.push(cred);
+    }
+}
+
+/// Seed env-var credentials after config entries (step 3 of pool load).
+/// Unset/empty vars, suppressed sources, and duplicate fingerprints are
+/// skipped.
+fn seed_env_vars(
+    cfg: &PoolLoadConfig,
+    suppressed: &HashSet<(String, String)>,
+    persisted: &HashMap<String, PersistedRow>,
+    clock: &dyn Clock,
+    seed: &mut SeedState,
+) {
+    for var in &cfg.env_vars {
+        let Ok(val) = std::env::var(var) else {
+            continue;
+        };
+        let val = val.trim().to_string();
+        if val.is_empty() {
+            continue;
+        }
+        let source = CredentialSource::Env { var: var.clone() };
+        if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
+            continue;
+        }
+        let fingerprint = fingerprint(&val);
+        if !seed.seen_fp.insert(fingerprint.clone()) {
+            continue;
+        }
+        let cred = reconcile_or_new(
+            persisted,
+            fingerprint,
+            val,
+            var.clone(),
+            source,
+            seed.next_priority,
+            clock.now_ms(),
+        );
+        seed.next_priority += 1;
+        seed.live.push(cred);
+    }
+}
+
+/// Seed OAuth and custom-endpoint credentials discovered on disk (step 3b of
+/// pool load). Discoverers are matched per-provider; sources that find
+/// nothing return Ok(vec![]). Parser errors log + continue — a malformed
+/// credentials file must never crash pool load.
+fn seed_discovered_credentials(
+    provider: Provider,
+    cfg: &PoolLoadConfig,
+    suppressed: &HashSet<(String, String)>,
+    persisted: &HashMap<String, PersistedRow>,
+    clock: &dyn Clock,
+    seed: &mut SeedState,
+) {
+    let oauth_home = cfg.oauth_home.clone().or_else(dirs::home_dir);
+    let Some(home) = oauth_home.as_deref() else {
+        return;
+    };
+    for discoverer in crate::llm::credential_sources::discoverers_for(provider) {
+        let discovered = match discoverer.discover(home) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    target: "cortex::llm::credential_pool",
+                    source = discoverer.name(),
+                    error = %e,
+                    "credential pool: discoverer failed — skipping"
+                );
+                continue;
+            }
+        };
+        for disc in discovered {
+            // Reject unsafe base_urls before the credential lands in
+            // the pool — see `is_safe_base_url` for the threat model.
+            // Auto-seed quietly skips (logs warn); manual `borg auth
+            // pair` paths surface the error to the operator.
+            if let Some(url) = disc.base_url.as_deref() {
+                if !is_safe_base_url(url) {
+                    warn!(
+                        target: "cortex::llm::credential_pool",
+                        source = discoverer.name(),
+                        base_url = url,
+                        "credential pool: rejecting unsafe base_url from discoverer — skipping"
+                    );
+                    continue;
+                }
+            }
+            let source = match discoverer.provider() {
+                Provider::Custom => CredentialSource::Custom {
+                    name: discoverer.name().to_string(),
+                    base_url: disc.base_url.clone().unwrap_or_default(),
+                },
+                _ => CredentialSource::OAuth {
+                    name: discoverer.name().to_string(),
+                },
+            };
+            if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
+                continue;
+            }
+            let fp = fingerprint(&disc.access_token);
+            if !seed.seen_fp.insert(fp.clone()) {
+                continue;
+            }
+            // Qwen-CLI ships an API key with a base_url override, not
+            // an OAuth refresh pair. Everything else is OAuth.
+            let auth_type = if disc.refresh_token.is_some() {
+                AuthType::OAuth
+            } else {
+                AuthType::ApiKey
+            };
+            let cred = reconcile_or_new_oauth(
+                persisted,
+                fp,
+                disc,
+                source,
+                auth_type,
+                seed.next_priority,
+                clock.now_ms(),
+            );
+            seed.next_priority += 1;
+            seed.live.push(cred);
+        }
+    }
+}
+
+/// Carry forward removed-tombstone rows for `borg auth list` history (step 4
+/// of pool load). Rows whose `source_json` no longer parses are dropped.
+fn carry_forward_tombstones(
+    persisted: &HashMap<String, PersistedRow>,
+    seen_fp: &HashSet<String>,
+    live: &mut Vec<PooledCredential>,
+) {
+    for (fp, row) in persisted {
+        if !seen_fp.contains(fp) && row.removed_at_ms.is_some() {
+            if let Ok(source) = serde_json::from_str::<CredentialSource>(&row.source_json) {
+                live.push(PooledCredential {
+                    id: row.id.clone(),
+                    label: row.label.clone(),
+                    priority: row.priority,
+                    source,
+                    key: String::new(), // no live key — tombstone
+                    fingerprint: fp.clone(),
+                    use_count: row.use_count,
+                    last_status: CredentialStatus::from_db(&row.last_status),
+                    last_status_at_ms: row.last_status_at_ms,
+                    last_error_code: row.last_error_code,
+                    last_error_reason: row.last_error_reason.clone(),
+                    last_error_message: row.last_error_message.clone(),
+                    last_error_reset_at_ms: row.last_error_reset_at_ms,
+                    removed_at_ms: row.removed_at_ms,
+                    auth_type: row.auth_type,
+                    refresh_token: None, // tombstone — never resurrect refresh secret
+                    expires_at_ms: row.expires_at_ms,
+                    base_url: row.base_url.clone(),
+                    extra_json: row.extra_json.clone(),
+                    rate_limit: None,
+                    auth_refresh_grace_used: false,
+                    consecutive_rate_limits: 0,
+                });
+            }
+        }
+    }
+}
+
+/// Delete persisted rows whose source disappeared and that aren't carried
+/// forward as tombstones (step 5 of pool load).
+async fn prune_vanished_rows(
+    conn: &libsql::Connection,
+    provider_str: &str,
+    persisted: &HashMap<String, PersistedRow>,
+    live: &[PooledCredential],
+) -> Result<()> {
+    let live_fps: HashSet<String> = live.iter().map(|c| c.fingerprint.clone()).collect();
+    let to_prune: Vec<String> = persisted
+        .keys()
+        .filter(|fp| !live_fps.contains(*fp))
+        .cloned()
+        .collect();
+    if !to_prune.is_empty() {
+        for fp in to_prune {
+            conn.execute(
+                "DELETE FROM credential_pool WHERE provider = ?1 AND fingerprint = ?2",
+                params!(provider_str, fp),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-number priorities to a dense 0..n ordering — live entries first,
+/// tombstones at the end (step 6 of pool load).
+fn normalize_priorities(live: &mut [PooledCredential]) {
+    live.sort_by(|a, b| {
+        a.removed_at_ms
+            .is_some()
+            .cmp(&b.removed_at_ms.is_some())
+            .then(a.priority.cmp(&b.priority))
+    });
+    for (i, c) in live.iter_mut().enumerate() {
+        c.priority = i as u32;
+    }
 }
 
 fn reconcile_or_new(
