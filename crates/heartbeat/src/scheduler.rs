@@ -1569,4 +1569,82 @@ mod tests {
             "cron scheduler did not pick up live quiet-hours update (saw_fire={saw_fire})"
         );
     }
+
+    #[test]
+    fn skip_reason_display_names_each_reason() {
+        // These strings reach logs and channel skip notices; renaming one is
+        // an operator-visible change, so the exact wording is the spec.
+        let cases: &[(SkipReason, &str)] = &[
+            (SkipReason::QuietHours, "quiet hours"),
+            (SkipReason::EmptyResponse, "empty response"),
+            (SkipReason::DuplicateResponse, "duplicate response"),
+            (SkipReason::NoLlmProvider, "no llm provider"),
+            (
+                SkipReason::InteractiveInputUnavailable,
+                "interactive input unavailable",
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.to_string(), *expected);
+        }
+    }
+
+    #[test]
+    fn interval_at_the_floor_is_kept_without_a_clamp_warning() {
+        use std::sync::{Arc as StdArc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct WarnCounter(StdArc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.lock().unwrap().push(event.metadata().name().to_string());
+                }
+            }
+        }
+
+        let warns = WarnCounter::default();
+        let subscriber = tracing_subscriber::registry().with(warns.clone());
+
+        let mut config = HeartbeatConfig {
+            interval: "60s".to_string(),
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            cron: None,
+            channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
+            ..Default::default()
+        };
+        config.min_interval_secs = 60;
+
+        let at_floor = tracing::subscriber::with_default(subscriber, || {
+            let sched = test_scheduler(config.clone(), chrono_tz::UTC);
+            sched.clamped_interval()
+        });
+        assert_eq!(at_floor, std::time::Duration::from_secs(60));
+        assert!(
+            warns.0.lock().unwrap().is_empty(),
+            "an interval exactly at the floor must not log a clamp warning"
+        );
+
+        // Below the floor the clamp applies and warns.
+        config.interval = "30s".to_string();
+        let warns_below = WarnCounter::default();
+        let subscriber = tracing_subscriber::registry().with(warns_below.clone());
+        let clamped = tracing::subscriber::with_default(subscriber, || {
+            let sched = test_scheduler(config, chrono_tz::UTC);
+            sched.clamped_interval()
+        });
+        assert_eq!(clamped, std::time::Duration::from_secs(60));
+        assert_eq!(
+            warns_below.0.lock().unwrap().len(),
+            1,
+            "a below-floor interval must log exactly one clamp warning"
+        );
+    }
 }
