@@ -177,18 +177,13 @@ pub fn remove(service: &str, account: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
-    /// Serializes tests that mutate `$BORG_HOME`. Cargo runs tests in one
-    /// process across multiple threads; concurrent tests would clobber each
-    /// other's tempdir pointer and race on the shared credentials file.
+    /// Serializes tests that mutate `$BORG_HOME` (shared crate-wide via
+    /// `test_support` so keychain-shim tests in other modules can't race us).
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        // Poisoned locks are fine — we only guard env exclusivity, not invariants.
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::test_support::env_lock()
     }
 
     struct TestEnv {
@@ -418,6 +413,47 @@ mod tests {
             read(&svc, "account-x"),
             Some("token-abc".to_string()),
             "read() must fall back to the file when keychain misses"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_falls_back_to_file_when_keychain_write_fails() {
+        // The onboarding contract: a denied/broken keychain must not lose the
+        // credential — `store` has to land it in the 0600 fallback file and
+        // `read` has to find it there. A `store` that reports Ok without
+        // persisting anywhere strands the user with a "successful" setup that
+        // cannot authenticate.
+        let _lock = env_lock();
+        let _shim = crate::test_support::KeychainShim::failing();
+
+        store("svc-fallback", "acct", "sekrit").expect("store must succeed via file fallback");
+
+        let file = load_file().unwrap();
+        assert_eq!(
+            file.services.get("svc-fallback").unwrap().get("acct").unwrap(),
+            "sekrit",
+            "credential must be durably written to the fallback file"
+        );
+        assert_eq!(read("svc-fallback", "acct"), Some("sekrit".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_prefers_keychain_value_over_fallback_file() {
+        // Keychain is the primary backend: when both backends hold a value,
+        // the keychain one must win (the file may be stale from a period when
+        // the keychain was unavailable).
+        use crate::test_support::{KeychainShim, SHIM_SERVICE, SHIM_VALUE};
+        let _lock = env_lock();
+        let _shim = KeychainShim::find_succeeds();
+
+        file_only_store(SHIM_SERVICE, "acct", "stale-file-value").unwrap();
+
+        assert_eq!(
+            read(SHIM_SERVICE, "acct"),
+            Some(SHIM_VALUE.to_string()),
+            "read must consult the keychain before the fallback file"
         );
     }
 

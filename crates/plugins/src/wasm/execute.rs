@@ -378,6 +378,27 @@ mod tests {
             chain.to_lowercase().contains("fuel"),
             "expected wasmtime fuel-exhaustion trap, got chain: {chain}"
         );
+        // The classifier must bucket a real fuel trap from the execute path,
+        // not just hand-built errors — this pins the typed-trap match arm.
+        assert_eq!(
+            classify_execute_error(&err),
+            WasmExecuteErrorKind::FuelExhausted,
+            "a real out-of-fuel execution error must classify as FuelExhausted"
+        );
+    }
+
+    #[test]
+    fn execute_tool_allows_output_exactly_at_max_output_bytes() {
+        // minimal_wasm stages the 2-byte "OK". With the cap set to exactly 2
+        // the call must succeed — the output limit is inclusive. Drifting to
+        // a strict bound would reject guests that stay precisely within the
+        // budget their manifest declared.
+        let wasm = minimal_wasm();
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.max_output_bytes = 2;
+        let out = execute_tool(&manifest, &wasm, "echo_wasm", &serde_json::json!({}))
+            .expect("output exactly at max_output_bytes is allowed");
+        assert_eq!(out, "OK");
     }
 
     #[test]
@@ -757,10 +778,29 @@ mod tests {
     fn classify_execute_error_covers_string_matched_arms() {
         use anyhow::anyhow;
 
+        // Multi-alternative arms carry one case per alternative on its own,
+        // so no single `contains` can satisfy an arm for all its cases —
+        // an || that quietly became && fails at least one row.
         let cases: &[(&str, WasmExecuteErrorKind)] = &[
             (
                 "growing memory failed: out of pages",
                 WasmExecuteErrorKind::MemoryExceeded,
+            ),
+            (
+                "max memory pages exceeded",
+                WasmExecuteErrorKind::MemoryExceeded,
+            ),
+            (
+                "memory minimum size mismatch",
+                WasmExecuteErrorKind::MemoryExceeded,
+            ),
+            (
+                "url not on allowlist",
+                WasmExecuteErrorKind::HostHttpDenied,
+            ),
+            (
+                "host not in endpoint allowlist",
+                WasmExecuteErrorKind::HostHttpDenied,
             ),
             (
                 "output exceeded 1048576 bytes",
@@ -803,6 +843,64 @@ mod tests {
                 got, *expected,
                 "classifier drift: `{msg}` should map to {expected:?}, got {got:?}",
             );
+        }
+    }
+
+    /// The typed-trap arms are the most reliable classification signal; the
+    /// string fallbacks never see fuel/timeout stops. Dropping either arm
+    /// would collapse those buckets into `guest_trap` and blind the
+    /// fuel-vs-timeout distinction in dashboards.
+    #[test]
+    fn classify_execute_error_maps_wasmtime_traps() {
+        let cases = [
+            (
+                wasmtime::Trap::OutOfFuel,
+                WasmExecuteErrorKind::FuelExhausted,
+            ),
+            (wasmtime::Trap::Interrupt, WasmExecuteErrorKind::Timeout),
+            (
+                wasmtime::Trap::UnreachableCodeReached,
+                WasmExecuteErrorKind::GuestTrap,
+            ),
+        ];
+        for (trap, expected) in cases {
+            // Wrap in context so the classifier must walk the chain, exactly
+            // as it does for errors surfaced by execute_tool_prepared.
+            let err = anyhow::Error::new(trap).context("guest trapped");
+            assert_eq!(
+                classify_execute_error(&err),
+                expected,
+                "trap {trap:?} must classify as {expected:?}"
+            );
+        }
+    }
+
+    /// `as_str` labels are stable identifiers baked into audit rows and
+    /// metrics — an empty or renamed label breaks downstream queries even
+    /// though nothing in-process notices.
+    #[test]
+    fn error_kind_labels_are_stable() {
+        let cases = [
+            (WasmExecuteErrorKind::FuelExhausted, "fuel_exhausted"),
+            (WasmExecuteErrorKind::Timeout, "timeout"),
+            (WasmExecuteErrorKind::MemoryExceeded, "memory_exceeded"),
+            (WasmExecuteErrorKind::OutputTooLarge, "output_too_large"),
+            (WasmExecuteErrorKind::LogBytesExceeded, "log_bytes_exceeded"),
+            (WasmExecuteErrorKind::HostHttpDenied, "host_http_denied"),
+            (
+                WasmExecuteErrorKind::HostHttpSecretLeak,
+                "host_http_secret_leak",
+            ),
+            (WasmExecuteErrorKind::HostHttpUpstream, "host_http_upstream"),
+            (WasmExecuteErrorKind::CredentialDenied, "credential_denied"),
+            (
+                WasmExecuteErrorKind::InvalidGuestOutput,
+                "invalid_guest_output",
+            ),
+            (WasmExecuteErrorKind::GuestTrap, "guest_trap"),
+        ];
+        for (kind, label) in cases {
+            assert_eq!(kind.as_str(), label, "{kind:?} label drifted");
         }
     }
 }

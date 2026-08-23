@@ -454,6 +454,62 @@ mod tests {
     }
 
     #[test]
+    fn resource_limits_defaults_match_documented_budgets() {
+        // A manifest that omits `limits` (or any single field) gets the
+        // documented sandbox defaults. These numbers are contract: they bound
+        // what an unconfigured plugin can consume, so drift in any of them
+        // silently changes the sandbox posture of every default install.
+        let parsed: ResourceLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.timeout_ms, 5_000, "default wall-clock budget is 5s");
+        assert_eq!(parsed.fuel, 10_000_000, "default fuel budget is 10M");
+        assert_eq!(parsed.max_memory_pages, 16, "default heap is 16 pages (1 MiB)");
+        assert_eq!(
+            parsed.max_output_bytes, 65_536,
+            "default output cap is 64 KiB"
+        );
+        // The serde defaults and the `Default` impl are two code paths that
+        // must agree, or a programmatic manifest diverges from a parsed one.
+        assert_eq!(parsed, ResourceLimits::default());
+    }
+
+    #[test]
+    fn no_host_services_rejects_every_capability() {
+        // The default trait bodies (and thus NoHostServices) must fail every
+        // capability call. Returning Ok(...) instead would let a plugin whose
+        // host forgot to wire services read empty-but-successful state or
+        // credentials — a silent capability bypass.
+        let services = NoHostServices;
+        let fetch = HostHttpFetch {
+            method: "GET",
+            request: HostHttpRequest {
+                url: "https://api.example.com/",
+                headers: &[],
+                body: &[],
+            },
+        };
+        let err = services
+            .http_fetch(&fetch)
+            .expect_err("http_fetch must be unwired")
+            .to_string();
+        assert!(err.contains("not wired"), "http_fetch error: {err}");
+        let err = services
+            .state_read("k")
+            .expect_err("state_read must be unwired")
+            .to_string();
+        assert!(err.contains("not wired"), "state_read error: {err}");
+        let err = services
+            .state_write("k", b"v")
+            .expect_err("state_write must be unwired")
+            .to_string();
+        assert!(err.contains("not wired"), "state_write error: {err}");
+        let err = services
+            .credentials_get("k")
+            .expect_err("credentials_get must be unwired")
+            .to_string();
+        assert!(err.contains("not wired"), "credentials_get error: {err}");
+    }
+
+    #[test]
     fn wasmtime_config_has_required_setters() {
         // Source-grep guard. `wasmtime::Config` has no getters, so this
         // invariant can't be expressed in the type system. The setters below

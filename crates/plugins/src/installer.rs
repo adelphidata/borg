@@ -524,6 +524,9 @@ mod tests {
         // Native uninstall must be a graceful no-op when nothing is on disk
         // or in the keychain. Idempotency is the contract: re-running
         // uninstall after a successful uninstall must not error.
+        let _lock = crate::test_support::env_lock();
+        #[cfg(unix)]
+        let _shim = crate::test_support::KeychainShim::failing();
         let tmp = tempfile::tempdir().expect("create temp dir");
         let def = CATALOG
             .iter()
@@ -537,5 +540,319 @@ mod tests {
             std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
             "uninstall must not write to data_dir for native integrations"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_template_directory() {
+        // Uninstalling a template plugin must actually delete its files —
+        // an uninstall that reports Ok but leaves the channel dir behind
+        // keeps the gateway polling a "removed" integration.
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::failing();
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let def = CATALOG
+            .iter()
+            .find(|c| c.id == "messaging/whatsapp")
+            .expect("whatsapp in catalog");
+
+        write_templates(def, tmp.path()).expect("write templates");
+        let dir = tmp.path().join("channels").join("whatsapp");
+        assert!(dir.join("channel.toml").exists(), "fixture: templates written");
+
+        uninstall(def, tmp.path()).expect("uninstall");
+        assert!(
+            !dir.exists(),
+            "uninstall must delete the plugin's template directory"
+        );
+    }
+
+    #[test]
+    fn check_prerequisites_names_the_missing_binary() {
+        // The error must name exactly the binary that is missing, and the
+        // python3 install hint must not leak onto unrelated binaries (an
+        // operator told to `brew install python3` for a missing signal-cli
+        // would be sent down the wrong path).
+        const NO_SUCH: &str = "borg-test-no-such-binary-9c1d";
+        const BINS: &[&str] = &[NO_SUCH];
+        let def = crate::catalog::PluginDef {
+            id: "test/missing-bin",
+            name: "MissingBin",
+            category: Category::Channels,
+            kind: PluginKind::Channel,
+            description: "test fixture",
+            required_credentials: &[],
+            required_bins: BINS,
+            templates: &[],
+            platform: Platform::All,
+            is_native: true,
+            post_install: None,
+        };
+
+        let err = check_prerequisites(&def).expect_err("missing binary must fail prerequisites");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("Required binary not found: {NO_SUCH}")),
+            "error must name the missing binary: {msg}"
+        );
+        assert!(
+            !msg.contains("brew install"),
+            "python3 install hint must not appear for other binaries: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_scripts_executable_sets_exec_bit_on_scripts_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Channel scripts are exec'd directly by the gateway; a missing exec
+        // bit means the installed channel silently never polls or sends.
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let def = CATALOG
+            .iter()
+            .find(|c| c.id == "messaging/whatsapp")
+            .expect("whatsapp in catalog");
+        write_templates(def, tmp.path()).expect("write templates");
+
+        make_scripts_executable(def, tmp.path()).expect("chmod scripts");
+
+        let base = tmp.path().join("channels").join("whatsapp");
+        for script in ["parse_inbound.py", "send_outbound.py", "verify.py"] {
+            let mode = std::fs::metadata(base.join(script))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "{script} must be executable, got {mode:o}");
+        }
+        let manifest_mode = std::fs::metadata(base.join("channel.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111;
+        assert_eq!(manifest_mode, 0, "manifest must not gain exec bits");
+    }
+
+    #[test]
+    fn credential_account_is_borg_prefixed_key() {
+        // This is the on-keychain account naming contract. Changing it
+        // strands every credential stored by previous installs.
+        assert_eq!(
+            credential_account("TELEGRAM_BOT_TOKEN"),
+            "borg-TELEGRAM_BOT_TOKEN"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_and_remove_credential_round_trip() {
+        // store_credential must persist under the borg- prefixed account and
+        // remove_credential must actually delete it — a no-op remove leaves
+        // secrets behind after uninstall.
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::failing();
+        let service = "borg-test-installer-svc";
+
+        store_credential(service, "MY_KEY", "v1").expect("store credential");
+        assert_eq!(
+            crate::credential_store::read(service, "borg-MY_KEY"),
+            Some("v1".to_string()),
+            "credential must be stored under the borg- prefixed account"
+        );
+
+        remove_credential(service, "MY_KEY");
+        assert_eq!(
+            crate::credential_store::read(service, "borg-MY_KEY"),
+            None,
+            "credential must be gone after remove_credential"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn imessage_post_install_seeds_state_from_messages_db() {
+        // With a readable Messages DB the hook must seed the ROWID cursor and
+        // report Full Disk Access as working — not demand FDA (that path is
+        // for a missing/unreadable chat.db only).
+        let _lock = crate::test_support::env_lock();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let messages_dir = home.path().join("Library").join("Messages");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        {
+            let db = libsql::Builder::new_local(messages_dir.join("chat.db"))
+                .build()
+                .await
+                .expect("create fake chat.db");
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, handle_id INTEGER, is_from_me INTEGER)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)", ())
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO handle (ROWID, id) VALUES (1, 'me@example.com')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, is_from_me) VALUES (7, 1, 0), (42, 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let _home_guard = crate::test_support::EnvVarGuard::set("HOME", home.path());
+
+        let data = tempfile::tempdir().expect("data tempdir");
+        std::fs::create_dir_all(data.path().join("channels").join("imessage")).unwrap();
+
+        let notes = imessage_post_install(data.path().to_path_buf()).await;
+
+        assert!(
+            notes.iter().any(|n| n.contains("Full Disk Access detected")),
+            "readable chat.db must be reported as FDA working: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("Full Disk Access required")),
+            "must not demand FDA when chat.db is readable: {notes:?}"
+        );
+        let state = std::fs::read_to_string(
+            data.path()
+                .join("channels")
+                .join("imessage")
+                .join("state.json"),
+        )
+        .expect("state.json seeded");
+        assert_eq!(
+            state, "{\"last_rowid\": 42}",
+            "cursor must start at the current max ROWID so old messages are skipped"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("me@example.com")),
+            "self handle should be surfaced to the user: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_max_rowid_returns_highest_rowid_or_none_when_empty() {
+        // The cursor seed: too low replays the user's message history into
+        // the agent; a phantom value on an empty table skips the gateway's
+        // first-arrival seeding.
+        let tmp = tempfile::tempdir().expect("db tempdir");
+        let db = libsql::Builder::new_local(tmp.path().join("m.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, handle_id INTEGER, is_from_me INTEGER)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_max_rowid(&conn).await.unwrap(),
+            None,
+            "empty message table has no cursor to seed"
+        );
+
+        conn.execute(
+            "INSERT INTO message (ROWID, handle_id, is_from_me) VALUES (7, 1, 0), (42, 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_max_rowid(&conn).await.unwrap(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn read_self_handle_returns_own_address_only_when_outbound_exists() {
+        let tmp = tempfile::tempdir().expect("db tempdir");
+        let db = libsql::Builder::new_local(tmp.path().join("m.db"))
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, handle_id INTEGER, is_from_me INTEGER)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO handle (ROWID, id) VALUES (1, 'friend@example.com'), (2, 'me@example.com')",
+            (),
+        )
+        .await
+        .unwrap();
+        // Inbound-only traffic: no is_from_me rows means no self handle.
+        conn.execute(
+            "INSERT INTO message (ROWID, handle_id, is_from_me) VALUES (1, 1, 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_self_handle(&conn).await.unwrap(), None);
+
+        // One outbound message pins the self handle to the sent-to address.
+        conn.execute(
+            "INSERT INTO message (ROWID, handle_id, is_from_me) VALUES (2, 2, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_self_handle(&conn).await.unwrap(),
+            Some("me@example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn send_event_delivers_to_progress_channel() {
+        // The TUI renders install progress from this channel; a dropped
+        // event means a spinner that never resolves.
+        let (tx, mut rx) = mpsc::channel(1);
+        send_event(Some(&tx), InstallEvent::Complete { id: "x".to_string() }).await;
+        match rx.try_recv() {
+            Ok(InstallEvent::Complete { id }) => assert_eq!(id, "x"),
+            other => panic!("expected the Complete event to be delivered, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keychain_available_tracks_helper_binary_on_path() {
+        // The onboarding flow branches on this: available -> keychain-first
+        // storage, unavailable -> file fallback with a reduced-security note.
+        // Both directions matter.
+        let _lock = crate::test_support::env_lock();
+        {
+            // A helper binary on PATH (even a broken one) means "available".
+            let _shim = crate::test_support::KeychainShim::failing();
+            assert!(
+                keychain_available(),
+                "helper binary on PATH must report available"
+            );
+        }
+        {
+            let _shim = crate::test_support::KeychainShim::without_helpers();
+            assert!(
+                !keychain_available(),
+                "no helper binary on PATH must report unavailable"
+            );
+            assert!(
+                !crate::keychain::available(),
+                "keychain::available must agree"
+            );
+        }
     }
 }

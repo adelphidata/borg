@@ -193,6 +193,223 @@ pub struct InstallResult {
     pub file_hashes: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared helpers for tests that mutate process-global state.
+    //!
+    //! Any test that changes an env var, or whose outcome depends on which
+    //! keychain helper binary `PATH` resolves, must hold [`env_lock`] for its
+    //! whole body so parallel tests cannot observe each other's overrides.
+    //! [`KeychainShim`] keeps such tests hermetic: keychain helpers resolve to
+    //! a fake script and `BORG_HOME` points at a temp dir, so nothing ever
+    //! touches the user's real login keychain or `~/.borg`.
+
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Global lock serializing env-mutating tests. Poisoning is ignored — the
+    /// lock guards exclusivity, not data invariants.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets (or unsets) one env var for the guard's lifetime, restoring the
+    /// prior value on drop. Callers must hold [`env_lock`] first.
+    pub(crate) struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        /// Override `key` with `value` until the guard drops.
+        pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        /// Remove `key` from the environment until the guard drops.
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Service name the [`KeychainShim::find_succeeds`] script answers for.
+    /// Scoping success to one service keeps concurrently running tests that
+    /// probe other (nonexistent) services from seeing phantom credentials.
+    pub(crate) const SHIM_SERVICE: &str = "borg-shim-svc";
+    /// Secret value the [`KeychainShim::find_succeeds`] script prints.
+    pub(crate) const SHIM_VALUE: &str = "kc-value";
+
+    /// Redirects keychain helper invocations (`security` on macOS,
+    /// `secret-tool` on Linux) to a fake shell script and points `BORG_HOME`
+    /// at a fresh temp dir. Callers must hold [`env_lock`] first.
+    #[cfg(unix)]
+    pub(crate) struct KeychainShim {
+        tmp: tempfile::TempDir,
+        _guards: Vec<EnvVarGuard>,
+    }
+
+    #[cfg(unix)]
+    impl KeychainShim {
+        /// Install a fake keychain helper with the given `sh` body, prepended
+        /// to `PATH` so it shadows the real binaries. `{{LOG}}` in the body is
+        /// replaced with [`Self::log_path`]. The body should drain stdin
+        /// (`cat >/dev/null`) if it must succeed on the Linux `secret-tool
+        /// store` path, which pipes the secret in.
+        pub(crate) fn fake_helper(body: &str) -> Self {
+            let tmp = tempfile::TempDir::new().expect("shim tempdir");
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("shim bin dir");
+            let log = tmp.path().join("helper.log");
+            let script = format!(
+                "#!/bin/sh\n{}\n",
+                body.replace("{{LOG}}", &log.display().to_string())
+            );
+            for name in ["security", "secret-tool"] {
+                write_executable(&bin.join(name), &script);
+            }
+            let home = tmp.path().join("borg-home");
+            std::fs::create_dir_all(&home).expect("shim home dir");
+            let mut path = bin.into_os_string();
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
+            let guards = vec![
+                EnvVarGuard::set("PATH", &path),
+                EnvVarGuard::set("BORG_HOME", &home),
+            ];
+            Self {
+                tmp,
+                _guards: guards,
+            }
+        }
+
+        /// Helper that always fails — forces the file fallback everywhere and
+        /// guarantees `check`/`read` keychain misses.
+        pub(crate) fn failing() -> Self {
+            Self::fake_helper("exit 1")
+        }
+
+        /// Helper where credential lookups succeed — but only for
+        /// [`SHIM_SERVICE`], printing [`SHIM_VALUE`]. Everything else fails.
+        pub(crate) fn find_succeeds() -> Self {
+            Self::fake_helper(concat!(
+                "case \"$1\" in find-generic-password|lookup) ;; *) exit 1 ;; esac\n",
+                "for a in \"$@\"; do\n",
+                "  [ \"$a\" = \"borg-shim-svc\" ] && { printf 'kc-value\\n'; exit 0; }\n",
+                "done\n",
+                "exit 1",
+            ))
+        }
+
+        /// `PATH` with no keychain helper at all. Keeps `sh`, `cat`, and
+        /// `python3` resolvable via symlinks so unrelated concurrent tests
+        /// that spawn subprocesses keep working.
+        pub(crate) fn without_helpers() -> Self {
+            let tmp = tempfile::TempDir::new().expect("shim tempdir");
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).expect("shim bin dir");
+            for (name, target) in [
+                ("sh", "/bin/sh"),
+                ("cat", "/bin/cat"),
+                ("python3", "/usr/bin/python3"),
+            ] {
+                if std::path::Path::new(target).exists() {
+                    std::os::unix::fs::symlink(target, bin.join(name)).expect("shim symlink");
+                }
+            }
+            let home = tmp.path().join("borg-home");
+            std::fs::create_dir_all(&home).expect("shim home dir");
+            let guards = vec![
+                EnvVarGuard::set("PATH", bin.as_os_str()),
+                EnvVarGuard::set("BORG_HOME", &home),
+            ];
+            Self {
+                tmp,
+                _guards: guards,
+            }
+        }
+
+        /// Path the `{{LOG}}` placeholder in [`Self::fake_helper`] expands to.
+        pub(crate) fn log_path(&self) -> std::path::PathBuf {
+            self.tmp.path().join("helper.log")
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, content: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, content).expect("write shim script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shim script");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_and_category_display_match_ui_vocabulary() {
+        // These strings are UI/config vocabulary — lowercase kind nouns and
+        // uppercase section headers. A Display that writes nothing (or the
+        // wrong casing) breaks marketplace rendering and settings matching.
+        let kinds: &[(PluginKind, &str)] = &[
+            (PluginKind::Channel, "channel"),
+            (PluginKind::Tool, "tool"),
+        ];
+        for (kind, expected) in kinds {
+            assert_eq!(kind.to_string(), *expected);
+        }
+
+        let categories: &[(Category, &str)] = &[
+            (Category::Channels, "CHANNELS"),
+            (Category::Core, "CORE"),
+            (Category::Email, "EMAIL"),
+            (Category::Developer, "DEVELOPER"),
+            (Category::Productivity, "PRODUCTIVITY"),
+            (Category::Utilities, "UTILITIES"),
+            (Category::Payments, "PAYMENTS"),
+        ];
+        for (category, expected) in categories {
+            assert_eq!(category.to_string(), *expected);
+        }
+    }
+
+    #[test]
+    fn platform_label_flags_only_restricted_platforms() {
+        // The marketplace badges restricted plugins; unrestricted ones must
+        // show no badge at all, and the restricted label must name the OS.
+        assert_eq!(Platform::All.label(), None);
+        assert_eq!(Platform::MacOS.label(), Some("macOS only"));
+    }
+
+    #[test]
+    fn platform_availability_tracks_host_os() {
+        // `All` installs everywhere; `MacOS` only where the OS matches. On a
+        // non-macOS host a `MacOS` platform reporting available would let the
+        // installer write templates for a channel that can never run.
+        assert!(Platform::All.is_available());
+        assert_eq!(Platform::MacOS.is_available(), cfg!(target_os = "macos"));
+    }
+}
+
 /// Events emitted during installation for progress display.
 #[derive(Debug, Clone)]
 pub enum InstallEvent {

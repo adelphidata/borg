@@ -441,6 +441,48 @@ mod tests {
     }
 
     #[test]
+    fn by_category_filters_matching_entries_in_order() {
+        // Every catalog entry is a Channels plugin today, so filtering by
+        // Channels must return the whole catalog in declaration order (the
+        // marketplace renders in this order), and filtering by a category
+        // with no plugins must return nothing — not everything.
+        let channel_ids: Vec<&str> = by_category(Category::Channels)
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        let all_ids: Vec<&str> = CATALOG.iter().map(|d| d.id).collect();
+        assert_eq!(channel_ids, all_ids);
+        assert!(
+            by_category(Category::Payments).is_empty(),
+            "no payments plugins exist yet — an inverted filter would return the full catalog"
+        );
+    }
+
+    #[test]
+    fn categories_lists_each_ui_section_once_channels_first() {
+        let cats = categories();
+        assert_eq!(
+            cats.first(),
+            Some(&Category::Channels),
+            "channels lead the marketplace display order"
+        );
+        assert_eq!(cats.len(), 7, "one entry per UI section");
+        for (i, cat) in cats.iter().enumerate() {
+            assert!(
+                !cats[i + 1..].contains(cat),
+                "duplicate category {cat} would render its section twice"
+            );
+        }
+        for def in CATALOG {
+            assert!(
+                cats.contains(&def.category),
+                "catalog entry {} has a category missing from the display list",
+                def.id
+            );
+        }
+    }
+
+    #[test]
     fn all_catalog_entries_are_channels() {
         for entry in CATALOG {
             assert_eq!(

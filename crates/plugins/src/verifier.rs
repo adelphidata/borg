@@ -83,6 +83,118 @@ fn check_keychain_credential(def: &PluginDef, key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::catalog::CATALOG;
+    use crate::{Category, CredentialSpec, Platform, PluginKind};
+
+    fn native_def(id: &'static str, creds: &'static [CredentialSpec]) -> PluginDef {
+        PluginDef {
+            id,
+            name: "Fixture",
+            category: Category::Channels,
+            kind: PluginKind::Channel,
+            description: "test fixture",
+            required_credentials: creds,
+            required_bins: &[],
+            templates: &[],
+            platform: Platform::All,
+            is_native: true,
+            post_install: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_treats_empty_env_var_as_missing_credential() {
+        // `KEY=""` in the environment (a common .envrc placeholder) is not a
+        // usable credential; counting it as present would report a channel as
+        // healthy that can never authenticate.
+        const CREDS: &[CredentialSpec] = &[CredentialSpec {
+            key: "BORG_TEST_VERIFY_EMPTY",
+            label: "Token",
+            help_url: "",
+            is_optional: false,
+        }];
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::failing();
+        let _env = crate::test_support::EnvVarGuard::set("BORG_TEST_VERIFY_EMPTY", "");
+
+        let result = verify(&native_def("test/empty-env", CREDS), &std::env::temp_dir());
+        assert!(!result.ok, "empty env var must not satisfy verification");
+        assert!(
+            result.message.contains("BORG_TEST_VERIFY_EMPTY"),
+            "message must name the missing credential: {}",
+            result.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_passes_with_env_credential_alone() {
+        // Env var OR keychain suffices — a user who exports the token but
+        // never stored it in the keychain must still verify clean.
+        const CREDS: &[CredentialSpec] = &[CredentialSpec {
+            key: "BORG_TEST_VERIFY_SET",
+            label: "Token",
+            help_url: "",
+            is_optional: false,
+        }];
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::failing();
+        let _env = crate::test_support::EnvVarGuard::set("BORG_TEST_VERIFY_SET", "tok-123");
+
+        let result = verify(&native_def("test/env-only", CREDS), &std::env::temp_dir());
+        assert!(
+            result.ok,
+            "env credential alone must satisfy verification: {}",
+            result.message
+        );
+        assert_eq!(result.message, "All checks passed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_passes_with_keychain_credential_alone() {
+        // The mirror case: token stored in the keychain, nothing exported.
+        const CREDS: &[CredentialSpec] = &[CredentialSpec {
+            key: "BORG_TEST_VERIFY_KC",
+            label: "Token",
+            help_url: "",
+            is_optional: false,
+        }];
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::find_succeeds();
+        let _env = crate::test_support::EnvVarGuard::unset("BORG_TEST_VERIFY_KC");
+
+        // id "shim-svc" -> service_name "borg-shim-svc", the service the fake
+        // keychain helper answers for.
+        let result = verify(&native_def("shim-svc", CREDS), &std::env::temp_dir());
+        assert!(
+            result.ok,
+            "keychain credential alone must satisfy verification: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn verify_all_resolves_known_ids_and_skips_unknown() {
+        // Stale installed-plugin rows (a catalog entry that was removed) must
+        // be skipped, not crash or block verification of the rest.
+        let tmp = std::env::temp_dir().join("borg-verify-all-test");
+        let ids = vec![
+            "messaging/whatsapp".to_string(),
+            "not/a-plugin".to_string(),
+        ];
+        let results = verify_all(&ids, &tmp);
+        assert_eq!(
+            results.len(),
+            1,
+            "one result per known id, unknown ids skipped"
+        );
+        assert_eq!(results[0].id, "messaging/whatsapp");
+        assert!(
+            !results[0].ok,
+            "whatsapp is not installed under this temp dir"
+        );
+    }
 
     #[test]
     fn verify_template_plugin_fails_on_missing_files_not_some_other_reason() {

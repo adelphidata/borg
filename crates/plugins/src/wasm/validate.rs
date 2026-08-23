@@ -381,6 +381,53 @@ mod tests {
     use super::super::{sha256_hex, WasmToolManifest, MAX_MEMORY_PAGES_DEFAULT};
     use super::*;
 
+    /// Build an ABI-complete module (memory/alloc/borg_tool_call exports)
+    /// whose memory section holds exactly the given declarations.
+    fn abi_module_with_memories(memory_types: &[MemoryType]) -> Vec<u8> {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(1);
+        module.section(&funcs);
+        let mut memories = MemorySection::new();
+        for memory_type in memory_types {
+            memories.memory(*memory_type);
+        }
+        module.section(&memories);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("borg_tool_call", ExportKind::Func, 1);
+        module.section(&exports);
+        let mut code = CodeSection::new();
+        let mut alloc = Function::new([]);
+        alloc.instruction(&Instruction::I32Const(1024));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+        let mut call = Function::new([]);
+        call.instruction(&Instruction::I64Const(0));
+        call.instruction(&Instruction::End);
+        code.function(&call);
+        module.section(&code);
+        module.finish()
+    }
+
+    fn plain_memory(minimum: u64, maximum: Option<u64>) -> MemoryType {
+        MemoryType {
+            minimum,
+            maximum,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }
+    }
+
     #[test]
     fn manifest_rejects_http_without_endpoint_allowlist() {
         let wasm = minimal_wasm();
@@ -605,36 +652,7 @@ mod tests {
         ];
 
         for (label, memory_type, expected_fragment) in cases {
-            let mut module = Module::new();
-            let mut types = TypeSection::new();
-            types.ty().function([ValType::I32], [ValType::I32]);
-            types
-                .ty()
-                .function([ValType::I32, ValType::I32], [ValType::I64]);
-            module.section(&types);
-            let mut funcs = FunctionSection::new();
-            funcs.function(0);
-            funcs.function(1);
-            module.section(&funcs);
-            let mut memories = MemorySection::new();
-            memories.memory(*memory_type);
-            module.section(&memories);
-            let mut exports = ExportSection::new();
-            exports.export("memory", ExportKind::Memory, 0);
-            exports.export("alloc", ExportKind::Func, 0);
-            exports.export("borg_tool_call", ExportKind::Func, 1);
-            module.section(&exports);
-            let mut code = CodeSection::new();
-            let mut alloc = Function::new([]);
-            alloc.instruction(&Instruction::I32Const(1024));
-            alloc.instruction(&Instruction::End);
-            code.function(&alloc);
-            let mut call = Function::new([]);
-            call.instruction(&Instruction::I64Const(0));
-            call.instruction(&Instruction::End);
-            code.function(&call);
-            module.section(&code);
-            let wasm = module.finish();
+            let wasm = abi_module_with_memories(&[*memory_type]);
 
             let mut manifest = manifest_for(&baseline_wasm);
             manifest.wasm_sha256 = sha256_hex(&wasm);
@@ -803,5 +821,158 @@ mod tests {
             err.contains("reserved prefix"),
             "expected reserved-prefix rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn manifest_string_length_caps_are_exact() {
+        // Spec: each cap is inclusive — a value exactly at the cap installs,
+        // one byte over is rejected, and empty is rejected independently of
+        // the cap (kills the `||`→`&&` and `>`→`==`/`>=` mutations together).
+        type Set = fn(&mut WasmPluginManifest, String);
+        let cases: &[(&str, usize, Set)] = &[
+            ("name", 128, |m, v| m.name = v),
+            ("version", 64, |m, v| m.version = v),
+            ("tool description", 2048, |m, v| m.tools[0].description = v),
+            ("id", 128, |m, v| m.id = v),
+            ("tool name", 64, |m, v| m.tools[0].name = v),
+        ];
+        let wasm = minimal_wasm();
+        for (label, cap, set) in cases {
+            let mut at_cap = manifest_for(&wasm);
+            set(&mut at_cap, "a".repeat(*cap));
+            validate_manifest(&at_cap)
+                .unwrap_or_else(|e| panic!("[{label}] length {cap} must be accepted: {e}"));
+
+            let mut over_cap = manifest_for(&wasm);
+            set(&mut over_cap, "a".repeat(*cap + 1));
+            assert!(
+                validate_manifest(&over_cap).is_err(),
+                "[{label}] length {} must be rejected",
+                cap + 1
+            );
+
+            let mut empty = manifest_for(&wasm);
+            set(&mut empty, String::new());
+            assert!(
+                validate_manifest(&empty).is_err(),
+                "[{label}] empty value must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_limit_bounds_are_exact() {
+        // Spec: every limit is "between 1 and MAX" inclusive. Zero is
+        // rejected, MAX is accepted, MAX+1 is rejected.
+        type Set = fn(&mut WasmPluginManifest, u64);
+        let cases: &[(&str, u64, Set)] = &[
+            ("fuel", MAX_FUEL_LIMIT, |m, v| m.limits.fuel = v),
+            ("timeout_ms", MAX_TIMEOUT_MS_LIMIT, |m, v| {
+                m.limits.timeout_ms = v
+            }),
+            ("max_memory_pages", MAX_MEMORY_PAGES_LIMIT, |m, v| {
+                m.limits.max_memory_pages = v
+            }),
+            ("max_output_bytes", MAX_OUTPUT_BYTES_LIMIT, |m, v| {
+                m.limits.max_output_bytes = v
+            }),
+        ];
+        let wasm = minimal_wasm();
+        for (label, max, set) in cases {
+            let mut at_max = manifest_for(&wasm);
+            set(&mut at_max, *max);
+            validate_manifest(&at_max)
+                .unwrap_or_else(|e| panic!("[{label}] value {max} (the cap) must be accepted: {e}"));
+
+            let mut over = manifest_for(&wasm);
+            set(&mut over, *max + 1);
+            assert!(
+                validate_manifest(&over).is_err(),
+                "[{label}] value {} must be rejected",
+                *max + 1
+            );
+
+            let mut zero = manifest_for(&wasm);
+            set(&mut zero, 0);
+            assert!(
+                validate_manifest(&zero).is_err(),
+                "[{label}] zero must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_key_charset_is_exact() {
+        // Spec: keys are non-empty ASCII SCREAMING_SNAKE (uppercase, digits,
+        // underscore). A valid key must pass end-to-end so the validator
+        // cannot silently invert (the deleted-`!` mutation rejects everything
+        // valid) or degrade to a stub.
+        let wasm = minimal_wasm();
+        let mut valid = manifest_for(&wasm);
+        valid.capabilities = vec!["credentials".to_string()];
+        valid.credentials = vec!["API_TOKEN_2".to_string()];
+        validate_manifest(&valid).expect("SCREAMING_SNAKE key with digit must be accepted");
+
+        for bad_key in ["", "api_token", "API-TOKEN", "API TOKEN", "API.TOKEN"] {
+            let mut manifest = manifest_for(&wasm);
+            manifest.capabilities = vec!["credentials".to_string()];
+            manifest.credentials = vec![bad_key.to_string()];
+            let err = validate_manifest(&manifest).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid credential key"),
+                "[{bad_key:?}] expected credential-key rejection, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn wildcard_endpoint_syntax_is_exact() {
+        // Spec: a wildcard entry is `*.` plus a bare host — no empty host, no
+        // path separator, no port. Each bad shape must fail on its own so the
+        // `||`→`&&` mutations at either operator are caught.
+        let wasm = minimal_wasm();
+        for (endpoint, why) in [
+            ("*.", "empty wildcard host"),
+            ("*.example.com/path", "path in wildcard host"),
+            ("*.example.com:8443", "port in wildcard host"),
+        ] {
+            let mut manifest = manifest_for(&wasm);
+            manifest.capabilities = vec!["http".to_string()];
+            manifest.endpoints = vec![endpoint.to_string()];
+            let err = validate_manifest(&manifest).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid wildcard endpoint"),
+                "[{why}] expected wildcard rejection for {endpoint:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_validation_rejects_second_memory_declaration() {
+        let wasm = abi_module_with_memories(&[plain_memory(1, Some(1)), plain_memory(1, Some(1))]);
+        let mut manifest = manifest_for(&minimal_wasm());
+        manifest.wasm_sha256 = sha256_hex(&wasm);
+        let err = validate_wasm_module(&manifest, &wasm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only one memory"),
+            "two memory declarations must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn static_validation_accepts_memory_exactly_at_page_limit() {
+        // Spec: the page limit is inclusive — a module declaring exactly the
+        // manifest's max pages (initial and maximum) installs; only exceeding
+        // it fails (the over-limit cases live in the memory-shapes table).
+        let wasm = abi_module_with_memories(&[plain_memory(
+            MAX_MEMORY_PAGES_DEFAULT,
+            Some(MAX_MEMORY_PAGES_DEFAULT),
+        )]);
+        let mut manifest = manifest_for(&minimal_wasm());
+        manifest.wasm_sha256 = sha256_hex(&wasm);
+        validate_wasm_module(&manifest, &wasm)
+            .expect("memory at exactly the page limit must pass static validation");
     }
 }

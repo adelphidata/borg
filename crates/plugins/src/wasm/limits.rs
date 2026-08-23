@@ -91,3 +91,92 @@ impl wasmtime::ResourceLimiter for PluginLimits {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use wasmtime::ResourceLimiter;
+
+    use super::super::build_engine;
+    use super::super::test_util::minimal_wasm;
+    use super::*;
+
+    /// The runtime memory cap is inclusive: a guest may grow to exactly
+    /// `max_memory_bytes`; the first byte past it is denied. The module's own
+    /// declared maximum is enforced the same way when present.
+    #[test]
+    fn memory_growing_cap_is_inclusive() {
+        let cases: &[(usize, Option<usize>, bool, &str)] = &[
+            (2 * WASM_PAGE_BYTES, None, true, "exactly at manifest cap"),
+            (
+                2 * WASM_PAGE_BYTES + 1,
+                None,
+                false,
+                "one byte past manifest cap",
+            ),
+            (
+                WASM_PAGE_BYTES,
+                Some(WASM_PAGE_BYTES),
+                true,
+                "exactly at declared module maximum",
+            ),
+            (
+                2 * WASM_PAGE_BYTES,
+                Some(WASM_PAGE_BYTES),
+                false,
+                "past declared module maximum",
+            ),
+        ];
+        for (desired, maximum, expect, why) in cases {
+            let mut limits = PluginLimits {
+                max_memory_bytes: 2 * WASM_PAGE_BYTES,
+            };
+            let got = limits.memory_growing(0, *desired, *maximum).unwrap();
+            assert_eq!(got, *expect, "{why} (desired={desired}, maximum={maximum:?})");
+        }
+    }
+
+    /// Funcref tables are deliberately unbounded here — memory is the
+    /// resource the manifest cap governs. Denying table growth would break
+    /// guests compiled with grow-on-demand call tables.
+    #[test]
+    fn table_growing_is_not_limited() {
+        let mut limits = PluginLimits {
+            max_memory_bytes: WASM_PAGE_BYTES,
+        };
+        assert!(
+            limits.table_growing(0, 1024, None).unwrap(),
+            "table growth must be permitted regardless of the memory cap"
+        );
+    }
+
+    /// Dropping the timer must CANCEL the ticker, not abandon it. If Drop did
+    /// nothing, the struct's sender would still be dropped, the ticker's
+    /// `recv_timeout` would wake with a disconnect error (`is_err`), and the
+    /// engine's epoch would advance even though the guest call already
+    /// finished — poisoning the shared engine for the next call.
+    #[test]
+    #[ntest::timeout(15_000)]
+    fn epoch_timer_drop_cancels_instead_of_firing() {
+        let engine = build_engine().expect("engine");
+        let module = wasmtime::Module::new(&engine, minimal_wasm()).expect("module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        store.set_fuel(1_000_000).unwrap();
+        // Relative deadline of one tick, armed BEFORE the timer is dropped,
+        // so any stray post-drop increment is observable as a trap below.
+        store.set_epoch_deadline(1);
+        let linker = wasmtime::Linker::new(&engine);
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alloc")
+            .expect("alloc export");
+
+        let timer = EpochTimer::new(&engine, std::time::Duration::from_secs(30));
+        drop(timer);
+        // Give a mis-cancelled ticker time to fire its increment.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        alloc
+            .call(&mut store, 0)
+            .expect("epoch must not advance after a clean cancel");
+    }
+}

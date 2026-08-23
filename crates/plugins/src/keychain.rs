@@ -198,8 +198,80 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn available_true_on_macos() {
-        // macOS always has the `security` binary
+        // macOS always has the `security` binary. Locked because other tests
+        // temporarily rewrite PATH to hide the keychain helpers.
+        let _lock = crate::test_support::env_lock();
         assert!(available());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_result_reflects_helper_exit_status() {
+        // `store` must mirror the helper's exit status: a failed write that
+        // reports Ok makes the installer claim success while the credential
+        // was never persisted (the fallback file only engages when the caller
+        // sees the error).
+        let _lock = crate::test_support::env_lock();
+        {
+            let _shim = crate::test_support::KeychainShim::failing();
+            assert!(
+                store("borg-shim-store", "acct", "v").is_err(),
+                "helper failure must surface as an error"
+            );
+        }
+        {
+            // Succeed on writes/deletes only; drain stdin for the Linux
+            // `secret-tool store` path which pipes the secret in.
+            let _shim = crate::test_support::KeychainShim::fake_helper(concat!(
+                "cat >/dev/null 2>/dev/null\n",
+                "case \"$1\" in add-generic-password|delete-generic-password|store|clear) exit 0 ;; esac\n",
+                "exit 1",
+            ));
+            store("borg-shim-store", "acct", "v").expect("helper success must map to Ok");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_invokes_keychain_delete_helper() {
+        // `remove` swallows errors by design, so the only observable contract
+        // is that it actually issues a delete for the right service — a no-op
+        // remove leaves secrets in the keychain after uninstall.
+        let _lock = crate::test_support::env_lock();
+        // Log every invocation, but only report success for deletes so a
+        // concurrently running lookup test can't see a phantom credential.
+        let shim = crate::test_support::KeychainShim::fake_helper(concat!(
+            "printf '%s\\n' \"$*\" >> \"{{LOG}}\"\n",
+            "case \"$1\" in delete-generic-password|clear) exit 0 ;; esac\n",
+            "exit 1",
+        ));
+
+        remove("borg-shim-remove-svc", "acct-r");
+
+        let log = std::fs::read_to_string(shim.log_path())
+            .expect("remove must have invoked the keychain helper");
+        assert!(
+            log.lines().any(|l| l.contains("borg-shim-remove-svc")
+                && (l.contains("delete-generic-password") || l.contains("clear"))),
+            "remove must issue a delete for the service: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_reports_presence_from_helper_lookup() {
+        // `check` gates is_installed and the post-uninstall leftover warning;
+        // it must reflect what the helper actually finds.
+        let _lock = crate::test_support::env_lock();
+        let _shim = crate::test_support::KeychainShim::find_succeeds();
+        assert!(
+            check(crate::test_support::SHIM_SERVICE, "any-acct"),
+            "successful lookup must report the credential as present"
+        );
+        assert!(
+            !check("borg-shim-other-svc", "any-acct"),
+            "failed lookup must report absent"
+        );
     }
 
     /// Regression: saving an API key in `/settings` corrupted the TUI because

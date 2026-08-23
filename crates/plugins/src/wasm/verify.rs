@@ -484,4 +484,43 @@ mod tests {
             mode & 0o777
         );
     }
+
+    #[test]
+    fn compute_local_hmac_current_produces_verifiable_seal() {
+        // The public wrapper is what callers persist as the seal, so it must
+        // emit the real 64-hex MAC — a stubbed value would either fail hex
+        // decoding or never match the recomputed MAC at verification time.
+        let key = b"hmac-key-v1";
+        let seal = compute_local_hmac_current(key, b"manifest", b"wasm").unwrap();
+        assert!(
+            is_hex_64(&seal),
+            "seal must be a 64-char lowercase hex MAC, got: {seal:?}"
+        );
+        verify_installed_hmac(key, b"manifest", b"wasm", &seal)
+            .expect("seal from compute_local_hmac_current must verify");
+        assert!(
+            verify_installed_hmac(key, b"manifest", b"tampered", &seal).is_err(),
+            "seal must bind the actual input bytes"
+        );
+    }
+
+    #[test]
+    fn is_hex_64_requires_exact_length_and_lowercase_hex() {
+        let cases: &[(String, bool, &str)] = &[
+            ("a".repeat(64), true, "64 lowercase hex digits"),
+            ("0123456789abcdef".repeat(4), true, "full lowercase alphabet"),
+            ("a".repeat(63), false, "one short of 64"),
+            ("a".repeat(65), false, "one over 64"),
+            ("A".repeat(64), false, "uppercase hex digits"),
+            ("z".repeat(64), false, "non-hex characters"),
+            (String::new(), false, "empty string"),
+        ];
+        for (input, expected, why) in cases {
+            assert_eq!(
+                is_hex_64(input),
+                *expected,
+                "[{why}] is_hex_64({input:?}) must be {expected}"
+            );
+        }
+    }
 }
