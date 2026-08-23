@@ -24,7 +24,17 @@ describe("TokenGate", () => {
     // This is the only setup step the web surface has; a gate that does not say
     // where the token comes from is a dead end.
     renderGate();
-    expect(screen.getByText("borg client-token issue web")).toBeTruthy();
+    const command = screen.getByText("borg client-token issue web");
+    // The sentence must stay readable — "with" and the command are separate
+    // JSX children, so the space between them is easy to lose.
+    expect(command.parentElement?.textContent).toBe(
+      "Paste a client token. Create one with borg client-token issue web.",
+    );
+  });
+
+  it("starts with an empty box", () => {
+    renderGate();
+    expect((box() as HTMLInputElement).value).toBe("");
   });
 
   it("lets a stored token straight through", () => {
@@ -48,6 +58,15 @@ describe("TokenGate", () => {
     fireEvent.change(box(), { target: { value: "tok_live" } });
     fireEvent.keyDown(box(), { key: "Enter" });
     expect(screen.getByText("the app")).toBeTruthy();
+  });
+
+  it("only submits on Enter, not on other keys", () => {
+    // Submitting mid-typing would store a half-pasted token.
+    renderGate();
+    fireEvent.change(box(), { target: { value: "tok_live" } });
+    fireEvent.keyDown(box(), { key: "a" });
+    expect(localStorage.getItem(STORAGE_KEYS.token)).toBeNull();
+    expect(screen.queryByText("the app")).toBeNull();
   });
 
   it("trims a token pasted with surrounding whitespace", () => {

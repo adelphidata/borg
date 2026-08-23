@@ -66,3 +66,7 @@ coverage/
 # cargo-mutants output
 mutants.out/
 mutants.out.old/
+
+# StrykerJS mutation-testing artifacts
+.stryker-tmp/
+reports/mutation/
