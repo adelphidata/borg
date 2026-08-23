@@ -66,8 +66,12 @@ const ALIASES: Record<string, keyof typeof LANGUAGES> = {
 export function resolveLanguage(tag: string | undefined): keyof typeof LANGUAGES | null {
   if (!tag) return null;
   const key = tag.toLowerCase();
-  if (key in LANGUAGES) return key as keyof typeof LANGUAGES;
-  return ALIASES[key] ?? null;
+  // Own properties only. `in` walks the prototype chain, so a fence tagged
+  // ```constructor or ```toString would resolve to a "grammar" that is really
+  // an Object member, and loading it throws instead of falling back to plain
+  // text.
+  if (Object.hasOwn(LANGUAGES, key)) return key as keyof typeof LANGUAGES;
+  return Object.hasOwn(ALIASES, key) ? ALIASES[key] : null;
 }
 
 let highlighter: Promise<HighlighterCore> | undefined;
