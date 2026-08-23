@@ -377,7 +377,34 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
 
     let use_keychain = result.api_key.is_some() && keychain_available();
 
-    // Write settings via the daemon (single writer, cache-coherent).
+    persist_onboarding_settings(result, use_keychain)?;
+
+    write_seed_file_if_absent(
+        &data_dir,
+        IDENTITY_FILE,
+        &generate_identity(&result.agent_name, &result.user_name),
+    )?;
+    write_seed_file_if_absent(
+        &data_dir,
+        MEMORY_INDEX_FILE,
+        &format!(
+            "# Memory Index\n\n## Owner\n- Name: {}\n- Agent: {}\n",
+            result.user_name, result.agent_name
+        ),
+    )?;
+    write_seed_file_if_absent(
+        &data_dir,
+        SETUP_FILE,
+        &generate_setup(&result.agent_name, &result.user_name),
+    )?;
+
+    store_llm_api_key(result, use_keychain, &data_dir)?;
+
+    install_channel_plugins(result, &data_dir)
+}
+
+/// Write the wizard's choices via the daemon (single writer, cache-coherent).
+fn persist_onboarding_settings(result: &OnboardingResult, use_keychain: bool) -> Result<()> {
     block_on(async {
         let mut client = daemon_client::connect_or_spawn()
             .await
@@ -416,214 +443,224 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         }
         anyhow::Ok(())
     })
-    .context("Failed to persist onboarding settings via daemon")?;
+    .context("Failed to persist onboarding settings via daemon")
+}
 
-    let identity_path = data_dir.join(IDENTITY_FILE);
-    if !identity_path.exists() {
-        let identity_content = generate_identity(&result.agent_name, &result.user_name);
-        if let Err(e) = atomic_write(&identity_path, &identity_content) {
-            cleanup_tmp_files(&data_dir);
-            return Err(e.context("Failed to write IDENTITY.md during onboarding"));
-        }
+/// Atomically write a first-boot seed file, but never overwrite one that
+/// already exists — re-running onboarding must not clobber user edits.
+/// On failure, sweep any .tmp leftovers so a retry starts clean.
+fn write_seed_file_if_absent(
+    data_dir: &std::path::Path,
+    file_name: &str,
+    content: &str,
+) -> Result<()> {
+    let path = data_dir.join(file_name);
+    if path.exists() {
+        return Ok(());
     }
-
-    let memory_path = data_dir.join(MEMORY_INDEX_FILE);
-    if !memory_path.exists() {
-        let memory_content = format!(
-            "# Memory Index\n\n## Owner\n- Name: {}\n- Agent: {}\n",
-            result.user_name, result.agent_name
-        );
-        if let Err(e) = atomic_write(&memory_path, &memory_content) {
-            cleanup_tmp_files(&data_dir);
-            return Err(e.context("Failed to write MEMORY.md during onboarding"));
-        }
+    if let Err(e) = atomic_write(&path, content) {
+        cleanup_tmp_files(data_dir);
+        return Err(e.context(format!("Failed to write {file_name} during onboarding")));
     }
+    Ok(())
+}
 
-    let setup_path = data_dir.join(SETUP_FILE);
-    if !setup_path.exists() {
-        let setup_content = generate_setup(&result.agent_name, &result.user_name);
-        if let Err(e) = atomic_write(&setup_path, &setup_content) {
-            cleanup_tmp_files(&data_dir);
-            return Err(e.context("Failed to write SETUP.md during onboarding"));
-        }
-    }
-
-    if let Some(ref api_key) = result.api_key {
-        if use_keychain {
-            match store_in_keychain(&result.provider, api_key) {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("  Warning: Failed to store in keychain: {e}");
-                    eprintln!("  Falling back to .env file");
-                    let provider = Provider::from_str(&result.provider)?;
-                    let env_var_owned = provider.default_env_var().to_string();
-                    if let Err(e) = block_on(async {
-                        let mut client = daemon_client::connect_or_spawn().await?;
-                        client
-                            .set_setting("llm.api_key_env", &env_var_owned)
-                            .await?;
-                        client.unset_setting("llm.api_key").await?;
-                        anyhow::Ok(())
-                    }) {
-                        tracing::warn!(
-                            "onboarding: failed to switch llm.api_key to env-var fallback: {e}"
-                        );
-                    }
-                    let env_var = provider.default_env_var();
-                    append_env_file(&data_dir, env_var, api_key)?;
-                    println!("  Updated {}", data_dir.join(".env").display());
+/// Store the LLM API key: keychain when available, else the 0600
+/// `~/.borg/.env` file. A keychain failure downgrades the daemon-side
+/// `llm.api_key` SecretRef to the env-var form before falling back.
+fn store_llm_api_key(
+    result: &OnboardingResult,
+    use_keychain: bool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let Some(ref api_key) = result.api_key else {
+        return Ok(());
+    };
+    if use_keychain {
+        match store_in_keychain(&result.provider, api_key) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("  Warning: Failed to store in keychain: {e}");
+                eprintln!("  Falling back to .env file");
+                let provider = Provider::from_str(&result.provider)?;
+                let env_var_owned = provider.default_env_var().to_string();
+                if let Err(e) = block_on(async {
+                    let mut client = daemon_client::connect_or_spawn().await?;
+                    client
+                        .set_setting("llm.api_key_env", &env_var_owned)
+                        .await?;
+                    client.unset_setting("llm.api_key").await?;
+                    anyhow::Ok(())
+                }) {
+                    tracing::warn!(
+                        "onboarding: failed to switch llm.api_key to env-var fallback: {e}"
+                    );
                 }
             }
-        } else {
-            let provider = Provider::from_str(&result.provider)?;
-            let env_var = provider.default_env_var();
-            append_env_file(&data_dir, env_var, api_key)?;
-            println!("  Updated {}", data_dir.join(".env").display());
         }
     }
+    let provider = Provider::from_str(&result.provider)?;
+    let env_var = provider.default_env_var();
+    append_env_file(data_dir, env_var, api_key)?;
+    println!("  Updated {}", data_dir.join(".env").display());
+    Ok(())
+}
 
+/// Store one channel's credentials: OS keychain first; on headless servers
+/// (no secret-service / dbus) it fails — fall back to a 0600 ~/.borg/.env
+/// file with an env-var SecretRef so the daemon still resolves the credential
+/// through systemd's `EnvironmentFile=`. Without this fallback the channel
+/// install was silently dropped on every Linux VPS.
+fn store_channel_credentials(
+    cfg: &mut Config,
+    service: &str,
+    credentials: &[(String, String)],
+    data_dir: &std::path::Path,
+) {
+    for (key, value) in credentials {
+        let account = format!("borg-{key}");
+        match plugins::keychain::store(service, &account, value) {
+            Ok(()) => {
+                cfg.credentials.insert(
+                    key.clone(),
+                    cortex::config::CredentialValue::Ref(
+                        cortex::security::secrets_resolve::SecretRef::Keychain {
+                            service: service.to_string(),
+                            account,
+                        },
+                    ),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Keychain store failed for {key}: {e}; falling back to .env");
+                eprintln!(
+                    "  · Keychain unavailable for {key}; storing in {}/.env",
+                    data_dir.display()
+                );
+                if let Err(e) = append_env_file(data_dir, key, value) {
+                    eprintln!("  Warning: failed to write .env for {key}: {e}");
+                    tracing::warn!("append_env_file failed for {key}: {e}");
+                    continue;
+                }
+                cfg.credentials.insert(
+                    key.clone(),
+                    cortex::config::CredentialValue::Ref(
+                        cortex::security::secrets_resolve::SecretRef::Env { var: key.clone() },
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Build the daemon-side install request for one catalog channel definition.
+fn build_channel_install_request(def: &plugins::catalog::PluginDef) -> PluginInstallRequest {
+    let channel_name = def.id.rsplit('/').next().unwrap_or(def.id);
+    let runtime = if def.is_native { "native" } else { "python" };
+    let webhook = format!("/webhook/{channel_name}");
+    PluginInstallRequest {
+        plugin_id: def.id.to_string(),
+        plugin_name: def.name.to_string(),
+        kind: def.kind.to_string(),
+        category: def.category.to_string(),
+        file_hashes: Vec::new(),
+        installed_tool: None,
+        installed_channel: Some(PluginInstalledChannel {
+            name: channel_name.to_string(),
+            description: def.description.to_string(),
+            runtime: runtime.to_string(),
+            plugin_id: def.id.to_string(),
+            webhook,
+        }),
+        // Per-plugin install RPCs leave credentials alone; we
+        // overwrite the full credentials map once at the end.
+        credentials_json: String::new(),
+    }
+}
+
+/// Install the channel plugins picked during onboarding: store credentials,
+/// then register each plugin and persist the merged credentials map through
+/// the daemon in a single round-trip so the cli never opens the DB itself.
+fn install_channel_plugins(result: &OnboardingResult, data_dir: &std::path::Path) -> Result<()> {
     if result.channels.is_empty() {
         println!(
             "  No channels connected. Add one later with `borg add <name>` (e.g. `borg add telegram`)."
         );
-    } else {
-        let mut cfg = match block_on(Config::load_from_db()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  Warning: failed to load config for channel setup: {e}");
-                tracing::warn!("Config::load_from_db failed during channel install: {e}");
-                // Skip all channel installs — can't wire credentials without config
-                return Ok(());
-            }
+        return Ok(());
+    }
+
+    let mut cfg = match block_on(Config::load_from_db()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  Warning: failed to load config for channel setup: {e}");
+            tracing::warn!("Config::load_from_db failed during channel install: {e}");
+            // Skip all channel installs — can't wire credentials without config
+            return Ok(());
+        }
+    };
+
+    // Pre-build per-plugin install requests; route credential persistence
+    // through the daemon at the end so the cli never opens the DB itself.
+    struct PendingInstall {
+        req: PluginInstallRequest,
+        display_name: &'static str,
+    }
+    let mut pending: Vec<PendingInstall> = Vec::new();
+
+    for (plugin_id, credentials) in &result.channels {
+        let Some(def) = plugins::catalog::find_by_id(plugin_id) else {
+            eprintln!("  Warning: unknown plugin '{plugin_id}', skipping");
+            continue;
         };
 
-        // Pre-build per-plugin install requests; route credential persistence
-        // through the daemon at the end so the cli never opens the DB itself.
-        struct PendingInstall {
-            req: PluginInstallRequest,
-            display_name: &'static str,
-        }
-        let mut pending: Vec<PendingInstall> = Vec::new();
+        store_channel_credentials(&mut cfg, &def.service_name(), credentials, data_dir);
 
-        for (plugin_id, credentials) in &result.channels {
-            let Some(def) = plugins::catalog::find_by_id(plugin_id) else {
-                eprintln!("  Warning: unknown plugin '{plugin_id}', skipping");
-                continue;
-            };
-
-            let service = def.service_name();
-
-            // Try OS keychain first; on headless servers (no secret-service /
-            // dbus) it fails — fall back to a 0600 ~/.borg/.env file with an
-            // env-var SecretRef so the daemon still resolves the credential
-            // through systemd's `EnvironmentFile=`. Without this fallback the
-            // channel install was silently dropped on every Linux VPS.
-            for (key, value) in credentials {
-                let account = format!("borg-{key}");
-                match plugins::keychain::store(&service, &account, value) {
-                    Ok(()) => {
-                        cfg.credentials.insert(
-                            key.clone(),
-                            cortex::config::CredentialValue::Ref(
-                                cortex::security::secrets_resolve::SecretRef::Keychain {
-                                    service: service.clone(),
-                                    account,
-                                },
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Keychain store failed for {key}: {e}; falling back to .env"
-                        );
-                        eprintln!(
-                            "  · Keychain unavailable for {key}; storing in {}/.env",
-                            data_dir.display()
-                        );
-                        if let Err(e) = append_env_file(&data_dir, key, value) {
-                            eprintln!("  Warning: failed to write .env for {key}: {e}");
-                            tracing::warn!("append_env_file failed for {key}: {e}");
-                            continue;
-                        }
-                        cfg.credentials.insert(
-                            key.clone(),
-                            cortex::config::CredentialValue::Ref(
-                                cortex::security::secrets_resolve::SecretRef::Env {
-                                    var: key.clone(),
-                                },
-                            ),
-                        );
-                    }
-                }
-            }
-
-            let channel_name = def.id.rsplit('/').next().unwrap_or(def.id);
-            let runtime = if def.is_native { "native" } else { "python" };
-            let webhook = format!("/webhook/{channel_name}");
-            pending.push(PendingInstall {
-                req: PluginInstallRequest {
-                    plugin_id: def.id.to_string(),
-                    plugin_name: def.name.to_string(),
-                    kind: def.kind.to_string(),
-                    category: def.category.to_string(),
-                    file_hashes: Vec::new(),
-                    installed_tool: None,
-                    installed_channel: Some(PluginInstalledChannel {
-                        name: channel_name.to_string(),
-                        description: def.description.to_string(),
-                        runtime: runtime.to_string(),
-                        plugin_id: def.id.to_string(),
-                        webhook,
-                    }),
-                    // Per-plugin install RPCs leave credentials alone; we
-                    // overwrite the full credentials map once at the end.
-                    credentials_json: String::new(),
-                },
-                display_name: def.name,
-            });
-        }
-
-        // Single round-trip: install each plugin row + persist the merged
-        // credentials map. The daemon owns the DB writes.
-        let credentials_json = match serde_json::to_string(&cfg.credentials) {
-            Ok(j) => j,
-            Err(e) => {
-                eprintln!("  Warning: failed to serialize credentials: {e}");
-                tracing::warn!("serde_json::to_string failed for credentials: {e}");
-                String::new()
-            }
-        };
-
-        let install_outcome: Result<()> = block_on(async {
-            let mut client = daemon_client::connect_or_spawn()
-                .await
-                .context("connect to borgd for channel install")?;
-            for p in &pending {
-                if let Err(e) = client.plugin_install(p.req.clone()).await {
-                    tracing::warn!("plugin_install RPC failed for {}: {e}", p.req.plugin_id);
-                    eprintln!(
-                        "  Warning: failed to register plugin {}: {e}",
-                        p.req.plugin_id
-                    );
-                } else {
-                    println!(
-                        "  Connected {0}. Send a message to the bot on {0} to get your pairing code, then run: /pairing approve <CODE>",
-                        p.display_name
-                    );
-                }
-            }
-            if !credentials_json.is_empty() {
-                client
-                    .set_setting("credentials", &credentials_json)
-                    .await
-                    .context("Admin.SetSetting(credentials) failed")?;
-            }
-            Ok(())
+        pending.push(PendingInstall {
+            req: build_channel_install_request(def),
+            display_name: def.name,
         });
-        if let Err(e) = install_outcome {
-            eprintln!("  Warning: channel install partly failed: {e}");
-            tracing::warn!("channel install daemon round-trip failed: {e}");
+    }
+
+    // Single round-trip: install each plugin row + persist the merged
+    // credentials map. The daemon owns the DB writes.
+    let credentials_json = match serde_json::to_string(&cfg.credentials) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("  Warning: failed to serialize credentials: {e}");
+            tracing::warn!("serde_json::to_string failed for credentials: {e}");
+            String::new()
         }
+    };
+
+    let install_outcome: Result<()> = block_on(async {
+        let mut client = daemon_client::connect_or_spawn()
+            .await
+            .context("connect to borgd for channel install")?;
+        for p in &pending {
+            if let Err(e) = client.plugin_install(p.req.clone()).await {
+                tracing::warn!("plugin_install RPC failed for {}: {e}", p.req.plugin_id);
+                eprintln!(
+                    "  Warning: failed to register plugin {}: {e}",
+                    p.req.plugin_id
+                );
+            } else {
+                println!(
+                    "  Connected {0}. Send a message to the bot on {0} to get your pairing code, then run: /pairing approve <CODE>",
+                    p.display_name
+                );
+            }
+        }
+        if !credentials_json.is_empty() {
+            client
+                .set_setting("credentials", &credentials_json)
+                .await
+                .context("Admin.SetSetting(credentials) failed")?;
+        }
+        Ok(())
+    });
+    if let Err(e) = install_outcome {
+        eprintln!("  Warning: channel install partly failed: {e}");
+        tracing::warn!("channel install daemon round-trip failed: {e}");
     }
 
     Ok(())
@@ -1091,5 +1128,40 @@ mod tests {
         std::fs::write(&tmp, "partial").unwrap();
         cleanup_tmp_files(dir.path());
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn seed_file_written_when_absent_and_never_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        write_seed_file_if_absent(dir.path(), "IDENTITY.md", "seed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("IDENTITY.md")).unwrap(),
+            "seed"
+        );
+        // Re-running onboarding must preserve user edits, not re-seed.
+        std::fs::write(dir.path().join("IDENTITY.md"), "user edited").unwrap();
+        write_seed_file_if_absent(dir.path(), "IDENTITY.md", "seed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("IDENTITY.md")).unwrap(),
+            "user edited"
+        );
+    }
+
+    #[test]
+    fn channel_install_request_derives_name_webhook_and_runtime() {
+        let def = plugins::catalog::find_by_id("messaging/telegram")
+            .expect("telegram must exist in the catalog");
+        let req = build_channel_install_request(def);
+        assert_eq!(req.plugin_id, "messaging/telegram");
+        let channel = req.installed_channel.expect("channel plugin sets channel");
+        // The gateway routes by the short channel name, not the catalog id.
+        assert_eq!(channel.name, "telegram");
+        assert_eq!(channel.webhook, "/webhook/telegram");
+        // Telegram is a native integration, so its channel row must select
+        // the native runtime, not the python plugin lane.
+        assert_eq!(channel.runtime, "native");
+        // Credentials are persisted once at the end of onboarding, never per
+        // install RPC.
+        assert!(req.credentials_json.is_empty());
     }
 }

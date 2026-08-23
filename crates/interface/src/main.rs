@@ -539,14 +539,7 @@ fn resolve_worktree_request(cli: &Cli) -> Result<Option<&str>> {
 }
 
 async fn async_main() -> Result<()> {
-    // Missing .env is the common case — silent best-effort load.
-    let _ = dotenvy::dotenv();
-    // Also load .env from the data directory (~/.borg/.env)
-    if let Ok(data_dir) = cortex::config::Config::data_dir() {
-        let _ = dotenvy::from_path(data_dir.join(".env"));
-        // Harden data directory permissions (owner-only access)
-        harden_data_dir(&data_dir);
-    }
+    load_env_files();
 
     let cli = Cli::parse();
 
@@ -556,118 +549,166 @@ async fn async_main() -> Result<()> {
         return commands::acp::run_acp_stdio().await;
     }
 
-    // `--worktree NAME` is applied by moving the process into the worktree
-    // before anything reads the current directory. Everything downstream —
-    // session workspace identity, the agent's cwd, git context, project docs —
-    // derives from it, so one chdir here is what makes the whole run isolated.
-    // Deliberately skipped for `borg worktree ...` itself: resolving a worktree
-    // in order to manage worktrees would make `--worktree` create the very
-    // thing the operator may be about to remove.
-    let mut worktree_dir: Option<std::path::PathBuf> = None;
-    if let Some(name) = requested_worktree.as_deref() {
-        let dir = commands::worktree::resolve_or_create(name).await?;
-        std::env::set_current_dir(&dir)
-            .with_context(|| format!("entering worktree at {}", dir.display()))?;
-        // Kept for the session-open calls below: moving this process is not
-        // enough, because the agent runs inside the long-lived `borgd`.
-        worktree_dir = Some(dir);
-    }
+    let worktree_dir = enter_worktree(requested_worktree.as_deref()).await?;
 
     let tui_mode = matches!(cli.command, Some(Commands::Start) | None);
 
     // _guard and _telemetry_guard must live for the program's duration to flush logs
-    let _guard;
-    let _telemetry_guard;
+    let (_guard, _telemetry_guard) = init_diagnostics(tui_mode).await;
 
-    {
-        let config = cortex::config::Config::load_from_db()
-            .await
-            .unwrap_or_default();
+    let _shutdown = spawn_shutdown_listener();
 
-        // Install the process-global output-redaction policy for standalone
-        // `borg` (TUI / REPL without `borgd`). When `borgd` is the host the
-        // daemon installs its own policy with a shared DB handle; here the
-        // TUI opens its own connection just for audit writes. Gated by
-        // `security.output_redaction` (default true). The policy will still
-        // strip secrets even if the audit-DB open fails — failing closed
-        // (i.e. skipping redaction) would be the wrong choice security-wise.
-        match cortex::db::Database::open().await {
-            Ok(db) => {
-                use std::sync::{Arc, Mutex};
-                cortex::output_redaction::install_global(
-                    cortex::output_redaction::RedactionPolicy::from_db(
-                        config.security.output_redaction,
-                        Arc::new(Mutex::new(db)),
-                    ),
-                );
-            }
-            Err(e) => {
-                eprintln!("Warning: audit-DB open failed ({e}); output redaction will run without audit logging");
-                cortex::output_redaction::install_global(if config.security.output_redaction {
-                    cortex::output_redaction::RedactionPolicy::enabled_no_audit()
-                } else {
-                    cortex::output_redaction::RedactionPolicy::disabled()
-                });
-            }
-        }
+    autostart_daemon(&cli).await;
 
-        // If the database was unreadable on open, recovery preserved it aside
-        // and rebuilt an empty one so the agent could still boot. Tell the user
-        // once, here, where the original went.
-        if let Some(notice) = cortex::db::Database::take_recovery_notice() {
-            eprintln!(
-                "Notice: your database was unreadable and has been rebuilt empty. \
-                 The original was preserved at {} — remove it once you've confirmed \
-                 you don't need it.",
-                notice.backup_path.display()
+    dispatch_command(cli, worktree_dir).await
+}
+
+/// Best-effort .env loading plus data-dir permission hardening. Runs before
+/// clap so credentials from either .env are visible to every subcommand.
+fn load_env_files() {
+    // Missing .env is the common case — silent best-effort load.
+    let _ = dotenvy::dotenv();
+    // Also load .env from the data directory (~/.borg/.env)
+    if let Ok(data_dir) = cortex::config::Config::data_dir() {
+        let _ = dotenvy::from_path(data_dir.join(".env"));
+        // Harden data directory permissions (owner-only access)
+        harden_data_dir(&data_dir);
+    }
+}
+
+/// Apply `--worktree NAME` by moving the process into the worktree before
+/// anything reads the current directory. Everything downstream — session
+/// workspace identity, the agent's cwd, git context, project docs — derives
+/// from it, so one chdir here is what makes the whole run isolated.
+/// Deliberately skipped for `borg worktree ...` itself (the caller passes
+/// `None` then): resolving a worktree in order to manage worktrees would make
+/// `--worktree` create the very thing the operator may be about to remove.
+///
+/// Returns the worktree path for the session-open calls downstream: moving
+/// this process is not enough, because the agent runs inside the long-lived
+/// `borgd`.
+async fn enter_worktree(name: Option<&str>) -> Result<Option<std::path::PathBuf>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let dir = commands::worktree::resolve_or_create(name).await?;
+    std::env::set_current_dir(&dir)
+        .with_context(|| format!("entering worktree at {}", dir.display()))?;
+    Ok(Some(dir))
+}
+
+/// Install the process-global output-redaction policy for standalone `borg`
+/// (TUI / REPL without `borgd`). When `borgd` is the host the daemon installs
+/// its own policy with a shared DB handle; here the TUI opens its own
+/// connection just for audit writes. Gated by `security.output_redaction`
+/// (default true). The policy will still strip secrets even if the audit-DB
+/// open fails — failing closed (i.e. skipping redaction) would be the wrong
+/// choice security-wise.
+async fn install_redaction_policy(config: &cortex::config::Config) {
+    match cortex::db::Database::open().await {
+        Ok(db) => {
+            use std::sync::{Arc, Mutex};
+            cortex::output_redaction::install_global(
+                cortex::output_redaction::RedactionPolicy::from_db(
+                    config.security.output_redaction,
+                    Arc::new(Mutex::new(db)),
+                ),
             );
         }
-
-        let (otel_layers, tg) = cortex::telemetry::init_telemetry(&config.telemetry)
-            .unwrap_or_else(|e| {
-                eprintln!("Warning: OpenTelemetry init failed: {e}");
-                (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
+        Err(e) => {
+            eprintln!("Warning: audit-DB open failed ({e}); output redaction will run without audit logging");
+            cortex::output_redaction::install_global(if config.security.output_redaction {
+                cortex::output_redaction::RedactionPolicy::enabled_no_audit()
+            } else {
+                cortex::output_redaction::RedactionPolicy::disabled()
             });
-        _telemetry_guard = tg;
-
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("warn,chromiumoxide=error,tungstenite=error"));
-
-        if tui_mode {
-            let (non_blocking, guard) = match cortex::config::Config::logs_dir() {
-                Ok(log_dir) => {
-                    // The OpenOptions::open below surfaces any real dir-creation failure.
-                    let _ = std::fs::create_dir_all(&log_dir);
-                    let mut opts = std::fs::OpenOptions::new();
-                    opts.create(true).append(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.mode(0o600);
-                    }
-                    match opts.open(log_dir.join("tui.log")) {
-                        Ok(f) => tracing_appender::non_blocking(f),
-                        Err(e) => {
-                            eprintln!("Warning: could not open log file: {e}");
-                            tracing_appender::non_blocking(std::io::sink())
-                        }
-                    }
-                }
-                Err(_) => tracing_appender::non_blocking(std::io::sink()),
-            };
-            _guard = Some(guard);
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_ansi(false)
-                .with_writer(non_blocking);
-            cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
-        } else {
-            _guard = None;
-            let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
-            cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
         }
     }
 
+    // If the database was unreadable on open, recovery preserved it aside
+    // and rebuilt an empty one so the agent could still boot. Tell the user
+    // once, here, where the original went.
+    if let Some(notice) = cortex::db::Database::take_recovery_notice() {
+        eprintln!(
+            "Notice: your database was unreadable and has been rebuilt empty. \
+             The original was preserved at {} — remove it once you've confirmed \
+             you don't need it.",
+            notice.backup_path.display()
+        );
+    }
+}
+
+/// Open the append-only TUI log file as a non-blocking tracing writer,
+/// falling back to a sink when the logs dir or file is unavailable.
+fn tui_log_writer() -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    match cortex::config::Config::logs_dir() {
+        Ok(log_dir) => {
+            // The OpenOptions::open below surfaces any real dir-creation failure.
+            let _ = std::fs::create_dir_all(&log_dir);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(log_dir.join("tui.log")) {
+                Ok(f) => tracing_appender::non_blocking(f),
+                Err(e) => {
+                    eprintln!("Warning: could not open log file: {e}");
+                    tracing_appender::non_blocking(std::io::sink())
+                }
+            }
+        }
+        Err(_) => tracing_appender::non_blocking(std::io::sink()),
+    }
+}
+
+/// Set up redaction, telemetry, and the tracing subscriber. Returns the two
+/// guards that must live for the program's duration so logs flush on exit.
+async fn init_diagnostics(
+    tui_mode: bool,
+) -> (
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+    cortex::telemetry::TelemetryGuard,
+) {
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .unwrap_or_default();
+
+    install_redaction_policy(&config).await;
+
+    let (otel_layers, telemetry_guard) = cortex::telemetry::init_telemetry(&config.telemetry)
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: OpenTelemetry init failed: {e}");
+            (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
+        });
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,chromiumoxide=error,tungstenite=error"));
+
+    let guard = if tui_mode {
+        let (non_blocking, guard) = tui_log_writer();
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(non_blocking);
+        cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
+        Some(guard)
+    } else {
+        let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+        cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
+        None
+    };
+
+    (guard, telemetry_guard)
+}
+
+/// Spawn the ctrl-c / SIGTERM listener and return the token it cancels.
+fn spawn_shutdown_listener() -> CancellationToken {
     let shutdown = CancellationToken::new();
     {
         let shutdown = shutdown.clone();
@@ -695,11 +736,14 @@ async fn async_main() -> Result<()> {
             shutdown.cancel();
         });
     }
+    shutdown
+}
 
-    // Ensure daemon service is installed and running on every command
-    // (skip commands that manage the service themselves, and `worktree`, which
-    // is pure local git work — waiting seconds on a daemon that has nothing to
-    // do would make listing worktrees feel broken)
+/// Ensure daemon service is installed and running on every command
+/// (skip commands that manage the service themselves, and `worktree`, which
+/// is pure local git work — waiting seconds on a daemon that has nothing to
+/// do would make listing worktrees feel broken)
+async fn autostart_daemon(cli: &Cli) {
     if !matches!(
         cli.command,
         Some(Commands::Init)
@@ -711,22 +755,42 @@ async fn async_main() -> Result<()> {
             tracing::warn!("Auto-start borgd: {e}");
         }
     }
+}
 
-    match cli.command {
+/// Body of the default `borg` / `borg start` invocation: gate on onboarding,
+/// resolve `--resume` / `--continue`, run the TUI, and print the resume hint.
+async fn run_start(
+    resume_flag: Option<String>,
+    continue_session: bool,
+    worktree_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
+    ensure_onboarded()?;
+    let resume = if resume_flag.is_some() {
+        resume_flag
+    } else if continue_session {
+        resolve_continue_session().await
+    } else {
+        None
+    };
+    if let Some(hint) = repl::run(resume, worktree_dir).await? {
+        println!();
+        println!("Session: {} ({})", hint.title, hint.short_id);
+        println!("Resume with: borg --resume {}", hint.short_id);
+    }
+    Ok(())
+}
+
+/// Flat subcommand dispatch: every arm delegates to a named handler.
+async fn dispatch_command(cli: Cli, worktree_dir: Option<std::path::PathBuf>) -> Result<()> {
+    let Cli {
+        resume,
+        continue_session,
+        worktree: _,
+        command,
+    } = cli;
+    match command {
         Some(Commands::Start) | None => {
-            ensure_onboarded()?;
-            let resume = if cli.resume.is_some() {
-                cli.resume.clone()
-            } else if cli.continue_session {
-                resolve_continue_session().await
-            } else {
-                None
-            };
-            if let Some(hint) = repl::run(resume, worktree_dir.clone()).await? {
-                println!();
-                println!("Session: {} ({})", hint.title, hint.short_id);
-                println!("Resume with: borg --resume {}", hint.short_id);
-            }
+            run_start(resume, continue_session, worktree_dir.clone()).await?
         }
         Some(Commands::Stop) => borgd_launcher::stop_service().await?,
         Some(Commands::Restart) => borgd_launcher::restart_service().await?,
@@ -804,34 +868,44 @@ async fn async_main() -> Result<()> {
             output,
             no_redact,
         }) => commands::export::run_export(&session_id, &format, output, no_redact)?,
-        Some(Commands::Pair { action }) => match action {
-            PairCmd::Show => commands::device_pair::run_show().await?,
-            PairCmd::Complete {
-                code,
-                label,
-                socket,
-            } => commands::device_pair::run_complete(&code, &label, socket).await?,
-        },
-        Some(Commands::Revoke { action }) => match action {
-            None | Some(RevokeCmd::List) => commands::revoke::run_list().await?,
-            Some(RevokeCmd::Device {
-                fingerprint,
-                reason,
-            }) => commands::revoke::run(&fingerprint, reason.as_deref()).await?,
-        },
+        Some(Commands::Pair { action }) => dispatch_pair(action).await?,
+        Some(Commands::Revoke { action }) => dispatch_revoke(action).await?,
         Some(Commands::Audit { action }) => match action {
             AuditCmd::Verify => commands::audit::run_verify().await?,
         },
-        Some(Commands::Backup { action }) => match action {
-            BackupCmd::Create => commands::backup::run_create().await?,
-            BackupCmd::Verify { file } => commands::backup::run_verify(&file).await?,
-            BackupCmd::Restore { file, force } => {
-                commands::backup::run_restore(&file, force).await?
-            }
-        },
+        Some(Commands::Backup { action }) => dispatch_backup(action).await?,
     }
 
     Ok(())
+}
+
+async fn dispatch_pair(action: PairCmd) -> Result<()> {
+    match action {
+        PairCmd::Show => commands::device_pair::run_show().await,
+        PairCmd::Complete {
+            code,
+            label,
+            socket,
+        } => commands::device_pair::run_complete(&code, &label, socket).await,
+    }
+}
+
+async fn dispatch_revoke(action: Option<RevokeCmd>) -> Result<()> {
+    match action {
+        None | Some(RevokeCmd::List) => commands::revoke::run_list().await,
+        Some(RevokeCmd::Device {
+            fingerprint,
+            reason,
+        }) => commands::revoke::run(&fingerprint, reason.as_deref()).await,
+    }
+}
+
+async fn dispatch_backup(action: BackupCmd) -> Result<()> {
+    match action {
+        BackupCmd::Create => commands::backup::run_create().await,
+        BackupCmd::Verify { file } => commands::backup::run_verify(&file).await,
+        BackupCmd::Restore { file, force } => commands::backup::run_restore(&file, force).await,
+    }
 }
 
 /// Resolve `--continue` to a session id: the most recent non-archived session
