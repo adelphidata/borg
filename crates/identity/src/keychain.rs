@@ -410,6 +410,33 @@ fn decrypt_map(blob: &[u8], passphrase: &[u8]) -> Result<HashMap<String, Vec<u8>
 mod tests {
     use super::*;
 
+    /// A missing keychain entry must surface as PkiError::NotFound naming the
+    /// account — callers key their "run `borg device pair` first" guidance on
+    /// that variant, and a fabricated Ok(secret) would hand out a bogus KEK.
+    /// Runs against keyring's in-process mock backend (whose entries are
+    /// always absent) so the test never touches the real OS keychain.
+    #[test]
+    fn keychain_store_maps_missing_entry_to_notfound() {
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let store = KeychainStore::new();
+        let account = "borg-test-kek-missing";
+        match store.get(account) {
+            Err(PkiError::NotFound(a)) => assert_eq!(a, account),
+            other => panic!("expected NotFound for an absent entry, got {other:?}"),
+        }
+    }
+
+    /// A read error other than NotFound (here: EISDIR from opening a
+    /// directory) must fail open loudly, never masquerade as an empty store —
+    /// treating it as empty would silently orphan every wrapped KEK.
+    #[test]
+    fn file_kek_open_propagates_non_notfound_read_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = FileKekStore::open(dir.path(), "passphrase").expect_err("open must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("read"), "error must name the failed read: {msg}");
+    }
+
     #[test]
     fn memory_store_round_trips() {
         let store = MemoryKekStore::new();

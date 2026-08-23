@@ -209,6 +209,69 @@ mod tests {
             .expect("issued cert must verify against the CA public key");
     }
 
+    /// The validity window must anchor to wall-clock now: not_before sits
+    /// CA_CLOCK_SKEW in the past (tolerates clock drift between peers) and
+    /// not_after sits the full validity ahead. Span-only checks cannot catch
+    /// a window shifted into the future or the past.
+    #[test]
+    fn validity_windows_anchor_to_now_minus_clock_skew() {
+        let skew = CA_CLOCK_SKEW.whole_seconds();
+        // Generous slack for slow test hosts; far smaller than the 5-min skew.
+        let slack = 60;
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ca = generate_root_ca("borg-test-ca").expect("ca");
+        let meta = parse_cert_metadata(&ca.cert_der).expect("parse root");
+        assert!(
+            (meta.not_before - (now - skew)).abs() <= slack,
+            "root not_before must be ~{skew}s in the past, got offset {}",
+            meta.not_before - now
+        );
+        let five_years = 365 * 5 * 86_400;
+        assert!(
+            (meta.not_after - (now + five_years)).abs() <= slack + 86_400,
+            "root not_after must be ~5 years ahead, got offset {}",
+            meta.not_after - now
+        );
+
+        let dns = vec!["localhost".to_string()];
+        let sp = ServerCertParams {
+            common_name: "borgd",
+            san_dns: &dns,
+            validity_days: 90,
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (server, _) =
+            issue_server_cert(&ca.cert_pem, &ca.key_pkcs8_pem, &sp).expect("server cert");
+        assert!(
+            (server.not_before - (now - skew)).abs() <= slack,
+            "server not_before must be ~{skew}s in the past, got offset {}",
+            server.not_before - now
+        );
+
+        let client_kp = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("kp");
+        let client_pub_pem = client_kp.serialize_pem();
+        let cp = ClientCertParams {
+            device_label: "alice-laptop",
+            device_id: "fp-abc123",
+            client_public_key_pem: &client_pub_pem,
+            validity_days: 90,
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let client = issue_client_cert(&ca.cert_pem, &ca.key_pkcs8_pem, &cp).expect("client cert");
+        assert!(
+            (client.not_before - (now - skew)).abs() <= slack,
+            "client not_before must be ~{skew}s in the past, got offset {}",
+            client.not_before - now
+        );
+        let ninety_days = 90 * 86_400;
+        assert!(
+            (client.not_after - (now + ninety_days)).abs() <= slack + 86_400,
+            "client not_after must be ~90 days ahead, got offset {}",
+            client.not_after - now
+        );
+    }
+
     #[test]
     fn root_ca_is_self_signed_and_reparses() {
         let ca = generate_root_ca("borg-test-ca").expect("ca");
