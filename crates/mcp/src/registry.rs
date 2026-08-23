@@ -523,17 +523,66 @@ pub enum ToolRegistrationOutcome {
 /// - Any non-`[a-z0-9_]` byte → `_`.
 /// - Trailing/leading underscores in the *components* are preserved (we
 ///   only collapse runs of underscores within the joined name to keep
-///   names readable but unambiguously decodable).
+///   names readable).
+///
+/// The name is an opaque key, not a decodable encoding: dispatch is a map
+/// lookup on the full name, and an over-long one is shortened with a hash
+/// suffix that cannot be reversed to server + tool.
 ///
 /// Returns `None` if the resulting name has empty server *or* tool
-/// component.
+/// component. The result is always within [`MAX_TOOL_NAME_LEN`].
 pub fn sanitize_full_name(server: &str, tool: &str) -> Option<String> {
     let s = sanitize_component(server);
     let t = sanitize_component(tool);
     if s.is_empty() || t.is_empty() {
         return None;
     }
-    Some(format!("mcp_{s}_{t}"))
+    Some(shorten_tool_name(format!("mcp_{s}_{t}")))
+}
+
+/// Max length providers accept for a *tool* name (Anthropic's
+/// `^[a-zA-Z0-9_-]{1,128}$`; OpenAI-compatible endpoints are no stricter).
+///
+/// Distinct from [`MAX_PROPERTY_KEY_LEN`], which is 64: the two limits are
+/// different in the API and were not interchangeable here.
+const MAX_TOOL_NAME_LEN: usize = 128;
+
+/// Bound `name` to [`MAX_TOOL_NAME_LEN`], keeping distinct inputs distinct.
+///
+/// Without this the namespaced name is unbounded: `mcp_<server>_<tool>` over
+/// the provider limit fails validation for the *whole* request, so one verbose
+/// server takes every other tool — builtins included — down with it. The
+/// failure is a 400 with no indication of which tool caused it.
+///
+/// A plain truncation is not enough. Two long names from the same server would
+/// collapse onto one string, and the registry fails colliding names closed as
+/// ambiguous, so *both* tools would vanish. Appending a hash of the
+/// untruncated name keeps them apart.
+///
+/// The hash is FNV-1a rather than `DefaultHasher` because the rendered tools
+/// array must stay byte-identical across processes and releases for the prompt
+/// prefix cache. `truncate` is byte-safe here: [`sanitize_component`] emits
+/// only ASCII, so every index is a char boundary.
+fn shorten_tool_name(name: String) -> String {
+    if name.len() <= MAX_TOOL_NAME_LEN {
+        return name;
+    }
+    let suffix = format!("_{:08x}", fnv1a(name.as_bytes()));
+    let mut out = name;
+    out.truncate(MAX_TOOL_NAME_LEN.saturating_sub(suffix.len()));
+    out.push_str(&suffix);
+    out
+}
+
+/// FNV-1a, 32-bit. Chosen for cross-process stability, not collision
+/// resistance — the names it disambiguates are not adversarial.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in bytes {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn sanitize_component(s: &str) -> String {
@@ -889,6 +938,77 @@ mod tests {
         );
     }
 
+    /// Spec: a namespaced name must never exceed the provider's 128-byte tool
+    /// name limit. An over-long name is not merely cosmetic — the provider
+    /// rejects the entire request, so every other tool in the array dies with
+    /// it. Real-world trigger: an MCP server that names its tools after full
+    /// API operation IDs.
+    #[test]
+    fn long_names_are_bounded_to_the_provider_limit() {
+        let name = sanitize_full_name("server", &"a".repeat(400)).expect("non-empty components");
+        assert!(
+            name.len() <= MAX_TOOL_NAME_LEN,
+            "name must fit the provider limit, got {} bytes: {name}",
+            name.len()
+        );
+    }
+
+    /// Spec: shortening must not merge two distinct tools. The registry fails
+    /// colliding sanitized names closed as ambiguous, so a plain truncation
+    /// would delete *both* tools rather than one — the hash suffix is what
+    /// keeps them registrable.
+    #[test]
+    fn distinct_long_names_stay_distinct_after_shortening() {
+        let stem = "z".repeat(300);
+        let a = sanitize_full_name("server", &format!("{stem}_alpha")).unwrap();
+        let b = sanitize_full_name("server", &format!("{stem}_beta")).unwrap();
+        assert_ne!(a, b, "truncation collapsed two tools onto one name");
+        assert!(a.len() <= MAX_TOOL_NAME_LEN && b.len() <= MAX_TOOL_NAME_LEN);
+    }
+
+    /// Spec: the rendered tools array must be byte-stable across processes so
+    /// the prompt prefix cache survives a daemon restart. That rules out
+    /// `DefaultHasher`, whose output is not guaranteed stable; this pins the
+    /// actual emitted bytes so a swap to a non-portable hasher fails here.
+    #[test]
+    fn shortened_names_are_stable_across_runs() {
+        // Literal bytes, not a value recomputed with `fnv1a` — comparing the
+        // function against itself would still pass if the hash were swapped
+        // for a non-portable one, which is the regression this guards.
+        let long = sanitize_full_name("srv", &"q".repeat(200)).unwrap();
+        assert_eq!(long, format!("mcp_srv_{}_e21d1e0a", "q".repeat(119 - 8)));
+    }
+
+    /// Spec: `fnv1a` is the published FNV-1a/32 function, pinned by its
+    /// reference vectors. It is an on-the-wire format, so a "cleanup" that
+    /// changed the offset basis or prime would silently renumber every
+    /// shortened tool name and cold-start the prompt cache.
+    #[test]
+    fn fnv1a_matches_the_reference_vectors() {
+        assert_eq!(fnv1a(b""), 0x811c_9dc5);
+        assert_eq!(fnv1a(b"a"), 0xe40c_292c);
+        assert_eq!(fnv1a(b"foobar"), 0xbf9c_f968);
+    }
+
+    /// Spec: names that already fit are passed through untouched. A hash
+    /// suffix on an ordinary name would be pure churn and would break every
+    /// existing per-tool allow/deny filter the operator has configured.
+    #[test]
+    fn names_within_the_limit_are_untouched() {
+        assert_eq!(
+            sanitize_full_name("github", "create_issue").as_deref(),
+            Some("mcp_github_create_issue")
+        );
+        let exact = "b".repeat(MAX_TOOL_NAME_LEN - "mcp_s_".len());
+        let name = sanitize_full_name("s", &exact).unwrap();
+        assert_eq!(
+            name.len(),
+            MAX_TOOL_NAME_LEN,
+            "boundary must not be shortened"
+        );
+        assert_eq!(name, format!("mcp_s_{exact}"));
+    }
+
     #[test]
     fn sanitize_rejects_empty_components() {
         assert!(sanitize_full_name("", "tool").is_none());
@@ -1058,6 +1178,50 @@ mod tests {
         assert!(outcomes
             .iter()
             .any(|o| matches!(o, ToolRegistrationOutcome::FilteredOut { original } if original == "delete")));
+    }
+
+    /// Spec: two over-long tool names from one server must both survive
+    /// registration. This is the behaviour the hash suffix exists for — under
+    /// a plain truncation the two names collapse onto one string, the registry
+    /// fails the second closed as ambiguous, and the operator loses *both*
+    /// tools with only a log line to say so.
+    #[test]
+    fn two_over_long_tool_names_both_register() {
+        let reg = McpRegistry::new();
+        // Identical for the first 300 bytes; they differ only past the cut.
+        let shared = "x".repeat(300);
+        let tools = vec![
+            McpToolSchema {
+                name: format!("{shared}_alpha"),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+            },
+            McpToolSchema {
+                name: format!("{shared}_beta"),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+            },
+        ];
+        let outcomes = reg.replace_server_tools("srv", &tools, &ToolFilter::default(), &[]);
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| matches!(o, ToolRegistrationOutcome::Collision { .. })),
+            "shortening must not manufacture a collision: {outcomes:?}"
+        );
+
+        let names: Vec<String> = reg.tools().into_iter().map(|t| t.full_name).collect();
+        assert_eq!(names.len(), 2, "both tools must remain callable: {names:?}");
+        assert_ne!(names[0], names[1]);
+        for name in &names {
+            assert!(
+                name.len() <= MAX_TOOL_NAME_LEN,
+                "{name} exceeds the provider limit"
+            );
+            assert!(reg.lookup(name).is_some(), "{name} must be dispatchable");
+        }
     }
 
     #[test]
