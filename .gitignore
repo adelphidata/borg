@@ -62,3 +62,7 @@ borg_*.txt
 
 # Vitest coverage reports (cargo-llvm-cov writes under target/)
 coverage/
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/

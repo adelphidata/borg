@@ -60,6 +60,7 @@ cargo test -p plugins         # plugin tests
 - Run `cargo fmt` before committing
 - Run `cargo clippy -- -D warnings` and fix any warnings
 - The lefthook `pre-commit` hook runs both in parallel; `pre-push` runs the full test suite
+- `just complexity` reports functions with cyclomatic complexity > 15 (lizard via `uvx`); keep new code under that bar
 
 ## Making Changes
 

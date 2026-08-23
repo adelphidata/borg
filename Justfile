@@ -95,6 +95,10 @@ coverage:
 coverage-summary:
     cargo llvm-cov --workspace
 
+# Cyclomatic complexity report (functions with CCN > 15; needs uv)
+complexity:
+    uvx lizard -l rust crates/ -C 15 -w
+
 # Default RUST_LOG for dev commands: surfaces cortex::llm lifecycle logs
 # (request start → response headers → first byte → stream end) and other
 # cortex-internal debug output. Override by exporting RUST_LOG before invoking.

@@ -64,7 +64,7 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Dev cadence.** Per-edit: `cargo build` + targeted `cargo test -p <crate> <new_test_name>` only. Skip `fmt --check`, `clippy`, full `--workspace` until ship-time (`/ship` runs them). CI re-runs everything. Investigation that needs >3 reads/greps → Explore subagent. Batch independent tool calls in one message.
 
-**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. CI gates via `cargo llvm-cov --fail-under-lines <n>`, a ratchet set to today's number — raise it as tests land, never lower it.
+**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage`. Complexity: `just complexity` (lizard via uvx, warns on CCN > 15). CI gates via `cargo llvm-cov --fail-under-lines <n>`, a ratchet set to today's number — raise it as tests land, never lower it.
 
 **Coverage.** The standard is line coverage above 90%. All new or modified code must have corresponding test coverage — no exceptions. The workspace sits below that today, so CI's `--fail-under-lines` is a ratchet at the current number: it stops regressions, and every coverage push raises it. Raising the ratchet is part of the work, not a follow-up.
 
