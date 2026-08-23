@@ -252,4 +252,54 @@ mod tests {
         let cmd = "apply_patch <<EOF\nEOFISH\n";
         assert!(maybe_extract_apply_patch_from_shell(cmd).is_none());
     }
+
+    #[test]
+    fn extracts_with_trailing_whitespace_after_closing_tag() {
+        // A closing-tag line with a trailing space, followed by further
+        // command lines, must still terminate the heredoc — non-newline
+        // whitespace after the tag is a valid terminator.
+        let cmd = format!("apply_patch <<EOF\n{PATCH_BODY}\nEOF \necho done");
+        let body = maybe_extract_apply_patch_from_shell(&cmd)
+            .expect("a trailing space after the closing tag must still terminate");
+        assert_eq!(body, PATCH_BODY);
+    }
+
+    #[test]
+    fn extracts_with_space_between_opening_tag_and_newline() {
+        // A space after the opening tag must not become part of the tag —
+        // the closing line is bare `EOF` and must still match.
+        let cmd = format!("apply_patch <<EOF \n{PATCH_BODY}\nEOF");
+        let body = maybe_extract_apply_patch_from_shell(&cmd)
+            .expect("whitespace ends a bare heredoc tag");
+        assert_eq!(body, PATCH_BODY);
+    }
+
+    #[test]
+    fn strip_one_layer_of_quotes_length_edge_cases() {
+        // Inputs shorter than one full quote pair can never be unwrapped and
+        // must not panic; an empty quote pair unwraps to the empty string.
+        assert_eq!(strip_one_layer_of_quotes(""), None);
+        assert_eq!(strip_one_layer_of_quotes("'"), None);
+        assert_eq!(strip_one_layer_of_quotes("''"), Some(String::new()));
+        assert_eq!(strip_one_layer_of_quotes("\"\""), Some(String::new()));
+    }
+
+    #[test]
+    fn parse_heredoc_tag_returns_remainder_directly_after_tag() {
+        // The remainder must start immediately after the tag (and after the
+        // closing quote for quoted tags) — not on the quote itself.
+        assert_eq!(
+            parse_heredoc_tag("'EOF' rest"),
+            Some(("EOF".to_string(), " rest"))
+        );
+        assert_eq!(
+            parse_heredoc_tag("\"TAG\"\nbody"),
+            Some(("TAG".to_string(), "\nbody"))
+        );
+        // Bare tags end at the first whitespace of any kind, not only '\n'.
+        assert_eq!(
+            parse_heredoc_tag("EOF more"),
+            Some(("EOF".to_string(), " more"))
+        );
+    }
 }

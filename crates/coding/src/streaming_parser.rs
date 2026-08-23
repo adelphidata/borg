@@ -723,6 +723,139 @@ mod tests {
     }
 
     #[test]
+    fn invalid_header_error_names_offender_line_and_valid_headers() {
+        let mut p = StreamingPatchParser::default();
+        let err = p
+            .push_delta("*** Begin Patch\n*** Bogus: x\n")
+            .unwrap_err();
+        match err {
+            ParseError::InvalidHunk {
+                message,
+                line_number,
+            } => {
+                assert_eq!(line_number, 2);
+                assert!(
+                    message.contains("'*** Bogus: x' is not a valid hunk header"),
+                    "got: {message}"
+                );
+                assert!(message.contains("*** Add File: "), "got: {message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_reports_empty_chunk_error_at_buffered_end_patch_line() {
+        // `@@` opened a chunk that never received lines; the buffered final
+        // `*** End Patch` (no trailing newline) must be counted as line 4 and
+        // produce the empty-hunk message, not the unexpected-line one.
+        let mut p = StreamingPatchParser::default();
+        let _ = p
+            .push_delta("*** Begin Patch\n*** Update File: f.txt\n@@\n*** End Patch")
+            .unwrap();
+        match p.finish().unwrap_err() {
+            ParseError::InvalidHunk {
+                message,
+                line_number,
+            } => {
+                assert_eq!(line_number, 4);
+                assert!(
+                    message.contains("does not contain any lines"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_rejects_buffered_content_line_that_is_not_end_patch() {
+        // A trailing non-sentinel line must go through normal processing and
+        // then fail the End Patch requirement — not be mistaken for the
+        // sentinel and silently accepted.
+        let mut p = StreamingPatchParser::default();
+        let _ = p
+            .push_delta("*** Begin Patch\n*** Add File: f.txt\n+hi")
+            .unwrap();
+        let err = p.finish().unwrap_err();
+        assert!(matches!(err, ParseError::InvalidFormat(ref m) if m.contains("*** End Patch")));
+    }
+
+    #[test]
+    fn insertion_only_and_deletion_only_chunks_are_valid() {
+        let mut p = StreamingPatchParser::default();
+        assert_eq!(
+            p.push_delta(
+                "*** Begin Patch\n*** Update File: f.txt\n@@\n+one\n@@ ctx\n-two\n*** End Patch\n"
+            )
+            .unwrap(),
+            vec![upd(
+                "f.txt",
+                None,
+                vec![
+                    chunk(None, vec![], vec!["one"], false),
+                    chunk(Some("ctx"), vec!["two"], vec![], false),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn eof_marker_accepted_after_insertion_only_chunk() {
+        let mut p = StreamingPatchParser::default();
+        assert_eq!(
+            p.push_delta(
+                "*** Begin Patch\n*** Update File: f.txt\n@@\n+line\n*** End of File\n*** End Patch\n"
+            )
+            .unwrap(),
+            vec![upd("f.txt", None, vec![chunk(None, vec![], vec!["line"], true)])]
+        );
+    }
+
+    #[test]
+    fn move_to_rejected_after_first_chunk() {
+        // `Move to:` is only valid immediately after the Update header; once a
+        // chunk exists it must be treated as an unexpected line.
+        let mut p = StreamingPatchParser::default();
+        let err = p
+            .push_delta("*** Begin Patch\n*** Update File: a.rs\n@@\n-x\n+y\n*** Move to: b.rs\n")
+            .unwrap_err();
+        match err {
+            ParseError::InvalidHunk { message, .. } => {
+                assert!(
+                    message.contains("@@ context marker"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn junk_line_after_diff_lines_asks_for_context_marker() {
+        // Whether the open chunk has only removals or only additions, an
+        // unprefixed line must produce the "expected @@" diagnostic, not the
+        // generic unexpected-line one reserved for empty chunks.
+        for body in ["-x", "+x"] {
+            let mut p = StreamingPatchParser::default();
+            let err = p
+                .push_delta(&format!(
+                    "*** Begin Patch\n*** Update File: f.txt\n@@\n{body}\njunk\n"
+                ))
+                .unwrap_err();
+            match err {
+                ParseError::InvalidHunk { message, .. } => {
+                    assert!(
+                        message.contains("Expected update hunk to start with a @@ context marker"),
+                        "body {body}: got: {message}"
+                    );
+                }
+                other => panic!("body {body}: unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn streaming_then_apply_via_conversion_works_end_to_end() {
         // Integration guard: a stream that builds an AddFile hunk, when fed
         // through to_patch_operations and then apply::apply_patch via the

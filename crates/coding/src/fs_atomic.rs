@@ -262,6 +262,65 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
     }
 
+    /// A metadata error other than NotFound must fail the write instead of
+    /// being treated as "new file" — here a self-referential symlink, whose
+    /// resolution errors while the path itself very much exists. Treating it
+    /// as new would let the rename clobber the link with a plain file.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_propagates_non_notfound_metadata_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("loop");
+        std::os::unix::fs::symlink(&target, &target).unwrap();
+
+        assert!(
+            atomic_write(&target, b"content").is_err(),
+            "a symlink loop must fail the write, not count as a new file"
+        );
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the unresolvable link must survive the failed write"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["loop".to_string()],
+            "no temp residue after the early failure: {entries:?}"
+        );
+    }
+
+    /// Ownership restoration must be skipped when the writer already owns the
+    /// file: an unprivileged fchown — even to the file's current owner —
+    /// makes the kernel strip setuid/setgid, so a gratuitous one would break
+    /// the "existing target keeps its exact mode" contract.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_chown_a_file_the_writer_already_owns() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: plain libc getter, no arguments, always succeeds.
+        if unsafe { libc::geteuid() } == 0 {
+            // root chown never clears setuid, so the observable vanishes.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("suid.sh");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).unwrap();
+
+        atomic_write(&target, b"new").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o4755,
+            "the setuid bit must survive a same-owner rewrite"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
     #[test]
     fn atomic_write_leaves_no_temp_residue() {
         let dir = tempfile::tempdir().unwrap();

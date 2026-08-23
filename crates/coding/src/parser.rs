@@ -2322,4 +2322,398 @@ diff --git a/f b/f
         let content = std::fs::read_to_string(dir.path().join("greet.txt")).unwrap();
         assert_eq!(content, "howdy\nworld\n");
     }
+
+    // ── Marker classification helpers ──
+
+    #[test]
+    fn is_dsl_marker_recognizes_each_marker_independently() {
+        // Every marker family must be detected on its own — no marker's
+        // detection may depend on another clause also matching.
+        let markers = [
+            "*** Begin Patch",
+            "*** End Patch",
+            "*** Add File: a.txt",
+            "*** Update File: a.txt",
+            "*** Delete File: a.txt",
+            "*** Move File: a.txt -> b.txt",
+            "*** Move to: b.txt",
+            "*** End of File",
+        ];
+        for m in markers {
+            assert!(is_dsl_marker(m), "{m:?} must be detected as a DSL marker");
+        }
+        assert!(!is_dsl_marker("plain content line"));
+        assert!(!is_dsl_marker("*** Bold header ***"));
+    }
+
+    #[test]
+    fn is_hijacked_marker_on_final_line_counts_as_hijacked() {
+        // A marker payload on the very last line has nothing following it,
+        // so it is a hijacked marker — and the check must not index past
+        // the end of the slice.
+        let lines = ["-*** End Patch"];
+        assert!(is_hijacked_marker("*** End Patch", &lines, 1));
+        // With a diff line following it is legitimate content.
+        let lines = ["-*** End Patch", "+more"];
+        assert!(!is_hijacked_marker("*** End Patch", &lines, 1));
+    }
+
+    // ── parse_patch_dsl body-boundary behavior ──
+    //
+    // parse_patch_dsl trusts its caller to have validated the outer
+    // sentinels, so bodies that end abruptly (no trailing *** End Patch
+    // line) must still be handled without panicking.
+
+    #[test]
+    fn parse_dsl_blank_bodies_error_without_panicking() {
+        for input in ["", "\n   \n"] {
+            let err = parse_patch_dsl(input).expect_err("blank body has no operations");
+            assert!(
+                err.to_string().contains("No operations"),
+                "expected no-operations error for {input:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_dsl_body_without_begin_marker_still_parses_first_operation() {
+        // The Begin sentinel is consumed only when present; a first line
+        // that is a real operation must never be swallowed in its place.
+        let patch = parse_patch_dsl("*** Add File: a.txt\n+x").unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::AddFile { path, content } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(content, "x");
+            }
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dsl_update_hunk_running_to_end_of_body() {
+        let patch = parse_patch_dsl("*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new")
+            .expect("diff lines up to end of body must parse");
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "old");
+                assert_eq!(hunks[0].replace, "new");
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dsl_add_file_trailing_blank_at_end_of_body_is_not_content() {
+        // A trailing blank with no further '+' content ends the block; it
+        // must not be folded into the file content as an extra newline.
+        let patch = parse_patch_dsl("*** Begin Patch\n*** Add File: a.txt\n+x\n\n").unwrap();
+        match &patch.operations[0] {
+            PatchOperation::AddFile { content, .. } => assert_eq!(content, "x"),
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dsl_add_file_marker_line_at_end_of_body_is_stripped() {
+        // '+*** End Patch' as the very last line of the body: hijacked
+        // marker, stripped — and the next-line lookahead must not read
+        // past the end of the slice.
+        let patch =
+            parse_patch_dsl("*** Begin Patch\n*** Add File: a.txt\n+x\n+*** End Patch").unwrap();
+        match &patch.operations[0] {
+            PatchOperation::AddFile { content, .. } => assert_eq!(content, "x"),
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dsl_update_header_at_end_of_body_reports_empty_update() {
+        let err = parse_patch_dsl("*** Begin Patch\n*** Update File: f.txt")
+            .expect_err("update with no hunks must error");
+        match err {
+            ParseError::InvalidHunk {
+                message,
+                line_number,
+            } => {
+                assert!(message.contains("empty"), "got: {message}");
+                assert_eq!(line_number, 2, "error must point at the Update File line");
+            }
+            other => panic!("Expected InvalidHunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_dsl_anchor_only_hunk_at_end_of_body_is_rejected() {
+        let err = parse_patch_dsl("*** Begin Patch\n*** Update File: f.txt\n@@ fn foo")
+            .expect_err("anchor with no diff lines must error");
+        match err {
+            ParseError::InvalidHunk {
+                message,
+                line_number,
+            } => {
+                assert!(message.contains("does not contain any lines"), "got: {message}");
+                assert_eq!(line_number, 3, "error must point at the @@ line");
+            }
+            other => panic!("Expected InvalidHunk, got {other:?}"),
+        }
+    }
+
+    // ── Index bookkeeping through the public parser ──
+
+    #[test]
+    fn parse_leading_blank_lines_before_begin_marker() {
+        let input = "\n\n*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch";
+        let patch = parse_patch(input).expect("leading blank lines are tolerated");
+        match &patch.operations[0] {
+            PatchOperation::AddFile { path, content } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(content, "x");
+            }
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_add_file_preserves_double_blank_separator() {
+        // Two consecutive unprefixed blanks before more '+' content are
+        // both part of the file — the lookahead accepts a run of blanks,
+        // not just a single one.
+        let input = "\
+*** Begin Patch
+*** Add File: a.txt
++x
+
+
++y
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::AddFile { content, .. } => assert_eq!(content, "x\n\n\ny"),
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_add_file_leading_blank_line_before_content() {
+        // A bare blank line as the first "content" line, with '+' content
+        // after it, must not truncate the block to an empty file.
+        let input = "\
+*** Begin Patch
+*** Add File: a.txt
+
++x
+*** End Patch";
+        let patch = parse_patch(input).expect("leading blank inside Add File is tolerated");
+        match &patch.operations[0] {
+            PatchOperation::AddFile { content, .. } => assert_eq!(content, "x"),
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_blank_line_before_first_hunk_header() {
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+
+@@
+-old
++new
+*** End Patch";
+        let patch = parse_patch(input).expect("blank line before @@ is tolerated");
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "old");
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_eof_marker_hunk_followed_by_another_hunk() {
+        // The End of File sentinel closes one hunk; parsing must resume on
+        // the line after it, so a following @@ hunk is not dropped.
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+-old
++new
+*** End of File
+@@
+-second
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 2, "hunk after End of File must survive");
+                assert!(hunks[0].is_end_of_file);
+                assert_eq!(hunks[1].search, "second");
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_strips_minus_prefixed_end_patch_marker() {
+        // The '-' twin of the '+*** End Patch' LLM error: the marker must
+        // end the hunk, not become a line to search for.
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+-old
+-*** End Patch
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "old");
+                assert_eq!(hunks[0].replace, "");
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_top_level_marker_line_is_skipped() {
+        let input = "\
+*** Begin Patch
+*** Something Unknown
+*** Add File: a.txt
++x
+*** End Patch";
+        let patch = parse_patch(input).expect("unknown *** lines are skipped");
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::AddFile { path, .. } => assert_eq!(path, "a.txt"),
+            other => panic!("Expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_move_file_requires_both_sides_nonempty() {
+        for input in [
+            "*** Begin Patch\n*** Move File: -> dst.rs\n*** End Patch",
+            "*** Begin Patch\n*** Move File: src.rs ->\n*** End Patch",
+        ] {
+            let err = parse_patch(input).expect_err("one-sided Move File must error");
+            assert!(
+                err.to_string().contains("requires both"),
+                "expected both-sides error for {input:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_headerless_chunk_source_line_points_at_first_diff_line() {
+        let input = "\
+*** Begin Patch
+*** Update File: file.py
+ import foo
++bar
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks[0].source_line, 3);
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    // ── Unified-diff edge cases ──
+
+    #[test]
+    fn parse_unified_git_header_paths_used_when_body_headers_missing() {
+        // No ---/+++ lines: the paths must come from the `diff --git`
+        // header, and the @@ body must parse as a normal update.
+        let input = "\
+diff --git a/f b/f
+@@ -1 +1 @@
+-x
++y
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile {
+                path,
+                move_to,
+                hunks,
+            } => {
+                assert_eq!(path, "f");
+                assert!(move_to.is_none());
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "x");
+                assert_eq!(hunks[0].replace, "y");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_rename_only_section_errors_naming_the_file() {
+        // A rename with no hunks cannot be represented; the error must name
+        // the file taken from the `diff --git` header — and scanning the
+        // extended headers must not run past the end of the input.
+        let input = "\
+diff --git a/old.rs b/new.rs
+similarity index 100%
+rename from old.rs
+rename to new.rs
+";
+        let err = parse_patch(input).expect_err("rename-only diff must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no hunks") && msg.contains("old.rs"),
+            "error must name the hunk-less file, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_unified_hunk_source_line_points_at_hunk_header() {
+        let input = "\
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-x
++y
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                // The @@ header is on line 3 (1-indexed).
+                assert_eq!(hunks[0].source_line, 3);
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_stray_plus_header_terminates_hunk_body() {
+        // A `+++ ` header line directly after a hunk body (e.g. a truncated
+        // multi-file diff) must end the body — never leak into the replace
+        // text as an added line reading "++ b/g".
+        let input = "\
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-x
++y
++++ b/g
+";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].replace, "y");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
 }

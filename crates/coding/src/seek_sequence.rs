@@ -69,8 +69,13 @@ fn seek_sequence_in_range(
         ("trim_surrounding_whitespace", |line, pat| {
             line.trim() == pat.trim()
         }),
+        // Punctuation-normalised but whitespace-exact, so it stays stricter
+        // than the indentation-flexible tier below (`normalise` itself trims,
+        // which would collapse the two tiers into one).
         ("unicode_normalized", |line, pat| {
-            normalise(line) == normalise(pat)
+            line.chars()
+                .map(normalise_char)
+                .eq(pat.chars().map(normalise_char))
         }),
     ];
 
@@ -148,13 +153,20 @@ fn collect_matches(
     matches
 }
 
+/// Last-resort tier: the pattern's first and last lines act as anchors
+/// (compared trim + punctuation normalised) and the interior lines are not
+/// compared at all, so a block whose body drifted since the patch was written
+/// can still be located. Requires at least three pattern lines so the anchor
+/// pair always brackets real interior content; with fewer lines every line is
+/// an anchor and the tier would collapse into `indentation_flexible_match`.
+/// Ambiguity is still reported, never resolved silently.
 fn collect_block_anchor_matches(
     lines: &[String],
     pattern: &[String],
     start: usize,
     anchored_to_start: bool,
 ) -> Vec<usize> {
-    if pattern.len() < 2 {
+    if pattern.len() < 3 {
         return Vec::new();
     }
 
@@ -164,20 +176,9 @@ fn collect_block_anchor_matches(
         if anchored_to_start && i != start {
             break;
         }
-        if !boundary_match(&lines[i], &pattern[0])
-            || !boundary_match(&lines[i + pattern.len() - 1], &pattern[pattern.len() - 1])
+        if boundary_match(&lines[i], &pattern[0])
+            && boundary_match(&lines[i + pattern.len() - 1], &pattern[pattern.len() - 1])
         {
-            continue;
-        }
-
-        let mut ok = true;
-        for middle_idx in 1..pattern.len() - 1 {
-            if !middle_block_match(&lines[i + middle_idx], &pattern[middle_idx]) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
             matches.push(i);
         }
     }
@@ -190,10 +191,6 @@ fn indentation_flexible_match(line: &str, pat: &str) -> bool {
 
 fn boundary_match(line: &str, pat: &str) -> bool {
     normalise(line) == normalise(pat)
-}
-
-fn middle_block_match(line: &str, pat: &str) -> bool {
-    indentation_flexible_match(line, pat)
 }
 
 /// Best-effort hint for failed hunks: find the file line that most closely
@@ -258,7 +255,7 @@ fn normalise_iter(s: &str) -> impl Iterator<Item = char> + '_ {
 
 #[cfg(test)]
 mod tests {
-    use super::{seek_sequence, MatchOutcome};
+    use super::{find_nearest_context, seek_sequence, MatchOutcome};
     use std::string::ToString;
 
     fn to_vec(strings: &[&str]) -> Vec<String> {
@@ -396,6 +393,123 @@ mod tests {
         assert_eq!(
             seek_sequence(&lines, &pattern, 0, false),
             MatchOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn eof_mode_falls_back_to_full_search_when_end_anchor_misses() {
+        // The pattern exists only at the top of the file; the eof anchor at
+        // the bottom does not match, so the search must retry from `start`.
+        let lines = to_vec(&["x", "y", "a", "b", "c"]);
+        let pattern = to_vec(&["x", "y"]);
+        assert_eq!(
+            seek_sequence(&lines, &pattern, 0, true),
+            MatchOutcome::Unique(0)
+        );
+    }
+
+    #[test]
+    fn indentation_flexible_tier_combines_indent_and_unicode_tolerance() {
+        // Needs leading-whitespace tolerance AND punctuation normalisation at
+        // once — no earlier tier covers both, so this must fall through to
+        // the indentation_flexible tier.
+        let lines = to_vec(&["    fancy \u{2014} dash"]);
+        let pattern = to_vec(&["fancy - dash"]);
+        assert_eq!(
+            seek_sequence(&lines, &pattern, 0, false),
+            MatchOutcome::Unique(0)
+        );
+    }
+
+    #[test]
+    fn block_anchor_matches_on_boundaries_when_interior_drifted() {
+        // Interior content changed since the patch was written; the first and
+        // last lines still uniquely bracket the block. Three- and four-line
+        // patterns must both anchor (interior length is irrelevant).
+        let cases: [(&[&str], &[&str], usize); 2] = [
+            (
+                &["pad", "fn beta() {", "    new_impl();", "}"],
+                &["fn beta() {", "    old_impl();", "}"],
+                1,
+            ),
+            (
+                &["fn gamma(", "    a,", "    b,", ") {"],
+                &["fn gamma(", "    x,", "    y,", ") {"],
+                0,
+            ),
+        ];
+        for (lines, pattern, expected) in cases {
+            let lines = to_vec(lines);
+            let pattern = to_vec(pattern);
+            assert_eq!(
+                seek_sequence(&lines, &pattern, 0, false),
+                MatchOutcome::Unique(expected),
+                "pattern {pattern:?} should block-anchor at {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_anchor_eof_mode_prefers_unique_end_anchor() {
+        // Two boundary-compatible blocks exist; in eof mode the end-of-file
+        // anchored pass must resolve to the trailing block on its own instead
+        // of falling back to the full scan (which would be ambiguous).
+        let lines = to_vec(&["anchor {", "mid1", "}", "pad", "anchor {", "mid2", "}"]);
+        let pattern = to_vec(&["anchor {", "midX", "}"]);
+        assert_eq!(
+            seek_sequence(&lines, &pattern, 0, true),
+            MatchOutcome::Unique(4)
+        );
+    }
+
+    #[test]
+    fn nearest_context_returns_none_without_shared_prefix() {
+        let lines = to_vec(&["alpha", "beta"]);
+        let pattern = to_vec(&["zzz"]);
+        assert_eq!(find_nearest_context(&lines, &pattern), None);
+    }
+
+    #[test]
+    fn nearest_context_picks_longest_shared_prefix() {
+        // Scores: "ab zz" shares 2 chars with the anchor, "abcd zz" shares 4.
+        let lines = to_vec(&["ab zz", "abcd zz", "junk"]);
+        let pattern = to_vec(&["abcdef"]);
+        let snippet = find_nearest_context(&lines, &pattern).expect("snippet");
+        assert_eq!(
+            snippet,
+            vec![
+                (1, "ab zz".to_string()),
+                (2, "abcd zz".to_string()),
+                (3, "junk".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nearest_context_keeps_first_line_on_score_tie() {
+        // Both "abX" and "abY" share 2 chars with the anchor; the earlier
+        // line wins so the hint stays deterministic.
+        let lines = to_vec(&["abX", "pad", "abY"]);
+        let pattern = to_vec(&["abZ"]);
+        let snippet = find_nearest_context(&lines, &pattern).expect("snippet");
+        assert_eq!(
+            snippet,
+            vec![(1, "abX".to_string()), (2, "pad".to_string())]
+        );
+    }
+
+    #[test]
+    fn nearest_context_snippet_is_three_lines_centered_with_one_based_numbers() {
+        let lines = to_vec(&["l1", "l2", "l3", "target line", "l5", "l6"]);
+        let pattern = to_vec(&["target line"]);
+        let snippet = find_nearest_context(&lines, &pattern).expect("snippet");
+        assert_eq!(
+            snippet,
+            vec![
+                (3, "l3".to_string()),
+                (4, "target line".to_string()),
+                (5, "l5".to_string()),
+            ]
         );
     }
 }

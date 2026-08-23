@@ -2908,4 +2908,476 @@ EOF";
         );
         assert_eq!(String::from_utf8(raw).unwrap(), "\u{FEFF}SOURCE\n");
     }
+
+    /// The size cap is 10 MB. A 2 MiB file sits comfortably inside it and must
+    /// be accepted; the byte count is hardcoded so a wrongly-computed limit
+    /// (e.g. additions in place of multiplications) fails here instead of
+    /// silently shrinking the cap.
+    #[test]
+    fn size_limit_admits_a_two_megabyte_file() {
+        let dir = TempDir::new().unwrap();
+        let content = "x".repeat(2_097_152);
+        let patch = make_patch(vec![PatchOperation::AddFile {
+            path: "big.txt".to_string(),
+            content,
+        }]);
+        let affected = apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(affected.added, vec!["big.txt"]);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("big.txt")).unwrap().len(),
+            2_097_152
+        );
+    }
+
+    /// The cap is exclusive: an updated file of exactly the maximum size is
+    /// still legal — only strictly larger results are rejected.
+    #[test]
+    fn update_result_at_exactly_the_size_limit_is_allowed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        // Result is the replacement plus the preserved trailing newline, so
+        // the updated content lands on the limit exactly.
+        let replacement = "x".repeat(MAX_PATCH_FILE_SIZE - 1);
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("a", &replacement)],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.path().join("f.txt")).unwrap().len() as usize,
+            MAX_PATCH_FILE_SIZE
+        );
+    }
+
+    /// The source of a rename ceases to exist, so a second operation removing
+    /// the same file is incoherent and must be rejected up front.
+    #[test]
+    fn move_source_cannot_also_be_deleted() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        let patch = make_patch(vec![
+            PatchOperation::UpdateFile {
+                path: "a.txt".to_string(),
+                move_to: Some("b.txt".to_string()),
+                hunks: vec![simple_hunk("x", "y")],
+            },
+            PatchOperation::DeleteFile {
+                path: "a.txt".to_string(),
+            },
+        ]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("Multiple operations remove"),
+            "double-removal must be rejected, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "x\n",
+            "a rejected patch must not touch the filesystem"
+        );
+    }
+
+    /// A move with content edits reports both halves in the diff: the rename
+    /// header and the unified-diff body of the edit.
+    #[test]
+    fn move_with_hunks_diff_has_header_and_body() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("old.rs"), "fn main() {\n    old();\n}\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "old.rs".to_string(),
+            move_to: Some("new.rs".to_string()),
+            hunks: vec![simple_hunk("    old();", "    new();")],
+        }]);
+        let result = apply_patch(&patch, dir.path()).unwrap();
+        assert!(
+            result.diff.contains("# Moved: old.rs -> new.rs"),
+            "diff must announce the rename, got: {}",
+            result.diff
+        );
+        assert!(
+            result.diff.contains("-    old();") && result.diff.contains("+    new();"),
+            "diff must include the edit body, got: {}",
+            result.diff
+        );
+    }
+
+    /// Records the message of every tracing event emitted during a test.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageVisitor<'a>(&'a mut String);
+            impl tracing::field::Visit for MessageVisitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        use std::fmt::Write as _;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut msg = String::new();
+            event.record(&mut MessageVisitor(&mut msg));
+            self.0.lock().unwrap().push(msg);
+        }
+    }
+
+    /// A failed commit rolls back files the patch created. When that removal
+    /// itself fails for a real reason (here the parent path component is a
+    /// regular file, so unlink reports NotADirectory) the failure must surface
+    /// as a warning — only "already gone" is silence-worthy.
+    #[test]
+    fn rollback_warns_when_created_file_cannot_be_removed() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("blocker"), "i am a file").unwrap();
+
+        let logs = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let patch = make_patch(vec![PatchOperation::AddFile {
+            path: "blocker/new.txt".to_string(),
+            content: "content".to_string(),
+        }]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to create directory"),
+            "commit should fail on the file-as-directory component, got: {err}"
+        );
+
+        let captured = logs.0.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("Rollback: failed to remove")),
+            "a non-NotFound removal failure during rollback must be warned about, got: {captured:?}"
+        );
+    }
+
+    /// Re-sending a patch of anchored insertions whose lines already sit at
+    /// their insertion points is a success no-op — and the cursor still
+    /// advances past each recognized block so later anchors resolve in the
+    /// right region instead of re-scanning from the top.
+    #[test]
+    fn reapplying_anchored_insertions_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let original = "fn alpha\none\ntwo fn beta junk\nfn beta\nadded\n";
+        std::fs::write(dir.path().join("f.rs"), original).unwrap();
+        let anchored_insert = |anchor: &str, replace: &str, line: usize| Hunk {
+            context_anchors: vec![anchor.to_string()],
+            search: String::new(),
+            replace: replace.to_string(),
+            is_end_of_file: false,
+            source_line: line,
+        };
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.rs".to_string(),
+            move_to: None,
+            hunks: vec![
+                // Already present right after `fn alpha`. Recognizing it must
+                // move the cursor past BOTH inserted lines; otherwise the
+                // second hunk's `fn beta` anchor also sees the decoy on the
+                // "two fn beta junk" line and becomes ambiguous.
+                anchored_insert("fn alpha", "one\ntwo fn beta junk", 1),
+                anchored_insert("fn beta", "added", 2),
+            ],
+        }]);
+        let affected = apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(affected.already_applied, vec!["f.rs"]);
+        assert!(affected.modified.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.rs")).unwrap(),
+            original,
+            "an already-applied insertion must not be duplicated"
+        );
+    }
+
+    /// A hunk whose replace equals its search can never count as "already
+    /// applied": when its text matches ambiguously the error must stand.
+    #[test]
+    fn noop_hunk_with_ambiguous_match_still_errors() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x = 1;\nx = 1;\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("x = 1;", "x = 1;")],
+        }]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("matched 2 locations"),
+            "a no-op hunk must not be excused as already applied, got: {err}"
+        );
+    }
+
+    /// When a hunk is recognized as already applied, the cursor resumes AFTER
+    /// its replacement block — a later hunk must not re-match text that sits
+    /// inside the earlier block.
+    #[test]
+    fn already_applied_probe_resumes_after_the_previous_hunk() {
+        let dir = TempDir::new().unwrap();
+        let original = "head\nN1\nN2\nR2\ntail\n";
+        std::fs::write(dir.path().join("f.txt"), original).unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![
+                // Search text gone, replacement present at lines 2-3.
+                simple_hunk("gone1", "N1\nN2"),
+                // "N2" only exists INSIDE the previous hunk's replacement.
+                // With the cursor correctly past that block this hunk is also
+                // already applied (its "R2" sits at line 4); a stale cursor
+                // would instead match "N2" and report the patch as half-applied.
+                simple_hunk("N2", "R2"),
+            ],
+        }]);
+        let affected = apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(affected.already_applied, vec!["f.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            original
+        );
+    }
+
+    /// After a hunk matches, the next hunk's search resumes after the matched
+    /// lines — an earlier duplicate of the second search text must be skipped
+    /// rather than reported as ambiguous.
+    #[test]
+    fn hunk_cursor_advances_past_the_matched_lines() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "alpha\nmark\nbeta\ngap\nbeta\ntail\n",
+        )
+        .unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![
+                simple_hunk("mark\nbeta", "MARK\nBETA"),
+                // "beta" also occurs inside hunk 1's match; only the later
+                // occurrence is visible from the advanced cursor.
+                simple_hunk("beta", "BETA2"),
+            ],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "alpha\nMARK\nBETA\ngap\nBETA2\ntail\n"
+        );
+    }
+
+    /// An end-of-file hunk may land before the cursor, so genuine overlap with
+    /// an earlier hunk's replaced range must be detected and rejected.
+    #[test]
+    fn eof_hunk_overlapping_an_earlier_hunk_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![
+                simple_hunk("a\nb", "A\nB"),
+                Hunk {
+                    context_anchors: Vec::new(),
+                    search: "b\nc".to_string(),
+                    replace: "B2\nC2".to_string(),
+                    is_end_of_file: true,
+                    source_line: 2,
+                },
+            ],
+        }]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("Overlapping hunks"),
+            "hunks touching the same line must be rejected, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "a\nb\nc\n",
+            "a rejected patch must not touch the file"
+        );
+    }
+
+    /// Overlap is exclusive at the boundary: a hunk that starts exactly where
+    /// the previous one ends is legal.
+    #[test]
+    fn back_to_back_hunks_do_not_count_as_overlapping() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![
+                simple_hunk("a\nb", "A\nB"),
+                Hunk {
+                    context_anchors: Vec::new(),
+                    search: "c\nd".to_string(),
+                    replace: "C\nD".to_string(),
+                    is_end_of_file: true,
+                    source_line: 2,
+                },
+            ],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "A\nB\nC\nD\n"
+        );
+    }
+
+    /// CRLF wins only a strict majority: a tie stays LF, so an edit never
+    /// introduces carriage returns the file didn't already prefer.
+    #[test]
+    fn line_ending_tie_resolves_to_lf() {
+        assert_eq!(dominant_line_ending("a\r\nb\nc"), "\n");
+        assert_eq!(dominant_line_ending("a\r\nb\r\nc\n"), "\r\n");
+    }
+
+    /// Boundary behavior of the exact-window probe that backs already-applied
+    /// detection.
+    #[test]
+    fn find_exact_window_edge_cases() {
+        let lines: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+        // An empty pattern never matches — otherwise the already-applied
+        // probe would declare any hunk applied on a zero-line window.
+        assert!(find_exact_window(&lines, &[], 0).is_none());
+        // A pattern longer than the file has no window (and must not panic).
+        let long: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(find_exact_window(&lines, &long, 0).is_none());
+        // A pattern exactly as long as the file is still a legal window.
+        assert_eq!(find_exact_window(&lines, &lines, 0), Some(0));
+        // Matches strictly before `start` are invisible.
+        assert!(find_exact_window(&lines, &lines[1..2], 2).is_none());
+    }
+
+    /// A trailing empty line in the search pattern is dropped on retry — and
+    /// the replacement's trailing empty line goes with it, so the rewrite does
+    /// not smuggle in an extra blank line.
+    #[test]
+    fn trailing_empty_search_and_replace_lines_are_dropped_together() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "aaa\nbbb\nccc\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            // lines() yields ["bbb", ""] / ["BBB", ""] — the trailing empties
+            // must be trimmed as a pair for the hunk to land cleanly.
+            hunks: vec![simple_hunk("bbb\n\n", "BBB\n\n")],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "aaa\nBBB\nccc\n"
+        );
+    }
+
+    /// Ambiguity errors list at most five candidates; any overflow is
+    /// summarized — and the summary line appears ONLY when candidates were
+    /// actually elided.
+    #[test]
+    fn ambiguous_candidates_beyond_the_cap_are_summarized() {
+        let dir = TempDir::new().unwrap();
+        let mut content = String::new();
+        for i in 0..7 {
+            content.push_str(&format!("fn f{i}() {{\n    dup();\n}}\n"));
+        }
+        std::fs::write(dir.path().join("many.rs"), &content).unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "many.rs".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("    dup();", "    unique();")],
+        }]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("matched 7 locations") && err.contains("and 2 more"),
+            "7 matches must list 5 candidates and summarize 2, got: {err}"
+        );
+
+        std::fs::write(dir.path().join("two.rs"), "    dup();\ngap\n    dup();\n").unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "two.rs".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("    dup();", "    unique();")],
+        }]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("matched 2 locations") && !err.contains("and 0 more"),
+            "fully-listed candidates must not grow a summary line, got: {err}"
+        );
+    }
+
+    /// Guard boundaries of the whitespace near-miss scan.
+    #[test]
+    fn whitespace_near_miss_guard_boundaries() {
+        let to_lines = |strs: &[&str]| -> Vec<String> {
+            strs.iter().map(ToString::to_string).collect()
+        };
+        // A pattern spanning the whole file is still a valid candidate window.
+        let lines = to_lines(&["fn a() {", "\tx = 1;", "}"]);
+        let pattern = to_lines(&["fn a() {", "    x = 1;", "}"]);
+        assert!(
+            format_whitespace_near_miss(&lines, &pattern).is_some(),
+            "a whole-file window must still be considered"
+        );
+        // A pattern longer than the file has no window (and must not panic).
+        assert!(format_whitespace_near_miss(&lines[..2], &pattern).is_none());
+        // The size cap is exclusive: a file of exactly the cap is scanned.
+        let mut big = vec!["\tx = 1;".to_string()];
+        big.extend((1..100_000).map(|i| format!("filler {i}")));
+        assert_eq!(big.len(), 100_000);
+        let pat = vec!["    x = 1;".to_string()];
+        assert!(
+            format_whitespace_near_miss(&big, &pat).is_some(),
+            "a file of exactly the cap size must still get the near-miss hint"
+        );
+    }
+
+    /// Inner anchors of a stack take the FIRST hit after their parent — that
+    /// tolerance for later duplicates is the whole point of stacking, while
+    /// the outermost anchor keeps its ambiguity handling.
+    #[test]
+    fn inner_anchor_takes_first_match_after_parent_despite_later_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let original = "impl Zed {\n    fn bar() {\n        keep();\n    }\n}\n\
+                        impl Foo {\n    fn bar() {\n        keep();\n    }\n}\n\
+                        impl Baz {\n    fn bar() {\n        other();\n    }\n}\n";
+        std::fs::write(dir.path().join("f.rs"), original).unwrap();
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "f.rs".to_string(),
+            move_to: None,
+            hunks: vec![Hunk {
+                // `fn bar` occurs again in `impl Baz` after Foo; the inner
+                // anchor must take Foo's occurrence, not give up as ambiguous.
+                context_anchors: vec!["impl Foo".to_string(), "fn bar".to_string()],
+                search: "        keep();".to_string(),
+                replace: "        keep();\n        added();".to_string(),
+                is_end_of_file: false,
+                source_line: 1,
+            }],
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("f.rs")).unwrap();
+        assert!(
+            content.contains("impl Foo {\n    fn bar() {\n        keep();\n        added();"),
+            "the edit must land inside impl Foo, got:\n{content}"
+        );
+        assert!(
+            content.contains("impl Zed {\n    fn bar() {\n        keep();\n    }\n}"),
+            "impl Zed must stay untouched, got:\n{content}"
+        );
+    }
 }
