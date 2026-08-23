@@ -262,10 +262,10 @@ pub fn generate_profile(
             // The read deny alone protects the key only while it sits at this
             // path. `mv ~/.ssh/id_rsa /tmp/loot` needs unlink on the *file*,
             // which the read deny does not cover and the rename guards below
-            // do not either — they guard directories. `cat /tmp/loot` is then
-            // an ordinary allowed read. `file-write*` also subsumes
-            // `file-link`, so it closes `ln ~/.ssh/id_rsa /tmp/hard` in the
-            // same stroke — a hardlink needs no unlink at all.
+            // do not either — those pin this directory and its ancestors as
+            // literals, never the files inside it. `cat /tmp/loot` is then an
+            // ordinary allowed read. Denying `file-write*` over the subpath
+            // reaches the children and closes it.
             //
             // Nothing legitimate writes into `~/.ssh`, `~/.aws`, `~/.gnupg`,
             // or `~/.config/gh` from inside a sandbox, so this costs nothing.
@@ -278,6 +278,27 @@ pub fn generate_profile(
     // Deny rules are security-critical — invalid paths are hard errors.
     for path in &policy.deny_read {
         push_subpath_rule(&mut profile, "deny", "file-read*", path)?;
+        // Writes are denied alongside reads, for the same reason the
+        // `SENSITIVE_HOME_PATHS` block above does it. Two things a read-only
+        // deny leaves open, both verified against `sandbox-exec` rather than
+        // assumed:
+        //
+        //   * Confidentiality, when the denied path is a directory. The rename
+        //     guards below pin the declared path and its *ancestors* as
+        //     literals, so nothing stops `mv <denied>/secret /tmp/loot` — the
+        //     child is named by no guard, and `cat /tmp/loot` is then an
+        //     ordinary allowed read. A `file-write*` subpath deny reaches the
+        //     children; the literal guards cannot.
+        //   * Integrity. Read-denied is not write-denied: the sandboxed
+        //     process could still truncate or overwrite the path in place.
+        //
+        // Note the read deny already blocks `link(2)` on the source, so a
+        // hardlink out is not among the holes this closes.
+        //
+        // The cost is that an operator-declared unreadable path also becomes
+        // unwritable. That is the right trade: a path the agent may not read
+        // is not one it has a legitimate reason to write.
+        push_subpath_rule(&mut profile, "deny", "file-write*", path)?;
         protected.push(path.clone());
     }
 
@@ -424,6 +445,122 @@ mod tests {
         let deny = profile
             .find(&format!("(deny file-write* (subpath \"{home}/.ssh\"))"))
             .expect("the sensitive write deny must be present");
+        assert!(
+            deny > allow,
+            "the deny must follow the allow or last-match-wins voids it:\n{profile}"
+        );
+    }
+
+    /// Spec: an operator's `deny_read` entry must deny writes over the whole
+    /// subpath, not only reads. The rename guards deny `file-write-unlink` on
+    /// the declared path and its ancestors as *literals*, which leaves a
+    /// child untouched — so with reads alone denied, `mv <denied>/secret
+    /// /tmp/loot` moves the bytes to a path no rule mentions and `cat` reads
+    /// them back. Only a `subpath` write deny reaches the children.
+    #[test]
+    fn policy_deny_read_paths_deny_writes_not_only_reads() {
+        let policy = SandboxPolicy {
+            deny_read: vec!["/opt/secrets".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        assert!(
+            profile.contains("(deny file-write* (subpath \"/opt/secrets\"))"),
+            "children of a read-denied directory stay renamable without a \
+             subpath write deny:\n{profile}"
+        );
+        // The literal rename guards are why the subpath deny is needed: they
+        // never name `/opt/secrets/token`, only `/opt/secrets` and up.
+        assert!(
+            !profile.contains("(deny file-write-unlink (literal \"/opt/secrets/token\"))"),
+            "guards are expected to stop at the declared path:\n{profile}"
+        );
+    }
+
+    /// Spec, enforced against the real kernel rather than the generated text:
+    /// a `deny_read` directory must not leak its contents by rename, and must
+    /// not be writable in place. String assertions cannot see either — the
+    /// rule this file emits is only as good as what `sandbox-exec` does with
+    /// it, and an earlier revision of this code shipped a justification that
+    /// the kernel disagreed with.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_enforces_the_deny_read_write_deny_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let vault = root.join("vault");
+        let loot = root.join("loot");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::create_dir(&loot).unwrap();
+        let secret = vault.join("secret");
+        std::fs::write(&secret, b"TOPSECRET").unwrap();
+
+        let policy = SandboxPolicy {
+            fs_write: vec![root.to_string_lossy().into_owned()],
+            deny_read: vec![vault.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let profile_path = root.join("p.sb");
+        std::fs::write(&profile_path, &profile).unwrap();
+
+        let run = |script: &str| {
+            std::process::Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile_path)
+                .args(["/bin/sh", "-c", script])
+                .output()
+                .expect("sandbox-exec must be present on macOS")
+        };
+
+        // Exfiltration by moving a child out of the read-denied directory.
+        let mv = run(&format!(
+            "mv {} {}",
+            secret.display(),
+            loot.join("stolen").display()
+        ));
+        assert!(
+            !mv.status.success(),
+            "a child of a read-denied dir was renamed out: {}",
+            String::from_utf8_lossy(&mv.stderr)
+        );
+        assert!(!loot.join("stolen").exists(), "the bytes escaped the deny");
+
+        // Integrity: the path must not be overwritable in place either.
+        let clobber = run(&format!("echo WIPED > {}", secret.display()));
+        assert!(
+            !clobber.status.success(),
+            "a read-denied path was overwritten: {}",
+            String::from_utf8_lossy(&clobber.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"TOPSECRET",
+            "the protected file was modified from inside the sandbox"
+        );
+    }
+
+    /// Spec: last-match-wins. Seatbelt applies the final matching rule, so the
+    /// `deny_read` write deny is worth nothing unless it is emitted after the
+    /// policy's own `fs_write` allows — a workspace that contains a
+    /// `deny_read` path is the case that matters.
+    #[test]
+    fn the_deny_read_write_deny_outranks_a_broad_write_allow() {
+        let policy = SandboxPolicy {
+            fs_write: vec!["/opt/work".to_string()],
+            deny_read: vec!["/opt/work/.secret".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let allow = profile
+            .find("(allow file-write* (subpath \"/opt/work\"))")
+            .expect("the workspace write allow must be present");
+        let deny = profile
+            .find("(deny file-write* (subpath \"/opt/work/.secret\"))")
+            .expect("the deny_read write deny must be present");
         assert!(
             deny > allow,
             "the deny must follow the allow or last-match-wins voids it:\n{profile}"
