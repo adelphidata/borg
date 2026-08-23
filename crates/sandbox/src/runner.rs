@@ -444,6 +444,152 @@ mod tests {
     }
 
     #[test]
+    fn into_result_string_reports_exit_code_and_prefers_stderr() {
+        // Spec: success passes stdout through verbatim; failure folds the exit
+        // code and the most useful stream into one message — stderr when the
+        // process wrote any, stdout otherwise, and -1 stands in for a
+        // signal-terminated process with no exit code at all.
+        let cases: &[(Option<i32>, &str, &str, bool, &str)] = &[
+            (Some(0), "tool output", "ignored warning", true, "tool output"),
+            (Some(3), "partial out", "boom", false, "Error (exit 3): boom"),
+            (Some(7), "only stdout", "", false, "Error (exit 7): only stdout"),
+            (None, "", "killed", false, "Error (exit -1): killed"),
+        ];
+        for (exit_code, stdout, stderr, want_ok, want_text) in cases.iter().copied() {
+            let output = ScriptOutput {
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+                exit_code,
+            };
+            assert_eq!(
+                output.into_result_string(),
+                (want_ok, want_text.to_string()),
+                "exit_code={exit_code:?} stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_sandboxed_script_returns_the_real_success_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok_script = dir.path().join("ok.sh");
+        std::fs::write(&ok_script, "#!/bin/bash\necho 'marker42'\n").unwrap();
+        let fail_script = dir.path().join("fail.sh");
+        std::fs::write(&fail_script, "#!/bin/bash\necho 'boom' >&2\nexit 7\n").unwrap();
+
+        let (ok, text) = run_sandboxed_script(
+            "bash",
+            &ok_script,
+            dir.path(),
+            SandboxPolicy::default(),
+            5000,
+            &[],
+            "ok-test",
+            "{}",
+        )
+        .await
+        .unwrap();
+        assert!(ok, "a zero-exit script must report success: {text}");
+        assert_eq!(text.trim(), "marker42");
+
+        let (ok, text) = run_sandboxed_script(
+            "bash",
+            &fail_script,
+            dir.path(),
+            SandboxPolicy::default(),
+            5000,
+            &[],
+            "fail-test",
+            "{}",
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "a non-zero script must report failure: {text}");
+        assert!(
+            text.contains("Error (exit 7)") && text.contains("boom"),
+            "failure text must carry the exit code and stderr: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_script_path_returns_the_canonical_path_for_an_existing_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tool.sh");
+        std::fs::write(&script, "#!/bin/bash\n").unwrap();
+        let validated = validate_script_path(dir.path(), "tool.sh").unwrap();
+        assert_eq!(
+            validated,
+            dir.path().canonicalize().unwrap().join("tool.sh"),
+            "an in-base script must come back canonicalized, not defaulted"
+        );
+    }
+
+    #[test]
+    fn validate_script_path_allows_a_not_yet_created_script_but_not_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        // The caller writes the file at this exact path right after, so the
+        // joined (un-canonicalized) path must come back as-is.
+        let validated = validate_script_path(dir.path(), "new.sh").unwrap();
+        assert_eq!(validated, dir.path().join("new.sh"));
+
+        let err = validate_script_path(dir.path(), "../evil.sh").unwrap_err();
+        assert!(
+            err.to_string().contains("path traversal"),
+            "a dot-dot name must be rejected: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_script_path_rejects_a_symlink_that_escapes_the_base_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let outside = tmp.path().join("outside.sh");
+        std::fs::write(&outside, "#!/bin/bash\n").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("evil.sh")).unwrap();
+
+        let err = validate_script_path(&base, "evil.sh").unwrap_err();
+        assert!(
+            err.to_string().contains("escapes base directory"),
+            "a symlink out of the base dir must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_forwards_the_minimal_safe_env_after_clearing() {
+        // Spec: `env_clear()` strips everything, and the SAFE_ENV_VARS
+        // allowlist restores the handful a runtime genuinely needs. Without
+        // the restore, the child would see an empty PATH and HOME.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("safe_env.sh");
+        std::fs::write(&script, "#!/bin/bash\necho \"P=$PATH\"\necho \"H=$HOME\"\n").unwrap();
+        let runner = ScriptRunner {
+            runtime: "bash",
+            script_path: &script,
+            work_dir: dir.path(),
+            sandbox_policy: SandboxPolicy::default(),
+            timeout_ms: 5000,
+            extra_env: &[],
+            name: "safe-env-test",
+        };
+        let output = runner.run("{}").await.unwrap();
+        assert!(output.success(), "script failed: {}", output.stderr);
+        let parent_path = std::env::var("PATH").expect("test env has PATH");
+        assert!(
+            output.stdout.contains(&format!("P={parent_path}")),
+            "PATH must be forwarded into the child: {}",
+            output.stdout
+        );
+        let parent_home = std::env::var("HOME").expect("test env has HOME");
+        assert!(
+            output.stdout.contains(&format!("H={parent_home}")),
+            "HOME must be forwarded into the child: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
     fn resolve_bash_returns_absolute_path() {
         let (program, args) = resolve_runtime("bash", Path::new("/tmp")).unwrap();
         assert!(
@@ -754,6 +900,59 @@ mod tests {
         assert!(output.stdout.contains("line2"));
         assert!(output.stdout.contains("line3"));
         assert!(lines.iter().any(|(l, s)| l == "line1" && !s));
+    }
+
+    #[tokio::test]
+    async fn run_streaming_bounds_the_callback_but_captures_multi_megabyte_output() {
+        // Spec: live streaming to the callback stops at 120KB to bound UI/log
+        // volume, while the captured buffer keeps everything up to the 10MB
+        // cap — so a ~2.6MB stream must arrive complete and untruncated.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("big.sh");
+        const LINE_LEN: usize = 64 * 1024;
+        const LINES: usize = 40;
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nline=$(head -c {LINE_LEN} /dev/zero | tr '\\0' x)\n\
+                 for i in $(seq 1 {LINES}); do echo \"$line\"; done\n"
+            ),
+        )
+        .unwrap();
+        let mut callback_lines = 0usize;
+        let runner = ScriptRunner {
+            runtime: "bash",
+            script_path: &script,
+            work_dir: dir.path(),
+            sandbox_policy: SandboxPolicy::default(),
+            timeout_ms: 30_000,
+            extra_env: &[],
+            name: "big-output-test",
+        };
+        let output = runner
+            .run_streaming("{}", |line, _is_stderr| {
+                assert_eq!(line.len(), LINE_LEN);
+                callback_lines += 1;
+            })
+            .await
+            .unwrap();
+        assert!(output.success(), "script failed: {}", output.stderr);
+        // 64KB lines against the 120KB callback budget: the first two lines
+        // stream (0 and 64KB are under the limit), the third does not.
+        assert_eq!(
+            callback_lines, 2,
+            "the callback budget must be 120KB — enough for exactly two 64KB lines"
+        );
+        // The full stream stays captured: 40 lines of 64KB plus a newline each.
+        assert_eq!(
+            output.stdout.len(),
+            LINES * (LINE_LEN + 1),
+            "the capture cap is 10MB, so ~2.6MB must survive untruncated"
+        );
+        assert!(
+            !output.stdout.contains("[output truncated"),
+            "no truncation note may appear below the 10MB cap"
+        );
     }
 
     #[tokio::test]

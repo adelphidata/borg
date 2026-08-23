@@ -523,6 +523,88 @@ impl SandboxPolicy {
 }
 
 #[cfg(test)]
+mod sandbox_command_tests {
+    use super::*;
+
+    /// Spec: `passthrough` is the audited "run this outside the sandbox"
+    /// escape hatch. It must run exactly the command it was handed — an empty
+    /// or altered program here would break every unsandboxed platform path.
+    #[test]
+    fn passthrough_runs_exactly_the_requested_command() {
+        let args = vec!["-c".to_string(), "print(1)".to_string()];
+        let cmd = SandboxCommand::passthrough("python3", &args);
+        assert_eq!(cmd.program, "python3");
+        assert_eq!(cmd.args, args);
+        assert!(
+            cmd._resources.is_none(),
+            "a passthrough holds no OS resources"
+        );
+    }
+
+    /// Spec: the hand-written `Debug` exists so wrapped commands are auditable
+    /// in logs. It must show the program and args it will execute.
+    #[test]
+    fn debug_output_names_the_program_and_args() {
+        let cmd = SandboxCommand::passthrough("python3", &["run.py".to_string()]);
+        let rendered = format!("{cmd:?}");
+        assert!(
+            rendered.contains("python3") && rendered.contains("run.py"),
+            "Debug must expose the command for audit logs: {rendered}"
+        );
+    }
+
+    /// Spec: `Clone` is hand-written because `_resources` is a type-erased
+    /// drop guard — a clone must run the same command *and* share the same
+    /// guard, so the OS handle stays open until the last copy drops.
+    #[test]
+    fn clone_preserves_the_command_and_shares_the_resource_guard() {
+        let guard: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(7u8);
+        let cmd = SandboxCommand {
+            program: "tool".to_string(),
+            args: vec!["arg".to_string()],
+            _resources: Some(guard.clone()),
+        };
+        let cloned = cmd.clone();
+        assert_eq!(cloned.program, "tool");
+        assert_eq!(cloned.args, vec!["arg".to_string()]);
+        let held = cloned
+            ._resources
+            .as_ref()
+            .expect("the clone must keep the resource guard alive");
+        assert!(
+            std::sync::Arc::ptr_eq(held, &guard),
+            "clones must share one guard, not invent a new one"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+
+    /// Spec: the Windows refusal stub must actually refuse — report the
+    /// failure on stderr and exit non-zero via `cmd.exe`, never a runnable
+    /// (or empty) command.
+    #[test]
+    fn the_windows_refusal_stub_reports_and_exits_nonzero() {
+        let cmd = fail_closed_windows("setup context", "the detail");
+        assert_eq!(cmd.program, "cmd.exe");
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a.contains("Borg sandbox setup failed: setup context: the detail")),
+            "the refusal must explain itself: {:?}",
+            cmd.args
+        );
+        assert!(
+            cmd.args.iter().any(|a| a.contains("exit 1")),
+            "the stub must exit non-zero: {:?}",
+            cmd.args
+        );
+    }
+}
+
+#[cfg(test)]
 mod blocked_path_tests {
     use super::*;
 
@@ -564,6 +646,17 @@ mod blocked_path_tests {
                 "{path} must not be blocked — the rule is not a substring match"
             );
         }
+    }
+
+    /// Boundary of the dotted-family rule: the suffix after the dot must be
+    /// non-empty. `.env.local` is a family member; a bare trailing dot
+    /// (`.env.`) is not — the rule is "entry plus a real extension", so the
+    /// empty-extension edge stays on the unblocked side with `.env_backup`.
+    #[test]
+    fn a_trailing_dot_with_no_extension_is_not_a_family_member() {
+        assert!(component_matches_family(".env.local", ".env"));
+        assert!(!component_matches_family(".env.", ".env"));
+        assert!(!component_matches_family("credentials.", "credentials"));
     }
 
     #[test]
@@ -1137,6 +1230,31 @@ mod tests {
             result.deny_read.iter().any(|p| p.starts_with(&*home_str)),
             "deny_read tildes should be expanded"
         );
+    }
+
+    /// Spec: the Windows wrapper is only reachable through the runtime
+    /// `cfg!(target_os = "windows")` dispatch, and its non-Windows trampoline
+    /// stub panics by contract. On any other host it must never fabricate a
+    /// command (empty or otherwise) that a caller could go on to spawn.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    #[should_panic(expected = "Windows-only")]
+    fn wrap_windows_off_windows_panics_rather_than_fabricating_a_command() {
+        let policy = SandboxPolicy::default();
+        let args = vec!["script.py".to_string()];
+        policy.wrap_windows("python3", &args, std::path::Path::new("/tmp/tool"));
+    }
+
+    /// Spec: on a non-Linux host the bubblewrap wrapper degrades to running
+    /// the command directly — never an empty command that would spawn nothing.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn wrap_bubblewrap_off_linux_degrades_to_passthrough() {
+        let policy = SandboxPolicy::default();
+        let args = vec!["arg1".to_string(), "arg2".to_string()];
+        let cmd = policy.wrap_bubblewrap("node", &args, std::path::Path::new("/tmp/tool"));
+        assert_eq!(cmd.program, "node");
+        assert_eq!(cmd.args, args);
     }
 
     #[cfg(target_os = "windows")]

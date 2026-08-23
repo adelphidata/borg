@@ -7480,6 +7480,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "which 7.0.3",
  "windows-sys 0.59.0",
 ]

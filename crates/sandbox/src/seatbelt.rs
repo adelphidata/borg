@@ -1079,6 +1079,70 @@ mod tests {
         assert!(profile.contains("(allow process-exec (literal \"/python3\"))"));
     }
 
+    /// Spec: when the runtime binary is reached through a symlink, the profile
+    /// must also allow the *resolved* binary and its directory — the kernel
+    /// checks the path the loader actually execs, and pyenv shims / Homebrew
+    /// links are exactly this shape.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_runtime_emits_resolved_exec_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        let link_dir = tmp.path().join("shims");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let real_bin = real_dir.join("runtime");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let link = link_dir.join("runtime");
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        let link_str = link.to_string_lossy().into_owned();
+        let canonical = link.canonicalize().unwrap();
+        let canon_str = canonical.to_string_lossy().into_owned();
+        assert_ne!(canon_str, link_str, "the fixture must be a real symlink");
+
+        let profile =
+            generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), &link_str).unwrap();
+        assert!(
+            profile.contains(&format!("(allow process-exec (literal \"{canon_str}\"))")),
+            "the resolved binary must be executable:\n{profile}"
+        );
+        let canon_parent = canonical.parent().unwrap().to_string_lossy();
+        assert!(
+            profile.contains(&format!("(allow process-exec (subpath \"{canon_parent}\"))")),
+            "the resolved binary's directory must be executable:\n{profile}"
+        );
+    }
+
+    /// Spec: a canonical parent directory that cannot be expressed in a
+    /// Seatbelt profile (non-ASCII here) must be skipped, never emitted — an
+    /// unvalidated path in an allow rule is exactly the injection surface
+    /// `validate_seatbelt_path` exists to close.
+    #[cfg(unix)]
+    #[test]
+    fn unexpressible_canonical_parent_gets_no_exec_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let odd_dir = tmp.path().join("tëst-bin");
+        let link_dir = tmp.path().join("shims");
+        std::fs::create_dir(&odd_dir).unwrap();
+        std::fs::create_dir(&link_dir).unwrap();
+        let real_bin = odd_dir.join("runtime");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let link = link_dir.join("runtime");
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            &link.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(
+            !profile.contains("tëst-bin"),
+            "a non-ASCII canonical parent must never reach the profile:\n{profile}"
+        );
+    }
+
     #[test]
     fn rejects_relative_runtime_binary() {
         let result = generate_profile(&default_policy(), Path::new(TEST_TOOL_DIR), "python3");

@@ -281,6 +281,21 @@ mod tests {
         );
     }
 
+    /// A `bwrap:` line naming the network must classify as a *network*
+    /// denial even when it also carries a filesystem-denial marker — the
+    /// network check has to win, not fall through to `bwrap-mount`.
+    #[test]
+    fn a_bwrap_network_denial_classifies_as_network() {
+        let violation = classify(
+            SandboxBackend::Bubblewrap,
+            Some(1),
+            "bwrap: setting up the network: Permission denied",
+        )
+        .expect("classifies");
+        assert_eq!(violation.reason, "bwrap-network");
+        assert_eq!(violation.kind, ViolationKind::Network);
+    }
+
     /// bwrap prefixes every startup failure, not just denials. A missing
     /// binary is the common one and must not be recorded as a denial.
     #[test]
@@ -356,6 +371,19 @@ mod tests {
         );
         assert!(violation.snippet.ends_with('…'));
         assert!(!violation.snippet.contains('\u{fffd}'));
+    }
+
+    /// The bound must keep the first `MAX_SNIPPET_BYTES` of evidence, not
+    /// merely stay under the cap — a snippet trimmed to nothing would satisfy
+    /// a length check while carrying no evidence at all.
+    #[test]
+    fn an_over_long_ascii_snippet_keeps_the_full_budget_of_evidence() {
+        let stderr = "a".repeat(MAX_SNIPPET_BYTES + 100);
+        assert_eq!(
+            bound_snippet(&stderr),
+            format!("{}…", "a".repeat(MAX_SNIPPET_BYTES)),
+            "an ASCII overflow must be cut at exactly the cap"
+        );
     }
 
     #[test]

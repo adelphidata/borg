@@ -252,6 +252,40 @@ mod tests {
         SandboxPolicy::default()
     }
 
+    /// Spec: detection actually runs the `bwrap` binary found on `PATH` and
+    /// parses its `--version` output — it must not be hardwired to `None`
+    /// (which would silently disable every version-gated hardening flag).
+    #[cfg(unix)]
+    #[test]
+    fn detect_bwrap_version_reads_the_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("bwrap");
+        std::fs::write(&fake, "#!/bin/sh\necho 'bubblewrap 0.7.3'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: prepend-only PATH change, restored below; every other lookup
+        // in the test binary still resolves through the untouched tail.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+        }
+        let detected = detect_bwrap_version();
+        // SAFETY: restore before asserting so a failure cannot leak the fake.
+        unsafe {
+            std::env::set_var("PATH", &old_path);
+        }
+
+        assert_eq!(
+            detected,
+            Some(BwrapVersion {
+                major: 0,
+                minor: 7,
+                patch: 3
+            })
+        );
+    }
+
     #[test]
     fn includes_tool_dir_ro_bind() {
         // The tool dir must exist on disk: bwrap rejects a bind whose source is

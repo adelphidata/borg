@@ -32,6 +32,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Log-capture assertions in `process_group` tests: the group-signalling
+# contract distinguishes its error paths only by what it logs.
+tracing-subscriber = { workspace = true }
 
 # The Windows FFI smoke test (`tests/windows_ffi_smoke.rs`) constructs a
 # real anonymous pipe directly to round-trip the runner protocol over

@@ -137,6 +137,122 @@ mod imp {
         use super::*;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+
+        /// Run `f` with a subscriber that captures everything at DEBUG and
+        /// above, returning the rendered log text. The signalling contract is
+        /// best-effort by design, so *what it logs* is the observable spec
+        /// for its error paths.
+        fn capture_logs(f: impl FnOnce()) -> String {
+            #[derive(Clone)]
+            struct Buf(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("log buffer poisoned").extend_from_slice(data);
+                    Ok(data.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+                type Writer = Buf;
+                fn make_writer(&'a self) -> Buf {
+                    self.clone()
+                }
+            }
+            let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(buf.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+            let bytes = buf.0.lock().expect("log buffer poisoned");
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        /// A child leading its own process group, for signalling tests.
+        fn spawn_group_leader() -> std::process::Child {
+            Command::new("sleep")
+                .arg("30")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn sleep")
+        }
+
+        /// Spec: a `killpg` failure that is neither ESRCH (group already
+        /// gone) nor EPERM (fall back per-member) must be *warned about and
+        /// stopped at* — not silently swallowed (the leak this module exists
+        /// to close) and not misrouted into the EPERM member walk.
+        ///
+        /// An out-of-range signal number gives a deterministic EINVAL.
+        #[test]
+        fn an_unexpected_killpg_failure_is_warned_not_swallowed() {
+            let mut child = spawn_group_leader();
+            let pgid = child.id() as i32;
+            // Not a valid signal on any unix; killpg fails with EINVAL.
+            const BAD_SIGNAL: i32 = 999;
+
+            let logs = capture_logs(|| signal_group_or_members(pgid, BAD_SIGNAL));
+            assert!(
+                logs.contains("killpg failed"),
+                "an EINVAL from killpg must be surfaced as a warning: {logs:?}"
+            );
+            assert!(
+                !logs.contains("signalling group members individually"),
+                "EINVAL must not be treated as the EPERM fallback case: {logs:?}"
+            );
+
+            signal_group_or_members(pgid, libc::SIGKILL);
+            child.wait().expect("wait");
+        }
+
+        /// Spec: a successful group kill needs no fallback and no complaint —
+        /// the happy path is silent, and the child is actually dead.
+        #[test]
+        fn a_successful_group_kill_is_silent() {
+            let mut child = spawn_group_leader();
+            let pgid = child.id() as i32;
+
+            let logs = capture_logs(|| signal_group_or_members(pgid, libc::SIGKILL));
+            assert!(
+                !logs.contains("killpg failed") && !logs.contains("EPERM"),
+                "a successful killpg must not log a failure: {logs:?}"
+            );
+
+            let status = child.wait().expect("wait");
+            assert!(!status.success(), "the child must have been killed");
+        }
+
+        /// Spec: the member-walk fallback is only as good as its process
+        /// enumeration. The table must span old (launchd, pid 1), current
+        /// (this test runner) and brand-new (a just-spawned child) processes;
+        /// a truncated or padded list would let group members escape the
+        /// EPERM fallback or signal garbage PIDs.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn all_pids_spans_the_whole_process_table() {
+            let mut child = spawn_group_leader();
+            let child_pid = child.id() as i32;
+
+            let pids = all_pids();
+            for (pid, what) in [
+                (1, "launchd"),
+                (std::process::id() as i32, "the test runner"),
+                (child_pid, "a freshly spawned child"),
+            ] {
+                assert!(
+                    pids.contains(&pid),
+                    "{what} (pid {pid}) missing from the {} listed pids",
+                    pids.len()
+                );
+            }
+
+            signal_group_or_members(child_pid, libc::SIGKILL);
+            child.wait().expect("wait");
+        }
 
         /// Spec: signalling group 0 would hit the *caller's* own process group
         /// and kill borg itself. A cleanup helper must refuse it outright.
