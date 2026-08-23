@@ -930,154 +930,18 @@ impl HistoryCell {
         _throbber_state: Option<&ThrobberState>,
     ) -> Vec<Line<'static>> {
         match self {
-            HistoryCell::User { text } => {
-                // User messages render as a flat filled block, not an outlined
-                // bubble. Every rendered row owns the full viewport width.
-                let bg = theme::user_message_style();
-                let prefix_style =
-                    bg.add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM);
-                let mention_style = bg.patch(theme::file_mention_style());
-                let w = width as usize;
-                let inset = 0usize;
-                let wrap_width = w.saturating_sub(2).max(1);
-                let mut lines = Vec::new();
-                if w > 0 {
-                    lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
-                }
-                // Sanitize at render so raw CSI sequences in pasted or
-                // replayed history never reach native scrollback. Done here
-                // (not on the stored value) so the transcript stays faithful.
-                let text = sanitize_user_text(text);
-                let mut first = true;
-                for line in text.lines() {
-                    let wrapped = if line.is_empty() {
-                        vec![std::borrow::Cow::Borrowed("")]
-                    } else {
-                        super::wrapping::wrap(line, wrap_width)
-                    };
-                    for wl in wrapped.iter() {
-                        let prefix = if first {
-                            first = false;
-                            Span::styled(format!("{} ", theme::CHEVRON), prefix_style)
-                        } else {
-                            Span::styled("  ", bg)
-                        };
-                        let spans = parse_at_mentions(wl.as_ref(), bg, mention_style);
-                        let mut row: Vec<Span<'static>> = Vec::new();
-                        if inset > 0 {
-                            row.push(Span::styled(" ".repeat(inset), bg));
-                        }
-                        row.push(prefix);
-                        row.extend(spans);
-                        let used_width: usize = row
-                            .iter()
-                            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                            .sum();
-                        let pad = w.saturating_sub(used_width);
-                        if pad > 0 {
-                            row.push(Span::styled(" ".repeat(pad), bg));
-                        }
-                        lines.push(Line::from(row).style(bg));
-                    }
-                }
-                if w > 0 {
-                    lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
-                }
-                lines
-            }
+            HistoryCell::User { text } => render_user_message(text, width),
             HistoryCell::Assistant {
                 text,
                 streaming,
                 cache,
-            } => {
-                // Output-redaction chokepoint for the TUI transcript.
-                // Assistant text is stripped of detected secrets before it
-                // enters markdown rendering, so a shared-screen viewer
-                // never sees a raw API key the agent legitimately read
-                // from disk. Clean text takes a zero-allocation fast path
-                // (Cow::Borrowed). User-input cells are intentionally not
-                // redacted — the user sees their own input verbatim.
-                let redacted;
-                let text: &str = match current_policy().apply(OutputSink::Tui, None, text) {
-                    std::borrow::Cow::Borrowed(b) => b,
-                    std::borrow::Cow::Owned(o) => {
-                        redacted = o;
-                        &redacted
-                    }
-                };
-                let visible_text = strip_reply_directive_prefix(text);
-                let inner_width = width.saturating_sub(LIVE_PREFIX_COLS as u16);
-                let commit_end = visible_text
-                    .as_bytes()
-                    .iter()
-                    .rposition(|&b| b == b'\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-
-                let mut cache = cache.borrow_mut();
-                let cache_hit = cache.cached_width == Some(inner_width)
-                    && cache.committed_byte_len == commit_end;
-                if !cache_hit {
-                    cache.committed_lines = if commit_end == 0 {
-                        Vec::new()
-                    } else {
-                        markdown::render_markdown(&visible_text[..commit_end], inner_width)
-                    };
-                    cache.committed_byte_len = commit_end;
-                    cache.cached_width = Some(inner_width);
-                }
-                let pending_lines = if commit_end < visible_text.len() {
-                    markdown::render_markdown(&visible_text[commit_end..], inner_width)
-                } else {
-                    Vec::new()
-                };
-
-                let prefix_span = Span::styled(format!("{} ", theme::BULLET), theme::dim());
-                let all: Vec<Line<'static>> = cache
-                    .committed_lines
-                    .iter()
-                    .cloned()
-                    .chain(pending_lines)
-                    .collect();
-                let lines = if visible_text.is_empty() {
-                    vec![]
-                } else if all.is_empty() {
-                    vec![Line::from(prefix_span)]
-                } else {
-                    prefix_lines(all, prefix_span, Span::raw("  "))
-                };
-                if *streaming {
-                    lines
-                } else {
-                    collapse_long_lines(lines)
-                }
-            }
+            } => render_assistant_message(text, *streaming, cache, width),
             HistoryCell::ToolStart {
                 name,
                 args,
                 completed,
                 ..
-            } => {
-                let cat = super::tool_display::classify_tool(name, args);
-                let bullet_style = if *completed {
-                    theme::tool_bullet_done()
-                } else {
-                    theme::tool_bullet_active()
-                };
-                let mut header_spans =
-                    vec![Span::styled(format!("{} ", theme::BULLET), bullet_style)];
-                header_spans.extend(super::tool_display::tool_header_spans(&cat));
-                let mut lines = vec![Line::from(header_spans)];
-                if let Some(detail_spans) = super::tool_display::tool_detail_line(&cat) {
-                    let mut spans = vec![Span::styled(
-                        format!("  {} ", theme::TREE_END),
-                        theme::dim(),
-                    )];
-                    spans.extend(detail_spans);
-                    lines.push(Line::from(spans));
-                }
-                lines
-            }
+            } => render_tool_start(name, args, *completed),
             HistoryCell::ToolResult {
                 output,
                 is_error,
@@ -1087,214 +951,22 @@ impl HistoryCell {
                 args_json,
                 collapsed,
             } => {
-                // Output-redaction chokepoint for tool result text. A
-                // `run_shell` that cats `~/.aws/credentials` or
-                // `read_file` on `.env` would otherwise echo the raw
-                // value into the transcript. Apply once at the top so
-                // every downstream render path (shell formatter, diff
-                // formatter, generic body) sees the redacted form.
-                let redacted_output;
-                let output: &str = match current_policy().apply(OutputSink::Tui, None, output) {
-                    std::borrow::Cow::Borrowed(b) => b,
-                    std::borrow::Cow::Owned(o) => {
-                        redacted_output = o;
-                        &redacted_output
-                    }
-                };
-                let mut lines: Vec<Line<'static>> = Vec::new();
-
-                // Contextual: apply_patch renders the raw patch as a colored diff
-                // instead of the plain success-text output. Only on success —
-                // errors show the usual dim preview so the error text is visible.
-                // run_shell uses a compact two-line layout: separate
-                // └ Exit code row, per-stream `--- stdout/stderr ---`
-                // sections (omitted when empty), capped preview per
-                // stream. Falls through to the generic body path if
-                // the envelope can't be parsed.
-                if !*is_error && tool_name == "run_shell" {
-                    if let Some(parsed) = parse_shell_output(output) {
-                        return render_shell_result(
-                            parsed,
-                            display_label,
-                            *duration_ms,
-                            *collapsed,
-                            width,
-                        );
-                    }
-                }
-
-                let rendered_body = if !*is_error
-                    && tool_name == "apply_patch"
-                    && args_json.is_some()
-                {
-                    args_json
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                        .and_then(|v| v.get("patch").and_then(|p| p.as_str()).map(str::to_string))
-                        .map(|patch| {
-                            // Reserve room for the cell's left bullet/indent
-                            // (~6 cols) so wrapped diff rows don't overrun.
-                            let inner = (width as usize).saturating_sub(6).max(20);
-                            diff_render::render_patch_wrapped(&patch, inner)
-                        })
-                } else {
-                    None
-                };
-
-                let (body_lines, body_style) = match rendered_body {
-                    Some(diff_lines) => (diff_lines, theme::dim()),
-                    None => {
-                        let style = if *is_error {
-                            theme::error_style()
-                        } else {
-                            theme::dim()
-                        };
-                        let hard_cap = body_hard_cap(width);
-                        // If the full output is pretty-printed JSON, collapse to a
-                        // compact form first so `textwrap` has `: ` / `, ` break
-                        // points and doesn't have to hard-split inside objects.
-                        let owned;
-                        let source: &str = if !*is_error {
-                            if let Some(compact) = line_utils::format_json_compact(output) {
-                                owned = compact;
-                                &owned
-                            } else {
-                                output
-                            }
-                        } else {
-                            output
-                        };
-                        let raw_lines: Vec<Line<'static>> = source
-                            .lines()
-                            .map(|l| {
-                                let parsed = parse_ansi_line(l, style);
-                                line_utils::truncate_line_with_ellipsis(parsed, hard_cap)
-                            })
-                            .collect();
-                        (raw_lines, style)
-                    }
-                };
-
-                // Errors render boxed so failures stand out from successful
-                // tool calls. Skip the tree-end body prefix path entirely;
-                // the `✗ display_label` status line below the box keeps the
-                // visual link to the tool call.
                 if *is_error {
-                    let boxed = render_boxed_lines(
-                        body_lines,
-                        theme::error_style(),
-                        Some(" error "),
+                    render_tool_result_error(output, display_label, *duration_ms, width)
+                } else {
+                    render_tool_result_ok(
+                        output,
+                        display_label,
+                        *duration_ms,
+                        tool_name,
+                        args_json.as_deref(),
+                        *collapsed,
                         width,
-                        2,
-                    );
-                    lines.extend(boxed);
-                    let (indicator, ind_style) = (theme::CROSS, theme::cross_style());
-                    let duration_str = match duration_ms {
-                        Some(ms) => {
-                            let secs_f = *ms as f64 / 1000.0;
-                            format!(" • {secs_f:.1}s")
-                        }
-                        None => String::new(),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {indicator} "), ind_style),
-                        Span::styled(format!("{display_label}{duration_str}"), theme::dim()),
-                    ]));
-                    return lines;
+                    )
                 }
-
-                // Row-aware collapse: measure each logical line's post-wrap row
-                // cost so one stray long URL can't burst past the preview.
-                let content_width = (width as usize).saturating_sub(4).max(1);
-                let row_cost = |line: &Line<'_>| -> usize {
-                    let w = line_utils::line_width(line);
-                    if w == 0 {
-                        1
-                    } else {
-                        w.div_ceil(content_width)
-                    }
-                };
-                let total_rows: usize = body_lines.iter().map(&row_cost).sum();
-                let should_collapse = *collapsed && total_rows > COLLAPSE_THRESHOLD;
-
-                let (taken, rows_used) = if should_collapse {
-                    let mut used = 0usize;
-                    let mut n = 0usize;
-                    for line in body_lines.iter() {
-                        let cost = row_cost(line);
-                        if used + cost > COLLAPSE_PREVIEW_LINES && n > 0 {
-                            break;
-                        }
-                        used += cost;
-                        n += 1;
-                        if used >= COLLAPSE_PREVIEW_LINES {
-                            break;
-                        }
-                    }
-                    (n, used)
-                } else {
-                    (body_lines.len(), total_rows)
-                };
-
-                for (i, line) in body_lines.into_iter().take(taken).enumerate() {
-                    let prefix = if i == 0 {
-                        format!("  {} ", theme::TREE_END)
-                    } else {
-                        "    ".to_string()
-                    };
-                    let mut spans = vec![Span::styled(prefix, body_style)];
-                    spans.extend(line.spans);
-                    lines.push(Line::from(spans));
-                }
-
-                if should_collapse {
-                    let extra = total_rows.saturating_sub(rows_used);
-                    lines.push(Line::from(Span::styled(
-                        collapse_footer(extra),
-                        theme::dim(),
-                    )));
-                }
-
-                // Status line with check/cross and duration
-                let (indicator, ind_style) = if *is_error {
-                    (theme::CROSS, theme::cross_style())
-                } else {
-                    (theme::CHECK, theme::check_style())
-                };
-                let duration_str = match duration_ms {
-                    Some(ms) => {
-                        let secs_f = *ms as f64 / 1000.0;
-                        format!(" • {secs_f:.1}s")
-                    }
-                    None => String::new(),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {indicator} "), ind_style),
-                    Span::styled(format!("{display_label}{duration_str}"), theme::dim()),
-                ]));
-                lines
             }
             HistoryCell::ShellApproval { command, status } => {
-                let status_text = match status {
-                    ApprovalStatus::Pending => "[y/N]",
-                    ApprovalStatus::Approved => "[approved]",
-                    ApprovalStatus::Denied => "[denied]",
-                };
-                let status_style = match status {
-                    ApprovalStatus::Pending => theme::error_style(),
-                    ApprovalStatus::Approved => theme::success_style(),
-                    ApprovalStatus::Denied => theme::dim(),
-                };
-                vec![
-                    Line::from(vec![
-                        Span::styled("  [run_shell] ", theme::error_style()),
-                        Span::styled(command.clone(), theme::error_style()),
-                    ]),
-                    Line::from(vec![
-                        Span::raw("  Allow? "),
-                        Span::styled(status_text.to_string(), status_style),
-                    ]),
-                ]
+                render_shell_approval(command, status)
             }
             HistoryCell::Heartbeat { text } => {
                 let mut spans = vec![Span::styled("[heartbeat] ", theme::code_style())];
@@ -1304,143 +976,526 @@ impl HistoryCell {
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
             HistoryCell::Card { lines } => lines.clone(),
             HistoryCell::DoctorWarning { warnings } => build_doctor_warning_lines(warnings, width),
-            HistoryCell::Thinking { text } => {
-                // reasoning: dim + italic bullet block, no box.
-                // Header line: "• thinking" (dim, italic) — bullet matches assistant
-                // bullet width so wrapped continuation lines hang under the body.
-                if text.is_empty() {
-                    return vec![];
-                }
-                let content_style = theme::reasoning_style();
-                let bullet = Span::styled(format!("{} ", theme::BULLET), theme::dim());
-                let header = Line::from(vec![
-                    bullet.clone(),
-                    Span::styled("thinking", content_style),
-                ]);
-                let inner_w = (width as usize).saturating_sub(LIVE_PREFIX_COLS).max(1);
-                let mut body: Vec<Line<'static>> = Vec::new();
-                for line in text.lines() {
-                    if line.is_empty() {
-                        body.push(Line::default());
-                        continue;
-                    }
-                    for wrapped in super::wrapping::wrap(line, inner_w) {
-                        body.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(wrapped.to_string(), content_style),
-                        ]));
-                    }
-                }
-                let mut out = vec![header];
-                out.extend(body);
-                out
-            }
+            HistoryCell::Thinking { text } => render_thinking(text, width),
             HistoryCell::ToolStreaming {
                 lines: tool_lines,
                 dropped,
-            } => {
-                let _ = width;
-                let mut rendered: Vec<Line<'static>> = Vec::new();
-                let total = tool_lines.len();
-                let max_visible = 8;
-                let skip = total.saturating_sub(max_visible);
-                let hidden = skip as u64 + dropped;
-                if hidden > 0 {
-                    rendered.push(Line::from(Span::styled(
-                        format!("  ... ({hidden} lines above)"),
-                        theme::dim(),
-                    )));
-                }
-                let hard_cap = body_hard_cap(width);
-                for (line_text, is_stderr) in tool_lines.iter().skip(skip) {
-                    let style = if *is_stderr {
-                        theme::error_style()
-                    } else {
-                        theme::dim()
-                    };
-                    let parsed = parse_ansi_line(line_text, style);
-                    let truncated = line_utils::truncate_line_with_ellipsis(parsed, hard_cap);
-                    let prefix = if *is_stderr { "! " } else { "\u{2502} " };
-                    let mut spans = vec![Span::styled(format!("  {prefix}"), style)];
-                    spans.extend(truncated.spans);
-                    rendered.push(Line::from(spans));
-                }
-                rendered
-            }
-            HistoryCell::Plan { steps } => {
-                use ratatui::style::Modifier;
-                // Header: `• Updated Plan` (dim bullet + bold title).
-                let mut lines = vec![Line::from(vec![
-                    Span::styled(format!("{} ", theme::BULLET), theme::dim()),
-                    Span::styled("Updated Plan", theme::bold()),
-                ])];
-                // Step markers: `✔ ` crossed-out+dim (done),
-                // `□ ` teal+bold (in-progress), `□ ` dim (pending).
-                let mut step_lines: Vec<Line<'static>> = Vec::new();
-                for step in steps {
-                    let (marker, style) = match step.status {
-                        PlanStepStatus::Completed => {
-                            ("✔ ", theme::dim().add_modifier(Modifier::CROSSED_OUT))
-                        }
-                        PlanStepStatus::InProgress => (
-                            "□ ",
-                            ratatui::style::Style::default()
-                                .fg(theme::cyan())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        PlanStepStatus::Pending => ("□ ", theme::dim()),
-                    };
-                    step_lines.push(Line::from(vec![
-                        Span::styled(marker, style),
-                        Span::styled(step.title.clone(), style),
-                    ]));
-                }
-                lines.extend(prefix_lines(
-                    step_lines,
-                    Span::styled("  └ ", theme::dim()),
-                    Span::raw("    "),
-                ));
-                lines
-            }
-            HistoryCell::MentionCard { label } => {
-                // Matches the reference screenshot format: dim `⌞ Read
-                // CLAUDE.md (275 lines)` / `⌞ Listed directory foo/`.
-                // The filename/path portion after the verb is bolded.
-                let (verb, rest) = split_mention_label(label);
-                let mut spans = vec![Span::styled(
-                    format!("  {} ", theme::TREE_END),
-                    theme::dim(),
-                )];
-                spans.push(Span::styled(verb.to_string(), theme::dim()));
-                if !rest.is_empty() {
-                    spans.push(Span::styled(
-                        rest.to_string(),
-                        theme::dim().add_modifier(ratatui::style::Modifier::BOLD),
-                    ));
-                }
-                vec![Line::from(spans)]
-            }
-            HistoryCell::Separator { label } => {
-                let w = width as usize;
-                let line = match label {
-                    Some(l) if !l.is_empty() => {
-                        // Labeled format: `─ {label} ─` then fill the remainder.
-                        // If the label can't fit the viewport, fall back to a
-                        // plain full-width rule rather than overflow/truncate it.
-                        let labeled = format!("{0} {l} {0}", theme::SEPARATOR);
-                        let used = unicode_width::UnicodeWidthStr::width(labeled.as_str());
-                        if used > w {
-                            theme::SEPARATOR.repeat(w)
-                        } else {
-                            format!("{labeled}{}", theme::SEPARATOR.repeat(w - used))
-                        }
-                    }
-                    _ => theme::SEPARATOR.repeat(w),
-                };
-                vec![Line::from(Span::styled(line, theme::dim()))]
-            }
+            } => render_tool_streaming(tool_lines, *dropped, width),
+            HistoryCell::Plan { steps } => render_plan(steps),
+            HistoryCell::MentionCard { label } => render_mention_card(label),
+            HistoryCell::Separator { label } => render_separator(label.as_deref(), width),
         }
     }
+}
+
+/// Render a user message as a flat filled block, not an outlined bubble.
+/// Every rendered row owns the full viewport width.
+fn render_user_message(text: &str, width: u16) -> Vec<Line<'static>> {
+    let bg = theme::user_message_style();
+    let prefix_style =
+        bg.add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM);
+    let mention_style = bg.patch(theme::file_mention_style());
+    let w = width as usize;
+    let inset = 0usize;
+    let wrap_width = w.saturating_sub(2).max(1);
+    let mut lines = Vec::new();
+    if w > 0 {
+        lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
+    }
+    // Sanitize at render so raw CSI sequences in pasted or
+    // replayed history never reach native scrollback. Done here
+    // (not on the stored value) so the transcript stays faithful.
+    let text = sanitize_user_text(text);
+    let mut first = true;
+    for line in text.lines() {
+        let wrapped = if line.is_empty() {
+            vec![std::borrow::Cow::Borrowed("")]
+        } else {
+            super::wrapping::wrap(line, wrap_width)
+        };
+        for wl in wrapped.iter() {
+            let prefix = if first {
+                first = false;
+                Span::styled(format!("{} ", theme::CHEVRON), prefix_style)
+            } else {
+                Span::styled("  ", bg)
+            };
+            let spans = parse_at_mentions(wl.as_ref(), bg, mention_style);
+            let mut row: Vec<Span<'static>> = Vec::new();
+            if inset > 0 {
+                row.push(Span::styled(" ".repeat(inset), bg));
+            }
+            row.push(prefix);
+            row.extend(spans);
+            let used_width: usize = row
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = w.saturating_sub(used_width);
+            if pad > 0 {
+                row.push(Span::styled(" ".repeat(pad), bg));
+            }
+            lines.push(Line::from(row).style(bg));
+        }
+    }
+    if w > 0 {
+        lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
+    }
+    lines
+}
+
+/// Render an assistant message with the newline-gated streaming markdown
+/// cache. Finalized (non-streaming) cells collapse long bodies.
+fn render_assistant_message(
+    text: &str,
+    streaming: bool,
+    cache: &RefCell<AssistantRenderCache>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    // Output-redaction chokepoint for the TUI transcript.
+    // Assistant text is stripped of detected secrets before it
+    // enters markdown rendering, so a shared-screen viewer
+    // never sees a raw API key the agent legitimately read
+    // from disk. Clean text takes a zero-allocation fast path
+    // (Cow::Borrowed). User-input cells are intentionally not
+    // redacted — the user sees their own input verbatim.
+    let redacted;
+    let text: &str = match current_policy().apply(OutputSink::Tui, None, text) {
+        std::borrow::Cow::Borrowed(b) => b,
+        std::borrow::Cow::Owned(o) => {
+            redacted = o;
+            &redacted
+        }
+    };
+    let visible_text = strip_reply_directive_prefix(text);
+    let inner_width = width.saturating_sub(LIVE_PREFIX_COLS as u16);
+    let commit_end = visible_text
+        .as_bytes()
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let mut cache = cache.borrow_mut();
+    let cache_hit =
+        cache.cached_width == Some(inner_width) && cache.committed_byte_len == commit_end;
+    if !cache_hit {
+        cache.committed_lines = if commit_end == 0 {
+            Vec::new()
+        } else {
+            markdown::render_markdown(&visible_text[..commit_end], inner_width)
+        };
+        cache.committed_byte_len = commit_end;
+        cache.cached_width = Some(inner_width);
+    }
+    let pending_lines = if commit_end < visible_text.len() {
+        markdown::render_markdown(&visible_text[commit_end..], inner_width)
+    } else {
+        Vec::new()
+    };
+
+    let prefix_span = Span::styled(format!("{} ", theme::BULLET), theme::dim());
+    let all: Vec<Line<'static>> = cache
+        .committed_lines
+        .iter()
+        .cloned()
+        .chain(pending_lines)
+        .collect();
+    let lines = if visible_text.is_empty() {
+        vec![]
+    } else if all.is_empty() {
+        vec![Line::from(prefix_span)]
+    } else {
+        prefix_lines(all, prefix_span, Span::raw("  "))
+    };
+    if streaming {
+        lines
+    } else {
+        collapse_long_lines(lines)
+    }
+}
+
+/// Render a tool-call header (`• verb target`) plus an optional detail line.
+fn render_tool_start(name: &str, args: &str, completed: bool) -> Vec<Line<'static>> {
+    let cat = super::tool_display::classify_tool(name, args);
+    let bullet_style = if completed {
+        theme::tool_bullet_done()
+    } else {
+        theme::tool_bullet_active()
+    };
+    let mut header_spans = vec![Span::styled(format!("{} ", theme::BULLET), bullet_style)];
+    header_spans.extend(super::tool_display::tool_header_spans(&cat));
+    let mut lines = vec![Line::from(header_spans)];
+    if let Some(detail_spans) = super::tool_display::tool_detail_line(&cat) {
+        let mut spans = vec![Span::styled(
+            format!("  {} ", theme::TREE_END),
+            theme::dim(),
+        )];
+        spans.extend(detail_spans);
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Apply the TUI output-redaction policy to tool result text. A `run_shell`
+/// that cats `~/.aws/credentials` or `read_file` on `.env` would otherwise
+/// echo the raw value into the transcript. Applied once at the top of each
+/// result render path so every downstream formatter (shell, diff, generic
+/// body) sees the redacted form.
+fn redact_tool_output(output: &str) -> std::borrow::Cow<'_, str> {
+    current_policy().apply(OutputSink::Tui, None, output)
+}
+
+/// Status line with check/cross indicator, display label, and duration.
+fn tool_status_line(
+    is_error: bool,
+    display_label: &str,
+    duration_ms: Option<u64>,
+) -> Line<'static> {
+    let (indicator, ind_style) = if is_error {
+        (theme::CROSS, theme::cross_style())
+    } else {
+        (theme::CHECK, theme::check_style())
+    };
+    let duration_str = match duration_ms {
+        Some(ms) => {
+            let secs_f = ms as f64 / 1000.0;
+            format!(" • {secs_f:.1}s")
+        }
+        None => String::new(),
+    };
+    Line::from(vec![
+        Span::styled(format!("  {indicator} "), ind_style),
+        Span::styled(format!("{display_label}{duration_str}"), theme::dim()),
+    ])
+}
+
+/// Generic tool result body: one rendered line per source line, ANSI-parsed
+/// and hard-capped. When `compact_json` is set and the full output is
+/// pretty-printed JSON, it is collapsed to a compact form first so `textwrap`
+/// has `: ` / `, ` break points and doesn't have to hard-split inside objects.
+fn plain_tool_body(
+    output: &str,
+    style: Style,
+    compact_json: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let hard_cap = body_hard_cap(width);
+    let owned;
+    let source: &str = if compact_json {
+        if let Some(compact) = line_utils::format_json_compact(output) {
+            owned = compact;
+            &owned
+        } else {
+            output
+        }
+    } else {
+        output
+    };
+    source
+        .lines()
+        .map(|l| {
+            let parsed = parse_ansi_line(l, style);
+            line_utils::truncate_line_with_ellipsis(parsed, hard_cap)
+        })
+        .collect()
+}
+
+/// Render a failed tool result. Errors render boxed so failures stand out
+/// from successful tool calls; the `✗ display_label` status line below the
+/// box keeps the visual link to the tool call.
+fn render_tool_result_error(
+    output: &str,
+    display_label: &str,
+    duration_ms: Option<u64>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let output = redact_tool_output(output);
+    let body_lines = plain_tool_body(&output, theme::error_style(), false, width);
+    let mut lines = render_boxed_lines(body_lines, theme::error_style(), Some(" error "), width, 2);
+    lines.push(tool_status_line(true, display_label, duration_ms));
+    lines
+}
+
+/// Post-wrap row cost of one logical line at `content_width`, so one stray
+/// long URL can't burst past the collapse preview.
+fn wrapped_row_cost(line: &Line<'_>, content_width: usize) -> usize {
+    let w = line_utils::line_width(line);
+    if w == 0 {
+        1
+    } else {
+        w.div_ceil(content_width)
+    }
+}
+
+/// How many leading body lines a collapsed preview keeps, and the row cost
+/// they occupy, honoring `COLLAPSE_PREVIEW_LINES` in wrapped rows.
+fn collapsed_preview_take(body_lines: &[Line<'_>], content_width: usize) -> (usize, usize) {
+    let mut used = 0usize;
+    let mut n = 0usize;
+    for line in body_lines.iter() {
+        let cost = wrapped_row_cost(line, content_width);
+        if used + cost > COLLAPSE_PREVIEW_LINES && n > 0 {
+            break;
+        }
+        used += cost;
+        n += 1;
+        if used >= COLLAPSE_PREVIEW_LINES {
+            break;
+        }
+    }
+    (n, used)
+}
+
+/// Render a successful tool result.
+///
+/// Contextual: `run_shell` uses a compact two-line layout (separate
+/// `└ Exit code` row, per-stream `--- stdout/stderr ---` sections omitted
+/// when empty, capped preview per stream), falling through to the generic
+/// body path if the envelope can't be parsed. `apply_patch` renders the raw
+/// patch as a colored diff instead of the plain success-text output.
+fn render_tool_result_ok(
+    output: &str,
+    display_label: &str,
+    duration_ms: Option<u64>,
+    tool_name: &str,
+    args_json: Option<&str>,
+    collapsed: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let output = redact_tool_output(output);
+    let output: &str = &output;
+
+    if tool_name == "run_shell" {
+        if let Some(parsed) = parse_shell_output(output) {
+            return render_shell_result(parsed, display_label, duration_ms, collapsed, width);
+        }
+    }
+
+    let rendered_body = if tool_name == "apply_patch" {
+        args_json
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("patch").and_then(|p| p.as_str()).map(str::to_string))
+            .map(|patch| {
+                // Reserve room for the cell's left bullet/indent
+                // (~6 cols) so wrapped diff rows don't overrun.
+                let inner = (width as usize).saturating_sub(6).max(20);
+                diff_render::render_patch_wrapped(&patch, inner)
+            })
+    } else {
+        None
+    };
+
+    let body_lines = match rendered_body {
+        Some(diff_lines) => diff_lines,
+        None => plain_tool_body(output, theme::dim(), true, width),
+    };
+    let body_style = theme::dim();
+
+    // Row-aware collapse: measure each logical line's post-wrap row
+    // cost so one stray long URL can't burst past the preview.
+    let content_width = (width as usize).saturating_sub(4).max(1);
+    let total_rows: usize = body_lines
+        .iter()
+        .map(|l| wrapped_row_cost(l, content_width))
+        .sum();
+    let should_collapse = collapsed && total_rows > COLLAPSE_THRESHOLD;
+
+    let (taken, rows_used) = if should_collapse {
+        collapsed_preview_take(&body_lines, content_width)
+    } else {
+        (body_lines.len(), total_rows)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, line) in body_lines.into_iter().take(taken).enumerate() {
+        let prefix = if i == 0 {
+            format!("  {} ", theme::TREE_END)
+        } else {
+            "    ".to_string()
+        };
+        let mut spans = vec![Span::styled(prefix, body_style)];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+
+    if should_collapse {
+        let extra = total_rows.saturating_sub(rows_used);
+        lines.push(Line::from(Span::styled(
+            collapse_footer(extra),
+            theme::dim(),
+        )));
+    }
+
+    lines.push(tool_status_line(false, display_label, duration_ms));
+    lines
+}
+
+/// Render the shell-approval prompt card with its current status.
+fn render_shell_approval(command: &str, status: &ApprovalStatus) -> Vec<Line<'static>> {
+    let status_text = match status {
+        ApprovalStatus::Pending => "[y/N]",
+        ApprovalStatus::Approved => "[approved]",
+        ApprovalStatus::Denied => "[denied]",
+    };
+    let status_style = match status {
+        ApprovalStatus::Pending => theme::error_style(),
+        ApprovalStatus::Approved => theme::success_style(),
+        ApprovalStatus::Denied => theme::dim(),
+    };
+    vec![
+        Line::from(vec![
+            Span::styled("  [run_shell] ", theme::error_style()),
+            Span::styled(command.to_string(), theme::error_style()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Allow? "),
+            Span::styled(status_text.to_string(), status_style),
+        ]),
+    ]
+}
+
+/// Render reasoning as a dim + italic bullet block, no box.
+/// Header line: "• thinking" (dim, italic) — bullet matches assistant
+/// bullet width so wrapped continuation lines hang under the body.
+fn render_thinking(text: &str, width: u16) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![];
+    }
+    let content_style = theme::reasoning_style();
+    let bullet = Span::styled(format!("{} ", theme::BULLET), theme::dim());
+    let header = Line::from(vec![
+        bullet.clone(),
+        Span::styled("thinking", content_style),
+    ]);
+    let inner_w = (width as usize).saturating_sub(LIVE_PREFIX_COLS).max(1);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            body.push(Line::default());
+            continue;
+        }
+        for wrapped in super::wrapping::wrap(line, inner_w) {
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped.to_string(), content_style),
+            ]));
+        }
+    }
+    let mut out = vec![header];
+    out.extend(body);
+    out
+}
+
+/// Render the live tail of a streaming tool's output: at most the last 8
+/// lines, with an elision notice folding in both the skipped and the
+/// already-dropped lines.
+fn render_tool_streaming(
+    tool_lines: &[(String, bool)],
+    dropped: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut rendered: Vec<Line<'static>> = Vec::new();
+    let total = tool_lines.len();
+    let max_visible = 8;
+    let skip = total.saturating_sub(max_visible);
+    let hidden = skip as u64 + dropped;
+    if hidden > 0 {
+        rendered.push(Line::from(Span::styled(
+            format!("  ... ({hidden} lines above)"),
+            theme::dim(),
+        )));
+    }
+    let hard_cap = body_hard_cap(width);
+    for (line_text, is_stderr) in tool_lines.iter().skip(skip) {
+        let style = if *is_stderr {
+            theme::error_style()
+        } else {
+            theme::dim()
+        };
+        let parsed = parse_ansi_line(line_text, style);
+        let truncated = line_utils::truncate_line_with_ellipsis(parsed, hard_cap);
+        let prefix = if *is_stderr { "! " } else { "\u{2502} " };
+        let mut spans = vec![Span::styled(format!("  {prefix}"), style)];
+        spans.extend(truncated.spans);
+        rendered.push(Line::from(spans));
+    }
+    rendered
+}
+
+/// Render the plan card: `• Updated Plan` header plus per-step marker lines.
+fn render_plan(steps: &[PlanStep]) -> Vec<Line<'static>> {
+    // Header: `• Updated Plan` (dim bullet + bold title).
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{} ", theme::BULLET), theme::dim()),
+        Span::styled("Updated Plan", theme::bold()),
+    ])];
+    // Step markers: `✔ ` crossed-out+dim (done),
+    // `□ ` teal+bold (in-progress), `□ ` dim (pending).
+    let mut step_lines: Vec<Line<'static>> = Vec::new();
+    for step in steps {
+        let (marker, style) = match step.status {
+            PlanStepStatus::Completed => ("✔ ", theme::dim().add_modifier(Modifier::CROSSED_OUT)),
+            PlanStepStatus::InProgress => (
+                "□ ",
+                ratatui::style::Style::default()
+                    .fg(theme::cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            PlanStepStatus::Pending => ("□ ", theme::dim()),
+        };
+        step_lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(step.title.clone(), style),
+        ]));
+    }
+    lines.extend(prefix_lines(
+        step_lines,
+        Span::styled("  └ ", theme::dim()),
+        Span::raw("    "),
+    ));
+    lines
+}
+
+/// Render a one-line mention card: dim `⌞ Read CLAUDE.md (275 lines)` /
+/// `⌞ Listed directory foo/`. The filename/path portion after the verb is
+/// bolded.
+fn render_mention_card(label: &str) -> Vec<Line<'static>> {
+    let (verb, rest) = split_mention_label(label);
+    let mut spans = vec![Span::styled(
+        format!("  {} ", theme::TREE_END),
+        theme::dim(),
+    )];
+    spans.push(Span::styled(verb.to_string(), theme::dim()));
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            rest.to_string(),
+            theme::dim().add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
+/// Render a turn divider as a full-width dim rule, with an optional
+/// `─ {label} ─` inline label.
+fn render_separator(label: Option<&str>, width: u16) -> Vec<Line<'static>> {
+    let w = width as usize;
+    let line = match label {
+        Some(l) if !l.is_empty() => {
+            // Labeled format: `─ {label} ─` then fill the remainder.
+            // If the label can't fit the viewport, fall back to a
+            // plain full-width rule rather than overflow/truncate it.
+            let labeled = format!("{0} {l} {0}", theme::SEPARATOR);
+            let used = unicode_width::UnicodeWidthStr::width(labeled.as_str());
+            if used > w {
+                theme::SEPARATOR.repeat(w)
+            } else {
+                format!("{labeled}{}", theme::SEPARATOR.repeat(w - used))
+            }
+        }
+        _ => theme::SEPARATOR.repeat(w),
+    };
+    vec![Line::from(Span::styled(line, theme::dim()))]
 }
 
 /// Split a line into spans, highlighting `@path` tokens with the mention style.
