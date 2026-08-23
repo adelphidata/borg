@@ -36,4 +36,15 @@ describe("useIsMobile", () => {
     act(() => breakpoint.set(false));
     expect(screen.getByText("desktop")).toBeTruthy();
   });
+
+  it("detaches its listener when the consumer unmounts", () => {
+    // The MediaQueryList is module-cached and outlives every consumer, so a
+    // subscribe without a working unsubscribe leaks a listener per mount and
+    // fires state updates into dead components.
+    const before = breakpoint.listenerCount();
+    const { unmount } = render(<Probe />);
+    expect(breakpoint.listenerCount()).toBe(before + 1);
+    unmount();
+    expect(breakpoint.listenerCount()).toBe(before);
+  });
 });

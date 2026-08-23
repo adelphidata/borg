@@ -143,4 +143,88 @@ describe("ThemeProvider", () => {
   it("refuses to run outside a provider instead of silently painting nothing", () => {
     expect(() => render(<Probe />)).toThrow(/ThemeProvider/);
   });
+
+  it("subscribes to the OS query once and lets go of it on unmount", () => {
+    const before = system.listenerCount();
+    const calls = system.subscribeCalls();
+    const { unmount } = render(
+      <ThemeProvider>
+        <Probe />
+      </ThemeProvider>,
+    );
+    expect(system.listenerCount()).toBe(before + 1);
+
+    // A provider that re-subscribed on every render would leak churn into the
+    // OS query; a re-render must not add a second registration.
+    act(() => system.set(true));
+    expect(system.subscribeCalls()).toBe(calls + 1);
+
+    // And the listener must not outlive the provider: an unmounted provider
+    // still hearing OS changes is a state update into a dead component.
+    unmount();
+    expect(system.listenerCount()).toBe(before);
+  });
+
+  it("repaints the document and re-persists when the choice changes", () => {
+    localStorage.setItem(STORAGE_KEYS.theme, "dark");
+    render(
+      <ThemeProvider>
+        <Probe />
+      </ThemeProvider>,
+    );
+    expect(document.documentElement.dataset.theme).toBe("dark");
+
+    click("toggle");
+    // A mount-only effect would leave the stylesheet on the old theme and the
+    // storage on the old choice.
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(localStorage.getItem(STORAGE_KEYS.theme)).toBe("light");
+  });
+
+  it("toggles light to dark even when the OS also prefers dark", () => {
+    // "light" must flip because it is light, not because of what the OS says.
+    localStorage.setItem(STORAGE_KEYS.theme, "light");
+    system.set(true);
+    render(
+      <ThemeProvider>
+        <Probe />
+      </ThemeProvider>,
+    );
+    click("toggle");
+    expect(preference()).toBe("dark");
+    expect(theme()).toBe("dark");
+  });
+
+  it("toggling out of system on a light OS lands on dark", () => {
+    // The counterpart of the dark-OS case: flip away from what is showing.
+    localStorage.setItem(STORAGE_KEYS.theme, "system");
+    system.set(false);
+    render(
+      <ThemeProvider>
+        <Probe />
+      </ThemeProvider>,
+    );
+    expect(theme()).toBe("light");
+    click("toggle");
+    expect(preference()).toBe("dark");
+    expect(theme()).toBe("dark");
+  });
+
+  it("toggling out of system reads the OS as it is now, not as it was at mount", () => {
+    localStorage.setItem(STORAGE_KEYS.theme, "system");
+    system.set(false);
+    render(
+      <ThemeProvider>
+        <Probe />
+      </ThemeProvider>,
+    );
+    act(() => system.set(true));
+    expect(theme()).toBe("dark");
+
+    // A toggle closed over the mount-time OS state would flip to "dark" —
+    // which would look like the toggle did nothing.
+    click("toggle");
+    expect(preference()).toBe("light");
+    expect(theme()).toBe("light");
+  });
 });

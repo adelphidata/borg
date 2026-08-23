@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, render } from "@testing-library/react";
 import { usePauseAnimationsWhenHidden } from "./pauseWhenHidden";
 
@@ -51,5 +51,19 @@ describe("usePauseAnimationsWhenHidden", () => {
 
     setHidden(true);
     expect(document.documentElement.hasAttribute(HIDDEN_ATTR)).toBe(false);
+  });
+
+  it("subscribes once, not once per render", () => {
+    // A listener added on every render would pile up handlers for the life of
+    // the app; the effect must run on mount alone.
+    const addSpy = vi.spyOn(document, "addEventListener");
+    const { rerender } = render(<Probe />);
+    rerender(<Probe />);
+    rerender(<Probe />);
+    const visibilitySubscriptions = addSpy.mock.calls.filter(
+      ([type]) => type === "visibilitychange",
+    );
+    expect(visibilitySubscriptions).toHaveLength(1);
+    addSpy.mockRestore();
   });
 });

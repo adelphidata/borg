@@ -25,6 +25,12 @@ describe("clampToViewport", () => {
     expect(tall.top).toBeLessThan(short.top);
   });
 
+  it("clamps with the estimated height: items plus a gap at each edge", () => {
+    // 3 items * 28px + 2 * 8px gap = 100px tall; 150px wide.
+    // left: 1000 - 150 - 8 = 842; top: 800 - 100 - 8 = 692.
+    expect(clampToViewport({ x: 980, y: 790 }, 3, VIEWPORT)).toEqual({ left: 842, top: 692 });
+  });
+
   it("never leaves the menu off the top or left, even in a tiny window", () => {
     const tiny = { width: 120, height: 60 };
     const { left, top } = clampToViewport({ x: 100, y: 50 }, 6, tiny);

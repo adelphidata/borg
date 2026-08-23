@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { readPreference, resolveTheme } from "./theme";
+import { THEME_PREFERENCES, readPreference, resolveTheme } from "./theme";
+
+describe("THEME_PREFERENCES", () => {
+  it("offers exactly the choices readPreference accepts, in menu order", () => {
+    // This list is what a settings menu renders. An entry readPreference
+    // rejects would be a menu item that silently becomes "dark" on reload.
+    expect(THEME_PREFERENCES).toEqual(["light", "dark", "system"]);
+    for (const p of THEME_PREFERENCES) expect(readPreference(p)).toBe(p);
+  });
+});
 
 describe("readPreference", () => {
   it("accepts the three real preferences", () => {

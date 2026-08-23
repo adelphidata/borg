@@ -9,6 +9,10 @@
 export interface MediaController {
   /** Flip what the query matches and notify every listener, as the OS would. */
   set(matches: boolean): void;
+  /** How many `change` listeners are attached right now. */
+  listenerCount(): number;
+  /** How many times `addEventListener("change", …)` has ever been called. */
+  subscribeCalls(): number;
 }
 
 /**
@@ -22,13 +26,13 @@ export function installMatchMedia(initial: (query: string) => boolean): {
 } {
   const lists = new Map<
     string,
-    { matches: boolean; listeners: Set<(e: MediaQueryListEvent) => void> }
+    { matches: boolean; listeners: Set<(e: MediaQueryListEvent) => void>; subscribeCalls: number }
   >();
 
   const entry = (query: string) => {
     let found = lists.get(query);
     if (!found) {
-      found = { matches: initial(query), listeners: new Set() };
+      found = { matches: initial(query), listeners: new Set(), subscribeCalls: 0 };
       lists.set(query, found);
     }
     return found;
@@ -42,10 +46,16 @@ export function installMatchMedia(initial: (query: string) => boolean): {
       },
       media: query,
       onchange: null,
-      addEventListener: (_type: string, listener: (e: MediaQueryListEvent) => void) => {
+      // Type-aware, like the real EventTarget: a listener registered for any
+      // event other than "change" never hears a media change, and removing
+      // with the wrong type removes nothing.
+      addEventListener: (type: string, listener: (e: MediaQueryListEvent) => void) => {
+        if (type !== "change") return;
+        state.subscribeCalls += 1;
         state.listeners.add(listener);
       },
-      removeEventListener: (_type: string, listener: (e: MediaQueryListEvent) => void) => {
+      removeEventListener: (type: string, listener: (e: MediaQueryListEvent) => void) => {
+        if (type !== "change") return;
         state.listeners.delete(listener);
       },
       addListener: () => {},
@@ -64,6 +74,8 @@ export function installMatchMedia(initial: (query: string) => boolean): {
             listener({ matches } as MediaQueryListEvent);
           }
         },
+        listenerCount: () => state.listeners.size,
+        subscribeCalls: () => state.subscribeCalls,
       };
     },
   };

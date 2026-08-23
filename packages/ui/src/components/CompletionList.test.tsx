@@ -43,6 +43,13 @@ describe("CompletionList", () => {
     renderList({ cursor: 1 });
     const options = screen.getAllByRole("option");
     expect(options.map((o) => o.getAttribute("aria-selected"))).toEqual(["false", "true", "false"]);
+    // The highlight is the sighted-user half of the same signal: the cursor
+    // row is filled, the others are transparent.
+    expect(options[1].className).toContain("bg-surface3");
+    for (const other of [options[0], options[2]]) {
+      expect(other.className).not.toContain("bg-surface3");
+      expect(other.className).toContain("bg-transparent");
+    }
   });
 
   it("gives each row the DOM id the input points at", () => {
@@ -50,17 +57,21 @@ describe("CompletionList", () => {
     // so a mismatch means a screen reader never learns what Enter will take.
     renderList();
     const options = screen.getAllByRole("option");
-    expect(options.map((o) => o.id)).toEqual([
-      rowDomId("cmd", 0),
-      rowDomId("cmd", 1),
-      rowDomId("cmd", 2),
-    ]);
+    // Literal ids, not rowDomId() again: comparing the helper to itself would
+    // pass even if it returned garbage on both sides.
+    expect(options.map((o) => o.id)).toEqual(["cmd-row-0", "cmd-row-1", "cmd-row-2"]);
+    expect(rowDomId("cmd", 1)).toBe("cmd-row-1");
   });
 
   it("names the listbox so the input can label it", () => {
     renderList();
     const box = screen.getByRole("listbox", { name: "Commands" });
     expect(box.id).toBe("cmd");
+  });
+
+  it("caps its height so a long list scrolls instead of covering the screen", () => {
+    renderList();
+    expect(screen.getByRole("listbox").style.maxHeight).toBe("232px");
   });
 
   it("chooses on pointer-down and keeps focus in the input", () => {
@@ -83,9 +94,22 @@ describe("CompletionList", () => {
 
   it("shows detail and hint only for the rows that have them", () => {
     renderList();
-    expect(screen.getByText("opus")).toBeTruthy();
-    expect(screen.getByText("Session")).toBeTruthy();
-    expect(screen.getAllByRole("option")[2].textContent).toBe("/quit");
+    // Each lives in its own element — not raw text spliced into the row.
+    expect(screen.getByText("opus").tagName).toBe("SPAN");
+    expect(screen.getByText("Session").tagName).toBe("SPAN");
+    const options = screen.getAllByRole("option");
+    expect(options[2].textContent).toBe("/quit");
+    // A row without detail or hint renders neither slot, not empty spans:
+    // just the label and the flexible spacer.
+    expect(options[2].querySelectorAll("span")).toHaveLength(2);
+    // Hint present, detail absent → exactly one extra span.
+    expect(options[1].querySelectorAll("span")).toHaveLength(3);
+  });
+
+  it("tolerates a cursor past the end of the rows", () => {
+    // The caller owns the cursor; a filter that shrinks the rows can leave it
+    // out of range for a frame. The scroll effect must not throw on that frame.
+    expect(() => renderList({ cursor: 7 })).not.toThrow();
   });
 
   it("scrolls the highlighted row into view when the cursor moves past the fold", () => {

@@ -88,6 +88,44 @@ describe("CodeBlock", () => {
     expect(container.querySelector(".second")).not.toBeNull();
   });
 
+  it("drops stale markup when a later pass fails", async () => {
+    // The fallback branch must actively reset to plain text: keeping the old
+    // markup would show highlighted code that no longer matches the block.
+    highlight
+      .mockResolvedValueOnce('<pre class="shiki">old</pre>')
+      .mockRejectedValueOnce(new Error("grammar load failed"));
+    const { container, rerender } = render(<CodeBlock code="old" lang="rust" />);
+    await settle();
+    expect(container.querySelector(".shiki")).not.toBeNull();
+
+    rerender(<CodeBlock code="new" lang="brainfuck" />);
+    await settle();
+    expect(container.querySelector(".shiki")).toBeNull();
+    expect(container.querySelector("pre")?.textContent).toBe("new");
+  });
+
+  it("ignores a failure that lands after the code changed again", async () => {
+    // The stale-guard has to hold on the rejection path too, or a slow failing
+    // pass blanks the markup the newer pass already painted.
+    let rejectFirst: (err: Error) => void = () => {};
+    highlight
+      .mockImplementationOnce(() => new Promise<string>((_, r) => (rejectFirst = r)))
+      .mockResolvedValueOnce('<pre class="second">second</pre>');
+
+    const { container, rerender } = render(<CodeBlock code="first" lang="rust" />);
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    rerender(<CodeBlock code="second" lang="rust" />);
+    await settle();
+    expect(container.querySelector(".second")).not.toBeNull();
+
+    await act(async () => {
+      rejectFirst(new Error("late failure"));
+    });
+    expect(container.querySelector(".second")).not.toBeNull();
+  });
+
   it("copies the code and says so, then goes back to offering the copy", async () => {
     highlight.mockResolvedValue(null);
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -105,5 +143,49 @@ describe("CodeBlock", () => {
       vi.advanceTimersByTime(1500);
     });
     expect(screen.getByRole("button", { name: "Copy code" })).toBeTruthy();
+  });
+
+  it("restarts the Copied window on a second copy", async () => {
+    // Without clearing the first timer, a re-copy flips back to "Copy code"
+    // on the first timer's schedule, mid-way through the second window.
+    highlight.mockResolvedValue(null);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    render(<CodeBlock code="x" />);
+    await act(async () => {
+      screen.getByRole("button", { name: "Copy code" }).click();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Copied" }).click();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(900); // 1900ms after the first copy, 900 after the second
+    });
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
+    await act(async () => {
+      vi.advanceTimersByTime(600); // second window (1400ms) elapsed
+    });
+    expect(screen.getByRole("button", { name: "Copy code" })).toBeTruthy();
+  });
+
+  it("cancels the pending label restore when it unmounts", async () => {
+    // The unmount cleanup is the only thing that stops the restore timer
+    // firing into a component that no longer exists.
+    highlight.mockResolvedValue(null);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    const { unmount } = render(<CodeBlock code="x" />);
+    await settle();
+    await act(async () => {
+      screen.getByRole("button", { name: "Copy code" }).click();
+    });
+    expect(vi.getTimerCount()).toBe(1);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

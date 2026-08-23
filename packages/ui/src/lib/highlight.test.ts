@@ -1,5 +1,24 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { highlight, resolveLanguage } from "./highlight";
+
+/** Every grammar handed to the highlighter, recorded to observe the cache. */
+const loadCalls = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock("shiki/core", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("shiki/core")>();
+  return {
+    ...mod,
+    createHighlighterCore: (async (...args: Parameters<typeof mod.createHighlighterCore>) => {
+      const core = await mod.createHighlighterCore(...args);
+      const original = core.loadLanguage.bind(core);
+      core.loadLanguage = async (...langs) => {
+        loadCalls.count += 1;
+        return original(...langs);
+      };
+      return core;
+    }) as typeof mod.createHighlighterCore,
+  };
+});
 
 describe("resolveLanguage", () => {
   it("accepts a grammar named directly", () => {
@@ -7,14 +26,26 @@ describe("resolveLanguage", () => {
     expect(resolveLanguage("typescript")).toBe("typescript");
   });
 
-  it("accepts the fence tags people actually type", () => {
-    // These are aliases, not grammars: a `sh` fence must still highlight.
-    expect(resolveLanguage("sh")).toBe("bash");
-    expect(resolveLanguage("zsh")).toBe("bash");
-    expect(resolveLanguage("py")).toBe("python");
-    expect(resolveLanguage("rs")).toBe("rust");
-    expect(resolveLanguage("c++")).toBe("cpp");
-    expect(resolveLanguage("patch")).toBe("diff");
+  // These are aliases, not grammars: a `sh` fence must still highlight, and an
+  // alias that resolves to nothing silently downgrades that fence to plain text.
+  it.each([
+    ["sh", "bash"],
+    ["shell", "bash"],
+    ["zsh", "bash"],
+    ["console", "bash"],
+    ["js", "javascript"],
+    ["mjs", "javascript"],
+    ["cjs", "javascript"],
+    ["ts", "typescript"],
+    ["py", "python"],
+    ["rb", "ruby"],
+    ["rs", "rust"],
+    ["yml", "yaml"],
+    ["md", "markdown"],
+    ["c++", "cpp"],
+    ["patch", "diff"],
+  ])("accepts the %s fence tag as %s", (tag, lang) => {
+    expect(resolveLanguage(tag)).toBe(lang);
   });
 
   it("is case-insensitive, as fence tags in the wild are", () => {
@@ -83,6 +114,15 @@ describe("highlight", () => {
     host.innerHTML = html ?? "";
     expect(host.querySelector("script")).toBeNull();
     expect(host.textContent).toContain("<script>alert(1)</script>");
+  }, 20000);
+
+  it("loads a grammar once and serves later fences from the cache", async () => {
+    // A grammar is a dynamic import plus a tokenizer build; re-loading it on
+    // every fence would pay that cost for each code block in a transcript.
+    await highlight("package main", "go");
+    const afterFirst = loadCalls.count;
+    await highlight("func main() {}", "go");
+    expect(loadCalls.count).toBe(afterFirst);
   }, 20000);
 });
 

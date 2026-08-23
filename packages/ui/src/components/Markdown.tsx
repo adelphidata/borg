@@ -15,7 +15,8 @@ import { CodeBlock } from "./CodeBlock";
  * and reparsing unchanged prose for each of them is the expensive part.
  */
 
-function codeText(children: ReactNode): string {
+/** Flattens a code element's children into the text to highlight. Exported for tests. */
+export function codeText(children: ReactNode): string {
   if (typeof children === "string") return children;
   if (Array.isArray(children)) return children.map(codeText).join("");
   return "";

@@ -22,6 +22,27 @@ describe("PageChrome", () => {
     expect(screen.getByText("body")).toBeTruthy();
   });
 
+  it("wraps the meta in its own element, and renders none without meta", () => {
+    breakpoint.set(false);
+    const { container, unmount } = render(
+      <PageChrome title="Usage" meta="last 7 days">
+        <p>body</p>
+      </PageChrome>,
+    );
+    // The meta needs its own styled span — not a bare text node in the header.
+    expect(screen.getByText("last 7 days").tagName).toBe("SPAN");
+    expect(container.querySelector(".text-ink3")?.textContent).toBe("last 7 days");
+    unmount();
+
+    const bare = render(
+      <PageChrome title="Usage">
+        <p>body</p>
+      </PageChrome>,
+    );
+    // No meta, no slot: an empty styled span would still take header space.
+    expect(bare.container.querySelector(".text-ink3")).toBeNull();
+  });
+
   it("drops the desktop header at phone width", () => {
     // Pages render their own heading through MobileTitle instead.
     breakpoint.set(true);
@@ -86,5 +107,13 @@ describe("MobileTitle", () => {
     breakpoint.set(true);
     render(<MobileTitle>Usage</MobileTitle>);
     expect(screen.getByText("Usage")).toBeTruthy();
+  });
+
+  it("appends the caller's className to the heading styles, nothing else", () => {
+    breakpoint.set(true);
+    render(<MobileTitle>Plain</MobileTitle>);
+    render(<MobileTitle className="pt-4">Styled</MobileTitle>);
+    const base = screen.getByText("Plain").className;
+    expect(screen.getByText("Styled").className).toBe(`${base} pt-4`);
   });
 });

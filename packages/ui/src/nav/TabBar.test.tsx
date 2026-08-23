@@ -69,4 +69,33 @@ describe("TabBar", () => {
     renderAt("/");
     expect(screen.getByRole("link", { name: "History" }).getAttribute("href")).toBe("/sessions");
   });
+
+  it("keeps a parent tab lit on its own detail pages", () => {
+    // Only the root is exact-matched; every other tab prefix-matches so a
+    // drill-down does not un-light the tab the user is inside.
+    renderAt("/sessions/abc123");
+    expect(screen.getByRole("link", { name: "History" }).getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("link", { name: "Talk" }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("distinguishes the active tab's dot and label from the inactive ones", () => {
+    renderAt("/sessions");
+    const [dot, label] = Array.from(
+      screen.getByRole("link", { name: "History" }).querySelectorAll("span"),
+    );
+    const [idleDot, idleLabel] = Array.from(
+      screen.getByRole("link", { name: "Talk" }).querySelectorAll("span"),
+    );
+
+    // Tokens, not full class strings: the contract is the lit-dot/dim-label
+    // difference between active and inactive, not the exact styling.
+    expect(dot.classList.contains("bg-neon")).toBe(true);
+    expect(dot.classList.contains("bg-transparent")).toBe(false);
+    expect(idleDot.classList.contains("bg-transparent")).toBe(true);
+    expect(idleDot.classList.contains("bg-neon")).toBe(false);
+
+    expect(label.classList.contains("text-ink")).toBe(true);
+    expect(idleLabel.classList.contains("text-ink3")).toBe(true);
+    expect(idleLabel.classList.contains("text-ink")).toBe(false);
+  });
 });

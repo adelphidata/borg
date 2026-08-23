@@ -105,4 +105,62 @@ describe("Menu", () => {
     expect(menu.style.left).toBe("");
     expect(menu.style.top).toBe("");
   });
+
+  it("switches between fixed-at-pointer and absolute-under-trigger layout", () => {
+    // The inline left/top only mean anything under `position: fixed`; without
+    // a pointer the menu must instead anchor absolutely to its trigger.
+    const { unmount } = render(
+      <Menu
+        open
+        onClose={vi.fn()}
+        actions={actions()}
+        label="Conversation actions"
+        at={{ x: 10, y: 10 }}
+      />,
+    );
+    let classes = screen.getByRole("menu").className;
+    expect(classes).toContain("fixed");
+    expect(classes).not.toContain("absolute");
+    unmount();
+
+    render(<Menu open onClose={vi.fn()} actions={actions()} label="Conversation actions" />);
+    classes = screen.getByRole("menu").className;
+    expect(classes).toContain("absolute");
+    expect(classes).not.toContain("fixed");
+  });
+
+  it("draws the divider above the action that asked for it, and nowhere else", () => {
+    // `dividerBefore` marks Archive, so the walk order must be
+    // item, separator, item — not a separator hanging above the first item.
+    render(<Menu open onClose={vi.fn()} actions={actions()} label="Conversation actions" />);
+    const roles = Array.from(screen.getByRole("menu").children).map((el) =>
+      el.getAttribute("role"),
+    );
+    expect(roles).toEqual(["menuitem", "separator", "menuitem"]);
+  });
+
+  it("shows the action's icon, or a placeholder that keeps labels aligned", () => {
+    render(
+      <Menu
+        open
+        onClose={vi.fn()}
+        actions={[
+          {
+            id: "rename",
+            label: "Rename",
+            icon: <svg data-testid="rename-icon" />,
+            onSelect: vi.fn(),
+          },
+          { id: "archive", label: "Archive", onSelect: vi.fn() },
+        ]}
+        label="Conversation actions"
+      />,
+    );
+    const withIcon = screen.getByRole("menuitem", { name: "Rename" });
+    expect(withIcon.querySelector('[data-testid="rename-icon"]')).not.toBeNull();
+    expect(withIcon.querySelector("span")).toBeNull();
+    // Without an icon a fixed-width spacer stands in, so labels line up.
+    const bare = screen.getByRole("menuitem", { name: "Archive" });
+    expect(bare.querySelector("span")).not.toBeNull();
+  });
 });

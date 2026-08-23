@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
-import { Markdown } from "./Markdown";
+import { describe, expect, it, vi } from "vitest";
+import { act, render } from "@testing-library/react";
+import { codeText, Markdown } from "./Markdown";
+
+// Highlighting is async and irrelevant here; a never-settling promise keeps
+// every block on its plain-text fallback while still recording the call.
+const highlight = vi.hoisted(() => vi.fn(() => new Promise<string>(() => {})));
+vi.mock("../lib/highlight", () => ({ highlight }));
 
 describe("Markdown", () => {
   it("drops raw HTML from model output", () => {
@@ -44,6 +49,29 @@ describe("Markdown", () => {
     expect(container.querySelector("pre")?.textContent).toBe("one\ntwo");
   });
 
+  it("hands the highlighter the exact fence language and its text", () => {
+    // The fence class is `language-bash`; the extraction must yield the whole
+    // tag, not a prefix of it, and the trailing fence newline must be gone.
+    vi.useFakeTimers();
+    try {
+      render(<Markdown>{"```bash\nls -la\n```"}</Markdown>);
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+      expect(highlight).toHaveBeenCalledWith("ls -la", "bash");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes an empty fence to the block path, not inline code", () => {
+    // No text and no newline, but the language class alone marks it a block.
+    const { container } = render(<Markdown>{"```bash\n```"}</Markdown>);
+    const pre = container.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre?.textContent).toBe("");
+  });
+
   it("does not double-wrap a fence in nested pre elements", () => {
     const { container } = render(<Markdown>{"```js\nconst a = 1;\n```"}</Markdown>);
     expect(container.querySelectorAll("pre")).toHaveLength(1);
@@ -73,5 +101,15 @@ describe("Markdown", () => {
     expect(container.querySelector("ol li")?.textContent).toBe("two");
     expect(container.querySelector("blockquote")?.textContent).toContain("quoted");
     expect(container.querySelector("hr")).not.toBeNull();
+  });
+});
+
+describe("codeText", () => {
+  it("flattens nested children into one string, in order", () => {
+    expect(codeText(["a", ["b", "c"], "d"])).toBe("abcd");
+  });
+
+  it("drops anything that is not text", () => {
+    expect(codeText(<em>styled</em>)).toBe("");
   });
 });

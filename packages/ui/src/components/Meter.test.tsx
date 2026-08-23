@@ -28,4 +28,25 @@ describe("Meter", () => {
     const { container } = render(<Meter percent={-20} />);
     expect(fillWidth(container)).toBe("0%");
   });
+
+  // `warnAt` is opt-in and inclusive: reaching the threshold is already worth
+  // the alert colour, and a bar with no threshold never turns red.
+  it.each([
+    { name: "no threshold", percent: 95, warnAt: undefined, warns: false },
+    { name: "below the threshold", percent: 79, warnAt: 80, warns: false },
+    { name: "exactly at the threshold", percent: 80, warnAt: 80, warns: true },
+    { name: "above the threshold", percent: 90, warnAt: 80, warns: true },
+  ])("paints the $name bar in the right colour", ({ percent, warnAt, warns }) => {
+    const { container } = render(<Meter percent={percent} warnAt={warnAt} />);
+    const classes = fill(container).className;
+    expect(classes.includes("bg-alert")).toBe(warns);
+    expect(classes.includes("bg-neon")).toBe(!warns);
+  });
+
+  it("appends the caller's className to the track, nothing else", () => {
+    const bare = render(<Meter percent={10} />);
+    const styled = render(<Meter percent={10} className="mt-2" />);
+    const track = (c: HTMLElement) => c.firstElementChild as HTMLElement;
+    expect(track(styled.container).className).toBe(`${track(bare.container).className}mt-2`);
+  });
 });
