@@ -96,22 +96,24 @@ describe("loadWindowState", () => {
   it.each([
     // These values go straight into the BrowserWindow constructor; a string
     // `x` from a hand-edited file must be dropped, not forwarded.
-    ["x", { x: "40", y: 60, width: 900, height: 700 }, { y: 60, width: 900, height: 700 }],
-    ["y", { x: 40, y: null, width: 900, height: 700 }, { x: 40, width: 900, height: 700 }],
-    [
-      "width",
-      { x: 40, y: 60, width: "900", height: 700 },
-      { x: 40, y: 60, width: 1240, height: 700 },
-    ],
-    [
-      "height",
-      { x: 3000, y: 60, width: 900, height: "tall" },
-      { x: 3000, y: 60, width: 900, height: 800 },
-    ],
+    // A broken position drops as a pair, and a broken size takes the position
+    // with it — clamping needs the full rectangle, so a partial one must not
+    // smuggle unclamped coordinates past clampToDisplays.
+    ["x", { x: "40", y: 60, width: 900, height: 700 }, { width: 900, height: 700 }],
+    ["y", { x: 40, y: null, width: 900, height: 700 }, { width: 900, height: 700 }],
+    ["width", { x: 40, y: 60, width: "900", height: 700 }, { width: 1240, height: 700 }],
+    ["height", { x: 40, y: 60, width: 900, height: "tall" }, { width: 900, height: 800 }],
     ["maximized", { width: 900, height: 700, maximized: "yes" }, { width: 900, height: 700 }],
   ])("drops a %s of the wrong type instead of handing it to the window", (_field, saved, want) => {
     stored(saved);
     expect(loadWindowState()).toEqual(want);
+  });
+
+  it("never forwards a position that clampToDisplays has not approved", () => {
+    // Regression: a wrong-typed width once skipped the clamp entirely and let
+    // a far-off-screen x through, reopening the window out of reach.
+    stored({ x: 40000, y: 100, width: "900", height: 700 });
+    expect(loadWindowState()).toEqual({ width: 1240, height: 700 });
   });
 
   it("keeps the size but drops the position when the monitor is gone", () => {

@@ -50,21 +50,24 @@ export function loadWindowState(): WindowState {
     // BrowserWindow constructor, and Electron does not forgive a string `x`
     // from a hand-edited file. A wrong-typed field is dropped, not forwarded.
     const state: WindowState = {};
-    if (typeof raw.x === "number") state.x = raw.x;
-    if (typeof raw.y === "number") state.y = raw.y;
     if (typeof raw.width === "number") state.width = raw.width;
     if (typeof raw.height === "number") state.height = raw.height;
     if (typeof raw.maximized === "boolean") state.maximized = raw.maximized;
-    const { x, y, width, height } = state;
+    // A position only means something as a pair, and only with the size it
+    // was saved with: clamping needs the full rectangle. A partial or
+    // off-display rectangle keeps the size and lets the OS place the window.
     if (
-      typeof x === "number" &&
-      typeof y === "number" &&
-      typeof width === "number" &&
-      typeof height === "number" &&
-      clampToDisplays({ x, y, width, height }, screen.getAllDisplays()) === null
+      typeof raw.x === "number" &&
+      typeof raw.y === "number" &&
+      typeof state.width === "number" &&
+      typeof state.height === "number" &&
+      clampToDisplays(
+        { x: raw.x, y: raw.y, width: state.width, height: state.height },
+        screen.getAllDisplays(),
+      ) !== null
     ) {
-      // The saved monitor is gone; keep the size, let the OS place it.
-      return { width, height, maximized: state.maximized };
+      state.x = raw.x;
+      state.y = raw.y;
     }
     return { ...DEFAULTS, ...state };
   } catch {
