@@ -4,7 +4,7 @@ import { CHANNELS, type WireBootStatus } from "./channels";
 /** The handlers `registerBoot` installs, captured from the fake ipcMain. */
 const handlers = new Map<string, (...args: unknown[]) => unknown>();
 const sent: { channel: string; payload: unknown }[] = [];
-let destroyed = false;
+const destroyed = { win: false, webContents: false };
 
 vi.mock("electron", () => ({
   ipcMain: {
@@ -15,9 +15,9 @@ vi.mock("electron", () => ({
   BrowserWindow: {
     getAllWindows: () => [
       {
-        isDestroyed: () => destroyed,
+        isDestroyed: () => destroyed.win,
         webContents: {
-          isDestroyed: () => destroyed,
+          isDestroyed: () => destroyed.webContents,
           send: (channel: string, payload: unknown) => sent.push({ channel, payload }),
         },
       },
@@ -30,7 +30,8 @@ const { registerBoot } = await import("./boot");
 afterEach(() => {
   handlers.clear();
   sent.length = 0;
-  destroyed = false;
+  destroyed.win = false;
+  destroyed.webContents = false;
 });
 
 const deps = {
@@ -64,7 +65,18 @@ describe("registerBoot", () => {
   });
 
   it("does not send to a window that has gone away", async () => {
-    destroyed = true;
+    destroyed.win = true;
+    destroyed.webContents = true;
+    const boot = registerBoot({ ...deps, reachable: async () => true });
+    await boot.start();
+    expect(sent).toEqual([]);
+    boot.dispose();
+  });
+
+  it("skips a live window whose webContents is already torn down", async () => {
+    // During close the webContents can die before the BrowserWindow does;
+    // sending into it throws. Both halves must be alive, not either.
+    destroyed.webContents = true;
     const boot = registerBoot({ ...deps, reachable: async () => true });
     await boot.start();
     expect(sent).toEqual([]);
@@ -109,7 +121,7 @@ describe("registerBoot", () => {
   it("ends a boot that throws in a state the user can act on", async () => {
     // Anything unexpected still has to land on the failure screen: a silent
     // rejection would leave the window on a step that never finishes.
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     const boot = registerBoot({
       ...deps,
       reachable: async () => false,
@@ -119,6 +131,12 @@ describe("registerBoot", () => {
     });
     await expect(boot.start()).resolves.toBe(false);
     expect(read()).toMatchObject({ state: "failed", canRetry: true });
+    // The cause never reaches the renderer (statuses carry no codes or paths),
+    // so stderr is the only diagnostic trail — it must name what happened.
+    expect(errorLog).toHaveBeenCalledWith(
+      expect.stringContaining("boot attempt failed"),
+      expect.any(Error),
+    );
     boot.dispose();
   });
 

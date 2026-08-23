@@ -22,16 +22,18 @@ beforeEach(() => {
 const press = () => shortcutState.registered.get(OPTIONS.accelerator)?.();
 
 describe("registerQuickEntry", () => {
-  it("registers the hotkey it was given", () => {
+  it("registers the hotkey it was given, with nothing to warn about", () => {
     const panel = registerQuickEntry(OPTIONS);
     expect(shortcutState.registered.has(OPTIONS.accelerator)).toBe(true);
+    expect(console.warn).not.toHaveBeenCalled();
     panel.dispose();
   });
 
   it("reports a hotkey another app already owns instead of crashing", () => {
     shortcutState.available = false;
     expect(() => registerQuickEntry(OPTIONS).dispose()).not.toThrow();
-    expect(console.warn).toHaveBeenCalled();
+    // The warning names the contested accelerator, or the report is useless.
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(OPTIONS.accelerator));
   });
 
   it("releases the hotkey when the app quits", () => {
@@ -69,6 +71,45 @@ describe("registerQuickEntry", () => {
     const bounds = stub.constructedWindows[0].bounds;
     const area = displays[1].bounds;
     expect(bounds.x).toBe(Math.round(area.x + (area.width - bounds.width) / 2));
+    panel.dispose();
+  });
+
+  it("places the panel a third of the way down the pointer's display", () => {
+    displays.length = 0;
+    displays.push({ bounds: { x: 100, y: 200, width: 1620, height: 1000 } });
+    cursor.point = { x: 500, y: 500 };
+    const panel = registerQuickEntry(OPTIONS);
+    press();
+    // x: 100 + (1620 − 620) / 2 = 600; y: 200 + 1000 × 0.28 = 480.
+    expect(stub.constructedWindows[0].bounds).toEqual({ x: 600, y: 480, width: 620, height: 148 });
+    panel.dispose();
+  });
+
+  it("builds a frameless spotlight-style panel, not another app window", () => {
+    // Each flag here is user-visible: a frame, a taskbar entry, or a resize
+    // handle would make the capture panel read as a second app window.
+    const panel = registerQuickEntry(OPTIONS);
+    press();
+    expect(stub.constructedOptions[0]).toMatchObject({
+      width: 620,
+      height: 148,
+      show: false,
+      frame: false,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      transparent: true,
+      backgroundColor: "#00000000",
+    });
+    panel.dispose();
+  });
+
+  it("focuses the panel it shows, so the next keystroke lands in it", () => {
+    const panel = registerQuickEntry(OPTIONS);
+    press();
+    expect(stub.constructedWindows[0].focus).toHaveBeenCalled();
     panel.dispose();
   });
 

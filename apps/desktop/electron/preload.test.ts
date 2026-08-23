@@ -100,11 +100,15 @@ describe("transport.serverStream", () => {
     expect(onMessage).not.toHaveBeenCalled();
   });
 
-  it("gives concurrent streams distinct ids", async () => {
+  it("gives concurrent streams distinct, increasing ids", async () => {
+    // The counter only ever moves forward, so an id can never be reused for a
+    // later stream within the window's lifetime.
     const borg = await loadPreload();
     const first = await open(borg);
     const second = await open(borg);
     expect(first.id).not.toBe(second.id);
+    const numeric = (id: string) => Number(id.slice(1));
+    expect(numeric(second.id)).toBeGreaterThan(numeric(first.id));
   });
 
   it("rehydrates a stream error and stops listening", async () => {
@@ -134,10 +138,15 @@ describe("transport.serverStream", () => {
   });
 
   it("survives a stream with no error or completion handler", async () => {
+    // Two separate streams: an error detaches its listener, so a completion
+    // delivered on the same stream would never reach the handler code at all.
     const borg = await loadPreload();
-    const { id } = await open(borg);
-    expect(() => deliver(id, { kind: "error", error: { code: 1, message: "x" } })).not.toThrow();
-    expect(() => deliver(id, { kind: "complete" })).not.toThrow();
+    const errored = await open(borg);
+    expect(() =>
+      deliver(errored.id, { kind: "error", error: { code: 1, message: "x" } }),
+    ).not.toThrow();
+    const completed = await open(borg);
+    expect(() => deliver(completed.id, { kind: "complete" })).not.toThrow();
   });
 
   it("cancelling detaches the listener and tells the daemon", async () => {
@@ -223,6 +232,22 @@ describe("native boot bridge", () => {
     };
     pushToRenderer(CHANNELS.bootStatus, starting);
     expect(onStatus).toHaveBeenCalledWith(starting);
+  });
+
+  it("stops delivering broadcasts after unsubscribe", async () => {
+    // Unsubscribing must tear down the push listener too, not just the replay
+    // guard — a reloaded window would otherwise leak a subscription.
+    const borg = await loadPreload();
+    const onStatus = vi.fn();
+    const stop = borg.native.boot.subscribe(onStatus);
+    stop();
+    pushToRenderer(CHANNELS.bootStatus, {
+      state: "ready",
+      message: "Ready",
+      progress: 1,
+      canRetry: false,
+    });
+    expect(onStatus).not.toHaveBeenCalled();
   });
 
   it("drops a replay that lands after the caller unsubscribed", async () => {

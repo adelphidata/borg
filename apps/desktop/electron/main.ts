@@ -53,13 +53,12 @@ function createWindow() {
 
   // Security: only hand http(s) URLs to the OS — file:, smb:, custom schemes stay blocked.
   const openExternally = (url: string) => {
-    let protocol = "";
     try {
-      protocol = new URL(url).protocol;
+      const { protocol } = new URL(url);
+      if (protocol === "https:" || protocol === "http:") void shell.openExternal(url);
     } catch {
-      return;
+      // unparseable URL → not something to hand to the OS
     }
-    if (protocol === "https:" || protocol === "http:") void shell.openExternal(url);
   };
 
   // Security: never spawn in-app windows — external links go to the system browser.

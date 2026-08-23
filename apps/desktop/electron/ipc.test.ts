@@ -168,6 +168,28 @@ describe("registerBorgIpc streams", () => {
     ipc.dispose();
   });
 
+  it("does not cancel again on dispose a stream the renderer already cancelled", () => {
+    // streamCancel must also drop the map entry; a leftover entry would be
+    // cancelled a second time on quit.
+    const ipc = registerBorgIpc();
+    const { cancel } = openStream();
+
+    invoke(CHANNELS.streamCancel, event(), "s0");
+    ipc.dispose();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispose is idempotent: a second dispose cancels nothing again", () => {
+    // Window reload and app quit can both tear the bridge down; the map must
+    // be emptied by the first pass so the second finds nothing to cancel.
+    const ipc = registerBorgIpc();
+    const { cancel } = openStream();
+
+    ipc.dispose();
+    ipc.dispose();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
   it("does not cancel a finished stream on dispose", () => {
     // The map is the leak guard: an entry left behind after completion would be
     // cancelled again on quit.

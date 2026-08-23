@@ -48,6 +48,17 @@ describe("clampToDisplays", () => {
     expect(clampToDisplays(sliver, [MAIN])).toBeNull();
   });
 
+  it.each([
+    // MIN_VISIBLE (80px) is the boundary: exactly that much still counts as
+    // "enough title bar to grab", one pixel less does not — on either axis.
+    ["exactly 80px left at the right edge", { x: 1840, y: 100, width: 800, height: 600 }, true],
+    ["exactly 80px left above the bottom edge", { x: 100, y: 1000, width: 800, height: 600 }, true],
+    ["a 60px sliver above the bottom edge", { x: 100, y: 1020, width: 800, height: 600 }, false],
+    ["hanging off the top with 50px visible", { x: 100, y: -550, width: 800, height: 600 }, false],
+  ])("applies the 80px rule to a window with %s", (_case, bounds, kept) => {
+    expect(clampToDisplays(bounds, [MAIN])).toEqual(kept ? bounds : null);
+  });
+
   it("checks every display, not just the first", () => {
     displays.push({ bounds: { x: 1920, y: 0, width: 1920, height: 1080 } });
     const onSecond = { x: 2200, y: 100, width: 800, height: 600 };
@@ -78,6 +89,29 @@ describe("loadWindowState", () => {
   it("restores a position that is still on a display", () => {
     stored({ x: 40, y: 60, width: 900, height: 700, maximized: false });
     expect(loadWindowState()).toEqual({ x: 40, y: 60, width: 900, height: 700, maximized: false });
+    // The state lives in userData as text — not next to the binary, not binary.
+    expect(fs.readFileSync).toHaveBeenCalledWith("/tmp/borg-userdata/window-state.json", "utf8");
+  });
+
+  it.each([
+    // These values go straight into the BrowserWindow constructor; a string
+    // `x` from a hand-edited file must be dropped, not forwarded.
+    ["x", { x: "40", y: 60, width: 900, height: 700 }, { y: 60, width: 900, height: 700 }],
+    ["y", { x: 40, y: null, width: 900, height: 700 }, { x: 40, width: 900, height: 700 }],
+    [
+      "width",
+      { x: 40, y: 60, width: "900", height: 700 },
+      { x: 40, y: 60, width: 1240, height: 700 },
+    ],
+    [
+      "height",
+      { x: 3000, y: 60, width: 900, height: "tall" },
+      { x: 3000, y: 60, width: 900, height: 800 },
+    ],
+    ["maximized", { width: 900, height: 700, maximized: "yes" }, { width: 900, height: 700 }],
+  ])("drops a %s of the wrong type instead of handing it to the window", (_field, saved, want) => {
+    stored(saved);
+    expect(loadWindowState()).toEqual(want);
   });
 
   it("keeps the size but drops the position when the monitor is gone", () => {
@@ -121,6 +155,16 @@ describe("trackWindowState", () => {
     win.emit("maximize");
     vi.advanceTimersByTime(500);
     expect(written()).toEqual({ x: 40, y: 60, width: 900, height: 700, maximized: true });
+  });
+
+  it("persists the restored bounds after an unmaximize", () => {
+    // Leaving maximized is the last chance to learn the normal bounds before
+    // a quit; without this listener the un-maximized position is lost.
+    const win = makeWindow({ bounds: { x: 12, y: 34, width: 780, height: 560 } });
+    trackWindowState(win as never);
+    win.emit("unmaximize");
+    vi.advanceTimersByTime(500);
+    expect(written()).toEqual({ x: 12, y: 34, width: 780, height: 560, maximized: false });
   });
 
   it("writes immediately on close, without waiting for the debounce", () => {

@@ -45,7 +45,16 @@ export function loadWindowState(): WindowState {
   try {
     const parsed: unknown = JSON.parse(readFileSync(statePath(), "utf8"));
     if (parsed === null || typeof parsed !== "object") return DEFAULTS;
-    const state = parsed as WindowState;
+    const raw = parsed as Record<string, unknown>;
+    // Whitelist and type-check: these values go straight into the
+    // BrowserWindow constructor, and Electron does not forgive a string `x`
+    // from a hand-edited file. A wrong-typed field is dropped, not forwarded.
+    const state: WindowState = {};
+    if (typeof raw.x === "number") state.x = raw.x;
+    if (typeof raw.y === "number") state.y = raw.y;
+    if (typeof raw.width === "number") state.width = raw.width;
+    if (typeof raw.height === "number") state.height = raw.height;
+    if (typeof raw.maximized === "boolean") state.maximized = raw.maximized;
     const { x, y, width, height } = state;
     if (
       typeof x === "number" &&

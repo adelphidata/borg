@@ -27,6 +27,38 @@ describe("borgdCandidates", () => {
     expect(candidates[0]).toBe("/custom/borgd");
   });
 
+  it("trims the override and ignores a blank one", () => {
+    // A padded env var must resolve to the real file, and a blank one must not
+    // inject a whitespace "binary" ahead of the ladder.
+    const padded = borgdCandidates({
+      env: { BORG_DAEMON_BIN: "  /custom/borgd  " },
+      appPath: APP_PATH,
+      platform: "darwin",
+      pathDirs: [],
+    });
+    expect(padded[0]).toBe("/custom/borgd");
+
+    const blank = borgdCandidates({
+      env: { BORG_DAEMON_BIN: "   " },
+      appPath: APP_PATH,
+      platform: "darwin",
+      pathDirs: [],
+    });
+    expect(blank).not.toContain("   ");
+    expect(blank[0]).not.toBe("");
+  });
+
+  it("skips whitespace-only PATH entries rather than probing a relative borgd", () => {
+    const candidates = borgdCandidates({
+      env: {},
+      appPath: "/repo/apps/desktop",
+      platform: "linux",
+      pathDirs: ["   ", "/usr/bin"],
+    });
+    expect(candidates).toContain("/usr/bin/borgd");
+    expect(candidates).not.toContain(path.join("   ", "borgd"));
+  });
+
   it("looks inside the packaged app before anything on the machine", () => {
     // A shipped daemon must win: an old `borgd` on PATH would otherwise pair a
     // new app with a daemon that predates its protos.
@@ -107,6 +139,48 @@ describe("waitForSocket", () => {
     });
     expect(up).toBe(false);
   });
+
+  it("treats reaching the deadline exactly as expired", async () => {
+    // The deadline is a budget, not a grace period: at the boundary the wait
+    // is over, with no extra poll squeezed in.
+    const clock = [1_000, 1_500];
+    const reachable = vi.fn(async () => false);
+    const up = await waitForSocket("/s.sock", 500, {
+      reachable,
+      now: () => clock.shift() ?? 99_999,
+      wait: async () => {},
+    });
+    expect(up).toBe(false);
+    expect(reachable).toHaveBeenCalledTimes(1);
+  });
+
+  it("supplies a real clock when none is injected", async () => {
+    await expect(waitForSocket("/s.sock", 60_000, { reachable: async () => true })).resolves.toBe(
+      true,
+    );
+  });
+
+  it("pauses a real poll interval between probes by default", async () => {
+    vi.useFakeTimers();
+    try {
+      const reachable = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      let settled: boolean | "rejected" | null = null;
+      void waitForSocket("/s.sock", 60_000, { reachable, now: () => 0 }).then(
+        (r) => (settled = r),
+        () => (settled = "rejected"),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      // Still asleep: the retry must not be a busy-loop.
+      expect(settled).toBeNull();
+      expect(reachable).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(250);
+      expect(reachable).toHaveBeenCalledTimes(2);
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 /** Collects the statuses a boot reports, in order. */
@@ -150,28 +224,78 @@ describe("ensureDaemonRunning", () => {
   });
 
   it("says the engine is missing when no binary can be found", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const { seen, report } = recorder();
     const ok = await ensureDaemonRunning(base({ resolve: () => null }), report);
     expect(ok).toBe(false);
     expect(seen.at(-1)).toMatchObject({ state: "failed", message: NOT_INSTALLED, canRetry: true });
+    // The status is user-facing copy: it must name the remedy in plain words.
+    expect(NOT_INSTALLED).toContain("Reinstall Borg");
+    // The diagnostic detail — every path that was tried — belongs in stderr.
+    expect(err).toHaveBeenCalledWith(
+      expect.stringContaining("no borgd binary"),
+      expect.stringContaining("/usr/bin/borgd"),
+    );
+    const tried = err.mock.calls.find((c) => String(c[0]).includes("no borgd binary"))?.[1];
+    expect(tried).toContain(", ");
   });
 
   it("reports a failed spawn as a retryable failure", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const { seen, report } = recorder();
     const ok = await ensureDaemonRunning(base({ launch: () => new Error("EACCES") }), report);
     expect(ok).toBe(false);
     expect(seen.at(-1)).toMatchObject({ state: "failed", message: DID_NOT_START });
+    expect(DID_NOT_START).toContain("Try again");
+    // stderr names the binary and the spawn error; the user-facing copy never does.
+    expect(err).toHaveBeenCalledWith(
+      expect.stringContaining("could not start /usr/bin/borgd: EACCES"),
+    );
   });
 
   it("does not claim success when the daemon never binds its socket", async () => {
     // The spawn succeeding proves nothing; only the socket does.
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const { seen, report } = recorder();
     const ok = await ensureDaemonRunning(base({ waitFor: async () => false }), report);
     expect(ok).toBe(false);
     expect(seen.at(-1)).toMatchObject({ state: "failed", message: DID_NOT_START });
+    expect(err).toHaveBeenCalledWith(
+      expect.stringContaining("started /usr/bin/borgd but its socket never answered"),
+    );
+  });
+
+  it("hands the injected socket path, timeout and prober to the waiter", async () => {
+    // Every injected dependency must reach the waiter as given; falling back
+    // to the machine's defaults would probe the wrong socket with the wrong
+    // budget.
+    const reachable = vi.fn(async () => false);
+    const waitFor = vi.fn(async () => true);
+    const ok = await ensureDaemonRunning(
+      base({ reachable, waitFor, readyTimeoutMs: 1_234 }),
+      () => {},
+    );
+    expect(ok).toBe(true);
+    expect(reachable).toHaveBeenCalledWith("/home/me/.borg/borgd.sock");
+    expect(waitFor).toHaveBeenCalledWith("/home/me/.borg/borgd.sock", 1_234, { reachable });
+  });
+
+  it("builds candidates for the injected platform, not the host's", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let captured: string[] = [];
+    await ensureDaemonRunning(
+      base({
+        platform: "win32",
+        env: { PATH: "C:\\bin" },
+        resolve: (c) => {
+          captured = c;
+          return null;
+        },
+      }),
+      () => {},
+    );
+    expect(captured.length).toBeGreaterThan(0);
+    expect(captured.every((c) => c.endsWith("borgd.exe"))).toBe(true);
   });
 
   it("keeps paths and commands out of what the user is shown", async () => {

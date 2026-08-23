@@ -111,8 +111,9 @@ export interface StubWindow {
   setBounds(bounds: { x: number; y: number; width: number; height: number }): void;
   show(): void;
   hide(): void;
-  focus(): void;
-  restore(): void;
+  /** Spies, so a test can assert the code focused or restored — or didn't. */
+  focus: Mock<() => void>;
+  restore: Mock<() => void>;
   destroy(): void;
   /** Spies, so a test can read what the code under test loaded or set. */
   loadURL: Mock<(url: string) => Promise<void>>;
@@ -168,10 +169,10 @@ export function makeWindow(overrides: Partial<StubWindow> = {}): StubWindow {
     hide: () => {
       win.visible = false;
     },
-    focus: () => {},
-    restore: () => {
+    focus: vi.fn(),
+    restore: vi.fn(() => {
       win.minimized = false;
-    },
+    }),
     destroy: () => {
       win.destroyed = true;
     },
@@ -221,6 +222,8 @@ export interface StubNotification {
   options: { title: string; body: string };
   shown: boolean;
   closed: boolean;
+  /** How many times `close()` was called — a double close is a bug signal. */
+  closeCount: number;
   listeners: Map<string, (() => void)[]>;
   show(): void;
   close(): void;
@@ -237,13 +240,16 @@ export class Notification {
       options,
       shown: false,
       closed: false,
+      closeCount: 0,
       listeners: new Map(),
       show: () => {
         record.shown = true;
       },
+      // Electron's `close` event is reported back by the OS asynchronously, so
+      // `close()` does not fire it here — tests emit it explicitly.
       close: () => {
         record.closed = true;
-        record.emit("close");
+        record.closeCount += 1;
       },
       on: (event, listener) => {
         record.listeners.set(event, [...(record.listeners.get(event) ?? []), listener]);

@@ -58,10 +58,10 @@ vi.mock("./menu", () => ({
   installApplicationMenu: (...args: unknown[]) => spies.installApplicationMenu(...args),
 }));
 vi.mock("./window-state", () => ({
-  loadWindowState: (...args: unknown[]) => {
-    spies.loadWindowState(...args);
-    return { width: 1240, height: 800 };
-  },
+  // A test can queue a saved state on the spy (e.g. a maximized one); the
+  // default is a plain restored window.
+  loadWindowState: (...args: unknown[]) =>
+    spies.loadWindowState(...args) ?? { width: 1240, height: 800 },
   trackWindowState: (...args: unknown[]) => spies.trackWindowState(...args),
 }));
 
@@ -156,6 +156,72 @@ describe("main process launch", () => {
     });
   });
 
+  it("creates the window hidden, with the dark chrome it flashes otherwise", async () => {
+    // `show: false` avoids a blank-window flash; the background color keeps
+    // pre-paint frames from flashing white over the dark theme.
+    restores.push(await launch());
+    expect(stub.constructedOptions[0]).toMatchObject({
+      show: false,
+      titleBarStyle: "hiddenInset",
+      trafficLightPosition: { x: 15, y: 14 },
+      backgroundColor: "#0B0E0B",
+    });
+  });
+
+  it("re-maximizes a window that was maximized last session", async () => {
+    spies.loadWindowState.mockReturnValueOnce({ width: 1240, height: 800, maximized: true });
+    restores.push(await launch());
+    const win = mainWindow();
+    win.emit("ready-to-show");
+    expect(win.maximized).toBe(true);
+  });
+
+  it("does not maximize a window that was not maximized before", async () => {
+    restores.push(await launch());
+    const win = mainWindow();
+    win.emit("ready-to-show");
+    expect(win.maximized).toBe(false);
+    expect(win.visible).toBe(true);
+  });
+
+  it("boots the daemon against the app root, resources only when packaged", async () => {
+    restores.push(await launch());
+    expect(spies.registerBoot).toHaveBeenCalledWith({
+      appPath: APP_ROOT,
+      resourcesPath: undefined,
+    });
+    restores.pop()?.();
+
+    Object.defineProperty(process, "resourcesPath", { configurable: true, value: "/res" });
+    try {
+      restores.push(await launch({ packaged: true }));
+      expect(spies.registerBoot).toHaveBeenCalledWith({ appPath: APP_ROOT, resourcesPath: "/res" });
+    } finally {
+      delete (process as { resourcesPath?: string }).resourcesPath;
+    }
+  });
+
+  it("wires the quick-entry panel with the global hotkey and the app bundle", async () => {
+    restores.push(await launch({ dev: true }));
+    expect(spies.registerQuickEntry).toHaveBeenCalledWith({
+      accelerator: "CmdOrCtrl+Shift+Space",
+      isDev: true,
+      devServerUrl: "http://localhost:5173",
+      indexHtml: INDEX_HTML,
+      preload: path.join(APP_ROOT, "dist-electron", "preload.js"),
+    });
+  });
+
+  it("hands the native bridge a live view of the main window, not a snapshot", async () => {
+    // The window can be closed and recreated; a captured reference would send
+    // reveals to a destroyed window.
+    restores.push(await launch({ platform: "darwin" }));
+    const getWindow = spies.registerNativeIpc.mock.calls[0][0] as () => unknown;
+    expect(getWindow()).toBe(mainWindow());
+    mainWindow().emit("closed");
+    expect(getWindow()).toBeNull();
+  });
+
   it("resolves the preload against the app root, not the source directory", async () => {
     // bun's bundler rewrites __dirname to electron/, where preload.js does not
     // exist — this has regressed once.
@@ -199,6 +265,14 @@ describe("main process launch", () => {
     restores.push(await launch());
     stub.emitApp("second-instance");
     expect(spies.raise).toHaveBeenCalledWith(mainWindow());
+  });
+
+  it("raises nothing on a second launch when no window is left", async () => {
+    restores.push(await launch({ platform: "darwin" }));
+    mainWindow().emit("closed"); // last window gone; app keeps running on macOS
+    spies.raise.mockClear();
+    stub.emitApp("second-instance");
+    expect(spies.raise).not.toHaveBeenCalled();
   });
 
   it("tears every subsystem down on quit", async () => {
@@ -334,5 +408,23 @@ describe("window lifecycle", () => {
     const before = stub.appState.quit;
     stub.emitApp("window-all-closed");
     expect(stub.appState.quit).toBeGreaterThan(before);
+  });
+
+  it("stays alive on window-all-closed on macOS", async () => {
+    restores.push(await launch({ platform: "darwin" }));
+    stub.emitApp("window-all-closed");
+    expect(stub.appState.quit).toBe(0);
+  });
+
+  it("keeps the current window when a stale closed event arrives from an old one", async () => {
+    restores.push(await launch({ platform: "darwin" }));
+    const first = mainWindow();
+    first.emit("closed");
+    stub.emitApp("activate"); // rebuilds — the second window is now the main one
+    const second = stub.constructedWindows[1];
+    first.emit("closed"); // a late event from the already-closed window
+    stub.emitApp("activate");
+    expect(spies.raise).toHaveBeenCalledWith(second);
+    expect(stub.constructedWindows).toHaveLength(2);
   });
 });

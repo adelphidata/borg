@@ -151,6 +151,22 @@ describe("launching the daemon", () => {
     expect(child.spawn.mock.calls[0][2]).toMatchObject({ cwd: undefined });
   });
 
+  it("probes the candidates itself when no resolver is injected", async () => {
+    // The production path: the executable check on disk decides which
+    // candidate is spawned.
+    fs.accessSync.mockImplementation((file: string) => {
+      if (file !== "/custom/borgd") throw new Error("EACCES");
+    });
+    child.spawn.mockReturnValue({ unref: vi.fn() });
+    const { resolve: _omitted, ...withoutResolver } = deps;
+    const ok = await ensureDaemonRunning(
+      { ...withoutResolver, env: { BORG_DAEMON_BIN: "/custom/borgd" } },
+      () => {},
+    );
+    expect(ok).toBe(true);
+    expect(child.spawn).toHaveBeenCalledWith("/custom/borgd", [], expect.anything());
+  });
+
   it("turns a spawn failure into a reported failure rather than a crash", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     child.spawn.mockImplementation(() => {

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/api/schema/stryker-core.json",
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "inPlace": true,
+  "vitest": { "configFile": "vitest.config.mts", "related": false },
+  "reporters": ["clear-text", "json", "progress"],
+  "mutate": [
+    "electron/**/*.ts",
+    "!electron/**/*.test.ts",
+    "!electron/test/**",
+    "!electron/channels.ts"
+  ],
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}

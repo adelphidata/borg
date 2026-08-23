@@ -4,6 +4,7 @@ import { CHANNELS } from "./channels";
 vi.mock("electron", () => import("./test/electron-stub"));
 
 const {
+  app,
   appState,
   handlers,
   invoke,
@@ -67,11 +68,21 @@ describe("raise", () => {
     expect(win.visible).toBe(true);
   });
 
-  it("leaves a destroyed window alone", () => {
-    const win = makeWindow();
+  it("leaves a destroyed window entirely alone", () => {
+    const win = makeWindow({ visible: false, minimized: true });
     win.destroy();
     expect(() => raise(win as never)).not.toThrow();
-    expect(win.visible).toBe(true);
+    expect(win.visible).toBe(false);
+    expect(win.restore).not.toHaveBeenCalled();
+    expect(win.focus).not.toHaveBeenCalled();
+  });
+
+  it("focuses without restoring a window that is not minimized", () => {
+    // Restoring a normal window is a visible flicker on some platforms.
+    const win = makeWindow();
+    raise(win as never);
+    expect(win.restore).not.toHaveBeenCalled();
+    expect(win.focus).toHaveBeenCalled();
   });
 });
 
@@ -162,6 +173,45 @@ describe("registerNativeIpc", () => {
     expect(win.sent).toEqual([]);
   });
 
+  it("ignores a click after the window that sent it is gone", () => {
+    const win = makeWindow();
+    windows.push(win);
+    registerNativeIpc(() => win as never);
+
+    invoke(
+      CHANNELS.notify,
+      { sender: senderOf(win) },
+      { title: "Reply", body: "", sessionId: "sess-3" },
+    );
+    windows.length = 0; // the window closed before the user clicked the toast
+    expect(() => notifications[0].emit("click")).not.toThrow();
+  });
+
+  it("does not track an unkeyed notification, so dispose leaves it alone", () => {
+    // Only keyed notifications are replaceable; tracking unkeyed ones would
+    // make dispose retract toasts that should outlive the app.
+    const win = makeWindow();
+    windows.push(win);
+    const native = registerNativeIpc(() => win as never);
+
+    invoke(CHANNELS.notify, { sender: senderOf(win) }, { title: "One", body: "" });
+    native.dispose();
+    expect(notifications[0].closed).toBe(false);
+  });
+
+  it("keeps the replacement live when the replaced toast's close arrives late", () => {
+    const win = makeWindow();
+    windows.push(win);
+    const native = registerNativeIpc(() => win as never);
+
+    invoke(CHANNELS.notify, { sender: senderOf(win) }, { title: "One", body: "", key: "s1" });
+    invoke(CHANNELS.notify, { sender: senderOf(win) }, { title: "Two", body: "", key: "s1" });
+    notifications[0].emit("close"); // the OS reports the replaced toast late
+    native.dispose();
+    // The replacement was still tracked, so dispose closes it.
+    expect(notifications[1].closed).toBe(true);
+  });
+
   it("forgets a notification once it closes, so a later key reuse is clean", () => {
     const win = makeWindow();
     windows.push(win);
@@ -202,6 +252,26 @@ describe("registerNativeIpc", () => {
     expect(main.visible).toBe(true);
   });
 
+  it("ignores a hide request from a window that no longer exists", () => {
+    registerNativeIpc(() => null);
+    expect(() => invoke(CHANNELS.hideWindow, { sender: {} })).not.toThrow();
+  });
+
+  it("skips the badge where the platform offers none", () => {
+    // Some Linux desktops have no badge; Electron then has no setBadgeCount.
+    const win = makeWindow();
+    windows.push(win);
+    registerNativeIpc(() => win as never);
+
+    const real = app.setBadgeCount;
+    (app as { setBadgeCount: unknown }).setBadgeCount = undefined;
+    try {
+      expect(() => invoke(CHANNELS.setBadge, {}, 3)).not.toThrow();
+    } finally {
+      app.setBadgeCount = real;
+    }
+  });
+
   it("sets the dock badge, and never to a negative count", () => {
     const win = makeWindow();
     windows.push(win);
@@ -229,5 +299,20 @@ describe("registerNativeIpc", () => {
     ]) {
       expect(handlers.has(channel)).toBe(false);
     }
+  });
+
+  it("clears its ledger on dispose, so a fresh registration starts clean", () => {
+    // Without the clear, a re-registered bridge would find the old disposed
+    // toast under the same key and close it a second time.
+    const win = makeWindow();
+    windows.push(win);
+    const first = registerNativeIpc(() => win as never);
+    invoke(CHANNELS.notify, { sender: senderOf(win) }, { title: "One", body: "", key: "s1" });
+    first.dispose();
+
+    const second = registerNativeIpc(() => win as never);
+    invoke(CHANNELS.notify, { sender: senderOf(win) }, { title: "Two", body: "", key: "s1" });
+    expect(notifications[0].closeCount).toBe(1);
+    second.dispose();
   });
 });

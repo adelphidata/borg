@@ -17,6 +17,83 @@ type Item = MenuItemConstructorOptions;
 
 const template = () => menuState.template as Item[];
 
+function withPlatform(platform: NodeJS.Platform, run: () => void): void {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(process, "platform", { configurable: true, value: real });
+  }
+}
+
+/** The declarative face of a menu item: everything except click handlers. */
+type Shape = {
+  label?: string;
+  role?: string;
+  type?: string;
+  accelerator?: string;
+  submenu?: Shape[];
+};
+
+function shapeOf(items: Item[]): Shape[] {
+  return items.map((item) => {
+    const s: Shape = {};
+    if (item.label !== undefined) s.label = item.label;
+    if (item.role !== undefined) s.role = item.role;
+    if (item.type !== undefined) s.type = item.type;
+    if (item.accelerator !== undefined) s.accelerator = item.accelerator as string;
+    if (Array.isArray(item.submenu)) s.submenu = shapeOf(item.submenu as Item[]);
+    return s;
+  });
+}
+
+const sep: Shape = { type: "separator" };
+
+/** An action item's shape: its label under the chord table's accelerator. */
+function act(label: string, id: string): Shape {
+  const accelerator = acceleratorFor(id);
+  return accelerator === undefined ? { label } : { label, accelerator };
+}
+
+const editMenu = (isMac: boolean): Shape => ({
+  label: "Edit",
+  submenu: [
+    { role: "undo" },
+    { role: "redo" },
+    sep,
+    { role: "cut" },
+    { role: "copy" },
+    { role: "paste" },
+    // Pasting model output into the composer should not carry styling.
+    ...(isMac ? [{ role: "pasteAndMatchStyle" }] : []),
+    { role: "selectAll" },
+  ],
+});
+
+const viewMenu: Shape = {
+  label: "View",
+  submenu: [
+    act("Find in Conversation…", "find-in-conversation"),
+    act("Find Conversation…", "search-sessions"),
+    act("Command Palette…", "command-palette"),
+    sep,
+    { role: "reload" },
+    { role: "toggleDevTools" },
+    sep,
+    { role: "resetZoom" },
+    { role: "zoomIn" },
+    { role: "zoomOut" },
+    sep,
+    { role: "togglefullscreen" },
+  ],
+};
+
+const helpMenu: Shape = {
+  role: "help",
+  submenu: [{ label: "Borg on GitHub" }, act("Check for Updates…", "check-for-updates")],
+};
+
 function findItem(label: string): Item {
   const walk = (items: Item[]): Item | undefined => {
     for (const item of items) {
@@ -40,14 +117,63 @@ describe("installApplicationMenu", () => {
     expect(menuState.applied).not.toBeNull();
   });
 
-  it("gives every top-level menu the app expects", () => {
-    installApplicationMenu();
-    const labels = template().map((item) => item.label ?? item.role);
-    expect(labels).toContain("File");
-    expect(labels).toContain("Edit");
-    expect(labels).toContain("View");
-    expect(labels).toContain("Window");
-    expect(labels).toContain("help");
+  it("builds the exact macOS menu — the copy is the spec", () => {
+    withPlatform("darwin", () => {
+      installApplicationMenu();
+      expect(shapeOf(template())).toEqual([
+        {
+          label: "Borg",
+          submenu: [
+            { role: "about" },
+            sep,
+            // Settings lives in the application menu, where Mac users look.
+            act("Settings…", "open-settings"),
+            sep,
+            { role: "services" },
+            sep,
+            { role: "hide" },
+            { role: "hideOthers" },
+            { role: "unhide" },
+            sep,
+            { role: "quit" },
+          ],
+        },
+        {
+          label: "File",
+          submenu: [act("New Conversation", "new-conversation"), sep, { role: "close" }],
+        },
+        editMenu(true),
+        viewMenu,
+        {
+          label: "Window",
+          submenu: [{ role: "minimize" }, { role: "zoom" }, sep, { role: "front" }],
+        },
+        helpMenu,
+      ]);
+    });
+  });
+
+  it("builds the exact Windows/Linux menu — the copy is the spec", () => {
+    withPlatform("win32", () => {
+      installApplicationMenu();
+      expect(shapeOf(template())).toEqual([
+        {
+          label: "File",
+          submenu: [
+            act("New Conversation", "new-conversation"),
+            sep,
+            // No application menu here, so Settings would be unreachable.
+            act("Settings…", "open-settings"),
+            // Closing the last window should quit, not leave a stray process.
+            { role: "quit" },
+          ],
+        },
+        editMenu(false),
+        viewMenu,
+        { label: "Window", submenu: [{ role: "minimize" }, { role: "close" }] },
+        helpMenu,
+      ]);
+    });
   });
 
   it("dispatches a keybind action rather than acting itself", () => {
@@ -93,38 +219,6 @@ describe("installApplicationMenu", () => {
     ] as const) {
       (findItem(label).click as () => void)();
       expect(win.sent.at(-1)?.args).toEqual([action]);
-    }
-  });
-
-  it("puts Settings in the File menu where there is no application menu", () => {
-    // Windows and Linux have no app menu, so Settings would be unreachable.
-    const real = process.platform;
-    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-    try {
-      installApplicationMenu();
-      const file = template().find((item) => item.label === "File");
-      const labels = (file?.submenu as Item[]).map((i) => i.label ?? i.role);
-      expect(labels).toContain("Settings…");
-      // Closing the last window on Windows should quit, not leave a dock icon.
-      expect(labels).toContain("quit");
-      expect(template()[0].label).toBe("File");
-    } finally {
-      Object.defineProperty(process, "platform", { configurable: true, value: real });
-    }
-  });
-
-  it("keeps Settings in the application menu on macOS", () => {
-    const real = process.platform;
-    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
-    try {
-      installApplicationMenu();
-      const file = template().find((item) => item.label === "File");
-      const labels = (file?.submenu as Item[]).map((i) => i.label ?? i.role);
-      expect(labels).not.toContain("Settings…");
-      expect(labels).toContain("close");
-      expect(template()[0].label).toBe("Borg");
-    } finally {
-      Object.defineProperty(process, "platform", { configurable: true, value: real });
     }
   });
 
