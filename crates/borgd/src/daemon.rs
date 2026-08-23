@@ -564,8 +564,8 @@ async fn bootstrap_pki(borg_home: &Path, listen_tcp: Option<&str>) -> Result<Pki
             .context("ensure server cert")?
     };
     let server_tls_material = ServerCertMaterial {
-        server_cert_pem: server_cert_pem.clone(),
-        server_key_pem: server_key_pem.clone(),
+        server_cert_pem,
+        server_key_pem,
         ca_cert_pem: ca_cert_pem.clone(),
     };
     Ok(PkiBootstrap {
@@ -795,7 +795,7 @@ fn spawn_pairing_listener(
         ca_cert_pem: ca_cert_pem.to_string(),
         ca_key_pem: ca_key_pem.to_string(),
     };
-    let listener = BootstrapListener::new(pair_sock.clone());
+    let listener = BootstrapListener::new(pair_sock);
     tokio::spawn(async move {
         if let Err(e) = listener.serve(bootstrap_state).await {
             tracing::warn!(error = %e, "pairing bootstrap listener exited");
