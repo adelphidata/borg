@@ -16,9 +16,9 @@ use std::path::Path;
 /// closes the file handle, which causes the kernel to release the lock.
 #[derive(Debug)]
 pub struct PidLock {
-    /// File handle holding the flock. Dropping it releases the lock.
-    /// (Underscored — the field is never read; its only job is to live.)
-    _file: File,
+    /// File handle holding the flock. Kept alive for the lock's lifetime and
+    /// unlocked explicitly on drop.
+    file: File,
 }
 
 impl PidLock {
@@ -48,12 +48,22 @@ impl PidLock {
         writer.set_len(0).context("truncating PID file")?;
         writeln!(writer, "{pid}").context("writing PID")?;
 
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
 impl Drop for PidLock {
     fn drop(&mut self) {
+        // Release the flock explicitly rather than relying on the close.
+        // Closing only drops the lock once *every* descriptor referring to
+        // this open file description is gone — and a child forked by another
+        // thread between our `open` and its `exec` briefly owns one. An
+        // explicit unlock releases the description's lock immediately, so a
+        // restart can never see a phantom "already running".
+        if let Err(e) = fs2::FileExt::unlock(&self.file) {
+            tracing::warn!(error = %e, "releasing borgd PID file lock");
+        }
+
         // Intentionally do NOT unlink the PID file. The flock is the source of
         // truth — the kernel releases it when the file handle closes (here),
         // and a stale file at the path is harmless because the next acquirer
@@ -103,6 +113,28 @@ mod tests {
         // The file may have been removed by Drop; either way, a fresh acquire
         // should succeed.
         PidLock::acquire(&path).expect("second acquire after drop");
+    }
+
+    #[test]
+    fn drop_releases_lock_even_when_a_duplicate_descriptor_survives() {
+        // Real failure mode: borgd spawns children, and a fork by another
+        // thread duplicates every open descriptor for the moment before exec.
+        // The kernel keeps a flock alive until *all* descriptors on the open
+        // file description close, so relying on the close alone would leave a
+        // phantom lock behind and make the next `borgd` start refuse to boot.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("borgd.pid");
+
+        let duplicate = {
+            let lock = PidLock::acquire(&path).expect("first");
+            // Stands in for the descriptor a forked child holds; it outlives
+            // the PidLock exactly the way that child's copy can.
+            lock.file.try_clone().expect("duplicate descriptor")
+        };
+
+        PidLock::acquire(&path)
+            .expect("acquire must succeed with a duplicate descriptor still open");
+        drop(duplicate);
     }
 
     #[test]

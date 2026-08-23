@@ -15,7 +15,7 @@ const transport = {} as BorgTransport;
 /** A shell whose boot status the test drives. */
 function bridge(initial: BootStatus) {
   let push: ((status: BootStatus) => void) | undefined;
-  const retry = vi.fn();
+  const retry = vi.fn(() => Promise.resolve());
   const native: NativeBridge = {
     ...NO_NATIVE,
     boot: {

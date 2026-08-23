@@ -1,6 +1,12 @@
 import { BrowserWindow, ipcMain } from "electron";
 import { CHANNELS, type WireBootStatus } from "./channels";
-import { BOOT_STEPS, ensureDaemonRunning, type BootDeps } from "./daemon";
+import {
+  BOOT_STEPS,
+  DID_NOT_START,
+  bootFailure,
+  ensureDaemonRunning,
+  type BootDeps,
+} from "./daemon";
 
 /**
  * The boot conversation between the shell and the window.
@@ -30,9 +36,18 @@ export function registerBoot(deps: BootDeps): {
   const start = (): Promise<boolean> => {
     // A retry arriving mid-attempt joins the attempt already running rather
     // than racing a second daemon into the same socket.
-    inFlight ??= ensureDaemonRunning(deps, publish).finally(() => {
-      inFlight = null;
-    });
+    // A throw anywhere in the attempt must still end in a status the renderer
+    // can act on: an unreported failure leaves the boot screen spinning on a
+    // step that will never finish, with no retry and no way past it.
+    inFlight ??= ensureDaemonRunning(deps, publish)
+      .catch((error: unknown) => {
+        console.error("[borg] boot attempt failed:", error);
+        publish(bootFailure(DID_NOT_START));
+        return false;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
     return inFlight;
   };
 

@@ -122,7 +122,7 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
                 rel="noreferrer"
                 className="mt-2.5 inline-block text-[12.5px] leading-none text-ink3 no-underline hover:text-ink"
               >
-                Get a {selected.label} key ↗
+                Get a key from {selected.label} ↗
               </a>
             )}
           </>

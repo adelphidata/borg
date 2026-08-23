@@ -17,7 +17,8 @@ export function DaemonState<T>({
   label,
   children,
 }: {
-  query: Query<T>;
+  /** A `useQuery` result. `refetch` is optional so a bare `Query` still fits. */
+  query: Query<T> & { refetch?: () => void };
   /** What was being fetched, used in the failure line: "Could not load {label}." */
   label: string;
   children: (data: T) => ReactNode;
@@ -47,8 +48,11 @@ export function DaemonState<T>({
           Could not load {label}.
         </div>
         <div className="text-[12.5px] leading-[1.4] text-ink2">{message}</div>
+        {/* Starting Borg is only half the remedy: the call that failed has to
+            run again, or the page keeps the outage on screen and the button
+            looks like it did nothing. */}
         {kind === "desktop" && error.isUnavailable && (
-          <Pill variant="primary" onClick={() => native.boot.retry()}>
+          <Pill variant="primary" onClick={() => void native.boot.retry().then(query.refetch)}>
             Start Borg
           </Pill>
         )}

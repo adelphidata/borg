@@ -106,6 +106,22 @@ describe("registerBoot", () => {
     boot.dispose();
   });
 
+  it("ends a boot that throws in a state the user can act on", async () => {
+    // Anything unexpected still has to land on the failure screen: a silent
+    // rejection would leave the window on a step that never finishes.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const boot = registerBoot({
+      ...deps,
+      reachable: async () => false,
+      resolve: () => {
+        throw new Error("boom");
+      },
+    });
+    await expect(boot.start()).resolves.toBe(false);
+    expect(read()).toMatchObject({ state: "failed", canRetry: true });
+    boot.dispose();
+  });
+
   it("leaves no handlers behind when disposed", () => {
     const boot = registerBoot(deps);
     boot.dispose();

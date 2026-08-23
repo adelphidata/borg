@@ -91,15 +91,28 @@ const native: NativeBridge = {
   },
   boot: {
     subscribe: (handler) => {
+      let live = true;
       const detach = subscribe<WireBootStatus>(CHANNELS.bootStatus, handler);
       // Replay whatever the shell has already decided: a window created after
-      // the daemon came up would otherwise never hear a thing.
-      void ipcRenderer.invoke(CHANNELS.bootRead).then((status: WireBootStatus) => handler(status));
-      return detach;
+      // the daemon came up would otherwise never hear a thing. The reply can
+      // land after the caller has gone (a reload mid-flight) or never come at
+      // all (handlers torn down on quit), so neither outcome may escape here.
+      void ipcRenderer
+        .invoke(CHANNELS.bootRead)
+        .then((status: WireBootStatus) => {
+          if (live) handler(status);
+        })
+        .catch(() => {});
+      return () => {
+        live = false;
+        detach();
+      };
     },
-    retry: () => {
-      void ipcRenderer.invoke(CHANNELS.bootRetry);
-    },
+    retry: () =>
+      ipcRenderer.invoke(CHANNELS.bootRetry).then(
+        () => {},
+        () => {},
+      ),
   },
   updates: {
     subscribe: (handler) => subscribe<WireUpdateStatus>(CHANNELS.updateStatus, handler),

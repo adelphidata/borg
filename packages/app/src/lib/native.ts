@@ -63,8 +63,9 @@ export interface NativeBridge {
   boot: {
     /** Pushes the current status at once, then every change. */
     subscribe(handler: (status: BootStatus) => void): () => void;
-    /** Tries the failed boot again. */
-    retry(): void;
+    /** Tries the failed boot again. Resolves once the attempt has settled, so
+     * a caller can re-run whatever failed while Borg was down. */
+    retry(): Promise<void>;
   };
   updates: {
     subscribe(handler: (status: UpdateStatus) => void): () => void;
@@ -93,7 +94,7 @@ export const NO_NATIVE: NativeBridge = {
       handler({ state: "ready", message: "Ready", progress: 1, canRetry: false });
       return noop;
     },
-    retry: noop,
+    retry: () => Promise.resolve(),
   },
   updates: {
     subscribe: unsubscribe,

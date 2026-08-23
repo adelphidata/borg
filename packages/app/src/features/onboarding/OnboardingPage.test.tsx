@@ -41,7 +41,7 @@ describe("OnboardingPage", () => {
     const { transport } = stubTransport();
     toProviderStep(transport);
     fireEvent.click(screen.getByText("Anthropic"));
-    const link = screen.getByText("Get a Anthropic key ↗") as HTMLAnchorElement;
+    const link = screen.getByText("Get a key from Anthropic ↗") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toBe("https://console.anthropic.com/settings/keys");
   });
 
@@ -50,7 +50,7 @@ describe("OnboardingPage", () => {
     toProviderStep(transport);
     fireEvent.click(screen.getByText("Ollama"));
     expect(screen.queryByPlaceholderText(/API key/)).toBeNull();
-    expect(screen.queryByText(/Get a .* key/)).toBeNull();
+    expect(screen.queryByText(/Get a key from/)).toBeNull();
   });
 
   it("holds back the next step until a key has been pasted", () => {
