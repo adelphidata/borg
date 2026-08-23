@@ -262,6 +262,7 @@ jobs:
         # Coverage thresholds live in each package's vitest.config; this is
         # where a drop below them fails the build.
         run: |
+          bun run --cwd packages/client test --coverage.enabled
           bun run --cwd packages/ui test --coverage.enabled
           bun run --cwd packages/app test --coverage.enabled
           bun run --cwd apps/desktop test --coverage.enabled

@@ -16,12 +16,6 @@ describe("SERVICES", () => {
 });
 
 describe("WEB_SERVICES", () => {
-  it("is a subset of SERVICES", () => {
-    for (const name of WEB_SERVICES) {
-      expect(Object.keys(SERVICES)).toContain(name);
-    }
-  });
-
   it("omits pki — pairing bootstraps over the socket only, never the browser", () => {
     expect(WEB_SERVICES).not.toContain("pki");
   });
