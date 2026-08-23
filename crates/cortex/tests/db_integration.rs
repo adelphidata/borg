@@ -331,6 +331,118 @@ async fn a_missed_run_reaches_the_surfaces_that_report_task_health() {
     );
 }
 
+/// A missed-run note must not clobber a real failure diagnosis.
+///
+/// The stall scan re-fires every few minutes for a task whose `next_run`
+/// keeps drifting, so an unconditional stamp would replace an actionable
+/// error (a 401 from the provider) with a generic "missed run" note the user
+/// cannot act on — and keep replacing it, so the real error never resurfaces.
+#[tokio::test]
+async fn a_missed_run_note_does_not_clobber_a_real_failure_diagnosis() {
+    let db = Database::test_db().await;
+    let now = chrono::Utc::now().timestamp();
+    let task = NewTask {
+        id: "nightly",
+        name: "Nightly summary",
+        prompt: "Summarize",
+        schedule_type: "interval",
+        schedule_expr: "24h",
+        timezone: "UTC",
+        next_run: Some(now),
+        max_retries: Some(0),
+        timeout_ms: Some(60_000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+        continuity: false,
+    };
+    db.create_task(&task).await.expect("create task");
+    db.set_task_retry("nightly", 1, "provider rejected key (401)", now + 60)
+        .await
+        .expect("set retry");
+
+    db.record_missed_run("nightly", now, "self-healing: next_run drifted")
+        .await
+        .expect("record missed run");
+
+    let row = db
+        .get_task_by_id("nightly")
+        .await
+        .expect("get")
+        .expect("found");
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("provider rejected key (401)"),
+        "the specific diagnosis must survive the missed-run stamp"
+    );
+    // The audit row is still written regardless.
+    let runs = db.task_run_history("nightly", 5).await.expect("history");
+    assert_eq!(runs.first().map(|r| r.status.as_str()), Some("missed"));
+}
+
+/// Continuity history must be `limit` real prior outputs, not `limit` rows.
+///
+/// The in-flight run's own row (status `running`, result NULL) is inserted
+/// before dispatch, and failed or missed rows carry no result either — none
+/// of them may consume a slot, or a continuity task sees fewer prior results
+/// than advertised (possibly zero) and repeats itself.
+#[tokio::test]
+async fn result_history_slots_are_not_consumed_by_resultless_rows() {
+    let db = Database::test_db().await;
+    let now = chrono::Utc::now().timestamp();
+    let task = NewTask {
+        id: "watch",
+        name: "Watcher",
+        prompt: "Watch",
+        schedule_type: "interval",
+        schedule_expr: "1h",
+        timezone: "UTC",
+        next_run: Some(now),
+        max_retries: Some(0),
+        timeout_ms: Some(60_000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+        continuity: true,
+    };
+    db.create_task(&task).await.expect("create task");
+
+    // Three old runs with results, then a failed run, a missed run, and the
+    // current in-flight row — the three newest rows all lack a result.
+    for (i, out) in ["oldest", "middle", "newest"].iter().enumerate() {
+        db.record_task_run("watch", now - 600 + i as i64, 5, Some(out), None)
+            .await
+            .expect("record");
+    }
+    db.record_task_run("watch", now - 200, 5, None, Some("boom"))
+        .await
+        .expect("record failed");
+    db.record_missed_run("watch", now - 100, "daemon was down")
+        .await
+        .expect("record missed");
+    db.start_task_run("watch", now)
+        .await
+        .expect("start running");
+
+    let runs = db.task_result_history("watch", 3).await.expect("history");
+    let results: Vec<_> = runs.iter().filter_map(|r| r.result.as_deref()).collect();
+    assert_eq!(
+        results,
+        vec!["newest", "middle", "oldest"],
+        "all three real prior outputs must be returned, newest first"
+    );
+}
+
 /// Continuity round-trips through the schema and is opt-in.
 ///
 /// Off by default matters: carrying prior output costs context on every fire,

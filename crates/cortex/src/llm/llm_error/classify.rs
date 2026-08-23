@@ -146,6 +146,30 @@ fn matches_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
 
+/// Request parameters Borg never puts on the wire, on any route. When a 400
+/// rejects one of these by name, the provider's own gateway injected the field
+/// into its upstream call and then rejected it — a server-side flake, not a
+/// deterministic request-shape error, so retrying the identical request is the
+/// correct recovery.
+///
+/// Deliberately narrow. Before adding an entry, verify no transport builder
+/// sends it on ANY route; a parameter Borg sends somewhere needs a
+/// per-provider exception here instead of a blanket entry, or a genuine
+/// client-side bad parameter stops failing fast.
+const SERVER_INJECTED_PARAMS: &[&str] = &["prompt_cache_retention"];
+
+/// Phrases that make the mention an actual rejection of the parameter rather
+/// than an incidental appearance in the body.
+const PARAM_REJECTION_NEEDLES: &[&str] =
+    &["not supported", "unsupported", "unknown", "unrecognized"];
+
+/// True when a 400 body blames a parameter Borg never sends — see
+/// [`SERVER_INJECTED_PARAMS`].
+pub(super) fn body_indicates_server_injected_param(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    matches_any(&lower, SERVER_INJECTED_PARAMS) && matches_any(&lower, PARAM_REJECTION_NEEDLES)
+}
+
 pub(super) fn body_indicates_context_overflow(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     matches_any(&lower, OVERFLOW_NEEDLES)

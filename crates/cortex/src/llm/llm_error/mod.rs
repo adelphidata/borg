@@ -11,7 +11,7 @@ mod retry;
 use classify::{
     body_indicates_cloudflare_block, body_indicates_context_overflow,
     body_indicates_expired_credential, body_indicates_image_unsupported,
-    body_indicates_no_allowed_providers, body_mentions_model,
+    body_indicates_no_allowed_providers, body_indicates_server_injected_param, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
@@ -426,6 +426,20 @@ pub(crate) fn classify_status(
             reason: FailoverReason::PayloadTooLarge,
             status: Some(status.as_u16()),
         },
+        // A 400 rejecting a parameter Borg never sends: the provider's own
+        // gateway injected the field and then rejected it. The rejection is
+        // not deterministic (a byte-identical request can succeed on retry),
+        // so this MUST NOT reach the catch-all `Format` arm below — that arm
+        // is permanent and would burn the whole fallback chain on a
+        // server-side flake. The request shape was fine, so no compaction.
+        400 if body_indicates_server_injected_param(body) => LlmError::Retryable {
+            source: anyhow::anyhow!(
+                "{provider} returned 400 rejecting a parameter Borg never sends (provider-injected; retrying): {safe}"
+            ),
+            retry_after: None,
+            reason: FailoverReason::Overloaded,
+            status: Some(status.as_u16()),
+        },
         400 if body_indicates_context_overflow(body) => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 400 (context overflow): {safe}"),
             reason: FailoverReason::ContextOverflow,
@@ -515,6 +529,39 @@ mod tests {
     }
 
     // ── classify_status ──
+
+    /// A 400 rejecting a parameter Borg never sends is a provider-injected
+    /// flake: it must retry (Overloaded), never compact, and never reach the
+    /// permanent `Format` arm that would burn the fallback chain.
+    #[test]
+    fn classify_400_server_injected_param_is_retryable_not_format() {
+        let body = r#"{"error":{"code":"invalid_parameter","message":"prompt_cache_retention is not supported for this model"}}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+        assert!(err.is_retryable(), "must retry the identical request");
+        assert_eq!(err.reason(), FailoverReason::Overloaded);
+        assert!(
+            !err.should_compress(),
+            "request shape was fine — no compaction"
+        );
+    }
+
+    /// A genuine client-side bad parameter still fails fast as `Format`: the
+    /// server-injected arm only fires for parameters Borg provably never
+    /// sends, and only when the body actually rejects them.
+    #[test]
+    fn classify_400_ordinary_bad_parameter_stays_permanent_format() {
+        let cases = [
+            // A parameter Borg does send on some routes.
+            r#"{"error":{"message":"Unsupported parameter: max_tokens"}}"#,
+            // The never-sent parameter mentioned without a rejection phrase.
+            r#"{"error":{"message":"prompt_cache_retention accepted"}}"#,
+        ];
+        for body in cases {
+            let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+            assert!(!err.is_retryable(), "{body}: must fail fast");
+            assert_eq!(err.reason(), FailoverReason::Format, "{body}");
+        }
+    }
 
     #[test]
     fn classify_429_is_retryable_rate_limit() {

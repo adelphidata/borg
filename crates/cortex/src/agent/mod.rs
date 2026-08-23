@@ -454,8 +454,11 @@ async fn build_common(config: &Config) -> Result<AgentCommon> {
     }
     let rate_guard = SessionRateGuard::new(limits);
     let resolved_creds = config.resolve_credentials();
+    // No workspace is known yet at construction; `set_execution_context`
+    // recomputes the allowlist once the session's workspace arrives, so
+    // project-tier skills' `requires.env` still reach `run_shell`.
     let skill_env_allowlist =
-        crate::skills::collect_required_env_vars(&resolved_creds, &config.skills);
+        crate::skills::collect_required_env_vars(&resolved_creds, &config.skills, None);
     let tts_synthesizer = crate::media::tts::TtsSynthesizer::from_config(config);
     Ok(AgentCommon {
         policy,
@@ -685,6 +688,15 @@ impl Agent {
         self.execution_context = execution_context;
         self.git_repo_root = crate::git::find_repo_root(self.execution_context.workspace_cwd());
         self.caches.clear_project_docs();
+        // The workspace decides which project-tier skills exist, and their
+        // `requires.env` feeds the run_shell credential allowlist — recompute
+        // it so a project skill's declared credential is actually forwarded.
+        self.ensure_credentials_cached();
+        self.skill_env_allowlist = crate::skills::collect_required_env_vars(
+            self.credentials_cached(),
+            &self.config.skills,
+            Some(self.execution_context.workspace_root()),
+        );
     }
 
     /// Attach or remove the IDE-backed text-file bridge without invalidating
@@ -724,6 +736,7 @@ impl Agent {
         self.skill_env_allowlist = crate::skills::collect_required_env_vars(
             self.credentials_cached(),
             &self.config.skills,
+            Some(self.execution_context.workspace_root()),
         );
     }
 

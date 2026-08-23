@@ -39,11 +39,17 @@ pub fn collect_skill_env(
 
 /// Collect the set of env var names declared in `requires.env` across all skills.
 /// Used to filter which credentials are injected into `run_shell` subprocesses.
+///
+/// `workspace` MUST match what the prompt-side loader was given: a project
+/// skill (`.borg/skills/`) that is injected into the system prompt but
+/// missing from this allowlist runs its scripts with the credential it
+/// declared filtered out — an auth failure the model cannot explain.
 pub fn collect_required_env_vars(
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
+    workspace: Option<&std::path::Path>,
 ) -> std::collections::HashSet<String> {
-    match load_all_skills(resolved_creds, skills_config, None) {
+    match load_all_skills(resolved_creds, skills_config, workspace) {
         Ok(skills) => skills
             .iter()
             .flat_map(|s| s.manifest.requires.env.iter().cloned())

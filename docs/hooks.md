@@ -47,7 +47,7 @@ Script hooks subscribe to these six events. The compiled-in `HookPoint` enum use
 
 ## Payload
 
-Each hook receives the same JSON payload on **two** channels: as `$1`, and on **stdin**. Use whichever you prefer — `"$1"` is the shorter form, while `input=$(cat)` is what Claude Code hooks expect, so scripts copied from a Claude Code config work unchanged.
+Each hook receives a JSON payload on **two** channels: as `$1`, and on **stdin**. `"$1"` is the shorter form, while `input=$(cat)` is what Claude Code hooks expect, so scripts copied from a Claude Code config work unchanged. The two copies are identical except on `PreToolUse`, where only the **stdin** copy carries the tool arguments — argv is visible to every local user in `ps` output and is size-capped by the OS, and tool arguments can hold whole file bodies and secrets. A hook that inspects arguments must read stdin.
 
 A hook that never reads stdin is fine: borg closes the pipe and ignores the resulting broken pipe, so your exit code and output are still honored.
 
@@ -64,9 +64,10 @@ A hook that never reads stdin is fine: borg closes the pipe and ignores the resu
 
 `tool` is `null` for events that aren't tool-related.
 
-On `PreToolUse` the `tool` object also carries the call's arguments, so a hook
-can inspect what is about to run. The same object appears twice: `args` is the
-canonical spelling, `tool_input` is the Claude Code one.
+On `PreToolUse` the `tool` object in the **stdin** copy also carries the
+call's arguments, so a hook can inspect what is about to run. The same object
+appears twice: `args` is the canonical spelling, `tool_input` is the Claude
+Code one. The `$1` copy carries only `name` and `is_error`.
 
 ```json
 {

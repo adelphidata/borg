@@ -1785,12 +1785,51 @@ fn summary_line_no_hint_for_available() {
 fn test_collect_required_env_vars() {
     let creds = std::collections::HashMap::new();
     let config = SkillsConfig::default();
-    let env_vars = collect_required_env_vars(&creds, &config);
+    let env_vars = collect_required_env_vars(&creds, &config, None);
     // Built-in skills declare env vars like SLACK_BOT_TOKEN, DISCORD_BOT_TOKEN, etc.
     // At minimum, slack skill requires SLACK_BOT_TOKEN
     assert!(
         env_vars.contains("SLACK_BOT_TOKEN"),
         "should contain SLACK_BOT_TOKEN, got: {env_vars:?}"
+    );
+}
+
+/// A project-tier skill's `requires.env` must reach the run_shell credential
+/// allowlist. The prompt-side loader is workspace-aware, so if this
+/// collection is not, a project skill is injected into the system prompt but
+/// its declared credential is filtered out of the subprocess env — the
+/// script fails with an auth error the model cannot explain.
+#[test]
+fn project_skill_env_requirements_reach_the_allowlist() {
+    let env = SkillsDataDirEnv::new();
+    std::fs::create_dir_all(env.skills_path()).unwrap();
+    let workspace = tempfile::TempDir::new().unwrap();
+    let dir = workspace.path().join(".borg/skills/proj-deploy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: proj-deploy\ndescription: Deploy the app\nrequires:\n  env: [PROJECT_DEPLOY_TOKEN]\n---\n\nBody.\n",
+    )
+    .unwrap();
+
+    let creds = std::collections::HashMap::new();
+    let mut config = SkillsConfig {
+        project_discovery: true,
+        ..SkillsConfig::default()
+    };
+    // A non-built-in skill must be granted its env var explicitly, or the
+    // security gate skips the skill outright.
+    config.entries.insert(
+        "proj-deploy".to_string(),
+        crate::config::SkillEntryConfig {
+            allowed_env: vec!["PROJECT_DEPLOY_TOKEN".to_string()],
+            ..Default::default()
+        },
+    );
+    let env_vars = collect_required_env_vars(&creds, &config, Some(workspace.path()));
+    assert!(
+        env_vars.contains("PROJECT_DEPLOY_TOKEN"),
+        "project skill's requires.env missing from allowlist, got: {env_vars:?}"
     );
 }
 

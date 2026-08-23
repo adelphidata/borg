@@ -166,6 +166,14 @@ struct Session {
     /// so per-command attribution is impossible — from that point every poll's
     /// output must go through env-assignment masking in the shell handler.
     env_mask: bool,
+    /// The conversation session that started this shell session, from
+    /// `ExecutionContext::session_id`. Every later action must present the
+    /// same id: the registry is process-global, so without this check any
+    /// channel/sender routed through the daemon could drive (inject stdin
+    /// into, read output from, kill) a shell another conversation started.
+    /// `None` means the starter had no session id; then only callers that
+    /// also have none may act on it.
+    owner: Option<String>,
 }
 
 /// Registry of live interactive shell sessions. Cheap to clone — state is
@@ -210,11 +218,15 @@ impl ShellSessionRegistry {
     /// `max_output_bytes` caps the unread output retained between polls; the
     /// caller resolves it from `security.max_shell_output_bytes` so sessions and
     /// one-shot commands share one budget.
+    ///
+    /// `owner` is the starting conversation's session id; all later actions on
+    /// the returned id must present the same value (see [`Session::owner`]).
     pub fn register(
         &self,
         mut child: Child,
         guard: Option<ProcessGuard>,
         max_output_bytes: usize,
+        owner: Option<String>,
     ) -> String {
         let pid = child.id();
         let stdout = child.stdout.take();
@@ -225,10 +237,15 @@ impl ShellSessionRegistry {
 
         let mut inner = self.lock();
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
-        let id = format!("sh-{}", inner.next_id);
-        // Ids are monotonic (u64); a collision would mean a wrap past a still-live
-        // session — practically unreachable, but assert the invariant rather than
-        // silently `insert`-overwriting (and thus killing) a live session.
+        // The counter keeps ids readable and collision-free; the random
+        // suffix keeps them unguessable, so a foreign conversation cannot
+        // enumerate `sh-1`, `sh-2`, … and probe sessions it does not own.
+        // Defense in depth alongside the owner check — not a substitute.
+        let suffix: u32 = rand::random();
+        let id = format!("sh-{}-{suffix:08x}", inner.next_id);
+        // The counter makes a collision unreachable, but assert the invariant
+        // rather than silently `insert`-overwriting (and thus killing) a live
+        // session.
         debug_assert!(
             !inner.sessions.contains_key(&id),
             "shell session id {id} collided with a live session"
@@ -246,6 +263,7 @@ impl ShellSessionRegistry {
                 // unreadable cwd just means the note is never produced.
                 last_cwd: pid.and_then(crate::util::process_tree::process_cwd),
                 env_mask: false,
+                owner,
             },
         );
         id
@@ -256,16 +274,34 @@ impl ShellSessionRegistry {
         self.lock().sessions.contains_key(id)
     }
 
+    /// Whether `caller` may act on `session`. Both sides must match exactly:
+    /// an owned session rejects every other (or absent) caller id, and an
+    /// ownerless session rejects callers that do have one. Fail closed.
+    fn caller_owns(session: &Session, caller: Option<&str>) -> bool {
+        session.owner.as_deref() == caller
+    }
+
+    /// Look up `id` for `caller`, mapping both "unknown id" and "not the
+    /// owner" to the same error so a foreign caller cannot use the message
+    /// as an existence oracle for other conversations' sessions.
+    fn get_owned<'a>(
+        inner: &'a mut Inner,
+        id: &str,
+        caller: Option<&str>,
+    ) -> Result<&'a mut Session> {
+        inner
+            .sessions
+            .get_mut(id)
+            .filter(|s| Self::caller_owns(s, caller))
+            .ok_or_else(|| anyhow!("no such shell session: {id}"))
+    }
+
     /// Write `data` to the session's stdin and flush. Errors if the session is
-    /// unknown or its stdin has already closed.
-    pub async fn write_stdin(&self, id: &str, data: &str) -> Result<()> {
+    /// unknown, owned by a different conversation, or its stdin has closed.
+    pub async fn write_stdin(&self, id: &str, data: &str, caller: Option<&str>) -> Result<()> {
         let stdin = {
-            let inner = self.lock();
-            inner
-                .sessions
-                .get(id)
-                .map(|s| s.stdin.clone())
-                .ok_or_else(|| anyhow!("no such shell session: {id}"))?
+            let mut inner = self.lock();
+            Self::get_owned(&mut inner, id, caller)?.stdin.clone()
         };
         let mut guard = stdin.lock().await;
         match guard.as_mut() {
@@ -283,12 +319,9 @@ impl ShellSessionRegistry {
     /// session's working directory changed since the last observation (a `cd`
     /// ran), a `cwd: <path>` note is appended so the model knows where the
     /// shell now lives. Errors if the session is unknown.
-    pub fn poll(&self, id: &str) -> Result<String> {
+    pub fn poll(&self, id: &str, caller: Option<&str>) -> Result<String> {
         let mut inner = self.lock();
-        let session = inner
-            .sessions
-            .get_mut(id)
-            .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
+        let session = Self::get_owned(&mut inner, id, caller)?;
         let mut out = {
             let mut buf = session
                 .output
@@ -317,8 +350,13 @@ impl ShellSessionRegistry {
     /// session output is drained asynchronously, so the file's contents can
     /// surface on any later poll. Unknown ids are ignored — the corresponding
     /// `write_stdin` fails on the same missing session anyway.
-    pub fn mark_env_mask(&self, id: &str) {
-        if let Some(session) = self.lock().sessions.get_mut(id) {
+    pub fn mark_env_mask(&self, id: &str, caller: Option<&str>) {
+        if let Some(session) = self
+            .lock()
+            .sessions
+            .get_mut(id)
+            .filter(|s| Self::caller_owns(s, caller))
+        {
             session.env_mask = true;
         }
     }
@@ -327,20 +365,27 @@ impl ShellSessionRegistry {
     /// env-assignment masking (a prior `write_stdin` read a blocked
     /// env/credential file). Unknown ids report `false`; `poll` errors on
     /// them before masking matters.
-    pub fn needs_env_mask(&self, id: &str) -> bool {
+    pub fn needs_env_mask(&self, id: &str, caller: Option<&str>) -> bool {
         self.lock()
             .sessions
             .get(id)
+            .filter(|s| Self::caller_owns(s, caller))
             .is_some_and(|session| session.env_mask)
     }
 
     /// Terminate a session: abort its drain task, kill the child's whole
     /// process group, reap it, and finalize the subprocess-registry guard.
     /// Errors if the session is unknown.
-    pub async fn kill(&self, id: &str) -> Result<()> {
+    pub async fn kill(&self, id: &str, caller: Option<&str>) -> Result<()> {
         let session = {
             let mut inner = self.lock();
-            inner.sessions.remove(id)
+            // Check ownership BEFORE removing: a plain `remove` would let a
+            // foreign caller tear the session out of the registry even when
+            // the kill itself is then refused.
+            match inner.sessions.get(id) {
+                Some(s) if Self::caller_owns(s, caller) => inner.sessions.remove(id),
+                _ => None,
+            }
         };
         let mut session = session.ok_or_else(|| anyhow!("no such shell session: {id}"))?;
         session.drain.abort();
@@ -475,16 +520,26 @@ mod tests {
             .kill_on_drop(true);
         crate::util::process_tree::spawn_in_own_group(&mut cmd);
         let child = cmd.spawn().expect("spawn cat");
-        reg.register(child, None, TEST_CAP)
+        reg.register(child, None, TEST_CAP, None)
     }
 
     /// Poll until `needle` shows up or we give up — drain is async, so the
     /// echo may not have landed by the first poll. Accumulates across polls
     /// because each `poll` only returns *new* bytes.
     async fn poll_until(reg: &ShellSessionRegistry, id: &str, needle: &str) -> String {
+        poll_until_as(reg, id, needle, None).await
+    }
+
+    /// [`poll_until`] with an explicit caller session id.
+    async fn poll_until_as(
+        reg: &ShellSessionRegistry,
+        id: &str,
+        needle: &str,
+        caller: Option<&str>,
+    ) -> String {
         let mut acc = String::new();
         for _ in 0..50 {
-            acc.push_str(&reg.poll(id).expect("poll"));
+            acc.push_str(&reg.poll(id, caller).expect("poll"));
             if acc.contains(needle) {
                 return acc;
             }
@@ -501,14 +556,14 @@ mod tests {
         let id = spawn_cat(&reg);
         assert!(reg.contains(&id), "session should be registered");
 
-        reg.write_stdin(&id, "hello\n").await.expect("write");
+        reg.write_stdin(&id, "hello\n", None).await.expect("write");
         let out = poll_until(&reg, &id, "hello").await;
         assert!(
             out.contains("hello"),
             "echoed stdin should surface: {out:?}"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
         assert!(!reg.contains(&id), "killed session is gone");
     }
 
@@ -520,13 +575,13 @@ mod tests {
         let reg = ShellSessionRegistry::new();
         let id = spawn_cat(&reg);
 
-        reg.write_stdin(&id, "first\n").await.expect("write");
+        reg.write_stdin(&id, "first\n", None).await.expect("write");
         let _ = poll_until(&reg, &id, "first").await;
         // Nothing new written; next poll must be empty.
-        let second = reg.poll(&id).expect("poll");
+        let second = reg.poll(&id, None).expect("poll");
         assert_eq!(second, "", "second poll with no new output must be empty");
 
-        reg.write_stdin(&id, "second\n").await.expect("write");
+        reg.write_stdin(&id, "second\n", None).await.expect("write");
         let out = poll_until(&reg, &id, "second").await;
         assert!(out.contains("second"));
         assert!(
@@ -534,7 +589,7 @@ mod tests {
             "poll must not re-emit old output: {out:?}"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
     }
 
     #[cfg(unix)]
@@ -553,20 +608,24 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP);
+        let id = reg.register(child, None, TEST_CAP, None);
 
         // Move somewhere distinct from the spawn-time cwd, then ask where we are
         // on a *separate* command. A fresh-process-per-command shell would
         // report `/`; a true persistent session reports `/tmp`.
-        reg.write_stdin(&id, "cd /tmp\n").await.expect("write cd");
-        reg.write_stdin(&id, "pwd\n").await.expect("write pwd");
+        reg.write_stdin(&id, "cd /tmp\n", None)
+            .await
+            .expect("write cd");
+        reg.write_stdin(&id, "pwd\n", None)
+            .await
+            .expect("write pwd");
         let out = poll_until(&reg, &id, "/tmp").await;
         assert!(
             out.contains("/tmp"),
             "cd must persist to the next command in the same session: {out:?}"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
     }
 
     #[test]
@@ -691,10 +750,12 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP);
+        let id = reg.register(child, None, TEST_CAP, None);
 
         // No directory change yet: output-producing polls carry no cwd note.
-        reg.write_stdin(&id, "echo before\n").await.expect("write");
+        reg.write_stdin(&id, "echo before\n", None)
+            .await
+            .expect("write");
         let out = poll_until(&reg, &id, "before").await;
         assert!(
             !out.contains("cwd: "),
@@ -704,7 +765,7 @@ mod tests {
         // The target must be symlink-free: the kernel reports the resolved
         // path (`/tmp` on macOS is a symlink to `/private/tmp`).
         let target = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
-        reg.write_stdin(&id, &format!("cd {}\necho moved\n", target.display()))
+        reg.write_stdin(&id, &format!("cd {}\necho moved\n", target.display()), None)
             .await
             .expect("write cd");
         let out = poll_until(&reg, &id, "cwd: ").await;
@@ -714,14 +775,16 @@ mod tests {
         );
 
         // Once noted, an unchanged cwd produces no further notes.
-        reg.write_stdin(&id, "echo after\n").await.expect("write");
+        reg.write_stdin(&id, "echo after\n", None)
+            .await
+            .expect("write");
         let out = poll_until(&reg, &id, "after").await;
         assert!(
             !out.contains("cwd: "),
             "cwd note must appear only on change, not on every poll: {out:?}"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
     }
 
     /// A multibyte character split across two separate pipe reads must reach
@@ -742,14 +805,14 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP);
+        let id = reg.register(child, None, TEST_CAP, None);
         // First half of the emoji, no newline — lands as its own drain chunk.
-        reg.write_stdin(&id, "printf '\\360\\237'\n")
+        reg.write_stdin(&id, "printf '\\360\\237'\n", None)
             .await
             .expect("write first half");
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Second half completes the codepoint on a later read.
-        reg.write_stdin(&id, "printf '\\230\\200\\n'\n")
+        reg.write_stdin(&id, "printf '\\230\\200\\n'\n", None)
             .await
             .expect("write second half");
 
@@ -763,16 +826,101 @@ mod tests {
             "no replacement chars for a cleanly split codepoint: {out:?}"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
     }
 
     #[tokio::test]
     async fn operations_on_unknown_session_error() {
         let reg = ShellSessionRegistry::new();
         assert!(!reg.contains("sh-404"));
-        assert!(reg.poll("sh-404").is_err());
-        assert!(reg.write_stdin("sh-404", "x").await.is_err());
-        assert!(reg.kill("sh-404").await.is_err());
+        assert!(reg.poll("sh-404", None).is_err());
+        assert!(reg.write_stdin("sh-404", "x", None).await.is_err());
+        assert!(reg.kill("sh-404", None).await.is_err());
+    }
+
+    /// The registry is process-global, so ownership is the only boundary
+    /// between conversations: a caller with a different (or absent) session id
+    /// must not write to, read from, or kill a session it did not start — and
+    /// the refusal must be indistinguishable from "no such session" so it
+    /// cannot be used as an existence oracle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreign_caller_cannot_drive_an_owned_session() {
+        let reg = ShellSessionRegistry::new();
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::util::process_tree::spawn_in_own_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn cat");
+        let id = reg.register(child, None, TEST_CAP, Some("owner-a".into()));
+
+        for caller in [Some("owner-b"), None] {
+            let write = reg.write_stdin(&id, "stolen\n", caller).await;
+            let poll = reg.poll(&id, caller);
+            let kill = reg.kill(&id, caller).await;
+            for (verb, msg) in [
+                (
+                    "write_stdin",
+                    write.expect_err("write must be refused").to_string(),
+                ),
+                ("poll", poll.expect_err("poll must be refused").to_string()),
+                ("kill", kill.expect_err("kill must be refused").to_string()),
+            ] {
+                assert_eq!(
+                    msg,
+                    format!("no such shell session: {id}"),
+                    "{verb} refusal for caller {caller:?} must not reveal the session exists"
+                );
+            }
+        }
+        // The refused kill must not have torn the session down.
+        assert!(
+            reg.contains(&id),
+            "foreign kill must not remove the session"
+        );
+
+        // The owner still has full access.
+        reg.write_stdin(&id, "mine\n", Some("owner-a"))
+            .await
+            .expect("owner write");
+        let out = poll_until_as(&reg, &id, "mine", Some("owner-a")).await;
+        assert!(out.contains("mine"), "owner poll must still work: {out:?}");
+        reg.kill(&id, Some("owner-a")).await.expect("owner kill");
+    }
+
+    /// An ownerless session (started outside a conversation) is not driveable
+    /// by a caller that HAS a session id — ownership matches exactly in both
+    /// directions.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_caller_cannot_drive_an_ownerless_session() {
+        let reg = ShellSessionRegistry::new();
+        let id = spawn_cat(&reg); // registered with owner=None
+        assert!(reg.write_stdin(&id, "x\n", Some("owner-a")).await.is_err());
+        assert!(reg.poll(&id, Some("owner-a")).is_err());
+        assert!(reg.kill(&id, Some("owner-a")).await.is_err());
+        reg.kill(&id, None).await.expect("ownerless kill");
+    }
+
+    /// Session ids must not be guessable: the counter alone (`sh-1`, `sh-2`)
+    /// let a foreign conversation enumerate live sessions. Each id must carry
+    /// a random suffix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_ids_carry_a_random_suffix() {
+        let reg = ShellSessionRegistry::new();
+        let id = spawn_cat(&reg);
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        assert_eq!(parts[0], "sh", "id keeps the sh- prefix: {id}");
+        assert!(
+            parts.len() == 3
+                && parts[2].len() == 8
+                && parts[2].chars().all(|c| c.is_ascii_hexdigit()),
+            "id must end in an 8-hex-digit random suffix: {id}"
+        );
+        reg.kill(&id, None).await.expect("kill");
     }
 
     #[cfg(unix)]
@@ -792,7 +940,7 @@ mod tests {
         // Mirror the production spawn: the child must lead its own group.
         crate::util::process_tree::spawn_in_own_group(&mut cmd);
         let child = cmd.spawn().expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP);
+        let id = reg.register(child, None, TEST_CAP, None);
 
         // The shell echoes the backgrounded grandchild's PID.
         let out = poll_until(&reg, &id, "\n").await;
@@ -806,7 +954,7 @@ mod tests {
             "descendant should be alive before kill"
         );
 
-        reg.kill(&id).await.expect("kill");
+        reg.kill(&id, None).await.expect("kill");
 
         // The descendant must be reaped shortly after the session is killed.
         assert!(
@@ -822,7 +970,7 @@ mod tests {
         let a = spawn_cat(&reg);
         let b = spawn_cat(&reg);
         assert_ne!(a, b, "each session gets a distinct id");
-        reg.kill(&a).await.expect("kill a");
-        reg.kill(&b).await.expect("kill b");
+        reg.kill(&a, None).await.expect("kill a");
+        reg.kill(&b, None).await.expect("kill b");
     }
 }

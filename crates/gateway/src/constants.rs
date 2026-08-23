@@ -102,10 +102,14 @@ pub const POLL_MAX_CONSECUTIVE_ERRORS: u32 = 10;
 /// Max retries for Telegram send operations.
 pub const TELEGRAM_MAX_SEND_RETRIES: u32 = 5;
 
-/// Max retry_after seconds we'll honor from Telegram before giving up.
-/// Why: Telegram occasionally returns retry_after >> minutes during flood waits;
-/// 300s caps the wait so a stuck send doesn't pin a worker indefinitely.
-pub const TELEGRAM_MAX_RETRY_AFTER_SECS: u64 = 300;
+/// Max retry_after seconds we'll sleep inline on a Telegram 429 before the
+/// send fails closed instead.
+/// Why: Telegram flood waits can run to minutes or hours, and sends are
+/// awaited inline on the polling loop — sleeping through even a clamped wait
+/// (formerly 300s × 5 retries ≈ 25 min) froze every chat on the bot. A short
+/// wait is worth riding out; anything longer returns an error immediately so
+/// the loop stays live and the flood window expires on its own.
+pub const TELEGRAM_FLOOD_FAIL_FAST_SECS: u64 = 5;
 
 /// Max bytes we'll download from Telegram's getFile endpoint to avoid memory exhaustion.
 /// Why: Telegram's Bot API caps getFile at 20 MiB; 25 MiB matches the documented

@@ -315,7 +315,7 @@ pub fn sanitize_xml_boundaries(s: &str) -> String {
 
     static BOUNDARY_RE: OnceLock<Option<Regex>> = OnceLock::new();
     let re = BOUNDARY_RE.get_or_init(|| {
-        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file|compaction_summary|mcp_tool_result|untrusted_content)\s*>")
+        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file|compaction_summary|mcp_tool_result|untrusted_content|prior_run_output)\s*>")
             .map_err(|e| tracing::error!("Invalid boundary regex: {e}"))
             .ok()
     });

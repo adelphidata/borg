@@ -181,6 +181,52 @@ fn anthropic_system_blocks(
     }
 }
 
+/// Claude families that only support manual budget-based thinking. For these,
+/// omitting the `thinking` block already means "off", so no explicit disable
+/// is needed (and none is defined on their wire contract).
+const LEGACY_MANUAL_THINKING_CLAUDE: &[&str] = &[
+    "claude-3",
+    "claude-opus-4-0",
+    "claude-opus-4.0",
+    "claude-opus-4-1",
+    "claude-opus-4.1",
+    "claude-sonnet-4-0",
+    "claude-sonnet-4.0",
+    "claude-opus-4-2025",
+    "claude-sonnet-4-2025",
+    "claude-opus-4-5",
+    "claude-opus-4.5",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4.5",
+    "claude-haiku-4-5",
+    "claude-haiku-4.5",
+];
+
+/// Claude families where thinking is mandatory: `thinking: {"type":"disabled"}`
+/// answers HTTP 400. The failure mode is asymmetric — a missing entry kills
+/// the turn with a 400, a spurious entry only leaves thinking on — so when in
+/// doubt a family belongs on this list.
+const MANDATORY_THINKING_CLAUDE: &[&str] = &["claude-fable"];
+
+/// Whether `model` accepts an explicit `thinking: {"type": "disabled"}`.
+///
+/// Modern Claude models think by default, so omitting the `thinking` block is
+/// not a disable — it silently leaves thinking on and the user keeps paying
+/// for it. Legacy manual-thinking families need no disable (thinking is
+/// opt-in via `budget_tokens`), and mandatory-thinking families reject the
+/// disable with a 400. Non-Claude models served over the Anthropic Messages
+/// wire keep the omission: their disable contract is not Claude's.
+pub(crate) fn anthropic_accepts_thinking_disable(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if !m.contains("claude") {
+        return false;
+    }
+    if LEGACY_MANUAL_THINKING_CLAUDE.iter().any(|v| m.contains(v)) {
+        return false;
+    }
+    !MANDATORY_THINKING_CLAUDE.iter().any(|v| m.contains(v))
+}
+
 pub(crate) fn build_anthropic_request(
     request: &TransportRequest<'_>,
     stream: bool,
@@ -230,12 +276,19 @@ pub(crate) fn build_anthropic_request(
             }
         })
     } else {
-        serde_json::json!({
+        let mut off_body = serde_json::json!({
             "model": request.model,
             "max_tokens": request.llm_config.max_tokens,
             "temperature": request.llm_config.temperature,
             "stream": stream,
-        })
+        });
+        // Thinking is off. Modern Claude models think by default, so the
+        // disable must be explicit; families that reject it keep the omission
+        // (a silently-ignored disable beats a dead turn).
+        if anthropic_accepts_thinking_disable(request.model) {
+            off_body["thinking"] = serde_json::json!({"type": "disabled"});
+        }
+        off_body
     };
 
     if let Some(sys) = system_text {
@@ -1569,6 +1622,53 @@ mod tests {
             }
         }
         walk(body)
+    }
+
+    /// Thinking off must be an explicit wire-level disable on modern Claude
+    /// models (they think by default, so omission leaves thinking ON), must
+    /// stay an omission on mandatory-thinking families (a disable answers
+    /// HTTP 400), and must stay an omission on legacy manual-thinking and
+    /// non-Claude models (no disable exists on their contract).
+    #[test]
+    fn anthropic_thinking_off_sends_explicit_disable_only_where_accepted() {
+        let mut off_cfg = LlmConfig::default();
+        off_cfg.thinking = crate::config::ThinkingLevel::Off;
+        off_cfg.thinking_overrides.clear();
+
+        let cases = [
+            ("claude-opus-5", true),
+            ("claude-sonnet-4-6", true),
+            ("claude-fable-5", false),
+            ("claude-3-7-sonnet-20250219", false),
+            ("claude-haiku-4-5-20251001", false),
+            ("minimax-m2", false),
+        ];
+        for (model, expect_disable) in cases {
+            let messages = vec![Message::user("hi")];
+            let request = TransportRequest {
+                provider: Provider::Anthropic,
+                model,
+                messages: &messages,
+                tools: None,
+                llm_config: &off_cfg,
+                prompt_cache_key: None,
+                system_stable_prefix: None,
+                cost_events_enabled: false,
+            };
+            let body = build_anthropic_request(&request, false);
+            if expect_disable {
+                assert_eq!(
+                    body["thinking"],
+                    serde_json::json!({"type": "disabled"}),
+                    "{model}: must send an explicit thinking disable"
+                );
+            } else {
+                assert!(
+                    body.get("thinking").is_none(),
+                    "{model}: must omit the thinking block entirely"
+                );
+            }
+        }
     }
 
     /// The bug this split exists to fix: the system prompt's dynamic tail

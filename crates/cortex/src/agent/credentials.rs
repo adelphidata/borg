@@ -39,6 +39,7 @@ impl Agent {
         self.skill_env_allowlist = crate::skills::collect_required_env_vars(
             self.credentials_cached(),
             &self.config.skills,
+            Some(self.execution_context.workspace_root()),
         );
     }
 

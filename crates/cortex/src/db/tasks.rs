@@ -201,6 +201,42 @@ impl Database {
         Ok(out)
     }
 
+    /// Fetch recent runs that actually produced a result, newest first.
+    ///
+    /// Unlike [`Self::task_run_history`], rows without a non-empty `result`
+    /// (the currently-running row, failed runs, missed-run audit rows) do not
+    /// consume `limit` slots — continuity always sees up to `limit` real
+    /// prior outputs, not whatever happens to survive a post-hoc filter.
+    pub async fn task_result_history(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRunRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, task_id, started_at, duration_ms, result, error, status
+             FROM task_runs
+             WHERE task_id = ?1 AND result IS NOT NULL AND TRIM(result) != ''
+             ORDER BY started_at DESC LIMIT ?2",
+                params!(task_id, limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(TaskRunRow {
+                id: row.get::<i64>(0)?,
+                task_id: row.get::<String>(1)?,
+                started_at: row.get::<i64>(2)?,
+                duration_ms: row.get::<i64>(3)?,
+                result: row.get::<Option<String>>(4)?,
+                error: row.get::<Option<String>>(5)?,
+                status: row.get::<String>(6)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Look up a single task by its ID.
     pub async fn get_task_by_id(&self, id: &str) -> Result<Option<ScheduledTaskRow>> {
         let sql = format!("SELECT {TASK_COLUMNS} FROM scheduled_tasks WHERE id = ?1");
@@ -690,10 +726,14 @@ impl Database {
         // they ask for it, while `last_error` is the field the system prompt,
         // the heartbeat health nudge, and `borg doctor` all surface — so
         // without this a job that quietly stopped running is invisible until
-        // the user notices its effects are missing.
+        // the user notices its effects are missing. Only when `last_error` is
+        // currently empty, so a specific failure diagnosis (e.g. a 401 from
+        // `record_task_failure`) is not clobbered by the generic missed-run
+        // note on every stall-scan pass.
         self.conn
             .execute(
-                "UPDATE scheduled_tasks SET last_error = ?1 WHERE id = ?2",
+                "UPDATE scheduled_tasks SET last_error = ?1
+             WHERE id = ?2 AND (last_error IS NULL OR last_error = '')",
                 params!(format!("missed run: {note}"), task_id),
             )
             .await?;

@@ -306,9 +306,16 @@ impl ScriptHook {
         self.points.contains(&HookPoint::BeforeToolCall)
     }
 
-    fn build_payload(&self, ctx: &HookContext) -> String {
+    /// `include_tool_args` controls whether a `ToolCall` block carries the
+    /// full argument object. The stdin copy does — a hook that cannot see the
+    /// arguments cannot judge the call. The argv (`$1`) copy never does:
+    /// argv is visible to every local user via `ps`/`/proc/<pid>/cmdline`
+    /// and capped by the OS (`E2BIG`), and tool arguments routinely carry
+    /// whole file bodies and can carry secrets. A hook that needs the
+    /// arguments reads them from stdin, as Claude Code hooks do.
+    fn build_payload(&self, ctx: &HookContext, include_tool_args: bool) -> String {
         let tool = match &ctx.data {
-            HookData::ToolCall { name, args } => {
+            HookData::ToolCall { name, args } if include_tool_args => {
                 // `args` is the tool's own serialized JSON. Pass it as a
                 // parsed object when it is one, so a hook can read a field
                 // without re-parsing a string; fall back to the raw text so a
@@ -322,6 +329,9 @@ impl ScriptHook {
                     "args": parsed,
                     "tool_input": parsed,
                 }))
+            }
+            HookData::ToolCall { name, .. } => {
+                Some(serde_json::json!({ "name": name, "is_error": false }))
             }
             HookData::ToolResult { name, is_error, .. } => {
                 Some(serde_json::json!({ "name": name, "is_error": *is_error }))
@@ -384,9 +394,16 @@ impl ScriptHook {
         if !self.matches_tool(ctx) {
             return HookAction::Continue;
         }
-        let payload = self.build_payload(ctx);
+        let argv_payload = self.build_payload(ctx, false);
+        let stdin_payload = self.build_payload(ctx, true);
         let started = Instant::now();
-        let result = run_subprocess(&self.command, &payload, self.timeout, self.is_pre_tool());
+        let result = run_subprocess(
+            &self.command,
+            &argv_payload,
+            &stdin_payload,
+            self.timeout,
+            self.is_pre_tool(),
+        );
         let duration_ms = started.elapsed().as_millis();
         // Completion trace on *every* arm, success included — a slow-but-OK hook
         // is otherwise invisible (only failures used to log). Low-cardinality
@@ -594,9 +611,13 @@ const MAX_HOOK_STREAM_BYTES: u64 = 8 * 1024;
 /// process that outlives it.
 const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-/// Spawn `sh -c <command>` with the payload on both `$1` and stdin, enforce
-/// `timeout` via `process_tree::wait_or_kill_group` (which takes the hook's
-/// whole process group with it on expiry).
+/// Spawn `sh -c <command>` with `argv_payload` on `$1` and `stdin_payload` on
+/// stdin, enforce `timeout` via `process_tree::wait_or_kill_group` (which
+/// takes the hook's whole process group with it on expiry).
+///
+/// The two payloads differ on `PreToolUse`: the argv copy omits the tool
+/// arguments (argv is world-readable and size-capped), the stdin copy
+/// carries them — see [`ScriptHook::build_payload`].
 ///
 /// All three pipes are serviced by dedicated threads *while* we poll, not after.
 /// Draining only once `try_wait` reports exit is a deadlock: a hook that writes
@@ -613,7 +634,8 @@ const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// pipe to a background process.
 fn run_subprocess(
     command: &str,
-    payload: &str,
+    argv_payload: &str,
+    stdin_payload: &str,
     timeout: Duration,
     wants_stdout: bool,
 ) -> Result<(i32, String, String), SubprocessError> {
@@ -621,7 +643,7 @@ fn run_subprocess(
     cmd.arg("-c")
         .arg(command)
         .arg("borg-hook") // $0 inside the script
-        .arg(payload) // $1
+        .arg(argv_payload) // $1
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -651,7 +673,7 @@ fn run_subprocess(
     // exit status and output still stand. Any other write error is worth a warn,
     // but still must not mask the child's own result.
     let stdin_writer = child.stdin.take().map(|mut stdin| {
-        let payload = payload.to_string();
+        let payload = stdin_payload.to_string();
         std::thread::spawn(move || match stdin.write_all(payload.as_bytes()) {
             Ok(()) => {
                 let _ = stdin.flush();
@@ -1742,7 +1764,7 @@ mod tests {
             let pid_file = dir.path().join("grandchild.pid");
             let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
             let result = tokio::task::spawn_blocking(move || {
-                run_subprocess(&command, "{}", Duration::from_secs(1), true)
+                run_subprocess(&command, "{}", "{}", Duration::from_secs(1), true)
             })
             .await
             .expect("join");
@@ -1778,6 +1800,7 @@ mod tests {
             let command = format!("cat > {}", out.display());
             let (code, _stdout, _stderr) = run_subprocess(
                 &command,
+                r#"{"event":"SessionStart","turn":7}"#,
                 r#"{"event":"SessionStart","turn":7}"#,
                 Duration::from_secs(10),
                 true,
@@ -1820,7 +1843,7 @@ mod tests {
             std::env::set_var("BORG_KEK_PASSPHRASE", "kek_leak_must_not_appear");
 
             let command = format!("env > {}", out.display());
-            let result = run_subprocess(&command, "{}", Duration::from_secs(10), true);
+            let result = run_subprocess(&command, "{}", "{}", Duration::from_secs(10), true);
 
             std::env::remove_var("HOOK_PROBE_PROVIDER_API_KEY");
             std::env::remove_var("BORG_KEK_PASSPHRASE");
@@ -1859,6 +1882,7 @@ mod tests {
             let (code, _stdout, _stderr) = run_subprocess(
                 &command,
                 r#"{"event":"SessionEnd"}"#,
+                r#"{"event":"SessionEnd"}"#,
                 Duration::from_secs(10),
                 true,
             )
@@ -1875,16 +1899,17 @@ mod tests {
         #[test]
         fn hook_that_ignores_stdin_still_reports_its_exit_code() {
             // Comfortably past the ~64 KiB pipe buffer so the write genuinely
-            // blocks, but well under `ARG_MAX` — the payload also rides on argv,
-            // and a megabyte there fails the spawn outright.
+            // blocks. Only stdin carries the large payload — the argv copy is
+            // compact in production precisely because a single argv string
+            // this big fails the spawn on Linux (`MAX_ARG_STRLEN`).
             let big_payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(128 * 1024));
             let (code, _stdout, _stderr) =
-                run_subprocess("exit 0", &big_payload, Duration::from_secs(10), true)
+                run_subprocess("exit 0", "{}", &big_payload, Duration::from_secs(10), true)
                     .expect("broken pipe must not be reported as a subprocess error");
             assert_eq!(code, 0);
 
             let (code, _stdout, _stderr) =
-                run_subprocess("exit 3", &big_payload, Duration::from_secs(10), true)
+                run_subprocess("exit 3", "{}", &big_payload, Duration::from_secs(10), true)
                     .expect("broken pipe must not mask a nonzero exit either");
             assert_eq!(code, 3);
         }
@@ -1897,6 +1922,7 @@ mod tests {
         fn hook_writing_more_than_the_pipe_buffer_does_not_time_out() {
             let (code, _stdout, _stderr) = run_subprocess(
                 "printf 'x%.0s' $(seq 1 200000); exit 0",
+                "{}",
                 "{}",
                 Duration::from_secs(20),
                 true,
@@ -1914,7 +1940,7 @@ mod tests {
         fn hook_that_backgrounds_a_process_returns_within_its_timeout() {
             let started = Instant::now();
             let (code, _stdout, _stderr) =
-                run_subprocess("sleep 5 & exit 0", "{}", Duration::from_secs(1), true)
+                run_subprocess("sleep 5 & exit 0", "{}", "{}", Duration::from_secs(1), true)
                     .expect("a hook that exits promptly must not be reported as failed");
             let elapsed = started.elapsed();
             assert_eq!(code, 0, "the hook's own exit status must be reported");
@@ -1944,16 +1970,39 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn pre_tool_payload_carries_the_call_arguments() {
             // A hook that cannot see the arguments cannot judge the call. The
-            // payload must carry them under both the canonical and the
+            // stdin payload must carry them under both the canonical and the
             // Claude Code-compatible spelling.
             let hook = make_hook(
-                r#"python3 -c "import json,sys; p=json.loads(sys.argv[1]); sys.exit(0 if p['tool']['args']['command']=='ls' and p['tool']['tool_input']['command']=='ls' else 3)" "$1""#,
+                r#"python3 -c "import json,sys; p=json.load(sys.stdin); sys.exit(0 if p['tool']['args']['command']=='ls' and p['tool']['tool_input']['command']=='ls' else 3)""#,
                 HookPoint::BeforeToolCall,
             );
             let action = hook.execute(&tool_ctx(r#"{"command":"ls"}"#)).await;
             assert!(
                 matches!(action, HookAction::Continue),
-                "hook could not read the arguments out of its payload: {action:?}"
+                "hook could not read the arguments out of its stdin payload: {action:?}"
+            );
+        }
+
+        /// The argv (`$1`) copy of the payload must NOT carry the tool
+        /// arguments: argv is readable by every local user via `ps` /
+        /// `/proc/<pid>/cmdline`, and tool arguments can carry secrets (a
+        /// `run_shell` command holding a bearer token) and whole file bodies
+        /// (which would hit the OS argv size cap and fail the spawn, silently
+        /// skipping the hook). Only stdin carries them.
+        #[tokio::test(flavor = "current_thread")]
+        async fn pre_tool_argv_payload_omits_the_call_arguments() {
+            let hook = make_hook(
+                r#"python3 -c "import json,sys; p=json.loads(sys.argv[1]); sys.exit(3 if ('args' in p['tool'] or 'tool_input' in p['tool']) else (0 if p['tool']['name']=='run_shell' else 4))" "$1""#,
+                HookPoint::BeforeToolCall,
+            );
+            let action = hook
+                .execute(&tool_ctx(
+                    r#"{"command":"curl -H 'Authorization: Bearer sk-secret'"}"#,
+                ))
+                .await;
+            assert!(
+                matches!(action, HookAction::Continue),
+                "argv payload leaked the tool arguments (or lost the tool name): {action:?}"
             );
         }
 

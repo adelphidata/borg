@@ -114,7 +114,18 @@ pub(crate) async fn report_prior_unclean_exit(
 
 /// Longest a failing tick will wait before trying again. Past this the
 /// watchdog has had ample time to notice the missing liveness bumps.
-const MAX_TICK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+///
+/// MUST stay comfortably below `DAEMON_LOCK_STALE_SECS` (300s): the daemon
+/// lock heartbeat is only refreshed at the top of the loop, so a backoff at
+/// the cap is a window in which the lock goes unrefreshed. If the cap ever
+/// reached the stale threshold, a concurrently started `borgd` could steal
+/// the lock mid-backoff and both daemons would dispatch.
+const MAX_TICK_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+
+const _: () = assert!(
+    MAX_TICK_BACKOFF.as_secs() * 2 <= cortex::constants::DAEMON_LOCK_STALE_SECS as u64,
+    "tick backoff must leave the daemon-lock heartbeat well inside its stale threshold"
+);
 
 /// Whether an IO error is the process running out of file descriptors.
 ///
@@ -143,7 +154,7 @@ fn tick_backoff_delay(consecutive_failures: u32) -> std::time::Duration {
 /// Wait out the backoff, or return early if the daemon is shutting down.
 ///
 /// Returns `true` when shutdown was requested. The wait has to be
-/// cancellable: at the cap it is five minutes, and the loop only checks the
+/// cancellable: at the cap it is two minutes, and the loop only checks the
 /// shutdown token at the top of its `select!`. An uncancellable sleep would
 /// hold a SIGTERM for that long — and since the shutdown arm is what releases
 /// the daemon lock and stamps the clean-exit timestamp, the process would
@@ -203,6 +214,11 @@ pub async fn run(
     }
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
+    // Skip missed ticks instead of bursting. The default (`Burst`) replays
+    // every tick missed during a backoff sleep back to back — the exact
+    // "hammer the resource that just failed" behavior the backoff exists to
+    // prevent.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Stall detection lives in the supervisor now: `liveness` is bumped once
     // per loop iteration below, and `spawn_supervised(..., liveness)` arms a
@@ -418,6 +434,12 @@ pub async fn run(
                 // this tick. Deliberate: they use the same database that just
                 // refused the claim, so they would fail too — and each failure
                 // would be logged as if it were an independent problem.
+                // Release the tick lock before sleeping: holding it across a
+                // multi-minute backoff would lock out out-of-process tick
+                // callers (manual CLI, ACP triggers) even after the DB
+                // recovers, breaking the "dropped before the inter-tick
+                // sleep" contract documented above.
+                drop(_tick_lock);
                 // A shutdown during the wait falls through to the loop
                 // top, where the `select!` runs the shutdown arm.
                 backoff_after_failed_tick(tick_failures, &shutdown).await;
@@ -617,7 +639,7 @@ mod tick_health_tests {
             "the wait must be capped, not unbounded"
         );
 
-        // The wait must be cancellable. At the cap it is five minutes, and the
+        // The wait must be cancellable. At the cap it is two minutes, and the
         // shutdown arm is what releases the daemon lock and stamps the
         // clean-exit timestamp — a SIGTERM held that long means the process is
         // killed first and the next boot reports an unclean exit that never

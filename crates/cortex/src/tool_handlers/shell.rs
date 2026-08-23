@@ -449,7 +449,7 @@ pub async fn handle_run_shell_with_context(
     match action {
         "run" | "start" => {}
         "write_stdin" | "poll" | "kill" => {
-            return handle_session_action(action, args, &config.security).await
+            return handle_session_action(action, args, &config.security, ctx).await
         }
         other => {
             return Ok(format!(
@@ -995,7 +995,12 @@ async fn start_session(
         })
     });
 
-    let id = sessions.register(child, guard, resolved_shell_output_cap(config));
+    let id = sessions.register(
+        child,
+        guard,
+        resolved_shell_output_cap(config),
+        ctx.session_id().map(str::to_string),
+    );
     Ok(format!(
         "Started shell session {id}. Drive it with run_shell: action=write_stdin \
          (session_id={id}, stdin=…) to send input, action=poll (session_id={id}) to read new \
@@ -1011,6 +1016,7 @@ async fn handle_session_action(
     action: &str,
     args: &serde_json::Value,
     security: &crate::config::SecurityConfig,
+    ctx: &ExecutionContext,
 ) -> Result<String> {
     // `write_stdin` injects fresh commands into a live shell that were never
     // seen by the start-time policy/control-plane checks, so re-guard the stdin
@@ -1027,17 +1033,22 @@ async fn handle_session_action(
     let Some(sessions) = crate::shell_session::global() else {
         return Ok(no_session_registry_msg());
     };
-    session_action_with_registry(action, args, security, &sessions).await
+    session_action_with_registry(action, args, security, &sessions, ctx.session_id()).await
 }
 
 /// [`handle_session_action`] body against an explicit registry, so tests can
 /// drive the write_stdin/poll/kill flow (including env-file masking) without
 /// installing the once-only process-global registry.
+///
+/// `caller` is the acting conversation's session id; the registry rejects any
+/// action whose caller does not match the session's owner, so one channel's
+/// conversation can never drive a shell another conversation started.
 async fn session_action_with_registry(
     action: &str,
     args: &serde_json::Value,
     security: &crate::config::SecurityConfig,
     sessions: &crate::shell_session::ShellSessionRegistry,
+    caller: Option<&str>,
 ) -> Result<String> {
     let session_id = args
         .get("session_id")
@@ -1051,9 +1062,9 @@ async fn session_action_with_registry(
             // session leaks the same content through later polls, so flag the
             // session now (sticky — output attribution is asynchronous).
             if command_reads_blocked_env_file(stdin, security) {
-                sessions.mark_env_mask(session_id);
+                sessions.mark_env_mask(session_id, caller);
             }
-            match sessions.write_stdin(session_id, stdin).await {
+            match sessions.write_stdin(session_id, stdin, caller).await {
                 Ok(()) => Ok(format!(
                     "Wrote {} bytes to session {session_id}. Use action=poll to read output.",
                     stdin.len()
@@ -1061,13 +1072,15 @@ async fn session_action_with_registry(
                 Err(e) => Ok(e.to_string()),
             }
         }
-        "poll" => match sessions.poll(session_id) {
+        "poll" => match sessions.poll(session_id, caller) {
             Ok(out) if out.is_empty() => Ok(format!("[no new output from session {session_id}]")),
-            Ok(out) if sessions.needs_env_mask(session_id) => Ok(mask_env_assignments(&out)),
+            Ok(out) if sessions.needs_env_mask(session_id, caller) => {
+                Ok(mask_env_assignments(&out))
+            }
             Ok(out) => Ok(out),
             Err(e) => Ok(e.to_string()),
         },
-        "kill" => match sessions.kill(session_id).await {
+        "kill" => match sessions.kill(session_id, caller).await {
             Ok(()) => Ok(format!("Killed session {session_id}.")),
             Err(e) => Ok(e.to_string()),
         },
@@ -2542,20 +2555,32 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, 64 * 1024);
+        let id = reg.register(child, None, 64 * 1024, Some("owner-a".into()));
         let security = crate::config::SecurityConfig::default();
 
         let write_args = serde_json::json!({ "session_id": id, "stdin": "cat .env\n" });
-        super::session_action_with_registry("write_stdin", &write_args, &security, &reg)
-            .await
-            .expect("write_stdin");
+        super::session_action_with_registry(
+            "write_stdin",
+            &write_args,
+            &security,
+            &reg,
+            Some("owner-a"),
+        )
+        .await
+        .expect("write_stdin");
 
         let poll_args = serde_json::json!({ "session_id": id });
         let mut out = String::new();
         for _ in 0..50 {
-            let polled = super::session_action_with_registry("poll", &poll_args, &security, &reg)
-                .await
-                .expect("poll");
+            let polled = super::session_action_with_registry(
+                "poll",
+                &poll_args,
+                &security,
+                &reg,
+                Some("owner-a"),
+            )
+            .await
+            .expect("poll");
             if polled.contains("SOME_UNKNOWN_VENDOR_KEY") {
                 out = polled;
                 break;
@@ -2571,7 +2596,7 @@ mod tests {
             "secret leaked through the session lane: {out:?}"
         );
 
-        super::session_action_with_registry("kill", &poll_args, &security, &reg)
+        super::session_action_with_registry("kill", &poll_args, &security, &reg, Some("owner-a"))
             .await
             .expect("kill");
     }

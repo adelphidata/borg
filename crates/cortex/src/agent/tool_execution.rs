@@ -556,6 +556,20 @@ impl Agent {
 
         for (idx, slot) in slots.iter().enumerate() {
             if let Slot::Approved { name, args } = slot {
+                // Announce the call BEFORE the work runs, in the LLM's
+                // original order (this loop is ordered). The stall watchdog
+                // counts a tool as in-flight from `ToolExecuting` to
+                // `ToolResult`; announcing only in the post-join merge pass
+                // reported zero tools in flight for the whole parallel batch,
+                // so a child running long parallel fetches was cancelled as
+                // stalled while doing exactly what it was asked.
+                let _ = event_tx
+                    .send(AgentEvent::ToolExecuting {
+                        tool_call_id: tool_calls[idx].id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .await;
                 let config = std::sync::Arc::clone(&self.config_arc);
                 let execution_context = self.execution_context.clone();
                 let tx = event_tx.clone();
@@ -598,25 +612,36 @@ impl Agent {
             }
         }
 
-        // Single in-order pass: emit ToolExecuting, fire hooks, and build the
-        // result messages in the LLM's original call order. Skip slots and
-        // completed slots are interleaved at their original positions. Every
-        // result already exists in memory at this point, so persistence is
-        // deferred to one batched flush after the loop — same rows, one
-        // transaction instead of one per result.
+        // Single in-order pass: fire hooks and build the result messages in
+        // the LLM's original call order (`ToolExecuting` was already emitted
+        // at spawn time, above). Skip slots and completed slots are
+        // interleaved at their original positions. Every result already
+        // exists in memory at this point, so persistence is deferred to one
+        // batched flush after the loop — same rows, one transaction instead
+        // of one per result.
         let mut result_batch: Vec<Message> = Vec::with_capacity(tool_calls.len());
         for (idx, slot) in slots.into_iter().enumerate() {
             let tool_call = tool_calls[idx];
-            let (name, elapsed, result, args_for_event) = match slot {
+            let (name, elapsed, result) = match slot {
                 Slot::Skipped { reason } => {
                     result_batch.push(Message::tool_result(&tool_call.id, &reason));
                     continue;
                 }
-                Slot::Approved { name: _, args } => match results[idx].take() {
-                    Some((nm, el, res)) => (nm, el, res, args),
+                Slot::Approved { name, .. } => match results[idx].take() {
+                    Some((nm, el, res)) => (nm, el, res),
                     None => {
                         // Worker panicked — surface a placeholder error so the
-                        // LLM still sees a tool_result for this call.
+                        // LLM still sees a tool_result for this call. Also
+                        // close the `ToolExecuting` announced at spawn time,
+                        // so event consumers (the stall watchdog's in-flight
+                        // counter) do not count a dead worker as running.
+                        let _ = event_tx
+                            .send(AgentEvent::ToolResult {
+                                tool_call_id: tool_call.id.clone(),
+                                name: name.clone(),
+                                result: "[tool call failed — worker panicked]".to_string(),
+                            })
+                            .await;
                         result_batch.push(Message::tool_result(
                             &tool_call.id,
                             "[tool call failed — worker panicked]",
@@ -625,14 +650,6 @@ impl Agent {
                     }
                 },
             };
-
-            let _ = event_tx
-                .send(AgentEvent::ToolExecuting {
-                    tool_call_id: tool_call.id.clone(),
-                    name: name.clone(),
-                    args: args_for_event,
-                })
-                .await;
 
             let tool_output = result.unwrap_or_else(|e| {
                 ToolOutput::Text(crate::security::sanitize::sanitize_tool_error(
@@ -1067,10 +1084,14 @@ pub(super) async fn dispatch_parallel_safe_tool(
             .await
             .map(ToolOutput::Text),
         crate::tool::Tool::ListSkills => {
-            // The parallel-safe path carries no execution context, so the
-            // project tier cannot be resolved here; the sequential path above
-            // is where a session's own catalog is rendered.
-            crate::tool::list::handle_list_skills(config, None).map(ToolOutput::Text)
+            // Same workspace resolution as the sequential path: the catalog
+            // must not change depending on whether the model happened to
+            // batch this call with other parallel-safe tools.
+            crate::tool::list::handle_list_skills(
+                config,
+                execution_context.map(crate::execution_context::ExecutionContext::workspace_root),
+            )
+            .map(ToolOutput::Text)
         }
         crate::tool::Tool::ListChannels => {
             crate::tool::list::handle_list_channels(config).map(ToolOutput::Text)

@@ -294,6 +294,66 @@ pub fn compaction_checkpoint_range(
     Some((from_seq, to_seq))
 }
 
+/// Hard ceiling for a compaction summary, as a fraction of the replaced
+/// middle's token count: the marker must cost at most 90% of what it removes,
+/// so every committed compaction shrinks history by a real margin.
+///
+/// The word cap in the summarizer prompt is a request, not a bound — chunked
+/// summarization merges several chunk summaries and the anchor index is
+/// appended afterwards, so nothing upstream stops a marker from costing more
+/// than the middle it replaces. Committing such a swap makes history LARGER
+/// while reporting a successful compaction, and nothing downstream compares
+/// before/after sizes — the session then wedges over budget with the
+/// compactor insisting it is making progress.
+///
+/// Deliberately a loose bound (not, say, half the middle): a legitimate
+/// summary of a small middle is dense — squeezing it harder deletes the
+/// identifiers and anchors the marker exists to preserve. The guard is
+/// against growth, not against modest summaries.
+fn summary_token_budget(middle_tokens: usize) -> usize {
+    (middle_tokens.saturating_sub(middle_tokens / 10)).max(1)
+}
+
+/// Enforce a hard token ceiling on a compaction summary by deterministic
+/// truncation. Truncation, not refusal: a refusal leaves the session over
+/// budget with no path forward, while a truncated summary still archives the
+/// middle and shrinks history. The appended note tells the model content was
+/// cut, so it reaches for `memory_search` instead of inventing what is gone.
+fn truncate_to_token_budget(text: String, budget_tokens: usize) -> String {
+    use crate::memory::tokenizer::estimate_tokens;
+    if estimate_tokens(&text) <= budget_tokens {
+        return text;
+    }
+    const NOTE: &str = "\n[truncated: the summary would have outgrown the messages it replaced]";
+    let mut kept = text;
+    loop {
+        let tokens = estimate_tokens(&kept);
+        if kept.is_empty() || tokens + estimate_tokens(NOTE) <= budget_tokens {
+            break;
+        }
+        // Proportional cut with 10% slack; BPE is nonlinear, so loop until
+        // the estimate converges under the budget. Each pass shrinks the text
+        // (the target is capped at len-1), so termination is structural.
+        let target = kept
+            .len()
+            .saturating_mul(budget_tokens)
+            .saturating_mul(9)
+            .checked_div(tokens.saturating_mul(10))
+            .unwrap_or(0);
+        let mut cut = target.min(kept.len().saturating_sub(1));
+        while cut > 0 && !kept.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == 0 {
+            kept.clear();
+            break;
+        }
+        kept.truncate(cut);
+    }
+    warn!("compaction summary exceeded its token budget ({budget_tokens}), truncated");
+    format!("{kept}{NOTE}")
+}
+
 /// Compact conversation history using the LLM to summarize dropped messages.
 ///
 /// Strategy:
@@ -342,7 +402,17 @@ pub async fn compact_history(
         return Err(SummarizeFailure::Transient);
     }
 
+    // Would-grow guard: the marker must cost strictly less than the messages
+    // it replaces, or the "compaction" grows history while reporting success.
+    let middle_tokens: usize = history[..dropped].iter().map(message_tokens).sum();
+    let summary = truncate_to_token_budget(summary, summary_token_budget(middle_tokens));
     let marker = Message::user(summary);
+    // Backstop for a middle so small even a fully-truncated marker outweighs
+    // it: refuse rather than commit a growth. Never mutates history.
+    if message_tokens(&marker) >= middle_tokens {
+        warn!("compaction marker would outweigh the {middle_tokens}-token middle, refusing");
+        return Err(SummarizeFailure::Transient);
+    }
 
     let mut compacted = Vec::with_capacity(history.len() - dropped + 1);
     compacted.push(marker);
@@ -421,10 +491,27 @@ pub async fn compact_history_v2(
     // redundancy — SHAs, issue numbers, paths, error text — survive at full
     // fidelity whatever the summarizer chose to keep. Done after the call so
     // no model ever gets the chance to rewrite them.
-    let summary_body = format!(
-        "{summary_body}{}",
-        super::anchors::build_anchor_index(&summarizer_region_text(&middle), &carried_anchors)
-    );
+    let anchor_index =
+        super::anchors::build_anchor_index(&summarizer_region_text(&middle), &carried_anchors);
+
+    // Would-grow guard: the marker must cost strictly less than the middle it
+    // replaces. The prose is truncated first, inside whatever budget the
+    // anchor index leaves — anchors are the highest-fidelity facts and sit at
+    // the tail, so a naive whole-string cut would delete them first. The
+    // second pass is the backstop for an anchor index that alone exceeds the
+    // budget.
+    let middle_tokens: usize = history[plan.head_end..plan.tail_start]
+        .iter()
+        .map(message_tokens)
+        .sum();
+    // The budget bounds the whole rendered marker, so the frame the body will
+    // be wrapped in (heading, fences, role overhead) is paid up front.
+    let frame_tokens = message_tokens(&render_compaction_marker(""));
+    let budget = summary_token_budget(middle_tokens).saturating_sub(frame_tokens);
+    let prose_budget =
+        budget.saturating_sub(crate::memory::tokenizer::estimate_tokens(&anchor_index));
+    let summary_body = truncate_to_token_budget(summary_body, prose_budget);
+    let summary_body = truncate_to_token_budget(format!("{summary_body}{anchor_index}"), budget);
 
     // Sanitize the summary body to strip any XML tag boundaries the LLM may
     // have injected (e.g. a stray `</compaction_summary>` inside a code
@@ -432,6 +519,15 @@ pub async fn compact_history_v2(
     // early and smuggle untrusted content onto the internal side.
     let safe_body = crate::security::sanitize::sanitize_xml_boundaries(&summary_body);
     let marker = render_compaction_marker(&safe_body);
+    // Backstop for a middle so small even a fully-truncated marker (frame +
+    // truncation note) outweighs it: the budget math above cannot shrink the
+    // frame, so refuse rather than commit a growth. Never mutates history.
+    if message_tokens(&marker) >= middle_tokens {
+        warn!(
+            "compact_history_v2: marker would outweigh the {middle_tokens}-token middle, refusing"
+        );
+        return Err(SummarizeFailure::Transient);
+    }
 
     let mut compacted = Vec::with_capacity(plan.head_end + 1 + history.len() - plan.tail_start);
     compacted.extend(history.drain(..plan.head_end));
@@ -501,6 +597,30 @@ pub fn extract_last_compaction_summary(history: &[Message]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::types::{FunctionCall, Message, MessageContent, Role, ToolCall};
+
+    /// Within budget → returned byte-for-byte, no truncation note.
+    #[test]
+    fn summary_within_budget_is_untouched() {
+        let text = "short summary".to_string();
+        assert_eq!(truncate_to_token_budget(text.clone(), 1_000), text);
+    }
+
+    /// Over budget → cut under the budget, with the truncation note appended
+    /// so the model knows content is gone.
+    #[test]
+    fn oversized_summary_is_truncated_under_its_budget() {
+        let text = "word ".repeat(4_000);
+        let budget = 100;
+        let out = truncate_to_token_budget(text, budget);
+        assert!(
+            crate::memory::tokenizer::estimate_tokens(&out) <= budget,
+            "truncated summary must fit its budget"
+        );
+        assert!(
+            out.contains("[truncated"),
+            "the cut must be announced, not silent: {out}"
+        );
+    }
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
@@ -1184,6 +1304,56 @@ mod tests {
                     .trim()
             ),
             "the stored summary must match the spliced marker body"
+        );
+    }
+
+    /// The would-grow bug: nothing upstream bounds the summarizer's output,
+    /// so a marker can cost more than the middle it replaces — history GROWS
+    /// while the compactor reports success, and no caller compares sizes.
+    /// A compaction must always shrink history; an oversized summary is
+    /// truncated (announced in the marker), never committed whole.
+    #[tokio::test]
+    async fn compaction_never_grows_history_even_when_the_summary_would() {
+        let mut history: Vec<Message> = Vec::new();
+        for i in 0..8 {
+            history.push(make_user(&format!(
+                "Turn {i}: a modest message with enough words to give the planner \
+                 a middle region worth folding away this pass."
+            )));
+            history.push(make_assistant(&format!(
+                "Reply {i}: acknowledged, adding filler so the history exceeds \
+                 the compaction budget."
+            )));
+        }
+        let before = history_tokens(&history);
+        let tight_budget = (before as f64 / 0.90) as usize;
+
+        // A summary far larger than the whole history it summarizes.
+        let huge: &'static str = Box::leak(
+            format!("## Goal\n{}", "verbose padding sentence. ".repeat(2_000)).into_boxed_str(),
+        );
+        let mut llm = client_returning(huge).await;
+        let mut previous: Option<String> = None;
+        let dropped = compact_history_v2(&mut history, tight_budget, 1, &mut previous, &mut llm)
+            .await
+            .expect("compaction runs");
+        assert!(dropped > 0, "precondition: the fold must have run");
+
+        let after = history_tokens(&history);
+        assert!(
+            after < before,
+            "compaction must shrink history: before={before}, after={after}"
+        );
+        let marker = history
+            .iter()
+            .find(|m| is_compaction_marker(m))
+            .expect("a marker must be spliced in");
+        assert!(
+            marker
+                .text_content()
+                .expect("marker text")
+                .contains("[truncated"),
+            "the truncation must be announced in the marker"
         );
     }
 

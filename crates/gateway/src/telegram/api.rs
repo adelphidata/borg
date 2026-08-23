@@ -25,7 +25,7 @@ const MEDIA_SEND_TIMEOUT: Duration = crate::constants::TELEGRAM_MEDIA_SEND_TIMEO
 
 // Telegram returns retry_after in JSON body, not Retry-After header, so we use custom retry logic instead of http_retry.
 const MAX_SEND_RETRIES: u32 = crate::constants::TELEGRAM_MAX_SEND_RETRIES;
-const MAX_RETRY_AFTER_SECS: u64 = crate::constants::TELEGRAM_MAX_RETRY_AFTER_SECS;
+const FLOOD_FAIL_FAST_SECS: u64 = crate::constants::TELEGRAM_FLOOD_FAIL_FAST_SECS;
 
 /// A client for the Telegram Bot API.
 #[derive(Clone)]
@@ -199,10 +199,16 @@ impl TelegramClient {
                     self.circuit_breaker.record_failure_status(429);
                     bail!("sendMessage rate limited after {MAX_SEND_RETRIES} retries");
                 }
-                let retry_secs = resp_body
-                    .retry_after_secs()
-                    .unwrap_or(5)
-                    .min(MAX_RETRY_AFTER_SECS);
+                let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
+                if retry_secs > FLOOD_FAIL_FAST_SECS {
+                    // A long flood wait must fail closed, not sleep: this send
+                    // is awaited inline on the polling loop, so sleeping here
+                    // freezes every chat on the bot for the whole wait.
+                    self.circuit_breaker.record_failure_status(429);
+                    bail!(
+                        "sendMessage flood-limited for {retry_secs}s — failing fast instead of blocking the send path"
+                    );
+                }
                 let jitter_ms = (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -498,10 +504,15 @@ impl TelegramClient {
                     self.circuit_breaker.record_failure_status(429);
                     bail!("{method} rate limited after {MAX_SEND_RETRIES} retries");
                 }
-                let retry_secs = resp_body
-                    .retry_after_secs()
-                    .unwrap_or(5)
-                    .min(MAX_RETRY_AFTER_SECS);
+                let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
+                if retry_secs > FLOOD_FAIL_FAST_SECS {
+                    // Same fail-closed rule as the text lane: a long flood
+                    // wait slept inline would pin the whole send path.
+                    self.circuit_breaker.record_failure_status(429);
+                    bail!(
+                        "{method} flood-limited for {retry_secs}s — failing fast instead of blocking the send path"
+                    );
+                }
                 warn!("Telegram rate limited on {method}, retry after {retry_secs}s (attempt {attempts}/{MAX_SEND_RETRIES})");
                 tokio::time::sleep(Duration::from_secs(retry_secs)).await;
                 continue;
@@ -1139,6 +1150,123 @@ mod tests {
         assert!(
             err.to_string().contains("file must be non-empty"),
             "API description must surface, got: {err}"
+        );
+    }
+
+    /// A long flood wait must fail closed on the FIRST response — no sleep,
+    /// no retry. Sends are awaited inline on the polling loop, so sleeping
+    /// through a minutes-long `retry_after` freezes every chat on the bot
+    /// (observed in production as a 97-minute pin).
+    #[tokio::test]
+    async fn send_message_fails_fast_on_long_flood_wait() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Too Many Requests: retry after 5820",
+                "parameters": { "retry_after": 5820 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let started = std::time::Instant::now();
+        let err = client
+            .send_message(7, "hello", None, None, None)
+            .await
+            .expect_err("a long flood wait must fail, not sleep");
+        assert!(
+            err.to_string().contains("flood-limited for 5820s"),
+            "error must name the wait so callers can log it, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(FLOOD_FAIL_FAST_SECS),
+            "fail-fast must not sleep through the flood wait"
+        );
+    }
+
+    /// A short flood wait (≤ the fail-fast threshold) is still worth riding
+    /// out inline: sleep, retry, succeed.
+    #[tokio::test]
+    async fn send_message_retries_short_flood_wait() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Too Many Requests",
+                "parameters": { "retry_after": 0 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        client
+            .send_message(7, "hello", None, None, None)
+            .await
+            .expect("a short flood wait must retry and succeed");
+    }
+
+    /// The media lane applies the same fail-closed rule as the text lane.
+    #[tokio::test]
+    async fn media_send_fails_fast_on_long_flood_wait() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendPhoto"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Too Many Requests",
+                "parameters": { "retry_after": 600 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let started = std::time::Instant::now();
+        let err = client
+            .send_photo(
+                7,
+                MediaSource::Bytes {
+                    bytes: b"jpeg-bytes",
+                    filename: "pic.jpg",
+                    mime: Some("image/jpeg"),
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("a long flood wait must fail, not sleep");
+        assert!(
+            err.to_string().contains("flood-limited for 600s"),
+            "error must name the wait, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(FLOOD_FAIL_FAST_SECS),
+            "fail-fast must not sleep through the flood wait"
         );
     }
 
