@@ -198,6 +198,42 @@ mod tests {
         assert_eq!(names, vec!["memory_search".to_string()]);
     }
 
+    /// The body cap is 1 MiB, matching the generic-webhook surface: a
+    /// legitimate multi-hundred-KB JSON-RPC body must pass, while
+    /// anything over 1 MiB is refused before materialization.
+    #[tokio::test]
+    async fn http_body_cap_is_one_mib() {
+        let (state, issued, _tmp) = make_state().await;
+        let router = http_router(state);
+
+        // Well under 1 MiB but far above any accidentally-shrunk cap.
+        let resp = router
+            .clone()
+            .oneshot(req_with(
+                Some(&issued.plaintext),
+                serde_json::json!({
+                    "jsonrpc":"2.0","id":5,"method":"tools/list",
+                    "params":{"pad": "x".repeat(512 * 1024)}
+                }),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::OK, "512 KiB body must pass");
+
+        // JSON wrapping pushes this past 1 MiB.
+        let resp = router
+            .oneshot(req_with(
+                Some(&issued.plaintext),
+                serde_json::json!({
+                    "jsonrpc":"2.0","id":6,"method":"tools/list",
+                    "params":{"pad": "x".repeat(1024 * 1024)}
+                }),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn http_notification_returns_204_no_content() {
         // Notifications get no JSON-RPC body but the HTTP response

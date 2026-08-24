@@ -370,6 +370,33 @@ mod tests {
         assert_eq!(urls, vec!["https://example.com"]);
     }
 
+    /// The inbound policy must inherit the operator's allow/deny rules — it
+    /// only *hardens* the configured policy (forcing private space off), it
+    /// never replaces it with defaults. A denylisted host stays blocked, a
+    /// non-allowlisted host stays blocked, and loopback stays blocked even
+    /// when the operator allowed private URLs for first-party fetches.
+    #[test]
+    fn inbound_policy_keeps_operator_rules_while_forcing_private_off() {
+        let denying = UrlPolicyConfig {
+            denylist: vec!["evil.example".into()],
+            allow_private_urls: true,
+            ..UrlPolicyConfig::default()
+        };
+        let urls = extract_urls(
+            "https://evil.example/x https://ok.example/y http://127.0.0.1/z",
+            10,
+            &denying,
+        );
+        assert_eq!(urls, vec!["https://ok.example/y"]);
+
+        let allowlisted = UrlPolicyConfig {
+            allowlist: vec!["ok.example".into()],
+            ..UrlPolicyConfig::default()
+        };
+        let urls = extract_urls("https://other.example/a https://ok.example/b", 10, &allowlisted);
+        assert_eq!(urls, vec!["https://ok.example/b"]);
+    }
+
     #[test]
     fn is_admissible_checks() {
         let p = policy();

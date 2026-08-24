@@ -236,6 +236,104 @@ mod tests {
         let _ = task.await;
     }
 
+    /// The stdio cap is 1 MiB — the same abuse budget as the HTTP body
+    /// limit — and inclusive: a frame of exactly the cap is legitimate.
+    /// The size is hardcoded (not derived from `MAX_FRAME_BYTES`) so a
+    /// drifted constant fails here instead of the test drifting with it.
+    #[tokio::test]
+    async fn frame_at_exactly_one_mib_is_accepted() {
+        const ONE_MIB: usize = 1_048_576;
+        let probe = serde_json::json!({
+            "jsonrpc":"2.0","id":9,"method":"tools/list","params":{"pad":""}
+        });
+        let base_len = serde_json::to_vec(&probe).expect("serialize").len();
+        let request = serde_json::json!({
+            "jsonrpc":"2.0","id":9,"method":"tools/list",
+            "params":{"pad": "x".repeat(ONE_MIB - base_len)}
+        });
+        let body = serde_json::to_vec(&request).expect("serialize");
+        assert_eq!(body.len(), ONE_MIB, "test must sit exactly on the cap");
+
+        let mut input = Vec::new();
+        input.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        input.extend_from_slice(&body);
+
+        let (mut out_reader, mut out_writer) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
+        let server = server();
+        let task = tokio::spawn(async move {
+            let cursor = std::io::Cursor::new(input);
+            run(server, cursor, &mut out_writer).await
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let n = out_reader.read(&mut buf).await.expect("read response");
+        let response = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            response.contains("\"id\":9") && !response.contains("exceeds"),
+            "an at-cap frame must be processed, got: {response}"
+        );
+        drop(out_reader);
+        let _ = task.await;
+    }
+
+    /// One byte over the cap must be refused up front by the declared
+    /// length — not by attempting the oversized allocation and read.
+    #[tokio::test]
+    async fn frame_over_the_cap_is_rejected_by_the_header() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"Content-Length: 1048577\r\n\r\n");
+        input.extend_from_slice(b"{}");
+
+        let err = run(server(), std::io::Cursor::new(input), tokio::io::sink())
+            .await
+            .expect_err("over-cap frame must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("1048577") && msg.contains("exceeds"),
+            "must reject via the cap check, got: {msg}"
+        );
+    }
+
+    /// The harness duplex buffer must absorb a whole multi-KB framed
+    /// response while nothing is draining the read side, or `run`
+    /// deadlocks mid-`write_all` — the invariant the buffer size exists
+    /// to uphold.
+    #[tokio::test]
+    async fn large_response_completes_without_a_draining_reader() {
+        let pad = "y".repeat(8 * 1024);
+        let request = serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_search","arguments":{"pad": pad}}
+        });
+        let mut input = serde_json::to_vec(&request).expect("serialize");
+        input.push(b'\n');
+
+        let (mut out_reader, mut out_writer) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
+        let server = server();
+        let task = tokio::spawn(async move {
+            let cursor = std::io::Cursor::new(input);
+            run(server, cursor, &mut out_writer).await
+        });
+
+        // Await completion BEFORE reading: the full ~8 KB response must
+        // fit the buffer without backpressure wedging the writer.
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("run must finish while the reader is idle")
+            .expect("join")
+            .expect("run ok");
+
+        let mut all = String::new();
+        out_reader
+            .read_to_string(&mut all)
+            .await
+            .expect("read response");
+        assert!(
+            all.contains(&"y".repeat(8 * 1024)),
+            "echoed pad must arrive intact"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_json_emits_parse_error_and_continues() {
         // A garbled message in the middle of a session must not

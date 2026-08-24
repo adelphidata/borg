@@ -221,6 +221,10 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
                     flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
                 }
                 let sep = usize::from(!current.is_empty());
+                // `sep` is decision-neutral here (kept for symmetry with the
+                // check above): after that check either the whole sum already
+                // fit, `total` alone exceeds the budget, or the flush left
+                // `current_chars == sep == 0`.
                 if current_chars + sep + total <= max_chars {
                     for fence_line in &lines[i..=i + close_off] {
                         if !current.is_empty() {
@@ -238,21 +242,6 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
             }
         }
 
-        // Closing fence arriving while the chunk holds only the reopened
-        // scaffold: emitting "```info\n```" would be a degenerate empty
-        // block (the body already shipped, properly closed, in earlier
-        // chunks). Drop the scaffold and the close together.
-        if is_fence_line
-            && open_fence.is_some()
-            && is_bare_scaffold(&current, &open_fence)
-            && !current.is_empty()
-        {
-            current.clear();
-            current_chars = 0;
-            open_fence = None;
-            i += 1;
-            continue;
-        }
         // +1 for the joining newline when the chunk already has content.
         let sep = usize::from(!current.is_empty());
         // While inside a fence, reserve room for BOTH bracketing sides: the
@@ -277,6 +266,25 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
             flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
         }
 
+        // Closing fence arriving while the chunk holds only the reopened
+        // scaffold: emitting "```info\n```" would be a degenerate empty
+        // block (the body already shipped, properly closed, in earlier
+        // chunks). Drop the scaffold and the close together. Checked after
+        // the flush above so a close line whose conservative budget check
+        // just triggered that flush is dropped too, instead of landing on
+        // the fresh scaffold as an empty block.
+        if is_fence_line
+            && open_fence.is_some()
+            && is_bare_scaffold(&current, &open_fence)
+            && !current.is_empty()
+        {
+            current.clear();
+            current_chars = 0;
+            open_fence = None;
+            i += 1;
+            continue;
+        }
+
         // A single line that alone exceeds the budget: hard-split it via
         // chunk_text; the flush's close/reopen bracketing keeps every piece
         // well-formed when this happens inside a fence.
@@ -284,13 +292,13 @@ pub fn chunk_markdown_fenced(text: &str, max_chars: usize) -> Vec<String> {
             if !current.trim().is_empty() && !is_bare_scaffold(&current, &open_fence) {
                 flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
             }
+            // No running-count updates here: every iteration ends in a
+            // flush, which recomputes `current_chars` from scratch.
             for piece in chunk_text(line, budget.max(1)) {
                 if !current.is_empty() {
                     current.push('\n');
-                    current_chars += 1;
                 }
                 current.push_str(&piece);
-                current_chars += piece.chars().count();
                 flush(&mut chunks, &mut current, &mut current_chars, &open_fence);
             }
             if is_fence_line {
@@ -609,6 +617,73 @@ mod tests {
         );
     }
 
+    /// Boundary contract of the intact-fence placement: a whole fence block
+    /// that fits inside one chunk is never split, lands beside the current
+    /// prose exactly when `current + newline + block` still fits the budget,
+    /// and otherwise moves whole to a fresh chunk. Each case pins the exact
+    /// chunk sequence so any drift in the char accounting (the joining
+    /// newline, the fence's own size, the fits-beside comparison, or the
+    /// close-line offset) changes the output.
+    ///
+    /// Fence blocks here are 12 chars ("```\nbbbb\n```") or 16 chars
+    /// ("```\nbbbbbbbb\n```") against a 16-char budget, so every comparison
+    /// sits within one char of the boundary.
+    #[test]
+    fn fenced_intact_placement_boundaries() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            // Prose + separator + block = 17 > 16, block alone = 12 <= 16:
+            // flush the prose, place the block whole in a fresh chunk.
+            ("fence_moves_whole_to_fresh_chunk", "aaaa\n```\nbbbb\n```", &[
+                "aaaa",
+                "```\nbbbb\n```",
+            ]),
+            // Prose + separator + block = 15 <= 16: block stays beside the
+            // prose; the trailing line no longer fits and starts chunk 2.
+            ("fence_fits_beside_prose", "aa\n```\nbbbb\n```\nzz", &[
+                "aa\n```\nbbbb\n```",
+                "zz",
+            ]),
+            // Block alone is exactly 16 = max: after flushing the prose it
+            // must still be placed whole (<= is inclusive), and the chunk's
+            // running count must be the full 16 so "zz" starts chunk 3.
+            ("fence_exactly_max_in_fresh_chunk", "aaaa\n```\nbbbbbbbb\n```\nzz", &[
+                "aaaa",
+                "```\nbbbbbbbb\n```",
+                "zz",
+            ]),
+            // Prose + separator + block = exactly 16 = max: not over budget,
+            // so no flush — they stay together in one chunk.
+            ("prose_plus_fence_exactly_max_stay_together", "aaa\n```\nbbbb\n```\nzzzzz", &[
+                "aaa\n```\nbbbb\n```",
+                "zzzzz",
+            ]),
+            // A blank line inside the block (13 chars total, 18 with the
+            // trailer) still counts its joining newline, so "zzzz" must not
+            // ride along in the fence's chunk.
+            ("fence_with_blank_body_line_counts_newlines", "aaaa\n```\nbbbb\n\n```\nzzzz", &[
+                "aaaa",
+                "```\nbbbb\n\n```",
+                "zzzz",
+            ]),
+        ];
+        for (name, text, expected) in cases {
+            assert_eq!(&chunk_markdown_fenced(text, 16), expected, "case {name}");
+        }
+    }
+
+    /// The re-split budgets `max_units / 2` chars per piece — the worst-case
+    /// bound where every char is a surrogate pair. 300 astral chars over a
+    /// 400-unit cap must give 200 + 100 chars, not a degenerate per-char
+    /// split (300 one-char sends) nor pieces still over the cap.
+    #[test]
+    fn resplit_utf16_budgets_half_the_unit_cap_in_chars() {
+        let emoji = "\u{1F600}".repeat(300);
+        let chunks = resplit_utf16(vec![emoji.clone()], 400);
+        let lens: Vec<usize> = chunks.iter().map(|c| c.chars().count()).collect();
+        assert_eq!(lens, vec![200, 100]);
+        assert_eq!(chunks.concat(), emoji);
+    }
+
     #[test]
     fn chunks_for_delivery_refuses_an_empty_message() {
         // A zero-chunk result makes every adapter's `for chunk in &chunks`
@@ -665,5 +740,109 @@ mod tests {
             chunks_for_delivery(&long, 100).unwrap(),
             chunk_text_nonempty(&long, 100)
         );
+    }
+    /// After a fence split whose body exactly filled the previous chunks, the
+    /// closing fence arrives while the chunk holds only the reopened
+    /// scaffold. Both must be dropped together — the body already shipped,
+    /// properly closed — and the walk must move past the close so trailing
+    /// prose lands outside any fence.
+    #[test]
+    fn fenced_close_after_split_drops_scaffold_and_frees_the_tail() {
+        assert_eq!(
+            chunk_markdown_fenced("```rs\nAAAAAAA\n```\ntail", 16),
+            vec!["```rs\nAAAAAA\n```", "```rs\nA\n```", "tail"]
+        );
+    }
+
+    /// A fence split landing exactly at end of input leaves only the
+    /// reopened scaffold pending; shipping it would render an empty block.
+    #[test]
+    fn fenced_split_ending_exactly_at_eof_drops_the_trailing_scaffold() {
+        assert_eq!(
+            chunk_markdown_fenced("```rs\nAAAAAAAAAAAA", 16),
+            vec!["```rs\nAAAAAA\n```", "```rs\nAAAAAA\n```"]
+        );
+    }
+
+    /// Whitespace-only input longer than the budget yields no flushable
+    /// content; the fallback must return the original text, not nothing —
+    /// a zero-chunk result upstream reads as "message delivered" while
+    /// nothing was sent.
+    #[test]
+    fn whitespace_only_overlong_input_falls_back_to_the_whole_text() {
+        let text = "\n".repeat(20);
+        assert_eq!(chunk_markdown_fenced(&text, 5), vec![text.clone()]);
+    }
+
+    /// Boundary pins for the prose flush accounting: the joining newline
+    /// counts exactly 1, and a chunk flushes only when the next line would
+    /// push it past the budget — never at exactly the budget.
+    #[test]
+    fn prose_flush_boundary_accounting() {
+        let cases: &[(&str, usize, &[&str])] = &[
+            // 5 + newline + 2 = 8 > 7: "cc" starts a fresh chunk.
+            ("aa\nbb\ncc", 7, &["aa\nbb", "cc"]),
+            // "aa\nbb\ncc" is exactly 8 = max: kept together; "dd" overflows.
+            ("aa\nbb\ncc\ndd", 8, &["aa\nbb\ncc", "dd"]),
+        ];
+        for (text, max, expected) in cases {
+            assert_eq!(
+                &chunk_markdown_fenced(text, *max),
+                expected,
+                "text {text:?} max {max}"
+            );
+        }
+    }
+
+    /// The reopen reserve must track the info string's real length: with the
+    /// 1-char info "r", each continuation chunk ("```r" + body + "\n```")
+    /// holds exactly max - 9 body chars. A mis-sized reserve either splits a
+    /// 7-char body line that fits or packs an 8-char line that doesn't.
+    #[test]
+    fn fenced_reopen_reserve_tracks_info_string_length() {
+        assert_eq!(
+            chunk_markdown_fenced("```r\nAAAAAAAA\n```", 16),
+            vec!["```r\nAAAAAAA\n```", "```r\nA\n```"]
+        );
+    }
+
+    /// A fence the input itself never closes: the tail chunk keeps the
+    /// sender's text as written. Close/reopen markers bracket only the
+    /// chunker's own split points — it never appends a close the sender
+    /// didn't write to the final chunk.
+    #[test]
+    fn fenced_unclosed_input_fence_tail_kept_verbatim() {
+        assert_eq!(
+            chunk_markdown_fenced("```r\nBBBB\nAAAAAAA", 16),
+            vec!["```r\nBBBB\n```", "```r\nAAAAAAA"]
+        );
+    }
+
+    /// Regression: a closing fence line whose conservative in-fence budget
+    /// check triggers a flush used to land on the fresh reopened scaffold
+    /// and ship a degenerate "```r\n```" chunk. The close must be dropped
+    /// together with the scaffold instead.
+    #[test]
+    fn fenced_close_line_after_flush_never_ships_an_empty_block() {
+        assert_eq!(
+            chunk_markdown_fenced("```r\nAAAAAAA\nBB\n```", 16),
+            vec!["```r\nAAAAAAA\n```", "```r\nBB\n```"]
+        );
+    }
+
+    /// Pathological input: the opening marker line itself exceeds the budget
+    /// (hard-split as plain text) and the body line does too. However
+    /// scrambled the result, no chunk may ship as a lone close marker or as
+    /// whitespace, and no body byte may be lost.
+    #[test]
+    fn fenced_overlong_marker_never_ships_a_bare_close_chunk() {
+        let text = format!("```{}\n{}", "a".repeat(10), "b".repeat(10));
+        let chunks = chunk_markdown_fenced(&text, 8);
+        for c in &chunks {
+            assert!(!c.trim().is_empty(), "whitespace-only chunk: {chunks:?}");
+            assert_ne!(c.trim(), "```", "bare close-marker chunk: {chunks:?}");
+        }
+        let joined = chunks.concat();
+        assert_eq!(joined.matches('b').count(), 10, "body lost: {chunks:?}");
     }
 }
