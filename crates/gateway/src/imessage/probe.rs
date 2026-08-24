@@ -59,6 +59,78 @@ mod tests {
             "QueryError must propagate the inner error message, got {err:?}"
         );
     }
+
+    /// Restores `HOME` on drop so a panicking test can't leak the override.
+    struct HomeOverride {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_no_db_when_chat_db_absent() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeOverride::set(tmp.path());
+
+        let result = probe_imessage().await;
+        // The missing-file check must short-circuit BEFORE opening: libsql
+        // creates the file on open, so skipping the check would fabricate an
+        // empty chat.db and misreport a query error instead of NoDb.
+        assert!(
+            matches!(result.status, ProbeStatus::NoDb),
+            "expected NoDb, got: {}",
+            result.status
+        );
+        assert!(result.max_rowid.is_none());
+        assert!(
+            !tmp.path().join("Library/Messages/chat.db").exists(),
+            "probe must never create chat.db"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_reports_ok_and_max_rowid_for_readable_chat_db() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let messages_dir = tmp.path().join("Library/Messages");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        let db_path = messages_dir.join("chat.db");
+        {
+            let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT)", ())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO message (ROWID, text) VALUES (7, 'hi')", ())
+                .await
+                .unwrap();
+        }
+        let _home = HomeOverride::set(tmp.path());
+
+        let result = probe_imessage().await;
+        assert!(
+            matches!(result.status, ProbeStatus::Ok),
+            "expected Ok, got: {}",
+            result.status
+        );
+        assert_eq!(result.max_rowid, Some(7));
+    }
 }
 
 /// Probe whether chat.db is accessible and return status + max ROWID.

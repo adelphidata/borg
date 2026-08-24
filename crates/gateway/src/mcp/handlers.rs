@@ -250,6 +250,41 @@ mod tests {
         }
     }
 
+    /// Every handler must actually delegate to its cortex tool: a missing
+    /// required parameter surfaces as `McpError::internal` (-32603) carrying
+    /// the tool name. A handler that short-circuits to a canned `Ok` would
+    /// silently return null results for every malformed (or well-formed)
+    /// call. Hermetic: each cortex handler validates arguments before
+    /// touching the database or the network.
+    #[tokio::test]
+    async fn handlers_delegate_and_surface_missing_param_errors() {
+        let mut config = Config::default();
+        // Force web tools past the enabled gate so the argument check runs.
+        config.web.enabled = true;
+
+        let handlers: Vec<(&str, Box<dyn ReadOnlyToolHandler>)> = vec![
+            (
+                "memory_search",
+                Box::new(MemorySearchHandler::new(config.clone())),
+            ),
+            ("read_memory", Box::new(ReadMemoryHandler::new(config.clone()))),
+            ("web_fetch", Box::new(WebFetchHandler::new(config.clone()))),
+            ("web_search", Box::new(WebSearchHandler::new(config.clone()))),
+        ];
+        for (name, handler) in handlers {
+            let err = handler
+                .call(serde_json::json!({}))
+                .await
+                .expect_err("missing required param must error, not succeed");
+            assert_eq!(err.code, -32603, "{name}: must be internal (-32603)");
+            assert!(
+                err.message.contains(name),
+                "{name}: error must name the failing tool, got {:?}",
+                err.message
+            );
+        }
+    }
+
     #[tokio::test]
     async fn list_handler_rejects_agents_with_invalid_params() {
         // Real failure mode: a regression that surfaced the cortex

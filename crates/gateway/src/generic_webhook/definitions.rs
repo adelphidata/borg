@@ -304,4 +304,54 @@ mod tests {
         let err = revoke(&db, "nothing").await.expect_err("must error");
         assert!(err.to_string().contains("no webhook"));
     }
+
+    #[tokio::test]
+    async fn revoke_is_idempotent_on_already_revoked_names() {
+        // Doc contract: revoke is idempotent. The second revoke updates
+        // zero rows but must distinguish "exists, already revoked" (Ok)
+        // from "never existed" (Err) via the count query.
+        let db = db().await;
+        create(&db, "twice", "$.s", None, "$.b")
+            .await
+            .expect("create");
+        revoke(&db, "twice").await.expect("first revoke");
+        revoke(&db, "twice")
+            .await
+            .expect("second revoke of an existing name must be Ok");
+    }
+
+    #[tokio::test]
+    async fn generated_secrets_are_random_and_full_length() {
+        // 32 CSPRNG bytes base64url-unpadded = 43 chars, and two creates
+        // must never mint the same plaintext — a fixed secret would make
+        // every webhook forgeable.
+        let db = db().await;
+        let a = create(&db, "s1", "$.s", None, "$.b").await.expect("create");
+        let b = create(&db, "s2", "$.s", None, "$.b").await.expect("create");
+        assert_eq!(a.secret.len(), 43, "32 bytes base64url no-pad");
+        assert_eq!(b.secret.len(), 43);
+        assert_ne!(a.secret, b.secret, "secrets must be unique per webhook");
+    }
+
+    #[tokio::test]
+    async fn names_with_dash_underscore_and_alphanumerics_are_accepted() {
+        // Spec: alphanumeric, `-`, and `_` are all legal in one name.
+        let db = db().await;
+        create(&db, "ci-alerts_v2", "$.s", None, "$.b")
+            .await
+            .expect("dash+underscore+alnum name must be accepted");
+    }
+
+    #[tokio::test]
+    async fn each_required_path_is_validated_independently() {
+        // sender_path and body_path are independently required — an
+        // empty value for either one alone must be rejected.
+        let db = db().await;
+        for (sender, body) in [("", "$.b"), ("$.s", ""), ("  ", "$.b"), ("$.s", "  ")] {
+            let err = create(&db, "paths", sender, None, body)
+                .await
+                .expect_err(&format!("sender={sender:?} body={body:?} must fail"));
+            assert!(err.to_string().contains("required"), "got: {err:#}");
+        }
+    }
 }

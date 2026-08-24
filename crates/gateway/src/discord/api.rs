@@ -81,10 +81,17 @@ pub struct DiscordClient {
     client: Client,
     token: String,
     application_id: Option<String>,
+    base_url: String,
 }
 
 impl DiscordClient {
     pub fn new(token: &str) -> Result<Self> {
+        Self::with_base(token, DISCORD_API_BASE)
+    }
+
+    /// Build a client against a custom API base URL (tests point this at a
+    /// loopback stub server).
+    pub(crate) fn with_base(token: &str, base_url: &str) -> Result<Self> {
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Discord",
@@ -93,6 +100,7 @@ impl DiscordClient {
             )?,
             token: token.to_string(),
             application_id: None,
+            base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -113,7 +121,7 @@ impl DiscordClient {
     pub async fn get_current_user(&self) -> Result<CurrentUser> {
         let resp = self
             .client
-            .get(format!("{DISCORD_API_BASE}/users/@me"))
+            .get(format!("{}/users/@me", self.base_url))
             .header("Authorization", format!("Bot {}", self.token))
             .send()
             .await
@@ -147,7 +155,8 @@ impl DiscordClient {
         response: &InteractionResponse,
     ) -> Result<()> {
         let url = format!(
-            "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+            "{}/interactions/{interaction_id}/{interaction_token}/callback",
+            self.base_url
         );
         let client = self.client.clone();
         let response = response.clone();
@@ -185,7 +194,8 @@ impl DiscordClient {
 
         // Edit the original response with the first chunk
         let url = format!(
-            "{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}/messages/@original"
+            "{}/webhooks/{application_id}/{interaction_token}/messages/@original",
+            self.base_url
         );
         let chunk0 = chunks[0].clone();
         let client = self.client.clone();
@@ -206,7 +216,7 @@ impl DiscordClient {
 
         for chunk in &chunks[1..] {
             let followup_url =
-                format!("{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}");
+                format!("{}/webhooks/{application_id}/{interaction_token}", self.base_url);
             let chunk = chunk.clone();
             let client = self.client.clone();
             self.send_with_retry(move || {
@@ -234,7 +244,7 @@ impl DiscordClient {
         let chunks = chunker::chunks_for_delivery(text, DISCORD_MESSAGE_CHUNK_SIZE)?;
 
         for chunk in &chunks {
-            let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+            let url = format!("{}/channels/{channel_id}/messages", self.base_url);
             let body = CreateMessageRequest {
                 content: chunk.clone(),
             };
@@ -265,7 +275,7 @@ impl DiscordClient {
     /// POST /channels/{channel_id}/typing
     pub async fn trigger_typing_indicator(&self, channel_id: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
+        let url = format!("{}/channels/{channel_id}/typing", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -299,7 +309,8 @@ impl DiscordClient {
         validate_snowflake(message_id, "message_id")?;
         validate_emoji(emoji)?;
         let url = format!(
-            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+            "{}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+            self.base_url
         );
         let token = self.token.clone();
         let client = self.client.clone();
@@ -330,7 +341,7 @@ impl DiscordClient {
         application_id: &str,
         commands: &[DiscordCommandPayload],
     ) -> Result<()> {
-        let url = format!("{DISCORD_API_BASE}/applications/{application_id}/commands");
+        let url = format!("{}/applications/{application_id}/commands", self.base_url);
         let token = self.token.clone();
         let body = serde_json::to_value(commands).context("Failed to serialize commands")?;
         let client = self.client.clone();
@@ -379,7 +390,7 @@ impl DiscordClient {
     ) -> Result<Vec<ChannelMessage>> {
         validate_snowflake(channel_id, "channel_id")?;
         let limit = query.limit.clamp(1, 100);
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let url = format!("{}/channels/{channel_id}/messages", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -424,7 +435,7 @@ impl DiscordClient {
     pub async fn edit_message(&self, channel_id: &str, message_id: &str, text: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
         let body = json!({ "content": text });
@@ -453,7 +464,7 @@ impl DiscordClient {
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -483,7 +494,7 @@ impl DiscordClient {
     ) -> Result<ChannelMessage> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -522,7 +533,8 @@ impl DiscordClient {
         validate_snowflake(message_id, "message_id")?;
         validate_emoji(emoji)?;
         let url = format!(
-            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+            "{}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+            self.base_url
         );
         let token = self.token.clone();
         let client = self.client.clone();
@@ -556,7 +568,8 @@ impl DiscordClient {
         validate_snowflake(message_id, "message_id")?;
         validate_emoji(emoji)?;
         let url = format!(
-            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}"
+            "{}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}",
+            self.base_url
         );
         let token = self.token.clone();
         let client = self.client.clone();
@@ -586,7 +599,7 @@ impl DiscordClient {
     pub async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins/{message_id}");
+        let url = format!("{}/channels/{channel_id}/pins/{message_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -613,7 +626,7 @@ impl DiscordClient {
     pub async fn unpin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins/{message_id}");
+        let url = format!("{}/channels/{channel_id}/pins/{message_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -638,7 +651,7 @@ impl DiscordClient {
     /// List pinned messages in a channel.
     pub async fn list_pins(&self, channel_id: &str) -> Result<Vec<ChannelMessage>> {
         validate_snowflake(channel_id, "channel_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins");
+        let url = format!("{}/channels/{channel_id}/pins", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -673,7 +686,7 @@ impl DiscordClient {
     ) -> Result<ThreadInfo> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/threads");
+        let url = format!("{}/channels/{channel_id}/messages/{message_id}/threads", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
         let body = json!({ "name": name, "auto_archive_duration": 1440 });
@@ -704,7 +717,7 @@ impl DiscordClient {
     /// List active threads in a guild.
     pub async fn list_active_threads(&self, guild_id: &str) -> Result<Vec<ThreadInfo>> {
         validate_snowflake(guild_id, "guild_id")?;
-        let url = format!("{DISCORD_API_BASE}/guilds/{guild_id}/threads/active");
+        let url = format!("{}/guilds/{guild_id}/threads/active", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -741,7 +754,7 @@ impl DiscordClient {
     pub async fn get_member_info(&self, guild_id: &str, user_id: &str) -> Result<MemberInfo> {
         validate_snowflake(guild_id, "guild_id")?;
         validate_snowflake(user_id, "user_id")?;
-        let url = format!("{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}");
+        let url = format!("{}/guilds/{guild_id}/members/{user_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -769,7 +782,7 @@ impl DiscordClient {
     /// Get info about a channel.
     pub async fn get_channel_info(&self, channel_id: &str) -> Result<ChannelInfo> {
         validate_snowflake(channel_id, "channel_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}");
+        let url = format!("{}/channels/{channel_id}", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -802,7 +815,7 @@ impl DiscordClient {
         filename: &str,
     ) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
-        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let url = format!("{}/channels/{channel_id}/messages", self.base_url);
         let token = self.token.clone();
         let client = self.client.clone();
         let content = content.to_vec();
@@ -1026,6 +1039,7 @@ mod tests {
     #[test]
     fn discord_error_hint_present_for_known() {
         assert!(discord_error_hint(10003).contains("channel"));
+        assert!(discord_error_hint(10008).contains("deleted"));
         assert!(discord_error_hint(10004).contains("guild"));
         assert!(discord_error_hint(40001).contains("DISCORD_BOT_TOKEN"));
         assert!(discord_error_hint(50001).contains("access"));
@@ -1283,5 +1297,399 @@ mod tests {
         assert_eq!(threads[0].id, "t1");
         assert_eq!(threads[0].name.as_deref(), Some("thread-1"));
         assert!(threads[1].name.is_none());
+    }
+
+    #[test]
+    fn http_returns_the_shared_client() {
+        // The contract is a *borrow* of the one pooled client — two calls
+        // must hand back the same instance, not a fresh client per call
+        // (which would defeat connection-pool reuse for CDN fetches).
+        let client = DiscordClient::new("tok").unwrap();
+        assert!(std::ptr::eq(client.http(), client.http()));
+        assert!(std::ptr::eq(client.http(), &client.client));
+    }
+
+    /// Loopback-stub tests: every Discord REST method must issue the right
+    /// HTTP verb, path, auth header, and payload against the API, and parse
+    /// the response — a client that silently skips the request is broken.
+    mod http_stub {
+        use super::*;
+        use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn client_for(server: &MockServer) -> DiscordClient {
+            DiscordClient::with_base("tok-1", &server.uri()).unwrap()
+        }
+
+        const BOT_AUTH: &str = "Bot tok-1";
+
+        #[tokio::test]
+        async fn get_current_user_parses_users_me() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/users/@me"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "bot-9", "username": "borg", "bot": true
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let user = client_for(&server).await.get_current_user().await.unwrap();
+            assert_eq!(user.id, "bot-9");
+            assert_eq!(user.username, "borg");
+            assert_eq!(user.bot, Some(true));
+        }
+
+        #[tokio::test]
+        async fn get_current_user_error_status_is_an_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/users/@me"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("bad token"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .get_current_user()
+                .await
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("401") && msg.contains("bad token"), "{msg}");
+        }
+
+        #[tokio::test]
+        async fn create_interaction_response_posts_callback_without_bot_auth() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/interactions/i1/t0k/callback"))
+                .and(body_json(serde_json::json!({ "type": 5 })))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .await
+                .create_interaction_response("i1", "t0k", &InteractionResponse::deferred())
+                .await
+                .unwrap();
+
+            // The callback endpoint authenticates via the interaction token
+            // in the path — a bot Authorization header must NOT be attached.
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert!(!reqs[0].headers.contains_key("authorization"));
+        }
+
+        #[tokio::test]
+        async fn edit_original_response_edits_then_sends_followup_chunks() {
+            let server = MockServer::start().await;
+            let long = "a".repeat(2500); // 2 chunks at the 2000-char limit
+            Mock::given(method("PATCH"))
+                .and(path("/webhooks/app7/t0k/messages/@original"))
+                .and(body_json(serde_json::json!({ "content": "a".repeat(2000) })))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/webhooks/app7/t0k"))
+                .and(body_json(serde_json::json!({ "content": "a".repeat(500) })))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .await
+                .edit_original_response("app7", "t0k", &long)
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn send_message_posts_each_chunk_with_bot_auth() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/channels/123/messages"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .await
+                .send_message("123", &"b".repeat(2500))
+                .await
+                .unwrap();
+
+            let reqs = server.received_requests().await.unwrap();
+            let contents: Vec<String> = reqs
+                .iter()
+                .map(|r| {
+                    serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(contents, vec!["b".repeat(2000), "b".repeat(500)]);
+        }
+
+        #[tokio::test]
+        async fn mutation_endpoints_hit_verb_path_and_auth() {
+            let server = MockServer::start().await;
+            let emoji = "%E2%9C%85";
+            // (method, path) for each fire-and-forget mutation endpoint.
+            let expected: &[(&str, String)] = &[
+                ("POST", "/channels/12/typing".into()),
+                ("PUT", format!("/channels/12/messages/34/reactions/{emoji}/@me")),
+                (
+                    "DELETE",
+                    format!("/channels/12/messages/34/reactions/{emoji}/@me"),
+                ),
+                ("PATCH", "/channels/12/messages/34".into()),
+                ("DELETE", "/channels/12/messages/34".into()),
+                ("PUT", "/channels/12/pins/34".into()),
+                ("DELETE", "/channels/12/pins/34".into()),
+            ];
+            for (m, p) in expected {
+                Mock::given(method(*m))
+                    .and(path(p.clone()))
+                    .and(header("authorization", BOT_AUTH))
+                    .respond_with(ResponseTemplate::new(204))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let client = client_for(&server).await;
+            client.trigger_typing_indicator("12").await.unwrap();
+            client.add_reaction("12", "34", emoji).await.unwrap();
+            client.remove_reaction("12", "34", emoji).await.unwrap();
+            client.edit_message("12", "34", "new text").await.unwrap();
+            client.delete_message("12", "34").await.unwrap();
+            client.pin_message("12", "34").await.unwrap();
+            client.unpin_message("12", "34").await.unwrap();
+
+            // edit_message must carry the replacement content in its body.
+            let reqs = server.received_requests().await.unwrap();
+            let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+            assert_eq!(body["content"], "new text");
+        }
+
+        #[tokio::test]
+        async fn get_channel_messages_sends_limit_and_parses() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/channels/55/messages"))
+                .and(header("authorization", BOT_AUTH))
+                .and(query_param("limit", "50"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "id": "m2", "content": "newer", "author": {"id": "u1", "username": "alice"} },
+                    { "id": "m1", "content": "older", "author": {"id": "u2", "username": "bob"} }
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let msgs = client_for(&server)
+                .await
+                .get_channel_messages("55", 50)
+                .await
+                .unwrap();
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0].id, "m2");
+            assert_eq!(msgs[0].author_username, "alice");
+            assert_eq!(msgs[1].content, "older");
+        }
+
+        #[tokio::test]
+        async fn get_channel_messages_query_clamps_limit_and_forwards_cursors() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/channels/55/messages"))
+                .and(query_param("limit", "100")) // 500 clamps to 100
+                .and(query_param("before", "888"))
+                .and(query_param("after", "777"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let msgs = client_for(&server)
+                .await
+                .get_channel_messages_query(
+                    "55",
+                    &MessageQuery {
+                        limit: 500,
+                        before: Some("888".into()),
+                        after: Some("777".into()),
+                        around: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(msgs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn fetch_reactions_parses_reacting_users() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/channels/12/messages/34/reactions/%E2%9C%85"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "id": "u1", "username": "alice" }
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let users = client_for(&server)
+                .await
+                .fetch_reactions("12", "34", "%E2%9C%85")
+                .await
+                .unwrap();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].id, "u1");
+            assert_eq!(users[0].username, "alice");
+        }
+
+        #[tokio::test]
+        async fn list_pins_parses_pinned_messages() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/channels/12/pins"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    { "id": "p1", "content": "pinned!", "author": {"id": "u1", "username": "alice"} }
+                ])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let pins = client_for(&server).await.list_pins("12").await.unwrap();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].id, "p1");
+            assert_eq!(pins[0].content, "pinned!");
+        }
+
+        #[tokio::test]
+        async fn list_active_threads_parses_threads_envelope() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/guilds/99/threads/active"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "threads": [ { "id": "t1", "name": "planning" } ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let threads = client_for(&server)
+                .await
+                .list_active_threads("99")
+                .await
+                .unwrap();
+            assert_eq!(threads.len(), 1);
+            assert_eq!(threads[0].id, "t1");
+            assert_eq!(threads[0].name.as_deref(), Some("planning"));
+        }
+
+        #[tokio::test]
+        async fn register_commands_bulk_puts_payloads_for_the_set_app_id() {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/applications/777/commands"))
+                .and(header("authorization", BOT_AUTH))
+                .and(body_partial_json(serde_json::json!([
+                    {
+                        "name": crate::commands::GATEWAY_COMMANDS[0].name,
+                        "description": crate::commands::GATEWAY_COMMANDS[0].description,
+                        "type": 1
+                    }
+                ])))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut client = client_for(&server).await;
+            // Without an application id the registration must refuse to run.
+            let err = client
+                .register_commands(crate::commands::GATEWAY_COMMANDS)
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("application_id"), "{err:#}");
+
+            client.set_application_id("777".to_string());
+            client
+                .register_commands(crate::commands::GATEWAY_COMMANDS)
+                .await
+                .unwrap();
+
+            // Every gateway command must be registered, all as slash commands.
+            let reqs = server.received_requests().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+            let arr = body.as_array().unwrap();
+            assert_eq!(arr.len(), crate::commands::GATEWAY_COMMANDS.len());
+            assert!(arr.iter().all(|c| c["type"] == 1));
+        }
+
+        #[tokio::test]
+        async fn upload_file_posts_multipart_attachment() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/channels/12/messages"))
+                .and(header("authorization", BOT_AUTH))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .await
+                .upload_file("12", b"PNGDATA", "shot.png")
+                .await
+                .unwrap();
+
+            let reqs = server.received_requests().await.unwrap();
+            let content_type = reqs[0].headers.get("content-type").unwrap().to_str().unwrap();
+            assert!(content_type.starts_with("multipart/form-data"), "{content_type}");
+            let body = String::from_utf8_lossy(&reqs[0].body);
+            assert!(body.contains("files[0]"), "{body}");
+            assert!(body.contains("shot.png"), "{body}");
+            assert!(body.contains("PNGDATA"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn non_success_response_surfaces_code_and_hint() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/channels/12/messages"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "code": 50013, "message": "Missing Permissions"
+                })))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .await
+                .send_message("12", "hello")
+                .await
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("FATAL"), "{msg}");
+            assert!(msg.contains("403"), "{msg}");
+            assert!(msg.contains("Missing Permissions"), "{msg}");
+            assert!(msg.contains("missing required permissions"), "{msg}");
+        }
     }
 }

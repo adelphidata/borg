@@ -202,6 +202,77 @@ mod tests {
         assert_eq!(last.session_key, "user-1:thread-7");
     }
 
+    /// Shared in-memory writer so a scoped subscriber's output is
+    /// assertable. `drain_to_log`'s only contract is what it logs and
+    /// when it stops, so the log text is the observable.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn drain_logs_agent_errors_and_stops_at_turn_complete() {
+        // Contract: every AgentEvent::Error before TurnComplete is
+        // warned (the only place webhook-turn failures surface), and
+        // TurnComplete ends the drain even while the sender stays open.
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(writer.clone())
+            .finish();
+
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(async {
+                tx.send(AgentEvent::TextDelta("ignored".into()))
+                    .await
+                    .expect("send");
+                tx.send(AgentEvent::Error("llm exploded".into()))
+                    .await
+                    .expect("send");
+                tx.send(AgentEvent::TurnComplete).await.expect("send");
+                // `tx` stays alive: only the TurnComplete arm can end the
+                // drain, so a deleted arm hangs here and trips the timeout.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    drain_to_log(rx, "k1".into(), "webhook:test".into()),
+                )
+                .await
+                .expect("drain must return at TurnComplete");
+            });
+        });
+        drop(tx);
+
+        let logs = String::from_utf8(writer.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            logs.contains("agent error") && logs.contains("llm exploded"),
+            "agent errors must be warned with their message: {logs}"
+        );
+        assert!(
+            logs.contains("agent turn complete"),
+            "completion must be logged: {logs}"
+        );
+    }
+
     #[tokio::test]
     async fn no_executor_logs_and_returns_without_panic() {
         // Real failure mode: dispatch before the daemon has installed

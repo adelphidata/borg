@@ -34,16 +34,24 @@ fn validate_url_path_component(label: &str, value: &str) -> Result<()> {
 pub struct GoogleChatClient {
     client: Client,
     token: String,
+    base_url: String,
 }
 
 impl GoogleChatClient {
     pub fn new(token: &str) -> Result<Self> {
+        Self::with_base(token, GOOGLE_CHAT_API_BASE)
+    }
+
+    /// Build a client against an alternate API base URL. Tests point this
+    /// at a loopback stub server; production always uses [`Self::new`].
+    pub(crate) fn with_base(token: &str, base_url: &str) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
                 .timeout(GATEWAY_HTTP_TIMEOUT)
                 .build()
                 .context("Failed to build Google Chat HTTP client")?,
             token: token.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -54,7 +62,7 @@ impl GoogleChatClient {
     /// the agent runs.
     pub async fn download_attachment(&self, resource_name: &str) -> Result<Vec<u8>> {
         validate_url_path_component("attachment resource name", resource_name)?;
-        let url = format!("{GOOGLE_CHAT_API_BASE}/media/{resource_name}?alt=media");
+        let url = format!("{}/media/{resource_name}?alt=media", self.base_url);
         let resp = self
             .client
             .get(&url)
@@ -104,7 +112,7 @@ impl GoogleChatClient {
     ) -> Result<()> {
         validate_url_path_component("space name", space_name)?;
 
-        let mut url = format!("{GOOGLE_CHAT_API_BASE}/{space_name}/messages");
+        let mut url = format!("{}/{space_name}/messages", self.base_url);
 
         let body = CreateMessageRequest {
             text: text.to_string(),
@@ -216,6 +224,126 @@ mod tests {
                 "expected rejection for {value:?}"
             );
         }
+    }
+
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn stub_client() -> (MockServer, GoogleChatClient) {
+        let server = MockServer::start().await;
+        let client = GoogleChatClient::with_base("tok-1", &server.uri()).expect("client");
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn send_message_posts_each_chunk_with_bearer_auth() {
+        // 5000 chars must produce exactly two POSTs (4096 + 904) against
+        // `/{space}/messages`, each with the bearer token. A stubbed-out
+        // send would leave the server at zero requests.
+        let (server, client) = stub_client().await;
+        Mock::given(method("POST"))
+            .and(path("/spaces/S1/messages"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let text = "a".repeat(5000);
+        client
+            .send_message("spaces/S1", &text, None)
+            .await
+            .expect("send must succeed on 200");
+
+        let reqs = server.received_requests().await.expect("recorded");
+        assert_eq!(reqs.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("json");
+        let second: serde_json::Value = serde_json::from_slice(&reqs[1].body).expect("json");
+        assert_eq!(first["text"].as_str().expect("text").len(), 4096);
+        assert_eq!(second["text"].as_str().expect("text").len(), 904);
+    }
+
+    #[tokio::test]
+    async fn send_message_thread_reply_sets_query_param_and_thread_body() {
+        let (server, client) = stub_client().await;
+        Mock::given(method("POST"))
+            .and(path("/spaces/S1/messages"))
+            .and(query_param(
+                "messageReplyOption",
+                "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
+            ))
+            .and(body_partial_json(
+                serde_json::json!({"thread": {"name": "spaces/S1/threads/T1"}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client
+            .send_message("spaces/S1", "hi", Some("spaces/S1/threads/T1"))
+            .await
+            .expect("threaded send must succeed");
+    }
+
+    #[tokio::test]
+    async fn send_message_error_status_surfaces_api_error() {
+        // A non-2xx from the API must bail with the status + body, not
+        // report success — "we said it sent" must mean it sent.
+        let (server, client) = stub_client().await;
+        Mock::given(method("POST"))
+            .and(path("/spaces/S1/messages"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("permission denied"))
+            .mount(&server)
+            .await;
+
+        let err = client
+            .send_message("spaces/S1", "hi", None)
+            .await
+            .expect_err("403 must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "error must carry status: {msg}");
+        assert!(
+            msg.contains("permission denied"),
+            "error must carry body: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_attachment_returns_exact_body_bytes() {
+        // The bytes feed STT verbatim; any substitution corrupts audio.
+        let (server, client) = stub_client().await;
+        let payload: Vec<u8> = b"\x00\x01OggS-fake-audio".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/media/attachments/AUDIO1"))
+            .and(query_param("alt", "media"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let got = client
+            .download_attachment("attachments/AUDIO1")
+            .await
+            .expect("download");
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn download_attachment_error_status_is_an_error() {
+        let (server, client) = stub_client().await;
+        Mock::given(method("GET"))
+            .and(path("/media/attachments/GONE"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = client
+            .download_attachment("attachments/GONE")
+            .await
+            .expect_err("404 must be an error");
+        assert!(err.to_string().contains("404"), "got: {err:#}");
     }
 
     #[test]

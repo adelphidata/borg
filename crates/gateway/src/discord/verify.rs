@@ -21,6 +21,17 @@ pub fn verify_discord_signature(
     body: &str,
     public_key_hex: &str,
 ) -> Result<()> {
+    verify_discord_signature_at(headers, body, public_key_hex, chrono::Utc::now().timestamp())
+}
+
+/// Inner verifier with an injected clock so the replay-window boundary is
+/// testable deterministically.
+fn verify_discord_signature_at(
+    headers: &HeaderMap,
+    body: &str,
+    public_key_hex: &str,
+    now: i64,
+) -> Result<()> {
     let key_bytes = hex::decode(public_key_hex)
         .map_err(|e| anyhow::anyhow!("Invalid Discord public key hex: {e}"))?;
     let key_array: [u8; 32] = key_bytes
@@ -60,7 +71,6 @@ pub fn verify_discord_signature(
     let ts: i64 = timestamp
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid X-Signature-Timestamp: not an integer"))?;
-    let now = chrono::Utc::now().timestamp();
     if (now - ts).unsigned_abs() > REPLAY_WINDOW_SECS {
         bail!("Discord request timestamp too old (replay protection)");
     }
@@ -123,6 +133,34 @@ mod tests {
             result.unwrap_err().to_string().contains("too old"),
             "expected replay-protection rejection"
         );
+    }
+
+    #[test]
+    fn replay_window_boundary_is_inclusive() {
+        // Spec: a signed timestamp exactly REPLAY_WINDOW_SECS old (or in
+        // the future) is still inside the window; one second beyond it is
+        // rejected. The injected clock makes the boundary deterministic.
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let body = r#"{"type":1}"#;
+        let ts: i64 = 1_700_000_000;
+        let (headers, public_key_hex) = make_signed_request(&signing_key, &ts.to_string(), body);
+        let window = REPLAY_WINDOW_SECS as i64;
+
+        for (now, ok) in [
+            (ts + window, true),
+            (ts - window, true),
+            (ts + window + 1, false),
+            (ts - window - 1, false),
+        ] {
+            let result = verify_discord_signature_at(&headers, body, &public_key_hex, now);
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "skew {} must be {}",
+                now - ts,
+                if ok { "accepted" } else { "rejected" }
+            );
+        }
     }
 
     #[test]

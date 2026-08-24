@@ -390,4 +390,93 @@ mod tests {
         let err = extract_string(&payload, "$.xs[5]").unwrap_err();
         assert!(err.to_string().contains("out of bounds"));
     }
+
+    #[test]
+    fn replay_window_boundary_is_inclusive() {
+        // Spec: skew of exactly REPLAY_WINDOW_SECONDS is still valid —
+        // the window is ±300s inclusive. One second past it is a replay.
+        let secret = "s";
+        let body = b"x";
+        let ts: i64 = 1_700_000_000;
+        let sig = make_signature(secret, ts, body);
+        for (now, ok) in [
+            (ts + REPLAY_WINDOW_SECONDS, true),
+            (ts - REPLAY_WINDOW_SECONDS, true),
+            (ts + REPLAY_WINDOW_SECONDS + 1, false),
+            (ts - REPLAY_WINDOW_SECONDS - 1, false),
+        ] {
+            let result = verify_signature(secret, body, Some(&sig), Some(&ts.to_string()), now);
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "skew {} must be {}",
+                now - ts,
+                if ok { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_error_display_messages_are_specific() {
+        // Operators debug webhook integrations from these strings; each
+        // variant must render its own actionable message, never blank.
+        let cases: Vec<(HmacError, &str)> = vec![
+            (
+                HmacError::MissingHeader("X-Borg-Signature"),
+                "missing required header `X-Borg-Signature`",
+            ),
+            (
+                HmacError::MalformedHeader("X-Borg-Timestamp"),
+                "malformed header `X-Borg-Timestamp`",
+            ),
+            (HmacError::Mismatch, "HMAC signature mismatch"),
+            (
+                HmacError::EmptySecret,
+                "signing secret is empty — refusing to verify",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+        let replay = HmacError::Replay { skew_seconds: 360 }.to_string();
+        assert!(replay.contains("±300s"), "got: {replay}");
+        assert!(replay.contains("skew 360s"), "got: {replay}");
+    }
+
+    #[test]
+    fn null_value_error_is_distinct_from_type_errors() {
+        // Null gets its own message (no misleading article/type text);
+        // arrays and objects report their concrete type name so users
+        // can fix the dot-path.
+        let payload = serde_json::json!({"n": null, "xs": [1], "o": {"k": 1}});
+        let err = extract_string(&payload, "$.n").unwrap_err().to_string();
+        assert_eq!(err, "path `$.n` resolved to null");
+
+        let err = extract_string(&payload, "$.xs").unwrap_err().to_string();
+        assert!(err.contains("resolved to a array"), "got: {err}");
+        let err = extract_string(&payload, "$.o").unwrap_err().to_string();
+        assert!(err.contains("resolved to a object"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_path_selects_root_like_dollar() {
+        // Lenient config: an empty (or whitespace) path means "the whole
+        // payload", same as `$` — not a parse error.
+        let payload = serde_json::json!("whole");
+        assert_eq!(extract_string(&payload, "").unwrap(), "whole");
+        assert_eq!(extract_string(&payload, "  ").unwrap(), "whole");
+    }
+
+    #[test]
+    fn bracket_suffix_only_parses_when_it_terminates_the_segment() {
+        // `xs[0]y` is NOT an index expression — the `]` isn't final, so
+        // the whole segment stays a literal key. Only a trailing `[N]`
+        // splits into key + index.
+        let payload = serde_json::json!({
+            "xs[0]y": "literal",
+            "xs": ["indexed"]
+        });
+        assert_eq!(extract_string(&payload, "$.xs[0]y").unwrap(), "literal");
+        assert_eq!(extract_string(&payload, "$.xs[0]").unwrap(), "indexed");
+    }
 }

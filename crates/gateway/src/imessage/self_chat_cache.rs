@@ -100,4 +100,48 @@ mod tests {
         }
         assert!(cache.entries.len() <= MAX_ENTRIES);
     }
+
+    #[test]
+    fn remember_keeps_all_entries_below_capacity() {
+        // Eviction must only kick in AT capacity — below it, every
+        // remembered message stays queryable. An inverted comparison would
+        // evict on every insert and remember only the most recent message.
+        let mut cache = SelfChatCache::new();
+        cache.remember("first", "chat");
+        cache.remember("second", "chat");
+        assert!(cache.is_self_echo("first", "chat"));
+        assert!(cache.is_self_echo("second", "chat"));
+    }
+
+    #[test]
+    fn eviction_starts_exactly_at_capacity() {
+        let mut cache = SelfChatCache::new();
+        for i in 0..MAX_ENTRIES {
+            cache.remember(&format!("msg-{i}"), "chat");
+        }
+        // At exactly MAX_ENTRIES nothing has been evicted yet.
+        assert!(cache.is_self_echo("msg-0", "chat"));
+        // One past capacity evicts only the oldest.
+        cache.remember("overflow", "chat");
+        assert!(!cache.is_self_echo("msg-0", "chat"));
+        assert!(cache.is_self_echo("msg-1", "chat"));
+        assert!(cache.is_self_echo("overflow", "chat"));
+    }
+
+    #[test]
+    fn prune_expires_entries_past_ttl() {
+        let mut cache = SelfChatCache::new();
+        cache.remember("stale", "chat");
+        // Backdate the entry past the TTL — Instant can't be mocked, so age
+        // the stored timestamp directly (tests live in-module).
+        let backdated = Instant::now()
+            .checked_sub(TTL + Duration::from_secs(1))
+            .expect("backdate instant");
+        cache.entries.front_mut().expect("entry present").created = backdated;
+        assert!(
+            !cache.is_self_echo("stale", "chat"),
+            "an entry older than the TTL must be pruned, not matched"
+        );
+        assert!(cache.entries.is_empty(), "prune must drop expired entries");
+    }
 }

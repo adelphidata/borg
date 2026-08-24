@@ -944,11 +944,17 @@ mod tests {
     /// Build a minimal chat.db schema sufficient to exercise poll_new_messages.
     /// Mirrors the columns Borg actually reads — not a full chat.db replica.
     async fn build_fixture_db() -> libsql::Connection {
-        let db = libsql::Builder::new_local(":memory:")
+        build_fixture_db_at(":memory:").await
+    }
+
+    /// Same schema, but at an arbitrary path so tests can exercise the
+    /// path-opening entry points against a file-backed fixture chat.db.
+    async fn build_fixture_db_at(path: &str) -> libsql::Connection {
+        let db = libsql::Builder::new_local(path)
             .build()
             .await
-            .expect("open in-memory libsql db");
-        let conn = db.connect().expect("connect to in-memory db");
+            .expect("open fixture libsql db");
+        let conn = db.connect().expect("connect to fixture db");
         conn.execute_batch(
             r#"
             CREATE TABLE handle (
@@ -1268,6 +1274,27 @@ mod tests {
     }
 
     #[test]
+    fn load_attachments_accepts_file_at_exact_size_limit() {
+        // The cap is exactly 10 MiB = 10_485_760 bytes and only *larger*
+        // files are skipped. The literal is intentional: it independently
+        // pins both the constant's arithmetic and the strict `>` comparison.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.bin");
+        std::fs::write(&path, vec![0u8; 10_485_760]).unwrap();
+        let metas = vec![AttachmentMeta {
+            path: path.to_string_lossy().into_owned(),
+            filename: Some("exact.bin".into()),
+            mime_type: Some("application/octet-stream".into()),
+        }];
+        let out = load_attachments(&metas);
+        assert_eq!(
+            out.len(),
+            1,
+            "a file at exactly the 10 MiB limit must be forwarded, not skipped"
+        );
+    }
+
+    #[test]
     fn load_attachments_skips_oversized_files() {
         // Ensure the size guard rejects without OOM-loading the file.
         let dir = tempfile::tempdir().unwrap();
@@ -1282,5 +1309,241 @@ mod tests {
         }];
         let out = load_attachments(&metas);
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sql_extracts_is_from_me_flag() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
+            "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me) \
+             VALUES (1, 'g1', 'from them', 1, 0)",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me) \
+             VALUES (2, 'g2', 'from me', 1, 1)",
+        )
+        .await;
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            !msgs[0].is_from_me,
+            "is_from_me=0 must map to false or every inbound message is dropped"
+        );
+        assert!(
+            msgs[1].is_from_me,
+            "is_from_me=1 must map to true or our own sends loop back as input"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_new_messages_opens_db_at_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chat.db");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        {
+            let conn = build_fixture_db_at(&db_path_str).await;
+            exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+            exec(
+                &conn,
+                "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
+            )
+            .await;
+            exec(
+                &conn,
+                "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (3, 'g', 'hi', 1)",
+            )
+            .await;
+            exec(
+                &conn,
+                "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 3)",
+            )
+            .await;
+        }
+        let msgs = poll_new_messages(&db_path_str, 0).await.unwrap();
+        assert_eq!(msgs.len(), 1, "path entry point must surface stored rows");
+        assert_eq!(msgs[0].rowid, 3);
+        assert_eq!(msgs[0].text.as_deref(), Some("hi"));
+    }
+
+    /// Shared in-memory writer so a scoped subscriber's output is
+    /// assertable — the warn-vs-silent distinction in `load_last_rowid`
+    /// is only observable through the log.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `load_last_rowid` under a scoped subscriber, returning
+    /// (result, captured log text).
+    fn load_last_rowid_capturing_logs(state_path: &std::path::Path) -> (i64, String) {
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer.clone())
+            .finish();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rowid = tracing::subscriber::with_default(subscriber, || {
+            rt.block_on(load_last_rowid(state_path))
+        });
+        let logs = String::from_utf8(writer.0.lock().expect("lock").clone()).expect("utf8");
+        (rowid, logs)
+    }
+
+    #[test]
+    fn load_last_rowid_missing_file_is_silent_first_run() {
+        // A missing state file is the normal first-run condition — it must
+        // return 0 WITHOUT the scary "Failed to parse" warning that is
+        // reserved for genuinely broken state.
+        let dir = tempfile::tempdir().unwrap();
+        let (rowid, logs) = load_last_rowid_capturing_logs(&dir.path().join("absent.json"));
+        assert_eq!(rowid, 0);
+        assert!(
+            !logs.contains("Failed to parse"),
+            "first run must not warn, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn load_last_rowid_unreadable_state_warns() {
+        // A state path that exists but cannot be read (here: a directory)
+        // is NOT a first run — the operator must see a warning, or silent
+        // rowid resets replay the whole message history into the agent.
+        let dir = tempfile::tempdir().unwrap();
+        let (rowid, logs) = load_last_rowid_capturing_logs(dir.path());
+        assert_eq!(rowid, 0);
+        assert!(
+            logs.contains("Failed to parse"),
+            "unreadable state must warn, got: {logs}"
+        );
+    }
+
+    /// Restores `HOME` on drop so a panicking test can't leak the override.
+    struct HomeOverride {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn set(path: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Lay out a fake home (with a file-backed fixture chat.db whose max
+    /// ROWID is 99) plus a channel dir with a minimal manifest. The single
+    /// message is `is_from_me=1` so even if a poll tick races the shutdown
+    /// branch, the evaluate gates drop it before any dispatch.
+    async fn setup_monitor_home(tmp: &std::path::Path) -> PathBuf {
+        let home = tmp.join("home");
+        let messages = home.join("Library/Messages");
+        std::fs::create_dir_all(&messages).unwrap();
+        let db_path = messages.join("chat.db");
+        {
+            let conn = build_fixture_db_at(&db_path.to_string_lossy()).await;
+            exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+            exec(
+                &conn,
+                "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me) \
+                 VALUES (99, 'g', 'mine', 1, 1)",
+            )
+            .await;
+        }
+        let channel_dir = tmp.join("channels/imessage");
+        std::fs::create_dir_all(&channel_dir).unwrap();
+        std::fs::write(
+            channel_dir.join("channel.toml"),
+            "name = \"imessage\"\ndescription = \"test fixture\"\n",
+        )
+        .unwrap();
+        channel_dir
+    }
+
+    fn read_state_rowid(channel_dir: &std::path::Path) -> i64 {
+        let content =
+            std::fs::read_to_string(channel_dir.join(STATE_FILE)).expect("state file present");
+        serde_json::from_str::<serde_json::Value>(&content)
+            .expect("state json")
+            .get("last_rowid")
+            .and_then(serde_json::Value::as_i64)
+            .expect("last_rowid key")
+    }
+
+    #[tokio::test]
+    async fn monitor_loop_initializes_state_from_existing_chat_db() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let channel_dir = setup_monitor_home(tmp.path()).await;
+        let _home = HomeOverride::set(&tmp.path().join("home"));
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        monitor_loop(Config::default(), channel_dir.clone(), shutdown)
+            .await
+            .expect("monitor must start cleanly when chat.db exists");
+
+        // First run: state is seeded to the current max ROWID so only
+        // future messages are ever processed.
+        assert_eq!(read_state_rowid(&channel_dir), 99);
+    }
+
+    #[tokio::test]
+    async fn monitor_loop_keeps_state_ahead_of_max_rowid() {
+        // A persisted rowid must be trusted verbatim — re-seeding from
+        // MAX(ROWID) on every boot would rewind past-the-end state and
+        // replay messages the operator already handled.
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let channel_dir = setup_monitor_home(tmp.path()).await;
+        std::fs::write(channel_dir.join(STATE_FILE), r#"{"last_rowid": 150}"#).unwrap();
+        let _home = HomeOverride::set(&tmp.path().join("home"));
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        monitor_loop(Config::default(), channel_dir.clone(), shutdown)
+            .await
+            .expect("monitor must start cleanly");
+
+        assert_eq!(
+            read_state_rowid(&channel_dir),
+            150,
+            "existing state must not be re-seeded from MAX(ROWID)"
+        );
     }
 }

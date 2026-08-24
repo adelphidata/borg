@@ -709,14 +709,27 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            // Distinguish an explicit stop signal (Ok) from the sender merely
+            // being dropped without a send (Err): Drop must actively signal
+            // the keepalive loop to stop.
+            let got_signal = Arc::new(AtomicU32::new(0));
+            let got_signal_task = got_signal.clone();
             let join = tokio::spawn(async move {
-                let _ = rx.await;
+                if rx.await.is_ok() {
+                    got_signal_task.fetch_add(1, Ordering::SeqCst);
+                }
             });
-            let handle = TypingHandle::new(tx, join);
-            // Dropping the handle should send the stop signal
+            // Take the JoinHandle out so we can await task completion after
+            // Drop runs (Drop itself can't await).
+            let mut handle = TypingHandle::new(tx, join);
+            let inner_join = handle.join.take().unwrap();
             drop(handle);
-            // Give the task a moment to complete
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            inner_join.await.unwrap();
+            assert_eq!(
+                got_signal.load(Ordering::SeqCst),
+                1,
+                "Drop must send the stop signal, not just release the sender"
+            );
         });
     }
 
@@ -958,5 +971,49 @@ mod tests {
         let ch = MinimalChannel;
         assert!(ch.bot_mention().is_none());
         assert!(ch.start_typing(&serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn default_media_support_is_declared_off_and_send_media_refuses() {
+        // A channel that does not override the media hooks must advertise
+        // "no attachments" (so the media-egress path emits a text fallback
+        // notice instead of silently dropping the file) and must refuse an
+        // actual send with an error naming the channel and the file.
+        let ch = MockChannel {
+            name: "textonly".to_string(),
+            call_count: Arc::new(AtomicU32::new(0)),
+            send_count: Arc::new(AtomicU32::new(0)),
+            should_skip: false,
+        };
+        assert!(!ch.supports_media_attachments());
+
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let err = ch
+            .send_media(
+                std::path::Path::new("/tmp/photo.png"),
+                None,
+                &serde_json::json!({}),
+                &health,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("textonly"), "{msg}");
+        assert!(msg.contains("photo.png"), "{msg}");
+        assert!(msg.contains("no attachment support"), "{msg}");
+    }
+
+    #[test]
+    fn service_unavailable_response_is_503_with_capacity_hint() {
+        let (status, body) = service_unavailable_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap()
+                .contains("capacity"),
+            "body: {}",
+            body.0
+        );
     }
 }

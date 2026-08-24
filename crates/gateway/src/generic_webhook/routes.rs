@@ -409,6 +409,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_extracted_sender_id_returns_400() {
+        // The sender path resolves but to "" — an empty principal must be
+        // rejected before it reaches the gate, with a distinct message.
+        let (state, sink, created, _tmp) = make_state().await;
+        let secret = secret_hex(&created);
+        let body = r#"{"user":{"id":""},"text":"x"}"#;
+        let now = chrono::Utc::now().timestamp();
+        let sig = sign(&secret, now, body.as_bytes());
+
+        let resp = router(state)
+            .oneshot(req("alerts", Some(&sig), Some(&now.to_string()), body))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("sender_id is empty"),
+            "got: {v}"
+        );
+        assert!(sink.admitted.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn body_at_exactly_the_cap_is_accepted() {
+        // The 1 MiB limit is exclusive: a signed body of exactly
+        // MAX_BODY_BYTES must pass the size gate and be admitted. This
+        // pins both the boundary comparison and the cap's magnitude — a
+        // shrunken cap would 413 this payload.
+        let (state, sink, created, _tmp) = make_state().await;
+        let secret = secret_hex(&created);
+        // 1 MiB spelled out, not via MAX_BODY_BYTES: sizing the payload
+        // off the constant would track a wrongly-shrunken cap and hide
+        // the regression this test exists to catch.
+        let cap = 1024 * 1024_usize;
+        let prefix = r#"{"user":{"id":"u-9"},"text":"big","pad":""#;
+        let suffix = r#""}"#;
+        let pad = "p".repeat(cap - prefix.len() - suffix.len());
+        let body = format!("{prefix}{pad}{suffix}");
+        assert_eq!(body.len(), cap);
+        let now = chrono::Utc::now().timestamp();
+        let sig = sign(&secret, now, body.as_bytes());
+
+        let resp = router(state)
+            .oneshot(req("alerts", Some(&sig), Some(&now.to_string()), &body))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(sink.admitted.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
     async fn body_too_large_returns_413() {
         // Abuse defense: a 2 MiB payload should never reach the
         // (CPU-bound) HMAC verifier. The size cap is checked first.

@@ -305,6 +305,151 @@ impl NativeChannel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+    use ed25519_dalek::{Signer, SigningKey};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_signed_headers(signing_key: &SigningKey, body: &str) -> (HeaderMap, String) {
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let message = format!("{timestamp}{body}");
+        let signature = signing_key.sign(message.as_bytes());
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-signature-ed25519",
+            HeaderValue::from_str(&sig_hex).unwrap(),
+        );
+        headers.insert(
+            "x-signature-timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        (headers, public_key_hex)
+    }
+
+    fn channel_against(server: &MockServer, public_key_hex: String) -> DiscordChannel {
+        DiscordChannel::new(
+            Arc::new(DiscordClient::with_base("tok-1", &server.uri()).unwrap()),
+            Some(public_key_hex),
+            None,
+            cortex::config::Config::default(),
+        )
+    }
+
+    /// Signed slash-command body. `guild_id: Some` makes it a guild (group)
+    /// interaction; `None` makes it a DM.
+    fn command_body(guild_id: Option<&str>) -> String {
+        let mut body = serde_json::json!({
+            "id": "9001",
+            "type": 2,
+            "token": "t0k",
+            "application_id": "app1",
+            "channel_id": "123",
+            "data": { "name": "ask", "options": [{ "name": "q", "value": "hello borg" }] },
+        });
+        match guild_id {
+            Some(g) => {
+                body["guild_id"] = serde_json::json!(g);
+                body["member"] = serde_json::json!({
+                    "user": { "id": "u1", "username": "alice", "bot": false }
+                });
+            }
+            None => {
+                body["user"] = serde_json::json!({
+                    "id": "u1", "username": "alice", "bot": false
+                });
+            }
+        }
+        body.to_string()
+    }
+
+    async fn run_webhook(channel: &DiscordChannel, headers: &HeaderMap, body: &str) -> String {
+        let config = cortex::config::Config::default();
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        match channel.handle_webhook(headers, body, &ctx).await.unwrap() {
+            WebhookOutcome::Message { inbound, .. } => inbound.text,
+            _ => panic!("expected Message outcome"),
+        }
+    }
+
+    #[test]
+    fn names_is_exactly_discord() {
+        // The registry keys webhook dispatch on this name — "discord" must
+        // be present and nothing else may claim the channel.
+        let channel = DiscordChannel::new(
+            Arc::new(DiscordClient::new("tok").unwrap()),
+            None,
+            None,
+            cortex::config::Config::default(),
+        );
+        assert_eq!(channel.names(), vec!["discord"]);
+    }
+
+    #[tokio::test]
+    async fn guild_interaction_injects_channel_history_context() {
+        let server = MockServer::start().await;
+        // Deferred callback the handler fires before fetching history.
+        Mock::given(method("POST"))
+            .and(path("/interactions/9001/t0k/callback"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Recent channel messages (newest first, as the API returns them).
+        Mock::given(method("GET"))
+            .and(path("/channels/123/messages"))
+            .and(query_param("limit", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": "m2", "content": "newer msg", "author": {"id": "u2", "username": "bob"} },
+                { "id": "m1", "content": "older msg", "author": {"id": "u3", "username": "carol"} }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let body = command_body(Some("g1"));
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (headers, pub_hex) = make_signed_headers(&signing_key, &body);
+        let channel = channel_against(&server, pub_hex);
+
+        let text = run_webhook(&channel, &headers, &body).await;
+        assert!(text.contains("[Channel context]"), "{text}");
+        // Oldest-first rendering of the fetched history.
+        assert!(text.contains("carol: older msg\nbob: newer msg"), "{text}");
+        assert!(text.contains("[Current message]\nhello borg"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn dm_interaction_skips_channel_history_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/interactions/9001/t0k/callback"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // DMs must not spend rate-limit budget on history fetches.
+        Mock::given(method("GET"))
+            .and(path("/channels/123/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let body = command_body(None);
+        let signing_key = SigningKey::from_bytes(&[8u8; 32]);
+        let (headers, pub_hex) = make_signed_headers(&signing_key, &body);
+        let channel = channel_against(&server, pub_hex);
+
+        let text = run_webhook(&channel, &headers, &body).await;
+        assert_eq!(text, "hello borg");
+    }
 
     #[test]
     fn response_context_roundtrip() {

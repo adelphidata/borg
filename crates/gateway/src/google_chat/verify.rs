@@ -92,6 +92,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_expected_and_empty_event_token_fails_closed() {
+        // An empty configured token must be treated as *unconfigured*, not as
+        // a valid credential. Otherwise an attacker sending `token: ""` would
+        // pass constant-time comparison against the empty expected value.
+        let event = make_event(Some(""));
+        let result = verify_google_chat_token(&event, Some(""));
+        assert!(result.is_err(), "empty-vs-empty must not authenticate");
+        assert!(
+            result.unwrap_err().to_string().contains("not configured"),
+            "must fail at the unconfigured gate, not the comparison"
+        );
+    }
+
+    #[test]
     fn missing_token_in_event_fails() {
         let event = make_event(None);
         let result = verify_google_chat_token(&event, Some("expected-token"));

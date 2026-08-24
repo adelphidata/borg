@@ -274,6 +274,30 @@ mod tests {
     }
 
     #[test]
+    fn peer_kind_maps_space_type() {
+        // "DM" is the only direct peer kind; every other space type (ROOM,
+        // SPACE, …) is a group. A missing space_type yields no peer_kind.
+        let cases = [
+            (Some("DM"), Some(PEER_KIND_DIRECT)),
+            (Some("ROOM"), Some(PEER_KIND_GROUP)),
+            (Some("SPACE"), Some(PEER_KIND_GROUP)),
+            (None, None),
+        ];
+        for (space_type, expected) in cases {
+            let mut event = make_message_event();
+            if let Some(ref mut space) = event.space {
+                space.space_type = space_type.map(String::from);
+            }
+            let msg = parse_event(&event).unwrap();
+            assert_eq!(
+                msg.peer_kind.as_deref(),
+                expected,
+                "space_type {space_type:?}"
+            );
+        }
+    }
+
+    #[test]
     fn falls_back_to_event_user_for_sender() {
         let mut event = make_message_event();
         if let Some(ref mut msg) = event.message {

@@ -205,6 +205,35 @@ fn apply_binding_overrides(config: &mut Config, binding: &GatewayBinding) {
 mod tests {
     use super::*;
 
+    /// Binding with only the matching fields set — overrides all None.
+    fn bare_binding(
+        channel: &str,
+        sender: Option<&str>,
+        peer_kind: Option<&str>,
+    ) -> GatewayBinding {
+        GatewayBinding {
+            channel: channel.to_string(),
+            sender: sender.map(str::to_string),
+            peer_kind: peer_kind.map(str::to_string),
+            provider: None,
+            model: None,
+            api_key_env: None,
+            temperature: None,
+            max_tokens: None,
+            identity: None,
+            memory_scope: None,
+            fallback: Vec::new(),
+            activation: None,
+            thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
+        }
+    }
+
     #[test]
     fn matches_pattern_exact() {
         assert!(matches_pattern("telegram", "telegram"));
@@ -593,6 +622,86 @@ mod tests {
         assert_eq!(route.config.llm.request_timeout_ms, 300_000);
         assert_eq!(route.config.gateway.request_timeout_ms, 360_000);
         assert_eq!(route.config.llm.stream_chunk_timeout_secs, 120);
+    }
+
+    #[test]
+    fn wrong_channel_never_matches_even_when_sender_and_peer_do() {
+        // Tier matching is a conjunction: a binding for another channel must
+        // not capture a message just because its sender/peer filters happen
+        // to match. Otherwise a slack-only credential override would leak
+        // onto telegram traffic.
+        let mut config = Config::default();
+        let mut binding = bare_binding("slack", Some("user1"), Some("group"));
+        binding.model = Some("slack-only-model".to_string());
+        config.gateway.bindings.push(binding);
+
+        let route = resolve_route(&config, "telegram", "user1", Some("group"));
+        assert_eq!(route.binding_id, DEFAULT_BINDING_ID);
+        assert_ne!(route.config.llm.model, "slack-only-model");
+    }
+
+    fn fallback_entry(model: &str) -> cortex::config::LlmFallback {
+        cortex::config::LlmFallback {
+            provider: "openrouter".to_string(),
+            model: model.to_string(),
+            api_key: None,
+            api_key_env: None,
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn fallback_override_applies_only_when_binding_sets_it() {
+        // Non-empty binding fallback replaces the base chain.
+        let mut config = Config::default();
+        config.llm.fallback = vec![fallback_entry("base-fallback")];
+        let mut binding = bare_binding("telegram", None, None);
+        binding.fallback = vec![fallback_entry("binding-fallback")];
+        config.gateway.bindings.push(binding);
+        let route = resolve_route(&config, "telegram", "user1", None);
+        assert_eq!(route.config.llm.fallback.len(), 1);
+        assert_eq!(route.config.llm.fallback[0].model, "binding-fallback");
+
+        // An empty binding fallback means "no override" — the base chain
+        // must survive, not be cleared.
+        let mut config = Config::default();
+        config.llm.fallback = vec![fallback_entry("base-fallback")];
+        config
+            .gateway
+            .bindings
+            .push(bare_binding("telegram", None, None));
+        let route = resolve_route(&config, "telegram", "user1", None);
+        assert_eq!(route.config.llm.fallback.len(), 1);
+        assert_eq!(route.config.llm.fallback[0].model, "base-fallback");
+    }
+
+    #[test]
+    fn identity_traversal_paths_are_rejected_safe_relative_applies() {
+        // Each traversal shape must independently block the override —
+        // otherwise a binding identity can escape the data dir.
+        for bad in ["../outside.md", "/etc/passwd", "\\windows\\evil"] {
+            let mut config = Config::default();
+            let mut binding = bare_binding("telegram", None, None);
+            binding.identity = Some(bad.to_string());
+            config.gateway.bindings.push(binding);
+            let route = resolve_route(&config, "telegram", "user1", None);
+            assert!(
+                route.config.identity_override.is_none(),
+                "identity {bad:?} must not set identity_override"
+            );
+        }
+
+        // A safe relative path resolves inside the data dir.
+        let mut config = Config::default();
+        let mut binding = bare_binding("telegram", None, None);
+        binding.identity = Some("personas/work.md".to_string());
+        config.gateway.bindings.push(binding);
+        let route = resolve_route(&config, "telegram", "user1", None);
+        let over = route.config.identity_override.expect("override applied");
+        assert!(over.ends_with("personas/work.md"), "{over:?}");
     }
 
     #[test]

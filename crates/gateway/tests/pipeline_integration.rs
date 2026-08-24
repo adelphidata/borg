@@ -275,6 +275,118 @@ retry_initial_delay_ms = 1
     );
 }
 
+/// Native channel whose delivery always fails, to exercise the
+/// dispatch_webhook failure branch.
+struct FailingSendChannel;
+
+#[async_trait::async_trait]
+impl gateway::channel::channel_trait::NativeChannel for FailingSendChannel {
+    fn names(&self) -> Vec<&str> {
+        vec!["retrychan"]
+    }
+    async fn handle_webhook(
+        &self,
+        _headers: &axum::http::HeaderMap,
+        body: &str,
+        _ctx: &gateway::channel::channel_trait::WebhookContext<'_>,
+    ) -> anyhow::Result<gateway::channel::channel_trait::WebhookOutcome> {
+        Ok(gateway::channel::channel_trait::WebhookOutcome::Message {
+            inbound: inbound_with_text("dm-user-retry", body),
+            session_key: "retrychan:dm-user-retry".to_string(),
+            response_context: serde_json::json!({}),
+        })
+    }
+    async fn send_response(
+        &self,
+        _text: &str,
+        _ctx: &serde_json::Value,
+        _health: &Arc<tokio::sync::RwLock<gateway::health::ChannelHealthRegistry>>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("simulated outage")
+    }
+}
+
+#[tokio::test]
+async fn failed_webhook_send_schedules_retry_thirty_seconds_out() {
+    let _guard = borg_home_guard();
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("BORG_HOME", tmp.path());
+    install_echo_executor();
+
+    let channel: Arc<dyn gateway::channel::channel_trait::NativeChannel> =
+        Arc::new(FailingSendChannel);
+    let config = open_dm_config();
+    let health = Arc::new(tokio::sync::RwLock::new(
+        gateway::health::ChannelHealthRegistry::new(),
+    ));
+    let ctx = gateway::channel::channel_trait::WebhookContext {
+        config: &config,
+        health: &health,
+    };
+    let queue = gateway::session_queue::SessionQueue::new(4);
+
+    let t0 = chrono::Utc::now().timestamp();
+    let (status, _body) = gateway::channel::channel_trait::dispatch_webhook(
+        &channel,
+        &axum::http::HeaderMap::new(),
+        "RETRY_MARKER",
+        &ctx,
+        &queue,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // The work runs on the session consumer task — poll for the row.
+    let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+        .await
+        .unwrap();
+    let mut row: Option<(String, Option<String>, Option<i64>)> = None;
+    for _ in 0..100 {
+        let stmt = db
+            .conn()
+            .prepare(
+                "SELECT status, error, next_retry_at FROM delivery_queue \
+                 WHERE channel_name = 'retrychan'",
+            )
+            .await
+            .unwrap();
+        let mut rows = stmt.query(libsql::params![]).await.unwrap();
+        if let Some(r) = rows.next().await.unwrap() {
+            let status: String = r.get(0).unwrap();
+            if status != "in_progress" && r.get::<Option<String>>(1).unwrap().is_some() {
+                row = Some((
+                    status,
+                    r.get::<Option<String>>(1).unwrap(),
+                    r.get::<Option<i64>>(2).unwrap(),
+                ));
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    std::env::remove_var("BORG_HOME");
+    let (status, error, next_retry_at) = row.expect("failed delivery row must appear");
+    let t1 = chrono::Utc::now().timestamp();
+
+    // First failure of max_retries=3 stays pending for the drain loop.
+    assert_eq!(status, "pending");
+    assert!(
+        error.as_deref().unwrap_or("").contains("simulated outage"),
+        "{error:?}"
+    );
+    // The retry must be scheduled 30 seconds after the failure — far enough
+    // to ride out a transient channel-API blip, near enough not to stall a
+    // user-visible reply.
+    let retry_at = next_retry_at.expect("retry time must be recorded");
+    assert!(
+        retry_at >= t0 + 30 && retry_at <= t1 + 30,
+        "retry_at {retry_at} outside [{}, {}]",
+        t0 + 30,
+        t1 + 30
+    );
+}
+
 #[tokio::test]
 async fn invoke_agent_returns_agent_reply_and_real_session_id() {
     let _guard = borg_home_guard();

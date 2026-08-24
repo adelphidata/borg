@@ -98,6 +98,42 @@ mod tests {
         );
     }
 
+    /// Each marker variant must trip the guard *on its own* — a leaked
+    /// fragment rarely carries both the opening and closing form, so the
+    /// detection for each pair is an OR, never an AND.
+    #[test]
+    fn each_marker_variant_detects_alone() {
+        let cases: &[(&str, &str)] = &[
+            ("prompt dump #####", "internal separator"),
+            ("assistant to = user", "role marker"),
+            ("assistant to=user", "role marker"),
+            ("leak <thinking> only open", "thinking tag"),
+            ("only close </thinking> leak", "thinking tag"),
+            ("leak <thought> only open", "thought tag"),
+            ("only close </thought> leak", "thought tag"),
+            ("leak <relevant_memories> only open", "memory tag"),
+            ("only close </relevant_memories> leak", "memory tag"),
+            ("leak <internal> only open", "internal tag"),
+            ("only close </internal> leak", "internal tag"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                detect_reflected_content(text),
+                Some(*expected),
+                "input: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_marker_after_closed_code_block() {
+        // The region scanner must resume exactly after the closing fence:
+        // an off-by-a-few slice would misalign fence tracking and drop the
+        // trailing non-code region where this marker lives.
+        let text = "```\ncode\n```\n<thinking>leak</thinking>";
+        assert_eq!(detect_reflected_content(text), Some("thinking tag"));
+    }
+
     #[test]
     fn ignores_markers_inside_code_blocks() {
         let text = "Look at this:\n```\n<thinking>example</thinking>\n```\nPretty cool right?";

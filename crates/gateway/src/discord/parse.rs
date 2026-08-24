@@ -332,6 +332,37 @@ mod tests {
     }
 
     #[test]
+    fn modal_submit_collects_fields_nested_inside_wrapper_components() {
+        // Discord wraps text inputs in container components (labels,
+        // sections); the collector must recurse into non-empty child
+        // lists or nested field values silently vanish from the turn.
+        let mut interaction = make_interaction(InteractionType::ModalSubmit);
+        interaction.data = Some(InteractionData {
+            id: None,
+            name: None,
+            options: None,
+            custom_id: Some("nested_form".into()),
+            values: None,
+            components: Some(vec![InteractionComponentRow {
+                components: vec![InteractionComponent {
+                    component_type: 18, // wrapper, not a text input
+                    custom_id: None,
+                    value: None,
+                    components: vec![InteractionComponent {
+                        component_type: 4,
+                        custom_id: Some("inner".into()),
+                        value: Some("deep value".into()),
+                        components: Vec::new(),
+                    }],
+                }],
+            }]),
+        });
+
+        let msg = parse_interaction(&interaction).unwrap();
+        assert_eq!(msg.text, "[Modal: nested_form]\ninner: deep value");
+    }
+
+    #[test]
     fn modal_submit_ignores_non_text_components() {
         let mut interaction = make_interaction(InteractionType::ModalSubmit);
         interaction.data = Some(InteractionData {
