@@ -117,6 +117,81 @@ mod tests {
         assert_eq!(policy.service_name, "API");
     }
 
+    #[test]
+    fn for_service_sets_name_and_keeps_default_limits() {
+        let policy = RateLimitPolicy::for_service("Telegram");
+        assert_eq!(policy.service_name, "Telegram");
+        assert_eq!(policy.max_retries, 5);
+        assert_eq!(policy.max_retry_after_secs, 300);
+    }
+
+    #[tokio::test]
+    async fn built_client_enforces_request_timeout() {
+        // The whole point of build_channel_client is the timeout wiring —
+        // a default (timeout-less) client would hang a channel forever on
+        // an unresponsive host. Point the client at a listener that
+        // accepts but never responds and require a timeout error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut buf = [0u8; 1024];
+                    // Drain the request, never write a response.
+                    while sock.read(&mut buf).await.unwrap_or(0) > 0 {}
+                });
+            }
+        });
+
+        let client = build_channel_client(
+            "test",
+            Duration::from_millis(200),
+            Some(Duration::from_millis(200)),
+        )
+        .expect("build client");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("configured client must give up within its timeout, not hang");
+        let err = outcome.expect_err("silent server must produce a timeout error");
+        assert!(err.is_timeout(), "expected timeout error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn retry_budget_allows_max_retries_before_failing() {
+        // max_retries = 1 means: one retry after the first 429 — a 200 on
+        // the second attempt must come back Ok, not a premature bail.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let policy = RateLimitPolicy {
+            max_retries: 1,
+            max_retry_after_secs: 0, // caps the sleep at 0s — no waiting
+            service_name: "Test",
+        };
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in = calls.clone();
+        let resp = send_with_rate_limit_retry(&policy, move || {
+            let calls_in = calls_in.clone();
+            async move {
+                let n = calls_in.fetch_add(1, Ordering::SeqCst);
+                Ok(mock_response(if n == 0 { 429 } else { 200 }))
+            }
+        })
+        .await
+        .expect("second attempt returns 200 within the retry budget");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+    }
+
     #[tokio::test]
     async fn non_429_returns_immediately() {
         let policy = RateLimitPolicy {

@@ -94,3 +94,23 @@ impl std::fmt::Display for EmbeddingDispatchError {
 }
 
 impl std::error::Error for EmbeddingDispatchError {}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbeddingDispatchError;
+
+    #[test]
+    fn dispatch_error_display_names_each_failure_mode() {
+        // Operators triage 502s from these strings in the warn logs —
+        // an empty or variant-agnostic rendering loses the distinction
+        // between "not configured" and "upstream fault".
+        assert_eq!(
+            EmbeddingDispatchError::ProviderUnavailable.to_string(),
+            "embedding provider unavailable"
+        );
+        assert_eq!(
+            EmbeddingDispatchError::Upstream("boom".into()).to_string(),
+            "upstream embedding error: boom"
+        );
+    }
+}

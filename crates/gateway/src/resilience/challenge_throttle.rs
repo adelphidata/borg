@@ -125,6 +125,52 @@ mod tests {
     }
 
     #[test]
+    fn suppression_window_is_exclusive_at_the_boundary() {
+        // An entry whose age has reached the full cooldown is expired:
+        // elapsed < cooldown suppresses, elapsed == cooldown does not.
+        // A future-stamped entry makes `duration_since` saturate to
+        // exactly zero, so with a zero cooldown the boundary case is hit
+        // deterministically — the challenge must go through.
+        let mut throttle = ChallengeThrottle::new(Duration::ZERO);
+        throttle.entries.insert(
+            ScopeKey {
+                channel: "telegram".to_string(),
+                sender_id: "user1".to_string(),
+            },
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert!(
+            !throttle.should_suppress("telegram", "user1"),
+            "elapsed == cooldown must not suppress"
+        );
+    }
+
+    #[test]
+    fn prune_removes_entries_at_exact_cooldown_age() {
+        // Same boundary as should_suppress: an entry exactly cooldown old
+        // is expired and must be pruned. Future-stamped entries saturate
+        // `duration_since` to zero; with a zero cooldown they all sit on
+        // the boundary and every one must go.
+        let mut throttle = ChallengeThrottle::new(Duration::ZERO);
+        let future = Instant::now() + Duration::from_secs(60);
+        for i in 0..(MAX_ENTRIES + 1) {
+            throttle.entries.insert(
+                ScopeKey {
+                    channel: "telegram".to_string(),
+                    sender_id: format!("user{i}"),
+                },
+                future,
+            );
+        }
+        throttle.prune_if_needed();
+        assert!(
+            throttle.entries.is_empty(),
+            "boundary-aged entries must be pruned, {} left",
+            throttle.entries.len()
+        );
+    }
+
+    #[test]
     fn prune_removes_expired_entries() {
         let mut throttle = make_throttle(10); // 10ms cooldown
         for i in 0..250 {

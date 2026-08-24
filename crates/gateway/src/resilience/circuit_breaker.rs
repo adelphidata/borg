@@ -115,6 +115,40 @@ mod tests {
     }
 
     #[test]
+    fn suspension_deadline_is_now_plus_configured_secs() {
+        // The stored deadline anchors the half-open probe. It must be
+        // wall-clock "now" plus the configured suspension — not an epoch
+        // near zero, and not a multiplied absurdity years in the future.
+        let unix_now = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs()
+        };
+        let cb = CircuitBreaker::new(1, 300);
+        let before = unix_now();
+        cb.record_failure();
+        let after = unix_now();
+        let until = cb.suspended_until.load(Ordering::Acquire);
+        assert!(
+            until >= before + 300 && until <= after + 300,
+            "deadline {until} outside [{}, {}]",
+            before + 300,
+            after + 300
+        );
+    }
+
+    #[test]
+    fn record_failure_status_401_trips_breaker() {
+        // The status-aware path exists precisely so 401 loops open the
+        // circuit (repeated bad-token calls can get a bot deleted). A
+        // 401 at threshold must actually open it.
+        let cb = CircuitBreaker::new(1, 300);
+        cb.record_failure_status(401);
+        assert!(cb.is_open(), "401 failures must count toward the threshold");
+    }
+
+    #[test]
     fn reopens_after_suspension_period() {
         let cb = CircuitBreaker::new(3, 300);
         for _ in 0..3 {

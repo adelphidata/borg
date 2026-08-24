@@ -906,6 +906,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_stream_error_after_partial_text_is_newline_separated() {
+        // A mid-stream agent error must land on its own line below the
+        // partial text — gluing "[error] …" onto the last word makes the
+        // failure invisible in chat clients.
+        let (state, issued, _tmp) = make_state(vec![
+            AgentEventChunk::Text("partial answer".into()),
+            AgentEventChunk::Error("boom".into()),
+        ])
+        .await;
+        let app = router(state);
+        let resp = app
+            .oneshot(req_with(
+                Some(&issued.plaintext),
+                serde_json::json!({
+                    "messages":[{"role":"user","content":"hi"}],
+                    "model":"borg-default",
+                    "stream":false
+                }),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "partial answer\n[error] boom"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_messages_returns_400() {
         // OpenAI returns 400 on empty messages; we match for SDK
         // compatibility (the `openai` Python SDK raises BadRequestError
@@ -1159,6 +1189,70 @@ mod tests {
         assert!(
             msg.contains("batch size"),
             "error must explain batch-cap violation, got: {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_batch_at_cap_is_accepted() {
+        // The cap is exclusive: exactly MAX_EMBEDDING_BATCH_SIZE inputs
+        // must go through — rejecting a full legal batch would force
+        // clients into off-by-one workarounds.
+        let (state, issued, _tmp) =
+            make_embedding_state(FakeEmbeddingOutcome::Vectors(vec![vec![0.0]])).await;
+        let app = router(state);
+        let at_cap: Vec<String> = (0..cortex::constants::MAX_EMBEDDING_BATCH_SIZE)
+            .map(|i| format!("input-{i}"))
+            .collect();
+        let resp = app
+            .oneshot(embed_req(
+                Some(&issued.plaintext),
+                serde_json::json!({"model":"m","input":at_cap}),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a batch of exactly the cap must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_per_input_char_limit_boundary() {
+        // Exactly MAX_EMBEDDING_INPUT_CHARS is legal; one char over is a
+        // 400 that names the limit. Silent acceptance of over-limit
+        // entries would hand cortex input it silently truncates.
+        let (state, issued, _tmp) =
+            make_embedding_state(FakeEmbeddingOutcome::Vectors(vec![vec![0.0]])).await;
+
+        let at_limit = "x".repeat(cortex::constants::MAX_EMBEDDING_INPUT_CHARS);
+        let resp = router(state.clone())
+            .oneshot(embed_req(
+                Some(&issued.plaintext),
+                serde_json::json!({"model":"m","input":at_limit}),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "input of exactly the char limit must be accepted"
+        );
+
+        let over_limit = "x".repeat(cortex::constants::MAX_EMBEDDING_INPUT_CHARS + 1);
+        let resp = router(state)
+            .oneshot(embed_req(
+                Some(&issued.plaintext),
+                serde_json::json!({"model":"m","input":over_limit}),
+            ))
+            .await
+            .expect("call");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("char limit"),
+            "error must name the per-input limit, got: {msg:?}"
         );
     }
 

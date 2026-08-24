@@ -45,6 +45,45 @@ pub(crate) fn append_voice_transcripts(text: &mut String, transcripts: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cortex::config::{AudioModelConfig, Config};
+
+    /// Transcriber backed by the command-template STT provider — hermetic
+    /// (no network, no keys): the transcript is whatever the shell command
+    /// prints.
+    fn transcriber_with_command(cmd: &str) -> AudioTranscriber {
+        let mut config = Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![AudioModelConfig {
+            provider: "custom".into(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(10_000),
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some(cmd.into()),
+        }];
+        AudioTranscriber::from_config(&config).expect("custom STT provider configured")
+    }
+
+    #[tokio::test]
+    async fn transcribe_or_warn_returns_provider_transcript() {
+        let transcriber = transcriber_with_command(": {audio_file} && printf 'voice says hi'");
+        let bytes = vec![0u8; 2048]; // above the 1 KB minimum size gate
+        let out = transcribe_or_warn(&transcriber, &bytes, "audio/ogg", "note.ogg", "test").await;
+        assert_eq!(out.as_deref(), Some("voice says hi"));
+    }
+
+    #[tokio::test]
+    async fn transcribe_or_warn_swallows_failure_as_none() {
+        // STT is best-effort on the inbound path: a failing provider must
+        // yield None (message continues without a transcript), never Some.
+        let transcriber = transcriber_with_command(": {audio_file} && exit 3");
+        let bytes = vec![0u8; 2048];
+        let out = transcribe_or_warn(&transcriber, &bytes, "audio/ogg", "note.ogg", "test").await;
+        assert_eq!(out, None);
+    }
 
     #[test]
     fn append_replaces_blank_text_and_appends_to_existing() {

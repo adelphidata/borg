@@ -438,6 +438,214 @@ mod tests {
         assert!(urls.is_empty());
     }
 
+    // ---- fetch pipeline tests against a loopback stub server ----
+    //
+    // `enabled: false` short-circuits the classifier gates to Allow so the
+    // fetch pipeline (status gate, content-type gate, body cap, redirect
+    // limit, truncation) can be exercised hermetically against a loopback
+    // stub. The SSRF gates themselves are pinned by the extraction tests
+    // above, which all run with the hardened default (`enabled: true`,
+    // `allow_private_urls: false`) policy — nothing here weakens them.
+    fn passthrough_policy() -> UrlPolicyConfig {
+        UrlPolicyConfig {
+            enabled: false,
+            ..UrlPolicyConfig::default()
+        }
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(route: &str, template: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn fetch_strips_html_to_plain_text() {
+        let server = serve(
+            "/",
+            ResponseTemplate::new(200).set_body_raw(
+                "<html><body><h1>Hello</h1><p>link target</p></body></html>".as_bytes(),
+                "text/html; charset=utf-8",
+            ),
+        )
+        .await;
+        let text = fetch_link_content(&server.uri(), 500, 5_000, &passthrough_policy())
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(text, "Hello link target");
+    }
+
+    #[tokio::test]
+    async fn fetch_accepts_json_and_xml_content_types() {
+        for (content_type, body) in [
+            ("application/json", r#"{"k":"v"}"#),
+            ("application/xml", "<r>value</r>"),
+        ] {
+            let server = serve(
+                "/",
+                ResponseTemplate::new(200).set_body_raw(body.as_bytes(), content_type),
+            )
+            .await;
+            let text = fetch_link_content(&server.uri(), 500, 5_000, &passthrough_policy())
+                .await
+                .unwrap_or_else(|e| panic!("{content_type} must be fetchable: {e}"));
+            assert_eq!(text, body, "{content_type} body returned verbatim");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_text_content_type() {
+        let server = serve(
+            "/",
+            ResponseTemplate::new(200).set_body_raw("not really a png".as_bytes(), "image/png"),
+        )
+        .await;
+        let err = fetch_link_content(&server.uri(), 500, 5_000, &passthrough_policy())
+            .await
+            .expect_err("binary content type must be refused");
+        assert!(
+            err.to_string().contains("Non-text content type"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_http_error_status() {
+        let server = serve(
+            "/",
+            ResponseTemplate::new(404)
+                .set_body_string("gone"),
+        )
+        .await;
+        let err = fetch_link_content(&server.uri(), 500, 5_000, &passthrough_policy())
+            .await
+            .expect_err("non-2xx status must be an error, not content");
+        assert!(err.to_string().contains("HTTP 404"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_follows_redirect_within_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/end"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/end"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("landed"),
+            )
+            .mount(&server)
+            .await;
+        let url = format!("{}/start", server.uri());
+        let text = fetch_link_content(&url, 500, 5_000, &passthrough_policy())
+            .await
+            .expect("a single redirect is within the hop limit");
+        assert_eq!(text, "landed");
+    }
+
+    #[tokio::test]
+    async fn fetch_allows_bodies_up_to_the_two_megabyte_cap() {
+        // 1.2 MB sits above every wrong cap a broken size computation
+        // yields (0, 2, ~3 KB, ~1 MB) while staying under the real 2 MB
+        // ceiling — the fetch must succeed and truncate normally.
+        let body = "a".repeat(1_200_000);
+        let server = serve(
+            "/",
+            ResponseTemplate::new(200)
+                .set_body_string(body),
+        )
+        .await;
+        let text = fetch_link_content(&server.uri(), 32, 15_000, &passthrough_policy())
+            .await
+            .expect("1.2 MB body is under the 2 MB cap");
+        assert_eq!(text, "a".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn fetch_truncates_ascii_at_max_chars() {
+        let server = serve(
+            "/",
+            ResponseTemplate::new(200)
+                .set_body_string("abcdefghij"),
+        )
+        .await;
+        let text = fetch_link_content(&server.uri(), 4, 5_000, &passthrough_policy())
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(text, "abcd");
+    }
+
+    #[tokio::test]
+    async fn fetch_truncation_backs_off_to_char_boundary() {
+        // Five two-byte chars; a 3-byte cut lands mid-char and must back
+        // off to byte 2 rather than panic or overshoot.
+        let server = serve(
+            "/",
+            ResponseTemplate::new(200)
+                .set_body_string("ééééé"),
+        )
+        .await;
+        let text = fetch_link_content(&server.uri(), 3, 5_000, &passthrough_policy())
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(text, "é");
+    }
+
+    #[tokio::test]
+    async fn augment_appends_content_inside_untrusted_tags() {
+        let server = serve(
+            "/page",
+            ResponseTemplate::new(200)
+                .set_body_string("hello from the page"),
+        )
+        .await;
+        let url = format!("{}/page", server.uri());
+        let config = LinkUnderstandingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let text = format!("look at {url}");
+        let (augmented, fetched) =
+            augment_with_links(&text, &config, &passthrough_policy()).await;
+        assert_eq!(fetched, vec![url.clone()]);
+        assert!(augmented.starts_with(&text), "original text preserved");
+        assert!(
+            augmented.contains(&format!("<untrusted_web_content source=\"{url}\">")),
+            "fetched content must be wrapped in the trust-boundary tag, got: {augmented}"
+        );
+        assert!(augmented.contains("hello from the page"));
+    }
+
+    #[tokio::test]
+    async fn augment_skips_whitespace_only_content() {
+        let server = serve(
+            "/blank",
+            ResponseTemplate::new(200)
+                .set_body_string("   \n  "),
+        )
+        .await;
+        let url = format!("{}/blank", server.uri());
+        let config = LinkUnderstandingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let text = format!("see {url}");
+        let (augmented, fetched) =
+            augment_with_links(&text, &config, &passthrough_policy()).await;
+        assert_eq!(augmented, text, "blank content must not be appended");
+        assert!(fetched.is_empty());
+    }
+
     #[tokio::test]
     async fn augment_no_urls_is_noop() {
         let config = LinkUnderstandingConfig {
