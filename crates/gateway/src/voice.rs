@@ -202,6 +202,48 @@ mod tests {
     }
 
     #[test]
+    fn from_str_parses_every_persisted_mode_string() {
+        // These strings are persisted in the settings table via `as_str()`;
+        // losing a parse arm silently downgrades stored overrides to the
+        // config default.
+        for (input, expected) in [
+            ("off", VoiceReplyMode::Off),
+            ("voice_only", VoiceReplyMode::VoiceOnly),
+            ("all", VoiceReplyMode::All),
+        ] {
+            assert_eq!(input.parse::<VoiceReplyMode>(), Ok(expected), "{input}");
+            assert_eq!(expected.as_str(), input, "as_str/from_str round trip");
+        }
+        assert!("loud".parse::<VoiceReplyMode>().is_err());
+    }
+
+    #[test]
+    fn voice_mode_setting_key_uses_stable_namespaced_format() {
+        // The key format is the on-disk contract for stored per-chat
+        // overrides — changing it orphans every existing setting row.
+        assert_eq!(
+            voice_mode_setting_key("telegram", "42"),
+            "gw:voice_mode:telegram:42"
+        );
+    }
+
+    #[test]
+    fn provider_hiccup_phrase_alone_suppresses_voice_reply() {
+        // A friendly-error sentence can mention "the AI provider" without
+        // tripping the raw-error classifier; the phrase filter must catch it
+        // on its own (each phrase is an independent OR branch, not a
+        // conjunction with the other phrases).
+        let text = "The AI provider gave a strange reply.";
+        assert_eq!(
+            cortex::error_format::classify_error(text),
+            cortex::error_format::ErrorCategory::Unknown,
+            "precondition: this phrase must not be classified as an error, \
+             or the test no longer exercises the phrase filter"
+        );
+        assert!(!should_send_voice_reply(VoiceReplyMode::All, text, true));
+    }
+
+    #[test]
     fn voice_reply_unavailable_reason_reports_disabled_tts() {
         let config = Config::default();
         assert_eq!(

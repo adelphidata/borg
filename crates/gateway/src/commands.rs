@@ -509,7 +509,13 @@ async fn handle_memory(config: &Config) -> String {
 }
 
 async fn handle_doctor(config: &Config) -> String {
-    let report = cortex::doctor::run_diagnostics(config).await;
+    format_doctor_report(&cortex::doctor::run_diagnostics(config).await)
+}
+
+/// Render a diagnostics report for a messaging channel: one summary line,
+/// then only the checks that need attention. Pure so the branch logic is
+/// testable without running the (network-probing) diagnostics themselves.
+fn format_doctor_report(report: &cortex::doctor::DiagnosticReport) -> String {
     let (pass, warnings, fail) = report.counts();
     let mut lines = vec![format!(
         "Diagnostics: {pass} passed, {warnings} warning(s), {fail} failed"
@@ -1256,11 +1262,16 @@ mod tests {
 
     #[tokio::test]
     async fn handle_memory_lists_inventory_across_stores() {
+        let _guard = crate::test_env::borg_home_guard();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("BORG_HOME", tmp.path());
 
+        // Fresh home: the empty-inventory message, not a zero-item listing.
+        let empty = handle_memory(&Config::default()).await;
+
         let db = cortex::db::Database::open().await.unwrap();
-        db.upsert_memory_entry("global", "shared-note", "saved fact")
+        // 2048 bytes → the listing must report exactly 2.0 KB.
+        db.upsert_memory_entry("global", "shared-note", &"x".repeat(2048))
             .await
             .unwrap();
         let memory_dir = tmp.path().join("memory");
@@ -1268,11 +1279,12 @@ mod tests {
         std::fs::write(memory_dir.join("memory.md"), "knowledge file").unwrap();
 
         let out = handle_memory(&Config::default()).await;
-        assert!(out.contains("Memory inventory"));
-        assert!(out.contains("[long-term:global] shared-note"));
-        assert!(out.contains("[knowledge:global] global/memory.md"));
-
         std::env::remove_var("BORG_HOME");
+
+        assert_eq!(empty, "No memory entries or knowledge files.");
+        assert!(out.contains("Memory inventory"));
+        assert!(out.contains("[long-term:global] shared-note (2.0 KB)"), "{out}");
+        assert!(out.contains("[knowledge:global] global/memory.md"));
     }
 
     #[test]
@@ -1480,5 +1492,591 @@ mod tests {
             out,
             "Voice mode is currently implemented for Telegram only."
         );
+    }
+
+    #[tokio::test]
+    async fn try_handle_command_dispatches_and_passes_through() {
+        let db = gateway_test_db().await;
+        let config = Config::default();
+
+        let resp = try_handle_command(
+            "/undo", &db, &config, "telegram", None, "skey", "sid-undo", "sender",
+        )
+        .await;
+        assert_eq!(resp.as_deref(), Some("Nothing to undo."));
+
+        // Non-commands and out-of-band/pass-through commands must fall
+        // through to the agent (or the async interceptors) untouched.
+        for passthrough in ["hello world", "/skill weather", "/cancel", "/poke", "/dream"] {
+            let resp = try_handle_command(
+                passthrough, &db, &config, "telegram", None, "skey", "sid-undo", "sender",
+            )
+            .await;
+            assert!(resp.is_none(), "{passthrough} must not be intercepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_status_reports_short_id_and_message_count() {
+        let db = gateway_test_db().await;
+        let sid = "statussession-1";
+        for text in ["one", "two"] {
+            db.insert_message(sid, "user", Some(text), None, None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            handle_status(&db, sid).await,
+            "Session: statusse...\nMessages: 2"
+        );
+        // Session ids shorter than 8 chars fall back to the full id.
+        assert_eq!(handle_status(&db, "abc").await, "Session: abc...\nMessages: 0");
+    }
+
+    #[tokio::test]
+    async fn handle_new_rotates_channel_session() {
+        let db = gateway_test_db().await;
+        assert_eq!(
+            handle_new(&db, "tg", "sender1").await,
+            "No existing session found to replace."
+        );
+
+        let old = db.resolve_channel_session("tg", "sender1").await.unwrap();
+        let out = handle_new(&db, "tg", "sender1").await;
+        assert!(out.starts_with("New session started ("), "{out}");
+        let new = db
+            .lookup_channel_session("tg", "sender1")
+            .await
+            .unwrap()
+            .expect("session row still exists");
+        assert_ne!(new, old, "session id must actually rotate");
+        assert!(
+            out.contains(&new[..8]),
+            "response must echo the new session's short id: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_reset_deletes_and_counts_messages() {
+        let db = gateway_test_db().await;
+        let sid = "reset-session";
+        for text in ["a", "b"] {
+            db.insert_message(sid, "user", Some(text), None, None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            handle_reset(&db, sid).await,
+            "Cleared 2 messages from current session."
+        );
+        assert_eq!(db.count_session_messages(sid).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn handle_usage_reports_counts_and_budget_pct() {
+        let db = gateway_test_db().await;
+        let sid = "usage-session";
+        db.insert_message(sid, "user", Some("q"), None, None, None, None)
+            .await
+            .unwrap();
+        db.log_token_usage(30, 20, 50, "test", "test-model", None)
+            .await
+            .unwrap();
+
+        let mut config = Config::default();
+        // No budget configured → no budget line.
+        config.budget.monthly_token_limit = 0;
+        assert_eq!(
+            handle_usage(&db, &config, sid).await,
+            "Session messages: 1\nMonthly tokens: 50"
+        );
+
+        // 50 of 200 tokens = exactly 25.0%.
+        config.budget.monthly_token_limit = 200;
+        assert_eq!(
+            handle_usage(&db, &config, sid).await,
+            "Session messages: 1\nMonthly tokens: 50\nBudget: 25.0% of 200 used"
+        );
+    }
+
+    #[test]
+    fn handle_skills_lists_bundled_skills() {
+        // Built-in skills are compiled in, so the default config always
+        // yields a non-empty listing with one line per skill.
+        let out = handle_skills(&Config::default());
+        assert!(out.starts_with("Skills ("), "{out}");
+        assert!(
+            out.lines().count() > 1,
+            "expected at least one skill line: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_whoami_reports_identity_and_pairing() {
+        let db = gateway_test_db().await;
+        assert_eq!(
+            handle_whoami("u42", "telegram", &db).await,
+            "Sender: u42\nChannel: telegram\nPairing: Not approved"
+        );
+    }
+
+    #[test]
+    fn format_doctor_report_summarizes_and_lists_problems() {
+        use cortex::doctor::{DiagnosticCheck, DiagnosticReport};
+
+        // All pass → summary plus the all-clear line.
+        let report = DiagnosticReport {
+            checks: vec![
+                DiagnosticCheck::pass("cat", "alpha"),
+                DiagnosticCheck::pass("cat", "beta"),
+            ],
+        };
+        assert_eq!(
+            format_doctor_report(&report),
+            "Diagnostics: 2 passed, 0 warning(s), 0 failed\n  All checks passed."
+        );
+
+        // Warn only → the warning line, and no premature all-clear.
+        let report = DiagnosticReport {
+            checks: vec![
+                DiagnosticCheck::pass("cat", "alpha"),
+                DiagnosticCheck::warn("cat", "disk", "nearly full"),
+            ],
+        };
+        assert_eq!(
+            format_doctor_report(&report),
+            "Diagnostics: 1 passed, 1 warning(s), 0 failed\n  ⚠ disk — nearly full"
+        );
+
+        // Fail only → the failure line, and no all-clear.
+        let report = DiagnosticReport {
+            checks: vec![DiagnosticCheck::fail("cat", "db", "cannot open")],
+        };
+        assert_eq!(
+            format_doctor_report(&report),
+            "Diagnostics: 0 passed, 0 warning(s), 1 failed\n  ✗ db — cannot open"
+        );
+
+        // Warn + fail together → both listed, still no all-clear.
+        let report = DiagnosticReport {
+            checks: vec![
+                DiagnosticCheck::warn("cat", "disk", "nearly full"),
+                DiagnosticCheck::fail("cat", "db", "cannot open"),
+            ],
+        };
+        let out = format_doctor_report(&report);
+        assert!(out.contains("⚠ disk — nearly full"), "{out}");
+        assert!(out.contains("✗ db — cannot open"), "{out}");
+        assert!(!out.contains("All checks passed."), "{out}");
+    }
+
+    #[tokio::test]
+    async fn handle_mode_shows_sets_and_validates() {
+        let db = gateway_test_db().await;
+        let config = Config::default();
+        let sid = "mode-session";
+
+        let show = handle_mode(&db, &config, sid, "").await;
+        assert!(show.starts_with("Collaboration mode: "), "{show}");
+        assert!(show.contains("Usage: /mode <default|execute|plan>"), "{show}");
+
+        assert_eq!(
+            handle_mode(&db, &config, sid, "plan").await,
+            "Switched to plan mode."
+        );
+        assert_eq!(
+            db.get_setting("gw:mode:mode-session")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plan")
+        );
+        // The show path must now reflect the DB override, not the config.
+        let show = handle_mode(&db, &config, sid, "").await;
+        assert!(show.starts_with("Collaboration mode: plan"), "{show}");
+
+        assert_eq!(
+            handle_mode(&db, &config, sid, "yolo").await,
+            "Invalid mode. Choose: default, execute, plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_voice_off_persists_and_reports() {
+        let db = gateway_test_db().await;
+        let config = Config::default();
+        // Disabling voice needs no TTS stack — it must always work.
+        let out = handle_voice(&db, &config, "telegram", Some("77"), "off").await;
+        assert_eq!(out, "Voice mode: Off (text only)");
+        let key = crate::voice::voice_mode_setting_key("telegram", "77");
+        assert_eq!(db.get_setting(&key).await.unwrap().as_deref(), Some("off"));
+    }
+
+    #[tokio::test]
+    async fn handle_voice_channel_subcommands_name_the_right_action() {
+        // Default build: the voice-channel path must (a) intercept before
+        // the Telegram-only guard, and (b) name the specific action the
+        // user asked for in the stub message.
+        let db = gateway_test_db().await;
+        let config = Config::default();
+        let cases = [
+            ("leave", "`leave`"),
+            ("channel 1:2", "`switch`"),
+            ("join", "`join`"),
+            ("join 1:2", "`join`"),
+        ];
+        for (input, action) in cases {
+            let resp = handle_voice(&db, &config, "discord", Some("999"), input).await;
+            if resp.contains("not active in this build") {
+                assert!(
+                    resp.contains(action),
+                    "input {input:?}: stub must name {action}, got: {resp}"
+                );
+                assert_ne!(
+                    resp, "Voice mode is currently implemented for Telegram only.",
+                    "voice-channel subcommand {input:?} must bypass the Telegram guard"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_plan_sets_mode_and_passes_message_through() {
+        let db = gateway_test_db().await;
+
+        // Bare /plan: respond directly, mode persisted.
+        let out = handle_plan(&db, "plan-session", "").await;
+        assert_eq!(
+            out.as_deref(),
+            Some("Entered plan mode. Send your message to begin planning.")
+        );
+        assert_eq!(
+            db.get_setting("gw:mode:plan-session")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plan")
+        );
+
+        // /plan <message>: mode persisted, message passes through (None).
+        let out = handle_plan(&db, "plan-session2", "design the schema").await;
+        assert!(out.is_none(), "with a message /plan must pass through");
+        assert_eq!(
+            db.get_setting("gw:mode:plan-session2")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("plan")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_validates_args_and_trims() {
+        let db = gateway_test_db().await;
+        let sid = "compact-session";
+        for i in 0..8 {
+            db.insert_message(sid, "user", Some(&format!("m{i}")), None, None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let usage = "Usage: /compact [keep_count] (positive integer, default 20)";
+        assert_eq!(handle_compact(&db, sid, "abc").await, usage);
+        assert_eq!(handle_compact(&db, sid, "0").await, usage);
+
+        assert_eq!(
+            handle_compact(&db, sid, "5").await,
+            "Compacted: removed 3 older messages, kept last 5."
+        );
+        assert_eq!(
+            handle_compact(&db, sid, "").await,
+            "Nothing to compact (≤20 messages)."
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_undo_on_empty_session_says_so() {
+        let db = gateway_test_db().await;
+        assert_eq!(handle_undo(&db, "undo-empty").await, "Nothing to undo.");
+    }
+
+    #[tokio::test]
+    async fn handle_history_validates_args_and_lists_tail() {
+        let db = gateway_test_db().await;
+        let sid = "history-session";
+        // History reads session lineage, which requires the sessions row.
+        db.upsert_session(sid, 0, 0, 0, "m", "t").await.unwrap();
+        for (role, text) in [
+            ("user", "first message"),
+            ("assistant", "second message"),
+            ("user", "third message"),
+        ] {
+            db.insert_message(sid, role, Some(text), None, None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let usage = "Usage: /history [count] (1-50, default 10)";
+        // Invalid counts against a *populated* session, so a broken guard
+        // produces a listing instead of the usage hint.
+        for bad in ["abc", "0", "51"] {
+            assert_eq!(handle_history(&db, sid, bad).await, usage, "arg {bad:?}");
+        }
+        // 50 is the inclusive upper bound.
+        assert!(
+            handle_history(&db, sid, "50")
+                .await
+                .starts_with("Last 3 messages:")
+        );
+
+        assert_eq!(
+            handle_history(&db, "history-empty", "").await,
+            "No messages in current session."
+        );
+
+        let out = handle_history(&db, sid, "2").await;
+        assert!(out.starts_with("Last 2 messages:"), "{out}");
+        assert!(out.contains("[assistant] second message"), "{out}");
+        assert!(out.contains("[user] third message"), "{out}");
+        assert!(
+            !out.contains("first message"),
+            "only the tail must be shown: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_history_truncates_only_past_200_chars() {
+        let db = gateway_test_db().await;
+        let sid = "history-trunc";
+        db.upsert_session(sid, 0, 0, 0, "m", "t").await.unwrap();
+        db.insert_message(sid, "user", Some(&"x".repeat(250)), None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_message(sid, "user", Some(&"y".repeat(200)), None, None, None, None)
+            .await
+            .unwrap();
+
+        let out = handle_history(&db, sid, "").await;
+        // 250 chars → cut at 200 with an ellipsis.
+        assert!(out.contains(&format!("{}…", "x".repeat(200))), "long message not truncated");
+        assert!(!out.contains(&"x".repeat(201)), "truncation must cut at 200 chars");
+        // Exactly 200 chars → untouched, no ellipsis.
+        assert!(out.contains(&"y".repeat(200)));
+        assert!(
+            !out.contains(&format!("{}…", "y".repeat(200))),
+            "boundary-length message must not gain an ellipsis"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_schedule_lists_tasks_with_next_run() {
+        let db = gateway_test_db().await;
+        // Migrations seed default maintenance tasks — clear them so both
+        // the empty branch and the single-task listing are deterministic.
+        for task in db.list_tasks().await.unwrap() {
+            assert!(db.delete_task(&task.id).await.unwrap());
+        }
+        assert_eq!(handle_schedule(&db).await, "No scheduled tasks.");
+
+        db.create_task(&cortex::db::NewTask {
+            id: "t1",
+            name: "nightly-backup",
+            prompt: "run backup",
+            schedule_type: "cron",
+            schedule_expr: "0 0 * * *",
+            timezone: "UTC",
+            next_run: Some(1_767_225_600), // 2026-01-01T00:00:00Z
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        })
+        .await
+        .unwrap();
+
+        let out = handle_schedule(&db).await;
+        assert!(out.starts_with("Scheduled tasks (1):"), "{out}");
+        assert!(
+            out.contains("nightly-backup (0 0 * * *) [active] next: 2026-01-01 00:00 UTC"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_settings_lists_gets_sets_and_refuses() {
+        let db = gateway_test_db().await;
+        let config = Config::default();
+
+        // No args → current-settings listing with usage.
+        let listing = handle_settings(&db, &config, "").await;
+        assert!(listing.starts_with("Current settings:"), "{listing}");
+        assert!(
+            listing.contains(&format!("  model = {}", config.llm.model)),
+            "{listing}"
+        );
+        assert!(listing.contains("Usage: /settings <key> <value>"), "{listing}");
+
+        // Single-key reads fall back to compiled config values once no DB
+        // override exists (test_db seeding may pre-populate some keys).
+        for key in ["model", "temperature", "max_tokens"] {
+            db.delete_setting(key).await.unwrap();
+        }
+        assert_eq!(
+            handle_settings(&db, &config, "model").await,
+            format!("model = {}", config.llm.model)
+        );
+        assert_eq!(
+            handle_settings(&db, &config, "temperature").await,
+            format!("temperature = {}", config.llm.temperature)
+        );
+        assert_eq!(
+            handle_settings(&db, &config, "max_tokens").await,
+            format!("max_tokens = {}", config.llm.max_tokens)
+        );
+        assert_eq!(
+            handle_settings(&db, &config, "no.such.setting").await,
+            "Unknown or read-only setting: no.such.setting"
+        );
+
+        // Set path: validate, persist, confirm.
+        let set = handle_settings(&db, &config, "temperature 0.4").await;
+        assert!(set.starts_with("Updated:"), "{set}");
+        assert_eq!(
+            db.get_setting("temperature").await.unwrap().as_deref(),
+            Some("0.4")
+        );
+
+        // Security-critical keys are refused from messaging channels.
+        assert_eq!(
+            handle_settings(&db, &config, "security.blocked_paths x").await,
+            "Setting 'security.blocked_paths' cannot be changed from a messaging channel."
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_settings_reads_provider_key() {
+        let db = gateway_test_db().await;
+        db.delete_setting("provider").await.unwrap();
+
+        // Unset provider reads back as the auto-detect placeholder, not the
+        // "unknown setting" fallback — provider is a first-class readable key.
+        let config = Config::default();
+        assert_eq!(
+            handle_settings(&db, &config, "provider").await,
+            "provider = (auto-detect)"
+        );
+
+        let mut config = Config::default();
+        config.llm.provider = Some("openrouter".to_string());
+        assert_eq!(
+            handle_settings(&db, &config, "provider").await,
+            "provider = openrouter"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_pairing_reports_each_pairing_state() {
+        let db = gateway_test_db().await;
+
+        // Unknown sender: no request on file yet.
+        assert_eq!(
+            handle_pairing(&db, "telegram", "stranger").await,
+            "No pairing request found. Send a message to start the pairing process."
+        );
+
+        // Challenge issued → pending, waiting on the owner.
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
+        let code = match cortex::pairing::check_sender_access(&db, &config, "telegram", "pairee", None)
+            .await
+            .unwrap()
+        {
+            cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
+            other => panic!("expected Challenge, got {other:?}"),
+        };
+        let out = handle_pairing(&db, "telegram", "pairee").await;
+        assert!(out.contains("pending pairing request"), "{out}");
+
+        // Approved → the approved confirmation, naming the channel.
+        db.approve_pairing("telegram", &code).await.unwrap();
+        assert_eq!(
+            handle_pairing(&db, "telegram", "pairee").await,
+            "You are approved on channel 'telegram'."
+        );
+    }
+
+    #[cfg(feature = "discord-voice-channels")]
+    mod voice_channel_dispatch {
+        use super::*;
+        use crate::discord::voice_channels::{self, VoiceCommand};
+        use tokio::sync::mpsc;
+
+        /// Stub manager: services the command channel deterministically so
+        /// the dispatch grammar is testable without a Discord connection.
+        fn spawn_stub_manager() -> voice_channels::VoiceManagerHandle {
+            let (tx, mut rx) = mpsc::channel::<VoiceCommand>(8);
+            tokio::spawn(async move {
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        VoiceCommand::Join { reply, .. } => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        VoiceCommand::Leave { reply, .. } => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        VoiceCommand::ResolveUserChannel {
+                            guild_id,
+                            user_id,
+                            reply,
+                        } => {
+                            let known = guild_id == 1 && user_id == 42;
+                            let _ = reply.send(known.then_some(777));
+                        }
+                        // Dropping the reply channel fails the caller —
+                        // these commands are not exercised here.
+                        _ => {}
+                    }
+                }
+            });
+            voice_channels::handle_for_tests(tx)
+        }
+
+        #[tokio::test]
+        async fn dispatch_grammar_routes_each_action() {
+            let handle = spawn_stub_manager();
+            let cases: &[(&str, &str)] = &[
+                // Explicit-id join.
+                ("join 1:2", "Joined Discord voice channel 2 in guild 1."),
+                // Zero ids are rejected as targets → usage hint.
+                ("join 0:5", "Usage: /voice join"),
+                // User-resolve join via the voice-state cache.
+                (
+                    "join 1:user:42",
+                    "Joined user 42's voice channel (777) in guild 1.",
+                ),
+                // Unknown user → explanatory message, not a join.
+                ("join 2:user:9", "Don't know what channel user 9 is in."),
+                ("leave 3", "Left Discord voice channel in guild 3."),
+                ("leave", "Usage: /voice leave <guild_id>"),
+                ("channel 4:6", "Switched to voice channel 6."),
+                ("channel nope", "Usage: /voice channel <guild_id>:<channel_id>"),
+                ("", "Usage: /voice [join|leave|channel]"),
+            ];
+            for (input, want) in cases {
+                let out =
+                    dispatch_voice_channel_via_handle(&handle, Some("text-chan"), input).await;
+                assert!(
+                    out.starts_with(want),
+                    "input {input:?}: expected prefix {want:?}, got: {out}"
+                );
+            }
+        }
     }
 }

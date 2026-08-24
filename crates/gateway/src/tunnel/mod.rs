@@ -196,6 +196,43 @@ mod tests {
         }
     }
 
+    /// `kill_shared` must actually terminate the child and empty the slot —
+    /// a no-op here leaks a live tunnel process past gateway shutdown and
+    /// makes the next `start()` race the zombie for the port.
+    #[tokio::test]
+    async fn kill_shared_terminates_child_and_clears_slot() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+
+        let slot = new_shared_process();
+        *slot.lock().await = Some(TunnelProcess {
+            child,
+            _pipe_drain: None,
+        });
+
+        kill_shared(&slot).await.expect("kill_shared succeeds");
+
+        assert!(
+            slot.lock().await.is_none(),
+            "slot must be cleared so health checks see the tunnel as down"
+        );
+        // kill_shared waits on the child, so the pid must be fully reaped —
+        // signal 0 delivery has to fail.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(!alive, "tunnel child {pid} still running after kill_shared");
+
+        // Idempotent on an empty slot (`stop_without_start_is_ok`).
+        kill_shared(&slot).await.expect("second kill is a no-op");
+    }
+
     #[test]
     fn create_tunnel_none_returns_no_tunnel() {
         let result =

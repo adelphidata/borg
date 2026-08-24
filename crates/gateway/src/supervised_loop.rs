@@ -174,6 +174,39 @@ mod tests {
         handle.await.expect("supervisor exits cleanly");
     }
 
+    /// Short runs must NOT reset the backoff — only a run of at least
+    /// `HEALTHY_RUN` earns a reset. A crash-looping channel therefore backs
+    /// off 1s, 2s, 4s, … up to the 60s ceiling instead of hammering a broken
+    /// upstream once per second forever.
+    #[tokio::test(start_paused = true)]
+    async fn crash_loop_backoff_grows_instead_of_resetting() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let cancel = CancellationToken::new();
+        let r = runs.clone();
+        let handle = spawn_supervised_loop("test-backoff", cancel.clone(), move || {
+            let runs = r.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                panic!("always broken");
+            }
+        });
+
+        // Doubling backoff schedules runs at t = 0, 1, 3, 7, 15, 31, 63 —
+        // 7 attempts in 100 virtual seconds. Resetting the backoff after
+        // every short run would produce one attempt per second (~100).
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let n = runs.load(Ordering::SeqCst);
+        assert!(n >= 5, "backoff must keep retrying, got {n} attempts");
+        assert!(
+            n <= 10,
+            "short crashing runs must not reset the backoff — {n} attempts \
+             in 100s means the loop retried ~every second"
+        );
+
+        cancel.cancel();
+        handle.await.expect("supervisor exits cleanly");
+    }
+
     /// Cancellation stops the supervisor without a restart, so shutdown
     /// doesn't spin up a loop that immediately has to be torn down.
     #[tokio::test(start_paused = true)]

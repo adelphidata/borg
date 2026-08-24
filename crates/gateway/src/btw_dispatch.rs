@@ -430,6 +430,112 @@ mod tests {
     }
 
     #[test]
+    fn message_row_to_message_maps_user_and_system_roles() {
+        // `/btw` replays the prior transcript — user questions and system
+        // context must survive the row conversion with the right roles, or
+        // the side-question model sees a lopsided conversation.
+        let cases: &[(&str, fn(&cortex::types::Role) -> bool)] = &[
+            ("user", |r| matches!(r, cortex::types::Role::User)),
+            ("system", |r| matches!(r, cortex::types::Role::System)),
+        ];
+        for (role, is_expected) in cases {
+            let row = MessageRow {
+                id: 7,
+                session_id: "s".into(),
+                role: (*role).to_string(),
+                content: Some("ctx".into()),
+                ..Default::default()
+            };
+            let m = message_row_to_message(&row)
+                .unwrap_or_else(|| panic!("{role} row must convert"));
+            assert!(is_expected(&m.role), "wrong role mapping for {role}");
+            match m.content {
+                Some(MessageContent::Text(t)) => assert_eq!(t, "ctx"),
+                other => panic!("expected text content for {role}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_blank_answer_falls_back_to_no_answer_marker() {
+        // A runner that "succeeds" with only whitespace must not deliver a
+        // blank message — the user gets the explicit no-answer marker.
+        let recording = RecordingChannel::new();
+        let channel = as_dyn(&recording);
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let inbound = inbound("/btw anything?");
+        let ctx = serde_json::json!({"chat_id": "c1"});
+
+        let runner =
+            |_q: String, _snap: Vec<Message>| async move { Ok::<_, anyhow::Error>("  \n".into()) };
+
+        let out = dispatch_btw_message(&channel, &inbound, "anything?", ctx, &health, runner)
+            .await
+            .expect("dispatch ok");
+        assert!(matches!(out, BtwOutcome::Delivered));
+        let text = recording.last_text.lock().await.clone().unwrap();
+        assert_eq!(text, "(/btw: no answer produced)");
+    }
+
+    #[tokio::test]
+    async fn run_btw_default_rejects_blank_question() {
+        // The production runner must propagate the agent's rejection of a
+        // blank question instead of fabricating an answer.
+        let err = run_btw_default(Config::default(), "   ".into(), vec![])
+            .await
+            .expect_err("blank question must be rejected");
+        assert!(
+            err.to_string().contains("empty question"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_channel_snapshot_returns_existing_session_transcript() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", tmp.path());
+
+        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .await
+            .unwrap();
+        let session_id = db
+            .resolve_channel_session("snapchan", "sender9")
+            .await
+            .unwrap();
+        // Lineage reads walk the sessions table, so the row must exist.
+        db.upsert_session(&session_id, 0, 0, 0, "m", "t").await.unwrap();
+        db.insert_message(&session_id, "user", Some("hello there"), None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_message(&session_id, "assistant", Some("hi!"), None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_message(
+            &session_id,
+            "tool",
+            Some("tool output"),
+            None,
+            Some("call_1"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = load_channel_snapshot("snapchan", "sender9").await;
+        std::env::remove_var("BORG_HOME");
+
+        assert_eq!(snapshot.len(), 2, "tool row must be dropped from the snapshot");
+        assert!(matches!(snapshot[0].role, cortex::types::Role::User));
+        assert!(matches!(snapshot[1].role, cortex::types::Role::Assistant));
+        match &snapshot[0].content {
+            Some(MessageContent::Text(t)) => assert_eq!(t, "hello there"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn message_row_to_message_drops_empty_content() {
         let row = MessageRow {
             id: 1,

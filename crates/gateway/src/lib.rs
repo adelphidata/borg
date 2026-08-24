@@ -104,3 +104,19 @@ pub type DbOpenFuture = std::pin::Pin<
 /// `Database::open_with_timeout`, the right entry point for the gateway
 /// busy-timeout profile.
 pub type DbOpener = std::sync::Arc<dyn Fn() -> DbOpenFuture + Send + Sync>;
+
+/// Test-only helpers shared across in-crate test modules.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that repoint `BORG_HOME` at a temp dir — env vars
+    /// are process-global while cargo runs tests on parallel threads.
+    static BORG_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the `BORG_HOME` serialization lock, surviving poisoning (a
+    /// panicked env test must not cascade into every later env test).
+    pub(crate) fn borg_home_guard() -> MutexGuard<'static, ()> {
+        BORG_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

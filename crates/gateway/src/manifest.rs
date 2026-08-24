@@ -293,6 +293,39 @@ description = "Discord bot"
     }
 
     #[test]
+    fn parse_rejects_each_traversal_character_independently() {
+        // Path-traversal protection must trip on ANY of '/', '\', or ".." —
+        // each alone is enough to escape the webhook route namespace, so the
+        // checks are OR'd, not AND'd.
+        for bad in ["a/b", "a\\b", "a..b"] {
+            let toml_str = format!("name = {bad:?}\ndescription = \"x\"\n");
+            let err = ChannelManifest::parse(&toml_str)
+                .expect_err(&format!("name {bad:?} must be rejected"));
+            assert!(
+                err.to_string().contains("invalid characters"),
+                "rejection for {bad:?} must name the invalid-character rule, got: {err}"
+            );
+        }
+        // A clean name still parses.
+        let ok = ChannelManifest::parse("name = \"clean-name\"\ndescription = \"x\"\n").unwrap();
+        assert_eq!(ok.name, "clean-name");
+    }
+
+    #[test]
+    fn sandbox_policy_carries_fs_write_paths() {
+        // A manifest granting write paths must see them in the policy —
+        // dropping fs_write would silently revoke the channel's declared
+        // write access.
+        let section = SandboxSection {
+            network: false,
+            fs_read: vec![],
+            fs_write: vec!["/tmp/channel-out".to_string()],
+        };
+        let policy = section.to_policy();
+        assert_eq!(policy.fs_write, vec!["/tmp/channel-out"]);
+    }
+
+    #[test]
     fn sandbox_policy_conversion() {
         let manifest: ChannelManifest = toml::from_str(FULL_TOML).unwrap();
         let policy = manifest.sandbox_policy();

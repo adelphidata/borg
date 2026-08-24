@@ -90,6 +90,14 @@ pub struct VoiceManagerHandle {
     tx: mpsc::Sender<VoiceCommand>,
 }
 
+/// Test-only constructor: wraps an arbitrary command channel so in-crate
+/// unit tests can service [`VoiceCommand`]s with a stub task instead of a
+/// live voice manager.
+#[cfg(test)]
+pub(crate) fn handle_for_tests(tx: mpsc::Sender<VoiceCommand>) -> VoiceManagerHandle {
+    VoiceManagerHandle { tx }
+}
+
 impl VoiceManagerHandle {
     pub async fn join(&self, guild_id: u64, channel_id: u64) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -286,7 +294,7 @@ async fn run_voice_manager(
         }
     });
     ws_tx
-        .send(Message::Text(identify.to_string()))
+        .send(Message::Text(identify.to_string().into()))
         .await
         .context("send IDENTIFY")?;
 
@@ -304,7 +312,7 @@ async fn run_voice_manager(
             let seq = *last_seq_hb.lock().await;
             let beat = serde_json::json!({"op": 1, "d": seq});
             if hb_tx_clone
-                .send(Message::Text(beat.to_string()))
+                .send(Message::Text(beat.to_string().into()))
                 .await
                 .is_err()
             {
@@ -359,7 +367,7 @@ where
 {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
-            Message::Text(t) => return Some(t),
+            Message::Text(t) => return Some(t.to_string()),
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => continue,
             Message::Close(_) => return None,
             Message::Frame(_) => continue,
@@ -446,7 +454,7 @@ where
                 }
             });
             ws_tx
-                .send(Message::Text(payload.to_string()))
+                .send(Message::Text(payload.to_string().into()))
                 .await
                 .map_err(|e| anyhow!("send voice state update: {e}"))?;
         }
@@ -467,7 +475,7 @@ where
                 }
             });
             ws_tx
-                .send(Message::Text(payload.to_string()))
+                .send(Message::Text(payload.to_string().into()))
                 .await
                 .map_err(|e| anyhow!("send leave voice state: {e}"))?;
             let _ = reply.send(Ok(()));

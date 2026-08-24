@@ -43,3 +43,43 @@ pub async fn start_imessage_monitor(
 pub async fn run_imessage_monitor(config: Config, shutdown: CancellationToken) -> Result<()> {
     monitor::run_monitor(config, shutdown).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The supervised entry point must surface a startup failure as `Err` —
+    /// swallowing it into `Ok(())` reads to the supervisor as a clean exit and
+    /// ends supervision at boot while iMessage is silently dead.
+    #[tokio::test]
+    async fn run_imessage_monitor_surfaces_startup_failure() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_borg_home = std::env::var_os("BORG_HOME");
+        // A home with no Library/Messages/chat.db makes startup fail
+        // deterministically without touching the real Messages database.
+        std::env::set_var("HOME", &fake_home);
+        std::env::set_var("BORG_HOME", tmp.path());
+
+        let result = run_imessage_monitor(Config::default(), CancellationToken::new()).await;
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_borg_home {
+            Some(v) => std::env::set_var("BORG_HOME", v),
+            None => std::env::remove_var("BORG_HOME"),
+        }
+
+        let err = result.expect_err("monitor startup without chat.db must be an error");
+        assert!(
+            err.to_string().contains("chat.db"),
+            "error must name the missing chat.db, got: {err}"
+        );
+    }
+}

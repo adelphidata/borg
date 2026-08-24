@@ -2331,6 +2331,928 @@ description = "Script fallback"
             "an idle gateway must not sleep even one poll interval before restarting"
         );
     }
+
+    // ── shared fixtures for handler-level tests ─────────────────────────
+
+    use crate::channel::channel_trait::{NativeChannel, WebhookContext as WCtx, WebhookOutcome};
+    use axum::response::IntoResponse as _;
+
+    /// Minimal native channel whose webhook handling always skips — enough to
+    /// exercise routing, rate limiting, and dispatch without a real backend.
+    struct StubNative(&'static str);
+
+    #[async_trait::async_trait]
+    impl NativeChannel for StubNative {
+        fn names(&self) -> Vec<&str> {
+            vec![self.0]
+        }
+        async fn handle_webhook(
+            &self,
+            _h: &HeaderMap,
+            _b: &str,
+            _c: &WCtx<'_>,
+        ) -> anyhow::Result<WebhookOutcome> {
+            Ok(WebhookOutcome::Skip)
+        }
+        async fn send_response(
+            &self,
+            _t: &str,
+            _c: &serde_json::Value,
+            _h: &Arc<RwLock<ChannelHealthRegistry>>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_metrics() -> BorgMetrics {
+        let provider = SdkMeterProvider::builder().build();
+        BorgMetrics::from_meter(&provider.meter("gateway-server-test"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_state(
+        config: Config,
+        registry: ChannelRegistry,
+        native_names: &[&'static str],
+        rate_limit: u32,
+        poke_tx: Option<mpsc::Sender<()>>,
+        slack: Option<(Arc<SlackClient>, String)>,
+    ) -> Arc<AppState> {
+        let mut native = NativeChannelRegistry::new();
+        for n in native_names {
+            native.register(Arc::new(StubNative(n)));
+        }
+        let rate_limiter = (rate_limit > 0).then(|| {
+            Arc::new(Mutex::new(SlidingWindowLimiter::new(
+                rate_limit,
+                Duration::from_secs(60),
+            )))
+        });
+        let (slack_client, slack_signing_secret) = match slack {
+            Some((c, s)) => (Some(c), Some(s)),
+            None => (None, None),
+        };
+        Arc::new(AppState {
+            config,
+            registry,
+            native_channels: native,
+            session_queue: SessionQueue::new(4),
+            request_timeout: Duration::from_secs(10),
+            health: Arc::new(RwLock::new(ChannelHealthRegistry::new())),
+            rate_limiter,
+            metrics: test_metrics(),
+            slack_client,
+            slack_signing_secret,
+            slack_bot_user_id: None,
+            poke_tx,
+            auto_reply_state: Arc::new(tokio::sync::RwLock::new(
+                crate::auto_reply::AutoReplyState::default(),
+            )),
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    fn empty_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        (
+            test_state(Config::default(), registry, &[], 0, None, None),
+            dir,
+        )
+    }
+
+    async fn response_parts(
+        resp: axum::response::Response,
+    ) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Save, clear, and restore a set of env vars on drop — keeps env-driven
+    /// assertions deterministic regardless of the host shell.
+    struct EnvVarsCleared {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarsCleared {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarsCleared {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Point `BORG_HOME` at a tempdir for the guard's lifetime.
+    struct BorgHomeTemp {
+        _dir: tempfile::TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl BorgHomeTemp {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = std::env::var_os("BORG_HOME");
+            std::env::set_var("BORG_HOME", dir.path());
+            Self { _dir: dir, saved }
+        }
+    }
+
+    impl Drop for BorgHomeTemp {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("BORG_HOME", v),
+                None => std::env::remove_var("BORG_HOME"),
+            }
+        }
+    }
+
+    // ── router construction ─────────────────────────────────────────────
+
+    /// The composed router and each merged sub-router must actually mount
+    /// their routes — an accidentally-empty router would 404 every surface
+    /// while the gateway still reports healthy startup.
+    #[tokio::test]
+    async fn router_mounts_core_and_merged_surfaces() {
+        use tower::ServiceExt;
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let config = Config::default();
+
+        let (state, _dir) = empty_state();
+        let app = build_router(state, &config, None);
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::OK, "/health must be routed");
+        assert_eq!(body["status"], "ok");
+
+        // OpenAI-compat surface: an unauthenticated /v1/models must be
+        // answered (401), not unrouted (404).
+        let resp = build_openai_compat_router(&config)
+            .oneshot(
+                axum::http::Request::get("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/v1/models must be mounted and enforce bearer auth"
+        );
+
+        // Generic webhook surface: an unknown name is answered with the
+        // anti-enumeration 404 *body*, which an unrouted 404 lacks.
+        let resp = build_generic_webhook_router(&config)
+            .oneshot(
+                axum::http::Request::post("/v1/webhook/no-such-hook")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.to_string().contains("no such webhook"),
+            "generic webhook route must answer with its own error body, got: {body}"
+        );
+
+        // MCP surface: unauthenticated POST /mcp must be answered (401).
+        let resp = build_mcp_http_router(&config)
+            .oneshot(
+                axum::http::Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/mcp must be mounted and enforce bearer auth"
+        );
+    }
+
+    // ── startup probe ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn probe_detects_live_instance_and_absent_port() {
+        // A live gateway on the port must be detected (so a double-start
+        // parks instead of crashing), and a free port must NOT be detected
+        // (or the gateway would never bind at all).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/healthz", get(|| async { "ok" }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        assert!(
+            probe_existing_instance(&addr.to_string()).await,
+            "a live /healthz responder must be detected"
+        );
+
+        let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free_addr = free.local_addr().unwrap();
+        drop(free);
+        assert!(
+            !probe_existing_instance(&free_addr.to_string()).await,
+            "an unbound port must not read as an existing instance"
+        );
+    }
+
+    // ── readiness ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn readyz_counts_channels_and_detects_each_provider_source() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let _env = EnvVarsCleared::new(&[
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ]);
+
+        // (api_key_env, env var to set, expected readiness)
+        let cases: &[(&str, Option<&'static str>, StatusCode)] = &[
+            // Default config carries a non-empty api_key_env — that alone
+            // must count as a provider source.
+            ("OPENROUTER_API_KEY", None, StatusCode::OK),
+            // Each recognized env var must independently satisfy the check.
+            ("", Some("OPENROUTER_API_KEY"), StatusCode::OK),
+            ("", Some("OPENAI_API_KEY"), StatusCode::OK),
+            ("", Some("ANTHROPIC_API_KEY"), StatusCode::OK),
+            // No provider anywhere → not ready.
+            ("", None, StatusCode::SERVICE_UNAVAILABLE),
+        ];
+
+        for (api_key_env, env_key, expected) in cases {
+            let mut config = Config::default();
+            config.llm.provider = None;
+            config.llm.api_key_env = (*api_key_env).to_string();
+            if let Some(k) = env_key {
+                std::env::set_var(k, "test-key");
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+            let state = test_state(config, registry, &["alpha", "beta"], 0, None, None);
+
+            let resp = readyz_handler(State(state)).await.into_response();
+            let (status, body) = response_parts(resp).await;
+
+            if let Some(k) = env_key {
+                std::env::remove_var(k);
+            }
+
+            assert_eq!(
+                status, *expected,
+                "api_key_env={api_key_env:?} env={env_key:?} body={body}"
+            );
+            assert_eq!(
+                body["ready"],
+                serde_json::json!(*expected == StatusCode::OK),
+                "ready flag must match the status code"
+            );
+            assert_eq!(
+                body["checks"]["channels"],
+                serde_json::json!(2),
+                "channel count must be the script+native sum"
+            );
+        }
+    }
+
+    // ── loopback gating ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_local_request_accepts_only_loopback_forms() {
+        let cases: &[(&str, bool)] = &[
+            ("127.0.0.1:1", true),
+            ("127.8.9.10:1", true),
+            ("192.168.1.100:1", false),
+            ("8.8.8.8:1", false),
+            ("[::1]:1", true),
+            ("[::ffff:127.0.0.1]:1", true),
+            ("[::ffff:8.8.8.8]:1", false),
+            ("[2001:db8::1]:1", false),
+        ];
+        for (addr, expected) in cases {
+            let addr: std::net::SocketAddr = addr.parse().unwrap();
+            assert_eq!(
+                is_local_request(&addr),
+                *expected,
+                "is_local_request({addr})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn poke_requires_loopback_and_signals_heartbeat() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let state = test_state(Config::default(), registry, &[], 0, Some(tx), None);
+
+        let resp = poke_handler(State(state.clone()), loopback_connect_info())
+            .await
+            .into_response();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::OK, "loopback poke must succeed: {body}");
+        assert!(
+            rx.try_recv().is_ok(),
+            "a successful poke must actually signal the heartbeat channel"
+        );
+
+        let resp = poke_handler(State(state), non_loopback_connect_info())
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "non-loopback poke must be refused (it triggers LLM cost)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused poke must not signal the heartbeat channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_from_loopback_cancels_immediately_when_idle() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let (state, _dir) = empty_state();
+
+        // No executor installed → zero active turns → the restart must be
+        // immediate (deferred=false) and cancel the shutdown token in-band.
+        let resp = restart_handler(State(state.clone()), loopback_connect_info())
+            .await
+            .into_response();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["deferred"],
+            serde_json::json!(false),
+            "an idle gateway must not defer its restart"
+        );
+        assert!(
+            state.shutdown.is_cancelled(),
+            "an immediate restart must cancel the shutdown token before responding"
+        );
+
+        // Non-loopback callers must never be able to restart the gateway.
+        let (other, _dir2) = empty_state();
+        let resp = restart_handler(State(other.clone()), non_loopback_connect_info())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !other.shutdown.is_cancelled(),
+            "a refused restart must leave the gateway running"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_requires_loopback() {
+        // Loopback without an installed executor → 503, not a silent OK and
+        // never FORBIDDEN.
+        let resp = cancel_handler(
+            loopback_connect_info(),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no session executor"));
+
+        let resp = cancel_handler(
+            non_loopback_connect_info(),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn away_and_available_toggle_auto_reply_for_loopback_only() {
+        let (state, _dir) = empty_state();
+
+        // Away with an explicit JSON message.
+        let resp = away_handler(
+            State(state.clone()),
+            loopback_connect_info(),
+            r#"{"message":"brb"}"#.to_string(),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_parts(resp).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["message"], "brb");
+        match &*state.auto_reply_state.read().await {
+            crate::auto_reply::AutoReplyState::Away(msg) => assert_eq!(msg, "brb"),
+            other => panic!("state must be Away after /internal/away, got {other:?}"),
+        }
+
+        // Non-loopback must not flip the state.
+        let resp = available_handler(State(state.clone()), non_loopback_connect_info())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            matches!(
+                &*state.auto_reply_state.read().await,
+                crate::auto_reply::AutoReplyState::Away(_)
+            ),
+            "a refused request must leave auto-reply untouched"
+        );
+
+        // Loopback available restores the state.
+        let resp = available_handler(State(state.clone()), loopback_connect_info())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(
+            &*state.auto_reply_state.read().await,
+            crate::auto_reply::AutoReplyState::Available
+        ));
+
+        // Non-loopback away is refused too.
+        let resp = away_handler(
+            State(state.clone()),
+            non_loopback_connect_info(),
+            String::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            &*state.auto_reply_state.read().await,
+            crate::auto_reply::AutoReplyState::Available
+        ));
+    }
+
+    // ── webhook dispatch ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn webhook_unknown_channel_is_a_404_error() {
+        let (state, _dir) = empty_state();
+        let (status, body) = webhook_handler(
+            State(state),
+            loopback_connect_info(),
+            Path("no-such-channel".to_string()),
+            HeaderMap::new(),
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "Unknown channel");
+    }
+
+    #[tokio::test]
+    async fn webhook_rate_limit_exempts_loopback_and_throttles_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        // Limit of 1/min so the second remote request must trip.
+        let state = test_state(Config::default(), registry, &["nat"], 1, None, None);
+
+        // Remote caller: first request passes, second is throttled.
+        let (status, _) = webhook_handler(
+            State(state.clone()),
+            non_loopback_connect_info(),
+            Path("nat".to_string()),
+            HeaderMap::new(),
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "first remote request must pass");
+        let (status, body) = webhook_handler(
+            State(state.clone()),
+            non_loopback_connect_info(),
+            Path("nat".to_string()),
+            HeaderMap::new(),
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "second remote request must be rate-limited: {}",
+            body.0
+        );
+
+        // Loopback caller is exempt even though the window is exhausted.
+        for _ in 0..2 {
+            let (status, body) = webhook_handler(
+                State(state.clone()),
+                loopback_connect_info(),
+                Path("nat".to_string()),
+                HeaderMap::new(),
+                "{}".to_string(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "loopback must be exempt from rate limiting: {}",
+                body.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn script_webhook_surfaces_handler_failure_as_500() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let dir = tempfile::tempdir().unwrap();
+        let chan_dir = dir.path().join("scriptchan");
+        std::fs::create_dir_all(&chan_dir).unwrap();
+        // Manifest with default scripts that do not exist on disk — the
+        // enqueued work must fail and the caller must see a 500, not the
+        // 503 reserved for a full queue.
+        std::fs::write(
+            chan_dir.join("channel.toml"),
+            "name = \"scriptchan\"\ndescription = \"t\"\n",
+        )
+        .unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let state = test_state(Config::default(), registry, &[], 0, None, None);
+
+        let (status, body) = webhook_handler(
+            State(state),
+            loopback_connect_info(),
+            Path("scriptchan".to_string()),
+            HeaderMap::new(),
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an enqueued-but-failed script webhook must be a 500: {}",
+            body.0
+        );
+        assert_eq!(body.0["error"], "Internal server error");
+    }
+
+    #[test]
+    fn webhook_ack_and_capacity_responses_have_contract_shape() {
+        // These bodies are the wire contract channel platforms retry on:
+        // 200 {"ok": true} acknowledges, 503 + error asks for a retry.
+        let (status, body) = ok_response();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0, serde_json::json!({ "ok": true }));
+
+        let (status, body) = service_unavailable_response();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("capacity"),
+            "503 body must explain the capacity condition: {}",
+            body.0
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_command_acks_ok_after_enqueue() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+
+        let secret = "test-signing-secret";
+        let body = "command=%2Fborg&text=hi&user_id=U1&channel_id=C1";
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let sig = {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(format!("v0:{ts}:{body}").as_bytes());
+            format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-slack-request-timestamp", ts.parse().unwrap());
+        headers.insert("x-slack-signature", sig.parse().unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let slack_client = Arc::new(SlackClient::new("xoxb-test-token").unwrap());
+        let state = test_state(
+            Config::default(),
+            registry,
+            &[],
+            0,
+            None,
+            Some((slack_client, secret.to_string())),
+        );
+
+        let (status, resp_body) =
+            slack_command_handler(State(state), headers, body.to_string()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a verified, enqueued slash command must be acked: {}",
+            resp_body.0
+        );
+        assert_eq!(resp_body.0, serde_json::json!({ "ok": true }));
+
+        // Let the spawned work finish against the temp BORG_HOME before the
+        // guard restores the real one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── background loops ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_marks_missing_channel_failed_and_schedules_retry_in_a_minute() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+
+        // One channel exists but its outbound script does not (delivery
+        // exhausts retries → +60s reschedule); one channel does not exist at
+        // all (immediate failure).
+        let dir = tempfile::tempdir().unwrap();
+        let chan_dir = dir.path().join("scriptchan");
+        std::fs::create_dir_all(&chan_dir).unwrap();
+        std::fs::write(
+            chan_dir.join("channel.toml"),
+            "name = \"scriptchan\"\ndescription = \"t\"\n\n[settings]\nretry_max_attempts = 1\nretry_initial_delay_ms = 1\n",
+        )
+        .unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let state = test_state(Config::default(), registry, &[], 0, None, None);
+        let health = state.health.clone();
+
+        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .await
+            .unwrap();
+        for (id, channel) in [("d-ghost", "ghost"), ("d-script", "scriptchan")] {
+            db.enqueue_delivery(&cortex::db::NewDelivery {
+                id,
+                channel_name: channel,
+                sender_id: "s1",
+                channel_id: None,
+                session_id: None,
+                payload_json: "{}",
+                max_retries: 5,
+            })
+            .await
+            .unwrap();
+        }
+
+        let before = chrono::Utc::now().timestamp();
+        drain_pending_deliveries(&state, &health).await;
+        let after = chrono::Utc::now().timestamp();
+
+        let stmt = db
+            .conn()
+            .prepare("SELECT id, error, next_retry_at FROM delivery_queue ORDER BY id ASC")
+            .await
+            .unwrap();
+        let mut rows_iter = stmt.query(()).await.unwrap();
+        let mut rows: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
+        while let Some(row) = rows_iter.next().await.unwrap() {
+            rows.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
+            ));
+        }
+        assert_eq!(rows.len(), 2, "both deliveries must be processed");
+
+        let (_, ghost_err, ghost_retry) = &rows[0];
+        assert_eq!(
+            ghost_err.as_deref(),
+            Some("channel not found"),
+            "a delivery for an unregistered channel must be marked failed"
+        );
+        assert_eq!(*ghost_retry, None);
+
+        let (_, script_err, script_retry) = &rows[1];
+        assert!(
+            script_err.is_some(),
+            "an exhausted delivery must record its error"
+        );
+        let retry_at = script_retry.expect("an exhausted delivery must be rescheduled");
+        assert!(
+            (before + 60..=after + 60).contains(&retry_at),
+            "reschedule must be one minute out (got {retry_at}, now ~{before})"
+        );
+    }
+
+    fn write_channel_manifest(base: &std::path::Path, name: &str, mode: &str) {
+        let d = base.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("channel.toml"),
+            format!(
+                "name = \"{name}\"\ndescription = \"t\"\n\n[settings]\nmode = \"{mode}\"\npoll_interval_ms = 3600000\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_poll_loops_targets_only_generic_poll_channels() {
+        // (channel name, mode, expected loop count)
+        let imessage_expected = if cfg!(target_os = "macos") {
+            0 // handled natively by the daemon on macOS
+        } else {
+            1
+        };
+        let cases: &[(&str, &str, usize)] = &[
+            ("pollchan", "poll", 1),
+            ("hookchan", "webhook", 0),
+            ("imessage", "poll", imessage_expected),
+        ];
+
+        for (name, mode, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write_channel_manifest(dir.path(), name, mode);
+            let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+            let state = test_state(Config::default(), registry, &[], 0, None, None);
+            let health = state.health.clone();
+
+            let shutdown = CancellationToken::new();
+            let server = GatewayServer::new(
+                Config::default(),
+                shutdown.clone(),
+                test_metrics(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let handles = server.spawn_poll_loops(&state, &health);
+            assert_eq!(
+                handles.len(),
+                *expected,
+                "channel {name} (mode {mode}) spawned the wrong number of poll loops"
+            );
+
+            shutdown.cancel();
+            for h in handles {
+                let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_loop_waits_one_interval_then_polls_and_records_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest: crate::manifest::ChannelManifest = toml::from_str(
+            "name = \"pollo\"\ndescription = \"t\"\n\n[settings]\nmode = \"poll\"\n",
+        )
+        .unwrap();
+        let channel = RegisteredChannel {
+            manifest,
+            dir: dir.path().to_path_buf(),
+        };
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let shutdown = CancellationToken::new();
+
+        let task = tokio::spawn(run_channel_poll_loop(
+            channel,
+            1000,
+            Config::default(),
+            shutdown.clone(),
+            health.clone(),
+            Duration::from_secs(5),
+        ));
+
+        // The first tick is one full interval out — polling immediately would
+        // hammer the channel script on every gateway (re)start.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let early: u64 = health
+            .read()
+            .await
+            .snapshot()
+            .iter()
+            .map(|c| c.error_count)
+            .sum();
+        assert_eq!(early, 0, "no poll may fire before the first interval");
+
+        // After the interval the loop must actually poll; this channel has no
+        // poll script, so the attempt surfaces as a recorded health error.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        let snapshot = health.read().await.snapshot();
+        let entry = snapshot
+            .iter()
+            .find(|c| c.name == "pollo")
+            .expect("the poll loop must have recorded an error for its channel");
+        assert!(entry.error_count >= 1);
+        assert!(
+            entry
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no poll script"),
+            "error must come from the poll attempt: {:?}",
+            entry.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_signal_sse_connects_to_the_event_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let _ = req_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let shutdown = CancellationToken::new();
+        let server = GatewayServer::new(
+            Config::default(),
+            shutdown.clone(),
+            test_metrics(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let inits = ChannelInits {
+            telegram_client: None,
+            telegram_bot_username: None,
+            telegram_secret: None,
+            telegram_dedup: Arc::new(Mutex::new(UpdateDeduplicator::new())),
+            slack_client: None,
+            slack_signing_secret: None,
+            slack_bot_user_id: None,
+            twilio_client: None,
+            twilio_auth_token: None,
+            twilio_phone_number: None,
+            twilio_whatsapp_number: None,
+            discord_client: None,
+            discord_public_key: None,
+            teams_client: None,
+            teams_app_secret: None,
+            google_chat_client: None,
+            google_chat_token: None,
+            signal_client: Some(Arc::new(
+                crate::signal::api::SignalClient::new(&format!("http://{addr}"), "+15550001111")
+                    .unwrap(),
+            )),
+            tts_synth: None,
+        };
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+
+        server.spawn_signal_sse(&inits, &health);
+
+        let request = tokio::time::timeout(Duration::from_secs(5), req_rx)
+            .await
+            .expect("a configured Signal client must open the SSE stream at spawn")
+            .unwrap();
+        assert!(
+            request.contains("GET /api/v1/events"),
+            "the SSE loop must subscribe to the daemon event stream, got: {request}"
+        );
+        shutdown.cancel();
+    }
 }
 
 /// Background task: claim pending deliveries and attempt to send them.

@@ -225,6 +225,48 @@ mod tests {
     }
 
     #[test]
+    fn error_at_exactly_512_bytes_is_kept_verbatim() {
+        // 512 is the cap itself, not past it — no truncation, no ellipsis.
+        let mut reg = ChannelHealthRegistry::new();
+        let msg = "a".repeat(512);
+        reg.record_error("test", &msg);
+
+        let snap = reg.snapshot();
+        let s = snap.iter().find(|s| s.name == "test").unwrap();
+        assert_eq!(s.last_error.as_deref(), Some(msg.as_str()));
+    }
+
+    #[test]
+    fn error_truncation_keeps_509_bytes_plus_ellipsis() {
+        // Over-cap messages must keep exactly the first 509 bytes and append
+        // "..." — total 512. Keeping less loses diagnostic detail; a broken
+        // boundary walk that runs to 0 would keep nothing but "...".
+        let mut reg = ChannelHealthRegistry::new();
+        let msg = "x".repeat(1000);
+        reg.record_error("test", &msg);
+
+        let snap = reg.snapshot();
+        let s = snap.iter().find(|s| s.name == "test").unwrap();
+        let expected = format!("{}...", "x".repeat(509));
+        assert_eq!(s.last_error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn error_truncation_backs_up_to_a_char_boundary() {
+        // 300 two-byte chars = 600 bytes. Byte 509 lands mid-char, so the cut
+        // must back up to 508 (254 whole chars); slicing at 509 would panic
+        // and stepping the wrong way would split the char.
+        let mut reg = ChannelHealthRegistry::new();
+        let msg = "é".repeat(300);
+        reg.record_error("test", &msg);
+
+        let snap = reg.snapshot();
+        let s = snap.iter().find(|s| s.name == "test").unwrap();
+        let expected = format!("{}...", "é".repeat(254));
+        assert_eq!(s.last_error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
     fn error_message_short_not_truncated() {
         let mut reg = ChannelHealthRegistry::new();
         reg.record_error("test", "short error");

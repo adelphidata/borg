@@ -172,3 +172,17 @@ pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
 /// Google Chat max message length (4096 chars).
 /// Why: Google Chat enforces a 4096-char ceiling per message body.
 pub const GOOGLE_CHAT_MESSAGE_CHUNK_SIZE: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_caps_are_25_mib() {
+        // The Bot API documents a 20 MiB getFile ceiling; our cap is that
+        // ceiling plus envelope margin — exactly 25 MiB. An arithmetic slip
+        // here silently changes how much untrusted data is buffered in memory.
+        assert_eq!(TELEGRAM_MAX_FILE_SIZE_BYTES, 26_214_400);
+        assert_eq!(ATTACHMENT_DOWNLOAD_MAX_BYTES, 26_214_400);
+    }
+}

@@ -294,6 +294,133 @@ mod tests {
         assert_eq!(photo.file_id, "abc");
     }
 
+    async fn parse_body(body: &str) -> TelegramParsed {
+        let dedup = Mutex::new(UpdateDeduplicator::new());
+        handle_telegram_webhook(&HeaderMap::new(), body, None, &dedup)
+            .await
+            .unwrap()
+            .expect("body must parse to a message")
+    }
+
+    /// A failed photo download must surface in the message text — a bare
+    /// "[Photo]" hands the agent a message that pretends the image arrived.
+    #[tokio::test]
+    async fn enrich_appends_failure_note_when_photo_download_fails() {
+        // Port 9 (discard) on loopback: nothing listens, connect is refused.
+        let client = api::TelegramClient::with_base("testtok", "http://127.0.0.1:9").unwrap();
+        let config = cortex::config::Config::default();
+        let mut parsed = parse_body(
+            r#"{
+                "update_id": 31,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "photo": [{ "file_id": "abc", "file_unique_id": "u1", "width": 100, "height": 100 }]
+                }
+            }"#,
+        )
+        .await;
+
+        enrich_parsed_message(&client, &config, &mut parsed).await;
+
+        assert_eq!(
+            parsed.inbound.text,
+            "[Photo]\n[image could not be downloaded]"
+        );
+        assert!(parsed.inbound.attachments.is_empty());
+    }
+
+    /// Voice enrichment must transcribe into the message text, and the
+    /// transcript echo must go back to the originating chat. The `!= 0`
+    /// chat-id guard only suppresses the echo when the chat id failed to
+    /// parse — never for a real chat.
+    #[tokio::test]
+    async fn enrich_transcribes_voice_and_echoes_to_originating_chat() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottesttok/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "file_id": "vf1",
+                    "file_unique_id": "u2",
+                    "file_size": 1500,
+                    "file_path": "voice/a.oga"
+                }
+            })))
+            .mount(&server)
+            .await;
+        // 1500 printable bytes: above the transcriber's min_file_size and
+        // valid UTF-8, so `cat` can serve as the transcript command.
+        let audio_bytes = vec![b'x'; 1500];
+        Mock::given(method("GET"))
+            .and(path("/file/bottesttok/voice/a.oga"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(audio_bytes))
+            .mount(&server)
+            .await;
+        // The echo: exactly one sendMessage back to the chat.
+        Mock::given(method("POST"))
+            .and(path("/bottesttok/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
+        let mut config = cortex::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.echo_transcript = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some("cat '{audio_file}'".to_string()),
+        }];
+
+        let mut parsed = parse_body(
+            r#"{
+                "update_id": 32,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 4242, "type": "private" },
+                    "date": 1700000000,
+                    "voice": { "file_id": "vf1", "file_unique_id": "u2", "duration": 3 }
+                }
+            }"#,
+        )
+        .await;
+        assert_eq!(parsed.inbound.channel_id.as_deref(), Some("4242"));
+
+        enrich_parsed_message(&client, &config, &mut parsed).await;
+
+        assert!(
+            parsed.inbound.text.starts_with(VOICE_TRANSCRIPT_PREFIX),
+            "voice text must be replaced by the transcript, got: {}",
+            &parsed.inbound.text[..parsed.inbound.text.len().min(60)]
+        );
+        assert!(
+            parsed.inbound.text.contains("xxxx"),
+            "transcript must carry the command output"
+        );
+        // MockServer verifies the sendMessage expect(1) on drop; verify
+        // explicitly so a missing echo fails here with context.
+        server.verify().await;
+    }
+
     #[tokio::test]
     async fn invalid_body_returns_error() {
         let dedup = Mutex::new(UpdateDeduplicator::new());

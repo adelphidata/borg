@@ -354,6 +354,198 @@ mod tests {
         assert_eq!(result.as_deref(), Some("config-value"));
     }
 
+    /// Builds a config whose credential store maps each `(credential key,
+    /// value)` pair through a uniquely named env var, so parallel tests
+    /// never race on the real credential names. Callers hold the
+    /// `borg_home_guard` and point `BORG_HOME` at a temp dir first, so the
+    /// on-disk credentials-file fallback for *absent* keys stays hermetic.
+    fn config_with_creds(pairs: &[(&str, &str)]) -> Config {
+        let mut config = Config::default();
+        for (key, value) in pairs {
+            let env_name = format!("BORG_TEST_CHINIT_{key}");
+            unsafe { std::env::set_var(&env_name, value) };
+            config.credentials.insert(
+                (*key).to_string(),
+                cortex::config::CredentialValue::EnvVar(env_name),
+            );
+        }
+        config
+    }
+
+    fn clear_cred_env(pairs: &[(&str, &str)]) {
+        for (key, _) in pairs {
+            unsafe { std::env::remove_var(format!("BORG_TEST_CHINIT_{key}")) };
+        }
+    }
+
+    struct BorgHomeTemp {
+        _tmp: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn hermetic_borg_home() -> BorgHomeTemp {
+        let guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
+        BorgHomeTemp {
+            _tmp: tmp,
+            _guard: guard,
+        }
+    }
+
+    impl Drop for BorgHomeTemp {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("BORG_HOME") };
+        }
+    }
+
+    /// With no bot token, no client is built — but the webhook secret must
+    /// still pass through, or webhook verification silently disarms for a
+    /// user who configured the secret before the token.
+    #[tokio::test]
+    async fn init_telegram_without_token_still_returns_webhook_secret() {
+        let _home = hermetic_borg_home();
+        let creds = [("TELEGRAM_WEBHOOK_SECRET", "tg-hook-secret-91")];
+        let config = config_with_creds(&creds);
+
+        let (client, bot_username, secret) = init_telegram(&config).await;
+        clear_cred_env(&creds);
+
+        assert!(client.is_none(), "no token must mean no client");
+        assert!(bot_username.is_none());
+        assert_eq!(secret.as_deref(), Some("tg-hook-secret-91"));
+    }
+
+    /// Same pass-through contract for Slack: the signing secret gates
+    /// webhook verification independently of whether the API client exists.
+    #[tokio::test]
+    async fn init_slack_without_token_still_returns_signing_secret() {
+        let _home = hermetic_borg_home();
+        let creds = [("SLACK_SIGNING_SECRET", "slack-sign-77")];
+        let config = config_with_creds(&creds);
+
+        let (client, signing_secret, bot_user_id) = init_slack(&config).await;
+        clear_cred_env(&creds);
+
+        assert!(client.is_none(), "no token must mean no client");
+        assert_eq!(signing_secret.as_deref(), Some("slack-sign-77"));
+        assert!(bot_user_id.is_none());
+    }
+
+    /// Discord's public key verifies interaction signatures — it must
+    /// resolve even when the bot token (and thus the client) is absent.
+    #[tokio::test]
+    async fn init_discord_without_token_still_returns_public_key() {
+        let _home = hermetic_borg_home();
+        let creds = [("DISCORD_PUBLIC_KEY", "disc-pub-abc")];
+        let config = config_with_creds(&creds);
+
+        let (client, public_key) = init_discord(&config).await;
+        clear_cred_env(&creds);
+
+        assert!(client.is_none(), "no token must mean no client");
+        assert_eq!(public_key.as_deref(), Some("disc-pub-abc"));
+    }
+
+    /// Twilio needs BOTH the account SID and the auth token to build a
+    /// client; the three metadata fields pass through regardless so webhook
+    /// verification and outbound numbers survive a partial configuration.
+    #[test]
+    fn init_twilio_requires_sid_and_token_and_passes_metadata_through() {
+        let _home = hermetic_borg_home();
+        let full = [
+            ("TWILIO_ACCOUNT_SID", "ACtestsid1234"),
+            ("TWILIO_AUTH_TOKEN", "tw-auth-3"),
+            ("TWILIO_PHONE_NUMBER", "+15550001111"),
+            ("TWILIO_WHATSAPP_NUMBER", "+15550002222"),
+        ];
+        let config = config_with_creds(&full);
+        let (client, auth, phone, whatsapp) = init_twilio(&config);
+        assert!(client.is_some(), "sid + token must build a client");
+        assert_eq!(auth.as_deref(), Some("tw-auth-3"));
+        assert_eq!(phone.as_deref(), Some("+15550001111"));
+        assert_eq!(whatsapp.as_deref(), Some("+15550002222"));
+        clear_cred_env(&full);
+
+        // Token without SID: no client, but the metadata still resolves.
+        let partial = [
+            ("TWILIO_AUTH_TOKEN", "tw-auth-3"),
+            ("TWILIO_PHONE_NUMBER", "+15550001111"),
+        ];
+        let config = config_with_creds(&partial);
+        let (client, auth, phone, _whatsapp) = init_twilio(&config);
+        clear_cred_env(&partial);
+        assert!(client.is_none(), "missing SID must not build a client");
+        assert_eq!(auth.as_deref(), Some("tw-auth-3"));
+        assert_eq!(phone.as_deref(), Some("+15550001111"));
+    }
+
+    /// Teams needs both the app ID and secret for a client; the secret is
+    /// returned either way because webhook JWT validation uses it directly.
+    #[test]
+    fn init_teams_builds_client_only_with_both_credentials() {
+        let _home = hermetic_borg_home();
+        let full = [
+            ("TEAMS_APP_ID", "teams-app-01"),
+            ("TEAMS_APP_SECRET", "teams-sec-5"),
+        ];
+        let config = config_with_creds(&full);
+        let (client, secret) = init_teams(&config).expect("init_teams must not error");
+        assert!(client.is_some(), "app id + secret must build a client");
+        assert_eq!(secret.as_deref(), Some("teams-sec-5"));
+        clear_cred_env(&full);
+
+        let partial = [("TEAMS_APP_ID", "teams-app-01")];
+        let config = config_with_creds(&partial);
+        let (client, secret) = init_teams(&config).expect("init_teams must not error");
+        clear_cred_env(&partial);
+        assert!(client.is_none(), "missing secret must not build a client");
+        assert!(secret.is_none());
+    }
+
+    /// Google Chat builds its client from the service token; the separate
+    /// webhook token passes through for inbound verification.
+    #[test]
+    fn init_google_chat_builds_client_and_returns_webhook_token() {
+        let _home = hermetic_borg_home();
+        let creds = [
+            ("GOOGLE_CHAT_SERVICE_TOKEN", "gchat-svc-1"),
+            ("GOOGLE_CHAT_WEBHOOK_TOKEN", "gchat-hook-9"),
+        ];
+        let config = config_with_creds(&creds);
+        let (client, webhook_token) =
+            init_google_chat(&config).expect("init_google_chat must not error");
+        clear_cred_env(&creds);
+        assert!(client.is_some(), "service token must build a client");
+        assert_eq!(webhook_token.as_deref(), Some("gchat-hook-9"));
+    }
+
+    /// The module-local wrapper must actually land an info-level
+    /// `"gateway"`-category activity row — it is the operator's only
+    /// visibility into which channels came up.
+    #[tokio::test]
+    async fn log_gateway_activity_wrapper_records_info_gateway_row() {
+        let _home = hermetic_borg_home();
+
+        log_gateway_activity("channel wiring probe 4711").await;
+
+        let db = cortex::db::Database::open_with_timeout(
+            cortex::db::Database::GATEWAY_BUSY_TIMEOUT_MS,
+        )
+        .await
+        .unwrap();
+        let entries = db
+            .query_activity(10, Some("info"), Some("gateway"))
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.message == "channel wiring probe 4711"),
+            "expected the wrapper to write an info/gateway activity row"
+        );
+    }
+
     /// Every credential key the gateway resolves must have a plugin-ID
     /// mapping in `Config::KEY_PLUGIN_MAP`, so the OS-keychain fallback can
     /// derive a service name. Drift here means a channel silently loses its

@@ -2190,4 +2190,199 @@ mod tests {
             args: "{}".into(),
         }));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_inactivity_timeout_disables_the_inactivity_timer() {
+        // inactivity_timeout_secs = 0 means "no inactivity timeout": a long
+        // silent stretch must NOT cancel the turn. Only the wall-clock
+        // ceiling (still far away here) may end it.
+        let config = test_config(0, 0, 0, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+
+        tx.send(AgentEvent::TextDelta("seed".to_string()))
+            .await
+            .unwrap();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            tx.send(AgentEvent::TurnComplete).await.ok();
+        });
+
+        let text = collect_agent_response("test", &config, &mut rx, &cancel, None).await;
+        producer.await.unwrap();
+        assert_eq!(text, "seed");
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn default_binding_key_is_unprefixed_and_custom_binding_prefixes() {
+        // The default binding must emit the bare `{sender}:{thread}` form —
+        // prefixing it would orphan every pre-existing session row. A custom
+        // binding must prefix its id so bindings stay isolated.
+        assert_eq!(
+            build_session_key(&inbound("alice", Some("t1")), DEFAULT_BINDING_ID),
+            "alice:t1"
+        );
+        assert_eq!(
+            build_session_key(&inbound("alice", Some("t1")), "teamb"),
+            "teamb:alice:t1"
+        );
+    }
+
+    // ── Webhook pipeline over a script-backed channel ──
+    //
+    // Hermetic: channel scripts are local bash scripts in a tempdir.
+    // (Tests that need the global SessionExecutor live in
+    // tests/pipeline_integration.rs — the OnceLock is process-wide.)
+
+    fn script_channel(dir: &std::path::Path, manifest_toml: &str) -> RegisteredChannel {
+        let manifest: crate::manifest::ChannelManifest = toml::from_str(manifest_toml).unwrap();
+        RegisteredChannel {
+            manifest,
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), format!("#!/bin/bash\n{body}\n")).unwrap();
+    }
+
+    fn inbound_with_text(sender_id: &str, text: &str) -> InboundMessage {
+        let mut msg = inbound(sender_id, None);
+        msg.text = text.to_string();
+        msg
+    }
+
+    const VERIFIED_CHANNEL_TOML: &str = r#"
+name = "verifychan"
+description = "test"
+runtime = "bash"
+
+[scripts]
+inbound = "inbound.sh"
+outbound = "outbound.sh"
+verify = "verify.sh"
+
+[auth]
+secret_env = "GW_TEST_WEBHOOK_SECRET"
+"#;
+
+    #[tokio::test]
+    async fn handle_webhook_verifies_then_honors_skip() {
+        // A passing verify script must let processing continue, and an
+        // inbound script that answers {"skip": true} must short-circuit to
+        // the literal "(skipped)" acknowledgement.
+        let dir = tempfile::tempdir().unwrap();
+        write_script(dir.path(), "verify.sh", r#"echo '{"valid": true}'"#);
+        write_script(dir.path(), "inbound.sh", r#"echo '{"skip": true}'"#);
+        write_script(dir.path(), "outbound.sh", "echo ok");
+        let channel = script_channel(dir.path(), VERIFIED_CHANNEL_TOML);
+        std::env::set_var("GW_TEST_WEBHOOK_SECRET", "s3cret");
+
+        let out = handle_webhook(
+            &channel,
+            serde_json::json!({}),
+            "{}".to_string(),
+            &Config::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "(skipped)");
+    }
+
+    #[tokio::test]
+    async fn handle_webhook_rejects_failed_verification() {
+        // A failing verify script must abort the webhook — the inbound
+        // script (which would report skip) must never make it return Ok.
+        let dir = tempfile::tempdir().unwrap();
+        write_script(dir.path(), "verify.sh", r#"echo '{"valid": false}'"#);
+        write_script(dir.path(), "inbound.sh", r#"echo '{"skip": true}'"#);
+        write_script(dir.path(), "outbound.sh", "echo ok");
+        let channel = script_channel(dir.path(), VERIFIED_CHANNEL_TOML);
+        std::env::set_var("GW_TEST_WEBHOOK_SECRET", "s3cret");
+
+        let err = handle_webhook(
+            &channel,
+            serde_json::json!({}),
+            "{}".to_string(),
+            &Config::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Webhook verification failed"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_access_control_allows_open_and_denies_disabled() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", tmp.path());
+
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        let allowed = enforce_access_control(&config, "telegram", "anyone")
+            .await
+            .unwrap();
+        assert!(allowed.is_none(), "open policy must pass senders through");
+
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        let early = enforce_access_control(&config, "telegram", "anyone")
+            .await
+            .unwrap()
+            .expect("disabled policy must short-circuit with a denial");
+        std::env::remove_var("BORG_HOME");
+        assert_eq!(early.0, "Access denied. Contact the Borg owner for access.");
+        assert_eq!(early.1, "");
+    }
+
+    #[tokio::test]
+    async fn poke_command_reports_http_status() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", tmp.path());
+
+        // (canned HTTP response, expected reply prefix)
+        let cases: &[(&str, &str)] = &[
+            (
+                "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                "Heartbeat triggered.",
+            ),
+            (
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+                "Poke failed (HTTP 500",
+            ),
+        ];
+        for (response, expect_prefix) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = response.to_string();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(response.as_bytes()).await;
+                }
+            });
+
+            let mut config = Config::default();
+            config.gateway.host = "127.0.0.1".to_string();
+            config.gateway.port = port;
+            let msg = inbound_with_text("poke-user", "/poke");
+            let res = resolve_session_and_commands("poke-chan", &msg, &config, &default_route())
+                .await
+                .unwrap();
+            let reply = res.command_response.expect("/poke is a command");
+            assert!(
+                reply.starts_with(expect_prefix),
+                "expected {expect_prefix:?}, got: {reply}"
+            );
+        }
+        std::env::remove_var("BORG_HOME");
+    }
 }

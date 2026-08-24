@@ -364,6 +364,46 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn coalesce_window_delays_batch_start_until_window_elapses() {
+        // The coalesce deadline is `now + COALESCE_WINDOW`: after the first
+        // item arrives the consumer holds it open for the window so rapid
+        // follow-ups join the same batch. A deadline in the past would run
+        // each item immediately and defeat coalescing entirely.
+        let queue = SessionQueue::new(10);
+        let ran = Arc::new(AtomicU32::new(0));
+
+        let c = ran.clone();
+        queue
+            .enqueue(
+                "chan:sender".to_string(),
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await;
+
+        // Let the consumer task pick up the item without advancing the clock.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "work must not execute before the coalesce window closes"
+        );
+
+        tokio::time::advance(COALESCE_WINDOW + Duration::from_millis(1)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "work must execute once the coalesce window elapses"
+        );
+    }
+
     #[tokio::test]
     async fn coalesces_rapid_messages() {
         let call_count = Arc::new(AtomicU32::new(0));
