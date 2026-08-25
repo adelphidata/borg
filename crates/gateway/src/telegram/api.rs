@@ -166,14 +166,13 @@ impl TelegramClient {
                 Ok(r) => r,
                 Err(e) => {
                     if is_safe_to_retry(&e) {
-                        attempts += 1;
                         let scrubbed = self.scrub(&e.to_string());
-                        if attempts > MAX_SEND_RETRIES {
+                        if retries_exhausted(&mut attempts) {
                             bail!(
                                 "sendMessage failed after {MAX_SEND_RETRIES} retries: {scrubbed}"
                             );
                         }
-                        let backoff = Duration::from_millis(500 * 2u64.pow(attempts - 1));
+                        let backoff = connect_backoff(attempts);
                         warn!("sendMessage connection error, retrying in {backoff:?} (attempt {attempts}/{MAX_SEND_RETRIES}): {scrubbed}");
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -194,13 +193,12 @@ impl TelegramClient {
             }
 
             if status.as_u16() == 429 {
-                attempts += 1;
-                if attempts > MAX_SEND_RETRIES {
+                if retries_exhausted(&mut attempts) {
                     self.circuit_breaker.record_failure_status(429);
                     bail!("sendMessage rate limited after {MAX_SEND_RETRIES} retries");
                 }
                 let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
-                if retry_secs > FLOOD_FAIL_FAST_SECS {
+                if flood_should_fail_fast(retry_secs) {
                     // A long flood wait must fail closed, not sleep: this send
                     // is awaited inline on the polling loop, so sleeping here
                     // freezes every chat on the bot for the whole wait.
@@ -470,15 +468,14 @@ impl TelegramClient {
                     // and retrying would deliver the file twice. A connect
                     // failure provably never reached the server.
                     if e.is_connect() {
-                        attempts += 1;
                         let scrubbed = self.scrub(&e.to_string());
-                        if attempts > MAX_SEND_RETRIES {
+                        if retries_exhausted(&mut attempts) {
                             // No breaker update: the circuit breaker is
                             // 401-scoped by design (auth-loop protection),
                             // not a network-outage detector.
                             bail!("{method} failed after {MAX_SEND_RETRIES} retries: {scrubbed}");
                         }
-                        let backoff = Duration::from_millis(500 * 2u64.pow(attempts - 1));
+                        let backoff = connect_backoff(attempts);
                         warn!("{method} connection error, retrying in {backoff:?} (attempt {attempts}/{MAX_SEND_RETRIES}): {scrubbed}");
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -499,13 +496,12 @@ impl TelegramClient {
             }
 
             if status.as_u16() == 429 {
-                attempts += 1;
-                if attempts > MAX_SEND_RETRIES {
+                if retries_exhausted(&mut attempts) {
                     self.circuit_breaker.record_failure_status(429);
                     bail!("{method} rate limited after {MAX_SEND_RETRIES} retries");
                 }
                 let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
-                if retry_secs > FLOOD_FAIL_FAST_SECS {
+                if flood_should_fail_fast(retry_secs) {
                     // Same fail-closed rule as the text lane: a long flood
                     // wait slept inline would pin the whole send path.
                     self.circuit_breaker.record_failure_status(429);
@@ -1008,6 +1004,26 @@ fn is_safe_to_retry(err: &reqwest::Error) -> bool {
     err.is_connect() || (err.is_timeout() && err.status().is_none())
 }
 
+/// Advance the shared send-retry counter; `true` once the
+/// `MAX_SEND_RETRIES` budget is spent and the caller must give up.
+fn retries_exhausted(attempts: &mut u32) -> bool {
+    *attempts += 1;
+    *attempts > MAX_SEND_RETRIES
+}
+
+/// Exponential backoff for connection-error retries: 500ms on the first
+/// attempt, doubling each subsequent attempt.
+fn connect_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(500 * 2u64.pow(attempt - 1))
+}
+
+/// A flood wait longer than `FLOOD_FAIL_FAST_SECS` must fail closed instead
+/// of sleeping inline on the send path; a wait of exactly the threshold is
+/// still ridden out.
+fn flood_should_fail_fast(retry_secs: u64) -> bool {
+    retry_secs > FLOOD_FAIL_FAST_SECS
+}
+
 /// Replace the bot token in error/log text with `[REDACTED]`.
 ///
 /// Two passes: exact occurrences of the stored token, plus any
@@ -1467,6 +1483,183 @@ mod tests {
                     .await
                     .expect("ok=true must succeed"),
             }
+        }
+    }
+
+    /// `get_me` must trust the API's `ok` flag, not just the presence of a
+    /// `result` payload: `ok=true` with a user succeeds, `ok=false` must fail
+    /// with the description even when a `result` object is attached.
+    #[tokio::test]
+    async fn get_me_honors_the_ok_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // ok=true → the user comes through.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bot123:ABC/getMe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 42, "first_name": "Borg", "username": "borg_bot", "is_bot": true }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let user = client.get_me().await.expect("ok=true must succeed");
+        assert_eq!(user.id, 42);
+        assert_eq!(user.username.as_deref(), Some("borg_bot"));
+
+        // ok=false with a result payload attached → still an error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bot123:ABC/getMe"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "ok": false,
+                "result": { "id": 0, "first_name": "ghost" },
+                "description": "Unauthorized"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client.get_me().await.expect_err("ok=false must fail");
+        assert!(
+            err.to_string().contains("Unauthorized"),
+            "description must surface, got: {err}"
+        );
+    }
+
+    /// Only the FIRST chunk of a long message may carry
+    /// `reply_to_message_id` — later chunks replying too would spam the
+    /// original message with N reply notifications.
+    #[tokio::test]
+    async fn only_first_chunk_replies_to_the_original_message() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let text = "a".repeat(DEFAULT_MESSAGE_CHUNK_SIZE + 1);
+        client
+            .send_message(7, &text, None, None, Some(10))
+            .await
+            .expect("chunked send must succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "expected exactly two chunks");
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first["reply_to_message_id"], 10,
+            "first chunk must reply to the original"
+        );
+        assert!(
+            second.get("reply_to_message_id").is_none(),
+            "later chunks must not reply: {second}"
+        );
+    }
+
+    /// The retry budget spends exactly `MAX_SEND_RETRIES` attempts: the
+    /// counter advances by one per call and reports exhausted only once the
+    /// budget is crossed.
+    #[test]
+    fn retry_budget_spends_exactly_max_send_retries() {
+        let mut attempts = 0u32;
+        for expected in 1..=MAX_SEND_RETRIES {
+            assert!(
+                !retries_exhausted(&mut attempts),
+                "attempt {expected} is within budget"
+            );
+            assert_eq!(attempts, expected, "counter must advance by one");
+        }
+        assert!(
+            retries_exhausted(&mut attempts),
+            "attempt {} exceeds the budget",
+            MAX_SEND_RETRIES + 1
+        );
+        assert_eq!(attempts, MAX_SEND_RETRIES + 1);
+    }
+
+    /// Connection-error backoff doubles from 500ms per attempt.
+    #[test]
+    fn connect_backoff_doubles_from_500ms() {
+        let cases = [(1, 500), (2, 1000), (3, 2000), (4, 4000), (5, 8000)];
+        for (attempt, ms) in cases {
+            assert_eq!(
+                connect_backoff(attempt),
+                Duration::from_millis(ms),
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    /// A flood wait of exactly the threshold is ridden out; one second more
+    /// fails fast.
+    #[test]
+    fn flood_fail_fast_boundary() {
+        assert!(!flood_should_fail_fast(0));
+        assert!(!flood_should_fail_fast(FLOOD_FAIL_FAST_SECS));
+        assert!(flood_should_fail_fast(FLOOD_FAIL_FAST_SECS + 1));
+    }
+
+    /// Persistent 429s must consume the full retry budget — exactly
+    /// `MAX_SEND_RETRIES + 1` requests — then fail naming the budget. Both
+    /// the text and media lanes share this contract.
+    #[tokio::test]
+    async fn rate_limit_retries_exhaust_after_budget_on_both_lanes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for lane in ["sendMessage", "sendPhoto"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{lane}")))
+                .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "description": "Too Many Requests",
+                    "parameters": { "retry_after": 0 }
+                })))
+                .expect(u64::from(MAX_SEND_RETRIES) + 1)
+                .mount(&server)
+                .await;
+
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            let err = match lane {
+                "sendMessage" => client
+                    .send_message(7, "hello", None, None, None)
+                    .await
+                    .expect_err("persistent 429 must exhaust retries"),
+                _ => client
+                    .send_photo(
+                        7,
+                        MediaSource::Bytes {
+                            bytes: b"jpeg-bytes",
+                            filename: "pic.jpg",
+                            mime: Some("image/jpeg"),
+                        },
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("persistent 429 must exhaust retries"),
+            };
+            assert!(
+                err.to_string()
+                    .contains(&format!("rate limited after {MAX_SEND_RETRIES} retries")),
+                "{lane}: error must name the budget, got: {err}"
+            );
         }
     }
 
