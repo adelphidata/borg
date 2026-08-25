@@ -285,4 +285,78 @@ mod tests {
         assert!(tunnel.stop().await.is_ok());
         assert!(tunnel.stop().await.is_ok());
     }
+
+    /// Full lifecycle with a `url_pattern`: `start()` must scrape the
+    /// https URL from the matching stdout line and return it, publish it
+    /// via `public_url()`, and `stop()` must clear the URL and the process
+    /// slot. No PATH shim needed — the operator command is arbitrary.
+    #[tokio::test]
+    async fn start_scrapes_url_matching_pattern_and_stop_clears_state() {
+        let cmd = r#"sh -c "echo 'tunnel ready at https://custom.example.com now'; exec sleep 30""#;
+        let tunnel = CustomTunnel::new(cmd.into(), None, Some("tunnel ready".into())).unwrap();
+        let url = tunnel
+            .start("127.0.0.1", 18084)
+            .await
+            .expect("pattern line must yield a URL");
+        assert_eq!(url, "https://custom.example.com");
+        assert_eq!(
+            tunnel.public_url().as_deref(),
+            Some("https://custom.example.com"),
+            "public_url must reflect the started tunnel"
+        );
+
+        tunnel.stop().await.expect("stop succeeds");
+        assert!(
+            tunnel.public_url().is_none(),
+            "stop must clear the published URL"
+        );
+        assert!(
+            !tunnel.health_check().await,
+            "stopped tunnel must report unhealthy"
+        );
+    }
+
+    /// With a `health_url` configured, `health_check()` must gate on BOTH
+    /// signals: no live child → false without probing (a 200 from a stale
+    /// endpoint must not mask a dead tunnel), live child + 200 → true.
+    #[tokio::test]
+    async fn health_check_requires_live_child_and_healthy_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let health_url = format!("{}/health", server.uri());
+
+        let tunnel = CustomTunnel::new(
+            "sh -c 'exec sleep 30'".into(),
+            Some(health_url.clone()),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !tunnel.health_check().await,
+            "no child yet: a healthy endpoint must not report the tunnel up"
+        );
+
+        let url = tunnel
+            .start("127.0.0.1", 18085)
+            .await
+            .expect("start without url_pattern succeeds");
+        assert_eq!(
+            url, health_url,
+            "without a url_pattern the health URL doubles as the status placeholder"
+        );
+        assert!(
+            tunnel.health_check().await,
+            "live child + 200 endpoint must report healthy"
+        );
+
+        tunnel.stop().await.expect("stop succeeds");
+        assert!(!tunnel.health_check().await);
+    }
 }

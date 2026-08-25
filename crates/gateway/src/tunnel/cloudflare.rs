@@ -299,4 +299,67 @@ mod tests {
     async fn health_false_before_start() {
         assert!(!CloudflareTunnel::new("tok".into()).health_check().await);
     }
+
+    /// Full lifecycle against a fake `cloudflared` on PATH: `start()` must
+    /// return the URL scraped from stderr, publish it via `public_url()`,
+    /// report healthy while the child lives, and `stop()` must clear both
+    /// the URL and the process slot. A `stop()` that silently no-ops would
+    /// leave `borg tunnel status` reporting a URL that no longer routes.
+    #[tokio::test]
+    async fn start_reports_url_health_and_stop_clears_state() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _shim = crate::tunnel::test_support::BinShim::install(
+            "cloudflared",
+            "echo 'INF | https://fake-cf.trycloudflare.com |' >&2\nexec sleep 30",
+        );
+        let tunnel = CloudflareTunnel::new("tok".into());
+        let url = tunnel
+            .start("127.0.0.1", 18080)
+            .await
+            .expect("fake cloudflared surfaces a URL");
+        assert_eq!(url, "https://fake-cf.trycloudflare.com");
+        assert_eq!(
+            tunnel.public_url().as_deref(),
+            Some("https://fake-cf.trycloudflare.com"),
+            "public_url must reflect the started tunnel"
+        );
+        assert!(
+            tunnel.health_check().await,
+            "live child must report healthy"
+        );
+
+        tunnel.stop().await.expect("stop succeeds");
+        assert!(
+            tunnel.public_url().is_none(),
+            "stop must clear the published URL"
+        );
+        assert!(
+            !tunnel.health_check().await,
+            "stopped tunnel must report unhealthy"
+        );
+    }
+
+    /// When cloudflared exits without printing a URL, `start()` must fail
+    /// with the child's stdout tail in the message — bounded at 10 lines so
+    /// a crash loop can't be dumped wholesale into the log.
+    #[tokio::test]
+    async fn start_failure_surfaces_bounded_stdout_tail() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _shim = crate::tunnel::test_support::BinShim::install(
+            "cloudflared",
+            "i=1\nwhile [ $i -le 12 ]; do echo \"tail-line-$i\"; i=$((i+1)); done\nexit 1",
+        );
+        let tunnel = CloudflareTunnel::new("tok".into());
+        let err = tunnel
+            .start("127.0.0.1", 18081)
+            .await
+            .expect_err("no URL must fail start");
+        let msg = format!("{err}");
+        assert!(msg.contains("tail-line-2"), "tail must carry detail: {msg}");
+        assert!(msg.contains("tail-line-10"), "tail keeps 10 lines: {msg}");
+        assert!(
+            !msg.contains("tail-line-11"),
+            "tail must be capped at {ERROR_TAIL_MAX_LINES} lines: {msg}"
+        );
+    }
 }

@@ -397,7 +397,9 @@ mod tests {
         /// deleteWebhook — beyond the unconditional one at startup — and the
         /// loop must then resume and deliver. Telegram phrases this error as
         /// "Conflict: …" with no literal "409", so detection must accept
-        /// either marker alone.
+        /// either marker alone. The conflict also counts as an error: the
+        /// retry must wait out MIN_BACKOFF rather than hammer getUpdates
+        /// while the old webhook consumer is still draining.
         #[tokio::test]
         async fn conflict_deletes_webhook_again_and_resumes() {
             let server = MockServer::start().await;
@@ -422,6 +424,7 @@ mod tests {
             mount_empty_updates_fallback(&server).await;
 
             let shutdown = CancellationToken::new();
+            let started = Instant::now();
             let (mut rx, handle) = spawn_polling(&server.uri(), shutdown.clone());
 
             let (text, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
@@ -429,6 +432,11 @@ mod tests {
                 .expect("polling must resume after the conflict")
                 .expect("callback channel open");
             assert_eq!(text, "resumed");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1900),
+                "retry after a 409 must wait out MIN_BACKOFF, took {:?}",
+                started.elapsed()
+            );
             shutdown.cancel();
             handle.await.unwrap();
 

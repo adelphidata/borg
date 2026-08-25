@@ -179,6 +179,51 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
     }
 }
 
+/// Test-only helper shared by the per-provider test modules: shadows a
+/// tunnel binary with a fake shell script so `start()` exercises the real
+/// spawn/parse/drain pipeline without any real tunnel process or network.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Prepends a temp dir containing a fake `binary` shell script to
+    /// `PATH`, and restores the prior `PATH` on drop. `PATH` is
+    /// process-global, so callers must hold
+    /// `crate::test_env::borg_home_guard()` for the whole test body.
+    pub(crate) struct BinShim {
+        _tmp: tempfile::TempDir,
+        prev_path: Option<std::ffi::OsString>,
+    }
+
+    impl BinShim {
+        pub(crate) fn install(binary: &str, body: &str) -> Self {
+            let tmp = tempfile::tempdir().expect("create shim dir");
+            let bin = tmp.path().join(binary);
+            std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write shim script");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim script");
+            let prev_path = std::env::var_os("PATH");
+            let mut path = tmp.path().as_os_str().to_os_string();
+            path.push(":");
+            path.push(prev_path.clone().unwrap_or_default());
+            std::env::set_var("PATH", &path);
+            Self {
+                _tmp: tmp,
+                prev_path,
+            }
+        }
+    }
+
+    impl Drop for BinShim {
+        fn drop(&mut self) {
+            match &self.prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

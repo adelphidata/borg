@@ -48,6 +48,14 @@ mod tests {
         assert!(format!("{err}").contains("none"));
     }
 
+    #[test]
+    fn name_is_the_stable_provider_identifier() {
+        // `name()` feeds supervisor logs and `borg tunnel status`; the
+        // string is the provider's stable identifier, matching the
+        // `tunnel.provider = none` config value operators set.
+        assert_eq!(NoneTunnel.name(), "none");
+    }
+
     #[tokio::test]
     async fn stop_and_health_check_match_no_op_semantics() {
         let t = NoneTunnel;
