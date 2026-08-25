@@ -43,14 +43,12 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
     };
 
     // Voice messages arrive as a `message` activity with an `audio/*`
-    // attachment and (usually) no text. Allow those through with empty text
-    // so channel.rs can transcribe; the transcript becomes the message body.
+    // attachment and (usually) no text. Treat missing text as empty and let
+    // the shared empty-text guard below decide: audio-carrying activities
+    // pass through (channel.rs fills in the transcript), everything else
+    // with no usable text is dropped.
     let has_audio_attachment = activity_has_audio(activity);
-    let raw_text = match raw_text.as_deref() {
-        Some(t) => t,
-        None if has_audio_attachment => "",
-        None => return None,
-    };
+    let raw_text = raw_text.as_deref().unwrap_or("");
 
     // Extract quoted content from HTML blockquotes in reply messages, then
     // strip the entire blockquote span from the body so the quote appears

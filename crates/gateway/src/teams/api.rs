@@ -28,11 +28,38 @@ pub struct TeamsClient {
     client: Client,
     app_id: String,
     app_secret: String,
+    /// OAuth2 token endpoint. Production uses `TOKEN_ENDPOINT`; tests point
+    /// this at a loopback stub server.
+    token_endpoint: String,
+    /// When true (always in production), service URLs must pass the
+    /// Microsoft-host SSRF allowlist. Test-only stub clients relax this so
+    /// they can target a loopback server.
+    enforce_service_allowlist: bool,
     token_cache: RwLock<Option<CachedToken>>,
 }
 
 impl TeamsClient {
     pub fn new(app_id: &str, app_secret: &str) -> Result<Self> {
+        Self::build(app_id, app_secret, TOKEN_ENDPOINT, true)
+    }
+
+    /// Build a client whose OAuth token endpoint points at a loopback stub
+    /// and whose service-URL allowlist is relaxed (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_endpoints(
+        app_id: &str,
+        app_secret: &str,
+        token_endpoint: &str,
+    ) -> Result<Self> {
+        Self::build(app_id, app_secret, token_endpoint, false)
+    }
+
+    fn build(
+        app_id: &str,
+        app_secret: &str,
+        token_endpoint: &str,
+        enforce_service_allowlist: bool,
+    ) -> Result<Self> {
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Teams",
@@ -41,8 +68,19 @@ impl TeamsClient {
             )?,
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
+            token_endpoint: token_endpoint.to_string(),
+            enforce_service_allowlist,
             token_cache: RwLock::new(None),
         })
+    }
+
+    /// SSRF gate for caller-supplied service URLs. Enforced on every public
+    /// send/edit/delete method; only test stub clients bypass it.
+    fn check_service_url(&self, url: &str) -> Result<()> {
+        if self.enforce_service_allowlist {
+            validate_service_url(url)?;
+        }
+        Ok(())
     }
 
     /// Get a valid OAuth2 access token, fetching a new one if the cache is empty or expired.
@@ -61,7 +99,7 @@ impl TeamsClient {
 
         let resp = self
             .client
-            .post(TOKEN_ENDPOINT)
+            .post(&self.token_endpoint)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", &self.app_id),
@@ -147,7 +185,7 @@ impl TeamsClient {
         activity_id: &str,
         text: &str,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
         let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
@@ -169,7 +207,7 @@ impl TeamsClient {
         conversation_id: &str,
         text: &str,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
         let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
@@ -199,7 +237,7 @@ impl TeamsClient {
         text: &str,
         mentions: &[Mention],
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
 
         let chunks = chunker::chunks_for_delivery(text, DEFAULT_MESSAGE_CHUNK_SIZE)?;
@@ -219,7 +257,7 @@ impl TeamsClient {
 
     /// Send a typing indicator to a conversation.
     pub async fn send_typing(&self, service_url: &str, conversation_id: &str) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
         let url = activities_url(&base, conversation_id, None);
         let typing = ReplyActivity::typing();
@@ -233,7 +271,7 @@ impl TeamsClient {
         conversation_id: &str,
         activity: &ReplyActivity,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
         let url = activities_url(&base, conversation_id, None);
         self.send_with_retry(&url, activity).await
@@ -247,7 +285,7 @@ impl TeamsClient {
         activity_id: &str,
         activity: &ReplyActivity,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
         let url = activities_url(&base, conversation_id, Some(activity_id));
         self.send_with_retry(&url, activity).await
@@ -261,7 +299,7 @@ impl TeamsClient {
         activity_id: &str,
         new_text: &str,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
         let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
         let body = ReplyActivity::message(new_text);
@@ -297,7 +335,7 @@ impl TeamsClient {
         conversation_id: &str,
         activity_id: &str,
     ) -> Result<()> {
-        validate_service_url(service_url)?;
+        self.check_service_url(service_url)?;
         let base = ensure_trailing_slash(service_url);
         let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
         let token = self.get_token().await?;
@@ -546,6 +584,411 @@ mod tests {
             url,
             "https://smba.trafficmanager.net/teams/v3/conversations/c1/activities/a1"
         );
+    }
+
+    /// Every public send/edit/delete method takes a caller-supplied service
+    /// URL and MUST run it through the SSRF allowlist before any network
+    /// traffic. A method that silently succeeds against a non-Microsoft host
+    /// is a data-exfiltration vector.
+    #[tokio::test]
+    async fn every_public_method_rejects_a_non_microsoft_service_url() {
+        let client = TeamsClient::new("app-1", "s3cret").unwrap();
+        let evil = "https://evil.example.com/";
+        let msg = ReplyActivity::message("hi");
+        let results: Vec<(&str, Result<()>)> = vec![
+            (
+                "reply_to_activity",
+                client.reply_to_activity(evil, "c1", "a1", "hi").await,
+            ),
+            (
+                "send_to_conversation",
+                client.send_to_conversation(evil, "c1", "hi").await,
+            ),
+            (
+                "reply_with_mentions",
+                client.reply_with_mentions(evil, "c1", "a1", "hi", &[]).await,
+            ),
+            ("send_typing", client.send_typing(evil, "c1").await),
+            ("send_activity", client.send_activity(evil, "c1", &msg).await),
+            (
+                "send_reply_activity",
+                client.send_reply_activity(evil, "c1", "a1", &msg).await,
+            ),
+            ("edit_activity", client.edit_activity(evil, "c1", "a1", "hi").await),
+            ("delete_activity", client.delete_activity(evil, "c1", "a1").await),
+        ];
+        for (name, result) in results {
+            let err = result.expect_err(name);
+            assert!(
+                err.to_string().contains("not allowed"),
+                "{name} must fail the allowlist check: {err}"
+            );
+        }
+    }
+
+    /// Loopback-stub tests: every Teams REST method must fetch a real OAuth
+    /// token, issue the right HTTP verb/path/auth/payload, and surface API
+    /// errors — a client that silently skips the request is broken.
+    mod http_stub {
+        use super::*;
+        use wiremock::matchers::{body_json, body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn client_for(server: &MockServer) -> TeamsClient {
+            TeamsClient::with_endpoints("app-1", "s3cret", &format!("{}/token", server.uri()))
+                .unwrap()
+        }
+
+        /// Mount the OAuth stub: one long-lived token so send tests fetch
+        /// exactly once and reuse the cache.
+        async fn mount_token(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok-abc", "expires_in": 3600
+                })))
+                .mount(server)
+                .await;
+        }
+
+        const BEARER: &str = "Bearer tok-abc";
+
+        #[tokio::test]
+        async fn get_token_posts_client_credentials_and_caches_the_token() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("grant_type=client_credentials"))
+                .and(body_string_contains("client_id=app-1"))
+                .and(body_string_contains("client_secret=s3cret"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok-abc", "expires_in": 3600
+                })))
+                .expect(1) // second call must come from the cache
+                .mount(&server)
+                .await;
+
+            let client = client_for(&server);
+            assert_eq!(client.get_token().await.unwrap(), "tok-abc");
+            assert_eq!(client.get_token().await.unwrap(), "tok-abc");
+        }
+
+        #[tokio::test]
+        async fn get_token_refetches_once_the_cached_token_expires() {
+            let server = MockServer::start().await;
+            // First token's lifetime equals the refresh buffer, so it is
+            // already expired the moment it is cached.
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok-1", "expires_in": TOKEN_EXPIRY_BUFFER_SECS
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "tok-2", "expires_in": 3600
+                })))
+                .mount(&server)
+                .await;
+
+            let client = client_for(&server);
+            assert_eq!(client.get_token().await.unwrap(), "tok-1");
+            assert_eq!(
+                client.get_token().await.unwrap(),
+                "tok-2",
+                "an expired cached token must be replaced, not served stale"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_token_error_status_reports_status_and_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(400).set_body_string("bad client"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server).get_token().await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Token request failed") && msg.contains("400") && msg.contains("bad client"),
+                "{msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn download_attachment_returns_the_bytes_with_bearer_auth() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/files/voice.ogg"))
+                .and(header("authorization", BEARER))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8, 0, 9, 250]))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let bytes = client_for(&server)
+                .download_attachment(&format!("{}/files/voice.ogg", server.uri()))
+                .await
+                .unwrap();
+            assert_eq!(bytes, vec![7u8, 0, 9, 250]);
+        }
+
+        #[tokio::test]
+        async fn download_attachment_http_error_is_an_error() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/files/missing.ogg"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .download_attachment(&format!("{}/files/missing.ogg", server.uri()))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("404"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn reply_to_activity_posts_every_chunk_to_the_activity_path() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities/a1"))
+                .and(header("authorization", BEARER))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let long_text = "a".repeat(8500);
+            client_for(&server)
+                .reply_to_activity(&server.uri(), "c1", "a1", &long_text)
+                .await
+                .unwrap();
+
+            let reqs = server.received_requests().await.unwrap();
+            let bodies: Vec<serde_json::Value> = reqs
+                .iter()
+                .filter(|r| r.url.path() == "/v3/conversations/c1/activities/a1")
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            assert!(bodies.len() > 1, "8500 chars must be chunked");
+            for body in &bodies {
+                assert_eq!(body["type"], "message");
+            }
+            let reassembled: String = bodies
+                .iter()
+                .map(|b| b["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(reassembled, long_text, "no chunk may be dropped");
+        }
+
+        #[tokio::test]
+        async fn send_to_conversation_posts_to_the_conversation_collection() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c9/activities"))
+                .and(header("authorization", BEARER))
+                .and(body_json(serde_json::json!({"type": "message", "text": "hello"})))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .send_to_conversation(&server.uri(), "c9", "hello")
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn reply_with_mentions_attaches_entities_only_to_the_first_chunk() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities/a1"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let long_text = format!("<at>Alice</at> {}", "b".repeat(4500));
+            let mentions = [Mention::new("29:alice", "Alice")];
+            client_for(&server)
+                .reply_with_mentions(&server.uri(), "c1", "a1", &long_text, &mentions)
+                .await
+                .unwrap();
+
+            let reqs = server.received_requests().await.unwrap();
+            let bodies: Vec<serde_json::Value> = reqs
+                .iter()
+                .filter(|r| r.url.path() == "/v3/conversations/c1/activities/a1")
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            assert!(bodies.len() > 1, "text must span multiple chunks");
+            assert_eq!(
+                bodies[0]["entities"][0]["mentioned"]["id"], "29:alice",
+                "first chunk carries the mention entities"
+            );
+            for later in &bodies[1..] {
+                assert!(
+                    later.get("entities").is_none(),
+                    "later chunks must not re-ping the user: {later}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn send_typing_posts_a_typing_activity() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities"))
+                .and(body_json(serde_json::json!({"type": "typing", "text": ""})))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            client_for(&server)
+                .send_typing(&server.uri(), "c1")
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn send_activity_and_send_reply_activity_hit_their_paths() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities"))
+                .and(body_string_contains("plain send"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities/a7"))
+                .and(body_string_contains("reply send"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client_for(&server);
+            client
+                .send_activity(&server.uri(), "c1", &ReplyActivity::message("plain send"))
+                .await
+                .unwrap();
+            client
+                .send_reply_activity(
+                    &server.uri(),
+                    "c1",
+                    "a7",
+                    &ReplyActivity::message("reply send"),
+                )
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn edit_activity_puts_the_new_text_and_surfaces_failures() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("PUT"))
+                .and(path("/v3/conversations/c1/activities/a1"))
+                .and(header("authorization", BEARER))
+                .and(body_json(serde_json::json!({"type": "message", "text": "edited"})))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/v3/conversations/c1/activities/gone"))
+                .respond_with(ResponseTemplate::new(404).set_body_string("no such activity"))
+                .mount(&server)
+                .await;
+
+            let client = client_for(&server);
+            client
+                .edit_activity(&server.uri(), "c1", "a1", "edited")
+                .await
+                .unwrap();
+
+            let err = client
+                .edit_activity(&server.uri(), "c1", "gone", "edited")
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("edit_activity failed") && msg.contains("404") && msg.contains("no such activity"),
+                "{msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn delete_activity_sends_delete_and_surfaces_failures() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("DELETE"))
+                .and(path("/v3/conversations/c1/activities/a1"))
+                .and(header("authorization", BEARER))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/v3/conversations/c1/activities/locked"))
+                .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+                .mount(&server)
+                .await;
+
+            let client = client_for(&server);
+            client
+                .delete_activity(&server.uri(), "c1", "a1")
+                .await
+                .unwrap();
+
+            let err = client
+                .delete_activity(&server.uri(), "c1", "locked")
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("delete_activity failed") && msg.contains("403"),
+                "{msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn send_error_status_is_classified_and_propagated() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v3/conversations/c1/activities/a1"))
+                .respond_with(ResponseTemplate::new(401).set_body_string("token rejected"))
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .reply_to_activity(&server.uri(), "c1", "a1", "hi")
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Teams API request failed")
+                    && msg.contains("401")
+                    && msg.contains("token rejected"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
