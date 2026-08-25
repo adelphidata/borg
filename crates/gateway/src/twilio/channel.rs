@@ -188,6 +188,134 @@ impl NativeChannel for TwilioChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The channel registry and webhook routing key on these exact names;
+    /// dropping one silently unbinds `[[gateway.bindings]]` rows for it.
+    #[test]
+    fn names_cover_twilio_whatsapp_and_sms() {
+        assert_eq!(
+            channel(None, None).names(),
+            vec!["twilio", "whatsapp", "sms"]
+        );
+    }
+
+    fn wired_channel(server_uri: &str) -> TwilioChannel {
+        TwilioChannel {
+            client: Arc::new(TwilioClient::with_base("AC-sid", "tok", server_uri).unwrap()),
+            auth_token: None,
+            phone_number: Some("+15550000000".to_string()),
+            whatsapp_number: Some("+15551111111".to_string()),
+            config: Config::default(),
+        }
+    }
+
+    /// `send_response` must actually deliver via the Messages API and record
+    /// the outbound event — a silent Ok(()) would drop replies while the
+    /// agent believes they were sent.
+    #[tokio::test]
+    async fn send_response_sms_delivers_and_records_outbound() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/Accounts/AC-sid/Messages.json"))
+            .and(body_string_contains("From=%2B15550000000"))
+            .and(body_string_contains("To=%2B15559990000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sid": "SM_ch_1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = wired_channel(&server.uri());
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+        let ctx = serde_json::json!({
+            "channel_type": "sms",
+            "sender": "+15559990000",
+            "from_number": "+15550000000",
+        });
+        channel
+            .send_response("hello", &ctx, &health)
+            .await
+            .expect("delivered response must be Ok");
+
+        let body =
+            String::from_utf8_lossy(&server.received_requests().await.unwrap()[0].body).to_string();
+        assert!(
+            !body.contains("whatsapp"),
+            "sms context must use the plain SMS path: {body}"
+        );
+        let snapshot = health.read().await.snapshot();
+        let sms = snapshot.iter().find(|s| s.name == "sms").expect("sms row");
+        assert_eq!(sms.outbound_count, 1, "outbound event must be recorded");
+        assert_eq!(sms.error_count, 0);
+    }
+
+    /// A whatsapp context must route through the WhatsApp sender, which
+    /// applies the `whatsapp:` address prefix. Inverting the branch would
+    /// send WhatsApp replies as SMS to an unprefixed number.
+    #[tokio::test]
+    async fn send_response_whatsapp_routes_through_whatsapp_sender() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/Accounts/AC-sid/Messages.json"))
+            .and(body_string_contains("From=whatsapp%3A%2B15551111111"))
+            .and(body_string_contains("To=whatsapp%3A%2B15559990000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sid": "SM_ch_2"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = wired_channel(&server.uri());
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+        let ctx = serde_json::json!({
+            "channel_type": "whatsapp",
+            "sender": "+15559990000",
+            "from_number": "+15551111111",
+        });
+        channel
+            .send_response("hello", &ctx, &health)
+            .await
+            .expect("delivered response must be Ok");
+
+        let snapshot = health.read().await.snapshot();
+        let wa = snapshot
+            .iter()
+            .find(|s| s.name == "whatsapp")
+            .expect("whatsapp row");
+        assert_eq!(wa.outbound_count, 1, "outbound event must be recorded");
+    }
+
+    /// A failed send must surface the error AND record it against the
+    /// channel's health — reporting success on failure is forbidden.
+    #[tokio::test]
+    async fn send_response_failure_is_err_and_recorded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream broke"))
+            .mount(&server)
+            .await;
+
+        let channel = wired_channel(&server.uri());
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+        let ctx = serde_json::json!({
+            "channel_type": "sms",
+            "sender": "+15559990000",
+            "from_number": "+15550000000",
+        });
+        channel
+            .send_response("hello", &ctx, &health)
+            .await
+            .expect_err("a 5xx from Twilio must not be reported as sent");
+
+        let snapshot = health.read().await.snapshot();
+        let sms = snapshot.iter().find(|s| s.name == "sms").expect("sms row");
+        assert_eq!(sms.error_count, 1, "error event must be recorded");
+        assert_eq!(sms.outbound_count, 0);
+    }
 
     #[test]
     fn response_context_roundtrip() {

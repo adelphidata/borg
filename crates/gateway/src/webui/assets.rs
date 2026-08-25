@@ -77,6 +77,58 @@ fn serve(path: &str) -> Response {
         .into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// A file missing from the embed must fall back to the "not bundled"
+    /// help page: a real HTML answer naming the fix, not an empty 200 the
+    /// browser renders as a blank screen.
+    #[tokio::test]
+    async fn serve_missing_file_answers_not_bundled_help_page() {
+        let resp = serve("__not_in_any_build__.bin");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .expect("fallback page must declare a content type"),
+            "text/html; charset=utf-8"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("just web-build"),
+            "fallback must name the fix command: {body}"
+        );
+    }
+
+    /// A missing content-hashed build artifact is a real 404 — answering
+    /// with index.html surfaces as a browser MIME error instead of the
+    /// actual problem.
+    #[tokio::test]
+    async fn missing_hashed_asset_is_404_not_spa_fallback() {
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/assets/__no_such_chunk__.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 /// Shown when borgd was built without running the web build first.
 fn not_bundled() -> Response {
     (

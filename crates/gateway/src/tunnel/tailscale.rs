@@ -253,6 +253,81 @@ mod tests {
         assert!(tunnel.stop().await.is_ok());
     }
 
+    /// Full lifecycle against a fake `tailscale` on PATH: `start()` must
+    /// discover the hostname from `status --json`, install the serve config,
+    /// publish `https://<dnsname>`, report healthy while the config is live,
+    /// and `stop()` must clear the published URL. A `stop()` that silently
+    /// no-ops leaves `borg tunnel status` showing a URL that no longer routes.
+    #[tokio::test]
+    async fn start_discovers_hostname_health_and_stop_clears_state() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _shim = crate::tunnel::test_support::BinShim::install(
+            "tailscale",
+            concat!(
+                "case \"$1\" in\n",
+                "status) printf '%s' '{\"Self\":{\"DNSName\":\"fake-host.tail-net.ts.net.\"}}' ;;\n",
+                "*) exit 0 ;;\n",
+                "esac",
+            ),
+        );
+        let tunnel = TailscaleTunnel::new(false, None);
+        let url = tunnel
+            .start("127.0.0.1", 18090)
+            .await
+            .expect("fake tailscale must yield a URL");
+        assert_eq!(
+            url, "https://fake-host.tail-net.ts.net",
+            "URL must come from the discovered Self.DNSName, dot stripped"
+        );
+        assert_eq!(
+            tunnel.public_url().as_deref(),
+            Some("https://fake-host.tail-net.ts.net"),
+            "public_url must reflect the started tunnel"
+        );
+        assert!(
+            tunnel.health_check().await,
+            "healthy while `tailscale status` succeeds and a URL is published"
+        );
+
+        tunnel.stop().await.expect("stop succeeds");
+        assert!(
+            tunnel.public_url().is_none(),
+            "stop must clear the published URL"
+        );
+        assert!(
+            !tunnel.health_check().await,
+            "stopped tunnel must report unhealthy"
+        );
+    }
+
+    /// `health_check` must report the daemon's actual state: a `tailscale
+    /// status` that exits non-zero (daemon stopped, logged out) means the
+    /// tunnel is not reachable even though a URL was published.
+    #[tokio::test]
+    async fn health_check_false_when_status_command_fails() {
+        let _guard = crate::test_env::borg_home_guard();
+        {
+            let _shim = crate::tunnel::test_support::BinShim::install(
+                "tailscale",
+                concat!(
+                    "case \"$1\" in\n",
+                    "status) printf '%s' '{\"Self\":{\"DNSName\":\"fake-host.tail-net.ts.net.\"}}' ;;\n",
+                    "*) exit 0 ;;\n",
+                    "esac",
+                ),
+            );
+            let tunnel = TailscaleTunnel::new(false, None);
+            tunnel.start("127.0.0.1", 18091).await.expect("start");
+
+            // Swap in a shim whose `status` fails, as if tailscaled stopped.
+            let _down = crate::tunnel::test_support::BinShim::install("tailscale", "exit 1");
+            assert!(
+                !tunnel.health_check().await,
+                "failing `tailscale status` must report unhealthy"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn health_check_false_when_url_unset() {
         assert!(!TailscaleTunnel::new(false, None).health_check().await);

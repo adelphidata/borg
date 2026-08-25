@@ -68,3 +68,46 @@ async fn dispatch(State(slot): State<GrpcWebSlot>, mut request: Request) -> Resp
         Err(infallible) => match infallible {},
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn req(uri: &str) -> Request {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    /// Before borgd installs its services the mount must answer 503 with a
+    /// human-readable reason — not an empty 200 the web client would try to
+    /// decode as a gRPC-Web frame.
+    #[tokio::test]
+    async fn empty_slot_answers_503_still_starting() {
+        let resp = dispatch(State(GrpcWebSlot::default()), req("/grpc/pkg.Svc/Method")).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("still starting"),
+            "503 must say the daemon is starting"
+        );
+    }
+
+    /// Once installed, requests must reach the inner router with the
+    /// `/grpc` mount prefix stripped — tonic routes on
+    /// `/<package>.<Service>/<Method>` and 404s the prefixed form.
+    #[tokio::test]
+    async fn installed_slot_receives_prefix_stripped_path() {
+        let slot = GrpcWebSlot::default();
+        slot.install(Router::new().route("/pkg.Svc/Method", any(|| async { "inner hit" })));
+
+        let resp = dispatch(State(slot.clone()), req("/grpc/pkg.Svc/Method")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "inner hit");
+
+        // The unstripped form must not resolve — proving the strip happened
+        // rather than the inner router accepting anything.
+        let resp = dispatch(State(slot), req("/pkg.Svc/Method/extra")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
