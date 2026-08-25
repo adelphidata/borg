@@ -203,6 +203,27 @@ mod tests {
             ),
             ("```rust\nfn main() {}\n```", "<pre>fn main() {}\n</pre>"),
             ("```\nhello\n```", "<pre>hello\n</pre>"),
+            // Language tags may contain underscores and must still be
+            // stripped from the rendered block.
+            ("```objective_c\nx\n```", "<pre>x\n</pre>"),
+            // A first line that is not a language tag (spaces) is content
+            // and must survive verbatim.
+            ("```not a lang\nx\n```", "<pre>not a lang\nx\n</pre>"),
+            // A fence opener is exactly three backticks AT the scan
+            // position — preceding prose must never be folded into the
+            // block, and scanning must resume right after the closer.
+            (
+                "before ```\ncode\n``` after",
+                "before <pre>code\n</pre> after",
+            ),
+            // Inline code directly followed by a fence: the single
+            // backtick must not be mistaken for a fence opener.
+            ("`a` ```\nx\n```", "<code>a</code> <pre>x\n</pre>"),
+            // Two backticks are an empty inline code span, not a fence —
+            // including hard against the end of input (the fence
+            // lookahead must not read past the buffer).
+            ("x``", "x<code></code>"),
+            ("``\n```\nx\n```", "<code></code>\n<pre>x\n</pre>"),
             (
                 "click [here](https://example.com) now",
                 r#"click <a href="https://example.com">here</a> now"#,

@@ -280,6 +280,47 @@ mod tests {
         );
     }
 
+    /// Spec: the transcode input cap is exactly 10 MiB, and the guard is
+    /// strict `>` — an at-cap payload must still be handed to ffmpeg, only
+    /// a payload past the cap is rejected. Asserted through observable
+    /// error text with hardcoded byte counts (not the constant) so cap
+    /// arithmetic drift is caught: shrinking the cap would reject the
+    /// at-cap payload; widening the comparison (`>=`) would too; inverting
+    /// it (`<`/`==`) misclassifies the small and over-cap payloads.
+    /// Hermetic either way: with ffmpeg on PATH the zero-byte payload is
+    /// rejected as invalid input, without it the spawn fails — neither
+    /// error mentions the cap.
+    #[tokio::test]
+    async fn transcode_cap_is_exactly_ten_mib_and_exclusive() {
+        // Small input: must never trip the cap error.
+        let err = transcode_to_opus(b"tiny garbage".to_vec())
+            .await
+            .expect_err("garbage input cannot transcode successfully");
+        assert!(
+            !err.to_string().contains("transcode cap"),
+            "small payload wrongly hit the size cap: {err}"
+        );
+
+        // Exactly at the cap (10 * 1024 * 1024 bytes): accepted by the size
+        // guard, so whatever error surfaces is ffmpeg/spawn-shaped.
+        let err = transcode_to_opus(vec![0u8; 10_485_760])
+            .await
+            .expect_err("zero-filled payload cannot transcode successfully");
+        assert!(
+            !err.to_string().contains("transcode cap"),
+            "at-cap payload must not be rejected by the size guard: {err}"
+        );
+
+        // One byte past the cap: rejected before ffmpeg is spawned.
+        let err = transcode_to_opus(vec![0u8; 10_485_761])
+            .await
+            .expect_err("over-cap payload must be rejected");
+        assert!(
+            err.to_string().contains("transcode cap"),
+            "over-cap payload must be rejected by the size guard, got: {err}"
+        );
+    }
+
     /// Spec: image extensions route through `sendPhoto`; anything else must
     /// go via `sendDocument` so the original bytes survive (Telegram
     /// re-encodes photos — a PDF or GIF sent as photo is rejected or
@@ -609,6 +650,106 @@ mod chunked_send_tests {
             .map(|(c, _)| c.matches('\u{1F600}').count())
             .sum();
         assert_eq!(total, 300, "emoji content lost in re-split");
+    }
+
+    /// Boundary spec: the wire cap is inclusive. A chunk whose rendering
+    /// lands at exactly 4000 UTF-16 units fits Telegram's limit and must be
+    /// sent as one message — re-splitting it would double the message count
+    /// for content that was already legal on the wire.
+    #[test]
+    fn chunk_rendering_at_exactly_the_wire_cap_is_not_resplit() {
+        // 200 ampersands render to "&amp;" (5 units each) + 3000 plain chars:
+        // exactly 200 * 5 + 3000 = 4000 rendered units from a 3200-char
+        // markdown chunk that fits the 3500-char markdown budget unsplit.
+        let text = format!("{}{}", "&".repeat(200), "a".repeat(3000));
+        let planned = plan_render_chunks(&text);
+        assert_eq!(
+            planned.len(),
+            1,
+            "an exactly-at-cap rendering must ship as a single chunk"
+        );
+        assert_eq!(
+            crate::message_processing::chunker::utf16_len(&planned[0].1),
+            4000,
+            "test premise: rendering must land exactly on the cap"
+        );
+        assert_eq!(planned[0].0, text, "chunk content must be untouched");
+    }
+
+    /// Spec: when an over-cap chunk cannot be split any further (the
+    /// re-chunker hands back a single piece), the planner must emit the
+    /// ORIGINAL chunk unchanged and let `send_message`'s splitter bound it
+    /// as a last resort. Accepting a single-piece "split" instead would
+    /// swap in the re-chunker's trimmed output and silently drop content.
+    #[test]
+    fn unsplittable_over_cap_chunk_is_emitted_verbatim() {
+        // 667 ampersands + newline + 667 trailing spaces: 1335 chars, so the
+        // first-pass chunker returns it whole (early return, untrimmed).
+        // Rendering is 667 * 5 + 1 + 667 = 4003 units — over the cap — but
+        // the halving re-chunker trims the whitespace-only tail away and
+        // hands back exactly one piece, so no real split exists.
+        let text = format!("{}\n{}", "&".repeat(667), " ".repeat(667));
+        let planned = plan_render_chunks(&text);
+        assert_eq!(planned.len(), 1, "no-progress re-split must not loop");
+        assert_eq!(
+            planned[0].0, text,
+            "unsplittable chunk must pass through verbatim, not swap in the \
+             re-chunker's lossy single piece"
+        );
+    }
+
+    /// Spec: only the FIRST chunk of a multi-chunk response replies to the
+    /// inbound message; follow-up chunks are plain sends. Inverting this
+    /// would spam the user with N reply notifications and detach the reply
+    /// arrow from the message that prompted the response.
+    #[tokio::test]
+    async fn only_first_chunk_replies_to_inbound_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .mount(&server)
+            .await;
+
+        // Enough lines to force at least two chunks.
+        let mut text = String::new();
+        for i in 0..250 {
+            text.push_str(&format!("HEADMARK filler line {i:03}\n"));
+        }
+        text.push_str("\nTAILMARK end");
+
+        let client =
+            super::super::api::TelegramClient::with_base("123:ABC", &server.uri()).expect("client");
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+
+        send_response(
+            &client,
+            7,
+            &text,
+            None,
+            Some(4242),
+            false,
+            None,
+            &health,
+            None,
+        )
+        .await
+        .expect("send must succeed");
+
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(requests.len() >= 2, "expected a multi-chunk send");
+        for r in &requests {
+            let body = String::from_utf8_lossy(&r.body);
+            let is_first_chunk = body.contains("HEADMARK filler line 000");
+            assert_eq!(
+                body.contains("\"reply_to_message_id\":4242"),
+                is_first_chunk,
+                "reply id must ride on the first chunk and only the first chunk: {body}"
+            );
+        }
     }
 
     /// Regression: recovery from a rejected chunk used to re-send the ENTIRE
