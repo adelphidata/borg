@@ -867,4 +867,25 @@ mod tests {
             );
         });
     }
+
+    /// A mention whose start index sits at or past the end of the text has
+    /// no placeholder character to replace — it must be ignored, never
+    /// appended after the message. The last in-range index must still
+    /// resolve, so the boundary is exact.
+    #[test]
+    fn mention_at_or_past_end_of_text_is_ignored_but_last_char_resolves() {
+        let mention = |start: i32| Mention {
+            start: Some(start),
+            length: Some(1),
+            uuid: Some("uuid-9".to_string()),
+            number: None,
+        };
+        // start == len: out of range, text unchanged.
+        assert_eq!(resolve_mentions("hello", &[mention(5)]), "hello");
+        // start == len - 1: last char is a valid placeholder position.
+        assert_eq!(
+            resolve_mentions("hi \u{fffc}", &[mention(3)]),
+            "hi @uuid-9"
+        );
+    }
 }

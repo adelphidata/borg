@@ -64,11 +64,18 @@ const TYPING_CB_SUSPENSION_SECS: u64 = crate::constants::SLACK_TYPING_CB_SUSPENS
 /// Max file download size for Slack attachments.
 const MAX_FILE_DOWNLOAD: usize = cortex::constants::SLACK_MAX_FILE_SIZE;
 
+/// Hostname prefix that `download_file` accepts in production. Slack file
+/// `url_private` links always live under this host.
+const SLACK_FILE_DOWNLOAD_PREFIX: &str = "https://files.slack.com/";
+
 /// A client for the Slack Web API.
 #[derive(Clone)]
 pub struct SlackClient {
     client: Client,
     token: String,
+    base_url: String,
+    /// URL prefix that `download_file` is allowed to fetch from (SSRF guard).
+    download_prefix: String,
     circuit_breaker: Arc<CircuitBreaker>,
     bot_user_id: Option<String>,
     echo_cache: Arc<Mutex<EchoCache>>,
@@ -76,6 +83,20 @@ pub struct SlackClient {
 
 impl SlackClient {
     pub fn new(token: &str) -> Result<Self> {
+        Self::with_base(token, SLACK_API_BASE)
+    }
+
+    /// Construct against a non-default API base. Production always uses
+    /// [`SLACK_API_BASE`]; tests point this at a local mock server. File
+    /// downloads stay pinned to `files.slack.com` in production; under a
+    /// custom base they are pinned to that base instead.
+    pub(crate) fn with_base(token: &str, base_url: &str) -> Result<Self> {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let download_prefix = if base_url == SLACK_API_BASE {
+            SLACK_FILE_DOWNLOAD_PREFIX.to_string()
+        } else {
+            format!("{base_url}/")
+        };
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Slack",
@@ -83,6 +104,8 @@ impl SlackClient {
                 None,
             )?,
             token: token.to_string(),
+            base_url,
+            download_prefix,
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 TYPING_CB_FAILURE_THRESHOLD,
                 TYPING_CB_SUSPENSION_SECS,
@@ -107,7 +130,7 @@ impl SlackClient {
     pub async fn auth_test(&mut self) -> Result<AuthTestResponse> {
         let resp: AuthTestResponse = self
             .client
-            .post(format!("{SLACK_API_BASE}/auth.test"))
+            .post(format!("{}/auth.test", self.base_url))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -169,7 +192,7 @@ impl SlackClient {
 
         let resp = send_with_rate_limit_retry(&policy, || async {
             self.client
-                .post(format!("{SLACK_API_BASE}/chat.postMessage"))
+                .post(format!("{}/chat.postMessage", self.base_url))
                 .bearer_auth(&self.token)
                 .json(&body)
                 .send()
@@ -242,7 +265,7 @@ impl SlackClient {
 
         let result = self
             .client
-            .post(format!("{SLACK_API_BASE}/assistant.threads.setStatus"))
+            .post(format!("{}/assistant.threads.setStatus", self.base_url))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -289,7 +312,7 @@ impl SlackClient {
 
         let result = self
             .client
-            .post(format!("{SLACK_API_BASE}/reactions.add"))
+            .post(format!("{}/reactions.add", self.base_url))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -322,7 +345,7 @@ impl SlackClient {
 
         let resp = self
             .client
-            .post(format!("{SLACK_API_BASE}/files.upload"))
+            .post(format!("{}/files.upload", self.base_url))
             .bearer_auth(&self.token)
             .multipart(form)
             .send()
@@ -357,7 +380,7 @@ impl SlackClient {
     /// Only downloads from `files.slack.com` to prevent SSRF.
     pub async fn download_file(&self, url: &str) -> Result<(Vec<u8>, String)> {
         // Validate URL domain to prevent SSRF
-        if !url.starts_with("https://files.slack.com/") {
+        if !url.starts_with(&self.download_prefix) {
             bail!("Refusing to download file from non-Slack domain");
         }
 
@@ -392,7 +415,7 @@ impl SlackClient {
     ) -> Result<Vec<HistoryMessage>> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/conversations.history"))
+            .get(format!("{}/conversations.history", self.base_url))
             .bearer_auth(&self.token)
             .query(&[("channel", channel), ("limit", &limit.to_string())])
             .send()
@@ -445,7 +468,7 @@ impl SlackClient {
 
         let result = self
             .client
-            .post(format!("{SLACK_API_BASE}/reactions.remove"))
+            .post(format!("{}/reactions.remove", self.base_url))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -496,7 +519,7 @@ impl SlackClient {
     ) -> Result<Vec<HistoryMessage>> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/conversations.replies"))
+            .get(format!("{}/conversations.replies", self.base_url))
             .bearer_auth(&self.token)
             .query(&[
                 ("channel", channel),
@@ -547,7 +570,7 @@ impl SlackClient {
     pub async fn list_reactions(&self, channel: &str, ts: &str) -> Result<Vec<ReactionInfo>> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/reactions.get"))
+            .get(format!("{}/reactions.get", self.base_url))
             .bearer_auth(&self.token)
             .query(&[("channel", channel), ("timestamp", ts), ("full", "true")])
             .send()
@@ -613,7 +636,7 @@ impl SlackClient {
     pub async fn list_pins(&self, channel: &str) -> Result<Vec<PinnedItem>> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/pins.list"))
+            .get(format!("{}/pins.list", self.base_url))
             .bearer_auth(&self.token)
             .query(&[("channel", channel)])
             .send()
@@ -649,7 +672,7 @@ impl SlackClient {
     pub async fn get_user_info(&self, user_id: &str) -> Result<UserInfo> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/users.info"))
+            .get(format!("{}/users.info", self.base_url))
             .bearer_auth(&self.token)
             .query(&[("user", user_id)])
             .send()
@@ -686,7 +709,7 @@ impl SlackClient {
     pub async fn list_channels(&self, limit: u32) -> Result<Vec<SlackChannelInfo>> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/conversations.list"))
+            .get(format!("{}/conversations.list", self.base_url))
             .bearer_auth(&self.token)
             .query(&[
                 ("limit", &limit.to_string()),
@@ -725,7 +748,7 @@ impl SlackClient {
     pub async fn get_channel_info(&self, channel: &str) -> Result<SlackChannelInfo> {
         let resp = self
             .client
-            .get(format!("{SLACK_API_BASE}/conversations.info"))
+            .get(format!("{}/conversations.info", self.base_url))
             .bearer_auth(&self.token)
             .query(&[("channel", channel)])
             .send()
@@ -832,7 +855,7 @@ impl SlackClient {
         method: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
-        let url = format!("{SLACK_API_BASE}/{method}");
+        let url = format!("{}/{method}", self.base_url);
         let policy = RateLimitPolicy::for_service("Slack");
         let client = &self.client;
         let token = &self.token;
@@ -996,6 +1019,11 @@ mod tests {
             ("channel_not_found", "channel"),
             ("missing_scope", "scope"),
             ("is_archived", "archived"),
+            // Token-lifecycle codes all point the operator at re-issuing
+            // the revoked/expired token.
+            ("account_inactive", "revoked"),
+            ("token_revoked", "revoked"),
+            ("token_expired", "revoked"),
         ];
         for (code, keyword) in cases {
             let hint = slack_error_hint(code);
@@ -1153,5 +1181,568 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text, "parent msg");
         assert_eq!(messages[1].user, "U2");
+    }
+
+    /// Wiremock-backed tests: every call must hit the right path with the
+    /// bot token as a Bearer header, ship the documented payload shape,
+    /// parse the documented response shape, and surface `ok:false` errors.
+    mod http {
+        use super::*;
+        use wiremock::matchers::{body_json, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "xoxb-test-token";
+
+        fn client(server: &MockServer) -> SlackClient {
+            SlackClient::with_base(TOKEN, &server.uri()).unwrap()
+        }
+
+        fn ok_body(extra: serde_json::Value) -> serde_json::Value {
+            let mut body = serde_json::json!({ "ok": true });
+            if let (Some(obj), Some(add)) = (body.as_object_mut(), extra.as_object()) {
+                for (k, v) in add {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            body
+        }
+
+        /// `auth_test` must treat `ok:true` as success and persist the
+        /// returned `user_id` so echo detection can compare against it.
+        #[tokio::test]
+        async fn auth_test_success_stores_bot_user_id() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/auth.test"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "user_id": "UBOT42", "user": "borg", "team": "acme" }),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut client = client(&server);
+            let resp = client.auth_test().await.expect("ok:true must succeed");
+            assert_eq!(resp.user.as_deref(), Some("borg"));
+            assert_eq!(
+                client.bot_user_id(),
+                Some("UBOT42"),
+                "auth_test must store the exact user_id from the response"
+            );
+        }
+
+        /// `ok:false` from auth.test must fail with the error code and the
+        /// operator hint — Slack keeps HTTP 200 for API-level failures.
+        #[tokio::test]
+        async fn auth_test_failure_surfaces_error_code_and_hint() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/auth.test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "invalid_auth" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let mut client = client(&server);
+            let err = client.auth_test().await.expect_err("ok:false must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("invalid_auth"), "got: {msg}");
+            assert!(msg.contains("SLACK_BOT_TOKEN"), "got: {msg}");
+            assert!(
+                client.bot_user_id().is_none(),
+                "a failed auth_test must not invent a bot user id"
+            );
+        }
+
+        /// The accessor must hand back the one shared cache: a write made
+        /// through it must be visible on the next call. (Echo filtering
+        /// reads through this accessor while sends write the same cache.)
+        #[tokio::test]
+        async fn echo_cache_accessor_returns_the_shared_cache() {
+            let server = MockServer::start().await;
+            let client = client(&server);
+            client.echo_cache().lock().await.remember("outbound text");
+            assert!(
+                client.echo_cache().lock().await.is_echo("outbound text"),
+                "echo_cache() must return the same cache on every call"
+            );
+        }
+
+        /// A successful post must send the documented chat.postMessage body
+        /// once and record the text for echo detection.
+        #[tokio::test]
+        async fn post_message_sends_payload_and_records_echo() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(body_json(serde_json::json!({
+                    "channel": "C123",
+                    "text": "hello world",
+                    "thread_ts": "111.222",
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            client
+                .post_message("C123", "hello world", Some("111.222"))
+                .await
+                .expect("ok:true must succeed");
+            assert!(
+                client.echo_cache().lock().await.is_echo("hello world"),
+                "sent text must land in the echo cache"
+            );
+        }
+
+        /// An `ok:false` reply must surface the error code (with hint), and
+        /// the text must NOT be recorded as an echo — the message never
+        /// reached the channel.
+        #[tokio::test]
+        async fn post_message_surfaces_api_error_without_recording_echo() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "is_archived" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .post_message("C123", "doomed", None)
+                .await
+                .expect_err("ok:false must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("is_archived"), "got: {msg}");
+            assert!(msg.contains("archived"), "hint must be attached: {msg}");
+            assert!(
+                !client.echo_cache().lock().await.is_echo("doomed"),
+                "failed sends must not be remembered as echoes"
+            );
+        }
+
+        /// With a thread_ts the status call must POST the documented
+        /// payload exactly once; without one it must not touch the network
+        /// (Slack's API requires a thread).
+        #[tokio::test]
+        async fn set_thread_status_posts_payload_only_when_threaded() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/assistant.threads.setStatus"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(body_json(serde_json::json!({
+                    "channel_id": "C9",
+                    "thread_ts": "42.007",
+                    "status": "is thinking...",
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            client
+                .set_thread_status("C9", None, "is thinking...")
+                .await
+                .expect("no-thread call is a no-op");
+            client
+                .set_thread_status("C9", Some("42.007"), "is thinking...")
+                .await
+                .expect("threaded call must succeed");
+        }
+
+        /// Reaction add/remove are fire-and-forget, but they must actually
+        /// fire: one POST each to the right method with the emoji payload.
+        #[tokio::test]
+        async fn add_and_remove_reaction_post_the_emoji_payload() {
+            let server = MockServer::start().await;
+            let expected = serde_json::json!({
+                "channel": "C1",
+                "timestamp": "1.2",
+                "name": "eyes",
+            });
+            for api in ["/reactions.add", "/reactions.remove"] {
+                Mock::given(method("POST"))
+                    .and(path(api))
+                    .and(header("authorization", format!("Bearer {TOKEN}")))
+                    .and(body_json(expected.clone()))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let client = client(&server);
+            client.add_reaction("C1", "1.2", "eyes").await;
+            client.remove_reaction("C1", "1.2", "eyes").await;
+        }
+
+        /// files.upload success returns Ok; `ok:false` must surface the
+        /// error code instead of pretending the file went out.
+        #[tokio::test]
+        async fn upload_file_reports_success_and_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/files.upload"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/files.upload"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "invalid_auth" }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            client
+                .upload_file("C1", b"file-bytes", "notes.txt", Some("text"))
+                .await
+                .expect("ok:true upload must succeed");
+            let err = client
+                .upload_file("C1", b"file-bytes", "notes.txt", None)
+                .await
+                .expect_err("ok:false upload must fail");
+            assert!(err.to_string().contains("invalid_auth"), "got: {err}");
+        }
+
+        /// A successful download must return the exact response bytes and
+        /// the server's content-type, authenticated with the bot token.
+        #[tokio::test]
+        async fn download_file_returns_body_bytes_and_content_type() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/files-pri/T1-F1/photo.png"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"PNG-PAYLOAD".to_vec())
+                        .insert_header("content-type", "image/png"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let url = format!("{}/files-pri/T1-F1/photo.png", server.uri());
+            let (bytes, content_type) = client
+                .download_file(&url)
+                .await
+                .expect("allowed-domain download must succeed");
+            assert_eq!(bytes, b"PNG-PAYLOAD");
+            assert_eq!(content_type, "image/png");
+        }
+
+        /// The SSRF guard must refuse URLs outside the pinned file host
+        /// before any request is made.
+        #[tokio::test]
+        async fn download_file_refuses_foreign_domain() {
+            let server = MockServer::start().await;
+            let client = client(&server);
+            let err = client
+                .download_file("https://127.0.0.1:9/etc/passwd")
+                .await
+                .expect_err("foreign domain must be refused");
+            assert!(
+                err.to_string().contains("non-Slack domain"),
+                "must fail at the guard, not the request: {err}"
+            );
+        }
+
+        /// conversations.history must pass channel+limit as query params
+        /// and map the messages array into HistoryMessage rows.
+        #[tokio::test]
+        async fn conversations_history_sends_query_and_parses_messages() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.history"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("channel", "C7"))
+                .and(query_param("limit", "25"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "messages": [
+                        { "user": "U1", "text": "first", "ts": "1.1" },
+                        { "user": "U2", "text": "second", "ts": "2.2" },
+                        { "subtype": "bot_message", "text": "no user field" },
+                    ]}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let messages = client.conversations_history("C7", 25).await.unwrap();
+            assert_eq!(messages.len(), 2, "rows without user/ts are skipped");
+            assert_eq!(messages[0].user, "U1");
+            assert_eq!(messages[0].text, "first");
+            assert_eq!(messages[1].ts, "2.2");
+        }
+
+        #[tokio::test]
+        async fn conversations_history_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.history"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "channel_not_found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .conversations_history("C7", 10)
+                .await
+                .expect_err("ok:false must fail, never an empty history");
+            assert!(err.to_string().contains("channel_not_found"), "got: {err}");
+        }
+
+        /// conversations.replies must pass channel+ts+limit and parse the
+        /// thread messages.
+        #[tokio::test]
+        async fn fetch_thread_replies_sends_query_and_parses_messages() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.replies"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("channel", "C7"))
+                .and(query_param("ts", "9.9"))
+                .and(query_param("limit", "50"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "messages": [
+                        { "user": "U1", "text": "parent", "ts": "9.9" },
+                        { "user": "U2", "text": "reply", "ts": "10.1" },
+                    ]}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let messages = client.fetch_thread_replies("C7", "9.9", 50).await.unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[1].text, "reply");
+            assert_eq!(messages[1].user, "U2");
+        }
+
+        #[tokio::test]
+        async fn fetch_thread_replies_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.replies"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "thread_not_found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .fetch_thread_replies("C7", "9.9", 50)
+                .await
+                .expect_err("ok:false must fail, never an empty thread");
+            assert!(err.to_string().contains("thread_not_found"), "got: {err}");
+        }
+
+        /// reactions.get must request the full reaction list for the target
+        /// message and parse `/message/reactions`.
+        #[tokio::test]
+        async fn list_reactions_sends_query_and_parses_reactions() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/reactions.get"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("channel", "C7"))
+                .and(query_param("timestamp", "3.3"))
+                .and(query_param("full", "true"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "message": { "reactions": [
+                        { "name": "eyes", "count": 2, "users": ["U1", "U2"] },
+                    ]}}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let reactions = client.list_reactions("C7", "3.3").await.unwrap();
+            assert_eq!(reactions.len(), 1);
+            assert_eq!(reactions[0].name, "eyes");
+            assert_eq!(reactions[0].count, 2);
+        }
+
+        #[tokio::test]
+        async fn list_reactions_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/reactions.get"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "message_not_found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .list_reactions("C7", "3.3")
+                .await
+                .expect_err("ok:false must fail, never an empty list");
+            assert!(err.to_string().contains("message_not_found"), "got: {err}");
+        }
+
+        /// edit/delete/pin/unpin all go through the shared JSON POST +
+        /// ok-check path; each must send its payload and surface `ok:false`
+        /// with the method name. Table-driven over the four methods.
+        #[tokio::test]
+        async fn mutating_calls_send_payload_and_surface_api_errors() {
+            type Call = fn(
+                SlackClient,
+            )
+                -> futures::future::BoxFuture<'static, Result<()>>;
+            let cases: Vec<(&str, serde_json::Value, Call)> = vec![
+                (
+                    "chat.update",
+                    serde_json::json!({ "channel": "C1", "ts": "5.5", "text": "edited" }),
+                    |c| Box::pin(async move { c.edit_message("C1", "5.5", "edited").await }),
+                ),
+                (
+                    "chat.delete",
+                    serde_json::json!({ "channel": "C1", "ts": "5.5" }),
+                    |c| Box::pin(async move { c.delete_message("C1", "5.5").await }),
+                ),
+                (
+                    "pins.add",
+                    serde_json::json!({ "channel": "C1", "timestamp": "5.5" }),
+                    |c| Box::pin(async move { c.pin_message("C1", "5.5").await }),
+                ),
+                (
+                    "pins.remove",
+                    serde_json::json!({ "channel": "C1", "timestamp": "5.5" }),
+                    |c| Box::pin(async move { c.unpin_message("C1", "5.5").await }),
+                ),
+            ];
+
+            for (api, expected_body, call) in cases {
+                // Success round: the payload must reach the endpoint.
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/{api}")))
+                    .and(header("authorization", format!("Bearer {TOKEN}")))
+                    .and(body_json(expected_body.clone()))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                call(client(&server))
+                    .await
+                    .unwrap_or_else(|e| panic!("{api} ok:true must succeed: {e}"));
+
+                // Error round: ok:false must fail and name the method.
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/{api}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "ok": false, "error": "some_error" }),
+                    ))
+                    .mount(&server)
+                    .await;
+                let err = call(client(&server))
+                    .await
+                    .expect_err("ok:false must fail");
+                let msg = err.to_string();
+                assert!(msg.contains(api), "error must name {api}: {msg}");
+                assert!(msg.contains("some_error"), "got: {msg}");
+            }
+        }
+
+        /// pins.list must query the channel and parse the items array.
+        #[tokio::test]
+        async fn list_pins_sends_query_and_parses_items() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/pins.list"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("channel", "C7"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "items": [
+                        { "message": { "text": "pinned!", "user": "U1", "ts": "7.7" } },
+                    ]}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let items = client.list_pins("C7").await.unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0].message.as_ref().unwrap().text.as_deref(),
+                Some("pinned!")
+            );
+        }
+
+        #[tokio::test]
+        async fn list_pins_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/pins.list"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "channel_not_found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .list_pins("C7")
+                .await
+                .expect_err("ok:false must fail, never an empty pin list");
+            assert!(err.to_string().contains("channel_not_found"), "got: {err}");
+        }
+
+        /// users.info on `ok:true` must parse the user object — the ok-check
+        /// must not treat success as failure.
+        #[tokio::test]
+        async fn get_user_info_parses_user_on_success() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/users.info"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("user", "U55"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "user": {
+                        "id": "U55", "name": "alice", "is_bot": false,
+                    }}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let user = client.get_user_info("U55").await.unwrap();
+            assert_eq!(user.id, "U55");
+            assert_eq!(user.name, "alice");
+        }
     }
 }

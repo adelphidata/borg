@@ -138,7 +138,7 @@ pub async fn run_sse_loop(
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             // Guard against unbounded buffer growth
-            if buffer.len() > MAX_BUFFER_SIZE {
+            if buffer_over_cap(buffer.len()) {
                 warn!(
                     "Signal SSE buffer exceeded {} bytes, dropping and reconnecting",
                     MAX_BUFFER_SIZE
@@ -251,6 +251,14 @@ fn parse_sse_event(
     let recipient = inbound.sender_id.clone();
 
     Some((inbound, recipient, group_id, raw_attachments))
+}
+
+/// True when the accumulated SSE buffer must be dropped and the stream
+/// reconnected. No legitimate event payload approaches [`MAX_BUFFER_SIZE`],
+/// so an over-cap buffer means a runaway or malicious stream; anything at
+/// or under the cap keeps parsing.
+fn buffer_over_cap(buffer_len: usize) -> bool {
+    buffer_len > MAX_BUFFER_SIZE
 }
 
 /// Minimal percent-encoding for query string values.
@@ -396,5 +404,218 @@ mod tests {
             }
         }"#;
         assert!(parse_sse_event(data, "+15559876543").is_none());
+    }
+
+    /// The 1 MB cap exists to bound memory on a runaway stream while
+    /// leaving generous room for legitimate envelopes: a buffer in the
+    /// tens-of-KB range (large group metadata, many attachment refs) must
+    /// keep parsing, and the cap is inclusive — dropping the stream at or
+    /// under it would lose a valid in-flight event.
+    #[test]
+    fn buffer_cap_allows_large_events_up_to_and_including_the_cap() {
+        assert!(
+            !buffer_over_cap(64 * 1024),
+            "a 64 KB event buffer is legitimate and must not force a reconnect"
+        );
+        assert!(!buffer_over_cap(MAX_BUFFER_SIZE), "the cap is inclusive");
+        assert!(buffer_over_cap(MAX_BUFFER_SIZE + 1));
+    }
+
+    /// Loop-level reconnect discipline, exercised against a raw loopback
+    /// TCP stub:
+    /// - the FIRST connection must open immediately (no backoff before
+    ///   any error has happened);
+    /// - after a buffer-overflow drop, the reconnect must be throttled by
+    ///   at least the minimum backoff (a hot reconnect loop would hammer
+    ///   the daemon), but must actually happen.
+    #[tokio::test]
+    async fn sse_overflow_reconnects_after_backoff_never_immediately() {
+        use std::time::Instant;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<Instant>();
+
+        tokio::spawn(async move {
+            // Connection 1: headers, then an over-cap body with no newline
+            // so nothing can be drained — the loop must drop the stream.
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            let _ = evt_tx.send(Instant::now());
+            let _ = sock1
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                .await;
+            let junk = vec![b'x'; MAX_BUFFER_SIZE + 64 * 1024];
+            let _ = sock1.write_all(&junk).await;
+            let _ = sock1.flush().await;
+            let _ = evt_tx.send(Instant::now());
+
+            // Connection 2: the reconnect after backoff.
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            let _ = evt_tx.send(Instant::now());
+            let _ = sock2
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                .await;
+            // Hold both sockets open until the test tears down.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock1);
+        });
+
+        let client =
+            Arc::new(SignalClient::new(&format!("http://{addr}"), "+15550001111").unwrap());
+        let callback: SseCallback = Arc::new(|_msg, _recipient, _group| Box::pin(async {}));
+        let shutdown = CancellationToken::new();
+        let spawned_at = Instant::now();
+        let loop_task = tokio::spawn(run_sse_loop(
+            client,
+            callback,
+            shutdown.clone(),
+            Config::default(),
+        ));
+
+        async fn recv(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Instant>) -> Option<Instant> {
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+        let conn1_at = recv(&mut evt_rx).await.unwrap();
+        assert!(
+            conn1_at.duration_since(spawned_at) < Duration::from_millis(700),
+            "the first connection must not wait for a backoff, took {:?}",
+            conn1_at.duration_since(spawned_at)
+        );
+
+        let junk_written_at = recv(&mut evt_rx).await.unwrap();
+        let conn2_at = recv(&mut evt_rx)
+            .await
+            .expect("the loop must reconnect after a buffer overflow");
+        let gap = conn2_at.duration_since(junk_written_at);
+        assert!(
+            gap >= Duration::from_millis(700),
+            "reconnect after an error must be throttled by backoff, got {gap:?}"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+    }
+
+    /// Full inbound pipeline against a loopback signal-cli stub: an event
+    /// carrying an audio attachment must have its bytes downloaded into
+    /// `inbound.attachments`, and — with STT configured — the audio must
+    /// be transcribed and appended to the message text. Uses the hermetic
+    /// command-template STT provider (no network, no keys).
+    #[tokio::test]
+    async fn sse_audio_attachment_is_downloaded_and_transcribed() {
+        use axum::routing::get;
+        use base64::Engine as _;
+
+        let audio_bytes = vec![7u8; 2048];
+
+        let events = || async {
+            let envelope = serde_json::json!({
+                "envelope": {
+                    "source": "+15557778888",
+                    "timestamp": 1_723_000_000_000_i64,
+                    "dataMessage": {
+                        "timestamp": 1_723_000_000_000_i64,
+                        "message": "voice note",
+                        "attachments": [{
+                            "id": "att-1",
+                            "contentType": "audio/ogg",
+                            "filename": "note.ogg"
+                        }]
+                    }
+                }
+            });
+            let frame = format!("data: {envelope}\n\n");
+            let stream = futures::stream::once(async move {
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(frame))
+            })
+            .chain(futures::stream::pending());
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(stream),
+            )
+        };
+        let served_audio = audio_bytes.clone();
+        let app = axum::Router::new()
+            .route("/api/v1/events", get(events))
+            .route(
+                "/api/v1/attachments/att-1",
+                get(move || {
+                    let bytes = served_audio.clone();
+                    async move { bytes }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = Config::default();
+        config.audio.enabled = true;
+        config.audio.min_file_size = 1;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".into(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(10_000),
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some(": {audio_file} && printf 'stub transcript'".into()),
+        }];
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let callback: SseCallback = Arc::new(move |msg, _recipient, _group| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(msg);
+            })
+        });
+
+        let client =
+            Arc::new(SignalClient::new(&format!("http://{addr}"), "+15550001111").unwrap());
+        let shutdown = CancellationToken::new();
+        let loop_task = tokio::spawn(run_sse_loop(
+            client,
+            callback,
+            shutdown.clone(),
+            config,
+        ));
+
+        let inbound = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the SSE event must reach the callback")
+            .unwrap();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+
+        assert_eq!(
+            inbound.attachments.len(),
+            1,
+            "the attachment ref must be downloaded into the inbound message"
+        );
+        assert_eq!(inbound.attachments[0].mime_type, "audio/ogg");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&inbound.attachments[0].data)
+                .unwrap(),
+            audio_bytes,
+            "attachment data must be the daemon's bytes, base64-encoded"
+        );
+        assert!(
+            inbound.text.contains("voice note"),
+            "original text must survive: {}",
+            inbound.text
+        );
+        assert!(
+            inbound.text.contains("stub transcript"),
+            "the audio attachment must be transcribed into the text: {}",
+            inbound.text
+        );
     }
 }
