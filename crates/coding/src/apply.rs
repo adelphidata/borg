@@ -3323,9 +3323,8 @@ EOF";
     /// Guard boundaries of the whitespace near-miss scan.
     #[test]
     fn whitespace_near_miss_guard_boundaries() {
-        let to_lines = |strs: &[&str]| -> Vec<String> {
-            strs.iter().map(ToString::to_string).collect()
-        };
+        let to_lines =
+            |strs: &[&str]| -> Vec<String> { strs.iter().map(ToString::to_string).collect() };
         // A pattern spanning the whole file is still a valid candidate window.
         let lines = to_lines(&["fn a() {", "\tx = 1;", "}"]);
         let pattern = to_lines(&["fn a() {", "    x = 1;", "}"]);

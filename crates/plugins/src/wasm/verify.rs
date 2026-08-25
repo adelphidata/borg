@@ -508,7 +508,11 @@ mod tests {
     fn is_hex_64_requires_exact_length_and_lowercase_hex() {
         let cases: &[(String, bool, &str)] = &[
             ("a".repeat(64), true, "64 lowercase hex digits"),
-            ("0123456789abcdef".repeat(4), true, "full lowercase alphabet"),
+            (
+                "0123456789abcdef".repeat(4),
+                true,
+                "full lowercase alphabet",
+            ),
             ("a".repeat(63), false, "one short of 64"),
             ("a".repeat(65), false, "one over 64"),
             ("A".repeat(64), false, "uppercase hex digits"),

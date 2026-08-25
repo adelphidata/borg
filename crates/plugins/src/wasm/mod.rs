@@ -462,7 +462,10 @@ mod tests {
         let parsed: ResourceLimits = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.timeout_ms, 5_000, "default wall-clock budget is 5s");
         assert_eq!(parsed.fuel, 10_000_000, "default fuel budget is 10M");
-        assert_eq!(parsed.max_memory_pages, 16, "default heap is 16 pages (1 MiB)");
+        assert_eq!(
+            parsed.max_memory_pages, 16,
+            "default heap is 16 pages (1 MiB)"
+        );
         assert_eq!(
             parsed.max_output_bytes, 65_536,
             "default output cap is 64 KiB"

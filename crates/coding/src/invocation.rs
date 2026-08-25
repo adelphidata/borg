@@ -269,8 +269,8 @@ mod tests {
         // A space after the opening tag must not become part of the tag —
         // the closing line is bare `EOF` and must still match.
         let cmd = format!("apply_patch <<EOF \n{PATCH_BODY}\nEOF");
-        let body = maybe_extract_apply_patch_from_shell(&cmd)
-            .expect("whitespace ends a bare heredoc tag");
+        let body =
+            maybe_extract_apply_patch_from_shell(&cmd).expect("whitespace ends a bare heredoc tag");
         assert_eq!(body, PATCH_BODY);
     }
 

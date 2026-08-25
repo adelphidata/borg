@@ -380,7 +380,7 @@ mod tests {
 
     struct BorgHomeTemp {
         _tmp: tempfile::TempDir,
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _guard: crate::test_env::BorgHomeGuard,
     }
 
     fn hermetic_borg_home() -> BorgHomeTemp {
@@ -529,11 +529,10 @@ mod tests {
 
         log_gateway_activity("channel wiring probe 4711").await;
 
-        let db = cortex::db::Database::open_with_timeout(
-            cortex::db::Database::GATEWAY_BUSY_TIMEOUT_MS,
-        )
-        .await
-        .unwrap();
+        let db =
+            cortex::db::Database::open_with_timeout(cortex::db::Database::GATEWAY_BUSY_TIMEOUT_MS)
+                .await
+                .unwrap();
         let entries = db
             .query_activity(10, Some("info"), Some("gateway"))
             .await

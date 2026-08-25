@@ -358,9 +358,7 @@ mod tests {
     /// Spawn a one-shot mock signal-cli daemon on a loopback socket. It
     /// answers the first request with `resp_body` and resolves its join
     /// handle to the raw request body it received.
-    async fn spawn_rpc_mock(
-        resp_body: &'static str,
-    ) -> (String, tokio::task::JoinHandle<String>) {
+    async fn spawn_rpc_mock(resp_body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -382,10 +380,7 @@ mod tests {
     /// Await the mock daemon's recorded request body and parse it as JSON.
     /// Fails fast if `what` never issued an RPC at all — the guard that
     /// catches a client method silently short-circuiting to `Ok(())`.
-    async fn recv_rpc(
-        server: tokio::task::JoinHandle<String>,
-        what: &str,
-    ) -> serde_json::Value {
+    async fn recv_rpc(server: tokio::task::JoinHandle<String>, what: &str) -> serde_json::Value {
         let body = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap_or_else(|_| panic!("{what} must issue an RPC request"))

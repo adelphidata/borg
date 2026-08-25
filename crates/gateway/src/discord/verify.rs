@@ -21,7 +21,12 @@ pub fn verify_discord_signature(
     body: &str,
     public_key_hex: &str,
 ) -> Result<()> {
-    verify_discord_signature_at(headers, body, public_key_hex, chrono::Utc::now().timestamp())
+    verify_discord_signature_at(
+        headers,
+        body,
+        public_key_hex,
+        chrono::Utc::now().timestamp(),
+    )
 }
 
 /// Inner verifier with an injected clock so the replay-window boundary is

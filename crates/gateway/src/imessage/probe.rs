@@ -114,9 +114,12 @@ mod tests {
         {
             let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
             let conn = db.connect().unwrap();
-            conn.execute("CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT)", ())
-                .await
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
             conn.execute("INSERT INTO message (ROWID, text) VALUES (7, 'hi')", ())
                 .await
                 .unwrap();

@@ -108,15 +108,31 @@ pub type DbOpener = std::sync::Arc<dyn Fn() -> DbOpenFuture + Send + Sync>;
 /// Test-only helpers shared across in-crate test modules.
 #[cfg(test)]
 pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     /// Serializes tests that repoint `BORG_HOME` at a temp dir — env vars
     /// are process-global while cargo runs tests on parallel threads.
     static BORG_HOME_LOCK: Mutex<()> = Mutex::new(());
 
+    /// RAII handle for the `BORG_HOME` serialization lock.
+    ///
+    /// Wraps the `MutexGuard` so async tests can hold it across `.await`
+    /// without tripping `clippy::await_holding_lock`: every `#[tokio::test]`
+    /// here runs on its own per-test runtime, so a contended lock only parks
+    /// that test's OS thread — it can never deadlock a shared executor. The
+    /// serialization guarantee is unchanged: the guard (and the lock) lives
+    /// until this handle drops.
+    pub(crate) struct BorgHomeGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
+
     /// Acquire the `BORG_HOME` serialization lock, surviving poisoning (a
     /// panicked env test must not cascade into every later env test).
-    pub(crate) fn borg_home_guard() -> MutexGuard<'static, ()> {
-        BORG_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn borg_home_guard() -> BorgHomeGuard {
+        BorgHomeGuard {
+            _guard: BORG_HOME_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
     }
 }

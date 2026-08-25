@@ -148,7 +148,10 @@ mod imp {
             struct Buf(Arc<Mutex<Vec<u8>>>);
             impl std::io::Write for Buf {
                 fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().expect("log buffer poisoned").extend_from_slice(data);
+                    self.0
+                        .lock()
+                        .expect("log buffer poisoned")
+                        .extend_from_slice(data);
                     Ok(data.len())
                 }
                 fn flush(&mut self) -> std::io::Result<()> {

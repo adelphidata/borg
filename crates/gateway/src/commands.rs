@@ -1283,7 +1283,10 @@ mod tests {
 
         assert_eq!(empty, "No memory entries or knowledge files.");
         assert!(out.contains("Memory inventory"));
-        assert!(out.contains("[long-term:global] shared-note (2.0 KB)"), "{out}");
+        assert!(
+            out.contains("[long-term:global] shared-note (2.0 KB)"),
+            "{out}"
+        );
         assert!(out.contains("[knowledge:global] global/memory.md"));
     }
 
@@ -1507,9 +1510,22 @@ mod tests {
 
         // Non-commands and out-of-band/pass-through commands must fall
         // through to the agent (or the async interceptors) untouched.
-        for passthrough in ["hello world", "/skill weather", "/cancel", "/poke", "/dream"] {
+        for passthrough in [
+            "hello world",
+            "/skill weather",
+            "/cancel",
+            "/poke",
+            "/dream",
+        ] {
             let resp = try_handle_command(
-                passthrough, &db, &config, "telegram", None, "skey", "sid-undo", "sender",
+                passthrough,
+                &db,
+                &config,
+                "telegram",
+                None,
+                "skey",
+                "sid-undo",
+                "sender",
             )
             .await;
             assert!(resp.is_none(), "{passthrough} must not be intercepted");
@@ -1530,7 +1546,10 @@ mod tests {
             "Session: statusse...\nMessages: 2"
         );
         // Session ids shorter than 8 chars fall back to the full id.
-        assert_eq!(handle_status(&db, "abc").await, "Session: abc...\nMessages: 0");
+        assert_eq!(
+            handle_status(&db, "abc").await,
+            "Session: abc...\nMessages: 0"
+        );
     }
 
     #[tokio::test]
@@ -1678,7 +1697,10 @@ mod tests {
 
         let show = handle_mode(&db, &config, sid, "").await;
         assert!(show.starts_with("Collaboration mode: "), "{show}");
-        assert!(show.contains("Usage: /mode <default|execute|plan>"), "{show}");
+        assert!(
+            show.contains("Usage: /mode <default|execute|plan>"),
+            "{show}"
+        );
 
         assert_eq!(
             handle_mode(&db, &config, sid, "plan").await,
@@ -1823,11 +1845,9 @@ mod tests {
             assert_eq!(handle_history(&db, sid, bad).await, usage, "arg {bad:?}");
         }
         // 50 is the inclusive upper bound.
-        assert!(
-            handle_history(&db, sid, "50")
-                .await
-                .starts_with("Last 3 messages:")
-        );
+        assert!(handle_history(&db, sid, "50")
+            .await
+            .starts_with("Last 3 messages:"));
 
         assert_eq!(
             handle_history(&db, "history-empty", "").await,
@@ -1858,8 +1878,14 @@ mod tests {
 
         let out = handle_history(&db, sid, "").await;
         // 250 chars → cut at 200 with an ellipsis.
-        assert!(out.contains(&format!("{}…", "x".repeat(200))), "long message not truncated");
-        assert!(!out.contains(&"x".repeat(201)), "truncation must cut at 200 chars");
+        assert!(
+            out.contains(&format!("{}…", "x".repeat(200))),
+            "long message not truncated"
+        );
+        assert!(
+            !out.contains(&"x".repeat(201)),
+            "truncation must cut at 200 chars"
+        );
         // Exactly 200 chars → untouched, no ellipsis.
         assert!(out.contains(&"y".repeat(200)));
         assert!(
@@ -1921,7 +1947,10 @@ mod tests {
             listing.contains(&format!("  model = {}", config.llm.model)),
             "{listing}"
         );
-        assert!(listing.contains("Usage: /settings <key> <value>"), "{listing}");
+        assert!(
+            listing.contains("Usage: /settings <key> <value>"),
+            "{listing}"
+        );
 
         // Single-key reads fall back to compiled config values once no DB
         // override exists (test_db seeding may pre-populate some keys).
@@ -1994,13 +2023,14 @@ mod tests {
         // Challenge issued → pending, waiting on the owner.
         let mut config = Config::default();
         config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
-        let code = match cortex::pairing::check_sender_access(&db, &config, "telegram", "pairee", None)
-            .await
-            .unwrap()
-        {
-            cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
-            other => panic!("expected Challenge, got {other:?}"),
-        };
+        let code =
+            match cortex::pairing::check_sender_access(&db, &config, "telegram", "pairee", None)
+                .await
+                .unwrap()
+            {
+                cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
+                other => panic!("expected Challenge, got {other:?}"),
+            };
         let out = handle_pairing(&db, "telegram", "pairee").await;
         assert!(out.contains("pending pairing request"), "{out}");
 
@@ -2066,7 +2096,10 @@ mod tests {
                 ("leave 3", "Left Discord voice channel in guild 3."),
                 ("leave", "Usage: /voice leave <guild_id>"),
                 ("channel 4:6", "Switched to voice channel 6."),
-                ("channel nope", "Usage: /voice channel <guild_id>:<channel_id>"),
+                (
+                    "channel nope",
+                    "Usage: /voice channel <guild_id>:<channel_id>",
+                ),
                 ("", "Usage: /voice [join|leave|channel]"),
             ];
             for (input, want) in cases {

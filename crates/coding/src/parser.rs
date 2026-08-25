@@ -2453,7 +2453,10 @@ diff --git a/f b/f
                 message,
                 line_number,
             } => {
-                assert!(message.contains("does not contain any lines"), "got: {message}");
+                assert!(
+                    message.contains("does not contain any lines"),
+                    "got: {message}"
+                );
                 assert_eq!(line_number, 3, "error must point at the @@ line");
             }
             other => panic!("Expected InvalidHunk, got {other:?}"),

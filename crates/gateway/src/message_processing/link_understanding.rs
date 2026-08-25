@@ -393,7 +393,11 @@ mod tests {
             allowlist: vec!["ok.example".into()],
             ..UrlPolicyConfig::default()
         };
-        let urls = extract_urls("https://other.example/a https://ok.example/b", 10, &allowlisted);
+        let urls = extract_urls(
+            "https://other.example/a https://ok.example/b",
+            10,
+            &allowlisted,
+        );
         assert_eq!(urls, vec!["https://ok.example/b"]);
     }
 
@@ -518,12 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_rejects_http_error_status() {
-        let server = serve(
-            "/",
-            ResponseTemplate::new(404)
-                .set_body_string("gone"),
-        )
-        .await;
+        let server = serve("/", ResponseTemplate::new(404).set_body_string("gone")).await;
         let err = fetch_link_content(&server.uri(), 500, 5_000, &passthrough_policy())
             .await
             .expect_err("non-2xx status must be an error, not content");
@@ -540,10 +539,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/end"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("landed"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string("landed"))
             .mount(&server)
             .await;
         let url = format!("{}/start", server.uri());
@@ -559,12 +555,7 @@ mod tests {
         // yields (0, 2, ~3 KB, ~1 MB) while staying under the real 2 MB
         // ceiling — the fetch must succeed and truncate normally.
         let body = "a".repeat(1_200_000);
-        let server = serve(
-            "/",
-            ResponseTemplate::new(200)
-                .set_body_string(body),
-        )
-        .await;
+        let server = serve("/", ResponseTemplate::new(200).set_body_string(body)).await;
         let text = fetch_link_content(&server.uri(), 32, 15_000, &passthrough_policy())
             .await
             .expect("1.2 MB body is under the 2 MB cap");
@@ -575,8 +566,7 @@ mod tests {
     async fn fetch_truncates_ascii_at_max_chars() {
         let server = serve(
             "/",
-            ResponseTemplate::new(200)
-                .set_body_string("abcdefghij"),
+            ResponseTemplate::new(200).set_body_string("abcdefghij"),
         )
         .await;
         let text = fetch_link_content(&server.uri(), 4, 5_000, &passthrough_policy())
@@ -589,12 +579,7 @@ mod tests {
     async fn fetch_truncation_backs_off_to_char_boundary() {
         // Five two-byte chars; a 3-byte cut lands mid-char and must back
         // off to byte 2 rather than panic or overshoot.
-        let server = serve(
-            "/",
-            ResponseTemplate::new(200)
-                .set_body_string("ééééé"),
-        )
-        .await;
+        let server = serve("/", ResponseTemplate::new(200).set_body_string("ééééé")).await;
         let text = fetch_link_content(&server.uri(), 3, 5_000, &passthrough_policy())
             .await
             .expect("fetch succeeds");
@@ -605,8 +590,7 @@ mod tests {
     async fn augment_appends_content_inside_untrusted_tags() {
         let server = serve(
             "/page",
-            ResponseTemplate::new(200)
-                .set_body_string("hello from the page"),
+            ResponseTemplate::new(200).set_body_string("hello from the page"),
         )
         .await;
         let url = format!("{}/page", server.uri());
@@ -615,8 +599,7 @@ mod tests {
             ..Default::default()
         };
         let text = format!("look at {url}");
-        let (augmented, fetched) =
-            augment_with_links(&text, &config, &passthrough_policy()).await;
+        let (augmented, fetched) = augment_with_links(&text, &config, &passthrough_policy()).await;
         assert_eq!(fetched, vec![url.clone()]);
         assert!(augmented.starts_with(&text), "original text preserved");
         assert!(
@@ -630,8 +613,7 @@ mod tests {
     async fn augment_skips_whitespace_only_content() {
         let server = serve(
             "/blank",
-            ResponseTemplate::new(200)
-                .set_body_string("   \n  "),
+            ResponseTemplate::new(200).set_body_string("   \n  "),
         )
         .await;
         let url = format!("{}/blank", server.uri());
@@ -640,8 +622,7 @@ mod tests {
             ..Default::default()
         };
         let text = format!("see {url}");
-        let (augmented, fetched) =
-            augment_with_links(&text, &config, &passthrough_policy()).await;
+        let (augmented, fetched) = augment_with_links(&text, &config, &passthrough_policy()).await;
         assert_eq!(augmented, text, "blank content must not be appended");
         assert!(fetched.is_empty());
     }

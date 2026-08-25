@@ -215,8 +215,10 @@ impl DiscordClient {
         .await?;
 
         for chunk in &chunks[1..] {
-            let followup_url =
-                format!("{}/webhooks/{application_id}/{interaction_token}", self.base_url);
+            let followup_url = format!(
+                "{}/webhooks/{application_id}/{interaction_token}",
+                self.base_url
+            );
             let chunk = chunk.clone();
             let client = self.client.clone();
             self.send_with_retry(move || {
@@ -435,7 +437,10 @@ impl DiscordClient {
     pub async fn edit_message(&self, channel_id: &str, message_id: &str, text: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
+        let url = format!(
+            "{}/channels/{channel_id}/messages/{message_id}",
+            self.base_url
+        );
         let token = self.token.clone();
         let client = self.client.clone();
         let body = json!({ "content": text });
@@ -464,7 +469,10 @@ impl DiscordClient {
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
+        let url = format!(
+            "{}/channels/{channel_id}/messages/{message_id}",
+            self.base_url
+        );
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -494,7 +502,10 @@ impl DiscordClient {
     ) -> Result<ChannelMessage> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{}/channels/{channel_id}/messages/{message_id}", self.base_url);
+        let url = format!(
+            "{}/channels/{channel_id}/messages/{message_id}",
+            self.base_url
+        );
         let token = self.token.clone();
         let client = self.client.clone();
 
@@ -686,7 +697,10 @@ impl DiscordClient {
     ) -> Result<ThreadInfo> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
-        let url = format!("{}/channels/{channel_id}/messages/{message_id}/threads", self.base_url);
+        let url = format!(
+            "{}/channels/{channel_id}/messages/{message_id}/threads",
+            self.base_url
+        );
         let token = self.token.clone();
         let client = self.client.clone();
         let body = json!({ "name": name, "auto_archive_duration": 1440 });
@@ -1390,7 +1404,9 @@ mod tests {
             let long = "a".repeat(2500); // 2 chunks at the 2000-char limit
             Mock::given(method("PATCH"))
                 .and(path("/webhooks/app7/t0k/messages/@original"))
-                .and(body_json(serde_json::json!({ "content": "a".repeat(2000) })))
+                .and(body_json(
+                    serde_json::json!({ "content": "a".repeat(2000) }),
+                ))
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
                 .mount(&server)
@@ -1447,7 +1463,10 @@ mod tests {
             // (method, path) for each fire-and-forget mutation endpoint.
             let expected: &[(&str, String)] = &[
                 ("POST", "/channels/12/typing".into()),
-                ("PUT", format!("/channels/12/messages/34/reactions/{emoji}/@me")),
+                (
+                    "PUT",
+                    format!("/channels/12/messages/34/reactions/{emoji}/@me"),
+                ),
                 (
                     "DELETE",
                     format!("/channels/12/messages/34/reactions/{emoji}/@me"),
@@ -1661,8 +1680,16 @@ mod tests {
                 .unwrap();
 
             let reqs = server.received_requests().await.unwrap();
-            let content_type = reqs[0].headers.get("content-type").unwrap().to_str().unwrap();
-            assert!(content_type.starts_with("multipart/form-data"), "{content_type}");
+            let content_type = reqs[0]
+                .headers
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(
+                content_type.starts_with("multipart/form-data"),
+                "{content_type}"
+            );
             let body = String::from_utf8_lossy(&reqs[0].body);
             assert!(body.contains("files[0]"), "{body}");
             assert!(body.contains("shot.png"), "{body}");

@@ -1008,10 +1008,7 @@ mod tests {
         let (status, body) = service_unavailable_response();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            body.0["error"]
-                .as_str()
-                .unwrap()
-                .contains("capacity"),
+            body.0["error"].as_str().unwrap().contains("capacity"),
             "body: {}",
             body.0
         );

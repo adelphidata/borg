@@ -205,15 +205,30 @@ pub(crate) mod test_support {
     //! touches the user's real login keychain or `~/.borg`.
 
     use std::ffi::{OsStr, OsString};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+    /// RAII handle for the env-serialization lock.
+    ///
+    /// Wraps the `MutexGuard` so async tests can hold it across `.await`
+    /// without tripping `clippy::await_holding_lock`: every `#[tokio::test]`
+    /// here runs on its own per-test runtime, so a contended lock only parks
+    /// that test's OS thread — it can never deadlock a shared executor. The
+    /// serialization guarantee is unchanged: the guard (and the lock) lives
+    /// until this handle drops.
+    pub(crate) struct EnvLockGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
 
     /// Global lock serializing env-mutating tests. Poisoning is ignored — the
     /// lock guards exclusivity, not data invariants.
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+    pub(crate) fn env_lock() -> EnvLockGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        EnvLockGuard {
+            _guard: LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
     }
 
     /// Sets (or unsets) one env var for the guard's lifetime, restoring the
@@ -370,10 +385,8 @@ mod tests {
         // These strings are UI/config vocabulary — lowercase kind nouns and
         // uppercase section headers. A Display that writes nothing (or the
         // wrong casing) breaks marketplace rendering and settings matching.
-        let kinds: &[(PluginKind, &str)] = &[
-            (PluginKind::Channel, "channel"),
-            (PluginKind::Tool, "tool"),
-        ];
+        let kinds: &[(PluginKind, &str)] =
+            &[(PluginKind::Channel, "channel"), (PluginKind::Tool, "tool")];
         for (kind, expected) in kinds {
             assert_eq!(kind.to_string(), *expected);
         }

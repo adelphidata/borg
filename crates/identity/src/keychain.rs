@@ -434,7 +434,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = FileKekStore::open(dir.path(), "passphrase").expect_err("open must fail");
         let msg = err.to_string();
-        assert!(msg.contains("read"), "error must name the failed read: {msg}");
+        assert!(
+            msg.contains("read"),
+            "error must name the failed read: {msg}"
+        );
     }
 
     #[test]

@@ -131,7 +131,10 @@ mod tests {
                 max_memory_bytes: 2 * WASM_PAGE_BYTES,
             };
             let got = limits.memory_growing(0, *desired, *maximum).unwrap();
-            assert_eq!(got, *expect, "{why} (desired={desired}, maximum={maximum:?})");
+            assert_eq!(
+                got, *expect,
+                "{why} (desired={desired}, maximum={maximum:?})"
+            );
         }
     }
 
@@ -165,7 +168,9 @@ mod tests {
         // so any stray post-drop increment is observable as a trap below.
         store.set_epoch_deadline(1);
         let linker = wasmtime::Linker::new(&engine);
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .expect("alloc export");

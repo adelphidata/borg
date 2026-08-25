@@ -633,38 +633,41 @@ mod tests {
         let cases: &[(&str, &str, &[&str])] = &[
             // Prose + separator + block = 17 > 16, block alone = 12 <= 16:
             // flush the prose, place the block whole in a fresh chunk.
-            ("fence_moves_whole_to_fresh_chunk", "aaaa\n```\nbbbb\n```", &[
-                "aaaa",
-                "```\nbbbb\n```",
-            ]),
+            (
+                "fence_moves_whole_to_fresh_chunk",
+                "aaaa\n```\nbbbb\n```",
+                &["aaaa", "```\nbbbb\n```"],
+            ),
             // Prose + separator + block = 15 <= 16: block stays beside the
             // prose; the trailing line no longer fits and starts chunk 2.
-            ("fence_fits_beside_prose", "aa\n```\nbbbb\n```\nzz", &[
-                "aa\n```\nbbbb\n```",
-                "zz",
-            ]),
+            (
+                "fence_fits_beside_prose",
+                "aa\n```\nbbbb\n```\nzz",
+                &["aa\n```\nbbbb\n```", "zz"],
+            ),
             // Block alone is exactly 16 = max: after flushing the prose it
             // must still be placed whole (<= is inclusive), and the chunk's
             // running count must be the full 16 so "zz" starts chunk 3.
-            ("fence_exactly_max_in_fresh_chunk", "aaaa\n```\nbbbbbbbb\n```\nzz", &[
-                "aaaa",
-                "```\nbbbbbbbb\n```",
-                "zz",
-            ]),
+            (
+                "fence_exactly_max_in_fresh_chunk",
+                "aaaa\n```\nbbbbbbbb\n```\nzz",
+                &["aaaa", "```\nbbbbbbbb\n```", "zz"],
+            ),
             // Prose + separator + block = exactly 16 = max: not over budget,
             // so no flush — they stay together in one chunk.
-            ("prose_plus_fence_exactly_max_stay_together", "aaa\n```\nbbbb\n```\nzzzzz", &[
-                "aaa\n```\nbbbb\n```",
-                "zzzzz",
-            ]),
+            (
+                "prose_plus_fence_exactly_max_stay_together",
+                "aaa\n```\nbbbb\n```\nzzzzz",
+                &["aaa\n```\nbbbb\n```", "zzzzz"],
+            ),
             // A blank line inside the block (13 chars total, 18 with the
             // trailer) still counts its joining newline, so "zzzz" must not
             // ride along in the fence's chunk.
-            ("fence_with_blank_body_line_counts_newlines", "aaaa\n```\nbbbb\n\n```\nzzzz", &[
-                "aaaa",
-                "```\nbbbb\n\n```",
-                "zzzz",
-            ]),
+            (
+                "fence_with_blank_body_line_counts_newlines",
+                "aaaa\n```\nbbbb\n\n```\nzzzz",
+                &["aaaa", "```\nbbbb\n\n```", "zzzz"],
+            ),
         ];
         for (name, text, expected) in cases {
             assert_eq!(&chunk_markdown_fenced(text, 16), expected, "case {name}");

@@ -1109,7 +1109,9 @@ mod tests {
         );
         let canon_parent = canonical.parent().unwrap().to_string_lossy();
         assert!(
-            profile.contains(&format!("(allow process-exec (subpath \"{canon_parent}\"))")),
+            profile.contains(&format!(
+                "(allow process-exec (subpath \"{canon_parent}\"))"
+            )),
             "the resolved binary's directory must be executable:\n{profile}"
         );
     }

@@ -725,9 +725,7 @@ mod tests {
     #[test]
     fn invalid_header_error_names_offender_line_and_valid_headers() {
         let mut p = StreamingPatchParser::default();
-        let err = p
-            .push_delta("*** Begin Patch\n*** Bogus: x\n")
-            .unwrap_err();
+        let err = p.push_delta("*** Begin Patch\n*** Bogus: x\n").unwrap_err();
         match err {
             ParseError::InvalidHunk {
                 message,
@@ -822,10 +820,7 @@ mod tests {
             .unwrap_err();
         match err {
             ParseError::InvalidHunk { message, .. } => {
-                assert!(
-                    message.contains("@@ context marker"),
-                    "got: {message}"
-                );
+                assert!(message.contains("@@ context marker"), "got: {message}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

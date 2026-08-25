@@ -881,8 +881,9 @@ mod tests {
         for (label, max, set) in cases {
             let mut at_max = manifest_for(&wasm);
             set(&mut at_max, *max);
-            validate_manifest(&at_max)
-                .unwrap_or_else(|e| panic!("[{label}] value {max} (the cap) must be accepted: {e}"));
+            validate_manifest(&at_max).unwrap_or_else(|e| {
+                panic!("[{label}] value {max} (the cap) must be accepted: {e}")
+            });
 
             let mut over = manifest_for(&wasm);
             set(&mut over, *max + 1);

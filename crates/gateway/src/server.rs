@@ -2335,7 +2335,6 @@ description = "Script fallback"
     // ── shared fixtures for handler-level tests ─────────────────────────
 
     use crate::channel::channel_trait::{NativeChannel, WebhookContext as WCtx, WebhookOutcome};
-    use axum::response::IntoResponse as _;
 
     /// Minimal native channel whose webhook handling always skips — enough to
     /// exercise routing, rate limiting, and dispatch without a real backend.
@@ -2421,15 +2420,12 @@ description = "Script fallback"
         )
     }
 
-    async fn response_parts(
-        resp: axum::response::Response,
-    ) -> (StatusCode, serde_json::Value) {
+    async fn response_parts(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        let json =
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
     }
 
@@ -2594,11 +2590,8 @@ description = "Script fallback"
     async fn readyz_counts_channels_and_detects_each_provider_source() {
         let _guard = crate::test_env::borg_home_guard();
         let _home = BorgHomeTemp::new();
-        let _env = EnvVarsCleared::new(&[
-            "OPENROUTER_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-        ]);
+        let _env =
+            EnvVarsCleared::new(&["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 
         // (api_key_env, env var to set, expected readiness)
         let cases: &[(&str, Option<&'static str>, StatusCode)] = &[

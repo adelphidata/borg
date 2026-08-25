@@ -31,9 +31,8 @@ mod tests {
     use super::*;
 
     fn test_router() -> Router {
-        let db_open: DbOpener = std::sync::Arc::new(|| {
-            Box::pin(async { anyhow::bail!("no database in this test") })
-        });
+        let db_open: DbOpener =
+            std::sync::Arc::new(|| Box::pin(async { anyhow::bail!("no database in this test") }));
         router(GrpcWebSlot::default(), db_open)
     }
 

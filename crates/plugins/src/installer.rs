@@ -558,7 +558,10 @@ mod tests {
 
         write_templates(def, tmp.path()).expect("write templates");
         let dir = tmp.path().join("channels").join("whatsapp");
-        assert!(dir.join("channel.toml").exists(), "fixture: templates written");
+        assert!(
+            dir.join("channel.toml").exists(),
+            "fixture: templates written"
+        );
 
         uninstall(def, tmp.path()).expect("uninstall");
         assert!(
@@ -690,9 +693,12 @@ mod tests {
             )
             .await
             .unwrap();
-            conn.execute("CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)", ())
-                .await
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
             conn.execute(
                 "INSERT INTO handle (ROWID, id) VALUES (1, 'me@example.com')",
                 (),
@@ -714,11 +720,15 @@ mod tests {
         let notes = imessage_post_install(data.path().to_path_buf()).await;
 
         assert!(
-            notes.iter().any(|n| n.contains("Full Disk Access detected")),
+            notes
+                .iter()
+                .any(|n| n.contains("Full Disk Access detected")),
             "readable chat.db must be reported as FDA working: {notes:?}"
         );
         assert!(
-            !notes.iter().any(|n| n.contains("Full Disk Access required")),
+            !notes
+                .iter()
+                .any(|n| n.contains("Full Disk Access required")),
             "must not demand FDA when chat.db is readable: {notes:?}"
         );
         let state = std::fs::read_to_string(
@@ -785,9 +795,12 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute("CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)", ())
-            .await
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT)",
+            (),
+        )
+        .await
+        .unwrap();
         conn.execute(
             "INSERT INTO handle (ROWID, id) VALUES (1, 'friend@example.com'), (2, 'me@example.com')",
             (),
@@ -821,7 +834,13 @@ mod tests {
         // The TUI renders install progress from this channel; a dropped
         // event means a spinner that never resolves.
         let (tx, mut rx) = mpsc::channel(1);
-        send_event(Some(&tx), InstallEvent::Complete { id: "x".to_string() }).await;
+        send_event(
+            Some(&tx),
+            InstallEvent::Complete {
+                id: "x".to_string(),
+            },
+        )
+        .await;
         match rx.try_recv() {
             Ok(InstallEvent::Complete { id }) => assert_eq!(id, "x"),
             other => panic!("expected the Complete event to be delivered, got {other:?}"),

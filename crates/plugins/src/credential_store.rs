@@ -177,17 +177,16 @@ pub fn remove(service: &str, account: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     /// Serializes tests that mutate `$BORG_HOME` (shared crate-wide via
     /// `test_support` so keychain-shim tests in other modules can't race us).
-    fn env_lock() -> MutexGuard<'static, ()> {
+    fn env_lock() -> crate::test_support::EnvLockGuard {
         crate::test_support::env_lock()
     }
 
     struct TestEnv {
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::EnvLockGuard,
         _tmp: TempDir,
         prev: Option<String>,
     }
@@ -431,7 +430,11 @@ mod tests {
 
         let file = load_file().unwrap();
         assert_eq!(
-            file.services.get("svc-fallback").unwrap().get("acct").unwrap(),
+            file.services
+                .get("svc-fallback")
+                .unwrap()
+                .get("acct")
+                .unwrap(),
             "sekrit",
             "credential must be durably written to the fallback file"
         );

@@ -267,9 +267,15 @@ mod tests {
                 "memory_search",
                 Box::new(MemorySearchHandler::new(config.clone())),
             ),
-            ("read_memory", Box::new(ReadMemoryHandler::new(config.clone()))),
+            (
+                "read_memory",
+                Box::new(ReadMemoryHandler::new(config.clone())),
+            ),
             ("web_fetch", Box::new(WebFetchHandler::new(config.clone()))),
-            ("web_search", Box::new(WebSearchHandler::new(config.clone()))),
+            (
+                "web_search",
+                Box::new(WebSearchHandler::new(config.clone())),
+            ),
         ];
         for (name, handler) in handlers {
             let err = handler

@@ -609,7 +609,9 @@ mod tests {
         linker
             .func_wrap(ABI_IMPORT_CREDENTIALS, "get", host_credentials_get)
             .unwrap();
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         let memory = instance
             .get_memory(&mut store, ABI_EXPORT_MEMORY)
             .expect("memory export");
@@ -646,7 +648,10 @@ mod tests {
         //     contract, so a drifted constant must fail here.
         let big_ok = vec![b'a'; 65_536];
         let too_big = vec![b'a'; 65_537];
-        let cases: &[(&[&str], i32, &[u8], i64, &str)] = &[
+        /// (declared capabilities, guest ptr, message bytes, expected
+        /// return, failure note) — one guest-visible log contract case.
+        type LogCase<'a> = (&'a [&'a str], i32, &'a [u8], i64, &'a str);
+        let cases: &[LogCase] = &[
             (
                 &[],
                 4096,
@@ -661,13 +666,7 @@ mod tests {
                 0,
                 "declared capability + valid message returns 0",
             ),
-            (
-                &["log"],
-                0,
-                b"",
-                0,
-                "ptr=0/len=0 is a valid empty message",
-            ),
+            (&["log"], 0, b"", 0, "ptr=0/len=0 is a valid empty message"),
             (
                 &["log"],
                 0,

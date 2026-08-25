@@ -45,7 +45,11 @@ mod tests {
             .unwrap();
         std::env::remove_var("BORG_HOME");
 
-        assert_eq!(entries.len(), 1, "expected exactly one gateway activity row");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one gateway activity row"
+        );
         assert_eq!(entries[0].message, "webhook signature rejected");
         assert_eq!(entries[0].level, "warn");
         assert_eq!(entries[0].category, "gateway");

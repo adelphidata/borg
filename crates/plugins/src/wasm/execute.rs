@@ -794,10 +794,7 @@ mod tests {
                 "memory minimum size mismatch",
                 WasmExecuteErrorKind::MemoryExceeded,
             ),
-            (
-                "url not on allowlist",
-                WasmExecuteErrorKind::HostHttpDenied,
-            ),
+            ("url not on allowlist", WasmExecuteErrorKind::HostHttpDenied),
             (
                 "host not in endpoint allowlist",
                 WasmExecuteErrorKind::HostHttpDenied,

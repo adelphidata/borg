@@ -450,9 +450,27 @@ mod tests {
         // process wrote any, stdout otherwise, and -1 stands in for a
         // signal-terminated process with no exit code at all.
         let cases: &[(Option<i32>, &str, &str, bool, &str)] = &[
-            (Some(0), "tool output", "ignored warning", true, "tool output"),
-            (Some(3), "partial out", "boom", false, "Error (exit 3): boom"),
-            (Some(7), "only stdout", "", false, "Error (exit 7): only stdout"),
+            (
+                Some(0),
+                "tool output",
+                "ignored warning",
+                true,
+                "tool output",
+            ),
+            (
+                Some(3),
+                "partial out",
+                "boom",
+                false,
+                "Error (exit 3): boom",
+            ),
+            (
+                Some(7),
+                "only stdout",
+                "",
+                false,
+                "Error (exit 7): only stdout",
+            ),
             (None, "", "killed", false, "Error (exit -1): killed"),
         ];
         for (exit_code, stdout, stderr, want_ok, want_text) in cases.iter().copied() {

@@ -1603,7 +1603,10 @@ mod tests {
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
                 if *event.metadata().level() == tracing::Level::WARN {
-                    self.0.lock().unwrap().push(event.metadata().name().to_string());
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(event.metadata().name().to_string());
                 }
             }
         }

@@ -179,10 +179,7 @@ mod tests {
         // Stale installed-plugin rows (a catalog entry that was removed) must
         // be skipped, not crash or block verification of the rest.
         let tmp = std::env::temp_dir().join("borg-verify-all-test");
-        let ids = vec![
-            "messaging/whatsapp".to_string(),
-            "not/a-plugin".to_string(),
-        ];
+        let ids = vec!["messaging/whatsapp".to_string(), "not/a-plugin".to_string()];
         let results = verify_all(&ids, &tmp);
         assert_eq!(
             results.len(),

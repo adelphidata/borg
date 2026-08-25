@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
@@ -21,10 +21,20 @@ use gateway::session_executor::{InboundTurn, SessionExecutor};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Serializes tests that repoint `BORG_HOME` — env vars are process-global.
-fn borg_home_guard() -> MutexGuard<'static, ()> {
+/// RAII handle serializing tests that repoint `BORG_HOME` — env vars are
+/// process-global. Wraps the `MutexGuard` so async tests can hold it across
+/// `.await` without tripping `clippy::await_holding_lock`: each test runs on
+/// its own per-test runtime, so a contended lock only parks that test's OS
+/// thread. The guard lives until this handle drops.
+struct BorgHomeGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+fn borg_home_guard() -> BorgHomeGuard {
     static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    BorgHomeGuard {
+        _guard: LOCK.lock().unwrap_or_else(PoisonError::into_inner),
+    }
 }
 
 struct EchoExec;
@@ -404,5 +414,8 @@ async fn invoke_agent_returns_agent_reply_and_real_session_id() {
         resp.contains("echo:") && resp.contains("INVOKE_MARKER_BETA"),
         "got: {resp}"
     );
-    assert!(!session_id.is_empty(), "session id must be the real session");
+    assert!(
+        !session_id.is_empty(),
+        "session id must be the real session"
+    );
 }
