@@ -569,6 +569,51 @@ mod tests {
         assert_ne!(msg.peer_kind.as_deref(), Some("direct"));
     }
 
+    /// Edit and delete events flow into the same DM-vs-group policy gating
+    /// as fresh messages, so their `peer_kind` classification must match:
+    /// `im` → direct, `channel`/`mpim` → group, unknown → None.
+    #[tokio::test]
+    async fn message_changed_and_deleted_classify_peer_kind() {
+        use super::super::types::NestedSlackMessage;
+        let cases = [
+            (Some("im"), Some("direct")),
+            (Some("channel"), Some("group")),
+            (Some("mpim"), Some("group")),
+            (None, None),
+        ];
+        for (channel_type, expected) in cases {
+            let nested = NestedSlackMessage {
+                user: Some("U456".to_string()),
+                text: Some("body".to_string()),
+                ts: Some("1700000000.111".to_string()),
+                thread_ts: None,
+            };
+
+            let mut changed = make_slack_event("message");
+            changed.subtype = Some("message_changed".to_string());
+            changed.channel_type = channel_type.map(str::to_string);
+            changed.message = Some(nested.clone());
+            let msg = parse_event(&make_event(changed), None, None).await.unwrap();
+            assert_eq!(
+                msg.peer_kind.as_deref(),
+                expected,
+                "message_changed channel_type={channel_type:?}"
+            );
+
+            let mut deleted = make_slack_event("message");
+            deleted.subtype = Some("message_deleted".to_string());
+            deleted.channel_type = channel_type.map(str::to_string);
+            deleted.deleted_ts = Some("1700000000.111".to_string());
+            deleted.previous_message = Some(nested);
+            let msg = parse_event(&make_event(deleted), None, None).await.unwrap();
+            assert_eq!(
+                msg.peer_kind.as_deref(),
+                expected,
+                "message_deleted channel_type={channel_type:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn app_mention_stores_event_type_metadata() {
         let cb = make_event(make_slack_event("app_mention"));
@@ -723,6 +768,18 @@ mod tests {
         assert_eq!(
             strip_bot_mention("  hello  ", ""),
             ("hello".to_string(), false)
+        );
+    }
+
+    /// An empty bot id must short-circuit before any scanning: without it the
+    /// `<@` prefix alone would match a bare `<@>` token and strip it, falsely
+    /// reporting the bot was mentioned. Interior whitespace also stays intact
+    /// on this path (only the strip path collapses runs it created).
+    #[test]
+    fn strip_bot_mention_empty_bot_id_never_strips_bare_token() {
+        assert_eq!(
+            strip_bot_mention("<@> hi  there", ""),
+            ("<@> hi  there".to_string(), false)
         );
     }
 

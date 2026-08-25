@@ -201,6 +201,22 @@ mod tests {
         }
     }
 
+    /// Malformed links must pass through verbatim, and the link scanner
+    /// must never read past the end of the line while looking for the
+    /// missing `]`, `(`, or `)`:
+    /// - `[` with no closing `]` (text scan hits end-of-line);
+    /// - `[text]` at end-of-line (nothing after the `]`);
+    /// - `[text]x…` where `(` does not immediately follow `]` — a later
+    ///   stray `(…)` on the line must not be adopted as the URL;
+    /// - `[text](` with no closing `)` (url scan hits end-of-line).
+    #[test]
+    fn malformed_links_pass_through_without_panicking() {
+        let identities = ["[unclosed", "[a]", "[a]b(c)", "[a](noclose"];
+        for input in identities {
+            assert_eq!(markdown_to_mrkdwn(input), input, "no-op for {input:?}");
+        }
+    }
+
     /// Delimiter-scanning edge cases. Each row pins one boundary of the
     /// two-char delimiter scan:
     /// - a closing pair must be exactly two chars — a lone `*`/`_` inside

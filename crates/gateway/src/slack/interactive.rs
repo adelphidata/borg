@@ -365,6 +365,37 @@ mod tests {
         }
     }
 
+    /// Prompt-injection guard: every XML-special character in an
+    /// attacker-controlled action value must land in the `<interactive/>` tag
+    /// escaped — a raw `"`/`'` closes the attribute and a raw `&`/`<`/`>`
+    /// corrupts the tag, letting a crafted button value inject instructions.
+    #[test]
+    fn block_action_value_is_fully_xml_escaped_in_prompt() {
+        let json = r#"{
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "actions": [
+                {
+                    "action_id": "approve_btn",
+                    "type": "button",
+                    "value": "a&b<c>d\"e'f"
+                }
+            ]
+        }"#;
+        let outcome = handle_interactive(&HeaderMap::new(), &body_for(json), None).unwrap();
+        let message = match outcome {
+            InteractiveOutcome::Forward { message, .. } => message,
+            other => panic!("expected Forward, got {:?}", outcome_kind(&other)),
+        };
+        assert!(
+            message
+                .text
+                .contains(r#"value="a&amp;b&lt;c&gt;d&quot;e&apos;f""#),
+            "unescaped value leaked into prompt: {}",
+            message.text
+        );
+    }
+
     #[test]
     fn select_menu_action_uses_selected_option_value() {
         let json = r#"{

@@ -256,6 +256,32 @@ mod tests {
     }
 
     #[test]
+    fn empty_text_param_falls_back_to_command_name() {
+        // Slack sends `text=` (present but empty) when the user types just
+        // `/borg` — same fallback as a missing param: prompt the command name,
+        // never an empty turn.
+        let body = "command=%2Fborg&user_id=U1&channel_id=C1&text=";
+        let outcome = handle_slash_command(&HeaderMap::new(), body, None).unwrap();
+        match outcome {
+            SlashOutcome::Forward(msg) => assert_eq!(msg.text, "/borg"),
+            SlashOutcome::BadRequest(_) => panic!("expected Forward"),
+        }
+    }
+
+    #[test]
+    fn empty_channel_name_leaves_peer_kind_unknown() {
+        // `channel_name=` (present but empty) carries no DM-vs-group signal;
+        // guessing "group" would flow a possible DM into group policy gating.
+        let body = "command=%2Fborg&user_id=U1&channel_id=C1&channel_name=";
+        let SlashOutcome::Forward(msg) =
+            handle_slash_command(&HeaderMap::new(), body, None).unwrap()
+        else {
+            panic!("expected Forward");
+        };
+        assert!(msg.peer_kind.is_none());
+    }
+
+    #[test]
     fn malformed_body_returns_bad_request_not_panic() {
         // Missing required field `user_id` — must surface as BadRequest, not unwrap-panic.
         let body = "command=%2Fborg&text=hi";
@@ -301,5 +327,61 @@ mod tests {
     fn response_visibility_maps_to_slack_strings() {
         assert_eq!(ResponseVisibility::Ephemeral.as_slack_str(), "ephemeral");
         assert_eq!(ResponseVisibility::InChannel.as_slack_str(), "in_channel");
+    }
+
+    #[tokio::test]
+    async fn post_response_url_sends_json_body_to_slack() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/commands/xyz"))
+            .and(body_partial_json(serde_json::json!({
+                "text": "all done",
+                "response_type": "in_channel",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/commands/xyz", server.uri());
+        post_response_url(
+            &Client::new(),
+            &url,
+            "all done",
+            ResponseVisibility::InChannel,
+            None,
+        )
+        .await
+        .expect("2xx from response_url must be Ok");
+        // MockServer::verify on drop enforces .expect(1) — the reply must
+        // actually reach Slack, not merely return Ok.
+    }
+
+    #[tokio::test]
+    async fn post_response_url_surfaces_http_error_status() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .mount(&server)
+            .await;
+
+        let err = post_response_url(
+            &Client::new(),
+            &server.uri(),
+            "all done",
+            ResponseVisibility::Ephemeral,
+            None,
+        )
+        .await
+        .expect_err("non-2xx must surface as Err, never report success");
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "error names the status: {msg}");
+        assert!(msg.contains("kaboom"), "error carries the body: {msg}");
     }
 }
