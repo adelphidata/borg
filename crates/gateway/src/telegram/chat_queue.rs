@@ -279,6 +279,28 @@ mod tests {
         }
     }
 
+    /// The split threshold sits 128 units under Telegram's 4096-unit cap:
+    /// 3968 units and above reads as a probable client-split fragment,
+    /// anything shorter keeps the immediate path. The boundary is asserted
+    /// with literal lengths so a miscomputed threshold (which would drag
+    /// ordinary short messages into the 400 ms coalesce wait) fails here.
+    #[test]
+    fn split_chunk_threshold_sits_128_under_the_telegram_cap() {
+        assert!(
+            !is_probable_split_chunk(&"a".repeat(3967)),
+            "3967 units is below the threshold"
+        );
+        assert!(
+            is_probable_split_chunk(&"a".repeat(3968)),
+            "3968 units (4096 - 128) is a probable fragment"
+        );
+        // UTF-16 units, not chars: astral-plane symbols count double.
+        assert!(
+            is_probable_split_chunk(&"𝄞".repeat(1984)),
+            "1984 astral chars = 3968 UTF-16 units"
+        );
+    }
+
     /// Every near-cap fragment restarts the coalesce window, so a sender that
     /// keeps emitting them holds the consumer in the merge loop and grows the
     /// buffer without bound — the chat's idle timeout can never fire. The merge

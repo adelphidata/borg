@@ -230,6 +230,213 @@ impl NativeChannel for TelegramChannel {
 mod tests {
     use super::*;
 
+    fn channel_with_client(client: TelegramClient, bot_username: Option<&str>) -> TelegramChannel {
+        TelegramChannel {
+            client: Arc::new(client),
+            dedup: Arc::new(Mutex::new(UpdateDeduplicator::new())),
+            secret: None,
+            bot_username: bot_username.map(String::from),
+            config: Config::default(),
+            tts_synthesizer: None,
+        }
+    }
+
+    fn context_json(chat_id: i64) -> serde_json::Value {
+        serde_json::to_value(TelegramResponseContext {
+            chat_id,
+            thread_id: None,
+            reply_to: None,
+            input_was_voice: false,
+            voice_reply_mode: None,
+        })
+        .unwrap()
+    }
+
+    /// The channel registers under exactly "telegram" — routing, health
+    /// records, and per-channel bindings all key on that name — and it
+    /// advertises media support (Telegram accepts photo/document uploads).
+    #[test]
+    fn names_and_capabilities_identify_telegram() {
+        let channel = channel_with_client(TelegramClient::new("123:ABC").unwrap(), None);
+        assert_eq!(channel.names(), vec!["telegram"]);
+        assert!(channel.supports_media_attachments());
+    }
+
+    /// Group mention detection needs the bot's username prefixed with `@`;
+    /// without a configured username there is nothing to match on.
+    #[test]
+    fn bot_mention_prefixes_the_configured_username() {
+        let with_name = channel_with_client(TelegramClient::new("123:ABC").unwrap(), Some("borg_bot"));
+        assert_eq!(with_name.bot_mention(), Some("@borg_bot".to_string()));
+
+        let without = channel_with_client(TelegramClient::new("123:ABC").unwrap(), None);
+        assert_eq!(without.bot_mention(), None);
+    }
+
+    /// `send_response` must actually deliver through the API: a successful
+    /// send posts sendMessage with the context's chat_id and records an
+    /// outbound event; a rejected send must surface as an error, never a
+    /// silent Ok for a reply that never arrived.
+    #[tokio::test]
+    async fn send_response_delivers_and_surfaces_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Success direction.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = channel_with_client(
+            TelegramClient::with_base("123:ABC", &server.uri()).unwrap(),
+            None,
+        );
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        channel
+            .send_response("hello there", &context_json(77), &health)
+            .await
+            .expect("delivery must succeed on ok=true");
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["chat_id"], 77, "must send to the context's chat");
+        let snapshot = health.read().await.snapshot();
+        let telegram = snapshot.iter().find(|s| s.name == "telegram").unwrap();
+        assert_eq!(telegram.outbound_count, 1, "success must record outbound");
+
+        // Failure direction: both the HTML attempt and the plain-text
+        // fallback are rejected, so the error must propagate.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: chat not found"
+            })))
+            .mount(&server)
+            .await;
+        let channel = channel_with_client(
+            TelegramClient::with_base("123:ABC", &server.uri()).unwrap(),
+            None,
+        );
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let err = channel
+            .send_response("hello there", &context_json(77), &health)
+            .await
+            .expect_err("a rejected send must not report success");
+        assert!(
+            err.to_string().contains("chat not found"),
+            "API description must surface, got: {err}"
+        );
+    }
+
+    /// `send_media` must read the file, route photos to sendPhoto, and
+    /// surface API failures — a no-op impl would report success for an
+    /// attachment that never left the machine.
+    #[tokio::test]
+    async fn send_media_routes_photos_and_surfaces_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("pic.jpg");
+        std::fs::write(&photo_path, b"jpeg-bytes").unwrap();
+        let doc_path = dir.path().join("report.pdf");
+        std::fs::write(&doc_path, b"pdf-bytes").unwrap();
+
+        // Photo extension routes to sendPhoto and succeeds.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = channel_with_client(
+            TelegramClient::with_base("123:ABC", &server.uri()).unwrap(),
+            None,
+        );
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        channel
+            .send_media(&photo_path, Some("a caption"), &context_json(77), &health)
+            .await
+            .expect("photo upload must succeed on ok=true");
+        let snapshot = health.read().await.snapshot();
+        let telegram = snapshot.iter().find(|s| s.name == "telegram").unwrap();
+        assert_eq!(telegram.outbound_count, 1, "success must record outbound");
+
+        // Non-photo extension routes to sendDocument; a rejection must
+        // propagate and be recorded against channel health.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendDocument"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: document too large"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = channel_with_client(
+            TelegramClient::with_base("123:ABC", &server.uri()).unwrap(),
+            None,
+        );
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let err = channel
+            .send_media(&doc_path, None, &context_json(77), &health)
+            .await
+            .expect_err("a rejected upload must not report success");
+        assert!(
+            err.to_string().contains("document too large"),
+            "API description must surface, got: {err}"
+        );
+        let snapshot = health.read().await.snapshot();
+        let telegram = snapshot.iter().find(|s| s.name == "telegram").unwrap();
+        assert_eq!(telegram.error_count, 1, "failure must record the error");
+    }
+
+    /// A valid response context yields a live typing handle (the keepalive
+    /// is what makes long turns feel alive on Telegram); garbage context
+    /// yields none instead of panicking the dispatcher.
+    #[tokio::test]
+    async fn start_typing_yields_a_handle_for_valid_context() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        let channel = channel_with_client(
+            TelegramClient::with_base("123:ABC", &server.uri()).unwrap(),
+            None,
+        );
+
+        let handle = channel.start_typing(&context_json(77));
+        assert!(handle.is_some(), "valid context must start the keepalive");
+        drop(handle);
+
+        assert!(
+            channel
+                .start_typing(&serde_json::json!({ "not": "a telegram context" }))
+                .is_none(),
+            "an undecodable context must yield no handle"
+        );
+    }
+
     #[test]
     fn response_context_roundtrip() {
         let ctx = TelegramResponseContext {

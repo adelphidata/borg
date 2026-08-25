@@ -1919,6 +1919,357 @@ mod tests {
         );
     }
 
+    /// `is_safe_to_retry` classifies real transport errors: a connect
+    /// failure never reached the server (retry), a whole-request timeout
+    /// with no status received is equally unacknowledged (retry), while a
+    /// request that failed for any other reason must NOT be replayed —
+    /// blind retries of acknowledged sends deliver duplicates.
+    #[tokio::test]
+    async fn is_safe_to_retry_classifies_real_transport_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Connect failure: bind a port, then drop the listener before dialing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let client = Client::new();
+        let connect_err = client
+            .get(format!("http://127.0.0.1:{closed_port}/"))
+            .send()
+            .await
+            .expect_err("closed port must refuse the connection");
+        assert!(connect_err.is_connect(), "precondition: a connect error");
+        assert!(
+            is_safe_to_retry(&connect_err),
+            "a connect failure never reached the server and is safe to retry"
+        );
+
+        // Timeout with no status: the server stalls past the client deadline.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let impatient = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let timeout_err = impatient
+            .get(format!("{}/slow", server.uri()))
+            .send()
+            .await
+            .expect_err("50ms deadline must expire");
+        assert!(timeout_err.is_timeout(), "precondition: a timeout error");
+        assert!(timeout_err.status().is_none(), "precondition: no status");
+        assert!(
+            is_safe_to_retry(&timeout_err),
+            "a pre-response timeout is safe to retry"
+        );
+
+        // Neither connect nor timeout (a request-build failure): not retryable.
+        let build_err = client
+            .get("http://[invalid-host/")
+            .send()
+            .await
+            .expect_err("malformed URL must fail");
+        assert!(
+            !build_err.is_connect() && !build_err.is_timeout(),
+            "precondition: neither connect nor timeout"
+        );
+        assert!(
+            !is_safe_to_retry(&build_err),
+            "only connect/pre-response-timeout errors may be replayed"
+        );
+    }
+
+    /// Redaction must stop at the token segment's terminating delimiter —
+    /// the text after `/bot<token>` (method path, status text) is the part
+    /// operators need to debug with and must survive verbatim.
+    #[test]
+    fn redaction_preserves_text_after_the_token_segment() {
+        let cases = [
+            (
+                "url (https://api.telegram.org/bot123:ABC/sendMessage): refused",
+                "url (https://api.telegram.org/bot[REDACTED]/sendMessage): refused",
+            ),
+            (
+                "call (https://api.telegram.org/bot999:OTHER) timed out",
+                "call (https://api.telegram.org/bot[REDACTED]) timed out",
+            ),
+            (
+                "request to \"https://x.test/bot999:OTHER\" failed",
+                "request to \"https://x.test/bot[REDACTED]\" failed",
+            ),
+            (
+                "request to 'https://x.test/bot999:OTHER' failed",
+                "request to 'https://x.test/bot[REDACTED]' failed",
+            ),
+            (
+                "GET https://x.test/bot999:OTHER failed fast",
+                "GET https://x.test/bot[REDACTED] failed fast",
+            ),
+            // An empty token segment (`/bot/`) has nothing to hide; the
+            // text must pass through unchanged rather than gaining markers.
+            ("path /bot/ handled", "path /bot/ handled"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_bot_token(input, "123:ABC"), expected);
+        }
+    }
+
+    /// setWebhook / deleteWebhook / setMyCommands must round-trip the API's
+    /// `ok` flag: `ok=true` succeeds, `ok=false` errors with the description.
+    /// A stubbed-out or inverted check would report webhook/command
+    /// registration success that never happened.
+    #[tokio::test]
+    async fn webhook_and_command_registration_honor_the_ok_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let call = |client: TelegramClient, api_method: &'static str| async move {
+            match api_method {
+                "setWebhook" => {
+                    client
+                        .set_webhook("https://example.com/hook", Some("s3cret"))
+                        .await
+                }
+                "deleteWebhook" => client.delete_webhook().await,
+                _ => client.set_my_commands(&[("start", "Start the bot")]).await,
+            }
+        };
+
+        for api_method in ["setWebhook", "deleteWebhook", "setMyCommands"] {
+            // Failure direction: ok=false must surface the description.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{api_method}")))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "description": "Bad Request: bad url"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            let err = call(client, api_method)
+                .await
+                .expect_err("ok=false must surface as an error");
+            assert!(
+                err.to_string().contains("bad url"),
+                "{api_method}: description must surface, got: {err}"
+            );
+
+            // Success direction: ok=true must return Ok.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{api_method}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            call(client, api_method)
+                .await
+                .expect("ok=true must succeed");
+
+            // The one request carried the real payload, not an empty body
+            // (deleteWebhook takes no parameters, so it has none to check).
+            if api_method != "deleteWebhook" {
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+                match api_method {
+                    "setWebhook" => {
+                        assert_eq!(body["url"], "https://example.com/hook");
+                        assert_eq!(body["secret_token"], "s3cret");
+                    }
+                    _ => {
+                        assert_eq!(body["commands"][0]["command"], "start");
+                        assert_eq!(body["commands"][0]["description"], "Start the bot");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every media variant must actually POST its endpoint and surface the
+    /// API's failure description — a swallowed error would report success
+    /// for media that never arrived.
+    #[tokio::test]
+    async fn media_variants_post_their_endpoints_and_surface_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for api_method in ["sendVideo", "sendAnimation", "sendSticker"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{api_method}")))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "description": "Bad Request: wrong file type"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            let source = MediaSource::Bytes {
+                bytes: b"media-bytes",
+                filename: "clip.bin",
+                mime: None,
+            };
+            let result = match api_method {
+                "sendVideo" => client.send_video(7, source, None, None, None).await,
+                "sendAnimation" => client.send_animation(7, source, None, None, None).await,
+                _ => client.send_sticker(7, source, None, None).await,
+            };
+            let err = result.expect_err("an API failure must not report success");
+            assert!(
+                err.to_string().contains("wrong file type"),
+                "{api_method}: description must surface, got: {err}"
+            );
+        }
+    }
+
+    /// `get_file` must trust the `ok` flag, not the mere presence of a
+    /// `result` payload: ok=true yields the file info, ok=false errors even
+    /// with a result attached.
+    #[tokio::test]
+    async fn get_file_honors_the_ok_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "file_id": "F1",
+                    "file_unique_id": "U1",
+                    "file_size": 512,
+                    "file_path": "photos/file_1.jpg"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let info = client.get_file("F1").await.expect("ok=true must succeed");
+        assert_eq!(info.file_path.as_deref(), Some("photos/file_1.jpg"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "result": { "file_id": "ghost", "file_unique_id": "ghost" },
+                "description": "Bad Request: file is too big"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client
+            .get_file("F1")
+            .await
+            .expect_err("ok=false must fail even with a result attached");
+        assert!(
+            err.to_string().contains("file is too big"),
+            "description must surface, got: {err}"
+        );
+    }
+
+    /// `get_updates` must return the updates on ok=true and error with the
+    /// description on ok=false — an always-bailing guard would stall the
+    /// whole polling loop.
+    #[tokio::test]
+    async fn get_updates_honors_the_ok_flag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getUpdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [{ "update_id": 41 }, { "update_id": 42 }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let updates = client
+            .get_updates(Some(41), 0)
+            .await
+            .expect("ok=true must yield the updates");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].update_id, 41);
+        assert_eq!(updates[1].update_id, 42);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getUpdates"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Conflict: terminated by other getUpdates request"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client
+            .get_updates(None, 0)
+            .await
+            .expect_err("ok=false must fail");
+        assert!(
+            err.to_string().contains("Conflict"),
+            "description must surface, got: {err}"
+        );
+    }
+
+    /// The `NativeCommandRegistration` impl must forward every command's
+    /// name and description to setMyCommands — a no-op impl would leave the
+    /// bot's native command menu empty.
+    #[tokio::test]
+    async fn register_commands_posts_the_command_defs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/setMyCommands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let defs = &crate::commands::GATEWAY_COMMANDS[..2];
+        client
+            .register_commands(defs)
+            .await
+            .expect("registration must succeed on ok=true");
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let posted = body["commands"].as_array().expect("commands array");
+        assert_eq!(posted.len(), defs.len());
+        for (def, posted) in defs.iter().zip(posted) {
+            assert_eq!(posted["command"], def.name);
+            assert_eq!(posted["description"], def.description);
+        }
+    }
+
     #[test]
     fn chunking_integration() {
         const CHUNK: usize = crate::constants::DEFAULT_MESSAGE_CHUNK_SIZE;
