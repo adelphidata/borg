@@ -224,10 +224,30 @@ mod tests {
             // lookahead must not read past the buffer).
             ("x``", "x<code></code>"),
             ("``\n```\nx\n```", "<code></code>\n<pre>x\n</pre>"),
+            // The CLOSING fence is also exactly three backticks — inline
+            // backticks inside the block (here two backticks a gap apart)
+            // must not terminate it early.
+            ("```\na`b`c\n```", "<pre>a`b`c\n</pre>"),
+            // A single '*' followed by a later "**" is italic then bold —
+            // the bold opener must require two ADJACENT stars, not treat
+            // the lone star as one.
+            ("*i* then **b**", "<i>i</i> then <b>b</b>"),
             (
                 "click [here](https://example.com) now",
                 r#"click <a href="https://example.com">here</a> now"#,
             ),
+            // A link at the very start of the input — the ']' scan begins
+            // right after the opening bracket, never before it.
+            (
+                "[a](https://example.com) leads",
+                r#"<a href="https://example.com">a</a> leads"#,
+            ),
+            // ']' as the final char: there is no room for '(' — must pass
+            // through as literal text, not read past the end of input.
+            ("tail [x]", "tail [x]"),
+            // ']' not immediately followed by '(' is not a link, even when
+            // a parenthesized group appears later in the text.
+            ("[a] (b)", "[a] (b)"),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -311,6 +331,15 @@ mod tests {
             "follow-up must start at a word: {:?}",
             rest.chars().take(12).collect::<String>()
         );
+        // The chosen boundary must be the LAST whitespace inside the limit
+        // (index 1019 for 10-char words), not some earlier one — a caption
+        // cut far short of the limit wastes the media message.
+        assert_eq!(
+            cap.chars().count(),
+            1019,
+            "cut must land at the last word boundary before the limit"
+        );
+        assert_eq!(rest.chars().count(), 2000 - 1020);
     }
 
     #[test]

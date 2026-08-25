@@ -329,6 +329,42 @@ mod tests {
         assert!(audio.is_none());
     }
 
+    /// Callback queries carry the chat's peer kind: a private chat is a
+    /// direct conversation, anything else is a group. Session routing keys
+    /// off this, so a callback in a DM misclassified as group-scoped would
+    /// land in the wrong session.
+    #[test]
+    fn callback_peer_kind_tracks_chat_type() {
+        let cases = [
+            ("private", PEER_KIND_DIRECT),
+            ("supergroup", PEER_KIND_GROUP),
+        ];
+        for (chat_type, expected) in cases {
+            let update: Update = serde_json::from_str(&format!(
+                r#"{{
+                    "update_id": 3,
+                    "callback_query": {{
+                        "id": "cb1",
+                        "from": {{ "id": 99, "first_name": "Bob", "is_bot": false }},
+                        "message": {{
+                            "message_id": 5,
+                            "chat": {{ "id": 42, "type": "{chat_type}" }},
+                            "date": 1700000000
+                        }},
+                        "data": "btn_click"
+                    }}
+                }}"#
+            ))
+            .unwrap();
+            let msg = parse_update(&update).unwrap().inbound;
+            assert_eq!(
+                msg.peer_kind.as_deref(),
+                Some(expected),
+                "chat type {chat_type:?}"
+            );
+        }
+    }
+
     #[test]
     fn photo_with_caption() {
         let update: Update = serde_json::from_str(

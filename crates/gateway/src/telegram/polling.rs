@@ -214,4 +214,235 @@ mod tests {
         let update: Update = serde_json::from_str(r#"{ "update_id": 1 }"#).unwrap();
         assert_eq!(extract_chat_id(&update), None);
     }
+
+    mod loop_behavior {
+        use super::*;
+        use futures::FutureExt;
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const UPDATES_PATH: &str = "/bot123:ABC/getUpdates";
+        const WEBHOOK_PATH: &str = "/bot123:ABC/deleteWebhook";
+
+        fn update_json(update_id: i64, text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 99, "first_name": "Bob", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "text": text
+                }
+            })
+        }
+
+        async fn mount_delete_webhook(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path(WEBHOOK_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": true }),
+                ))
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_empty_updates_fallback(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": [] }),
+                ))
+                .mount(server)
+                .await;
+        }
+
+        /// Spawn `run_polling` against the mock server, funneling every
+        /// delivered message into a channel as `(text, chat_id)`.
+        fn spawn_polling(
+            server_uri: &str,
+            shutdown: CancellationToken,
+        ) -> (
+            tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let client =
+                Arc::new(TelegramClient::with_base("123:ABC", server_uri).expect("client construction"));
+            let dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let callback: PollCallback = Arc::new(move |parsed, chat_id| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send((parsed.inbound.text, chat_id));
+                }
+                .boxed()
+            });
+            let handle = tokio::spawn(run_polling(client, dedup, callback, shutdown));
+            (rx, handle)
+        }
+
+        async fn updates_requests(server: &MockServer) -> Vec<serde_json::Value> {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == UPDATES_PATH)
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect()
+        }
+
+        /// Happy path: an update is delivered to the callback, the NEXT
+        /// getUpdates request acknowledges it with `offset = update_id + 1`
+        /// (the exact value Telegram requires — anything else re-delivers or
+        /// skips updates), and a clean iteration polls again immediately
+        /// with no idle backoff sleep.
+        #[tokio::test]
+        async fn delivers_update_and_acknowledges_with_next_offset() {
+            let server = MockServer::start().await;
+            mount_delete_webhook(&server).await;
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": [update_json(5, "hi")] }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            mount_empty_updates_fallback(&server).await;
+
+            let shutdown = CancellationToken::new();
+            let started = Instant::now();
+            let (mut rx, handle) = spawn_polling(&server.uri(), shutdown.clone());
+
+            let (text, chat_id) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("polling must deliver the update")
+                .expect("callback channel open");
+            assert_eq!((text.as_str(), chat_id), ("hi", 42));
+            // MIN_BACKOFF is 2s and jitter only adds; a clean first
+            // iteration sleeping the error backoff would land ≥ 2s here.
+            assert!(
+                started.elapsed() < Duration::from_millis(1900),
+                "a clean poll must not sleep the error backoff, took {:?}",
+                started.elapsed()
+            );
+
+            // Wait for the acknowledging poll after the delivery.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while updates_requests(&server).await.len() < 2 {
+                assert!(Instant::now() < deadline, "no follow-up getUpdates poll");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            shutdown.cancel();
+            handle.await.unwrap();
+
+            let requests = updates_requests(&server).await;
+            assert!(
+                requests[0].get("offset").is_none(),
+                "first poll carries no offset: {}",
+                requests[0]
+            );
+            assert_eq!(
+                requests[1]["offset"], 6,
+                "processed update 5 must be acknowledged with offset 6"
+            );
+        }
+
+        /// A transient getUpdates failure must back off (≥ MIN_BACKOFF)
+        /// before the retry — a loop that retries hot would hammer the API
+        /// during an outage — and then recover and deliver.
+        #[tokio::test]
+        async fn transient_error_backs_off_before_the_retry() {
+            let server = MockServer::start().await;
+            mount_delete_webhook(&server).await;
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(500).set_body_json(
+                    serde_json::json!({ "ok": false, "description": "internal error" }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": [update_json(7, "back")] }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            mount_empty_updates_fallback(&server).await;
+
+            let shutdown = CancellationToken::new();
+            let started = Instant::now();
+            let (mut rx, handle) = spawn_polling(&server.uri(), shutdown.clone());
+
+            let (text, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("polling must recover after a transient error")
+                .expect("callback channel open");
+            assert_eq!(text, "back");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1900),
+                "retry after an error must wait out MIN_BACKOFF, took {:?}",
+                started.elapsed()
+            );
+            shutdown.cancel();
+            handle.await.unwrap();
+        }
+
+        /// A 409 Conflict (webhook still registered) must trigger a SECOND
+        /// deleteWebhook — beyond the unconditional one at startup — and the
+        /// loop must then resume and deliver. Telegram phrases this error as
+        /// "Conflict: …" with no literal "409", so detection must accept
+        /// either marker alone.
+        #[tokio::test]
+        async fn conflict_deletes_webhook_again_and_resumes() {
+            let server = MockServer::start().await;
+            mount_delete_webhook(&server).await;
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "description": "Conflict: terminated by other getUpdates request"
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPDATES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": [update_json(9, "resumed")] }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            mount_empty_updates_fallback(&server).await;
+
+            let shutdown = CancellationToken::new();
+            let (mut rx, handle) = spawn_polling(&server.uri(), shutdown.clone());
+
+            let (text, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("polling must resume after the conflict")
+                .expect("callback channel open");
+            assert_eq!(text, "resumed");
+            shutdown.cancel();
+            handle.await.unwrap();
+
+            let webhook_deletes = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == WEBHOOK_PATH)
+                .count();
+            assert_eq!(
+                webhook_deletes, 2,
+                "startup delete plus one triggered by the conflict"
+            );
+        }
+    }
 }
