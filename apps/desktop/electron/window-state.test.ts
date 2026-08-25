@@ -109,6 +109,13 @@ describe("loadWindowState", () => {
     expect(loadWindowState()).toEqual(want);
   });
 
+  it("drops a non-finite size before it reaches the window", () => {
+    // JSON has no Infinity literal, but `1e999` parses to one; a hand-edited
+    // file must not hand the constructor an unbounded width.
+    fs.readFileSync.mockReturnValue('{"x":40,"y":60,"width":1e999,"height":700}');
+    expect(loadWindowState()).toEqual({ width: 1240, height: 700 });
+  });
+
   it("never forwards a position that clampToDisplays has not approved", () => {
     // Regression: a wrong-typed width once skipped the clamp entirely and let
     // a far-off-screen x through, reopening the window out of reach.

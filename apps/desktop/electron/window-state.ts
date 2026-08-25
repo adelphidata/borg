@@ -50,15 +50,18 @@ export function loadWindowState(): WindowState {
     // BrowserWindow constructor, and Electron does not forgive a string `x`
     // from a hand-edited file. A wrong-typed field is dropped, not forwarded.
     const state: WindowState = {};
-    if (typeof raw.width === "number") state.width = raw.width;
-    if (typeof raw.height === "number") state.height = raw.height;
+    // Finite, not just number: JSON `1e999` parses to Infinity, and NaN or
+    // Infinity in the BrowserWindow constructor is as bad as a string.
+    const finite = (v: unknown): v is number => Number.isFinite(v);
+    if (finite(raw.width)) state.width = raw.width;
+    if (finite(raw.height)) state.height = raw.height;
     if (typeof raw.maximized === "boolean") state.maximized = raw.maximized;
     // A position only means something as a pair, and only with the size it
     // was saved with: clamping needs the full rectangle. A partial or
     // off-display rectangle keeps the size and lets the OS place the window.
     if (
-      typeof raw.x === "number" &&
-      typeof raw.y === "number" &&
+      finite(raw.x) &&
+      finite(raw.y) &&
       typeof state.width === "number" &&
       typeof state.height === "number" &&
       clampToDisplays(
