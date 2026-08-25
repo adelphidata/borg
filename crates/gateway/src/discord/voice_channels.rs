@@ -226,7 +226,7 @@ pub fn voice_manager_handle() -> Option<&'static VoiceManagerHandle> {
 pub fn spawn_voice_manager(bot_token: String, cortex_config: CortexConfig) -> VoiceManagerHandle {
     let (tx, rx) = mpsc::channel::<VoiceCommand>(32);
     tokio::spawn(async move {
-        if let Err(e) = run_voice_manager(bot_token, rx, cortex_config).await {
+        if let Err(e) = run_voice_manager(bot_token, rx, cortex_config, GATEWAY_URL).await {
             warn!(error = %e, "Discord voice manager exited");
         }
     });
@@ -259,12 +259,15 @@ struct GuildState {
 /// the user is currently in a channel.
 type VoiceStateCache = Arc<Mutex<HashMap<(u64, u64), Option<u64>>>>;
 
+/// `gateway_url` is [`GATEWAY_URL`] in production; parameterized so tests
+/// can stand up a loopback WebSocket server instead of Discord.
 async fn run_voice_manager(
     bot_token: String,
     mut cmd_rx: mpsc::Receiver<VoiceCommand>,
     cortex_config: CortexConfig,
+    gateway_url: &str,
 ) -> Result<()> {
-    let (ws, _) = tokio_tungstenite::connect_async(GATEWAY_URL)
+    let (ws, _) = tokio_tungstenite::connect_async(gateway_url)
         .await
         .context("Discord Gateway connect")?;
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -690,6 +693,56 @@ impl InboundVoiceHandler {
             speakers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// Core of the `VoiceTick` arm, on plain data: `speaking` pairs each
+    /// active SSRC with its decoded PCM for this tick (`None` = not
+    /// decoded), `silent` lists SSRCs with no audio this tick. Factored
+    /// out of [`EventHandler::act`] because songbird's `VoiceTick` /
+    /// `VoiceData` are `#[non_exhaustive]` and cannot be constructed in
+    /// unit tests.
+    async fn on_voice_tick(&self, speaking: &[(u32, Option<&[i16]>)], silent: &[u32]) {
+        let mut speakers = self.speakers.lock().await;
+        // Active speakers — extend buffer with the tick's PCM.
+        for &(ssrc, pcm) in speaking {
+            if let Some(pcm) = pcm {
+                let entry = speakers.entry(ssrc).or_insert_with(|| SpeakerBuffer {
+                    pcm: Vec::new(),
+                    silent_ticks: 0,
+                    user_id: None,
+                });
+                entry.pcm.extend_from_slice(pcm);
+                entry.silent_ticks = 0;
+            }
+        }
+        // Silent speakers — increment silent counter and flush
+        // if past threshold.
+        let mut to_flush: Vec<(u32, SpeakerBuffer)> = Vec::new();
+        for ssrc in silent {
+            if let Some(entry) = speakers.get_mut(ssrc) {
+                entry.silent_ticks += 1;
+                if entry.silent_ticks >= SILENT_TICKS_THRESHOLD
+                    && entry.pcm.len() >= MIN_FLUSH_SAMPLES_48K_STEREO
+                {
+                    let drained = SpeakerBuffer {
+                        pcm: std::mem::take(&mut entry.pcm),
+                        silent_ticks: 0,
+                        user_id: entry.user_id,
+                    };
+                    to_flush.push((*ssrc, drained));
+                } else if entry.silent_ticks >= SILENT_TICKS_THRESHOLD {
+                    // Below min-samples — discard, don't STT.
+                    entry.pcm.clear();
+                }
+            }
+        }
+        drop(speakers);
+        for (ssrc, buf) in to_flush {
+            if let Err(e) = flush_buffer_to_inbox(ssrc, buf, &self.inbox, &self.cortex_config).await
+            {
+                debug!(ssrc, error = %e, "inbound voice flush failed");
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -708,48 +761,13 @@ impl EventHandler for InboundVoiceHandler {
                 entry.user_id = speaking.user_id.map(|u| u.0);
             }
             EventContext::VoiceTick(tick) => {
-                let mut speakers = self.speakers.lock().await;
-                // Active speakers — extend buffer with the tick's PCM.
-                for (&ssrc, data) in &tick.speaking {
-                    if let Some(ref pcm) = data.decoded_voice {
-                        let entry = speakers.entry(ssrc).or_insert_with(|| SpeakerBuffer {
-                            pcm: Vec::new(),
-                            silent_ticks: 0,
-                            user_id: None,
-                        });
-                        entry.pcm.extend_from_slice(pcm);
-                        entry.silent_ticks = 0;
-                    }
-                }
-                // Silent speakers — increment silent counter and flush
-                // if past threshold.
-                let mut to_flush: Vec<(u32, SpeakerBuffer)> = Vec::new();
-                for ssrc in &tick.silent {
-                    if let Some(entry) = speakers.get_mut(ssrc) {
-                        entry.silent_ticks += 1;
-                        if entry.silent_ticks >= SILENT_TICKS_THRESHOLD
-                            && entry.pcm.len() >= MIN_FLUSH_SAMPLES_48K_STEREO
-                        {
-                            let drained = SpeakerBuffer {
-                                pcm: std::mem::take(&mut entry.pcm),
-                                silent_ticks: 0,
-                                user_id: entry.user_id,
-                            };
-                            to_flush.push((*ssrc, drained));
-                        } else if entry.silent_ticks >= SILENT_TICKS_THRESHOLD {
-                            // Below min-samples — discard, don't STT.
-                            entry.pcm.clear();
-                        }
-                    }
-                }
-                drop(speakers);
-                for (ssrc, buf) in to_flush {
-                    if let Err(e) =
-                        flush_buffer_to_inbox(ssrc, buf, &self.inbox, &self.cortex_config).await
-                    {
-                        debug!(ssrc, error = %e, "inbound voice flush failed");
-                    }
-                }
+                let speaking: Vec<(u32, Option<&[i16]>)> = tick
+                    .speaking
+                    .iter()
+                    .map(|(&ssrc, data)| (ssrc, data.decoded_voice.as_deref()))
+                    .collect();
+                let silent: Vec<u32> = tick.silent.iter().copied().collect();
+                self.on_voice_tick(&speaking, &silent).await;
             }
             _ => {}
         }
@@ -876,5 +894,638 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(decoded.len(), samples.len());
+    }
+
+    /// Stub manager whose replies embed the arguments it received, so the
+    /// handle tests can verify both propagation and argument forwarding.
+    fn spawn_echo_stub() -> VoiceManagerHandle {
+        let (tx, mut rx) = mpsc::channel::<VoiceCommand>(8);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    VoiceCommand::Join {
+                        guild_id,
+                        channel_id,
+                        reply,
+                    } => {
+                        let _ = reply.send(Err(anyhow!("join {guild_id}:{channel_id}")));
+                    }
+                    VoiceCommand::Leave { guild_id, reply } => {
+                        let _ = reply.send(Err(anyhow!("leave {guild_id}")));
+                    }
+                    VoiceCommand::Play {
+                        guild_id,
+                        path,
+                        reply,
+                    } => {
+                        let _ = reply.send(Err(anyhow!("play {guild_id} {}", path.display())));
+                    }
+                    VoiceCommand::IsConnected { guild_id, reply } => {
+                        let _ = reply.send(guild_id == 1);
+                    }
+                    VoiceCommand::DrainTranscripts { guild_id, reply } => {
+                        let _ = reply.send(if guild_id == 1 {
+                            vec!["first".to_string(), "second".to_string()]
+                        } else {
+                            Vec::new()
+                        });
+                    }
+                    VoiceCommand::ResolveUserChannel { .. } => {}
+                }
+            }
+        });
+        handle_for_tests(tx)
+    }
+
+    /// The handle methods must round-trip through the manager task: the
+    /// command carries the caller's arguments and the caller sees the
+    /// manager's actual reply (not a fabricated success/default).
+    #[tokio::test]
+    async fn handle_methods_forward_args_and_return_manager_replies() {
+        let handle = spawn_echo_stub();
+
+        let err = handle.join(7, 8).await.unwrap_err();
+        assert_eq!(err.to_string(), "join 7:8");
+        let err = handle.leave(3).await.unwrap_err();
+        assert_eq!(err.to_string(), "leave 3");
+        let err = handle
+            .play(4, std::path::PathBuf::from("/tmp/clip.mp3"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "play 4 /tmp/clip.mp3");
+
+        assert!(handle.is_connected(1).await);
+        assert!(!handle.is_connected(2).await);
+
+        assert_eq!(
+            handle.drain_transcripts(1).await,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert!(handle.drain_transcripts(2).await.is_empty());
+    }
+
+    /// `init_voice_manager` must actually install the process-global
+    /// handle that `voice_manager_handle()` hands to dispatch sites.
+    /// Runs on the current-thread test runtime and never yields, so the
+    /// spawned manager task is dropped unpolled — no gateway connection
+    /// is ever dialed.
+    #[tokio::test]
+    async fn init_voice_manager_installs_global_handle() {
+        init_voice_manager("test-token".to_string(), CortexConfig::default());
+        assert!(voice_manager_handle().is_some(), "handle not installed");
+        // Idempotent — a second init keeps the handle installed.
+        init_voice_manager("other-token".to_string(), CortexConfig::default());
+        assert!(voice_manager_handle().is_some());
+    }
+
+    /// Drive `run_voice_manager` against a loopback WebSocket server:
+    /// after HELLO it must send a well-formed IDENTIFY (right token,
+    /// GUILDS + GUILD_VOICE_STATES intents) and then service commands
+    /// until the command channel closes.
+    #[tokio::test]
+    async fn run_voice_manager_identifies_and_services_commands() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (identify_tx, identify_rx) = oneshot::channel::<serde_json::Value>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = r#"{"op":10,"d":{"heartbeat_interval":45000}}"#;
+            ws.send(Message::Text(hello.to_string().into()))
+                .await
+                .unwrap();
+            let frame = loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) => break t.to_string(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("gateway closed before IDENTIFY: {other:?}"),
+                }
+            };
+            let _ = identify_tx.send(serde_json::from_str(&frame).unwrap());
+            // Hold the socket open until the client hangs up.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VoiceCommand>(4);
+        let url = format!("ws://{addr}");
+        let manager = tokio::spawn(async move {
+            run_voice_manager(
+                "sekrit-token".to_string(),
+                cmd_rx,
+                CortexConfig::default(),
+                &url,
+            )
+            .await
+        });
+
+        let identify = tokio::time::timeout(Duration::from_secs(5), identify_rx)
+            .await
+            .expect("timed out waiting for IDENTIFY")
+            .expect("manager never connected");
+        assert_eq!(identify["op"].as_i64(), Some(2));
+        assert_eq!(identify["d"]["token"].as_str(), Some("sekrit-token"));
+        assert_eq!(identify["d"]["intents"].as_u64(), Some(129));
+
+        // The command loop is live: IsConnected round-trips a reply.
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(VoiceCommand::IsConnected {
+                guild_id: 1,
+                reply: tx,
+            })
+            .await
+            .expect("manager dropped the command channel");
+        let connected = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("timed out waiting for IsConnected reply")
+            .unwrap();
+        assert!(!connected, "no guild joined yet");
+
+        // Closing the command channel ends the manager loop cleanly.
+        drop(cmd_tx);
+        tokio::time::timeout(Duration::from_secs(5), manager)
+            .await
+            .expect("manager did not exit after command channel close")
+            .unwrap()
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn next_gateway_message_skips_control_frames_and_stops_on_close() {
+        type WsResult = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        // Control/binary frames are skipped; each call pops the next text.
+        let mut s = futures_util::stream::iter::<Vec<WsResult>>(vec![
+            Ok(Message::Ping(Vec::new().into())),
+            Ok(Message::Binary(vec![1, 2].into())),
+            Ok(Message::Pong(Vec::new().into())),
+            Ok(Message::Text("payload".to_string().into())),
+            Ok(Message::Text("second".to_string().into())),
+        ]);
+        assert_eq!(next_gateway_message(&mut s).await.as_deref(), Some("payload"));
+        assert_eq!(next_gateway_message(&mut s).await.as_deref(), Some("second"));
+        assert_eq!(next_gateway_message(&mut s).await, None, "stream exhausted");
+
+        // Close terminates immediately, even with text queued behind it.
+        let mut closed = futures_util::stream::iter::<Vec<WsResult>>(vec![
+            Ok(Message::Close(None)),
+            Ok(Message::Text("late".to_string().into())),
+        ]);
+        assert_eq!(next_gateway_message(&mut closed).await, None);
+    }
+
+    fn test_guild_state(channel_id: u64) -> GuildState {
+        GuildState {
+            driver: Driver::new(SongbirdConfig::default()),
+            channel_id,
+            pending_session_id: None,
+            pending_endpoint_token: None,
+            join_replies: Vec::new(),
+            inbox: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    type EventState = (
+        Arc<Mutex<Option<u64>>>,
+        Arc<Mutex<Option<u64>>>,
+        Arc<Mutex<HashMap<u64, GuildState>>>,
+        VoiceStateCache,
+    );
+
+    fn fresh_event_state() -> EventState {
+        (
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+    }
+
+    /// `handle_command` must service every command variant: replies carry
+    /// real state (not defaults), and Join/Leave put the correct op-4
+    /// frames on the gateway socket.
+    #[tokio::test]
+    async fn handle_command_services_each_command_variant() {
+        let (mut sink, mut sent) = futures::channel::mpsc::unbounded::<Message>();
+        let guilds: Arc<Mutex<HashMap<u64, GuildState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let our_user_id: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let voice_states: VoiceStateCache = Arc::new(Mutex::new(HashMap::new()));
+        let config = Arc::new(CortexConfig::default());
+        voice_states.lock().await.insert((1, 42), Some(777));
+        voice_states.lock().await.insert((1, 43), None);
+
+        let mut next_sent = || {
+            let msg = sent.try_recv().expect("no frame sent");
+            let Message::Text(t) = msg else {
+                panic!("expected text frame");
+            };
+            serde_json::from_str::<serde_json::Value>(&t).unwrap()
+        };
+
+        // ResolveUserChannel reads the voice-state cache.
+        for (user_id, want) in [(42u64, Some(777u64)), (43, None), (9, None)] {
+            let (tx, rx) = oneshot::channel();
+            handle_command(
+                VoiceCommand::ResolveUserChannel {
+                    guild_id: 1,
+                    user_id,
+                    reply: tx,
+                },
+                &mut sink,
+                &guilds,
+                &our_user_id,
+                &voice_states,
+                config.clone(),
+                "t",
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.await.unwrap(), want, "user {user_id}");
+        }
+
+        // Not joined anywhere yet.
+        let (tx, rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::IsConnected {
+                guild_id: 1,
+                reply: tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        assert!(!rx.await.unwrap());
+
+        // Join registers guild state and sends the op-4 join frame.
+        let (join_tx, mut join_rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::Join {
+                guild_id: 1,
+                channel_id: 777,
+                reply: join_tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        let frame = next_sent();
+        assert_eq!(frame["op"].as_i64(), Some(4));
+        assert_eq!(frame["d"]["guild_id"].as_str(), Some("1"));
+        assert_eq!(frame["d"]["channel_id"].as_str(), Some("777"));
+        // The join reply stays queued until both gateway halves arrive.
+        assert!(join_rx.try_recv().is_err());
+        assert!(guilds.lock().await.contains_key(&1));
+
+        let (tx, rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::IsConnected {
+                guild_id: 1,
+                reply: tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        assert!(rx.await.unwrap());
+
+        // DrainTranscripts empties the guild inbox exactly once.
+        {
+            let g = guilds.lock().await;
+            g.get(&1).unwrap().inbox.lock().await.push("hi".to_string());
+        }
+        for want in [vec!["hi".to_string()], Vec::new()] {
+            let (tx, rx) = oneshot::channel();
+            handle_command(
+                VoiceCommand::DrainTranscripts {
+                    guild_id: 1,
+                    reply: tx,
+                },
+                &mut sink,
+                &guilds,
+                &our_user_id,
+                &voice_states,
+                config.clone(),
+                "t",
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.await.unwrap(), want);
+        }
+
+        // Play fails for a guild we haven't joined, succeeds for one we have.
+        let (tx, rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::Play {
+                guild_id: 2,
+                path: std::path::PathBuf::from("/tmp/clip.mp3"),
+                reply: tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("not in a voice channel"),
+            "{err}"
+        );
+        let (tx, rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::Play {
+                guild_id: 1,
+                path: std::path::PathBuf::from("/tmp/clip.mp3"),
+                reply: tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+
+        // Leave drops the guild state and sends the op-4 null-channel frame.
+        let (tx, rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::Leave {
+                guild_id: 1,
+                reply: tx,
+            },
+            &mut sink,
+            &guilds,
+            &our_user_id,
+            &voice_states,
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+        assert!(!guilds.lock().await.contains_key(&1));
+        let frame = next_sent();
+        assert_eq!(frame["op"].as_i64(), Some(4));
+        assert_eq!(frame["d"]["guild_id"].as_str(), Some("1"));
+        assert!(frame["d"]["channel_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn process_event_records_seq_and_ready_user_id() {
+        let (last_seq, our_user_id, guilds, voice_states) = fresh_event_state();
+        process_event(
+            r#"{"op":0,"s":7,"t":"READY","d":{"user":{"id":"555"}}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*last_seq.lock().await, Some(7));
+        assert_eq!(*our_user_id.lock().await, Some(555));
+
+        // Non-dispatch frames record the seq but never touch dispatch state.
+        process_event(
+            r#"{"op":11,"s":8,"t":"READY","d":{"user":{"id":"999"}}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*last_seq.lock().await, Some(8));
+        assert_eq!(*our_user_id.lock().await, Some(555), "op 11 must be ignored");
+    }
+
+    #[tokio::test]
+    async fn voice_state_update_caches_all_users_but_captures_only_our_session() {
+        let (last_seq, our_user_id, guilds, voice_states) = fresh_event_state();
+        *our_user_id.lock().await = Some(9);
+        guilds.lock().await.insert(1, test_guild_state(5));
+
+        // Another user's update populates the cache but must not be
+        // mistaken for our join's session half.
+        process_event(
+            r#"{"op":0,"t":"VOICE_STATE_UPDATE","d":{"user_id":"42","guild_id":"1","channel_id":"777","session_id":"not-ours"}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(voice_states.lock().await.get(&(1, 42)), Some(&Some(777)));
+        assert_eq!(guilds.lock().await.get(&1).unwrap().pending_session_id, None);
+
+        // Our own update captures the session id for join completion.
+        process_event(
+            r#"{"op":0,"t":"VOICE_STATE_UPDATE","d":{"user_id":"9","guild_id":"1","channel_id":"777","session_id":"sess-9"}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            guilds.lock().await.get(&1).unwrap().pending_session_id,
+            Some("sess-9".to_string())
+        );
+        assert_eq!(voice_states.lock().await.get(&(1, 9)), Some(&Some(777)));
+
+        // A null channel_id means the user left voice — the cache keeps
+        // the entry with None so /voice join knows they're not in voice.
+        process_event(
+            r#"{"op":0,"t":"VOICE_STATE_UPDATE","d":{"user_id":"42","guild_id":"1","channel_id":null}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(voice_states.lock().await.get(&(1, 42)), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn voice_server_update_stores_endpoint_and_token() {
+        let (last_seq, our_user_id, guilds, voice_states) = fresh_event_state();
+        *our_user_id.lock().await = Some(9);
+        guilds.lock().await.insert(1, test_guild_state(5));
+
+        process_event(
+            r#"{"op":0,"t":"VOICE_SERVER_UPDATE","d":{"guild_id":"1","endpoint":"ep.example:443","token":"tok"}}"#,
+            &last_seq,
+            &our_user_id,
+            &guilds,
+            &voice_states,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            guilds.lock().await.get(&1).unwrap().pending_endpoint_token,
+            Some(("ep.example:443".to_string(), "tok".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn try_complete_join_fails_queued_joins_on_zero_channel() {
+        // Terminal branch: channel_id 0 must unblock queued joins with an
+        // error rather than leaving them hanging.
+        let mut state = test_guild_state(0);
+        state.pending_session_id = Some("sid".to_string());
+        state.pending_endpoint_token = Some(("ep".to_string(), "tok".to_string()));
+        let (tx_a, mut rx_a) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
+        state.join_replies.push(tx_a);
+        state.join_replies.push(tx_b);
+
+        try_complete_join(&mut state, 1, 9).await;
+
+        for rx in [&mut rx_a, &mut rx_b] {
+            let err = rx.try_recv().expect("join caller left hanging").unwrap_err();
+            assert!(err.to_string().contains("invalid voice channel_id 0"), "{err}");
+        }
+        assert!(state.join_replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_complete_join_waits_until_both_halves_arrive() {
+        // Only the session half present — nothing must complete or fail.
+        let mut state = test_guild_state(5);
+        state.pending_session_id = Some("sid".to_string());
+        let (tx, mut rx) = oneshot::channel();
+        state.join_replies.push(tx);
+
+        try_complete_join(&mut state, 1, 9).await;
+
+        assert!(rx.try_recv().is_err(), "reply must stay queued");
+        assert_eq!(state.join_replies.len(), 1);
+        assert_eq!(state.pending_session_id, Some("sid".to_string()));
+    }
+
+    /// Handler whose STT is the hermetic command-template provider — the
+    /// transcript is whatever the shell command prints. No network, no keys.
+    fn handler_with_stub_stt(transcript: &str) -> InboundVoiceHandler {
+        let mut config = CortexConfig::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".into(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(10_000),
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some(format!(": {{audio_file}} && printf '{transcript}'")),
+        }];
+        InboundVoiceHandler::new(Arc::new(Mutex::new(Vec::new())), Arc::new(config))
+    }
+
+    fn speaking_update(ssrc: u32, user_id: u64) -> EventContext<'static> {
+        EventContext::SpeakingStateUpdate(songbird::model::payload::Speaking {
+            delay: Some(0),
+            speaking: songbird::model::SpeakingState::MICROPHONE,
+            ssrc,
+            user_id: Some(songbird::model::id::UserId(user_id)),
+        })
+    }
+
+    #[tokio::test]
+    async fn speaking_state_update_maps_ssrc_to_user() {
+        let handler = handler_with_stub_stt("unused");
+        handler.act(&speaking_update(10, 4242)).await;
+        let speakers = handler.speakers.lock().await;
+        assert_eq!(speakers.get(&10).expect("speaker registered").user_id, Some(4242));
+    }
+
+    #[tokio::test]
+    async fn voice_tick_flushes_after_full_silence_threshold() {
+        let handler = handler_with_stub_stt("voice hi");
+        handler.act(&speaking_update(10, 4242)).await;
+        let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
+        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+
+        // 49 silent ticks (0.98s) — still below the 1s threshold.
+        for _ in 0..SILENT_TICKS_THRESHOLD - 1 {
+            handler.on_voice_tick(&[], &[10]).await;
+        }
+        assert!(
+            handler.inbox.lock().await.is_empty(),
+            "flushed before the silence threshold"
+        );
+
+        // The 50th tick crosses the threshold: STT runs and the transcript
+        // lands on the inbox with the speaker's user mention prefix.
+        handler.on_voice_tick(&[], &[10]).await;
+        assert_eq!(
+            *handler.inbox.lock().await,
+            vec!["[<@4242>]: voice hi".to_string()]
+        );
+
+        // The buffer was consumed — further silence must not re-flush.
+        handler.on_voice_tick(&[], &[10]).await;
+        assert_eq!(handler.inbox.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_tick_discards_sub_250ms_buffer_without_stt() {
+        let handler = handler_with_stub_stt("must-not-appear");
+        // Half the 250ms minimum — a blip, not speech.
+        let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO / 2];
+        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+        for _ in 0..SILENT_TICKS_THRESHOLD {
+            handler.on_voice_tick(&[], &[10]).await;
+        }
+        assert!(
+            handler.inbox.lock().await.is_empty(),
+            "short blip must be discarded, not transcribed"
+        );
+        let speakers = handler.speakers.lock().await;
+        assert!(speakers.get(&10).unwrap().pcm.is_empty(), "buffer not discarded");
+    }
+
+    #[tokio::test]
+    async fn voice_tick_retains_buffer_during_brief_silence() {
+        let handler = handler_with_stub_stt("unused");
+        let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
+        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+        handler.on_voice_tick(&[], &[10]).await;
+
+        let speakers = handler.speakers.lock().await;
+        let entry = speakers.get(&10).unwrap();
+        assert_eq!(entry.silent_ticks, 1, "one silent tick counted");
+        assert_eq!(
+            entry.pcm.len(),
+            MIN_FLUSH_SAMPLES_48K_STEREO,
+            "buffer must survive a brief pause"
+        );
+        assert!(handler.inbox.lock().await.is_empty());
     }
 }
