@@ -352,21 +352,21 @@ mod tests {
         String::new()
     }
 
-    /// Send markdown text through a real `send_message` call against a mock
-    /// daemon and assert the daemon receives delimiter-stripped text plus the
-    /// matching Signal `textStyle` ranges. Regression guard: the send path
-    /// previously dropped all styling (callers passed `None`), so `**bold**`
-    /// reached the wire verbatim with no `textStyle`.
-    #[tokio::test]
-    async fn send_message_converts_markdown_to_text_styles_on_the_wire() {
+    /// Canned success response for RPC methods whose result payload is unused.
+    const OK_RESULT: &str = r#"{"jsonrpc":"2.0","result":{},"id":"1"}"#;
+
+    /// Spawn a one-shot mock signal-cli daemon on a loopback socket. It
+    /// answers the first request with `resp_body` and resolves its join
+    /// handle to the raw request body it received.
+    async fn spawn_rpc_mock(
+        resp_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
-
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let body = read_request_body(&mut sock).await;
-            let resp_body = r#"{"jsonrpc":"2.0","result":{},"id":"1"}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 resp_body.len(),
@@ -376,15 +376,38 @@ mod tests {
             sock.shutdown().await.ok();
             body
         });
+        (base, server)
+    }
 
+    /// Await the mock daemon's recorded request body and parse it as JSON.
+    /// Fails fast if `what` never issued an RPC at all — the guard that
+    /// catches a client method silently short-circuiting to `Ok(())`.
+    async fn recv_rpc(
+        server: tokio::task::JoinHandle<String>,
+        what: &str,
+    ) -> serde_json::Value {
+        let body = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap_or_else(|_| panic!("{what} must issue an RPC request"))
+            .unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// Send markdown text through a real `send_message` call against a mock
+    /// daemon and assert the daemon receives delimiter-stripped text plus the
+    /// matching Signal `textStyle` ranges. Regression guard: the send path
+    /// previously dropped all styling (callers passed `None`), so `**bold**`
+    /// reached the wire verbatim with no `textStyle`.
+    #[tokio::test]
+    async fn send_message_converts_markdown_to_text_styles_on_the_wire() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
         let client = SignalClient::new(&base, "+15559876543").unwrap();
         client
             .send_message("+15551234567", "**bold**")
             .await
             .unwrap();
 
-        let sent = server.await.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        let json = recv_rpc(server, "send_message").await;
         assert_eq!(json["method"], "send");
         let params = &json["params"];
         assert_eq!(
@@ -397,6 +420,117 @@ mod tests {
             serde_json::json!([{ "start": 0, "length": 4, "style": "BOLD" }]),
             "bold span must be sent as a Signal textStyle range"
         );
+    }
+
+    /// `send_group_message` must address the RPC by `groupId` (not
+    /// `recipient`) and carry the rendered markdown like the 1:1 path.
+    #[tokio::test]
+    async fn send_group_message_posts_send_rpc_with_group_id() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client
+            .send_group_message("grp-123", "hello **team**")
+            .await
+            .unwrap();
+
+        let json = recv_rpc(server, "send_group_message").await;
+        assert_eq!(json["method"], "send");
+        let params = &json["params"];
+        assert_eq!(params["groupId"], "grp-123");
+        assert_eq!(params["message"], "hello team");
+        assert_eq!(
+            params["textStyle"],
+            serde_json::json!([{ "start": 6, "length": 4, "style": "BOLD" }])
+        );
+        assert!(
+            params.get("recipient").is_none(),
+            "group sends must not carry a recipient field"
+        );
+    }
+
+    /// `send_typing` must issue a `sendTyping` RPC addressed to the recipient.
+    #[tokio::test]
+    async fn send_typing_posts_send_typing_rpc() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client
+            .send_typing(Some("+15551230000"), None)
+            .await
+            .unwrap();
+
+        let json = recv_rpc(server, "send_typing").await;
+        assert_eq!(json["method"], "sendTyping");
+        let params = &json["params"];
+        assert_eq!(params["account"], "+15559876543");
+        assert_eq!(params["recipient"], serde_json::json!(["+15551230000"]));
+        assert!(
+            params.get("groupId").is_none(),
+            "no groupId for a 1:1 typing indicator"
+        );
+    }
+
+    /// `send_read_receipt` must issue a `sendReceipt` RPC of type `read`
+    /// covering every supplied timestamp.
+    #[tokio::test]
+    async fn send_read_receipt_posts_send_receipt_rpc() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client
+            .send_read_receipt("+15551230000", &[1_700_000_000_123, 1_700_000_000_456])
+            .await
+            .unwrap();
+
+        let json = recv_rpc(server, "send_read_receipt").await;
+        assert_eq!(json["method"], "sendReceipt");
+        let params = &json["params"];
+        assert_eq!(params["type"], "read");
+        assert_eq!(params["recipient"], "+15551230000");
+        assert_eq!(
+            params["targetTimestamp"],
+            serde_json::json!([1_700_000_000_123i64, 1_700_000_000_456i64])
+        );
+    }
+
+    /// `send_reaction` must issue a `sendReaction` RPC carrying the emoji,
+    /// target message coordinates, and the remove flag.
+    #[tokio::test]
+    async fn send_reaction_posts_send_reaction_rpc() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client
+            .send_reaction(
+                "+15551230000",
+                None,
+                "\u{1F44D}",
+                "+15559999999",
+                1_700_000_000_123,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let json = recv_rpc(server, "send_reaction").await;
+        assert_eq!(json["method"], "sendReaction");
+        let params = &json["params"];
+        assert_eq!(params["emoji"], "\u{1F44D}");
+        assert_eq!(params["targetAuthor"], "+15559999999");
+        assert_eq!(params["targetTimestamp"], 1_700_000_000_123i64);
+        assert_eq!(params["remove"], false);
+        assert_eq!(params["recipient"], serde_json::json!(["+15551230000"]));
+    }
+
+    /// `probe` must call the `version` RPC and surface the daemon's actual
+    /// version string, not a placeholder.
+    #[tokio::test]
+    async fn probe_returns_daemon_version_string() {
+        let (base, server) =
+            spawn_rpc_mock(r#"{"jsonrpc":"2.0","result":{"version":"0.13.4"},"id":"1"}"#).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        let version = client.probe().await.unwrap();
+        assert_eq!(version, "0.13.4");
+
+        let json = recv_rpc(server, "probe").await;
+        assert_eq!(json["method"], "version");
     }
 
     /// `download_attachment` must accept bodies far larger than the old, broken

@@ -29,14 +29,19 @@ impl SlidingWindowLimiter {
     }
 
     pub fn check(&mut self, key: &str) -> bool {
+        self.check_at(key, Instant::now())
+    }
+
+    /// Core of [`Self::check`] with the clock injected, so window-boundary and
+    /// sweep-cadence behavior can be pinned deterministically in tests.
+    fn check_at(&mut self, key: &str, now: Instant) -> bool {
         self.check_count += 1;
         // Amortized sweep: pruning every call would be O(keys) per request, and
         // never pruning leaks a window per distinct client IP.
         if self.check_count.is_multiple_of(50) {
-            self.prune_stale();
+            self.prune_stale(now);
         }
 
-        let now = Instant::now();
         let cutoff = now - self.window_duration;
 
         // Reject new keys if at capacity to prevent unbounded memory growth
@@ -58,8 +63,7 @@ impl SlidingWindowLimiter {
         true
     }
 
-    fn prune_stale(&mut self) {
-        let now = Instant::now();
+    fn prune_stale(&mut self, now: Instant) {
         let cutoff = now - self.window_duration;
         self.windows.retain(|_, window| {
             while window.front().is_some_and(|&t| t < cutoff) {
@@ -121,24 +125,73 @@ mod tests {
 
     #[test]
     fn sliding_window_expires_old_entries() {
-        let mut limiter = SlidingWindowLimiter::new(2, Duration::from_millis(50));
-        assert!(limiter.check("x"));
-        assert!(limiter.check("x"));
-        assert!(!limiter.check("x"));
-        std::thread::sleep(Duration::from_millis(80));
+        let window = Duration::from_secs(1);
+        let mut limiter = SlidingWindowLimiter::new(2, window);
+        let t0 = Instant::now();
+        assert!(limiter.check_at("x", t0));
+        assert!(limiter.check_at("x", t0));
+        assert!(!limiter.check_at("x", t0));
         // After expiry, the window is empty again.
-        assert!(limiter.check("x"));
+        assert!(limiter.check_at("x", t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn window_boundary_is_inclusive() {
+        // Expiry is strict (`t < cutoff`): an entry aged exactly
+        // `window_duration` has not yet left the window, so a request landing
+        // on the boundary instant still counts against the limit.
+        let window = Duration::from_secs(60);
+        let mut limiter = SlidingWindowLimiter::new(1, window);
+        let t0 = Instant::now();
+        assert!(limiter.check_at("k", t0));
+        assert!(
+            !limiter.check_at("k", t0 + window),
+            "entry aged exactly window_duration must still count toward the limit"
+        );
+        assert!(
+            limiter.check_at("k", t0 + window + Duration::from_nanos(1)),
+            "entry strictly older than window_duration must expire"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_runs_on_the_50th_check_not_before() {
+        // The stale-key sweep is amortized to every 50th check. Between
+        // sweeps a stale key still occupies a capacity slot; the sweep on the
+        // 50th check frees it. If the check counter stopped advancing (stuck
+        // at zero) the sweep would run on every call and the very second
+        // check would already admit the new key.
+        let window = Duration::from_secs(1);
+        let mut limiter = SlidingWindowLimiter::new(10, window);
+        limiter.max_keys = 1;
+        let t0 = Instant::now();
+        assert!(limiter.check_at("old", t0));
+        let later = t0 + Duration::from_secs(5);
+        // Checks 2..=49: no sweep yet, so the stale key blocks admission.
+        for n in 0..48 {
+            assert!(
+                !limiter.check_at("new", later),
+                "check #{} must not sweep the stale key",
+                n + 2
+            );
+        }
+        // Check #50 sweeps first, freeing the slot for the new key.
+        assert!(
+            limiter.check_at("new", later),
+            "the 50th check must run the stale sweep and admit the new key"
+        );
     }
 
     #[test]
     fn prune_stale_drops_empty_windows() {
-        let mut limiter = SlidingWindowLimiter::new(5, Duration::from_millis(20));
+        let window = Duration::from_secs(1);
+        let mut limiter = SlidingWindowLimiter::new(5, window);
+        let t0 = Instant::now();
         for _ in 0..3 {
-            assert!(limiter.check("ephemeral"));
+            assert!(limiter.check_at("ephemeral", t0));
         }
         assert!(limiter.windows.contains_key("ephemeral"));
-        std::thread::sleep(Duration::from_millis(40));
-        limiter.prune_stale();
+        limiter.prune_stale(t0 + Duration::from_secs(2));
         assert!(!limiter.windows.contains_key("ephemeral"));
     }
 }

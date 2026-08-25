@@ -434,6 +434,111 @@ mod tests {
         );
     }
 
+    /// Boundary inputs where a delimiter's lookahead lands on or past the end
+    /// of the string, and lone delimiters followed later by a doubled closer.
+    /// All must pass through verbatim with no styles — an off-by-one in the
+    /// lookahead bounds check panics on out-of-range indexing, and a lookahead
+    /// reading the wrong index mis-parses the lone delimiter as an opener and
+    /// silently drops user text.
+    #[test]
+    fn boundary_and_lone_delimiters_pass_through_verbatim() {
+        let cases = [
+            "``",    // double backtick at end — fence lookahead needs a 3rd char
+            "a``",   // fence lookahead lands exactly past the end
+            "ab*",   // trailing single star — bold lookahead at the last index
+            "ab|",   // trailing single pipe — spoiler lookahead at the last index
+            "ab~",   // trailing single tilde — strikethrough lookahead
+            "*ab**", // lone star then a doubled closer: not bold, not italic
+            "~ab~~", // lone tilde then a doubled closer: not strikethrough
+            "|ab||", // lone pipe then a doubled closer: not a spoiler
+        ];
+        for input in cases {
+            let result = markdown_to_signal(input);
+            assert_eq!(result.text, input, "text for {input:?}");
+            assert!(
+                result.styles.is_empty(),
+                "no styles expected for {input:?}, got {:?}",
+                result.styles
+            );
+        }
+    }
+
+    /// A fence opener is only the exact sequence ``` at position i..i+3.
+    /// Text before the fence must survive, and a stray backtick pair with a
+    /// non-backtick third char must not swallow following text as a block.
+    #[test]
+    fn fence_detection_uses_exact_backtick_offsets() {
+        // Leading text before a real fence is kept, fence content styled.
+        let result = markdown_to_signal("x```\ny\n```");
+        assert_eq!(result.text, "xy");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 1,
+                length: 1,
+                style: SignalStyle::Monospace,
+            }]
+        );
+
+        // The third backtick is checked at i+2, not at a scaled offset.
+        let result = markdown_to_signal("abc```\nx\n```");
+        assert_eq!(result.text, "abcx");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 3,
+                length: 1,
+                style: SignalStyle::Monospace,
+            }]
+        );
+    }
+
+    /// A single backtick never opens a fence, even when an unrelated ```
+    /// appears later — `\`a\`` stays inline code and the trailing orphan
+    /// fence passes through as text.
+    #[test]
+    fn single_backtick_is_inline_code_not_a_fence() {
+        let result = markdown_to_signal("`a`\nb\n```");
+        assert_eq!(result.text, "a\nb\n```");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 0,
+                length: 1,
+                style: SignalStyle::Monospace,
+            }]
+        );
+    }
+
+    /// An empty fenced block (```\n```), like empty inline delimiters, must
+    /// not emit a zero-length style span — Signal rejects those.
+    #[test]
+    fn empty_fenced_block_emits_no_style() {
+        let result = markdown_to_signal("```\n```");
+        assert_eq!(result.text, "");
+        assert!(
+            result.styles.is_empty(),
+            "empty code block must not emit a zero-length span, got {:?}",
+            result.styles
+        );
+    }
+
+    /// A spoiler opener requires BOTH pipes: text before `||` must never be
+    /// absorbed into the spoiler span.
+    #[test]
+    fn spoiler_after_leading_text() {
+        let result = markdown_to_signal("a||b||");
+        assert_eq!(result.text, "ab");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 1,
+                length: 1,
+                style: SignalStyle::Spoiler,
+            }]
+        );
+    }
+
     #[test]
     fn empty_input() {
         let result = markdown_to_signal("");
