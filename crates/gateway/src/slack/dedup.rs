@@ -63,6 +63,10 @@ mod tests {
         assert!(!dedup.is_duplicate_channel_ts("C1", "111.222"));
         assert!(!dedup.is_duplicate("EvB"));
         assert!(
+            dedup.is_duplicate("EvA"),
+            "a repeated event_id must dedupe — Slack retries redeliver the same event_id"
+        );
+        assert!(
             dedup.is_duplicate_channel_ts("C1", "111.222"),
             "(channel, ts) must dedupe regardless of event_id traffic"
         );

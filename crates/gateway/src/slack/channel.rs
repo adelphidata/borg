@@ -311,6 +311,57 @@ impl NativeChannel for SlackChannel {
 mod tests {
     use super::*;
 
+    const SECRET: &str = "test-signing-secret";
+
+    fn make_channel(base: &str, bot_user_id: Option<&str>) -> SlackChannel {
+        SlackChannel {
+            client: Arc::new(SlackClient::with_base("xoxb-test", base).unwrap()),
+            signing_secret: Some(SECRET.to_string()),
+            dedup: Arc::new(Mutex::new(EventDeduplicator::new())),
+            bot_user_id: bot_user_id.map(str::to_string),
+            config: cortex::config::Config::default(),
+        }
+    }
+
+    fn response_ctx(
+        channel: &str,
+        thread_ts: Option<&str>,
+        message_ts: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::to_value(SlackResponseContext {
+            channel_id: channel.to_string(),
+            thread_ts: thread_ts.map(str::to_string),
+            message_ts: message_ts.map(str::to_string),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn names_is_exactly_slack() {
+        let channel = make_channel("http://127.0.0.1:1", None);
+        assert_eq!(channel.names(), vec!["slack"]);
+    }
+
+    /// The mention token must wrap the configured bot user id in Slack's
+    /// `<@ID>` syntax — mention-mode activation compares inbound text
+    /// against exactly this string.
+    #[test]
+    fn bot_mention_wraps_configured_id() {
+        let channel = make_channel("http://127.0.0.1:1", Some("UBOT99"));
+        assert_eq!(channel.bot_mention().as_deref(), Some("<@UBOT99>"));
+        let unconfigured = make_channel("http://127.0.0.1:1", None);
+        assert_eq!(unconfigured.bot_mention(), None);
+    }
+
+    /// Slack implements `send_media` via files.upload, so it must advertise
+    /// media support — otherwise the egress path degrades every attachment
+    /// to a text description.
+    #[test]
+    fn supports_media_attachments_because_upload_is_implemented() {
+        let channel = make_channel("http://127.0.0.1:1", None);
+        assert!(channel.supports_media_attachments());
+    }
+
     #[test]
     fn response_context_roundtrip() {
         let ctx = SlackResponseContext {
@@ -366,5 +417,329 @@ mod tests {
             parsed.thread_ts.as_deref()
         };
         assert_eq!(resolved, None);
+    }
+
+    mod outbound {
+        use super::*;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn ok_json() -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true }))
+        }
+
+        /// `send_response` must actually post the mrkdwn-formatted text to
+        /// chat.postMessage and then swap the ack reaction (`eyes`) for the
+        /// done reaction (`white_check_mark`) on the inbound message.
+        #[tokio::test]
+        async fn send_response_posts_formatted_text_and_swaps_reactions() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postMessage"))
+                .and(body_json(serde_json::json!({
+                    "channel": "C1",
+                    "text": "*bold* done",
+                })))
+                .respond_with(ok_json())
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/reactions.remove"))
+                .and(body_json(serde_json::json!({
+                    "channel": "C1", "timestamp": "5.5", "name": "eyes",
+                })))
+                .respond_with(ok_json())
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/reactions.add"))
+                .and(body_json(serde_json::json!({
+                    "channel": "C1", "timestamp": "5.5", "name": "white_check_mark",
+                })))
+                .respond_with(ok_json())
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let channel = make_channel(&server.uri(), None);
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+            channel
+                .send_response(
+                    "**bold** done",
+                    &response_ctx("C1", None, Some("5.5")),
+                    &health,
+                )
+                .await
+                .expect("post must succeed");
+        }
+
+        /// A missing local file must surface as an error — reporting success
+        /// for media that never left the machine is the exact failure the
+        /// no-silent-swallowing invariant forbids.
+        #[tokio::test]
+        async fn send_media_errors_on_unreadable_file() {
+            let server = MockServer::start().await;
+            let channel = make_channel(&server.uri(), None);
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+            let err = channel
+                .send_media(
+                    std::path::Path::new("/nonexistent/borg-test-media.png"),
+                    None,
+                    &response_ctx("C1", None, None),
+                    &health,
+                )
+                .await
+                .expect_err("unreadable file must fail, never fake success");
+            assert!(
+                err.to_string().contains("failed to read media file"),
+                "got: {err}"
+            );
+        }
+
+        /// A readable file must reach files.upload exactly once.
+        #[tokio::test]
+        async fn send_media_uploads_file_bytes() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/files.upload"))
+                .respond_with(ok_json())
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let file_path = dir.path().join("report.txt");
+            std::fs::write(&file_path, b"attachment-bytes").unwrap();
+
+            let channel = make_channel(&server.uri(), None);
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+            channel
+                .send_media(
+                    &file_path,
+                    Some("caption"),
+                    &response_ctx("C1", None, None),
+                    &health,
+                )
+                .await
+                .expect("upload must succeed");
+        }
+
+        /// `start_typing` must hand back a live keepalive handle whose
+        /// initial trigger posts the thread status; a malformed context
+        /// yields no handle.
+        #[tokio::test]
+        async fn start_typing_fires_thread_status_for_valid_context() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/assistant.threads.setStatus"))
+                .and(body_json(serde_json::json!({
+                    "channel_id": "C1",
+                    "thread_ts": "7.7",
+                    "status": "is typing...",
+                })))
+                .respond_with(ok_json())
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            let channel = make_channel(&server.uri(), None);
+            assert!(
+                channel
+                    .start_typing(&serde_json::json!("not-an-object"))
+                    .is_none(),
+                "malformed context must not spawn a typing loop"
+            );
+
+            let handle = channel
+                .start_typing(&response_ctx("C1", Some("7.7"), None))
+                .expect("valid context must return a typing handle");
+            let mut fired = false;
+            for _ in 0..250 {
+                if !server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    fired = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            drop(handle);
+            assert!(fired, "initial typing trigger must hit the status endpoint");
+        }
+    }
+
+    mod webhook {
+        use super::*;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        type HmacSha256 = Hmac<Sha256>;
+
+        fn signed_headers(body: &str) -> HeaderMap {
+            let ts = chrono::Utc::now().timestamp().to_string();
+            let basestring = format!("v0:{ts}:{body}");
+            let mut mac = HmacSha256::new_from_slice(SECRET.as_bytes()).unwrap();
+            mac.update(basestring.as_bytes());
+            let sig = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
+            let mut h = HeaderMap::new();
+            h.insert("x-slack-request-timestamp", ts.parse().unwrap());
+            h.insert("x-slack-signature", sig.parse().unwrap());
+            h
+        }
+
+        fn envelope(text: &str, thread_ts: Option<&str>) -> String {
+            let mut event = serde_json::json!({
+                "type": "message",
+                "user": "U_USER",
+                "text": text,
+                "ts": "1700000000.000100",
+                "channel": "C1",
+                "channel_type": "channel",
+            });
+            if let Some(t) = thread_ts {
+                event["thread_ts"] = serde_json::Value::String(t.to_string());
+            }
+            serde_json::json!({
+                "type": "event_callback",
+                "token": "tok",
+                "team_id": "T1",
+                "event_id": "Ev1",
+                "event": event,
+            })
+            .to_string()
+        }
+
+        /// Mount conversations.history returning the given (user, text) rows
+        /// (newest first, matching Slack's API order) plus a permissive
+        /// reactions.add mock for the ack reaction.
+        async fn mount_history(server: &MockServer, rows: &[(&str, &str)]) {
+            let messages: Vec<serde_json::Value> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (user, text))| {
+                    serde_json::json!({ "user": user, "text": text, "ts": format!("{i}.0") })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/conversations.history"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "messages": messages })),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/reactions.add"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn run_webhook(channel: &SlackChannel, body: &str) -> String {
+            let config = cortex::config::Config::default();
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+            let ctx = WebhookContext {
+                config: &config,
+                health: &health,
+            };
+            let outcome = channel
+                .handle_webhook(&signed_headers(body), body, &ctx)
+                .await
+                .expect("webhook must be accepted");
+            match outcome {
+                WebhookOutcome::Message { inbound, .. } => inbound.text,
+                _ => panic!("expected a Message outcome"),
+            }
+        }
+
+        /// A top-level @mention must inject the channel history above the
+        /// current message, oldest first, each line as `<@user>: text`.
+        /// History rows are long enough (>90 chars) that any arithmetic
+        /// slip in the budget accumulator collapses the context.
+        #[tokio::test]
+        async fn top_level_mention_injects_history_oldest_first() {
+            let server = MockServer::start().await;
+            let t1 = "a".repeat(100);
+            let t2 = "b".repeat(100);
+            let t3 = "c".repeat(100);
+            // Slack returns newest first: t1 is newest, t3 oldest.
+            mount_history(&server, &[("U1", &t1), ("U2", &t2), ("U3", &t3)]).await;
+
+            let channel = make_channel(&server.uri(), None);
+            let text = run_webhook(&channel, &envelope("<@UOTHER> ping", None)).await;
+            assert_eq!(
+                text,
+                format!(
+                    "[Channel context]\n<@U3>: {t3}\n<@U2>: {t2}\n<@U1>: {t1}\n[Current message]\n<@UOTHER> ping"
+                )
+            );
+        }
+
+        /// The 8000-char budget must drop the lines that overflow it —
+        /// and only those. Three 3000-char lines: the first two fit
+        /// (6000), the third would reach 9000 and is cut.
+        #[tokio::test]
+        async fn history_injection_stops_at_char_budget() {
+            let server = MockServer::start().await;
+            // Each line is `<@Ux>: ` (7) + text (2992) + `\n` (1) = 3000 chars.
+            let t1 = "a".repeat(2992);
+            let t2 = "b".repeat(2992);
+            let t3 = "c".repeat(2992);
+            mount_history(&server, &[("U1", &t1), ("U2", &t2), ("U3", &t3)]).await;
+
+            let channel = make_channel(&server.uri(), None);
+            let text = run_webhook(&channel, &envelope("<@UOTHER> ping", None)).await;
+            assert_eq!(
+                text,
+                format!(
+                    "[Channel context]\n<@U3>: {t3}\n<@U2>: {t2}\n[Current message]\n<@UOTHER> ping"
+                ),
+                "the newest line (9000 chars cumulative) must be cut; the first two kept"
+            );
+        }
+
+        /// A line landing exactly on the 8000-char budget is still within
+        /// budget and must be kept — the cap is exclusive, not inclusive.
+        #[tokio::test]
+        async fn history_line_on_exact_budget_boundary_is_kept() {
+            let server = MockServer::start().await;
+            // Two lines of exactly 4000 chars: cumulative hits exactly 8000.
+            let t1 = "a".repeat(3992);
+            let t2 = "b".repeat(3992);
+            mount_history(&server, &[("U1", &t1), ("U2", &t2)]).await;
+
+            let channel = make_channel(&server.uri(), None);
+            let text = run_webhook(&channel, &envelope("<@UOTHER> ping", None)).await;
+            assert_eq!(
+                text,
+                format!(
+                    "[Channel context]\n<@U2>: {t2}\n<@U1>: {t1}\n[Current message]\n<@UOTHER> ping"
+                ),
+                "a line that lands exactly on the budget must not be cut"
+            );
+        }
+
+        /// A threaded @mention already carries its own conversation context;
+        /// injecting channel history there would duplicate it. Even with
+        /// history available, the text must pass through untouched.
+        #[tokio::test]
+        async fn threaded_mention_skips_history_injection() {
+            let server = MockServer::start().await;
+            mount_history(&server, &[("U1", "available history")]).await;
+
+            let channel = make_channel(&server.uri(), None);
+            let text =
+                run_webhook(&channel, &envelope("<@UOTHER> in thread", Some("1699.0"))).await;
+            assert_eq!(text, "<@UOTHER> in thread");
+        }
     }
 }

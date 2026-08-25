@@ -200,4 +200,36 @@ mod tests {
             assert_eq!(markdown_to_mrkdwn(input), input, "no-op for {input:?}");
         }
     }
+
+    /// Delimiter-scanning edge cases. Each row pins one boundary of the
+    /// two-char delimiter scan:
+    /// - a closing pair must be exactly two chars — a lone `*`/`_` inside
+    ///   or before a pair must never close (or open) bold;
+    /// - a trailing lone delimiter at end-of-line must not read past the
+    ///   buffer;
+    /// - `__` pairs must only open at a real `__`, not at arbitrary text;
+    /// - text after a closing pair resumes immediately after it (offset
+    ///   `end + 2`, not further).
+    #[test]
+    fn delimiter_scan_edge_cases() {
+        let cases = [
+            // Lone `*` inside a `**` pair is content, not a closer.
+            ("**a*b**", "*a*b*"),
+            // Unclosed bold with a trailing lone `*` — unchanged, no OOB.
+            ("**abc*", "**abc*"),
+            // Lone `*` never opens bold even with a `**` later on the line.
+            ("a*b**", "a*b**"),
+            // Underscore analog: unclosed `__` with a trailing lone `_`.
+            ("__abc_", "__abc_"),
+            // `__` pair after leading plain text converts; the text stays.
+            ("ab__cd__", "ab*cd*"),
+            // Lone `_` never opens bold even with a `__` later on the line.
+            ("a_b__", "a_b__"),
+            // Text after the closing `__` resumes right after the pair.
+            ("__ab__ tail", "*ab* tail"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(markdown_to_mrkdwn(input), expected, "input={input:?}");
+        }
+    }
 }

@@ -1239,9 +1239,10 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/auth.test"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": false, "error": "invalid_auth" }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": false, "error": "invalid_auth" })),
+                )
                 .mount(&server)
                 .await;
 
@@ -1309,9 +1310,10 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/chat.postMessage"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": false, "error": "is_archived" }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": false, "error": "is_archived" })),
+                )
                 .mount(&server)
                 .await;
 
@@ -1406,9 +1408,10 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/files.upload"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": false, "error": "invalid_auth" }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": false, "error": "invalid_auth" })),
+                )
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -1549,9 +1552,11 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/conversations.replies"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": false, "error": "thread_not_found" }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "ok": false, "error": "thread_not_found" }),
+                    ),
+                )
                 .mount(&server)
                 .await;
 
@@ -1614,10 +1619,7 @@ mod tests {
         /// with the method name. Table-driven over the four methods.
         #[tokio::test]
         async fn mutating_calls_send_payload_and_surface_api_errors() {
-            type Call = fn(
-                SlackClient,
-            )
-                -> futures::future::BoxFuture<'static, Result<()>>;
+            type Call = fn(SlackClient) -> futures::future::BoxFuture<'static, Result<()>>;
             let cases: Vec<(&str, serde_json::Value, Call)> = vec![
                 (
                     "chat.update",
@@ -1662,14 +1664,14 @@ mod tests {
                 let server = MockServer::start().await;
                 Mock::given(method("POST"))
                     .and(path(format!("/{api}")))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(
-                        serde_json::json!({ "ok": false, "error": "some_error" }),
-                    ))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(
+                            serde_json::json!({ "ok": false, "error": "some_error" }),
+                        ),
+                    )
                     .mount(&server)
                     .await;
-                let err = call(client(&server))
-                    .await
-                    .expect_err("ok:false must fail");
+                let err = call(client(&server)).await.expect_err("ok:false must fail");
                 let msg = err.to_string();
                 assert!(msg.contains(api), "error must name {api}: {msg}");
                 assert!(msg.contains("some_error"), "got: {msg}");
@@ -1743,6 +1745,204 @@ mod tests {
             let user = client.get_user_info("U55").await.unwrap();
             assert_eq!(user.id, "U55");
             assert_eq!(user.name, "alice");
+        }
+
+        /// conversations.list must request both channel types with the
+        /// caller's limit and parse the channels array — never quietly
+        /// return an empty list on success.
+        #[tokio::test]
+        async fn list_channels_sends_query_and_parses_channels() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.list"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("limit", "77"))
+                .and(query_param("types", "public_channel,private_channel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "channels": [
+                        { "id": "C1", "name": "general", "is_private": false },
+                        { "id": "G1", "name": "secret", "is_private": true },
+                    ]}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let channels = client.list_channels(77).await.unwrap();
+            assert_eq!(channels.len(), 2);
+            assert_eq!(channels[0].id, "C1");
+            assert!(channels[1].is_private);
+        }
+
+        #[tokio::test]
+        async fn list_channels_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.list"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": false, "error": "invalid_auth" })),
+                )
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .list_channels(10)
+                .await
+                .expect_err("ok:false must fail, never an empty channel list");
+            assert!(err.to_string().contains("invalid_auth"), "got: {err}");
+        }
+
+        /// conversations.info on `ok:true` must parse the channel object —
+        /// the ok-check must not treat success as failure.
+        #[tokio::test]
+        async fn get_channel_info_parses_channel_on_success() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.info"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(query_param("channel", "C42"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_body(
+                    serde_json::json!({ "channel": {
+                        "id": "C42", "name": "general", "is_private": false,
+                    }}),
+                )))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let info = client.get_channel_info("C42").await.unwrap();
+            assert_eq!(info.id, "C42");
+            assert_eq!(info.name.as_deref(), Some("general"));
+        }
+
+        #[tokio::test]
+        async fn get_channel_info_surfaces_api_error_with_hint() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/conversations.info"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "channel_not_found" }),
+                ))
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            let err = client
+                .get_channel_info("C42")
+                .await
+                .expect_err("ok:false must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("channel_not_found"), "got: {msg}");
+        }
+
+        /// chat.postEphemeral must ship channel+user+text (and thread_ts
+        /// when threaded) and surface `ok:false` — an ephemeral that never
+        /// went out must not report success.
+        #[tokio::test]
+        async fn send_ephemeral_sends_payload_and_surfaces_api_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postEphemeral"))
+                .and(header("authorization", format!("Bearer {TOKEN}")))
+                .and(body_json(serde_json::json!({
+                    "channel": "C1",
+                    "user": "U1",
+                    "text": "only for you",
+                    "thread_ts": "9.9",
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat.postEphemeral"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": false, "error": "user_not_in_channel" }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = client(&server);
+            client
+                .send_ephemeral("C1", "U1", "only for you", Some("9.9"))
+                .await
+                .expect("ok:true must succeed");
+            let err = client
+                .send_ephemeral("C1", "U1", "only for you", Some("9.9"))
+                .await
+                .expect_err("ok:false must fail");
+            assert!(
+                err.to_string().contains("user_not_in_channel"),
+                "got: {err}"
+            );
+        }
+
+        /// views.open / views.update / views.publish all wrap the view in a
+        /// method-specific envelope; each must actually POST that payload
+        /// and surface `ok:false` instead of pretending the view rendered.
+        #[tokio::test]
+        async fn views_calls_send_payload_and_surface_api_errors() {
+            type Call = fn(SlackClient) -> futures::future::BoxFuture<'static, Result<()>>;
+            fn view() -> serde_json::Value {
+                serde_json::json!({ "type": "modal", "title": { "type": "plain_text", "text": "Hi" } })
+            }
+            let cases: Vec<(&str, serde_json::Value, Call)> = vec![
+                (
+                    "views.open",
+                    serde_json::json!({ "trigger_id": "tr1", "view": view() }),
+                    |c| Box::pin(async move { c.views_open("tr1", view()).await }),
+                ),
+                (
+                    "views.update",
+                    serde_json::json!({ "view_id": "V1", "view": view() }),
+                    |c| Box::pin(async move { c.views_update("V1", view()).await }),
+                ),
+                (
+                    "views.publish",
+                    serde_json::json!({ "user_id": "U1", "view": view() }),
+                    |c| Box::pin(async move { c.views_publish("U1", view()).await }),
+                ),
+            ];
+
+            for (api, expected_body, call) in cases {
+                // Success round: the envelope must reach the endpoint.
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/{api}")))
+                    .and(header("authorization", format!("Bearer {TOKEN}")))
+                    .and(body_json(expected_body.clone()))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(ok_body(serde_json::json!({}))),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                call(client(&server))
+                    .await
+                    .unwrap_or_else(|e| panic!("{api} ok:true must succeed: {e}"));
+
+                // Error round: ok:false must fail and name the method.
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(format!("/{api}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({ "ok": false, "error": "invalid_trigger_id" }),
+                    ))
+                    .mount(&server)
+                    .await;
+                let err = call(client(&server)).await.expect_err("ok:false must fail");
+                let msg = err.to_string();
+                assert!(msg.contains(api), "error must name {api}: {msg}");
+                assert!(msg.contains("invalid_trigger_id"), "got: {msg}");
+            }
         }
     }
 }
