@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/api/schema/stryker-core.json",
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "inPlace": true,
+  "reporters": ["clear-text", "json", "progress"],
+  "mutate": ["src/**/*.{ts,tsx}", "!src/**/*.test.{ts,tsx}", "!src/test/**", "!src/index.ts"],
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true
+}
