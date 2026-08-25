@@ -4938,7 +4938,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7274,7 +7274,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7484,7 +7484,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "which 7.0.3",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

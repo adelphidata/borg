@@ -41,7 +41,7 @@ tracing-subscriber = { workspace = true }
 # kernel I/O. Integration tests can't see regular [dependencies], so the
 # minimal feature slice is mirrored here.
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Pipes",
@@ -53,7 +53,7 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(target_os = "windows")'.dependencies]
 sha2 = "0.10"
 hkdf = "0.12"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
