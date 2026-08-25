@@ -493,6 +493,140 @@ mod tests {
         );
     }
 
+    /// An unclosed fence whose input ends in two backticks must pass through
+    /// verbatim. The closing-fence scan looks at `i`, `i+1`, `i+2`; an
+    /// off-by-one in its bounds check (`i + 2 <= len`) indexes one past the
+    /// end and panics exactly on this shape.
+    #[test]
+    fn unclosed_fence_ending_in_two_backticks_passes_through() {
+        let result = markdown_to_signal("```\nx``");
+        assert_eq!(result.text, "```\nx``");
+        assert!(result.styles.is_empty(), "got {:?}", result.styles);
+    }
+
+    /// The closing-fence scan must require all THREE backticks at `i..i+3`.
+    /// A scan that re-reads `chars[i]` instead of `chars[i+1]` treats a
+    /// backtick-nonbacktick-backtick run inside the block as a closer and
+    /// truncates the code content.
+    #[test]
+    fn fence_close_requires_three_consecutive_backticks() {
+        let result = markdown_to_signal("```\n`a`\n```");
+        assert_eq!(result.text, "`a`");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 0,
+                length: 3,
+                style: SignalStyle::Monospace,
+            }]
+        );
+    }
+
+    /// Text after a closed fence must survive: the resume index is the close
+    /// position plus three, and a scaled index (`i * 3`) overshoots and drops
+    /// the tail.
+    #[test]
+    fn text_after_closed_fence_is_kept() {
+        let result = markdown_to_signal("```\nab\n``` tail");
+        assert_eq!(result.text, "ab tail");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 0,
+                length: 2,
+                style: SignalStyle::Monospace,
+            }]
+        );
+    }
+
+    /// A lone `*` inside bold content is content, not a closer: the closing
+    /// scan must check the SECOND delimiter char at `i+1`, otherwise `**a*b**`
+    /// closes at the single star and swallows the following char.
+    #[test]
+    fn single_star_inside_bold_content_is_kept() {
+        let result = markdown_to_signal("**a*b**");
+        assert_eq!(result.text, "a*b");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 0,
+                length: 3,
+                style: SignalStyle::Bold,
+            }]
+        );
+    }
+
+    /// A doubled `**` inside italic content is skipped by advancing exactly
+    /// two chars. A scaled advance (`i *= 2`) jumps past the real closer once
+    /// the doubled pair sits at index >= 4 and mis-parses the whole span.
+    #[test]
+    fn doubled_star_inside_italic_content_advances_by_two() {
+        let result = markdown_to_signal("xy*a**b*");
+        assert_eq!(result.text, "xya**b");
+        assert_eq!(
+            result.styles,
+            vec![TextStyle {
+                start: 2,
+                length: 4,
+                style: SignalStyle::Italic,
+            }]
+        );
+    }
+
+    /// A style contained entirely in the FIRST chunk must land there and only
+    /// there. This pins the overlap test's real span end (`start + length`):
+    /// a corrupted span end either drops the style from its own chunk or
+    /// leaks it into later chunks with underflowing offsets.
+    #[test]
+    fn chunk_style_in_first_chunk_only_stays_there() {
+        let input = format!("**{}**{}", "b".repeat(5), "a".repeat(7995));
+        let formatted = markdown_to_signal(&input);
+        assert_eq!(formatted.text.chars().count(), 8000);
+        assert_eq!(formatted.styles[0].start, 0);
+        assert_eq!(formatted.styles[0].length, 5);
+
+        let chunks = chunk_with_styles(&formatted, 4000);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0].styles,
+            vec![TextStyle {
+                start: 0,
+                length: 5,
+                style: SignalStyle::Bold,
+            }],
+            "the bold span belongs to the first chunk"
+        );
+        assert!(
+            chunks[1].styles.is_empty(),
+            "a span ending at char 5 must not leak into the second chunk, got {:?}",
+            chunks[1].styles
+        );
+    }
+
+    /// A zero-length span in the input must be dropped from every chunk —
+    /// Signal rejects zero-length style ranges, and multi-chunk remapping is
+    /// the last gate before the wire.
+    #[test]
+    fn chunk_drops_zero_length_styles() {
+        let formatted = FormattedText {
+            text: "a".repeat(8000),
+            styles: vec![TextStyle {
+                start: 100,
+                length: 0,
+                style: SignalStyle::Bold,
+            }],
+        };
+        let chunks = chunk_with_styles(&formatted, 4000);
+        assert_eq!(chunks.len(), 2);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.styles.is_empty(),
+                "chunk {i} must not carry a zero-length span, got {:?}",
+                chunk.styles
+            );
+        }
+    }
+
     /// A single backtick never opens a fence, even when an unrelated ```
     /// appears later — `\`a\`` stays inline code and the trailing orphan
     /// fence passes through as text.

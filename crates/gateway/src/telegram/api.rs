@@ -1270,6 +1270,206 @@ mod tests {
         );
     }
 
+    /// `send_typing` is fire-and-forget (always `Ok`), but it must actually
+    /// POST sendChatAction and feed 401s into the circuit breaker — that
+    /// breaker is what stops an invalid token from looping forever. After
+    /// threshold consecutive 401s, the send path must refuse with the breaker
+    /// open, not reach the network.
+    #[tokio::test]
+    async fn send_typing_401s_trip_breaker_and_block_sends() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let threshold = cortex::constants::TELEGRAM_CIRCUIT_FAILURE_THRESHOLD;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendChatAction"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Unauthorized"
+            })))
+            .expect(u64::from(threshold))
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        for _ in 0..threshold {
+            client
+                .send_typing(7)
+                .await
+                .expect("send_typing is fire-and-forget and must not error");
+        }
+
+        let err = client
+            .send_message(7, "hello", None, None, None)
+            .await
+            .expect_err("sends must be refused once the breaker is open");
+        assert!(
+            err.to_string().contains("circuit breaker open"),
+            "expected breaker refusal, got: {err}"
+        );
+    }
+
+    /// A successful (non-401) sendChatAction must NOT count toward the
+    /// breaker — typing indicators run constantly and would otherwise wedge
+    /// the send path on a healthy bot.
+    #[tokio::test]
+    async fn send_typing_success_does_not_trip_breaker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let threshold = cortex::constants::TELEGRAM_CIRCUIT_FAILURE_THRESHOLD;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        for _ in 0..threshold {
+            client.send_typing(7).await.unwrap();
+        }
+        client
+            .send_message(7, "hello", None, None, None)
+            .await
+            .expect("healthy typing indicators must leave the send path open");
+    }
+
+    /// `send_voice` must go over the wire and surface the API's failure
+    /// description — a swallowed error would report success for a voice note
+    /// that never arrived.
+    #[tokio::test]
+    async fn send_voice_surfaces_api_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendVoice"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: VOICE_MESSAGES_FORBIDDEN"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client
+            .send_voice(7, b"ogg-bytes", Some("caption"), None, None)
+            .await
+            .expect_err("an API failure must not report success");
+        assert!(
+            err.to_string().contains("VOICE_MESSAGES_FORBIDDEN"),
+            "API description must surface, got: {err}"
+        );
+    }
+
+    /// `send_voice` success path: the upload must actually hit sendVoice and
+    /// return Ok on `ok: true`.
+    #[tokio::test]
+    async fn send_voice_posts_to_send_voice_endpoint() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendVoice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        client
+            .send_voice(7, b"ogg-bytes", None, None, None)
+            .await
+            .expect("voice send must succeed on ok response");
+    }
+
+    /// `edit_message_text` and `delete_message` must round-trip through their
+    /// endpoints: `ok: true` succeeds, `ok: false` fails with the API's
+    /// description. Both directions per method — an inverted or stubbed-out
+    /// `ok` check would let callers believe an edit/delete happened
+    /// (streaming drafts and cleanup both depend on the real outcome).
+    #[tokio::test]
+    async fn edit_and_delete_report_real_api_outcome() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cases = [
+            ("editMessageText", "Bad Request: message is not modified"),
+            ("deleteMessage", "Bad Request: message can't be deleted"),
+        ];
+        for (api_method, description) in cases {
+            // Failure direction: ok=false must error with the description.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{api_method}")))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "description": description
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            let err = match api_method {
+                "editMessageText" => client
+                    .edit_message_text(7, 100, "new text", None, None)
+                    .await
+                    .expect_err("ok=false must surface as an error"),
+                _ => client
+                    .delete_message(7, 100)
+                    .await
+                    .expect_err("ok=false must surface as an error"),
+            };
+            assert!(
+                err.to_string().contains(description),
+                "{api_method}: description must surface, got: {err}"
+            );
+
+            // Success direction: ok=true must return Ok.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/bot123:ABC/{api_method}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            match api_method {
+                "editMessageText" => client
+                    .edit_message_text(7, 100, "new text", None, None)
+                    .await
+                    .expect("ok=true must succeed"),
+                _ => client
+                    .delete_message(7, 100)
+                    .await
+                    .expect("ok=true must succeed"),
+            }
+        }
+    }
+
     #[test]
     fn file_url_construction() {
         let client = TelegramClient::new("123:ABC").unwrap();
