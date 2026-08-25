@@ -86,7 +86,7 @@ vi.mock("nice-grpc-web", () => {
   };
 });
 
-import { WEB_SERVICES } from "./services.js";
+import { SERVICES, WEB_SERVICES } from "./services.js";
 import { createWebTransport } from "./web.js";
 
 beforeEach(() => {
@@ -119,9 +119,7 @@ describe("createWebTransport", () => {
   it("builds clients for the web services only — pki never gets a browser client", () => {
     createWebTransport({ baseUrl: "http://x", getToken: () => null });
     expect(fake.createdFor.sort()).toEqual(
-      [...WEB_SERVICES]
-        .map((name) => `borg.${name}.v1.${name[0].toUpperCase()}${name.slice(1)}`)
-        .sort(),
+      [...WEB_SERVICES].map((name) => SERVICES[name].fullName).sort(),
     );
     expect(fake.createdFor).not.toContain("borg.pki.v1.Pki");
   });
