@@ -61,7 +61,7 @@ ratatui = { version = "0.29", features = [
 ] }
 pretty_assertions = "1"
 url = "2"
-itertools = "0.14"
+itertools = "0.15"
 tui-textarea = "0.7"
 pulldown-cmark = "0.13"
 textwrap = "0.16"
