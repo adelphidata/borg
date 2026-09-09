@@ -165,13 +165,28 @@ mod unix {
             libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         }
 
-        // Spawn the real server in its own process group so we can signal the
-        // whole tree (the server may fork its own children). stdio is inherited
-        // — these fds are the parent's pipe ends, so JSON-RPC flows straight
-        // through us without a copy.
-        let mut child = match Command::new(&cmd).args(&args).process_group(0).spawn() {
+        // Spawn the real server in its own session so we can signal the whole
+        // tree (the server may fork its own children) and so a launcher shell's
+        // startup files cannot stop it on background terminal I/O. stdio is
+        // inherited — these fds are the parent's pipe ends, so JSON-RPC flows
+        // straight through us without a copy.
+        let mut command = Command::new(&cmd);
+        command.args(&args);
+        // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid`, both
+        // async-signal-safe, as `pre_exec` requires.
+        unsafe {
+            command.pre_exec(crate::process_group::detach_from_tty);
+        }
+        let mut child = match command.spawn() {
             Ok(c) => c,
-            Err(_) => return 127,
+            Err(e) => {
+                // 127 alone tells an operator nothing, and `pre_exec` failing is
+                // a second way to land here. This process has no tracing
+                // subscriber, but its stderr is the parent's pipe end, which the
+                // parent routes to the server's stderr log.
+                eprintln!("borg mcp watchdog: failed to spawn '{cmd}': {e}");
+                return 127;
+            }
         };
         let pgid = child.id() as i32; // group leader pid == pgid
 

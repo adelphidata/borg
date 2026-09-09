@@ -2026,7 +2026,7 @@ mod tests {
 
     /// A timed-out command must not leave its background jobs running.
     /// `kill_on_drop` reaps only the shell we spawned; without
-    /// `process_group(0)` at spawn time everything that shell backgrounded
+    /// a group leader at spawn time everything that shell backgrounded
     /// outlives the tool call and is reparented to init.
     #[cfg(unix)]
     #[tokio::test]

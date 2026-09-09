@@ -18,6 +18,54 @@
 
 #[cfg(unix)]
 mod imp {
+    /// `pre_exec` hook that makes the child a session leader, detached from the
+    /// parent's controlling terminal.
+    ///
+    /// This replaces a plain `process_group(0)`, which leaves the child in a
+    /// *background* process group of our own terminal session. A background
+    /// process that touches `/dev/tty` — a `stty` guard in the operator's
+    /// `.bashrc`, a tool probing terminal width — takes `SIGTTIN`/`SIGTTOU` and
+    /// **stops**. From our side the child simply never exits: the command hangs
+    /// until its timeout fires and we kill it. `setsid` removes the controlling
+    /// terminal entirely, so the same `/dev/tty` open fails fast with `ENXIO`
+    /// and the command runs to completion.
+    ///
+    /// The PGID == PID invariant every `killpg` here relies on is preserved:
+    /// `setsid` puts the caller in a new session *and* a new process group it
+    /// leads.
+    ///
+    /// The `EPERM` fallback guards one narrow case. `setsid` refuses when the
+    /// caller already leads a process group, which a freshly forked child
+    /// normally cannot: it inherits the parent's PGID, and that names a
+    /// *different* live process. It becomes possible only when the inherited
+    /// PGID is stale (its leader exited) and this child's fresh PID is recycled
+    /// onto exactly that number. Then PID == PGID already holds, `setpgid(0, 0)`
+    /// succeeds as a no-op, and containment survives — we just keep the
+    /// controlling terminal. Aborting the spawn over a PID collision would be
+    /// the worse trade.
+    ///
+    /// # Safety
+    ///
+    /// Called between `fork` and `exec`, so it must only use async-signal-safe
+    /// calls. `setsid` and `setpgid` are both on the POSIX list.
+    pub fn detach_from_tty() -> std::io::Result<()> {
+        // SAFETY: FFI call taking no pointers. In the forked child this either
+        // creates a new session or fails; it cannot affect the parent.
+        if unsafe { libc::setsid() } != -1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EPERM) {
+            return Err(err);
+        }
+        // SAFETY: FFI call taking no pointers. `(0, 0)` names the calling
+        // process and makes it its own group leader.
+        if unsafe { libc::setpgid(0, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Send `sig` to every process in `pgid`, falling back to per-member
     /// signalling when the group call is refused.
     ///
@@ -185,6 +233,67 @@ mod imp {
                 .expect("spawn sleep")
         }
 
+        /// Spec: `detach_from_tty` must still establish the PGID == PID
+        /// invariant when `setsid` is refused, rather than failing the spawn.
+        ///
+        /// The refusal happens when the caller already leads a process group.
+        /// That is reached here deliberately — `setpgid(0, 0)` in the forked
+        /// child before the call — because in production it needs a PID
+        /// recycled onto a stale inherited PGID. Without the fallback the
+        /// child exits non-zero and, at a real call site, `pre_exec` would
+        /// abort the spawn outright.
+        #[test]
+        fn detach_falls_back_to_setpgid_when_setsid_is_refused() {
+            // SAFETY: FFI call. The child below touches only async-signal-safe
+            // calls (`setpgid`, `setsid`, `_exit`) before exiting, so forking
+            // from a threaded test process is sound.
+            let pid = unsafe { libc::fork() };
+            assert_ne!(pid, -1, "fork failed: {}", std::io::Error::last_os_error());
+
+            // The child checks the invariant itself and reports through its exit
+            // code. A parent-side `getpgid` would race the child's `setpgid`,
+            // and after `waitpid` there is no live process left to query.
+            const SETUP_FAILED: i32 = 2;
+            const DETACH_ERRORED: i32 = 3;
+            const NOT_GROUP_LEADER: i32 = 4;
+
+            if pid == 0 {
+                // SAFETY: FFI calls taking no pointers, in a forked child that
+                // never returns to the test harness.
+                unsafe {
+                    // Become a group leader so `setsid` is guaranteed to fail
+                    // with EPERM, which is the branch under test.
+                    if libc::setpgid(0, 0) == -1 {
+                        libc::_exit(SETUP_FAILED);
+                    }
+                    if super::detach_from_tty().is_err() {
+                        libc::_exit(DETACH_ERRORED);
+                    }
+                    if libc::getpgid(0) != libc::getpid() {
+                        libc::_exit(NOT_GROUP_LEADER);
+                    }
+                    libc::_exit(0);
+                }
+            }
+
+            let mut status = 0;
+            // SAFETY: FFI call writing the exit status into a local we own.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(libc::WIFEXITED(status), "child did not exit normally");
+
+            match libc::WEXITSTATUS(status) {
+                0 => {}
+                SETUP_FAILED => panic!("test setup: the child could not become a group leader"),
+                DETACH_ERRORED => {
+                    panic!("detach_from_tty returned Err instead of falling back to setpgid")
+                }
+                NOT_GROUP_LEADER => {
+                    panic!("the fallback left the child outside its own group, breaking killpg")
+                }
+                other => panic!("unexpected child exit code {other}"),
+            }
+        }
+
         /// Spec: a `killpg` failure that is neither ESRCH (group already
         /// gone) nor EPERM (fall back per-member) must be *warned about and
         /// stopped at* — not silently swallowed (the leak this module exists
@@ -303,6 +412,8 @@ mod imp {
     }
 }
 
+#[cfg(unix)]
+pub use imp::detach_from_tty;
 #[cfg(unix)]
 pub use imp::signal_group_or_members;
 

@@ -99,10 +99,17 @@ impl<'a> ScriptRunner<'a> {
         // `kill_on_drop` only reaches the direct child. A script that
         // backgrounds work (`foo &`) leaves those descendants running when the
         // timeout fires. On Linux the bwrap PID namespace collapses the tree
-        // for us, but macOS Seatbelt has no namespace — so lead a fresh process
-        // group here and signal the whole group on the timeout paths below.
+        // for us, but macOS Seatbelt has no namespace — so lead a fresh session
+        // here and signal the whole group on the timeout paths below. Detaching
+        // the controlling terminal at the same time keeps a runtime that touches
+        // `/dev/tty` from stopping on background terminal I/O; see
+        // [`crate::process_group::detach_from_tty`].
         #[cfg(unix)]
-        cmd.process_group(0);
+        // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid`, both
+        // async-signal-safe, as `pre_exec` requires.
+        unsafe {
+            cmd.pre_exec(crate::process_group::detach_from_tty);
+        }
 
         let child = cmd.kill_on_drop(true).spawn().with_context(|| {
             format!(

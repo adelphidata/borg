@@ -2,22 +2,30 @@
 //!
 //! Tokio's `kill_on_drop` only reaches the *direct* child. Anything that child
 //! spawned — a shell's background jobs, git's credential helper or fsmonitor —
-//! survives and is reparented to init. Spawning the child as its own process
-//! group leader (PGID == PID) lets us signal the whole tree instead.
+//! survives and is reparented to init. Spawning the child as its own session
+//! leader (PGID == PID) lets us signal the whole tree instead.
 
-/// Spawn `cmd`'s child as the leader of a fresh process group so
+/// Spawn `cmd`'s child as the leader of a fresh session so
 /// [`kill_process_group`] can reach its descendants.
 ///
 /// Establishes the PGID == PID invariant every `killpg` here relies on; without
 /// it the pid we later signal names some *unrelated* group.
 ///
-/// Tradeoff: a child in its own group is no longer in the terminal's
+/// Uses `setsid` rather than a plain `process_group(0)` so the child also loses
+/// our controlling terminal — see [`sandbox::process_group::detach_from_tty`]
+/// for why a background process group hangs on `/dev/tty`.
+///
+/// Tradeoff: a child outside our group is no longer in the terminal's
 /// foreground group, so a terminal-generated SIGINT (Ctrl-C) no longer reaches
 /// it. That is acceptable for the commands we apply this to — they are driven
 /// by our own timeout/cancellation, not by the operator's terminal.
 pub(crate) fn spawn_in_own_group(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
-    cmd.process_group(0);
+    // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid`, both
+    // async-signal-safe, as `pre_exec` requires.
+    unsafe {
+        cmd.pre_exec(sandbox::process_group::detach_from_tty);
+    }
     #[cfg(not(unix))]
     let _ = cmd;
 }
@@ -28,7 +36,10 @@ pub(crate) fn spawn_in_own_group_std(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // SAFETY: as above — `detach_from_tty` is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(sandbox::process_group::detach_from_tty);
+        }
     }
     #[cfg(not(unix))]
     let _ = cmd;
@@ -186,6 +197,44 @@ pub(crate) async fn wait_for_pid_exit(pid: i32) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Spec: a spawned child must land in a *new session*, not merely a new
+    /// process group of ours.
+    ///
+    /// A child in a background process group of our terminal session takes
+    /// `SIGTTIN`/`SIGTTOU` and stops the moment it touches `/dev/tty` — which
+    /// an operator's shell startup file routinely does (`stty` guards). The
+    /// command then never exits and we kill it at the timeout. Leaving the
+    /// session is what removes the controlling terminal and the stop.
+    ///
+    /// Asserted on the session id rather than by driving a real pty so the test
+    /// is meaningful under a test runner that has no controlling terminal.
+    #[tokio::test]
+    async fn a_spawned_child_leaves_our_terminal_session() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30")
+            .stdout(std::process::Stdio::null());
+        spawn_in_own_group(&mut cmd);
+        let mut child = cmd.kill_on_drop(true).spawn().expect("spawn sh");
+        let pid = child.id().expect("child pid") as i32;
+
+        // SAFETY: FFI calls taking no pointers.
+        let (child_sid, child_pgid) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+
+        child.kill().await.expect("kill child");
+
+        // Asserted against the child's own pid, not merely `!=` our session: a
+        // dead child reports -1, which would satisfy an inequality vacuously.
+        assert_eq!(
+            child_sid, pid,
+            "child must lead a new session, not sit in a background group of ours"
+        );
+        assert_eq!(
+            child_pgid, pid,
+            "the PGID == PID invariant every killpg here relies on must survive"
+        );
+    }
 
     /// The whole point of the module: a child that backgrounds a grandchild and
     /// is then abandoned must not leave that grandchild running. `kill_on_drop`

@@ -209,7 +209,7 @@ impl ShellSessionRegistry {
     /// generated session id (`sh-<n>`). The caller is responsible for having
     /// spawned `child` with piped stdin/stdout/stderr and `kill_on_drop(true)`.
     ///
-    /// On Unix the caller MUST also spawn with `process_group(0)` so the child
+    /// On Unix the caller MUST also spawn with `spawn_in_own_group` so the child
     /// leads its own group (PGID == PID): [`Self::kill`] signals the whole group
     /// via `killpg`, which is only safe — and only reaches descendants — when
     /// that holds. Without it, `kill` would signal an unrelated group, so it
@@ -399,8 +399,8 @@ impl ShellSessionRegistry {
 
 /// Terminate a session child and reap it so no zombie or descendant leaks.
 ///
-/// On Unix the child leads its own process group (set via `process_group(0)`
-/// at spawn), so we signal the entire group: SIGTERM, a short grace period for
+/// On Unix the child leads its own process group (it is made a session
+/// leader at spawn), so we signal the entire group: SIGTERM, a short grace period for
 /// the tree to clean up, then SIGKILL if anything is still alive. Without the
 /// group signal, a bare child kill would orphan whatever the shell spawned.
 /// This is best-effort against cooperative descendants: a child that calls
@@ -420,7 +420,7 @@ async fn terminate_child(child: &mut Child, pid: Option<u32>) {
             // also SIGKILL the direct child by PID. The direct kill is the
             // backstop if the child wasn't a group leader (then the group
             // signal was a no-op): it guarantees the `wait` below can't block
-            // forever even when the `process_group(0)` contract was not met.
+            // forever even when the group-leader contract was not met.
             signal_group(pgid, libc::SIGKILL);
             let _ = child.start_kill();
         }
@@ -511,7 +511,7 @@ mod tests {
 
     /// Spawn `cat` (echoes stdin to stdout line-by-line) as a session.
     /// Mirrors the production spawn contract documented on [`register`]:
-    /// `process_group(0)` so `kill`'s group signal reaches the child.
+    /// `spawn_in_own_group` so `kill`'s group signal reaches the child.
     fn spawn_cat(reg: &ShellSessionRegistry) -> String {
         let mut cmd = Command::new("cat");
         cmd.stdin(Stdio::piped())
