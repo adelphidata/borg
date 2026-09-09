@@ -372,6 +372,72 @@ fn tool_definition_to_function_declaration(tool: &ToolDefinition) -> Value {
     })
 }
 
+/// Collapse a JSON-Schema array `type` (`"type": ["string", "null"]`) into the
+/// single-type form Gemini's subset accepts, carrying the `"null"` member over
+/// to `nullable: true`.
+///
+/// Draft 2020-12 lets `type` be a list, and MCP tool schemas use it routinely
+/// for optional fields. Gemini rejects it with an INVALID_ARGUMENT that kills
+/// the *whole* request — every tool in the catalog goes down with the one
+/// offending parameter — so the union is narrowed rather than passed through.
+///
+/// A genuine multi-type union (`["string", "number"]`) cannot be expressed:
+/// `anyOf` is stripped a few lines above as another key Gemini's subset
+/// rejects. The first non-null member wins and the drop is logged, matching
+/// the surrounding trade-off — lose one constraint, not the turn. Every exit
+/// leaves a single-type `type` behind: a list must never reach the wire.
+///
+/// Like the rest of the sanitizer this runs on every object the recursion
+/// visits, so a non-schema payload that happens to carry a `type` key holding
+/// a list (inside `default` or `examples`) is rewritten too. That is the
+/// existing shape of the whole pass, not a new hazard.
+fn collapse_type_array(map: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(members)) = map.get("type") else {
+        return;
+    };
+    let mut nullable = false;
+    let mut concrete: Vec<String> = Vec::new();
+    for member in members {
+        match member.as_str() {
+            Some("null") => nullable = true,
+            Some(other) => concrete.push(other.to_string()),
+            // A non-string member is not a type name. Returning here would
+            // leave the list on the wire and 400 the whole request — the exact
+            // failure this exists to prevent — so drop the member and narrow
+            // to what is left.
+            None => tracing::warn!(
+                "gemini adapter: ignoring non-type-name member {} in a `type` array",
+                member
+            ),
+        }
+    }
+    if concrete.is_empty() {
+        tracing::warn!(
+            "gemini adapter: `type` array carried no usable type name; defaulting to `string`"
+        );
+    }
+    if concrete.len() > 1 {
+        tracing::warn!(
+            "gemini adapter: narrowed union type {:?} to `{}` — Gemini's schema subset has no \
+             union form",
+            concrete,
+            concrete[0]
+        );
+    }
+    // `["null"]` alone still needs a type Gemini accepts; `string` is the
+    // widest scalar and the value is nullable anyway.
+    let narrowed = concrete
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "string".to_string());
+    map.insert("type".to_string(), Value::String(narrowed));
+    if nullable {
+        // The `null` member is the authoritative signal: it beats a
+        // `nullable: false` the producer may have emitted alongside it.
+        map.insert("nullable".to_string(), Value::Bool(true));
+    }
+}
+
 /// Recursively strip JSON-Schema keys that Gemini's subset rejects. Drift
 /// to `oneOf` / `anyOf` / `allOf` etc. would make the whole request 400 —
 /// safer to drop the constraint and let the model misbehave once than to
@@ -418,6 +484,7 @@ pub(crate) fn sanitize_schema_for_gemini(value: &mut Value) {
                 }
             }
         }
+        collapse_type_array(map);
         for (_, v) in map.iter_mut() {
             sanitize_schema_for_gemini(v);
         }
@@ -1130,6 +1197,114 @@ mod tests {
         // is in Gemini's accepted set -> preserved.
         assert!(schema["properties"]["name"].get("format").is_none());
         assert_eq!(schema["properties"]["ts"]["format"], "date-time");
+    }
+
+    /// Draft 2020-12 array `type` is what MCP tools emit for optional fields.
+    /// Gemini rejects it outright, so it must be narrowed before the request
+    /// leaves — otherwise the whole tool catalog 400s on one parameter.
+    #[test]
+    fn sanitize_schema_collapses_array_typed_parameters() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "note": {"type": ["string", "null"]},
+                // The `null` member wins over the producer's `nullable: false`.
+                "tag": {"nullable": false, "type": ["null", "string"]},
+                "count": {"type": ["integer"]},
+                // No union form exists in Gemini's subset: first member wins.
+                "mixed": {"type": ["number", "string"]},
+                "empty": {"type": ["null"]},
+                "plain": {"type": "string"},
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let props = &schema["properties"];
+
+        assert_eq!(props["note"]["type"], "string");
+        assert_eq!(props["note"]["nullable"], true);
+
+        assert_eq!(props["tag"]["type"], "string");
+        assert_eq!(props["tag"]["nullable"], true);
+
+        assert_eq!(props["count"]["type"], "integer");
+        assert!(props["count"].get("nullable").is_none());
+
+        assert_eq!(props["mixed"]["type"], "number");
+        assert!(props["mixed"].get("nullable").is_none());
+
+        // `["null"]` alone still needs a type Gemini accepts.
+        assert_eq!(props["empty"]["type"], "string");
+        assert_eq!(props["empty"]["nullable"], true);
+
+        // A scalar type is untouched.
+        assert_eq!(props["plain"]["type"], "string");
+
+        // Nothing anywhere in the emitted schema still carries a list type.
+        fn has_array_type(v: &Value) -> bool {
+            match v {
+                Value::Object(m) => {
+                    m.get("type").is_some_and(Value::is_array) || m.values().any(has_array_type)
+                }
+                Value::Array(a) => a.iter().any(has_array_type),
+                _ => false,
+            }
+        }
+        assert!(!has_array_type(&schema));
+    }
+
+    /// Array types nested under `items` reach the wire too — the recursion
+    /// must cover them, not just top-level properties.
+    #[test]
+    fn sanitize_schema_collapses_array_types_inside_items() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": ["string", "null"]}}
+                    }
+                }
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let id = &schema["properties"]["rows"]["items"]["properties"]["id"];
+        assert_eq!(id["type"], "string");
+        assert_eq!(id["nullable"], true);
+    }
+
+    /// A malformed `type` array must still leave a single type behind.
+    /// Bailing out would put the list on the wire and 400 the whole request,
+    /// which is the failure the collapse exists to prevent.
+    #[test]
+    fn sanitize_schema_narrows_malformed_type_arrays() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                // A non-type-name member is dropped, not a reason to give up.
+                "mixed": {"type": ["string", 5]},
+                "only_junk": {"type": [5, true]},
+                "empty": {"type": []},
+                "nested_null": {"type": [{"a": 1}, "null"]},
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let props = &schema["properties"];
+
+        assert_eq!(props["mixed"]["type"], "string");
+        // Nothing usable is left, so the widest scalar stands in.
+        assert_eq!(props["only_junk"]["type"], "string");
+        assert_eq!(props["empty"]["type"], "string");
+        assert_eq!(props["nested_null"]["type"], "string");
+        assert_eq!(props["nested_null"]["nullable"], true);
+
+        for name in ["mixed", "only_junk", "empty", "nested_null"] {
+            assert!(
+                props[name]["type"].is_string(),
+                "{name} must not carry a list type on the wire"
+            );
+        }
     }
 
     #[test]

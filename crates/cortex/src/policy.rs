@@ -584,7 +584,154 @@ fn is_case_branch_label(token: &str) -> bool {
 /// (`xargs -I % rm -rf %`). Deliberately excludes GNU's `-i`, whose replacement
 /// is optional and attached-only: consuming the next token after a bare `-i`
 /// would swallow the verb in `xargs -i rm -rf {}` and lose the deny.
+///
+/// Unlike [`wrapper_options_with_argument`] these are consumed on *both*
+/// normalization paths, which is the historical behavior.
 const XARGS_PLACEHOLDER_FLAGS: &[&str] = &["-I", "-J"];
+
+/// Options that take their value as a *separate* token, keyed by the wrapper
+/// that accepts them.
+///
+/// The generic argument scan in [`strip_wrappers_inner`] stops at the first
+/// token that is neither a flag, an assignment, nor numeric — so a detached
+/// option value shields the verb behind it: `sudo -u root rm -rf /` stalled on
+/// `root`, `env -u PATH rm -rf /` on `PATH`, `timeout -s KILL rm -rf /` on
+/// `KILL`. The wrapper still runs `rm`, but every start-anchored deny glob
+/// missed it.
+///
+/// **Catastrophic path only.** Consuming a token erases text an operator glob
+/// may have matched on (`deny = ["*root*"]` against `sudo -u root …`), which is
+/// fail-open on the operator path — the same reason control-flow keywords are
+/// stripped only for [`strip_wrappers_and_control_flow`]. On the hardcoded
+/// path, over-stripping can only lose a match, never grant an unintended allow.
+///
+/// Membership must be exact, and an option is listed only when its argument is
+/// **required**. An optional-argument option (`sudo -h`, `xargs -i`/`-e`) never
+/// takes a detached value, so listing one would eat the wrapped verb and lose
+/// the deny. The attached spellings (`-uPATH`, `--unset=PATH`) need no entry —
+/// they carry the value in the same token.
+///
+/// Both GNU/coreutils and BSD/macOS spellings are covered, since Borg runs on
+/// both and the two disagree (`env -P` is BSD-only, `env --argv0` GNU-only;
+/// `sudo -a`/`-c` exist on BSD-auth builds).
+///
+/// `env -S`/`--split-string` is deliberately absent: its value is a whole
+/// command line, and consuming it would hide the payload from the inline-shell
+/// detection that currently reads it.
+fn wrapper_options_with_argument(verb: &str) -> &'static [&'static str] {
+    match verb {
+        // `-h`/`--host` is absent on purpose: sudo declares it as an
+        // optional-argument option that doubles as `--help`, so a detached
+        // token after it is the command, not a hostname.
+        "sudo" => &[
+            "-u",
+            "--user",
+            "-g",
+            "--group",
+            "-a",
+            "--auth-type",
+            "-c",
+            "--login-class",
+            "-C",
+            "--close-from",
+            "-p",
+            "--prompt",
+            "-r",
+            "--role",
+            "-t",
+            "--type",
+            "-T",
+            "--command-timeout",
+            "-U",
+            "--other-user",
+            "-R",
+            "--chroot",
+            "-D",
+            "--chdir",
+        ],
+        "doas" => &["-u", "-C", "-a"],
+        // `-a`/`--argv0` (GNU) only renames argv[0] and `-P` (BSD) only sets
+        // the search path; the real executable is the next operand, so
+        // consuming their values is what exposes it.
+        "env" => &["-u", "--unset", "-C", "--chdir", "-a", "--argv0", "-P"],
+        "timeout" => &["-k", "--kill-after", "-s", "--signal"],
+        "nice" => &["-n", "--adjustment"],
+        "ionice" => &[
+            "-c",
+            "--class",
+            "-n",
+            "--classdata",
+            "-p",
+            "--pid",
+            "-P",
+            "--pgid",
+            "-u",
+            "--uid",
+        ],
+        // `chrt -p` takes no argument — its priority and PID are both
+        // positional (`chrt -p [prio] PID`). Only the deadline-policy options
+        // carry a detached value.
+        "chrt" => &[
+            "-T",
+            "--sched-runtime",
+            "-P",
+            "--sched-period",
+            "-D",
+            "--sched-deadline",
+        ],
+        "stdbuf" => &["-i", "--input", "-o", "--output", "-e", "--error"],
+        // `-e`/`--eof` is absent for the same reason as `-i`: findutils
+        // declares it `e::`, an optional argument, so a detached token after
+        // it is the command. `-E` is the required-argument spelling.
+        "xargs" => &[
+            "-a",
+            "--arg-file",
+            "-d",
+            "--delimiter",
+            "-E",
+            "-L",
+            "--max-lines",
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-s",
+            "--max-chars",
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether `token` is an option spelling whose value is the *next* token, given
+/// the arg-taking options `flags` its wrapper accepts.
+///
+/// Long options are matched whole: `--unset` consumes the next token,
+/// `--unset=PATH` carries its value already.
+///
+/// Short options follow getopt's cluster rule rather than whole-token equality,
+/// which `sudo -nu root rm -rf /` and `env -iu PATH rm -rf /` walked straight
+/// through. Scan the cluster left to right and stop at the first arg-taking
+/// letter: if it ends the token its value is detached (`-iu` + `PATH`), and if
+/// anything follows, that remainder *is* the value (`-uPATH`), so the next
+/// token stays put.
+fn option_takes_detached_value(token: &str, flags: &[&str]) -> bool {
+    if token.starts_with("--") {
+        return !token.contains('=') && flags.contains(&token);
+    }
+    let Some(cluster) = token.strip_prefix('-') else {
+        return false;
+    };
+    let mut chars = cluster.chars();
+    while let Some(letter) = chars.next() {
+        let mut spelling = String::with_capacity(2);
+        spelling.push('-');
+        spelling.push(letter);
+        if flags.contains(&spelling.as_str()) {
+            return chars.next().is_none();
+        }
+    }
+    false
+}
 
 /// Normalize a command for more robust pattern matching:
 /// - Collapse multiple whitespace into single spaces
@@ -702,11 +849,19 @@ fn strip_wrappers_inner(tokens: &mut Vec<String>, strip_control_flow: bool) {
             return;
         }
         tokens.remove(0);
-        // Only `xargs` takes a detached replacement string; applying the rule to
-        // every wrapper would let `env -i rm -rf /` consume `rm` as `-i`'s
-        // argument and escape the deny.
+        // Only `xargs` takes a detached replacement string on every path;
+        // applying that rule to every wrapper would let `env -i rm -rf /`
+        // consume `rm` as `-i`'s argument and escape the deny.
         let placeholder_flags: &[&str] = if verb == "xargs" {
             XARGS_PLACEHOLDER_FLAGS
+        } else {
+            &[]
+        };
+        // The broader per-wrapper table is catastrophic-path only — see
+        // [`wrapper_options_with_argument`] for why consuming a token is
+        // fail-open against operator-configured globs.
+        let detached_value_flags = if strip_control_flow {
+            wrapper_options_with_argument(&verb)
         } else {
             &[]
         };
@@ -718,9 +873,10 @@ fn strip_wrappers_inner(tokens: &mut Vec<String>, strip_control_flow: bool) {
             let is_assignment = is_env_assignment(tok);
             let is_numeric = tok.chars().next().is_some_and(|c| c.is_ascii_digit());
             if is_option || is_assignment || is_numeric {
-                let takes_placeholder = placeholder_flags.contains(&tok.as_str());
+                let takes_detached_value = option_takes_detached_value(tok, placeholder_flags)
+                    || option_takes_detached_value(tok, detached_value_flags);
                 tokens.remove(0);
-                if takes_placeholder && !tokens.is_empty() {
+                if takes_detached_value && !tokens.is_empty() {
                     tokens.remove(0);
                 }
             } else {
@@ -3230,6 +3386,113 @@ mod tests {
             .collect();
         strip_leading_wrappers(&mut tokens);
         assert_eq!(tokens.join(" "), "rm -rf %");
+    }
+
+    /// A wrapper option whose value is a *separate* token must not shield the
+    /// verb behind it. Each of these still runs `rm -rf /`.
+    #[test]
+    fn detached_wrapper_option_values_do_not_shield_the_verb() {
+        for bad in [
+            "sudo -u root rm -rf /",
+            "sudo -g wheel rm -rf /",
+            "sudo -p Password: rm -rf /",
+            "env -u PATH rm -rf /",
+            "env -C /tmp rm -rf /",
+            // `--argv0` renames argv[0]; `/bin/rm` is still what executes.
+            "env --argv0 ls /bin/rm -rf /",
+            "timeout -s KILL rm -rf /",
+            "timeout -k 5s 10 rm -rf /",
+            "ionice -c idle rm -rf /",
+            "stdbuf -o L rm -rf /",
+            "sudo -u root env -u HOME rm -rf /",
+            // BSD/macOS spellings — the primary platform. `env -P` sets the
+            // search path, `sudo -a` the auth type, `sudo -c` the login class.
+            "env -P /bin rm -rf /",
+            "sudo -a foo rm -rf /",
+            "sudo -c daemon rm -rf /",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+        // The attached spellings carry their value in the same token, so the
+        // next token must NOT be eaten.
+        for bad in [
+            "env --unset=PATH rm -rf /",
+            "sudo --user=root rm -rf /",
+            "env -uPATH rm -rf /",
+            "stdbuf -oL rm -rf /",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+    }
+
+    /// getopt clusters an arg-taking letter with the flags before it, so
+    /// whole-token equality walked straight past `-nu` and `-iu`. Both of
+    /// these really run `rm -rf /`.
+    #[test]
+    fn bundled_short_options_do_not_shield_the_verb() {
+        for bad in [
+            "sudo -nu root rm -rf /",
+            "env -iu PATH rm -rf /",
+            "env -iC /tmp rm -rf /",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+        // The arg-taking letter ends the cluster only when nothing follows it.
+        // Here the remainder IS the value, so the verb must survive.
+        for bad in ["env -iuPATH rm -rf /", "sudo -nu root rm -rf /"] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+    }
+
+    /// The consume-one-more rule is keyed on an exact option list. A flag that
+    /// takes no argument must leave the verb in place, or the deny is lost.
+    #[test]
+    fn flag_only_wrapper_options_do_not_consume_the_verb() {
+        for bad in [
+            // `-i` clears the environment and takes no argument.
+            "env -i rm -rf /",
+            // `-n` is sudo's non-interactive flag, not `nice -n`.
+            "sudo -n rm -rf /",
+            "sudo -E rm -rf /",
+            "nohup rm -rf /",
+            "setsid rm -rf /",
+            // Optional-argument options never take a detached value: sudo's
+            // `-h` doubles as `--help`, and findutils declares `xargs -e` and
+            // `-i` with an optional replacement string.
+            "sudo -h rm -rf /",
+            "sudo --host rm -rf /",
+            "xargs -e rm -rf /",
+            "xargs --eof rm -rf /",
+            "xargs -i rm -rf /",
+            // `chrt -p` is flag-only — its priority and PID are positional.
+            "chrt -p rm -rf /",
+            "chrt --pid rm -rf /",
+        ] {
+            assert!(is_catastrophic_command(bad), "{bad} must be flagged");
+        }
+    }
+
+    /// The per-wrapper detached-value table is catastrophic-path only.
+    /// Consuming a token on the operator-glob path would erase text the
+    /// operator's own rule may match on — fail-open, the same reason
+    /// control-flow keywords are stripped only for the hardcoded layer.
+    #[test]
+    fn operator_glob_path_keeps_detached_option_values() {
+        let mut tokens: Vec<String> = "sudo -u root rm -rf /"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        strip_leading_wrappers(&mut tokens);
+        assert_eq!(
+            tokens.join(" "),
+            "root rm -rf /",
+            "the operator path must not eat a token a deny glob could match"
+        );
+        let policy = ExecutionPolicy {
+            auto_approve: Vec::new(),
+            deny: vec!["*root*".to_string()],
+        };
+        assert!(policy.deny_reason("sudo -u root whoami").is_some());
     }
 
     #[test]
