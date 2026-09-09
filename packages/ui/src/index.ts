@@ -19,6 +19,7 @@ export { MobileTitle } from "./components/MobileTitle";
 export { PageChrome } from "./components/PageChrome";
 export { Pill } from "./components/Pill";
 export { StatusDot, type DotTone } from "./components/StatusDot";
+export { Toast, type ToastProps } from "./components/Toast";
 export { Truncated } from "./components/Truncated";
 export { Meter } from "./components/Meter";
 export { Menu, clampToViewport, type MenuAction, type MenuProps } from "./components/Menu";

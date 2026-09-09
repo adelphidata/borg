@@ -170,7 +170,7 @@ function TaskRow({
           {finished && <> · {task.status}</>}
         </div>
       </div>
-      <div className="flex flex-none items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+      <div className="flex flex-none items-center gap-1.5 hover-reveal">
         <Pill square onClick={onRunNow}>
           Run now
         </Pill>

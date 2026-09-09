@@ -146,7 +146,7 @@ function RecentRow({
           e.stopPropagation();
           onArchive();
         }}
-        className="flex-none rounded px-1 text-[13px] leading-none text-ink3 opacity-0 transition-opacity duration-150 group-hover:opacity-100 hover:text-ink focus-visible:opacity-100"
+        className="flex-none rounded px-1 text-[13px] leading-none text-ink3 hover-reveal hover:text-ink"
       >
         ×
       </button>

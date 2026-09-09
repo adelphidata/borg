@@ -228,7 +228,7 @@ export function SessionsPage() {
                       now={now}
                       onOpen={() => navigate(`/c/${session.id}`)}
                       onRename={(title) => void sessions.rename(session.id, title)}
-                      onArchive={() => void sessions.archive(session.id)}
+                      onArchive={() => void sessions.archive(session.id, session.title)}
                       onRestore={() => void sessions.restore(session.id)}
                       onExport={(format) => void sessions.exportSession(session.id, format)}
                     />
@@ -280,7 +280,7 @@ export function SessionsPage() {
                           navigate(`/c/${session.id}`);
                         }}
                         onRename={(title) => void sessions.rename(session.id, title)}
-                        onArchive={() => void sessions.archive(session.id)}
+                        onArchive={() => void sessions.archive(session.id, session.title)}
                         onRestore={() => void sessions.restore(session.id)}
                         onExport={(format) => void sessions.exportSession(session.id, format)}
                       />

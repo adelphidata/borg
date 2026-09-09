@@ -65,7 +65,7 @@ function AgentRow({
         )}
       </div>
       {live && agent.depth > 0 && (
-        <div className="flex flex-none items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+        <div className="flex flex-none items-center gap-1 hover-reveal">
           <Pill
             square
             sizeClasses="px-2 py-1 text-[11px]"

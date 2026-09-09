@@ -6,12 +6,14 @@ import {
   Sidebar,
   TabBar,
   ThemeProvider,
+  Toast,
   useIsMobile,
   usePauseAnimationsWhenHidden,
 } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
+import { clearNotice, offerRestore, showNotice, takeNotice, useNotice } from "./lib/notice";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
@@ -31,6 +33,11 @@ import {
   unreadVersion,
 } from "./features/sessions/unreadStore";
 import { useMenuEscape } from "./features/sessions/SessionRowMenu";
+import {
+  sessionsChanged,
+  sessionsVersion,
+  subscribeSessions,
+} from "./features/sessions/sessionsVersion";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { UpdatePill } from "./components/UpdatePill";
@@ -77,6 +84,9 @@ function Shell({ platform }: { platform: Platform }) {
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
   // warnings appear without a reload.
+  // A write on the conversations page must renew this list too — the two
+  // queries are independent, so only a shared counter connects them.
+  const listVersion = useSyncExternalStore(subscribeSessions, sessionsVersion, sessionsVersion);
   const sessions = useQuery(
     async (borg) => {
       const list = await borg.admin.listSessions({});
@@ -91,7 +101,7 @@ function Shell({ platform }: { platform: Platform }) {
       );
       return list;
     },
-    [location.key],
+    [location.key, listVersion],
   );
   // Same naming rule as the full list: an unsent session is called after what
   // has been typed into it. The version counter re-renders as that changes.
@@ -123,17 +133,35 @@ function Shell({ platform }: { platform: Platform }) {
   // Archiving is a soft hide, not a delete — `borg sessions unarchive <id>`
   // brings a conversation back. The daemon also closes the session if it is
   // live, so the refetch is enough to drop the row.
+  const restoreSession = useMutation(
+    (borg, id: string) => borg.admin.setSessionArchived({ id, archived: false }),
+    { onSuccess: () => sessionsChanged() },
+  );
   const archiveSession = useMutation(
     (borg, id: string) => borg.admin.setSessionArchived({ id, archived: true }),
     {
       onSuccess: (_data, id) => {
-        sessions.refetch();
+        sessionsChanged();
         // Closing the conversation on screen would otherwise leave the user
         // staring at a session that is no longer in the list.
         if (location.pathname === `/c/${id}`) navigate("/");
+        // A row vanishing is the only sign the archive worked, and it is also
+        // exactly what an accidental click looks like. The toast says which
+        // conversation went, and gives it back without a dialog having stood
+        // in the way of the deliberate case.
+        offerRestore(id, listed.find((r) => r.id === id)?.title);
       },
     },
   );
+
+  const notice = useNotice();
+  // A restore that failed must not pass for one that worked: the row stays
+  // gone, so saying nothing would leave the user believing the conversation
+  // came back. `useMutation` parks the reason here rather than throwing.
+  const restoreFailure = restoreSession.error?.message;
+  useEffect(() => {
+    if (restoreFailure) showNotice(`Could not bring the conversation back: ${restoreFailure}`);
+  }, [restoreFailure]);
 
   // Right-click on a sidebar row. The menu lives here rather than in the
   // sidebar because it needs the archive call and the stacked Escape registry,
@@ -233,6 +261,22 @@ function Shell({ platform }: { platform: Platform }) {
       {isMobile && <TabBar routes={navRoutes} />}
       <CommandPalette />
       <UpdatePill />
+      {/* One slot for the whole shell: every reversible action anywhere in the
+          product offers its way back here. */}
+      <Toast
+        id={notice?.id}
+        message={notice?.message}
+        // The shell runs the restore rather than a closure from the page that
+        // archived: that page is often unmounted by now.
+        actionLabel={notice?.sessionId ? "Undo" : undefined}
+        onAction={() => {
+          const offer = takeNotice();
+          if (offer?.sessionId) void restoreSession.run(offer.sessionId);
+        }}
+        onDismiss={clearNotice}
+        // Clear of the mobile tab bar, which is 72px plus the home indicator.
+        bottomInset={isMobile ? "calc(88px + env(safe-area-inset-bottom))" : undefined}
+      />
     </div>
   );
 }

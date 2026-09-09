@@ -181,3 +181,41 @@
   margin-right: 6px;
   accent-color: var(--neon);
 }
+
+/*
+ * Actions that stay out of the way until you reach for them: a row's kebab, a
+ * code block's copy button, the per-row controls on Agents and Schedules.
+ *
+ * Unlayered on purpose — `@import "tailwindcss"` puts every utility in
+ * `@layer utilities`, and an unlayered rule beats a layered one whatever its
+ * specificity, so these win without `!important`. The cost is the other side
+ * of that coin: a Tailwind opacity utility on the same element can no longer
+ * override this class. It also keeps the whole pattern in one place instead of
+ * four classes repeated at every call site.
+ *
+ * The last block is the point: a touch screen never hovers, so a control that
+ * only appears on hover is a control that phone and tablet users cannot reach
+ * at all. There, the actions are simply always visible.
+ */
+.hover-reveal {
+  opacity: 0;
+  transition: opacity 150ms;
+}
+/*
+ * `:focus-within` matches the element itself as well as any focused descendant,
+ * so it covers both shapes here: the bare buttons and the wrappers holding a
+ * row of them. It is deliberately wider than the `focus-visible:` utility it
+ * replaces — a control that has focus is now always visible, including after a
+ * mouse click, which is the behaviour a keyboard user needs and a mouse user
+ * does not notice.
+ */
+.group:hover .hover-reveal,
+.hover-reveal:hover,
+.hover-reveal:focus-within {
+  opacity: 1;
+}
+@media (hover: none) {
+  .hover-reveal {
+    opacity: 1;
+  }
+}

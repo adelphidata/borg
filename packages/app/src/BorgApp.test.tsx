@@ -5,6 +5,7 @@ import { BorgError, GrpcStatus } from "@borg/client";
 import { BorgApp } from "./BorgApp";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { dispatchKeybind } from "./lib/keybinds";
+import { clearNotice } from "./lib/notice";
 import { STORAGE_KEYS } from "@borg/ui";
 import { fakeDaemon, fakeNative } from "./test/harness";
 import type { Platform } from "./lib/platform";
@@ -55,6 +56,9 @@ function mount(daemon = fakeDaemon(BASE), over: Partial<Platform> = {}) {
 beforeEach(() => {
   localStorage.clear();
   window.location.hash = "";
+  // The undo slot is module state shared by the whole shell; a leftover offer
+  // from the previous test would put an Undo button on a fresh mount.
+  clearNotice();
 });
 
 afterEach(() => {
@@ -102,6 +106,110 @@ describe("BorgApp shell", () => {
     await waitFor(() =>
       expect(daemon.calls.some((c) => c.method === "SetSessionArchived")).toBe(true),
     );
+  });
+
+  it("hands an archived conversation back without a confirmation dialog", async () => {
+    // The archive goes through immediately — Borg does not put a dialog in
+    // front of a reversible act — so the way back has to be on screen after it.
+    const daemon = fakeDaemon({ ...BASE, SetSessionArchived: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    await act(async () => screen.getByRole("button", { name: "Archive Ship the daemon" }).click());
+    // Named, so two archives in a row are told apart.
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toContain("Ship the daemon"),
+    );
+
+    await act(async () => screen.getByRole("button", { name: "Undo" }).click());
+    await waitFor(() =>
+      expect(
+        daemon.calls.filter((c) => c.method === "SetSessionArchived").map((c) => c.request),
+      ).toEqual([
+        { id: "s1", archived: true },
+        { id: "s1", archived: false },
+      ]),
+    );
+    // The offer is spent; leaving it up would invite a second restore.
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("puts the row back on the conversations page, not just in the daemon", async () => {
+    // The shell owns the toast, so the shell performs the restore — but the
+    // page runs its own listing query. Without a shared invalidation the RPC
+    // lands and the user, standing on /sessions, sees nothing change at all.
+    // On a phone there is no sidebar, so that would be the whole outcome.
+    const archived = new Set<string>();
+    const daemon = fakeDaemon({
+      ...BASE,
+      ListSessions: (request: unknown) => ({
+        sessions: [session()].filter(
+          (s) =>
+            !archived.has(s.id) ||
+            (request as { includeArchived?: boolean }).includeArchived === true,
+        ),
+      }),
+      SetSessionArchived: (request: unknown) => {
+        const { id, archived: want } = request as { id: string; archived: boolean };
+        if (want) archived.add(id);
+        else archived.delete(id);
+        return {};
+      },
+    });
+    window.location.hash = "#/sessions";
+    mount(daemon);
+
+    // One row in the sidebar, one on the page. Counting both is what makes the
+    // assertions discriminating: a count of 1 after archiving means exactly one
+    // surface refreshed, which is the bug.
+    const shown = () => screen.queryAllByText("Ship the daemon").length;
+    await waitFor(() => expect(shown()).toBe(2));
+
+    // Archived from the sidebar, so both directions of the cross-surface
+    // refresh are under test: the page must drop the row, then take it back.
+    await act(async () => screen.getByRole("button", { name: "Archive Ship the daemon" }).click());
+    await waitFor(() => expect(shown()).toBe(0));
+
+    await act(async () => screen.getByRole("button", { name: "Undo" }).click());
+    await waitFor(() => expect(shown()).toBe(2));
+  });
+
+  it("says so when the way back fails instead of letting it pass for success", async () => {
+    // The row is already gone from the list. A silent failure here leaves the
+    // user believing the conversation came back when it did not.
+    const daemon = fakeDaemon({
+      ...BASE,
+      // The archive lands; only the restore behind Undo fails.
+      SetSessionArchived: (request: unknown) =>
+        (request as { archived: boolean }).archived
+          ? {}
+          : new BorgError(GrpcStatus.Internal, "database is locked"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    await act(async () => screen.getByRole("button", { name: "Archive Ship the daemon" }).click());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy());
+
+    await act(async () => screen.getByRole("button", { name: "Undo" }).click());
+    await waitFor(() =>
+      expect(screen.getByRole("status").textContent).toContain("database is locked"),
+    );
+    // Nothing left to press — the offer was spent and the restore failed.
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("offers no way back when the archive never happened", async () => {
+    const daemon = fakeDaemon({
+      ...BASE,
+      SetSessionArchived: new BorgError(GrpcStatus.Internal, "database is locked"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    await act(async () => screen.getByRole("button", { name: "Archive Ship the daemon" }).click());
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 
   it("says why an archive failed rather than leaving a dead control", async () => {

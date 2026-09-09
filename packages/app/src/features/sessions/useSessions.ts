@@ -9,6 +9,8 @@ import {
   type SessionActivity,
 } from "./activityStore";
 import { formatElapsed } from "../../lib/format";
+import { offerRestore } from "../../lib/notice";
+import { sessionsChanged, sessionsVersion, subscribeSessions } from "./sessionsVersion";
 import { observeSessions, subscribeUnread, unreadVersion } from "./unreadStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
@@ -140,7 +142,8 @@ export interface Sessions {
   /** Filtered and bucketed, ready to render. */
   groups: SessionGroup[];
   rename: (id: string, title: string) => Promise<unknown>;
-  archive: (id: string) => Promise<unknown>;
+  /** `title` names the row in the undo offer once it has left the list. */
+  archive: (id: string, title?: string) => Promise<unknown>;
   /** Brings an archived conversation back into the list. */
   restore: (id: string) => Promise<unknown>;
   /** Archived conversations, empty until they are asked for. */
@@ -174,6 +177,10 @@ export function useSessions(deps: unknown[] = []): Sessions {
   const searching = search.trim() !== "";
   const includeArchived = showArchived || searching;
 
+  // A write made from the shell — archiving a sidebar row, or the Undo behind
+  // the shell's toast — must renew this list too. The two queries are
+  // independent, so only a shared counter connects them.
+  const listVersion = useSyncExternalStore(subscribeSessions, sessionsVersion, sessionsVersion);
   const query = useQuery(
     async (borg) => {
       const list = await borg.admin.listSessions({ includeArchived });
@@ -183,7 +190,7 @@ export function useSessions(deps: unknown[] = []): Sessions {
       observeSessions(rows);
       return rows;
     },
-    [...deps, includeArchived],
+    [...deps, includeArchived, listVersion],
   );
 
   const renameMutation = useMutation(
@@ -191,8 +198,20 @@ export function useSessions(deps: unknown[] = []): Sessions {
     { onSuccess: () => query.refetch() },
   );
   const setArchivedMutation = useMutation(
-    (borg, vars: { id: string; archived: boolean }) => borg.admin.setSessionArchived(vars),
-    { onSuccess: () => query.refetch() },
+    // `title` never reaches the daemon; it rides along so the undo offer can
+    // name the row after it has left the list.
+    (borg, vars: { id: string; archived: boolean; title?: string }) =>
+      borg.admin.setSessionArchived({ id: vars.id, archived: vars.archived }),
+    {
+      onSuccess: (_data, vars) => {
+        sessionsChanged();
+        // Archiving only shows as a row leaving the list, which is also what a
+        // mis-click looks like. The shell's toast names what went and hands it
+        // back, so the act needs no confirmation standing in front of it.
+        // Un-archiving needs none of that: the row appears where it went.
+        if (vars.archived) offerRestore(vars.id, vars.title);
+      },
+    },
   );
   const exportMutation = useMutation(async (borg, vars: { id: string; format: string }) => {
     const result = await borg.admin.exportSession({
@@ -238,7 +257,7 @@ export function useSessions(deps: unknown[] = []): Sessions {
     setSearch,
     groups,
     rename: (id, title) => renameMutation.run({ id, title }),
-    archive: (id) => setArchivedMutation.run({ id, archived: true }),
+    archive: (id, title) => setArchivedMutation.run({ id, archived: true, title }),
     restore: (id) => setArchivedMutation.run({ id, archived: false }),
     archived: split.archived,
     showArchived,

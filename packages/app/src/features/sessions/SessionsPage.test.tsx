@@ -3,6 +3,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { Route, Routes, useLocation } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp } from "../../test/harness";
+import { clearNotice, pendingNotice } from "../../lib/notice";
 import { resetActivity } from "./activityStore";
 import { SessionsPage } from "./SessionsPage";
 
@@ -45,6 +46,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  // The notice slot is module state shared with the shell. Vitest isolates
+  // files by default, but that is a config setting, not a property of the code.
+  clearNotice();
 });
 
 describe("SessionsPage listing", () => {
@@ -292,6 +296,43 @@ describe("SessionsPage row actions", () => {
         archived: true,
       }),
     );
+  });
+
+  it("names the row it archived, so the way back says which conversation", async () => {
+    const daemon = fakeDaemon({ ...listing([summary()]), SetSessionArchived: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
+    act(() => within(screen.getByRole("menu")).getByText("Archive").click());
+
+    await waitFor(() => expect(pendingNotice()?.message).toBe("Archived “Ship the daemon”"));
+    expect(pendingNotice()?.sessionId).toBe("s1");
+  });
+
+  it("offers nothing to undo when a conversation comes back", async () => {
+    // Un-archiving needs no way back — the row reappears where it went, so a
+    // toast would just be noise.
+    const daemon = fakeDaemon({
+      ListSessions: (request: unknown) =>
+        (request as { includeArchived: boolean }).includeArchived
+          ? { sessions: [summary(), summary({ id: "s2", title: "Old plan", archived: true })] }
+          : { sessions: [summary()] },
+      SetSessionArchived: {},
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    act(() => screen.getByRole("button", { name: /Archived/ }).click());
+    await waitFor(() => expect(screen.getByText("Old plan")).toBeTruthy());
+
+    act(() => screen.getByText("Old plan").click());
+    await waitFor(() =>
+      expect(daemon.calls.some((c: { method: string }) => c.method === "SetSessionArchived")).toBe(
+        true,
+      ),
+    );
+    expect(pendingNotice()).toBeUndefined();
   });
 
   it("surfaces a failed action instead of silently doing nothing", async () => {

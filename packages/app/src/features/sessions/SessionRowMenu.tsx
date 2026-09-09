@@ -75,7 +75,7 @@ export function SessionRowMenu(props: SessionRowMenuProps) {
           e.stopPropagation();
           setOpen((v) => !v);
         }}
-        className="flex h-6 w-6 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-ink3 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 hover:text-ink"
+        className="flex h-6 w-6 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-ink3 hover-reveal hover:text-ink"
       >
         <MoreIcon size={14} />
       </button>
