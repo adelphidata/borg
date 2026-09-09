@@ -883,9 +883,6 @@ mod tests {
         // start == len: out of range, text unchanged.
         assert_eq!(resolve_mentions("hello", &[mention(5)]), "hello");
         // start == len - 1: last char is a valid placeholder position.
-        assert_eq!(
-            resolve_mentions("hi \u{fffc}", &[mention(3)]),
-            "hi @uuid-9"
-        );
+        assert_eq!(resolve_mentions("hi \u{fffc}", &[mention(3)]), "hi @uuid-9");
     }
 }

@@ -69,7 +69,12 @@ mod tests {
     #[tokio::test]
     async fn missing_token_is_grpc_web_unauthenticated() {
         let resp = gated_router(failing_db())
-            .oneshot(Request::builder().uri("/probe").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -79,7 +84,10 @@ mod tests {
                 .expect("grpc-web clients need a grpc-status trailer-header"),
             "16"
         );
-        assert_eq!(resp.headers().get("grpc-message").unwrap(), "unauthenticated");
+        assert_eq!(
+            resp.headers().get("grpc-message").unwrap(),
+            "unauthenticated"
+        );
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(

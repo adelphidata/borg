@@ -211,7 +211,10 @@ mod tests {
             !stream.throttled(t + STREAM_THROTTLE),
             "a send is due at exactly the interval"
         );
-        assert!(!stream.throttled(t + STREAM_THROTTLE * 2), "past the window");
+        assert!(
+            !stream.throttled(t + STREAM_THROTTLE * 2),
+            "past the window"
+        );
     }
 
     #[test]
@@ -311,7 +314,10 @@ mod tests {
 
             let client = client_for(&server);
             let mut stream = TeamsStream::new(&client, &server.uri(), "conv-1", "act-1");
-            stream.send_chunk("a first chunk that is long enough").await.unwrap();
+            stream
+                .send_chunk("a first chunk that is long enough")
+                .await
+                .unwrap();
             assert_eq!(stream.sequence(), 1);
             stream.send_chunk(" immediately more").await.unwrap();
             assert_eq!(stream.sequence(), 1, "second chunk must be throttled");
@@ -328,7 +334,10 @@ mod tests {
             let client = client_for(&server);
             let mut stream = TeamsStream::new(&client, &server.uri(), "conv-1", "act-1");
             stream.throttle = Duration::ZERO;
-            stream.send_chunk("a first chunk that is long enough").await.unwrap();
+            stream
+                .send_chunk("a first chunk that is long enough")
+                .await
+                .unwrap();
             assert_eq!(stream.sequence(), 1);
             stream.send_chunk(" and a second piece").await.unwrap();
             assert_eq!(stream.sequence(), 2);
@@ -343,8 +352,7 @@ mod tests {
             assert_eq!(bodies[0]["entities"][0]["streamSequence"], 1);
             assert_eq!(bodies[1]["entities"][0]["streamSequence"], 2);
             assert_eq!(
-                bodies[1]["text"],
-                "a first chunk that is long enough and a second piece",
+                bodies[1]["text"], "a first chunk that is long enough and a second piece",
                 "later updates must carry the cumulative buffer"
             );
         }

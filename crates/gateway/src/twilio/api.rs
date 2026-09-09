@@ -325,7 +325,9 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/media/ME123"))
             .and(header("Authorization", expected_auth("AC123", "tok")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"twilio-media-payload".to_vec()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"twilio-media-payload".to_vec()),
+            )
             .expect(1)
             .mount(&server)
             .await;

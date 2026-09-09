@@ -241,9 +241,10 @@ mod tests {
         async fn mount_delete_webhook(server: &MockServer) {
             Mock::given(method("POST"))
                 .and(path(WEBHOOK_PATH))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": true, "result": true }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+                )
                 .mount(server)
                 .await;
         }
@@ -251,9 +252,10 @@ mod tests {
         async fn mount_empty_updates_fallback(server: &MockServer) {
             Mock::given(method("POST"))
                 .and(path(UPDATES_PATH))
-                .respond_with(ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({ "ok": true, "result": [] }),
-                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] })),
+                )
                 .mount(server)
                 .await;
         }
@@ -267,8 +269,9 @@ mod tests {
             tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
             tokio::task::JoinHandle<()>,
         ) {
-            let client =
-                Arc::new(TelegramClient::with_base("123:ABC", server_uri).expect("client construction"));
+            let client = Arc::new(
+                TelegramClient::with_base("123:ABC", server_uri).expect("client construction"),
+            );
             let dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let callback: PollCallback = Arc::new(move |parsed, chat_id| {

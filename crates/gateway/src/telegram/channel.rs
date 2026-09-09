@@ -266,7 +266,8 @@ mod tests {
     /// without a configured username there is nothing to match on.
     #[test]
     fn bot_mention_prefixes_the_configured_username() {
-        let with_name = channel_with_client(TelegramClient::new("123:ABC").unwrap(), Some("borg_bot"));
+        let with_name =
+            channel_with_client(TelegramClient::new("123:ABC").unwrap(), Some("borg_bot"));
         assert_eq!(with_name.bot_mention(), Some("@borg_bot".to_string()));
 
         let without = channel_with_client(TelegramClient::new("123:ABC").unwrap(), None);

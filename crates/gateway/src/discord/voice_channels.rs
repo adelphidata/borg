@@ -1064,8 +1064,14 @@ mod tests {
             Ok(Message::Text("payload".to_string().into())),
             Ok(Message::Text("second".to_string().into())),
         ]);
-        assert_eq!(next_gateway_message(&mut s).await.as_deref(), Some("payload"));
-        assert_eq!(next_gateway_message(&mut s).await.as_deref(), Some("second"));
+        assert_eq!(
+            next_gateway_message(&mut s).await.as_deref(),
+            Some("payload")
+        );
+        assert_eq!(
+            next_gateway_message(&mut s).await.as_deref(),
+            Some("second")
+        );
         assert_eq!(next_gateway_message(&mut s).await, None, "stream exhausted");
 
         // Close terminates immediately, even with text queued behind it.
@@ -1247,10 +1253,7 @@ mod tests {
         .await
         .unwrap();
         let err = rx.await.unwrap().unwrap_err();
-        assert!(
-            err.to_string().contains("not in a voice channel"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("not in a voice channel"), "{err}");
         let (tx, rx) = oneshot::channel();
         handle_command(
             VoiceCommand::Play {
@@ -1319,7 +1322,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*last_seq.lock().await, Some(8));
-        assert_eq!(*our_user_id.lock().await, Some(555), "op 11 must be ignored");
+        assert_eq!(
+            *our_user_id.lock().await,
+            Some(555),
+            "op 11 must be ignored"
+        );
     }
 
     #[tokio::test]
@@ -1340,7 +1347,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(voice_states.lock().await.get(&(1, 42)), Some(&Some(777)));
-        assert_eq!(guilds.lock().await.get(&1).unwrap().pending_session_id, None);
+        assert_eq!(
+            guilds.lock().await.get(&1).unwrap().pending_session_id,
+            None
+        );
 
         // Our own update captures the session id for join completion.
         process_event(
@@ -1408,8 +1418,14 @@ mod tests {
         try_complete_join(&mut state, 1, 9).await;
 
         for rx in [&mut rx_a, &mut rx_b] {
-            let err = rx.try_recv().expect("join caller left hanging").unwrap_err();
-            assert!(err.to_string().contains("invalid voice channel_id 0"), "{err}");
+            let err = rx
+                .try_recv()
+                .expect("join caller left hanging")
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid voice channel_id 0"),
+                "{err}"
+            );
         }
         assert!(state.join_replies.is_empty());
     }
@@ -1462,7 +1478,10 @@ mod tests {
         let handler = handler_with_stub_stt("unused");
         handler.act(&speaking_update(10, 4242)).await;
         let speakers = handler.speakers.lock().await;
-        assert_eq!(speakers.get(&10).expect("speaker registered").user_id, Some(4242));
+        assert_eq!(
+            speakers.get(&10).expect("speaker registered").user_id,
+            Some(4242)
+        );
     }
 
     #[tokio::test]
@@ -1470,7 +1489,9 @@ mod tests {
         let handler = handler_with_stub_stt("voice hi");
         handler.act(&speaking_update(10, 4242)).await;
         let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
-        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+        handler
+            .on_voice_tick(&[(10, Some(pcm.as_slice()))], &[])
+            .await;
 
         // 49 silent ticks (0.98s) — still below the 1s threshold.
         for _ in 0..SILENT_TICKS_THRESHOLD - 1 {
@@ -1499,7 +1520,9 @@ mod tests {
         let handler = handler_with_stub_stt("must-not-appear");
         // Half the 250ms minimum — a blip, not speech.
         let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO / 2];
-        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+        handler
+            .on_voice_tick(&[(10, Some(pcm.as_slice()))], &[])
+            .await;
         for _ in 0..SILENT_TICKS_THRESHOLD {
             handler.on_voice_tick(&[], &[10]).await;
         }
@@ -1508,14 +1531,19 @@ mod tests {
             "short blip must be discarded, not transcribed"
         );
         let speakers = handler.speakers.lock().await;
-        assert!(speakers.get(&10).unwrap().pcm.is_empty(), "buffer not discarded");
+        assert!(
+            speakers.get(&10).unwrap().pcm.is_empty(),
+            "buffer not discarded"
+        );
     }
 
     #[tokio::test]
     async fn voice_tick_retains_buffer_during_brief_silence() {
         let handler = handler_with_stub_stt("unused");
         let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
-        handler.on_voice_tick(&[(10, Some(pcm.as_slice()))], &[]).await;
+        handler
+            .on_voice_tick(&[(10, Some(pcm.as_slice()))], &[])
+            .await;
         handler.on_voice_tick(&[], &[10]).await;
 
         let speakers = handler.speakers.lock().await;

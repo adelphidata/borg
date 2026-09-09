@@ -580,12 +580,7 @@ mod tests {
         let client =
             Arc::new(SignalClient::new(&format!("http://{addr}"), "+15550001111").unwrap());
         let shutdown = CancellationToken::new();
-        let loop_task = tokio::spawn(run_sse_loop(
-            client,
-            callback,
-            shutdown.clone(),
-            config,
-        ));
+        let loop_task = tokio::spawn(run_sse_loop(client, callback, shutdown.clone(), config));
 
         let inbound = tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await

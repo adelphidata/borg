@@ -1949,9 +1949,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/slow"))
-            .respond_with(
-                ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
             .mount(&server)
             .await;
         let impatient = Client::builder()

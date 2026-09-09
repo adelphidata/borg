@@ -606,16 +606,27 @@ mod tests {
             ),
             (
                 "reply_with_mentions",
-                client.reply_with_mentions(evil, "c1", "a1", "hi", &[]).await,
+                client
+                    .reply_with_mentions(evil, "c1", "a1", "hi", &[])
+                    .await,
             ),
             ("send_typing", client.send_typing(evil, "c1").await),
-            ("send_activity", client.send_activity(evil, "c1", &msg).await),
+            (
+                "send_activity",
+                client.send_activity(evil, "c1", &msg).await,
+            ),
             (
                 "send_reply_activity",
                 client.send_reply_activity(evil, "c1", "a1", &msg).await,
             ),
-            ("edit_activity", client.edit_activity(evil, "c1", "a1", "hi").await),
-            ("delete_activity", client.delete_activity(evil, "c1", "a1").await),
+            (
+                "edit_activity",
+                client.edit_activity(evil, "c1", "a1", "hi").await,
+            ),
+            (
+                "delete_activity",
+                client.delete_activity(evil, "c1", "a1").await,
+            ),
         ];
         for (name, result) in results {
             let err = result.expect_err(name);
@@ -715,7 +726,9 @@ mod tests {
             let err = client_for(&server).get_token().await.unwrap_err();
             let msg = format!("{err:#}");
             assert!(
-                msg.contains("Token request failed") && msg.contains("400") && msg.contains("bad client"),
+                msg.contains("Token request failed")
+                    && msg.contains("400")
+                    && msg.contains("bad client"),
                 "{msg}"
             );
         }
@@ -783,10 +796,7 @@ mod tests {
             for body in &bodies {
                 assert_eq!(body["type"], "message");
             }
-            let reassembled: String = bodies
-                .iter()
-                .map(|b| b["text"].as_str().unwrap())
-                .collect();
+            let reassembled: String = bodies.iter().map(|b| b["text"].as_str().unwrap()).collect();
             assert_eq!(reassembled, long_text, "no chunk may be dropped");
         }
 
@@ -797,7 +807,9 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/v3/conversations/c9/activities"))
                 .and(header("authorization", BEARER))
-                .and(body_json(serde_json::json!({"type": "message", "text": "hello"})))
+                .and(body_json(
+                    serde_json::json!({"type": "message", "text": "hello"}),
+                ))
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
                 .mount(&server)
@@ -905,7 +917,9 @@ mod tests {
             Mock::given(method("PUT"))
                 .and(path("/v3/conversations/c1/activities/a1"))
                 .and(header("authorization", BEARER))
-                .and(body_json(serde_json::json!({"type": "message", "text": "edited"})))
+                .and(body_json(
+                    serde_json::json!({"type": "message", "text": "edited"}),
+                ))
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
                 .mount(&server)
@@ -928,7 +942,9 @@ mod tests {
                 .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("edit_activity failed") && msg.contains("404") && msg.contains("no such activity"),
+                msg.contains("edit_activity failed")
+                    && msg.contains("404")
+                    && msg.contains("no such activity"),
                 "{msg}"
             );
         }
