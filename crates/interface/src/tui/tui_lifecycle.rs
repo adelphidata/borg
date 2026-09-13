@@ -537,6 +537,13 @@ impl Tui {
         if !self.alt_screen_enabled {
             return Ok(());
         }
+        // Idempotent: a second entry while already on the alt screen would
+        // overwrite `alt_saved_viewport` with the *full-screen* rect, and
+        // `leave_alt_screen` would then restore a full-height "inline"
+        // viewport instead of the real one.
+        if self.is_alt_screen_active() {
+            return Ok(());
+        }
         let _ = write_enter_alt_screen_sequence(self.terminal.backend_mut());
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);

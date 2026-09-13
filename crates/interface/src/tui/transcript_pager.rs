@@ -22,8 +22,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use super::history::HistoryCell;
 use super::theme;
 
-/// Number of lines a PageUp/PageDown jump moves.
-const PAGE_JUMP: usize = 20;
+/// Lines a PageUp/PageDown jump moves before the first render has told us
+/// the real viewport height.
+const PAGE_JUMP_FALLBACK: usize = 20;
 
 /// Outcome of routing a key event into the pager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,11 +261,11 @@ impl TranscriptPager {
                 PagerAction::None
             }
             (KeyCode::PageUp, _) | (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                self.scroll_up_by(PAGE_JUMP);
+                self.scroll_up_by(self.page_jump());
                 PagerAction::None
             }
             (KeyCode::PageDown, _) | (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
-                self.scroll_down_by(PAGE_JUMP);
+                self.scroll_down_by(self.page_jump());
                 PagerAction::None
             }
             (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => {
@@ -340,6 +341,17 @@ impl TranscriptPager {
 
     fn max_scroll_offset(&self, content_height: usize) -> usize {
         content_height.saturating_sub(self.last_viewport_height.max(1))
+    }
+
+    /// One page is the rendered viewport: a fixed count over- or
+    /// under-shoots on any terminal that is not exactly that tall, so
+    /// PageDown skipped lines on a short pane and crawled on a tall one.
+    fn page_jump(&self) -> usize {
+        if self.last_viewport_height == 0 {
+            PAGE_JUMP_FALLBACK
+        } else {
+            self.last_viewport_height
+        }
     }
 
     fn advance_match(&mut self, delta: isize) {
@@ -781,30 +793,46 @@ mod tests {
         assert_eq!(p.scroll_offset, 50);
     }
 
+    /// Spec: a page is the rendered viewport. On a 45-line pane PageDown
+    /// must advance exactly 45 lines — a fixed 20 would show the same lines
+    /// twice; a fixed 60 would skip 15 the reader never saw.
     #[test]
-    fn pageup_pagedown_jump_twenty_lines() {
+    fn pageup_pagedown_jump_one_viewport() {
         let mut p = TranscriptPager::new();
         p.show();
-        p.last_content_height = 200;
-        p.last_viewport_height = 20;
+        p.last_content_height = 400;
+        p.last_viewport_height = 45;
         p.scroll_offset = 100;
 
         let _ = p.handle_key(key(KeyCode::PageUp));
-        assert_eq!(p.scroll_offset, 80);
+        assert_eq!(p.scroll_offset, 55);
         let _ = p.handle_key(key(KeyCode::PageDown));
         assert_eq!(p.scroll_offset, 100);
+    }
+
+    /// Before the first render there is no viewport height; the jump must
+    /// still move rather than be a no-op.
+    #[test]
+    fn page_jump_before_first_render_uses_the_fallback() {
+        let mut p = TranscriptPager::new();
+        p.show();
+        p.last_content_height = 200;
+        p.scroll_offset = 100;
+
+        let _ = p.handle_key(key(KeyCode::PageUp));
+        assert_eq!(p.scroll_offset, 100 - PAGE_JUMP_FALLBACK);
     }
 
     #[test]
     fn ctrl_b_ctrl_f_match_pageup_pagedown() {
         let mut p = TranscriptPager::new();
         p.show();
-        p.last_content_height = 200;
-        p.last_viewport_height = 20;
+        p.last_content_height = 400;
+        p.last_viewport_height = 45;
         p.scroll_offset = 100;
 
         let _ = p.handle_key(ctrl(KeyCode::Char('b')));
-        assert_eq!(p.scroll_offset, 80);
+        assert_eq!(p.scroll_offset, 55);
         let _ = p.handle_key(ctrl(KeyCode::Char('f')));
         assert_eq!(p.scroll_offset, 100);
     }

@@ -174,11 +174,106 @@ pub(crate) fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
 ///
 /// Note a killed-but-unreaped child is a zombie and still "alive" here, so
 /// prefer probing a *grandchild* when asserting that a group kill worked.
+/// Callers that need "still doing work" rather than "still has a pid" want
+/// [`pid_is_running`].
 #[cfg(all(test, unix))]
 pub(crate) fn pid_is_alive(pid: i32) -> bool {
     // SAFETY: FFI call to `kill` with signal 0 — an existence probe that never
     // delivers a signal and cannot affect the target.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Whether `pid` names a process that is still *running* — exists and is not
+/// a zombie.
+///
+/// `kill(pid, 0)` alone says yes for an exited-but-unreaped child: the kernel
+/// keeps the pid until the parent waits. A registry or lock that trusts that
+/// answer holds a dead process's slot forever (a task-runner lock is never
+/// released; a shell entry is never swept). `EPERM` means the process exists
+/// but is not ours to signal — counted as running, since a probe must never
+/// fabricate a death. Zombie detection is best-effort: a platform or kernel
+/// that cannot report process state falls back to the existence answer.
+pub(crate) fn pid_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // A pid above `i32::MAX` would wrap negative and probe a process
+        // *group*; no kernel hands out such a pid, so it names nothing.
+        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: pure FFI; signal 0 delivers nothing and has no memory
+        // preconditions.
+        let rc = unsafe { libc::kill(pid_t, 0) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return matches!(err.raw_os_error(), Some(libc::EPERM));
+        }
+        !pid_is_zombie(pid).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        // Borg targets unix for daemon workflows; keep non-unix builds
+        // compiling without a liveness answer that could wrongly free a slot.
+        true
+    }
+}
+
+/// `Some(true)` when the kernel reports `pid` as a zombie; `None` when the
+/// state cannot be read (gone between the probe and here, or no permission).
+#[cfg(target_os = "linux")]
+fn pid_is_zombie(pid: u32) -> Option<bool> {
+    // `/proc/<pid>/stat`: the `comm` field can contain spaces and
+    // parentheses, so the state letter is the first token after the final
+    // `)`. `Z` is zombie; `X`/`x` is dead-and-going, same for our purposes.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let state = after_comm.split_whitespace().next()?;
+    Some(matches!(state, "Z" | "X" | "x"))
+}
+
+/// macOS keeps a zombie visible to `kill` but drops it from `proc_find`, so
+/// `proc_pidinfo` answers `ESRCH` for a pid that `kill(pid, 0)` just
+/// accepted. That disagreement *is* the zombie signal; there is no
+/// `p_stat` to read because the query never reaches the struct. (`sysctl
+/// KERN_PROC_PID` would report `SZOMB`, but libc does not ship the
+/// `kinfo_proc` layout for this target.) Any other failure is "unknown".
+#[cfg(target_os = "macos")]
+fn pid_is_zombie(pid: u32) -> Option<bool> {
+    use std::mem::{size_of, MaybeUninit};
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: pure FFI. `info` is a correctly-sized, zeroed `proc_bsdinfo`
+    // buffer; `proc_pidinfo` writes at most `size` bytes into it and returns
+    // the number written (== size on success, 0/-1 on failure).
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == size {
+        // SAFETY: `proc_pidinfo` filled the whole struct (checked above).
+        let info = unsafe { info.assume_init() };
+        return Some(info.pbi_status == libc::SZOMB);
+    }
+    if written > 0 {
+        // Partial fill: no error was raised, so `errno` is stale and must
+        // not be read — a leftover `ESRCH` would call a live process dead.
+        return None;
+    }
+    let err = std::io::Error::last_os_error();
+    (err.raw_os_error() == Some(libc::ESRCH)).then_some(true)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn pid_is_zombie(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// Poll until `pid` disappears, up to ~2s. SIGKILL delivery is asynchronous, so
@@ -197,6 +292,47 @@ pub(crate) async fn wait_for_pid_exit(pid: i32) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Spec: an exited child the parent has not reaped is *not running*.
+    /// `kill(pid, 0)` still succeeds for it — asserted here so the case is
+    /// provably a zombie and not a pid that vanished — and a probe that
+    /// stopped at that answer would hold the task lock / registry slot for
+    /// as long as the corpse sat unreaped.
+    #[test]
+    fn an_unreaped_child_is_not_running() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // `true` exits at once; we hold off `wait` so it lingers as a zombie.
+        while pid_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "zombie child still reported as running after 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            pid_is_alive(pid as i32),
+            "the pid must still exist (unreaped) for this test to be about zombies"
+        );
+        assert!(pid_is_running(std::process::id()), "we are running");
+        let _ = child.wait();
+
+        // Positive control on a *child*: a probe that called every child
+        // dead (a stale-errno read, say) would pass the zombie half above.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        assert!(
+            pid_is_running(live.id()),
+            "a running child must be reported as running"
+        );
+        let _ = live.kill();
+        let _ = live.wait();
+    }
 
     /// Spec: a spawned child must land in a *new session*, not merely a new
     /// process group of ours.

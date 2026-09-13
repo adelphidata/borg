@@ -1309,6 +1309,30 @@ mod tests {
             "Request exceeds the maximum size allowed by the provider",
             FailoverReason::ContextOverflow,
         ),
+        // Account exhaustion delivered on a 429: the status says "rate
+        // limit" but the `code` says the money is gone. Cooling the key and
+        // retrying would spin until the operator noticed on their own.
+        (
+            r#"openai returned 429: {"error":{"message":"Your credit balance is too low","code":"credit_balance_exhausted"}}"#,
+            FailoverReason::Billing,
+        ),
+        (
+            r#"HTTP 429 {"error":{"code":"organization_spend_limit_exceeded","message":"Organization spend limit reached"}}"#,
+            FailoverReason::Billing,
+        ),
+        (
+            r#"HTTP 429 {"error":{"code":"project_spend_limit_exceeded","message":"Project spend limit reached"}}"#,
+            FailoverReason::Billing,
+        ),
+        (
+            r#"HTTP 429 {"error":{"code":"organization_usage_limit_exceeded"}}"#,
+            FailoverReason::Billing,
+        ),
+        // The same status with a genuine window code stays a rate limit.
+        (
+            r#"HTTP 429 {"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5 on tokens per min (TPM)"}}"#,
+            FailoverReason::RateLimit,
+        ),
     ];
 
     /// Strings that MUST NOT classify. Regression net against an overly-eager

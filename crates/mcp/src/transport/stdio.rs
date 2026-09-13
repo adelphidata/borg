@@ -386,11 +386,20 @@ impl Transport for StdioTransport {
 /// disable `kill_on_drop`, so without this the watchdog — and the server it
 /// supervises — would leak. SIGTERM (catchable) tells the watchdog to tear the
 /// server group down; if a runtime is present we also reap the watchdog zombie.
-/// A no-op for direct (non-watchdog) spawns, which `kill_on_drop` already
-/// covers.
+/// The process half is a no-op for direct (non-watchdog) spawns, which
+/// `kill_on_drop` already covers.
 #[cfg(unix)]
 impl Drop for StdioTransport {
     fn drop(&mut self) {
+        // The stderr pump ends on pipe EOF, and EOF needs *every* writer gone.
+        // A descendant that left the server's process group (a `setsid`
+        // daemon the server forked) keeps the write end open after the server
+        // itself is reaped, and the reader task plus its fd would live for as
+        // long as that stranger does. Abort it outright; the transport is
+        // gone, so there is no one left to log to.
+        if let Some(pump) = self.stderr_pump.take() {
+            pump.abort();
+        }
         let Some(pid) = self.watchdog_pid else {
             return;
         };

@@ -12,26 +12,18 @@ const CONSECUTIVE_FAILURE_WINDOW: i64 = 64;
 /// Column list shared by all scheduled-task SELECT queries.
 const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash, continuity";
 
-/// Returns true if `pid` is alive on this host. `kill(pid, 0)` only probes —
-/// 0 means alive; ESRCH means dead; any other errno (e.g. EPERM) is treated
-/// as alive (conservative: never starve a live daemon).
+/// Returns true if `pid` is alive on this host: it exists and is not a
+/// zombie. A crashed runner whose parent has not reaped it yet still owns a
+/// pid, and treating that as alive would hold the task lock until the
+/// heartbeat fallback expires. EPERM is treated as alive (conservative:
+/// never starve a live daemon).
 ///
 /// Assumes a single PID namespace (borgd is a single-host agent, DB lives at
 /// `~/.borg/borg.db`). Inside a sandboxed PID-namespace container the probe
 /// would see only namespace-local processes, which is still correct because
 /// the recorded PID was also written from that namespace.
 fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 never delivers a signal; the call only validates that
-    // the kernel can find a process with this PID.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    errno != libc::ESRCH
+    crate::util::process_tree::pid_is_running(pid)
 }
 
 fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {

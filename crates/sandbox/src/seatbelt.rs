@@ -315,6 +315,15 @@ pub fn generate_profile(
         profile.push_str("(allow network*)\n");
     }
 
+    // A sandboxed child inherits our controlling terminal. `TIOCSTI` lets it
+    // queue keystrokes into that terminal's input buffer, so a command that
+    // is "done" could still type into whatever shell the operator resumes
+    // after the agent exits. `(deny default)` already refuses the ioctl, but
+    // the deny is pinned here as the final rule so a future `(allow
+    // file-ioctl …)` for tty-aware tools cannot reopen it under
+    // last-match-wins. Verified end to end in the tests below.
+    profile.push_str("(deny file-ioctl (ioctl-command TIOCSTI))\n");
+
     Ok(profile)
 }
 
@@ -1282,6 +1291,84 @@ mod tests {
         assert!(
             allow_root < deny_ssh && allow_root < deny_secrets,
             "sensitive/secret denies must come AFTER the broad fs_read allow"
+        );
+    }
+
+    /// Spec: the `TIOCSTI` deny is the *final* rule of every profile. Under
+    /// last-match-wins any later `(allow file-ioctl …)` would reopen
+    /// keystroke injection into the operator's terminal, so the deny must
+    /// follow every allow — including the network allow, which is emitted
+    /// after the rename guards.
+    #[test]
+    fn tiocsti_deny_is_the_last_rule_of_every_profile() {
+        let policy = SandboxPolicy {
+            network: true,
+            fs_write: vec!["/opt".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let deny = "(deny file-ioctl (ioctl-command TIOCSTI))";
+        assert_eq!(
+            profile.trim_end().lines().last(),
+            Some(deny),
+            "the TIOCSTI deny must close the profile:\n{profile}"
+        );
+        let deny_at = profile.find(deny).unwrap();
+        let last_allow = profile
+            .rfind("(allow ")
+            .expect("profile must contain an allow");
+        assert!(
+            deny_at > last_allow,
+            "an allow follows the deny:\n{profile}"
+        );
+    }
+
+    /// Spec, verified against the kernel: a process inside the profile cannot
+    /// `ioctl(TIOCSTI)` the terminal it inherited. Driven through `script(1)`
+    /// so the child really has a controlling tty, and with a positive control
+    /// outside the sandbox — a host that refuses the ioctl unsandboxed would
+    /// make the sandboxed assertion vacuous, so that case is skipped rather
+    /// than reported as a pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_refuses_tiocsti_on_the_inherited_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        let profile_path = tmp.path().join("p.sb");
+        std::fs::write(&profile_path, &profile).unwrap();
+
+        // macOS `TIOCSTI` is `_IOW('t', 114, char)` == 0x80017472.
+        const PROBE: &str =
+            r#"$k = "x"; print((ioctl(STDIN, 0x80017472, $k) ? "STI OK" : "STI ERR"), "\n")"#;
+        let run = |sandboxed: bool| {
+            let mut cmd = std::process::Command::new("script");
+            cmd.args(["-q", "/dev/null"]);
+            if sandboxed {
+                cmd.arg("sandbox-exec").arg("-f").arg(&profile_path);
+            }
+            let out = cmd
+                .args(["/usr/bin/perl", "-e", PROBE])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("script(1) and sandbox-exec must be present on macOS");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let control = run(false);
+        if !control.contains("STI OK") {
+            eprintln!("skipping: TIOCSTI is refused outside the sandbox on this host: {control:?}");
+            return;
+        }
+        let sandboxed = run(true);
+        assert!(
+            sandboxed.contains("STI ERR"),
+            "a sandboxed child injected keystrokes into its terminal: {sandboxed:?}"
         );
     }
 }

@@ -305,6 +305,35 @@ async fn stderr_is_routed_to_sink_not_stdout() {
     );
 }
 
+/// Spec: dropping the transport ends the stderr reader even when a stranger
+/// still holds the pipe's write end. The pump otherwise lives until EOF, and
+/// EOF needs *every* writer gone — a descendant that left the server's
+/// process group (`setsid`) survives the watchdog's group kill and keeps the
+/// reader task and its fd alive for as long as it likes. The escaped child
+/// here writes a line *after* the drop; a pump that was still running would
+/// deliver it to the sink.
+#[tokio::test]
+async fn dropping_the_transport_stops_the_stderr_pump_despite_escaped_writers() {
+    let _lock = env_lock();
+    let (sink, lines) = collecting_sink();
+    // The server (`cat`) blocks on stdin until torn down. Its grandchild
+    // escapes to a fresh session, waits past the drop, then writes to the
+    // inherited stderr and exits.
+    let escaped = r#"perl -e 'use POSIX; POSIX::setsid(); select(undef,undef,undef,0.4); print STDERR "late-stderr-line\n"' & exec cat"#;
+    let stdio = cfg("/bin/sh", &["-c", escaped], HashMap::new());
+    let t = spawn(stdio, sink).await.expect("spawn sh");
+    // Let the pump settle on its first read before we pull the rug.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(t);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let captured = lines.lock().unwrap().clone();
+    assert!(
+        !captured.iter().any(|l| l.contains("late-stderr-line")),
+        "the stderr pump outlived the transport: {captured:?}"
+    );
+}
+
 #[tokio::test]
 async fn unknown_command_surfaces_spawn_error() {
     // Spec: a missing/typo'd command must fail at `spawn()` time with a

@@ -921,17 +921,10 @@ fn pid_identity_matches(pid: u32, registered: Option<u64>) -> bool {
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    // `kill(pid, 0)` checks signal-delivery permission without actually
-    // signalling. `ESRCH` (3) is the canonical "no such process".
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let err = std::io::Error::last_os_error();
-    // EPERM means the process exists but we can't signal it — count as
-    // alive, since the registry shouldn't fabricate deaths.
-    matches!(err.raw_os_error(), Some(libc::EPERM) | Some(libc::EINVAL))
+    // Existence *and* not a zombie: an exited-but-unreaped child still
+    // answers `kill(pid, 0)`, and a registry that believed it would keep the
+    // entry `Running` until the pid was finally reaped.
+    crate::util::process_tree::pid_is_running(pid)
 }
 
 #[cfg(not(unix))]

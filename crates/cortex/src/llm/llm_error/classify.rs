@@ -68,6 +68,14 @@ const BILLING_NEEDLES: &[&str] = &[
     "out of credits",
     "no credits",
     "billing error",
+    // Structured `error.code` values OpenAI sends with a 429 status when the
+    // account, not the window, is exhausted: a prepaid balance at zero, or an
+    // organization / project spend cap. Retrying or cooling the key cannot
+    // clear these — the operator has to top up or raise the cap — so they
+    // must classify as billing ahead of the 429 rate-limit needles.
+    "credit_balance_exhausted",
+    "spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
 ];
 
 const RATE_LIMIT_NEEDLES: &[&str] = &[
