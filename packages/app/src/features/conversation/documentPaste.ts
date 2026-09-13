@@ -31,3 +31,28 @@ export function appendPastedText(draft: string, pasted: string): string {
   if (draft === "") return pasted;
   return /\s$/.test(draft) ? draft + pasted : `${draft} ${pasted}`;
 }
+
+/**
+ * Text longer than this is attached as a file rather than typed into the box.
+ *
+ * A pasted log, stack trace, or whole source file is content to hand over, not
+ * a message to edit: dropped inline it fills the textarea past its height cap,
+ * buries the question the user was about to type under it, and makes the
+ * Enter key a gamble. A few thousand characters is well past anything typed by
+ * hand and short of most things pasted by mistake.
+ */
+export const PASTE_AS_FILE_CHARS = 3_000;
+
+/**
+ * The pasted text as a plain-text file, or null when it is short enough to
+ * stay in the box.
+ *
+ * `ordinal` numbers a second paste so its chip is not a twin of the first.
+ * The bytes reach the model as a labelled document, which is why the name
+ * says what it is.
+ */
+export function pastedTextFile(text: string, ordinal = 1): File | null {
+  if (text.length < PASTE_AS_FILE_CHARS) return null;
+  const name = ordinal > 1 ? `pasted-text-${ordinal}.txt` : "pasted-text.txt";
+  return new File([text], name, { type: "text/plain" });
+}

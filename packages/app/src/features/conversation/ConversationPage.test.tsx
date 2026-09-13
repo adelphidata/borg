@@ -97,6 +97,33 @@ describe("ConversationPage", () => {
     await waitFor(() => expect(screen.getByText("working on it")).toBeTruthy());
   });
 
+  it("reveals earlier history when the reader scrolls up into the top edge", async () => {
+    // Long enough that the render budget hides the first half.
+    const messages = Array.from({ length: 120 }, (_, i) => [
+      { role: "user", text: `ask ${i}` },
+      { role: "assistant", text: `answer ${i}` },
+    ]).flat();
+    mount(fakeDaemon({ ...OPEN, GetSession: { messages } }));
+    // Mounting a long transcript is slow under coverage instrumentation.
+    const button = await screen.findByText("Show earlier messages", {}, { timeout: 5_000 });
+    // A short cell costs two budget units, so the opening page is the last
+    // fifty exchanges and each reveal adds fifty more.
+    expect(screen.queryByText("ask 40")).toBeNull();
+    const scroller = button.closest(".overflow-y-auto") as HTMLElement;
+
+    // Down first, then up into the edge: position alone is not a request.
+    scroller.scrollTop = 400;
+    fireEvent.scroll(scroller);
+    expect(screen.queryByText("ask 40")).toBeNull();
+    scroller.scrollTop = 40;
+    fireEvent.scroll(scroller);
+
+    await waitFor(() => expect(screen.getByText("ask 40")).toBeTruthy());
+    // One page, not the whole transcript: the button is still there for the rest.
+    expect(screen.queryByText("ask 10")).toBeNull();
+    expect(screen.getByText("Show earlier messages")).toBeTruthy();
+  });
+
   it("says the connection dropped rather than freezing silently", async () => {
     // A silent stall used to look identical to an idle agent.
     const daemon = fakeDaemon(OPEN);

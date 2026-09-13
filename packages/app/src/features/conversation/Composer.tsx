@@ -12,7 +12,7 @@ import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
 import { collectAttachments } from "./attachments";
-import { appendPastedText, composerOwnsPaste } from "./documentPaste";
+import { appendPastedText, composerOwnsPaste, pastedTextFile } from "./documentPaste";
 import { draftTitle, publishDraft } from "./draftStore";
 import { ModelPill } from "./ModelPill";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
@@ -121,6 +121,10 @@ export function Composer({
   /** Read by effects that must not re-run when the queue changes. */
   const queuedRef = useRef<{ text: string; attachments: Attachment[] } | undefined>(undefined);
   queuedRef.current = queued;
+  // Read by the paste handler, which is registered once on the document and
+  // would otherwise see the attachment list as it was when it was registered.
+  const attachmentsRef = useRef<Attachment[]>(attachments);
+  attachmentsRef.current = attachments;
   useEffect(
     () => () => {
       for (const url of objectUrls.current) URL.revokeObjectURL(url);
@@ -303,8 +307,8 @@ export function Composer({
   };
 
   const addFiles = useCallback(
-    async (files: readonly File[]) => {
-      if (files.length === 0) return;
+    async (files: readonly File[]): Promise<number> => {
+      if (files.length === 0) return 0;
       const forConversation = conversationKey;
       const { attachments: added, errors } = await collectAttachments(files);
       // Reading and downscaling take long enough for the user to have moved on.
@@ -312,7 +316,7 @@ export function Composer({
       // gone, so anything arriving now would never be revoked.
       if (forConversation !== conversationKeyRef.current) {
         for (const a of added) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
-        return;
+        return 0;
       }
       if (added.length > 0) {
         // Only images mint one; a document has nothing to preview.
@@ -320,8 +324,39 @@ export function Composer({
         setAttachments((prev) => [...prev, ...added]);
       }
       setError(errors[0]);
+      return added.length;
     },
     [conversationKey],
+  );
+
+  /**
+   * Pasted text lands in the box, unless there is enough of it to be a file.
+   *
+   * A long paste becomes a chip so the question stays visible above it. If the
+   * chip cannot be made — the paste is past the document limit, or the reader
+   * failed — the text goes inline after all: cluttering the box is a nuisance,
+   * losing the paste is not.
+   */
+  const pasteText = useCallback(
+    (text: string) => {
+      const pasted = attachmentsRef.current.filter((a) => a.filename.startsWith("pasted-text"));
+      const file = pastedTextFile(text, pasted.length + 1);
+      if (file === null) {
+        setDraft((prev) => appendPastedText(prev, text));
+        return;
+      }
+      // Same guard as the attachment path: a paste that resolves after the
+      // user moved on must not land in the next conversation's box.
+      const forConversation = conversationKeyRef.current;
+      void addFiles([file]).then((added) => {
+        if (added > 0 || forConversation !== conversationKeyRef.current) return;
+        setDraft((prev) => appendPastedText(prev, text));
+        // Only this file's refusal is moot now; an image pasted alongside
+        // keeps its own error.
+        setError((prev) => (prev?.startsWith(file.name) ? undefined : prev));
+      });
+    },
+    [addFiles],
   );
 
   /**
@@ -339,7 +374,7 @@ export function Composer({
       if (files.length === 0 && text === "") return;
       e.preventDefault();
       if (files.length > 0) void addFiles(files);
-      if (text !== "") setDraft((prev) => appendPastedText(prev, text));
+      if (text !== "") pasteText(text);
       // After the state commit, or the caret would be placed in the old value.
       requestAnimationFrame(() => {
         const el = textarea.current;
@@ -351,7 +386,7 @@ export function Composer({
     };
     document.addEventListener("paste", onPaste);
     return () => document.removeEventListener("paste", onPaste);
-  }, [addFiles, textarea]);
+  }, [addFiles, pasteText, textarea]);
 
   const forget = (urls: (string | undefined)[]) => {
     const real = urls.filter((u): u is string => u !== undefined);
@@ -669,9 +704,14 @@ export function Composer({
             onKeyDown={onKeyDown}
             onPaste={(e) => {
               const files = Array.from(e.clipboardData.files);
-              if (files.length === 0) return;
+              const text = e.clipboardData.getData("text/plain");
+              // A short text paste is the browser's to insert at the caret;
+              // only a long one is taken out of its hands.
+              const asFile = files.length === 0 && pastedTextFile(text) !== null;
+              if (files.length === 0 && !asFile) return;
               e.preventDefault();
-              void addFiles(files);
+              if (files.length > 0) void addFiles(files);
+              if (asFile) pasteText(text);
             }}
           />
           {busy && draft.trim() === "" ? (

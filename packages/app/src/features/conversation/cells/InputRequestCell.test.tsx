@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { InputRequestCell } from "./InputRequestCell";
 import type { Cell } from "../useConversation";
 
@@ -90,6 +90,39 @@ describe("InputRequestCell", () => {
     fireEvent.change(screen.getByPlaceholderText("Your answer"), { target: { value: "duckdb" } });
     fireEvent.keyDown(screen.getByPlaceholderText("Your answer"), { key: "Enter" });
 
+    expect(answered(respond)).toEqual({ q1: { answers: ["duckdb"] } });
+  });
+
+  it("sends the chosen options on ⌘↩ or Ctrl+↩, like the composer", () => {
+    for (const chord of [{ metaKey: true }, { ctrlKey: true }]) {
+      const { respond } = renderCell();
+      fireEvent.click(screen.getByText("postgres"));
+      fireEvent.keyDown(screen.getByText("postgres"), { key: "Enter", ...chord });
+
+      expect(answered(respond)).toEqual({ q1: { answers: ["postgres"] } });
+      cleanup();
+    }
+  });
+
+  it("does not send on plain Enter from a pill, or the chord once answered", () => {
+    const { respond } = renderCell();
+    fireEvent.click(screen.getByText("postgres"));
+    fireEvent.keyDown(screen.getByText("postgres"), { key: "Enter" });
+    expect(respond).not.toHaveBeenCalled();
+    cleanup();
+
+    const done = renderCell({ answered: true });
+    fireEvent.keyDown(screen.getByText("postgres"), { key: "Enter", metaKey: true });
+    expect(done.respond).not.toHaveBeenCalled();
+  });
+
+  it("sends the typed answer once when the chord lands in the free-text box", () => {
+    const { respond } = renderCell();
+    fireEvent.click(screen.getByText("Other"));
+    fireEvent.change(screen.getByPlaceholderText("Your answer"), { target: { value: "duckdb" } });
+    fireEvent.keyDown(screen.getByPlaceholderText("Your answer"), { key: "Enter", metaKey: true });
+
+    expect(respond).toHaveBeenCalledTimes(1);
     expect(answered(respond)).toEqual({ q1: { answers: ["duckdb"] } });
   });
 

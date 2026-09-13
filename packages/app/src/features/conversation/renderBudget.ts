@@ -104,3 +104,25 @@ export function revealEarlier(items: RenderItem[], cutIndex: number): number {
 export function cutHidesEverything(items: RenderItem[], cutIndex: number): boolean {
   return cutIndex > 0 && !items.some((item) => item.index >= cutIndex);
 }
+
+/**
+ * How close to the top of the scroller counts as asking for more history.
+ *
+ * Wider than the follow-bottom threshold: a reader flicking upward on a
+ * trackpad overshoots, and the reveal should land before the scroller hits its
+ * hard stop and the flick reads as "nothing more here".
+ */
+export const TOP_EDGE_PX = 120;
+
+/**
+ * Whether a scroll should reveal earlier history on its own.
+ *
+ * Only an upward scroll that arrives at the top edge counts. Position alone
+ * would fire on the reveal itself — mounting older cells pushes `scrollTop`
+ * down, which reads as a downward move and is ignored — and on a short
+ * transcript that opens with nothing to scroll. Whether anything is left to
+ * reveal is the caller's check; the listener is not even attached otherwise.
+ */
+export function shouldRevealOnScroll(previousTop: number, top: number): boolean {
+  return top < previousTop && top <= TOP_EDGE_PX;
+}

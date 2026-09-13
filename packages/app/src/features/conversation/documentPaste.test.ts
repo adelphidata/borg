@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { appendPastedText, composerOwnsPaste } from "./documentPaste";
+import {
+  PASTE_AS_FILE_CHARS,
+  appendPastedText,
+  composerOwnsPaste,
+  pastedTextFile,
+} from "./documentPaste";
 
 /** Builds a detached element, optionally content-editable. */
 function el(tag: string, editable = false): HTMLElement {
@@ -58,5 +63,23 @@ describe("appendPastedText", () => {
   it("respects whitespace the user typed on purpose", () => {
     expect(appendPastedText("a list:\n", "- one")).toBe("a list:\n- one");
     expect(appendPastedText("look at ", "this")).toBe("look at this");
+  });
+});
+
+describe("pastedTextFile", () => {
+  it("leaves anything shorter than the threshold in the box", () => {
+    expect(pastedTextFile("x".repeat(PASTE_AS_FILE_CHARS - 1))).toBeNull();
+  });
+
+  it("turns a long paste into a plain-text file holding every byte", async () => {
+    const text = "line\n".repeat(PASTE_AS_FILE_CHARS);
+    const file = pastedTextFile(text);
+    expect(file?.name).toBe("pasted-text.txt");
+    expect(file?.type).toBe("text/plain");
+    expect(await file?.text()).toBe(text);
+  });
+
+  it("numbers a second paste so the chips are told apart", () => {
+    expect(pastedTextFile("x".repeat(PASTE_AS_FILE_CHARS), 2)?.name).toBe("pasted-text-2.txt");
   });
 });

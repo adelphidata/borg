@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { dispatchKeybind, resetKeybinds } from "../../lib/keybinds";
 import type { Command } from "../palette/score";
 import { Composer } from "./Composer";
+import { collectAttachments } from "./attachments";
 import { draftKeyFor, moveDraft, readDraft } from "./draftStore";
 
 /**
@@ -676,5 +677,77 @@ describe("typing while Borg waits on a prompt", () => {
     awaiting();
 
     expect(screen.getByRole("textbox")).toHaveProperty("placeholder", "Send after this…");
+  });
+});
+
+describe("Composer pasted text", () => {
+  const clipboard = (text: string) => ({
+    clipboardData: { files: [], getData: () => text, types: ["text/plain"] },
+  });
+  const long = "trace line\n".repeat(400);
+
+  it("attaches a long paste as a file and keeps the box clear for the question", async () => {
+    setup({ draftKey: draftKeyFor("sess-1"), conversationKey: "sess-1" });
+    fireEvent.paste(screen.getByRole("textbox"), clipboard(long));
+
+    await waitFor(() => expect(screen.getByText("pasted-text.txt")).toBeTruthy());
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+    expect(vi.mocked(collectAttachments).mock.calls.at(-1)?.[0][0]?.name).toBe("pasted-text.txt");
+  });
+
+  it("leaves a short paste in the browser's hands, at the caret", () => {
+    setup({ draftKey: draftKeyFor("sess-1"), conversationKey: "sess-1" });
+    const before = vi.mocked(collectAttachments).mock.calls.length;
+    const event = fireEvent.paste(screen.getByRole("textbox"), clipboard("just a line"));
+
+    // Not cancelled: the textarea inserts it natively.
+    expect(event).toBe(true);
+    expect(vi.mocked(collectAttachments).mock.calls.length).toBe(before);
+  });
+
+  it("numbers a second long paste rather than showing two identical chips", async () => {
+    setup({ draftKey: draftKeyFor("sess-1"), conversationKey: "sess-1" });
+    fireEvent.paste(document.body, clipboard(long));
+    await waitFor(() => expect(screen.getByText("pasted-text.txt")).toBeTruthy());
+    fireEvent.paste(document.body, clipboard(long));
+
+    await waitFor(() => expect(screen.getByText("pasted-text-2.txt")).toBeTruthy());
+  });
+
+  it("falls back to the box when the paste cannot become a file", async () => {
+    vi.mocked(collectAttachments).mockResolvedValueOnce({
+      attachments: [],
+      errors: ["pasted-text.txt is too long to attach to one message"],
+    });
+    setup({ draftKey: draftKeyFor("sess-1"), conversationKey: "sess-1" });
+    fireEvent.paste(document.body, clipboard(long));
+
+    // Cluttering the box is a nuisance; losing the paste would not be.
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveProperty("value", long));
+    expect(screen.queryByText(/too long to attach/)).toBeNull();
+  });
+
+  it("does not drop a failed paste into the conversation the user moved to", async () => {
+    let refuse: (value: { attachments: never[]; errors: string[] }) => void = () => {};
+    vi.mocked(collectAttachments).mockImplementationOnce(
+      () => new Promise((resolve) => (refuse = resolve)),
+    );
+    const { rerender } = setup({ draftKey: draftKeyFor("sess-1"), conversationKey: "sess-1" });
+    fireEvent.paste(document.body, clipboard(long));
+
+    rerender(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("sess-2")}
+        conversationKey="sess-2"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+    await act(async () => refuse({ attachments: [], errors: ["pasted-text.txt is too long"] }));
+
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+    expect(readDraft(draftKeyFor("sess-2"))).toBe("");
   });
 });

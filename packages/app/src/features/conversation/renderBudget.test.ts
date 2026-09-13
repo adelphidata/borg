@@ -4,11 +4,13 @@ import type { Cell } from "./useConversation";
 import {
   INITIAL_BUDGET,
   MIN_USER_TURNS,
+  TOP_EDGE_PX,
   budgetCutIndex,
   cellWeight,
   cutHidesEverything,
   itemWeight,
   revealEarlier,
+  shouldRevealOnScroll,
 } from "./renderBudget";
 
 const user = (text = "ask"): Cell => ({ kind: "user", text });
@@ -169,5 +171,23 @@ describe("cutHidesEverything", () => {
   it("treats showing everything as never hiding anything", () => {
     expect(cutHidesEverything(group(exchanges(3)), 0)).toBe(false);
     expect(cutHidesEverything([], 0)).toBe(false);
+  });
+});
+
+describe("shouldRevealOnScroll", () => {
+  it("reveals when an upward scroll reaches the top edge", () => {
+    expect(shouldRevealOnScroll(400, TOP_EDGE_PX)).toBe(true);
+    expect(shouldRevealOnScroll(50, 0)).toBe(true);
+  });
+
+  it("ignores an upward scroll that stops short of the edge", () => {
+    expect(shouldRevealOnScroll(800, TOP_EDGE_PX + 1)).toBe(false);
+  });
+
+  it("ignores the reveal's own re-anchor, which moves the scroller down", () => {
+    // Mounting older cells above the reader pushes `scrollTop` down by their
+    // height; that is not a request for more.
+    expect(shouldRevealOnScroll(20, 900)).toBe(false);
+    expect(shouldRevealOnScroll(0, 0)).toBe(false);
   });
 });

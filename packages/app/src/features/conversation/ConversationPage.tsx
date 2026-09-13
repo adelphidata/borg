@@ -17,7 +17,13 @@ import { PlanPanel } from "./cells/PlanPanel";
 import { ToolRunCell } from "./cells/ToolRunCell";
 import { TranscriptCell } from "./cells";
 import { groupCells } from "./cells/toolRuns";
-import { INITIAL_BUDGET, budgetCutIndex, cutHidesEverything, revealEarlier } from "./renderBudget";
+import {
+  INITIAL_BUDGET,
+  budgetCutIndex,
+  cutHidesEverything,
+  revealEarlier,
+  shouldRevealOnScroll,
+} from "./renderBudget";
 import { FailureCard } from "./FailureCard";
 import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
@@ -132,6 +138,30 @@ export function ConversationPage() {
     el.scrollTop = el.scrollHeight - fromBottom.current;
     fromBottom.current = undefined;
   }, [cutIndex]);
+
+  // Scrolling up into the top edge reveals the next page by itself; the
+  // button stays as the visible promise that there is more, and for anyone
+  // who would rather click. Through a ref so the listener is registered once
+  // rather than on every change to the transcript.
+  const showEarlierRef = useRef(showEarlier);
+  showEarlierRef.current = showEarlier;
+  const hasHidden = cutIndex > 0;
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !hasHidden) return;
+    let previousTop = el.scrollTop;
+    const onScroll = () => {
+      const top = el.scrollTop;
+      // One reveal at a time: a pending one has yet to re-anchor the
+      // scroller, and firing again would measure a page that is mid-move.
+      if (fromBottom.current === undefined && shouldRevealOnScroll(previousTop, top)) {
+        showEarlierRef.current();
+      }
+      previousTop = top;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [hasHidden]);
 
   useTurnNotifications(cells, busy, target);
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
