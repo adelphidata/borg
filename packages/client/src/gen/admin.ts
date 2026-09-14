@@ -843,6 +843,12 @@ export interface RemoveCredentialRequest {
 
 export interface ResetCredentialsRequest {
   provider: string;
+  /**
+   * Optional. Empty = clear every cooldown in the pool. Otherwise a numeric
+   * 1-based index, exact label, full id, or unique 4+ hex id-prefix — only
+   * that entry is cleared; sibling cooldowns and strike counts stay intact.
+   */
+  target: string;
 }
 
 export interface ResetCredentialsResponse {
@@ -853,6 +859,24 @@ export interface SetCredentialStrategyRequest {
   provider: string;
   /** "fill_first" | "round_robin" | "least_used" | "random" */
   strategy: string;
+}
+
+export interface SetCredentialPriorityRequest {
+  provider: string;
+  /** Numeric 1-based index, exact label, full id, or unique 4+ hex id-prefix. */
+  target: string;
+  /** 1-based position in the pool's priority order (1 = tried first). */
+  position: number;
+}
+
+export interface SetCredentialPriorityResponse {
+  /**
+   * The pool's active strategy — lets the client warn when the strategy
+   * ("round_robin" | "random") ignores priority.
+   */
+  strategy: string;
+  /** Live entries in their new priority order. */
+  entries: CredentialEntry[];
 }
 
 export interface PairCredentialRequest {
@@ -10795,13 +10819,16 @@ export const RemoveCredentialRequest: MessageFns<RemoveCredentialRequest> = {
 };
 
 function createBaseResetCredentialsRequest(): ResetCredentialsRequest {
-  return { provider: "" };
+  return { provider: "", target: "" };
 }
 
 export const ResetCredentialsRequest: MessageFns<ResetCredentialsRequest> = {
   encode(message: ResetCredentialsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.provider !== "") {
       writer.uint32(10).string(message.provider);
+    }
+    if (message.target !== "") {
+      writer.uint32(18).string(message.target);
     }
     return writer;
   },
@@ -10821,6 +10848,14 @@ export const ResetCredentialsRequest: MessageFns<ResetCredentialsRequest> = {
           message.provider = reader.string();
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.target = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -10831,13 +10866,19 @@ export const ResetCredentialsRequest: MessageFns<ResetCredentialsRequest> = {
   },
 
   fromJSON(object: any): ResetCredentialsRequest {
-    return { provider: isSet(object.provider) ? globalThis.String(object.provider) : "" };
+    return {
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      target: isSet(object.target) ? globalThis.String(object.target) : "",
+    };
   },
 
   toJSON(message: ResetCredentialsRequest): unknown {
     const obj: any = {};
     if (message.provider !== "") {
       obj.provider = message.provider;
+    }
+    if (message.target !== "") {
+      obj.target = message.target;
     }
     return obj;
   },
@@ -10848,6 +10889,7 @@ export const ResetCredentialsRequest: MessageFns<ResetCredentialsRequest> = {
   fromPartial<I extends Exact<DeepPartial<ResetCredentialsRequest>, I>>(object: I): ResetCredentialsRequest {
     const message = createBaseResetCredentialsRequest();
     message.provider = object.provider ?? "";
+    message.target = object.target ?? "";
     return message;
   },
 };
@@ -10982,6 +11024,178 @@ export const SetCredentialStrategyRequest: MessageFns<SetCredentialStrategyReque
     const message = createBaseSetCredentialStrategyRequest();
     message.provider = object.provider ?? "";
     message.strategy = object.strategy ?? "";
+    return message;
+  },
+};
+
+function createBaseSetCredentialPriorityRequest(): SetCredentialPriorityRequest {
+  return { provider: "", target: "", position: 0 };
+}
+
+export const SetCredentialPriorityRequest: MessageFns<SetCredentialPriorityRequest> = {
+  encode(message: SetCredentialPriorityRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.provider !== "") {
+      writer.uint32(10).string(message.provider);
+    }
+    if (message.target !== "") {
+      writer.uint32(18).string(message.target);
+    }
+    if (message.position !== 0) {
+      writer.uint32(24).uint32(message.position);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetCredentialPriorityRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetCredentialPriorityRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.provider = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.target = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.position = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetCredentialPriorityRequest {
+    return {
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      target: isSet(object.target) ? globalThis.String(object.target) : "",
+      position: isSet(object.position) ? globalThis.Number(object.position) : 0,
+    };
+  },
+
+  toJSON(message: SetCredentialPriorityRequest): unknown {
+    const obj: any = {};
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.target !== "") {
+      obj.target = message.target;
+    }
+    if (message.position !== 0) {
+      obj.position = Math.round(message.position);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SetCredentialPriorityRequest>, I>>(base?: I): SetCredentialPriorityRequest {
+    return SetCredentialPriorityRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SetCredentialPriorityRequest>, I>>(object: I): SetCredentialPriorityRequest {
+    const message = createBaseSetCredentialPriorityRequest();
+    message.provider = object.provider ?? "";
+    message.target = object.target ?? "";
+    message.position = object.position ?? 0;
+    return message;
+  },
+};
+
+function createBaseSetCredentialPriorityResponse(): SetCredentialPriorityResponse {
+  return { strategy: "", entries: [] };
+}
+
+export const SetCredentialPriorityResponse: MessageFns<SetCredentialPriorityResponse> = {
+  encode(message: SetCredentialPriorityResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.strategy !== "") {
+      writer.uint32(10).string(message.strategy);
+    }
+    for (const v of message.entries) {
+      CredentialEntry.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetCredentialPriorityResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetCredentialPriorityResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.strategy = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.entries.push(CredentialEntry.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetCredentialPriorityResponse {
+    return {
+      strategy: isSet(object.strategy) ? globalThis.String(object.strategy) : "",
+      entries: globalThis.Array.isArray(object?.entries)
+        ? object.entries.map((e: any) => CredentialEntry.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SetCredentialPriorityResponse): unknown {
+    const obj: any = {};
+    if (message.strategy !== "") {
+      obj.strategy = message.strategy;
+    }
+    if (message.entries?.length) {
+      obj.entries = message.entries.map((e) => CredentialEntry.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SetCredentialPriorityResponse>, I>>(base?: I): SetCredentialPriorityResponse {
+    return SetCredentialPriorityResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SetCredentialPriorityResponse>, I>>(
+    object: I,
+  ): SetCredentialPriorityResponse {
+    const message = createBaseSetCredentialPriorityResponse();
+    message.strategy = object.strategy ?? "";
+    message.entries = object.entries?.map((e) => CredentialEntry.fromPartial(e)) || [];
     return message;
   },
 };
@@ -13886,6 +14100,18 @@ export const AdminDefinition = {
       requestType: SetCredentialStrategyRequest as typeof SetCredentialStrategyRequest,
       requestStream: false,
       responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Move one credential to a 1-based position in the pool's priority order
+     * and renumber the rest contiguously. Backs `borg auth priority …`.
+     */
+    setCredentialPriority: {
+      name: "SetCredentialPriority",
+      requestType: SetCredentialPriorityRequest as typeof SetCredentialPriorityRequest,
+      requestStream: false,
+      responseType: SetCredentialPriorityResponse as typeof SetCredentialPriorityResponse,
       responseStream: false,
       options: {},
     },

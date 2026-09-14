@@ -52,6 +52,112 @@ impl Database {
         Ok(())
     }
 
+    /// Add the manual-run marker and the failure-delivery route to
+    /// `scheduled_tasks` on databases stamped before they joined `SCHEMA_SQL`.
+    /// Same contract as [`Database::migrate_v2`]: idempotent, and a no-op on a
+    /// database built from the current `SCHEMA_SQL`.
+    pub(super) async fn migrate_v3(&self) -> Result<()> {
+        for (column, decl) in [
+            (
+                "run_now_requested",
+                "run_now_requested INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("failure_delivery_channel", "failure_delivery_channel TEXT"),
+            ("failure_delivery_target", "failure_delivery_target TEXT"),
+        ] {
+            if !self.column_exists("scheduled_tasks", column).await? {
+                self.conn
+                    .execute(
+                        &format!("ALTER TABLE scheduled_tasks ADD COLUMN {decl}"),
+                        (),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite legacy `mcp.servers` rows whose `tools.include` is an empty
+    /// list.
+    ///
+    /// Before the include list became optional, the serializer always wrote
+    /// `"include": []` and the filter read that as "no allowlist". Today an
+    /// explicit empty list admits nothing, so a row written by the old CLI
+    /// would silently register zero tools. The old CLI had no way to set the
+    /// list, so every stored `[]` from that era means "absent": drop the key.
+    /// Idempotent — a row without the key, or with a non-empty list, is left
+    /// byte-for-byte as it was.
+    ///
+    /// Gated on its own `meta` marker rather than on `schema_version`, and
+    /// that distinction is load-bearing. `stamp_is_current` is `==`, so an
+    /// older binary — another worktree sharing `~/.borg/borg.db`, or a
+    /// rollback — restamps the database and makes every `migrate_vN` run
+    /// again. Every other migration is safe to repeat; this one is not. Once
+    /// the new serializer is in use, `"include": []` is a deliberate
+    /// lock-down that must never be rewritten, and a second run could not
+    /// tell it apart from the legacy default. The marker survives a stamp
+    /// regression, so the rewrite happens exactly once per database.
+    pub(super) async fn migrate_v4(&self) -> Result<()> {
+        const KEY: &str = "mcp.servers";
+        const DONE_MARKER: &str = "mcp_include_optional_rewrite";
+        if self.get_meta(DONE_MARKER).await?.is_some() {
+            return Ok(());
+        }
+        // Stamped before the rewrite, and on every early return below: a
+        // database with nothing to rewrite is just as finished as one that
+        // was rewritten, and leaving it unmarked would arm the rewrite
+        // against lock-downs written later.
+        self.set_meta(DONE_MARKER, "1").await?;
+        let Some(raw) = self.get_setting(KEY).await? else {
+            return Ok(());
+        };
+        let mut servers: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    key = KEY,
+                    error = %e,
+                    "settings row is not valid JSON; leaving it for the config loader to report"
+                );
+                return Ok(());
+            }
+        };
+        let rewritten = Self::drop_empty_include_lists(&mut servers);
+        if rewritten.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            servers = ?rewritten,
+            "upgraded legacy empty MCP include lists to \"no allowlist\""
+        );
+        self.set_setting(KEY, &serde_json::to_string(&servers)?)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove `tools.include` from every server whose list is empty; returns
+    /// the names of the servers that changed.
+    fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
+        let mut changed = Vec::new();
+        let Some(map) = servers.as_object_mut() else {
+            return changed;
+        };
+        for (name, server) in map.iter_mut() {
+            let Some(tools) = server.get_mut("tools").and_then(|t| t.as_object_mut()) else {
+                continue;
+            };
+            if tools
+                .get("include")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+            {
+                tools.remove("include");
+                changed.push(name.clone());
+            }
+        }
+        changed
+    }
+
     /// Whether `table` currently has a column named `column`.
     async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         // `PRAGMA table_info` does not accept a bound parameter for the table
@@ -447,7 +553,10 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     model TEXT,
     model_provider TEXT,
     monitor_mode INTEGER NOT NULL DEFAULT 0,
-    last_pre_run_hash TEXT
+    last_pre_run_hash TEXT,
+    run_now_requested INTEGER NOT NULL DEFAULT 0,
+    failure_delivery_channel TEXT,
+    failure_delivery_target TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run);
 CREATE INDEX IF NOT EXISTS idx_tasks_retry ON scheduled_tasks(status, retry_after);
@@ -1288,6 +1397,145 @@ mod tests {
             db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION,
             "a stale higher stamp must be corrected, not honoured"
+        );
+    }
+
+    /// A database stamped at v2 predates the run-now marker and the failure
+    /// route. Every other test builds from `SCHEMA_SQL` where the columns
+    /// already exist, so the `ALTER` branch of `migrate_v3` only runs here.
+    #[tokio::test]
+    async fn a_v2_database_gains_the_run_now_and_failure_route_columns() {
+        let db = Database::test_db().await;
+        // Last column first: sqlite rewrites the stored CREATE text on each
+        // drop, and peeling from the tail keeps the remaining text well-formed.
+        for column in [
+            "failure_delivery_target",
+            "failure_delivery_channel",
+            "run_now_requested",
+        ] {
+            db.conn
+                .execute(
+                    &format!("ALTER TABLE scheduled_tasks DROP COLUMN {column}"),
+                    (),
+                )
+                .await
+                .expect("drop the column to simulate an older database");
+            assert!(!db.column_exists("scheduled_tasks", column).await.unwrap());
+        }
+        db.set_meta("schema_version", "2").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION
+        );
+        for column in [
+            "run_now_requested",
+            "failure_delivery_channel",
+            "failure_delivery_target",
+        ] {
+            assert!(
+                db.column_exists("scheduled_tasks", column).await.unwrap(),
+                "migrate_v3 must add `{column}`"
+            );
+        }
+        // The upgraded row shape reads back through the normal path.
+        let rows = db.list_tasks().await.expect("list on upgraded schema");
+        assert!(
+            rows.iter().all(|t| !t.run_now_requested),
+            "the marker defaults to unset on upgraded rows"
+        );
+    }
+
+    /// A row written by the old CLI carries `"include": []`, which the
+    /// filter now reads as "admit nothing". The migration must drop that key
+    /// and leave every other shape untouched.
+    #[tokio::test]
+    async fn legacy_empty_include_lists_become_absent_on_upgrade() {
+        let db = Database::test_db().await;
+        let legacy = serde_json::json!({
+            "old": {"transport": "stdio", "command": "x", "tools": {"include": [], "exclude": ["rm"]}},
+            "pinned": {"transport": "stdio", "command": "y", "tools": {"include": ["read"]}},
+            "bare": {"transport": "stdio", "command": "z"}
+        });
+        db.set_setting("mcp.servers", &legacy.to_string())
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "3").await.unwrap();
+        // `test_db` already migrated, so clear the marker to model a database
+        // that has never seen the rewrite.
+        db.delete_meta("mcp_include_optional_rewrite")
+            .await
+            .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&db.get_setting("mcp.servers").await.unwrap().unwrap()).unwrap();
+        assert!(
+            after["old"]["tools"].get("include").is_none(),
+            "legacy empty list must be dropped, got {after}"
+        );
+        assert_eq!(after["old"]["tools"]["exclude"], serde_json::json!(["rm"]));
+        assert_eq!(
+            after["pinned"]["tools"]["include"],
+            serde_json::json!(["read"])
+        );
+        assert_eq!(after["bare"], legacy["bare"]);
+
+        // Running again is a no-op: nothing left to rewrite.
+        let before_second = db.get_setting("mcp.servers").await.unwrap();
+        db.migrate_v4().await.unwrap();
+        assert_eq!(db.get_setting("mcp.servers").await.unwrap(), before_second);
+    }
+
+    #[tokio::test]
+    async fn migrate_v4_leaves_an_unparseable_servers_row_alone() {
+        let db = Database::test_db().await;
+        db.delete_meta("mcp_include_optional_rewrite")
+            .await
+            .unwrap();
+        db.set_setting("mcp.servers", "{not json").await.unwrap();
+        db.migrate_v4().await.unwrap();
+        assert_eq!(
+            db.get_setting("mcp.servers").await.unwrap().as_deref(),
+            Some("{not json")
+        );
+    }
+
+    /// An older binary sharing `~/.borg/borg.db` restamps the schema version,
+    /// which re-runs every migration. A deliberate lock-down written after
+    /// the rewrite must survive that, or the second run silently turns
+    /// "this server exposes no tools" into "this server exposes all of them".
+    #[tokio::test]
+    async fn a_deliberate_empty_include_survives_a_stamp_regression() {
+        let db = Database::test_db().await;
+        // The rewrite has already happened on this database.
+        assert!(
+            db.get_meta("mcp_include_optional_rewrite")
+                .await
+                .unwrap()
+                .is_some(),
+            "opening a database must mark the one-shot rewrite as done"
+        );
+        let locked_down = serde_json::json!({
+            "vetted": {"transport": "stdio", "command": "x", "tools": {"include": []}}
+        });
+        db.set_setting("mcp.servers", &locked_down.to_string())
+            .await
+            .unwrap();
+        // An older binary reopened the shared database and stamped it back.
+        db.set_meta("schema_version", "2").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&db.get_setting("mcp.servers").await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            after["vetted"]["tools"]["include"],
+            serde_json::json!([]),
+            "the lock-down must survive, got {after}"
         );
     }
 }

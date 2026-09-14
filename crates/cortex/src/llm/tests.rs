@@ -388,6 +388,8 @@ async fn openrouter_cost_event_uses_usage_cost_verbatim() {
         provider: "openrouter".to_string(),
         model: "openai/gpt-4o-mini".to_string(),
         provider_cost_usd: Some("0.000123".to_string()),
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-1", Some(&usage), "openai/gpt-4o-mini");
@@ -415,6 +417,8 @@ async fn openrouter_missing_cost_emits_unknown_cost() {
         provider: "openrouter".to_string(),
         model: "openai/gpt-4o-mini".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-2", Some(&usage), "openai/gpt-4o-mini");
@@ -434,7 +438,8 @@ fn openai_sse_tool_calls_finish_reason_emits_tool_intent() {
     // instead of silently ending the turn on the model's narration.
     use crate::sse::SseAction;
     let line = r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
-    let action = transport::parse_openai_sse_line(line, "openai", "gpt-4o");
+    let action =
+        transport::parse_openai_sse_line(line, "openai", "gpt-4o", &mut Default::default());
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected tool-intent emit"),
@@ -446,7 +451,8 @@ fn openai_sse_tool_calls_finish_reason_emits_tool_intent() {
 
     // An ordinary stop must NOT signal tool intent.
     let line = r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#;
-    let action = transport::parse_openai_sse_line(line, "openai", "gpt-4o");
+    let action =
+        transport::parse_openai_sse_line(line, "openai", "gpt-4o", &mut Default::default());
     if let SseAction::Emit(ev) | SseAction::Done(ev) = action {
         assert!(
             !ev.iter().any(|e| matches!(e, StreamEvent::ToolIntent)),
@@ -475,6 +481,7 @@ fn anthropic_sse_tool_use_stop_reason_emits_tool_intent() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     );
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
@@ -498,7 +505,12 @@ fn openrouter_sse_usage_total_cost_populates_provider_cost_usd() {
     // "openrouter_usage" rather than falling through to "unknown".
     use crate::sse::SseAction;
     let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"total_cost":0.000123}}"#;
-    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(
+        line,
+        "openrouter",
+        "openai/gpt-4o-mini",
+        &mut Default::default(),
+    );
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit"),
@@ -520,7 +532,12 @@ fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
     // the emitter then attributes as cost_source = "unknown".
     use crate::sse::SseAction;
     let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
-    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(
+        line,
+        "openrouter",
+        "openai/gpt-4o-mini",
+        &mut Default::default(),
+    );
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit"),
@@ -538,7 +555,12 @@ fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
 /// Helper: extract the parsed `UsageData` from an SSE line.
 fn parse_openrouter_usage_from_sse(line: &str) -> UsageData {
     use crate::sse::SseAction;
-    let action = transport::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let action = transport::parse_openai_sse_line(
+        line,
+        "openrouter",
+        "openai/gpt-4o-mini",
+        &mut Default::default(),
+    );
     let events = match action {
         SseAction::Emit(ev) | SseAction::Done(ev) => ev,
         _ => panic!("expected usage emit, got non-emit action"),
@@ -649,6 +671,7 @@ fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
         line_first_terminal,
         "openrouter",
         "anthropic/claude-sonnet-4.5",
+        &mut Default::default(),
     );
     assert!(
         !matches!(action, SseAction::Done(_)),
@@ -664,8 +687,12 @@ fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
     );
 
     let done_line = "data: [DONE]";
-    let done_action =
-        transport::parse_openai_sse_line(done_line, "openrouter", "anthropic/claude-sonnet-4.5");
+    let done_action = transport::parse_openai_sse_line(
+        done_line,
+        "openrouter",
+        "anthropic/claude-sonnet-4.5",
+        &mut Default::default(),
+    );
     assert!(
         matches!(done_action, SseAction::Done(_)),
         "[DONE] sentinel must be the sole termination trigger"
@@ -700,6 +727,8 @@ async fn openai_cost_event_uses_static_price_table() {
         provider: "openai".to_string(),
         model: "gpt-4.1".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-3", Some(&usage), "gpt-4.1");
@@ -726,6 +755,8 @@ async fn anthropic_cost_event_uses_static_price_table() {
         provider: "anthropic".to_string(),
         model: "claude-sonnet-4".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-4", Some(&usage), "claude-sonnet-4");
@@ -752,6 +783,8 @@ async fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
         provider: "anthropic".to_string(),
         model: "claude-sonnet-4".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-4b", Some(&usage), "claude-sonnet-4");
@@ -778,6 +811,8 @@ async fn unknown_openai_model_emits_unknown_cost() {
         provider: "openai".to_string(),
         model: "missing-model".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     client.emit_cost_event_best_effort("req-5", Some(&usage), "missing-model");
@@ -827,6 +862,8 @@ async fn sink_panic_is_caught_and_does_not_propagate() {
         provider: "openai".to_string(),
         model: "gpt-4.1".to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1636,29 +1673,41 @@ fn openai_request_omits_prompt_cache_key_when_none() {
 }
 
 #[test]
-fn openai_stream_request_serializes_include_usage() {
-    // Invariant: streaming requests MUST set `stream_options.include_usage
-    // = true`. Without this, OpenAI-compatible providers (OpenAI,
+fn openai_stream_request_sends_stream_options_by_default_and_drops_them_after_rejection() {
+    // Invariant: streaming requests set `stream_options.include_usage =
+    // true` by default. Without it, OpenAI-compatible providers (OpenAI,
     // OpenRouter, DeepSeek, Groq, Gemini-via-OpenAI) never emit a `usage`
     // chunk and `/usage` + monthly budget tracking silently return zeros.
-    let request = ChatRequest {
-        model: "grok-4".to_string(),
-        messages: vec![Message::user("hi")],
+    // The one sanctioned exception is an endpoint that has rejected the
+    // field, after which the client strips it — and only it.
+    use crate::llm::provider::Provider;
+    use crate::llm::transport::TransportRequest;
+
+    let cfg = LlmConfig::default();
+    let req = TransportRequest {
+        provider: Provider::XAi,
+        model: "grok-4",
+        messages: &[Message::user("hi")],
         tools: None,
-        temperature: 0.7,
-        max_tokens: 4096,
-        stream: true,
-        reasoning_effort: None,
+        llm_config: &cfg,
         prompt_cache_key: None,
-        user: None,
-        session_id: None,
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }),
-        usage: None,
+        system_stable_prefix: None,
+        cost_events_enabled: false,
     };
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["stream_options"]["include_usage"], true);
+    let mut body = transport::build_openai_request(&req, true).expect("build");
+    assert_eq!(body["stream_options"]["include_usage"], true);
+
+    assert!(
+        transport::strip_stream_options(&mut body),
+        "strip reports the field it removed"
+    );
+    assert!(body.get("stream_options").is_none());
+    assert_eq!(body["stream"], true, "only stream_options is dropped");
+    assert_eq!(body["model"], "grok-4");
+    assert!(
+        !transport::strip_stream_options(&mut body),
+        "a second strip finds nothing to remove"
+    );
 }
 
 #[test]
@@ -1709,6 +1758,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     );
     assert!(matches!(action, SseAction::Continue));
     assert_eq!(pending_input, 150);
@@ -1725,6 +1775,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     );
     let events = match action {
         SseAction::Done(ev) | SseAction::Emit(ev) => ev,
@@ -1765,6 +1816,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     );
 
     let delta = r#"data: {"type":"message_delta","usage":{"input_tokens":120,"output_tokens":10},"delta":{"stop_reason":"end_turn"}}"#;
@@ -1778,6 +1830,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     );
     let events = match action {
         SseAction::Done(ev) | SseAction::Emit(ev) => ev,
@@ -3489,6 +3542,7 @@ fn parse_anthropic_error_sse(err_type: &str, err_msg: &str) -> crate::sse::SseAc
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
     )
 }
 
@@ -4304,4 +4358,276 @@ async fn custom_fallback_slot_never_borrows_the_default_provider_key() {
             "provider={provider} api_key_env={api_key_env:?}"
         );
     }
+}
+
+// ── stream_options compatibility resend ──
+
+/// An OpenAI-compatible endpoint that refuses unknown request keys: 400 on
+/// any body carrying `stream_options`, a normal SSE stream otherwise.
+async fn stream_options_rejecting_server() -> wiremock::MockServer {
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("stream_options"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"Unrecognized request argument supplied: stream_options","type":"invalid_request_error"}}"#,
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+fn request_bodies(requests: &[wiremock::Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).expect("request body is JSON"))
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_options_rejection_resends_once_without_the_field_and_remembers() {
+    let server = stream_options_rejecting_server().await;
+
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(format!("{}/v1/chat/completions", server.uri()));
+    // Zero transient budget: if the compat resend were implemented as an
+    // ordinary retry, the call would fail here instead of succeeding.
+    config.llm.max_retries = 0;
+    let mut client = LlmClient::new(&config).await.expect("client builds");
+
+    let message = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_streamed(&[Message::user("hi")]),
+    )
+    .await
+    .expect("stream completes promptly")
+    .expect("the resend without stream_options must succeed");
+    assert_eq!(message.text_content(), Some("hello"));
+
+    let bodies = request_bodies(&server.received_requests().await.expect("recording on"));
+    assert_eq!(bodies.len(), 2, "exactly one rejected send plus one resend");
+    assert_eq!(
+        bodies[0]["stream_options"]["include_usage"], true,
+        "the first request carries the field by default"
+    );
+    assert!(
+        bodies[1].get("stream_options").is_none(),
+        "the resend drops the field"
+    );
+    assert_eq!(bodies[1]["stream"], true, "the resend is still a stream");
+
+    // A later call on the same client never sends the field again — no
+    // second rejected round trip.
+    client
+        .chat_streamed(&[Message::user("again")])
+        .await
+        .expect("second call succeeds");
+    let bodies = request_bodies(&server.received_requests().await.expect("recording on"));
+    assert_eq!(bodies.len(), 3, "the second call is a single request");
+    assert!(bodies[2].get("stream_options").is_none());
+}
+
+#[tokio::test]
+async fn a_400_that_does_not_name_stream_options_is_not_resent() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"Invalid request: messages must be a non-empty array"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(format!("{}/v1/chat/completions", server.uri()));
+    config.llm.max_retries = 0;
+    let mut client = LlmClient::new(&config).await.expect("client builds");
+
+    client
+        .chat_streamed(&[Message::user("hi")])
+        .await
+        .expect_err("a generic 400 still fails the call");
+    let requests = server.received_requests().await.expect("recording on");
+    assert_eq!(
+        requests.len(),
+        1,
+        "an unrelated 400 must not trigger the compat resend"
+    );
+}
+
+// ── Response id + serving upstream on UsageData ──
+
+#[test]
+fn openai_stream_usage_carries_response_id_and_upstream_from_the_first_chunk() {
+    // OpenRouter stamps `id` and `provider` on every chunk but usage only
+    // on the last; the state must carry them across the stream.
+    use crate::sse::SseAction;
+    let mut state = transport::OpenAiStreamState::default();
+    let first = r#"data: {"id":"gen-abc123","provider":"Anthropic","choices":[{"delta":{"content":"hi"}}]}"#;
+    let action =
+        transport::parse_openai_sse_line(first, "openrouter", "anthropic/claude", &mut state);
+    assert!(matches!(action, SseAction::Emit(_)));
+
+    // The usage tail chunk omits both fields.
+    let tail = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cache_creation_input_tokens":7}}"#;
+    let action =
+        transport::parse_openai_sse_line(tail, "openrouter", "anthropic/claude", &mut state);
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected usage emit"),
+    };
+    let usage = events
+        .into_iter()
+        .find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u),
+            _ => None,
+        })
+        .expect("usage event");
+    assert_eq!(usage.response_id.as_deref(), Some("gen-abc123"));
+    assert_eq!(usage.upstream.as_deref(), Some("Anthropic"));
+    assert_eq!(usage.cache_creation_tokens, 7);
+}
+
+#[test]
+fn openai_stream_usage_without_id_or_provider_reports_none_not_empty() {
+    let cases = [
+        (
+            "fields absent",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ),
+        (
+            "fields empty",
+            r#"data: {"id":"","provider":"  ","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ),
+    ];
+    for (name, line) in cases {
+        let usage = parse_openrouter_usage_from_sse(line);
+        assert_eq!(usage.response_id, None, "{name}: response_id");
+        assert_eq!(usage.upstream, None, "{name}: upstream");
+    }
+}
+
+#[test]
+fn openai_chat_response_carries_response_id_and_upstream() {
+    let with = serde_json::json!({
+        "id": "chatcmpl-9xyz",
+        "provider": "DeepInfra",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+    });
+    let parsed = transport::openai_compat_transport()
+        .parse_chat_response(with, "openrouter", "m")
+        .expect("parses");
+    let usage = parsed.usage.expect("usage present");
+    assert_eq!(usage.response_id.as_deref(), Some("chatcmpl-9xyz"));
+    assert_eq!(usage.upstream.as_deref(), Some("DeepInfra"));
+
+    let without = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+    });
+    let parsed = transport::openai_compat_transport()
+        .parse_chat_response(without, "openai", "m")
+        .expect("parses");
+    let usage = parsed.usage.expect("usage present");
+    assert_eq!(usage.response_id, None);
+    assert_eq!(usage.upstream, None);
+}
+
+#[test]
+fn anthropic_usage_carries_message_id_from_message_start() {
+    use crate::sse::SseAction;
+    let mut tool_idx = 0usize;
+    let mut is_tool = false;
+    let mut is_thinking = false;
+    let mut pending_input = 0u64;
+    let mut pending_cached = 0u64;
+    let mut pending_created = 0u64;
+    let mut pending_id: Option<String> = None;
+
+    let start = r#"data: {"type":"message_start","message":{"id":"msg_01ABC","usage":{"input_tokens":3,"output_tokens":0}}}"#;
+    let _ = transport::parse_anthropic_sse_line(
+        start,
+        "anthropic",
+        "claude-opus-4",
+        &mut tool_idx,
+        &mut is_tool,
+        &mut is_thinking,
+        &mut pending_input,
+        &mut pending_cached,
+        &mut pending_created,
+        &mut pending_id,
+    );
+    let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":4},"delta":{"stop_reason":"end_turn"}}"#;
+    let action = transport::parse_anthropic_sse_line(
+        delta,
+        "anthropic",
+        "claude-opus-4",
+        &mut tool_idx,
+        &mut is_tool,
+        &mut is_thinking,
+        &mut pending_input,
+        &mut pending_cached,
+        &mut pending_created,
+        &mut pending_id,
+    );
+    let events = match action {
+        SseAction::Done(ev) | SseAction::Emit(ev) => ev,
+        _ => panic!("expected emit/done"),
+    };
+    let usage = events
+        .into_iter()
+        .find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u),
+            _ => None,
+        })
+        .expect("usage event");
+    assert_eq!(usage.response_id.as_deref(), Some("msg_01ABC"));
+    assert_eq!(usage.upstream, None, "first-party wire names no upstream");
+}
+
+#[test]
+fn anthropic_chat_response_carries_message_id() {
+    let resp = serde_json::json!({
+        "id": "msg_02DEF",
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 2, "output_tokens": 1}
+    });
+    let parsed = transport::anthropic_transport()
+        .parse_chat_response(resp, "anthropic", "claude")
+        .expect("parses");
+    assert_eq!(
+        parsed.usage.expect("usage").response_id.as_deref(),
+        Some("msg_02DEF")
+    );
+
+    let no_id = serde_json::json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 2, "output_tokens": 1}
+    });
+    let parsed = transport::anthropic_transport()
+        .parse_chat_response(no_id, "anthropic", "claude")
+        .expect("parses");
+    assert_eq!(parsed.usage.expect("usage").response_id, None);
 }

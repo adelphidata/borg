@@ -1281,6 +1281,125 @@ impl CredentialPool {
         cleared
     }
 
+    /// Clear the cooldown of exactly one credential, leaving every sibling's
+    /// cooldown and rate-limit strike count untouched.
+    ///
+    /// `target` resolves like `resolve_target` (id prefix → exact label →
+    /// 1-based index). Returns the number of cooldowns cleared (`1` when the
+    /// entry was `Exhausted`, `0` when it was already healthy). Errors name
+    /// the valid targets when `target` does not resolve, and reject removed
+    /// entries. The cleared entry also gets a fresh rate-limit observation
+    /// window — an operator reset says "try this key again from scratch".
+    /// Persists.
+    pub fn reset_cooldown_for(&self, target: &str) -> Result<usize> {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = Self::resolve_locked_named(&g, target)?;
+        let c = &mut g.creds[idx];
+        if c.is_removed() {
+            anyhow::bail!(
+                "credential `{}` is removed — re-add it with `borg auth add` instead",
+                c.label
+            );
+        }
+        let cleared = if matches!(c.last_status, CredentialStatus::Exhausted) {
+            c.last_status = CredentialStatus::Ok;
+            c.last_error_reset_at_ms = None;
+            c.consecutive_rate_limits = 0;
+            1
+        } else {
+            0
+        };
+        let snapshot = c.clone();
+        if cleared == 1 {
+            g.emitted_exhausted_warn = false;
+        }
+        drop(g);
+        self.persist_credential(&snapshot);
+        Ok(cleared)
+    }
+
+    /// Move one live credential to the 1-based `position` in the pool's
+    /// priority order and renumber every entry contiguously (`0..n`, live
+    /// entries first, tombstones after). The in-memory `Vec` is re-sorted to
+    /// match so `borg auth list` indexes and priorities agree. Returns the
+    /// live entries in their new order. Persists every renumbered row.
+    ///
+    /// Priority only matters to `fill_first` and `least_used`; callers
+    /// should tell the operator when the active strategy ignores it.
+    pub fn set_priority(&self, target: &str, position: usize) -> Result<Vec<PooledCredential>> {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = Self::resolve_locked_named(&g, target)?;
+        if g.creds[idx].is_removed() {
+            let label = g.creds[idx].label.clone();
+            anyhow::bail!(
+                "credential `{label}` is removed — re-add it with `borg auth add` instead"
+            );
+        }
+        let live_count = g.creds.iter().filter(|c| !c.is_removed()).count();
+        if position == 0 || position > live_count {
+            anyhow::bail!(
+                "position {position} is out of range — the pool has {live_count} live credential(s), \
+                 so position must be between 1 and {live_count}"
+            );
+        }
+        let moved = g.creds.remove(idx);
+        let mut live: Vec<PooledCredential> = Vec::with_capacity(g.creds.len());
+        let mut tombstones: Vec<PooledCredential> = Vec::new();
+        for c in g.creds.drain(..) {
+            if c.is_removed() {
+                tombstones.push(c);
+            } else {
+                live.push(c);
+            }
+        }
+        live.sort_by_key(|c| c.priority);
+        tombstones.sort_by_key(|c| c.priority);
+        live.insert(position - 1, moved);
+        live.extend(tombstones);
+        for (i, c) in live.iter_mut().enumerate() {
+            c.priority = i as u32;
+        }
+        g.creds = live;
+        let snapshot = g.creds.clone();
+        drop(g);
+        for c in &snapshot {
+            self.persist_credential(c);
+        }
+        Ok(snapshot.into_iter().filter(|c| !c.is_removed()).collect())
+    }
+
+    /// `resolve_locked` with an error message that lists the valid targets
+    /// (index, label, and id of every live entry) so an operator can correct
+    /// a typo without a second `borg auth list` round-trip. For callers that
+    /// already hold the guard — which is every mutating caller, on purpose.
+    fn resolve_locked_named(g: &PoolInner, target: &str) -> Result<usize> {
+        Self::resolve_locked(g, target).map_err(|e| {
+            let valid = Self::describe_targets_locked(g);
+            if valid.is_empty() {
+                anyhow!("{e} — the pool has no live credentials")
+            } else {
+                anyhow!("{e} — valid targets: {valid}")
+            }
+        })
+    }
+
+    /// Human-readable `index:label (id)` list of live entries.
+    fn describe_targets_locked(g: &PoolInner) -> String {
+        g.creds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_removed())
+            .map(|(i, c)| format!("{}:{} ({})", i + 1, c.label, c.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Runtime strategy change. Persists nothing on its own — the LLM config
     /// owns persistence of the strategy. Use this when an operator changes
     /// `llm.credential_strategy` and we need the live pool to honor it.
@@ -1466,7 +1585,19 @@ impl CredentialPool {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = Self::resolve_locked(&g, target)?;
+        Ok((idx, g.creds[idx].clone()))
+    }
 
+    /// Index-only resolution against a guard the caller already holds.
+    ///
+    /// A mutation must resolve and act under one guard. Resolving through
+    /// `resolve_target` first releases the lock, and a concurrent
+    /// `set_priority` reorders `creds` in the gap — the index then names a
+    /// different credential, so an operator's reset or promotion silently
+    /// lands on a key they never chose. Both admin RPCs are reachable at the
+    /// same time, so the window is real.
+    fn resolve_locked(g: &PoolInner, target: &str) -> std::result::Result<usize, ResolveError> {
         // Try id (full or unique 4+ hex prefix).
         let id_matches: Vec<usize> = g
             .creds
@@ -1476,8 +1607,7 @@ impl CredentialPool {
             .map(|(i, _)| i)
             .collect();
         if id_matches.len() == 1 {
-            let i = id_matches[0];
-            return Ok((i, g.creds[i].clone()));
+            return Ok(id_matches[0]);
         }
         if id_matches.len() > 1 {
             return Err(ResolveError::Ambiguous(target.into(), id_matches.len()));
@@ -1492,8 +1622,7 @@ impl CredentialPool {
             .map(|(i, _)| i)
             .collect();
         if label_matches.len() == 1 {
-            let i = label_matches[0];
-            return Ok((i, g.creds[i].clone()));
+            return Ok(label_matches[0]);
         }
         if label_matches.len() > 1 {
             return Err(ResolveError::Ambiguous(target.into(), label_matches.len()));
@@ -1504,8 +1633,7 @@ impl CredentialPool {
             if n == 0 || n > g.creds.len() {
                 return Err(ResolveError::OutOfRange(n, g.creds.len()));
             }
-            let i = n - 1;
-            return Ok((i, g.creds[i].clone()));
+            return Ok(n - 1);
         }
 
         Err(ResolveError::NotFound(target.into()))

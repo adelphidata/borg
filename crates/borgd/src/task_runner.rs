@@ -129,6 +129,19 @@ pub async fn spawn_task_execution(
     let monitor_mode = task.monitor_mode;
     let last_pre_run_hash = task.last_pre_run_hash.clone();
     let continuity = task.continuity;
+    // Resolved once, here, so every failure path (panic, exit code, spawn,
+    // timeout) sends — or deliberately does not send — to the same place.
+    let failure_delivery = match cortex::tasks::task_failure_delivery(&task) {
+        cortex::tasks::FailureDelivery::Route(ch, tgt) => Some((ch, tgt)),
+        cortex::tasks::FailureDelivery::Suppress => {
+            tracing::debug!(
+                task = %task.name,
+                "failure notices suppressed for this task (failure_delivery_channel=none)"
+            );
+            None
+        }
+        cortex::tasks::FailureDelivery::Unrouted => None,
+    };
 
     tokio::spawn(async move {
         // Liveness registration for the wedged-run recovery sweep: while
@@ -233,6 +246,7 @@ pub async fn spawn_task_execution(
             schedule_type,
             delivery_channel,
             delivery_target,
+            failure_delivery,
             config,
             cost_event_sink,
             pre_run_command,
@@ -294,8 +308,8 @@ pub async fn spawn_task_execution(
                 Err(e) => tracing::warn!("Task '{task_name}': panic DB open failed: {e}"),
             }
             // Match the normal failure path's delivery contract: the operator
-            // asked to hear about this task's outcome.
-            if let (Some(ch), Some(tgt)) = (&exec_ctx.delivery_channel, &exec_ctx.delivery_target) {
+            // asked to hear about this task's outcome — where they asked.
+            if let Some((ch, tgt)) = &exec_ctx.failure_delivery {
                 deliver_task_result(
                     ch,
                     tgt,
@@ -624,6 +638,10 @@ struct TaskExecContext {
     schedule_type: String,
     delivery_channel: Option<String>,
     delivery_target: Option<String>,
+    /// Where a `[FAILED]` notice goes, resolved from the row once by
+    /// `cortex::tasks::task_failure_delivery`. `None` means no notice —
+    /// either nothing addressable or the operator chose `none`.
+    failure_delivery: Option<(String, String)>,
     config: Config,
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
     pre_run_command: Option<String>,
@@ -747,6 +765,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         schedule_type,
         delivery_channel,
         delivery_target,
+        failure_delivery,
         config,
         cost_event_sink: _,
         pre_run_command: _,
@@ -773,8 +792,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 denial.message(),
             )
@@ -873,7 +891,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                         tracing::warn!("Task '{task_name}': DB open failed at failure path: {e}")
                     }
                 }
-                if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
+                if let Some((ch, tgt)) = failure_delivery {
                     deliver_task_result(
                         ch,
                         tgt,
@@ -900,8 +918,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 &format!("Failed to spawn command: {e}"),
             )
@@ -917,8 +934,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 "Cron job timed out",
             )
@@ -939,6 +955,7 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
         schedule_type,
         delivery_channel,
         delivery_target,
+        failure_delivery,
         config,
         ..
     } = ctx;
@@ -1000,8 +1017,7 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 &format!("consolidation failed: {e}"),
             )
@@ -1017,8 +1033,7 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 "Consolidation task timed out",
             )
@@ -1095,6 +1110,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         schedule_type,
         delivery_channel,
         delivery_target,
+        failure_delivery,
         config,
         cost_event_sink,
         pre_run_command,
@@ -1348,8 +1364,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 &format!("{e}"),
             )
@@ -1365,8 +1380,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                 *retry_count,
                 *max_retries,
                 schedule_type,
-                delivery_channel,
-                delivery_target,
+                failure_delivery,
                 config,
                 "Task timed out",
             )
@@ -1944,8 +1958,7 @@ async fn handle_task_failure(
     retry_count: i32,
     max_retries: i32,
     schedule_type: &str,
-    delivery_channel: &Option<String>,
-    delivery_target: &Option<String>,
+    failure_delivery: &Option<(String, String)>,
     config: &Config,
     error: &str,
 ) {
@@ -1990,7 +2003,10 @@ async fn handle_task_failure(
     }
     tracing::warn!("Task '{task_name}' failed: {error}");
 
-    if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
+    // `None` is either nothing addressable or an explicit
+    // `failure_delivery_channel=none`; both were decided when the run was
+    // dispatched, and the failure is already durable in `last_error`.
+    if let Some((ch, tgt)) = failure_delivery {
         let msg = format!("Error: {error}{escalation}");
         deliver_task_result(
             ch,
@@ -2324,6 +2340,9 @@ mod scheduled_model_tests {
             monitor_mode: false,
             last_pre_run_hash: None,
             continuity: false,
+            run_now_requested: false,
+            failure_delivery_channel: None,
+            failure_delivery_target: None,
         }
     }
 

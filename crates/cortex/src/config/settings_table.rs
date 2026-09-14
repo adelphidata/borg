@@ -121,6 +121,7 @@ define_settings! {
 
         // ── Interface ──
         "ui.shell_mode_enabled" => ui.shell_mode_enabled, parsed(bool);
+        "ui.notify_on_complete" => ui.notify_on_complete, parsed(bool);
 
         // ── Security ──
         "security.secret_detection" => security.secret_detection, parsed(bool);
@@ -284,6 +285,7 @@ define_settings! {
         "agents.heartbeat_interval_secs" => agents.heartbeat_interval_secs, parsed(u64);
         "agents.heartbeat_stale_cycles" => agents.heartbeat_stale_cycles, parsed(u32);
         "agents.tool_stale_cycles" => agents.tool_stale_cycles, parsed(u32);
+        "agents.compaction_threshold_tokens" => agents.compaction_threshold_tokens, parsed(usize);
 
         // ── Debug ──
         "debug.llm_logging" => debug.llm_logging, parsed(bool);
@@ -1010,6 +1012,7 @@ define_settings! {
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
         "ui.shell_mode_enabled" => "! shell mode", Bool, "Interface";
+        "ui.notify_on_complete" => "Notify when a reply finishes", Bool, "Interface";
         "security.secret_detection" => "Secret detection", Bool, "Security";
         "security.startup_audit" => "Startup posture audit", Bool, "Security";
         "security.output_redaction" => "Output redaction", Bool, "Security";

@@ -231,6 +231,18 @@ pub const GW_RATE_WEB_REQUESTS_WARN: u32 = 10;
 /// Gateway session: web request count that blocks further requests.
 pub const GW_RATE_WEB_REQUESTS_BLOCK: u32 = 25;
 
+// ── MCP per-server circuit breaker ────────────────────────────────
+
+/// Consecutive failed `tools/call`s (an `isError` result or a transport
+/// error) on one MCP server before its breaker opens. A success anywhere in
+/// the run resets the count. Five is enough for the model to fix its own
+/// arguments and low enough that a dead server stops eating a turn per call.
+pub const MCP_BREAKER_STRIKE_THRESHOLD: u32 = 5;
+
+/// How long an open MCP breaker refuses calls before letting one probe
+/// through (half-open). The probe's outcome closes or re-opens it.
+pub const MCP_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+
 // ── Evolution stage rate limits ───────────────────────────────────
 //
 // Rate-limit floors per evolution stage. `ActionLimits::apply_stage` uses

@@ -36,7 +36,7 @@ pub(crate) struct TransportResponse {
 }
 
 pub(crate) enum StreamState {
-    OpenAiCompat,
+    OpenAiCompat(OpenAiStreamState),
     Anthropic(AnthropicStreamState),
     Bedrock(BedrockStreamState),
     /// Native Gemini SSE accumulator. `Provider::Gemini` routes through
@@ -319,10 +319,26 @@ pub(crate) fn build_anthropic_request(
     body
 }
 
+/// `Some` only for a non-empty string: a provider that sends `"id": ""`
+/// has not named anything, and an empty id in the call log reads as one.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// Drop `stream_options` from an OpenAI-compatible request body. Used when the
+/// endpoint has rejected the field: some compatible servers refuse unknown
+/// request keys outright, and losing the final usage chunk is the lesser
+/// harm next to losing the whole turn. Returns whether the field was present.
+pub(crate) fn strip_stream_options(body: &mut serde_json::Value) -> bool {
+    body.as_object_mut()
+        .is_some_and(|obj| obj.remove("stream_options").is_some())
+}
+
 pub(crate) fn parse_openai_sse_line(
     line: &str,
     provider: &str,
     model: &str,
+    state: &mut OpenAiStreamState,
 ) -> crate::sse::SseAction {
     use crate::sse::SseAction;
 
@@ -338,6 +354,15 @@ pub(crate) fn parse_openai_sse_line(
     match serde_json::from_str::<StreamChunk>(data) {
         Ok(chunk) => {
             let mut events = Vec::new();
+
+            // The first chunk that names them wins; later chunks repeat the
+            // same values, and a usage-only tail chunk may omit them.
+            if state.response_id.is_none() {
+                state.response_id = non_empty(chunk.id);
+            }
+            if state.upstream.is_none() {
+                state.upstream = non_empty(chunk.provider);
+            }
 
             if let Some(usage) = chunk.usage {
                 let cached_input_tokens = usage.cached_read_tokens();
@@ -364,6 +389,8 @@ pub(crate) fn parse_openai_sse_line(
                     provider: provider.to_string(),
                     model: model.to_string(),
                     provider_cost_usd,
+                    response_id: state.response_id.clone(),
+                    upstream: state.upstream.clone(),
                 }));
             }
 
@@ -421,6 +448,7 @@ pub(crate) fn parse_anthropic_sse_line(
     pending_input_tokens: &mut u64,
     pending_cached_input_tokens: &mut u64,
     pending_cache_creation_tokens: &mut u64,
+    pending_response_id: &mut Option<String>,
 ) -> crate::sse::SseAction {
     use crate::sse::SseAction;
 
@@ -438,6 +466,9 @@ pub(crate) fn parse_anthropic_sse_line(
 
     match event_type {
         "message_start" => {
+            if let Some(id) = non_empty(event["message"]["id"].as_str().map(String::from)) {
+                *pending_response_id = Some(id);
+            }
             if let Some(usage) = event["message"]["usage"].as_object() {
                 let (cached, created) =
                     normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
@@ -547,6 +578,8 @@ pub(crate) fn parse_anthropic_sse_line(
                     provider: provider.to_string(),
                     model: model.to_string(),
                     provider_cost_usd: None,
+                    response_id: pending_response_id.clone(),
+                    upstream: None,
                 }));
             }
             if let Some(stop_reason) = event["delta"]["stop_reason"].as_str() {
@@ -578,6 +611,7 @@ pub(crate) fn parse_anthropic_sse_line(
                 | FailoverReason::Billing
                 | FailoverReason::ModelNotFound
                 | FailoverReason::PayloadTooLarge
+                | FailoverReason::MalformedToolCall
                 | FailoverReason::Format => LlmError::Fatal {
                     source,
                     reason,
@@ -604,6 +638,19 @@ pub(crate) struct AnthropicStreamState {
     pending_input_tokens: u64,
     pending_cached_input_tokens: u64,
     pending_cache_creation_tokens: u64,
+    /// `message.id` from `message_start`, carried onto the usage record that
+    /// `message_delta` emits so the per-call log can name the response.
+    pending_response_id: Option<String>,
+}
+
+/// Per-stream accumulator for the OpenAI-compatible wire. The chunk-level
+/// `id` and (OpenRouter) `provider` fields arrive on the first chunk, while
+/// usage arrives on the last, so they are remembered here and stamped onto
+/// the usage record when it is emitted.
+#[derive(Default)]
+pub(crate) struct OpenAiStreamState {
+    response_id: Option<String>,
+    upstream: Option<String>,
 }
 
 #[derive(Default)]
@@ -658,7 +705,7 @@ impl Transport for OpenAiCompatTransport {
     }
 
     fn new_stream_state(&self) -> StreamState {
-        StreamState::OpenAiCompat
+        StreamState::OpenAiCompat(OpenAiStreamState::default())
     }
 
     fn parse_stream_line(
@@ -666,9 +713,12 @@ impl Transport for OpenAiCompatTransport {
         line: &str,
         provider: &str,
         model: &str,
-        _state: &mut StreamState,
+        state: &mut StreamState,
     ) -> crate::sse::SseAction {
-        parse_openai_sse_line(line, provider, model)
+        let StreamState::OpenAiCompat(state) = state else {
+            return crate::sse::SseAction::Continue;
+        };
+        parse_openai_sse_line(line, provider, model, state)
     }
 
     fn parse_chat_response(
@@ -679,6 +729,11 @@ impl Transport for OpenAiCompatTransport {
     ) -> Result<TransportResponse> {
         #[derive(serde::Deserialize)]
         struct ChatResponse {
+            #[serde(default)]
+            id: Option<String>,
+            /// OpenRouter names the upstream that served the call.
+            #[serde(default)]
+            provider: Option<String>,
             #[serde(default)]
             choices: Vec<ChatChoice>,
             #[serde(default)]
@@ -706,6 +761,8 @@ impl Transport for OpenAiCompatTransport {
             provider: provider.to_string(),
             model: model.to_string(),
             provider_cost_usd: extract_provider_cost_usd(&usage),
+            response_id: non_empty(resp.id.clone()),
+            upstream: non_empty(resp.provider.clone()),
         });
 
         Ok(TransportResponse { message, usage })
@@ -767,6 +824,7 @@ impl Transport for AnthropicTransport {
             &mut state.pending_input_tokens,
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
+            &mut state.pending_response_id,
         )
     }
 
@@ -802,6 +860,8 @@ impl Transport for AnthropicTransport {
                 provider: provider.to_string(),
                 model: model.to_string(),
                 provider_cost_usd: None,
+                response_id: non_empty(response["id"].as_str().map(String::from)),
+                upstream: None,
             }
         });
 
@@ -943,6 +1003,7 @@ impl Transport for VertexAnthropicTransport {
             &mut state.pending_input_tokens,
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
+            &mut state.pending_response_id,
         )
     }
 
@@ -1407,6 +1468,8 @@ fn parse_bedrock_event_payload(
                 provider: provider.to_string(),
                 model: model.to_string(),
                 provider_cost_usd: None,
+                response_id: None,
+                upstream: None,
             })]);
         }
     }
@@ -1450,6 +1513,7 @@ fn parse_bedrock_event_error(event: &serde_json::Value) -> Option<LlmError> {
         | FailoverReason::Billing
         | FailoverReason::ModelNotFound
         | FailoverReason::PayloadTooLarge
+        | FailoverReason::MalformedToolCall
         | FailoverReason::Format => LlmError::Fatal {
             source,
             reason,
@@ -1497,6 +1561,8 @@ fn parse_bedrock_chat_response(
         provider: provider.to_string(),
         model: model.to_string(),
         provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
     });
 
     Ok(TransportResponse { message, usage })

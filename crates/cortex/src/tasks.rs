@@ -498,13 +498,19 @@ pub enum RunNowOutcome {
         /// The task's current (non-active) status.
         status: String,
     },
-    /// `next_run` was pulled to now; the scheduler will claim it next tick.
+    /// The manual run is marked; the scheduler will claim it next tick.
     Queued,
 }
 
-/// Queue a task for immediate execution by pulling `next_run` to now.
-/// Shared by the `manage_tasks` tool handler and the daemon admin RPC so the
-/// active-status gate cannot drift between the two lanes.
+/// Queue a task for immediate execution. Shared by the `manage_tasks` tool
+/// handler and the daemon admin RPC so the active-status gate cannot drift
+/// between the two lanes.
+///
+/// Marks the row with `run_now_requested` instead of pulling `next_run` to
+/// now: the claim path used to recompute `next_run` from the moment of the
+/// manual run, so an interval task run by hand at 14:00 kept firing at 14:00.
+/// The scheduled `next_run` is left untouched; see
+/// [`Database::claim_due_tasks`].
 pub async fn run_task_now(db: &Database, task_id: &str) -> Result<RunNowOutcome> {
     let Some(task) = db.get_task_by_id(task_id).await? else {
         return Ok(RunNowOutcome::NotFound);
@@ -514,12 +520,71 @@ pub async fn run_task_now(db: &Database, task_id: &str) -> Result<RunNowOutcome>
             status: task.status,
         });
     }
-    let now = Utc::now().timestamp();
-    db.update_task_next_run(task_id, Some(now)).await?;
+    if !db.request_task_run_now(task_id).await? {
+        return Ok(RunNowOutcome::NotFound);
+    }
     if let Err(e) = db.clear_task_retry(task_id).await {
         tracing::warn!("run_task_now: clear_task_retry({task_id}) failed: {e}");
     }
     Ok(RunNowOutcome::Queued)
+}
+
+/// The `failure_delivery_channel` value that suppresses failure notices.
+/// The failure is still recorded in `last_error` and the run history.
+pub const FAILURE_DELIVERY_NONE: &str = "none";
+
+/// Where a task's failure notice goes, resolved from its row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureDelivery {
+    /// Send `[FAILED]` to this `(channel, target)`.
+    Route(String, String),
+    /// Operator asked for no failure notice ([`FAILURE_DELIVERY_NONE`]).
+    Suppress,
+    /// Nothing addressable: no failure route and no success route either.
+    Unrouted,
+}
+
+/// Resolve the failure route from a task's delivery columns.
+///
+/// - `failure_channel` unset (or blank) → the success route, exactly as
+///   before the column existed.
+/// - `failure_channel == "none"` → [`FailureDelivery::Suppress`].
+/// - `failure_channel` set → that channel, with `failure_target` falling back
+///   to the success target so a same-channel override needs only one field.
+///
+/// One definition, two consumers: the task runner sends by it and the
+/// `schedule` tool validates against it.
+pub fn resolve_failure_delivery(
+    delivery_channel: Option<&str>,
+    delivery_target: Option<&str>,
+    failure_channel: Option<&str>,
+    failure_target: Option<&str>,
+) -> FailureDelivery {
+    fn non_blank(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let (channel, target) = match non_blank(failure_channel) {
+        Some(FAILURE_DELIVERY_NONE) => return FailureDelivery::Suppress,
+        Some(ch) => (
+            Some(ch),
+            non_blank(failure_target).or(non_blank(delivery_target)),
+        ),
+        None => (non_blank(delivery_channel), non_blank(delivery_target)),
+    };
+    match (channel, target) {
+        (Some(ch), Some(tgt)) => FailureDelivery::Route(ch.to_string(), tgt.to_string()),
+        _ => FailureDelivery::Unrouted,
+    }
+}
+
+/// [`resolve_failure_delivery`] over a task row.
+pub fn task_failure_delivery(task: &ScheduledTaskRow) -> FailureDelivery {
+    resolve_failure_delivery(
+        task.delivery_channel.as_deref(),
+        task.delivery_target.as_deref(),
+        task.failure_delivery_channel.as_deref(),
+        task.failure_delivery_target.as_deref(),
+    )
 }
 
 /// When more than this many recurring tasks look stalled in a single
@@ -733,8 +798,14 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         ),
         _ => String::new(),
     };
+    // Only an explicit override earns a line; the default route is implied.
+    let failure_route = match task.failure_delivery_channel.as_deref() {
+        Some(FAILURE_DELIVERY_NONE) => "\n    Failure notices: suppressed".to_string(),
+        Some(ch) if !ch.trim().is_empty() => format!("\n    Failure notices: {ch}"),
+        _ => String::new(),
+    };
     format!(
-        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}{}",
+        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}{}{}",
         task.name,
         task.status,
         task.id.chars().take(8).collect::<String>(),
@@ -744,6 +815,7 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         payload_label,
         crate::util::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
         last_error,
+        failure_route,
     )
 }
 
@@ -995,6 +1067,9 @@ mod tests {
             model_provider: None,
             monitor_mode: false,
             last_pre_run_hash: None,
+            run_now_requested: false,
+            failure_delivery_channel: None,
+            failure_delivery_target: None,
         };
         assert!(
             !format_task(&task).contains("Last error"),
@@ -1547,5 +1622,260 @@ mod tests {
             !live_run_ids().contains(&920_002),
             "guard must deregister during unwind"
         );
+    }
+
+    // ── Manual run-now must not shift a recurring task's cadence ──
+
+    async fn seed_recurring(
+        db: &Database,
+        task_id: &str,
+        schedule_type: &str,
+        schedule_expr: &str,
+        next_run: i64,
+    ) {
+        db.create_task(&crate::db::NewTask {
+            id: task_id,
+            name: task_id,
+            prompt: "p",
+            schedule_type,
+            schedule_expr,
+            timezone: "UTC",
+            next_run: Some(next_run),
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        })
+        .await
+        .expect("create task");
+    }
+
+    /// Regression: `run_task_now` used to pull `next_run` to now, and the
+    /// claim path then recomputed it from that moment — so a daily task run
+    /// by hand at 14:00 fired at 14:00 from then on. The manual run must be
+    /// claimed (a `running` run row exists) while the scheduled `next_run`
+    /// stays exactly where it was, for both interval and cron schedules.
+    #[tokio::test]
+    async fn run_now_fires_once_without_moving_a_recurring_next_run() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        let scheduled = now + 19 * SECS_PER_HOUR;
+        for (id, schedule_type, expr) in [
+            ("rn-interval", SCHEDULE_TYPE_INTERVAL, "24h"),
+            ("rn-cron", SCHEDULE_TYPE_CRON, "0 0 9 * * * *"),
+        ] {
+            seed_recurring(&db, id, schedule_type, expr, scheduled).await;
+            assert_eq!(
+                run_task_now(&db, id).await.expect("run now"),
+                RunNowOutcome::Queued
+            );
+
+            let claimed = db.claim_due_tasks(now).await.expect("claim");
+            let mine = claimed
+                .iter()
+                .find(|c| c.task.id == id)
+                .unwrap_or_else(|| panic!("{id}: a manual run must be claimed"));
+            assert_eq!(
+                run_status(&db, mine.run_id).await,
+                RUN_STATUS_RUNNING,
+                "{id}: the manual run must own a running run row"
+            );
+
+            let row = db.get_task_by_id(id).await.expect("query").expect("row");
+            assert_eq!(
+                row.next_run,
+                Some(scheduled),
+                "{id}: a manual run must not move the scheduled next_run"
+            );
+            assert!(
+                !row.run_now_requested,
+                "{id}: the marker must be consumed by the claim"
+            );
+            assert!(
+                db.claim_due_tasks(now)
+                    .await
+                    .expect("second claim")
+                    .is_empty(),
+                "{id}: a manual run fires exactly once"
+            );
+        }
+    }
+
+    /// A one-shot task run by hand is consumed by that run: leaving it
+    /// active with a future `next_run` would make the reminder fire twice.
+    #[tokio::test]
+    async fn run_now_completes_a_once_task() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_recurring(&db, "rn-once", SCHEDULE_TYPE_ONCE, "later", now + 3600).await;
+        run_task_now(&db, "rn-once").await.expect("run now");
+        let claimed = db.claim_due_tasks(now).await.expect("claim");
+        assert!(claimed.iter().any(|c| c.task.id == "rn-once"));
+        let row = db
+            .get_task_by_id("rn-once")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.status, TASK_STATUS_COMPLETED);
+        assert_eq!(row.next_run, None);
+    }
+
+    /// A task that is both manually requested and naturally due is one run,
+    /// not two, and its cadence still advances as a scheduled fire would.
+    #[tokio::test]
+    async fn run_now_on_an_already_due_task_advances_as_a_scheduled_fire() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_recurring(&db, "rn-due", SCHEDULE_TYPE_INTERVAL, "1h", now - 5).await;
+        run_task_now(&db, "rn-due").await.expect("run now");
+        let claimed = db.claim_due_tasks(now).await.expect("claim");
+        assert_eq!(
+            claimed.iter().filter(|c| c.task.id == "rn-due").count(),
+            1,
+            "one claim, one run"
+        );
+        let row = db
+            .get_task_by_id("rn-due")
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(
+            row.next_run.is_some_and(|n| n > now),
+            "a due task keeps advancing on its schedule, got {:?}",
+            row.next_run
+        );
+        assert!(!row.run_now_requested);
+    }
+
+    // ── Failure delivery routing ──
+
+    /// Unset falls back to the success route (the pre-column behaviour),
+    /// `"none"` suppresses, a channel overrides — with the target borrowed
+    /// from the success route when the override names none.
+    #[test]
+    fn failure_delivery_resolution_table() {
+        use FailureDelivery::{Route, Suppress, Unrouted};
+        let route = |c: &str, t: &str| Route(c.to_string(), t.to_string());
+        type Case = (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            FailureDelivery,
+        );
+        let cases: &[Case] = &[
+            // unset → success route
+            (
+                Some("telegram"),
+                Some("42"),
+                None,
+                None,
+                route("telegram", "42"),
+            ),
+            (
+                Some("telegram"),
+                Some("42"),
+                Some(""),
+                None,
+                route("telegram", "42"),
+            ),
+            (
+                Some("telegram"),
+                Some("42"),
+                Some("  "),
+                None,
+                route("telegram", "42"),
+            ),
+            (None, None, None, None, Unrouted),
+            (Some("telegram"), None, None, None, Unrouted),
+            // "none" → suppressed, whatever the success route says
+            (Some("telegram"), Some("42"), Some("none"), None, Suppress),
+            (
+                Some("telegram"),
+                Some("42"),
+                Some("none"),
+                Some("99"),
+                Suppress,
+            ),
+            (None, None, Some("none"), None, Suppress),
+            // explicit channel → that channel
+            (
+                Some("telegram"),
+                Some("42"),
+                Some("slack"),
+                Some("C123"),
+                route("slack", "C123"),
+            ),
+            // same-channel override borrows the success target
+            (
+                Some("telegram"),
+                Some("42"),
+                Some("telegram"),
+                None,
+                route("telegram", "42"),
+            ),
+            // a channel with no target anywhere cannot be routed
+            (None, None, Some("slack"), None, Unrouted),
+        ];
+        for (dc, dt, fc, ft, want) in cases {
+            assert_eq!(
+                &resolve_failure_delivery(*dc, *dt, *fc, *ft),
+                want,
+                "delivery=({dc:?},{dt:?}) failure=({fc:?},{ft:?})"
+            );
+        }
+    }
+
+    /// The failure route round-trips through the schema, and `create_task`
+    /// (no options) still produces an active task with the default route.
+    #[tokio::test]
+    async fn failure_delivery_round_trips_and_a_none_route_suppresses() {
+        let db = Database::test_db().await;
+        seed_recurring(&db, "fd-default", SCHEDULE_TYPE_INTERVAL, "1h", 100).await;
+        let row = db
+            .get_task_by_id("fd-default")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.status, TASK_STATUS_ACTIVE);
+        assert_eq!(task_failure_delivery(&row), FailureDelivery::Unrouted);
+
+        assert!(db
+            .set_task_failure_delivery("fd-default", Some(FAILURE_DELIVERY_NONE), None)
+            .await
+            .expect("set"));
+        let row = db
+            .get_task_by_id("fd-default")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(task_failure_delivery(&row), FailureDelivery::Suppress);
+        assert!(
+            format_task(&row).contains("Failure notices: suppressed"),
+            "the tool listing must show the override: {}",
+            format_task(&row)
+        );
+
+        assert!(db
+            .set_task_failure_delivery("fd-default", None, None)
+            .await
+            .expect("clear"));
+        let row = db
+            .get_task_by_id("fd-default")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(task_failure_delivery(&row), FailureDelivery::Unrouted);
+        assert!(!db
+            .set_task_failure_delivery("missing", None, None)
+            .await
+            .expect("no row"));
     }
 }

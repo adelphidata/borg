@@ -138,6 +138,8 @@ Rejections do not fail the whole server — the offending tool is dropped, the r
 
 Discovery itself is also bounded: `tools/list` follows `nextCursor` pagination (so multi-page catalogs aren't silently truncated to page one), but at most 100 pages / 1024 tools per server, cursors over 64 KiB or repeated cursors are rejected, and the whole pagination loop shares the per-call timeout. Violating any bound excludes the server for that discovery pass.
 
+The per-server `tools.include` allowlist has three states, and they are not interchangeable: key absent means no allowlist (only `tools.exclude` applies); an explicit empty list `[]` means **no tools** — the server registers nothing and a warning names it; a non-empty list admits only those names (globs allowed). `borg mcp list` prints the resulting filter as `all tools`, `no tools`, `only: …`, or `all except: …`.
+
 ### Layer 6 — Plan-mode opt-in
 
 Plan mode (`/plan`) blocks all MCP tools by default. The operator promotes a tool into Plan mode by listing it in the per-server `tools.read_only` config. The server's own `annotations.readOnlyHint` is **not** trusted for Plan mode — only the operator's explicit list. (The server's hint is still honored for parallel-fanout batching decisions in Execute mode, where the trust requirement is lower.)

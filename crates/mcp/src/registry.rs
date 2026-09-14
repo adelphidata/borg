@@ -206,9 +206,9 @@ impl McpRegistry {
         // filter meant to trim (or vet) a tool family actually did nothing.
         let declared: Vec<&str> = discovered.iter().map(|t| t.name.as_str()).collect();
         for (label, list) in [
-            ("include", &filter.include),
-            ("exclude", &filter.exclude),
-            ("read_only", &filter.read_only),
+            ("include", filter.include.as_deref().unwrap_or(&[])),
+            ("exclude", filter.exclude.as_slice()),
+            ("read_only", filter.read_only.as_slice()),
         ] {
             for pattern in ToolFilter::unmatched_patterns(list, &declared) {
                 tracing::warn!(
@@ -218,6 +218,16 @@ impl McpRegistry {
                     "tools.{label} glob pattern matched no declared tool",
                 );
             }
+        }
+        // An explicit empty `tools.include` is a lock-down: every declared
+        // tool is filtered. Say so once, loudly — the alternative is an
+        // operator staring at a healthy server with zero tools.
+        if filter.admits_nothing() && !discovered.is_empty() {
+            tracing::warn!(
+                server = %server,
+                declared = discovered.len(),
+                "tools.include is an explicit empty list; registering no tools for this server",
+            );
         }
 
         let mut inner = write_recovering(&self.inner, INNER_LOCK);
@@ -1178,6 +1188,42 @@ mod tests {
         assert!(outcomes
             .iter()
             .any(|o| matches!(o, ToolRegistrationOutcome::FilteredOut { original } if original == "delete")));
+    }
+
+    /// Spec: an explicit empty `tools.include` registers nothing, even with
+    /// a healthy catalog and no `exclude`. The registry used to treat an
+    /// empty allowlist as "no filter", so an operator's lock-down admitted
+    /// every declared tool.
+    #[test]
+    fn explicit_empty_include_registers_no_tools() {
+        let reg = McpRegistry::new();
+        let tools: Vec<McpToolSchema> = ["search", "delete"]
+            .iter()
+            .map(|n| McpToolSchema {
+                name: n.to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+            })
+            .collect();
+        let filter = ToolFilter {
+            include: Some(vec![]),
+            ..Default::default()
+        };
+        let outcomes = reg.replace_server_tools("locked", &tools, &filter, &[]);
+
+        assert!(
+            reg.tools().is_empty(),
+            "explicit empty include must admit nothing, got {:?}",
+            reg.tools().iter().map(|t| &t.full_name).collect::<Vec<_>>()
+        );
+        assert_eq!(outcomes.len(), 2, "every declared tool gets an outcome");
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ToolRegistrationOutcome::FilteredOut { .. })),
+            "every tool must be FilteredOut, got {outcomes:?}"
+        );
     }
 
     /// Spec: two over-long tool names from one server must both survive

@@ -155,8 +155,8 @@ pub(crate) async fn list() -> Result<()> {
     }
     let disabled: std::collections::HashSet<&String> = cfg.mcp.disabled_servers.iter().collect();
     println!(
-        "{:<24} {:<14} {:<8} {:<32}",
-        "NAME", "TRANSPORT", "ENABLED", "DETAIL"
+        "{:<24} {:<14} {:<8} {:<24} {:<32}",
+        "NAME", "TRANSPORT", "ENABLED", "TOOLS", "DETAIL"
     );
     let mut names: Vec<&String> = cfg.mcp.servers.keys().collect();
     names.sort();
@@ -172,10 +172,13 @@ pub(crate) async fn list() -> Result<()> {
         };
         let enabled = s.enabled && !disabled.contains(name);
         println!(
-            "{:<24} {:<14} {:<8} {:<32}",
+            "{:<24} {:<14} {:<8} {:<24} {:<32}",
             truncate(name, 24),
             transport,
             if enabled { "yes" } else { "no" },
+            // `ToolFilter::describe` distinguishes "all tools" from an
+            // explicit "no tools" lock-down — the two used to print alike.
+            truncate(&s.tools.describe(), 24),
             truncate(&detail, 32)
         );
     }

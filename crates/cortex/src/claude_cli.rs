@@ -266,6 +266,8 @@ fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
                 provider: "claude-cli".to_string(),
                 model: String::new(),
                 provider_cost_usd: None,
+                response_id: None,
+                upstream: None,
             })
         }),
         "result" => {

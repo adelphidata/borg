@@ -159,6 +159,8 @@ pub(crate) fn convert_pb_event(
             provider: String::new(),
             model: String::new(),
             provider_cost_usd: None,
+            response_id: None,
+            upstream: None,
         }),
         Kind::SubAgentUpdate(s) => CoreEvent::SubAgentUpdate {
             agent_id: s.agent_id,

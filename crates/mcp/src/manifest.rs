@@ -127,11 +127,21 @@ impl HttpAuth {
 /// `max` caps how many tools a single server can register.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolFilter {
-    /// If non-empty, only tools whose original (pre-sanitization) MCP name
-    /// matches one of these strings are registered.
-    #[serde(default)]
-    pub include: Vec<String>,
-    /// Tools to exclude. Ignored if `include` is non-empty.
+    /// Exhaustive allowlist of original (pre-sanitization) MCP tool names.
+    ///
+    /// Three distinct states, and the difference is load-bearing:
+    /// - `None` (key absent): no allowlist — `exclude` alone applies.
+    /// - `Some([])` (explicit empty list): admit **nothing**. An operator who
+    ///   writes an empty include list is locking the server down, and a
+    ///   filter that silently widened that to "every tool" would be the
+    ///   opposite of what was written.
+    /// - `Some(list)`: admit only the listed names (globs allowed).
+    ///
+    /// Serialized only when present, so a config that never set it stays
+    /// distinguishable from one that set it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    /// Tools to exclude. Ignored whenever `include` is present (even empty).
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Original MCP tool names the operator has marked safe to call in Plan
@@ -155,12 +165,32 @@ impl ToolFilter {
     }
 
     /// True iff `tool_name` (the *original* MCP name, before sanitization)
-    /// passes the include/exclude filter.
+    /// passes the include/exclude filter. An explicit empty `include` admits
+    /// nothing — fail closed, never open.
     pub fn admits(&self, tool_name: &str) -> bool {
-        if !self.include.is_empty() {
-            return list_matches(&self.include, tool_name);
+        match &self.include {
+            Some(allow) => list_matches(allow, tool_name),
+            None => !list_matches(&self.exclude, tool_name),
         }
-        !list_matches(&self.exclude, tool_name)
+    }
+
+    /// True iff the filter can never admit a tool: `include` is present and
+    /// empty. Surfaced at registration so a locked-down server is loud in
+    /// the logs rather than a silent "why are there no tools".
+    pub fn admits_nothing(&self) -> bool {
+        matches!(&self.include, Some(allow) if allow.is_empty())
+    }
+
+    /// One-line operator-facing description of what the include/exclude
+    /// pair lets through: `all tools`, `no tools`, `only: a, b`, or
+    /// `all except: x`. Never reads an empty list as "everything".
+    pub fn describe(&self) -> String {
+        match &self.include {
+            Some(allow) if allow.is_empty() => "no tools".to_string(),
+            Some(allow) => format!("only: {}", allow.join(", ")),
+            None if self.exclude.is_empty() => "all tools".to_string(),
+            None => format!("all except: {}", self.exclude.join(", ")),
+        }
     }
 
     /// True iff the operator has marked `tool_name` as safe to call in Plan
@@ -306,7 +336,7 @@ fn match_char_class(pat: &[char], start: usize, c: char) -> Option<(bool, usize)
 impl Default for ToolFilter {
     fn default() -> Self {
         Self {
-            include: Vec::new(),
+            include: None,
             exclude: Vec::new(),
             read_only: Vec::new(),
             max: Self::DEFAULT_MAX,
@@ -321,7 +351,7 @@ mod tests {
     #[test]
     fn include_wins_over_exclude() {
         let f = ToolFilter {
-            include: vec!["search".into()],
+            include: Some(vec!["search".into()]),
             exclude: vec!["search".into(), "delete".into()],
             ..Default::default()
         };
@@ -382,7 +412,7 @@ mod tests {
         // admitting "search_pro" would widen the operator-curated set.
         // Reject substring matching.
         let f = ToolFilter {
-            include: vec!["search".into()],
+            include: Some(vec!["search".into()]),
             ..Default::default()
         };
         assert!(f.admits("search"));
@@ -411,7 +441,7 @@ mod tests {
     #[test]
     fn glob_include_and_question_and_class_forms() {
         let f = ToolFilter {
-            include: vec!["get_?".into(), "purge_[cd]ache".into()],
+            include: Some(vec!["get_?".into(), "purge_[cd]ache".into()]),
             ..Default::default()
         };
         assert!(f.admits("get_a"), "? matches exactly one char");
@@ -425,7 +455,7 @@ mod tests {
     #[test]
     fn glob_negated_class_and_range() {
         let f = ToolFilter {
-            include: vec!["v[0-9]".into(), "x[!a]".into()],
+            include: Some(vec!["v[0-9]".into(), "x[!a]".into()]),
             ..Default::default()
         };
         assert!(f.admits("v7"));
@@ -499,7 +529,7 @@ mod tests {
         // operator config is allowed to omit any subset of fields without
         // surprising-default surprises.
         let f: ToolFilter = serde_json::from_str("{}").expect("default deserialize");
-        assert!(f.include.is_empty());
+        assert!(f.include.is_none(), "absent include must stay absent");
         assert!(f.exclude.is_empty());
         assert!(f.read_only.is_empty());
         assert_eq!(f.max, ToolFilter::DEFAULT_MAX);
@@ -512,11 +542,144 @@ mod tests {
         // the config gradually.
         let f: ToolFilter =
             serde_json::from_str(r#"{"include":["a","b"],"max":4}"#).expect("partial");
-        assert_eq!(f.include, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            f.include.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
         assert_eq!(f.max, 4);
         assert!(f.exclude.is_empty());
         assert!(f.read_only.is_empty());
         assert!(f.admits("a"));
         assert!(!f.admits("c"));
+    }
+
+    // ── Explicit-empty include ──
+
+    #[test]
+    fn include_states_admit_all_none_or_listed_only() {
+        // Spec: absent → exclude-only filter; explicit empty → nothing;
+        // list → only the listed names. The old code collapsed the first two
+        // into one and an operator's lock-down silently admitted everything.
+        type Case = (
+            Option<&'static [&'static str]>,
+            &'static [(&'static str, bool)],
+            &'static str,
+        );
+        let cases: &[Case] = &[
+            (
+                None,
+                &[("search", true), ("delete", true), ("", true)],
+                "absent",
+            ),
+            (
+                Some(&[]),
+                &[("search", false), ("delete", false), ("", false)],
+                "explicit empty",
+            ),
+            (
+                Some(&["search"]),
+                &[("search", true), ("delete", false), ("search_pro", false)],
+                "listed",
+            ),
+        ];
+        for (include, expectations, label) in cases {
+            let f = ToolFilter {
+                include: include.map(|l| l.iter().map(ToString::to_string).collect()),
+                ..Default::default()
+            };
+            for (name, admitted) in expectations.iter() {
+                assert_eq!(
+                    f.admits(name),
+                    *admitted,
+                    "{label}: admits({name:?}) must be {admitted}"
+                );
+            }
+            assert_eq!(
+                f.admits_nothing(),
+                matches!(include, Some(l) if l.is_empty()),
+                "{label}: admits_nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_include_ignores_exclude_and_stays_closed() {
+        // `include` wins over `exclude` even when empty: an exclude list
+        // must not re-open a locked-down server through the back door.
+        let f = ToolFilter {
+            include: Some(vec![]),
+            exclude: vec!["delete".into()],
+            ..Default::default()
+        };
+        assert!(!f.admits("search"));
+        assert!(!f.admits("delete"));
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_absent_vs_empty_include() {
+        // The DB row is JSON; if serialization flattened `None` and
+        // `Some([])` into the same bytes the lock-down would evaporate on
+        // the next read.
+        let absent = ToolFilter::default();
+        let json = serde_json::to_string(&absent).expect("serialize absent");
+        assert!(
+            !json.contains("include"),
+            "absent include must not be written as a list: {json}"
+        );
+        let back: ToolFilter = serde_json::from_str(&json).expect("deserialize absent");
+        assert!(back.include.is_none());
+        assert!(back.admits("anything"));
+
+        let empty = ToolFilter {
+            include: Some(vec![]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&empty).expect("serialize empty");
+        assert!(
+            json.contains(r#""include":[]"#),
+            "explicit empty must be written: {json}"
+        );
+        let back: ToolFilter = serde_json::from_str(&json).expect("deserialize empty");
+        assert_eq!(back.include, Some(vec![]));
+        assert!(!back.admits("anything"));
+
+        // A hand-written row: `"include": []` is a lock-down, `null` is absent.
+        let locked: ToolFilter = serde_json::from_str(r#"{"include":[]}"#).expect("locked");
+        assert!(!locked.admits("search"), "stored [] must fail closed");
+        let nulled: ToolFilter = serde_json::from_str(r#"{"include":null}"#).expect("null");
+        assert!(nulled.include.is_none());
+        assert!(nulled.admits("search"));
+    }
+
+    #[test]
+    fn describe_names_each_filter_state_honestly() {
+        let cases: Vec<(ToolFilter, &str)> = vec![
+            (ToolFilter::default(), "all tools"),
+            (
+                ToolFilter {
+                    include: Some(vec![]),
+                    ..Default::default()
+                },
+                "no tools",
+            ),
+            (
+                ToolFilter {
+                    include: Some(vec!["a".into(), "b".into()]),
+                    exclude: vec!["ignored".into()],
+                    ..Default::default()
+                },
+                "only: a, b",
+            ),
+            (
+                ToolFilter {
+                    exclude: vec!["delete".into()],
+                    ..Default::default()
+                },
+                "all except: delete",
+            ),
+        ];
+        for (f, want) in cases {
+            assert_eq!(f.describe(), want, "{f:?}");
+        }
     }
 }

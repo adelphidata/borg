@@ -135,12 +135,21 @@ struct ServerLimits {
     connect_timeout: Duration,
 }
 
+/// One `tools/call` reply as the session actor reports it to dispatch: the
+/// rendered text plus the server's `isError` flag. The flag rides alongside
+/// the text (rather than turning it into an `Err`) so the model still sees
+/// the server's explanation while the breaker counts the strike.
+struct CallOutcome {
+    text: String,
+    is_error: bool,
+}
+
 /// Commands the session actor accepts.
 enum SessionCmd {
     Call {
         original_name: String,
         args: Value,
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<CallOutcome>>,
     },
 }
 
@@ -180,6 +189,209 @@ fn session_map() -> &'static Mutex<HashMap<String, mpsc::Sender<SessionCmd>>> {
 
 fn limits_map() -> &'static Mutex<HashMap<String, ServerLimits>> {
     SERVER_LIMITS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ── Per-server application-error circuit breaker ──────────────────
+//
+// `mcp::registry::ServerHealth` tracks *transport* health (connect failures,
+// dropped sessions). Nothing tracked tool-level failures: a server that
+// answered every call with `isError: true` — or timed out on every call —
+// kept eating one agent turn per call. The breaker below counts consecutive
+// strikes per server and, once open, refuses calls without contacting the
+// server. Its message tells the model *why* so the retry is informed: a run
+// of pure application errors means the server understood the calls and
+// rejected them (fix the arguments); any transport strike in the run means
+// the server may be unreachable (wait or check the server).
+
+/// Why one `tools/call` counted against the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrikeKind {
+    /// The server replied with an `isError` result: it understood the call
+    /// and rejected it.
+    Application,
+    /// The call never got a well-formed reply: transport error, timeout,
+    /// dropped session.
+    Transport,
+}
+
+/// Refusal handed back while the breaker is open. Carries what the message
+/// needs and nothing else so the wording lives in one place (`Display`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BreakerRefusal {
+    server: String,
+    strikes: u32,
+    /// True when at least one strike in the streak was a transport failure.
+    transport_seen: bool,
+    retry_in: Duration,
+    /// True when the cooldown has elapsed and another call is already
+    /// probing the server. The wait is that probe's round-trip, not a
+    /// cooldown, so this case gets its own wording.
+    probe_in_flight: bool,
+}
+
+impl std::fmt::Display for BreakerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.retry_in.as_secs_f64().max(0.1);
+        if self.probe_in_flight {
+            return write!(
+                f,
+                "MCP server '{}' is being retried after {} consecutive failures; \
+                 one call is already testing it — retry after that call returns",
+                self.server, self.strikes
+            );
+        }
+        if self.transport_seen {
+            write!(
+                f,
+                "MCP server '{}' is unreachable: {} consecutive calls failed; \
+                 refusing calls for {secs:.0}s while it recovers",
+                self.server, self.strikes
+            )
+        } else {
+            write!(
+                f,
+                "MCP server '{}' rejected the last {} calls; refusing calls for \
+                 {secs:.0}s — fix the tool arguments before retrying",
+                self.server, self.strikes
+            )
+        }
+    }
+}
+
+/// Strike counter + open/half-open state for one server. Pure logic: every
+/// method takes `now` so the cooldown is testable without sleeping.
+#[derive(Debug, Default)]
+struct ServerBreaker {
+    /// Consecutive strikes since the last success. Never zeroed by a
+    /// reconnect — only a successful call proves the run is over.
+    strikes: u32,
+    /// Whether any strike in the current run was a transport failure.
+    transport_seen: bool,
+    /// Set while open. Once `now` passes it the breaker is half-open.
+    open_until: Option<Instant>,
+    /// When the in-flight half-open probe was admitted. Further calls wait
+    /// for its verdict.
+    ///
+    /// A timestamp rather than a flag because the probe's verdict can be
+    /// lost: the caller's future is dropped on turn cancellation or session
+    /// teardown between admission and the reply, and neither
+    /// `record_success` nor `record_strike` ever runs. A bare flag would
+    /// then refuse every later call forever and no probe could clear it —
+    /// the server would stay dead until the daemon restarted. A probe older
+    /// than the cooldown is treated as abandoned and a fresh one is let
+    /// through.
+    probing_since: Option<Instant>,
+}
+
+impl ServerBreaker {
+    /// Decide whether a call may go to the server. Closed: yes. Open: no,
+    /// with the refusal. Half-open (cooldown elapsed): exactly one probe
+    /// passes; the rest are refused until the probe reports back.
+    fn admit(&mut self, server: &str, now: Instant) -> Result<(), BreakerRefusal> {
+        let Some(until) = self.open_until else {
+            return Ok(());
+        };
+        let refusal = |retry_in, probe_in_flight| BreakerRefusal {
+            server: server.to_string(),
+            strikes: self.strikes,
+            transport_seen: self.transport_seen,
+            retry_in,
+            probe_in_flight,
+        };
+        if now < until {
+            return Err(refusal(until - now, false));
+        }
+        if let Some(started) = self.probing_since {
+            // An abandoned probe (its caller's future was dropped before it
+            // could report) must not wedge the server shut.
+            if now.saturating_duration_since(started) < crate::constants::MCP_BREAKER_COOLDOWN {
+                return Err(refusal(Duration::ZERO, true));
+            }
+            tracing::warn!(
+                server,
+                "half-open MCP probe never reported back; starting a new one"
+            );
+        }
+        self.probing_since = Some(now);
+        Ok(())
+    }
+
+    /// A well-formed, non-error reply: the run is over, close the breaker.
+    fn record_success(&mut self) {
+        *self = Self::default();
+    }
+
+    /// One more strike. Opens (or re-opens, for a failed probe) at the
+    /// threshold. The streak survives a transport recovery on purpose: a
+    /// server that comes back only to reject the call is still failing.
+    fn record_strike(&mut self, kind: StrikeKind, now: Instant) {
+        self.strikes = self.strikes.saturating_add(1);
+        self.transport_seen |= kind == StrikeKind::Transport;
+        self.probing_since = None;
+        if self.strikes >= crate::constants::MCP_BREAKER_STRIKE_THRESHOLD {
+            self.open_until = Some(now + crate::constants::MCP_BREAKER_COOLDOWN);
+        }
+    }
+
+    fn is_open(&self, now: Instant) -> bool {
+        self.open_until.is_some_and(|until| now < until)
+    }
+}
+
+/// Process-global breaker table, keyed by server name. Lives beside the
+/// session map rather than in the registry: the registry knows transport
+/// health, this knows call outcomes, and the two are reset on different
+/// events (a reconnect must *not* clear a strike run).
+static BREAKERS: OnceLock<Mutex<HashMap<String, ServerBreaker>>> = OnceLock::new();
+
+fn breakers() -> &'static Mutex<HashMap<String, ServerBreaker>> {
+    BREAKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Gate one call on `server`'s breaker. Logs the refusal so an operator can
+/// see a server being held off without reading the model's transcript.
+fn breaker_admit(server: &str, now: Instant) -> Result<(), BreakerRefusal> {
+    let mut map = lock_recover(breakers());
+    let outcome = map
+        .entry(server.to_string())
+        .or_default()
+        .admit(server, now);
+    if let Err(refusal) = &outcome {
+        tracing::warn!(
+            target: MCP_LOG_TARGET,
+            event = "breaker_open",
+            server = %server,
+            strikes = refusal.strikes,
+            transport_seen = refusal.transport_seen,
+            retry_in_secs = refusal.retry_in.as_secs_f64(),
+            "mcp tool call refused by open circuit breaker",
+        );
+    }
+    outcome
+}
+
+/// Report a call's outcome to `server`'s breaker. `None` is a success.
+fn breaker_record(server: &str, strike: Option<StrikeKind>, now: Instant) {
+    let mut map = lock_recover(breakers());
+    let breaker = map.entry(server.to_string()).or_default();
+    match strike {
+        None => breaker.record_success(),
+        Some(kind) => {
+            let was_open = breaker.is_open(now);
+            breaker.record_strike(kind, now);
+            if breaker.is_open(now) && !was_open {
+                tracing::warn!(
+                    target: MCP_LOG_TARGET,
+                    event = "breaker_tripped",
+                    server = %server,
+                    strikes = breaker.strikes,
+                    transport_seen = breaker.transport_seen,
+                    cooldown_secs = crate::constants::MCP_BREAKER_COOLDOWN.as_secs(),
+                    "mcp server circuit breaker opened after consecutive failures",
+                );
+            }
+        }
+    }
 }
 
 /// Per-server teardown counter, bumped every time [`reload_from_config`] drops
@@ -1062,6 +1274,14 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         ));
     }
 
+    // Circuit breaker. After the rate gate so every path past this point
+    // reports back to the breaker (a half-open probe must never be left
+    // dangling by a local refusal). Nothing is sent to the server while the
+    // breaker is open.
+    if let Err(refusal) = breaker_admit(&tool.server, Instant::now()) {
+        return Err(anyhow!("{refusal}"));
+    }
+
     let tx = {
         let map = lock_recover(session_map());
         match map.get(&tool.server) {
@@ -1071,6 +1291,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
                 // succeeded, so the session existed a moment ago and has since
                 // gone. A rate token *was* spent getting here, but nothing was
                 // sent to the server.
+                breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
                 return Err(anyhow!(
                     "MCP server '{server}' has no live session",
                     server = tool.server
@@ -1092,6 +1313,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         reply: reply_tx,
     };
     if tx.send(cmd).await.is_err() {
+        breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
         return Err(anyhow!(
             "MCP server '{server}' session task is gone",
             server = tool.server
@@ -1103,9 +1325,10 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     // forever. The session enforces the inner per-call timeout; this
     // covers actor-side deadlock.
     let outer_deadline = call_timeout + Duration::from_secs(5);
-    let raw_text = match tokio::time::timeout(outer_deadline, reply_rx).await {
-        Ok(Ok(Ok(text))) => text,
+    let (raw_text, is_error) = match tokio::time::timeout(outer_deadline, reply_rx).await {
+        Ok(Ok(Ok(CallOutcome { text, is_error }))) => (text, is_error),
         Ok(Ok(Err(e))) => {
+            breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
             let duration_ms = start.elapsed().as_millis() as u64;
             // Structured error kind from the typed `McpError` (preserved as the
             // anyhow root by the session actor). Defaults to "unknown" for
@@ -1142,12 +1365,14 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             return Err(e.context(format!("MCP tool '{}' failed", tool.full_name)));
         }
         Ok(Err(_canceled)) => {
+            breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
             return Err(anyhow!(
                 "MCP server '{server}' reply channel dropped",
                 server = tool.server
             ));
         }
         Err(_elapsed) => {
+            breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
             return Err(anyhow!(
                 "MCP server '{server}' did not reply within {ms}ms",
                 server = tool.server,
@@ -1156,6 +1381,14 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         }
     };
     let duration_ms = start.elapsed().as_millis() as u64;
+    // An `isError` result is the server rejecting the call: it counts as a
+    // strike, but the reply text still goes to the model unchanged — the
+    // server's explanation is what lets it fix the next call.
+    breaker_record(
+        &tool.server,
+        is_error.then_some(StrikeKind::Application),
+        Instant::now(),
+    );
 
     // Response size cap. Hostile/buggy servers cannot dump an unbounded
     // blob into the LLM context: we truncate before redaction + wrapping
@@ -1271,6 +1504,7 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
             "server": &tool.server,
             "tool": &tool.full_name,
             "success": true,
+            "is_error": is_error,
             "duration_ms": duration_ms,
             "threat_level": threat_label,
             "redaction_hits": redaction_hits,
@@ -1829,6 +2063,10 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
         reg.drop_server(name);
         lock_recover(buckets()).remove(name);
         lock_recover(limits_map()).remove(name);
+        // A server that is gone has no failure streak. Leaving the entry
+        // behind would both leak a row per removed server and hand a
+        // re-added one someone else's strikes.
+        lock_recover(breakers()).remove(name);
         // Tell any in-flight cache-warmed start that this server is gone, so it
         // doesn't register its tools back after we've dropped them.
         bump_server_epoch(name);
@@ -2645,7 +2883,10 @@ async fn run_session_task(
                 // output — and therefore the message surfaced to the LLM — is
                 // unchanged.
                 let result = raw_result
-                    .map(|(text, _raw)| text)
+                    .map(|(text, raw)| CallOutcome {
+                        text,
+                        is_error: raw.is_error,
+                    })
                     .map_err(anyhow::Error::new);
                 // Best-effort send — caller may have dropped its receiver
                 // (e.g. outer-watchdog fired). Log on the drop path so it
@@ -2736,6 +2977,11 @@ pub mod testing {
         }
         if let Some(d) = DISABLED_SERVERS.get() {
             if let Ok(mut g) = d.lock() {
+                g.clear();
+            }
+        }
+        if let Some(b) = BREAKERS.get() {
+            if let Ok(mut g) = b.lock() {
                 g.clear();
             }
         }
@@ -2897,15 +3143,16 @@ mod tests {
         use std::sync::Mutex as StdMutex;
 
         /// The start registry is process-global, so these cannot interleave.
+        /// Shared with `breaker` below, which drives the same globals.
         static SERIAL: StdMutex<()> = StdMutex::new(());
 
-        fn guard() -> std::sync::MutexGuard<'static, ()> {
+        pub(super) fn guard() -> std::sync::MutexGuard<'static, ()> {
             let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
             testing::reset_all();
             g
         }
 
-        fn rt() -> tokio::runtime::Runtime {
+        pub(super) fn rt() -> tokio::runtime::Runtime {
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
@@ -3987,5 +4234,354 @@ mod tests {
             .block_on(super::try_execute_tool("run_shell", &serde_json::json!({})))
             .expect("ok");
         assert!(r.is_none(), "non-mcp prefix must short-circuit to None");
+    }
+
+    mod breaker {
+        use super::start_registry::{guard, rt};
+        use super::*;
+        use crate::constants::{MCP_BREAKER_COOLDOWN, MCP_BREAKER_STRIKE_THRESHOLD};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const APP: StrikeKind = StrikeKind::Application;
+        const NET: StrikeKind = StrikeKind::Transport;
+
+        /// Drive `strikes` into a fresh breaker at time `t0` and return it.
+        fn after(strikes: &[StrikeKind], t0: Instant) -> ServerBreaker {
+            let mut b = ServerBreaker::default();
+            for k in strikes {
+                b.record_strike(*k, t0);
+            }
+            b
+        }
+
+        #[test]
+        fn streak_composition_decides_open_state_and_wording() {
+            // Spec table: the breaker opens at the threshold; the wording
+            // says "rejected" only when every strike was an application
+            // error, and "unreachable" as soon as one transport strike is in
+            // the run — order does not matter, and a transport recovery that
+            // then yields an application error keeps the transport mark.
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let cases: Vec<(&str, Vec<StrikeKind>, bool, Option<&str>)> = vec![
+                ("one short of threshold", vec![APP; n - 1], false, None),
+                ("all application", vec![APP; n], true, Some("rejected")),
+                (
+                    "transport last",
+                    [vec![APP; n - 1], vec![NET]].concat(),
+                    true,
+                    Some("unreachable"),
+                ),
+                (
+                    "transport first, then recovered into app errors",
+                    [vec![NET], vec![APP; n - 1]].concat(),
+                    true,
+                    Some("unreachable"),
+                ),
+            ];
+            let t0 = Instant::now();
+            for (label, strikes, open, word) in cases {
+                let mut b = after(&strikes, t0);
+                assert_eq!(b.is_open(t0), open, "{label}: open");
+                match b.admit("srv", t0) {
+                    Ok(()) => assert!(word.is_none(), "{label}: admitted while open"),
+                    Err(refusal) => {
+                        let msg = refusal.to_string();
+                        let want = word.expect(label);
+                        assert!(msg.contains(want), "{label}: {msg:?} lacks {want:?}");
+                        let other = if want == "rejected" {
+                            "unreachable"
+                        } else {
+                            "rejected"
+                        };
+                        assert!(!msg.contains(other), "{label}: {msg:?} mixes wording");
+                        assert!(msg.contains("'srv'"), "{label}: names the server");
+                        assert_eq!(refusal.strikes, n as u32, "{label}: strike count");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_success_mid_streak_resets_the_count_and_the_transport_mark() {
+            let t0 = Instant::now();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut b = after(&[vec![NET], vec![APP; n - 2]].concat(), t0);
+            b.record_success();
+            assert_eq!(b.strikes, 0);
+            assert!(!b.transport_seen, "a success ends the transport run too");
+            // A fresh run of application errors after the success must read
+            // as "rejected", not inherit the pre-success transport strike.
+            for _ in 0..n {
+                b.record_strike(APP, t0);
+            }
+            let msg = b.admit("srv", t0).unwrap_err().to_string();
+            assert!(msg.contains("rejected"), "{msg}");
+        }
+
+        #[test]
+        fn cooldown_elapsed_lets_exactly_one_probe_through() {
+            let t0 = Instant::now();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut b = after(&vec![APP; n], t0);
+            let before = t0 + MCP_BREAKER_COOLDOWN - Duration::from_millis(1);
+            assert!(b.admit("srv", before).is_err(), "still inside the cooldown");
+
+            let later = t0 + MCP_BREAKER_COOLDOWN;
+            assert!(b.admit("srv", later).is_ok(), "half-open admits one probe");
+            assert!(
+                b.admit("srv", later).is_err(),
+                "a second call while the probe is in flight is refused"
+            );
+
+            // A failed probe re-opens for a full cooldown; the streak keeps
+            // counting rather than restarting from one.
+            b.record_strike(APP, later);
+            assert_eq!(b.strikes, n as u32 + 1);
+            assert!(b.is_open(later + MCP_BREAKER_COOLDOWN - Duration::from_millis(1)));
+            assert!(b.admit("srv", later + MCP_BREAKER_COOLDOWN).is_ok());
+
+            // A successful probe closes it outright.
+            b.record_success();
+            assert!(!b.is_open(later));
+            assert!(b.admit("srv", later).is_ok());
+            assert!(b.admit("srv", later).is_ok(), "closed: no probe gating");
+        }
+
+        /// A probe whose caller was cancelled never reports a verdict. If the
+        /// breaker waited on it forever the server would be refused for the
+        /// life of the process, with no probe able to clear it.
+        #[test]
+        fn an_abandoned_probe_does_not_wedge_the_server_shut() {
+            let t0 = Instant::now();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut b = after(&vec![APP; n], t0);
+
+            let half_open = t0 + MCP_BREAKER_COOLDOWN;
+            assert!(b.admit("srv", half_open).is_ok(), "probe admitted");
+            // The caller's future is dropped here: no success, no strike.
+            assert!(
+                b.admit("srv", half_open + Duration::from_secs(1)).is_err(),
+                "a probe that may still be running keeps the gate shut"
+            );
+
+            let abandoned = half_open + MCP_BREAKER_COOLDOWN;
+            assert!(
+                b.admit("srv", abandoned).is_ok(),
+                "a probe older than the cooldown is abandoned; a fresh one goes through"
+            );
+        }
+
+        /// The probe-in-flight refusal is a round-trip wait, not a cooldown,
+        /// so it must not tell the caller to retry in zero seconds.
+        #[test]
+        fn probe_in_flight_refusal_names_the_probe_not_a_cooldown() {
+            let t0 = Instant::now();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut b = after(&vec![APP; n], t0);
+            let half_open = t0 + MCP_BREAKER_COOLDOWN;
+            b.admit("srv", half_open).expect("probe admitted");
+
+            let refusal = b.admit("srv", half_open).expect_err("second call refused");
+            let msg = refusal.to_string();
+            assert!(
+                msg.contains("already testing it"),
+                "must name the in-flight probe, got: {msg}"
+            );
+            assert!(
+                !msg.contains("refusing calls for"),
+                "must not read as a cooldown, got: {msg}"
+            );
+        }
+
+        // ── Dispatch-level: the breaker in front of a scripted session ──
+
+        /// Install a scripted session for `server` exposing one tool
+        /// (`mcp_<server>_echo`) and return how many calls reached it. Each
+        /// entry in `script` answers one call, in order.
+        fn install_scripted_server(
+            rt: &tokio::runtime::Runtime,
+            server: &str,
+            script: Vec<Result<CallOutcome>>,
+        ) -> Arc<AtomicUsize> {
+            let reg = REGISTRY.get_or_init(|| McpRegistry::with_global_cap(64));
+            let schema = mcp::protocol::McpToolSchema {
+                name: "echo".to_string(),
+                description: Some("echo".to_string()),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                annotations: None,
+            };
+            let outcomes = reg.replace_server_tools(
+                server,
+                &[schema],
+                &mcp::manifest::ToolFilter::default(),
+                &[],
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, ToolRegistrationOutcome::Registered { .. })),
+                "precondition: the tool registers, got {outcomes:?}"
+            );
+            record_limits(server, &stdio_cfg("/bin/true", &[], &[]));
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (tx, mut rx) = mpsc::channel::<SessionCmd>(8);
+            lock_recover(session_map()).insert(server.to_string(), tx);
+            let counter = Arc::clone(&calls);
+            rt.spawn(async move {
+                let mut script = script.into_iter();
+                while let Some(SessionCmd::Call { reply, .. }) = rx.recv().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let answer = script.next().expect("script ran dry");
+                    reply.send(answer).ok();
+                }
+            });
+            calls
+        }
+
+        fn ok(text: &str, is_error: bool) -> Result<CallOutcome> {
+            Ok(CallOutcome {
+                text: text.to_string(),
+                is_error,
+            })
+        }
+
+        fn transport_err() -> Result<CallOutcome> {
+            Err(anyhow::Error::new(mcp::errors::McpError::TransportClosed(
+                "pipe closed".into(),
+            )))
+        }
+
+        #[test]
+        fn is_error_results_reach_the_model_then_open_the_breaker_without_a_call() {
+            let _g = guard();
+            let rt = rt();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let script: Vec<_> = (0..n).map(|_| ok("bad args: missing q", true)).collect();
+            let calls = install_scripted_server(&rt, "brk", script);
+
+            for i in 0..n {
+                let out = rt
+                    .block_on(try_execute_tool("mcp_brk_echo", &serde_json::json!({})))
+                    .unwrap_or_else(|e| panic!("call {i} must still reach the model: {e}"))
+                    .expect("mcp tool");
+                assert!(
+                    out.contains("bad args: missing q"),
+                    "the server's own explanation must survive: {out}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                n,
+                "every strike hit the server"
+            );
+
+            let err = rt
+                .block_on(try_execute_tool("mcp_brk_echo", &serde_json::json!({})))
+                .expect_err("open breaker must refuse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rejected"),
+                "pure isError run reads as rejected: {msg}"
+            );
+            assert!(!msg.contains("unreachable"), "{msg}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                n,
+                "an open breaker must not contact the server"
+            );
+        }
+
+        #[test]
+        fn a_transport_strike_in_the_run_reads_as_unreachable() {
+            let _g = guard();
+            let rt = rt();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut script: Vec<_> = (0..n - 1).map(|_| ok("nope", true)).collect();
+            script.push(transport_err());
+            let calls = install_scripted_server(&rt, "flaky", script);
+
+            for _ in 0..n - 1 {
+                rt.block_on(try_execute_tool("mcp_flaky_echo", &serde_json::json!({})))
+                    .expect("isError still returns text");
+            }
+            let last = rt
+                .block_on(try_execute_tool("mcp_flaky_echo", &serde_json::json!({})))
+                .expect_err("transport failure surfaces as an error");
+            assert!(last.to_string().contains("failed"), "{last}");
+
+            let msg = rt
+                .block_on(try_execute_tool("mcp_flaky_echo", &serde_json::json!({})))
+                .expect_err("open")
+                .to_string();
+            assert!(msg.contains("unreachable"), "{msg}");
+            assert_eq!(calls.load(Ordering::SeqCst), n);
+        }
+
+        #[test]
+        fn a_success_mid_run_keeps_the_breaker_closed() {
+            let _g = guard();
+            let rt = rt();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            // n-1 errors, one success, n-1 errors: never reaches the threshold.
+            let mut script: Vec<_> = (0..n - 1).map(|_| ok("err", true)).collect();
+            script.push(ok("fine", false));
+            script.extend((0..n - 1).map(|_| ok("err", true)));
+            let total = script.len();
+            let calls = install_scripted_server(&rt, "steady", script);
+
+            for i in 0..total {
+                rt.block_on(try_execute_tool("mcp_steady_echo", &serde_json::json!({})))
+                    .unwrap_or_else(|e| panic!("call {i} must be admitted: {e}"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), total);
+            let b = lock_recover(breakers());
+            let state = b.get("steady").expect("breaker row");
+            assert_eq!(state.strikes, n as u32 - 1);
+            assert!(!state.is_open(Instant::now()));
+        }
+
+        #[test]
+        fn after_the_cooldown_one_probe_reaches_the_server_and_a_success_closes_it() {
+            let _g = guard();
+            let rt = rt();
+            let n = MCP_BREAKER_STRIKE_THRESHOLD as usize;
+            let mut script: Vec<_> = (0..n).map(|_| ok("err", true)).collect();
+            script.push(ok("recovered", false));
+            script.push(ok("still fine", false));
+            let calls = install_scripted_server(&rt, "probe", script);
+
+            for _ in 0..n {
+                rt.block_on(try_execute_tool("mcp_probe_echo", &serde_json::json!({})))
+                    .expect("strikes still return text");
+            }
+            rt.block_on(try_execute_tool("mcp_probe_echo", &serde_json::json!({})))
+                .expect_err("open");
+            assert_eq!(calls.load(Ordering::SeqCst), n);
+
+            // Wind the clock: pretend the cooldown elapsed.
+            lock_recover(breakers())
+                .get_mut("probe")
+                .expect("row")
+                .open_until = Some(Instant::now() - Duration::from_millis(1));
+
+            let out = rt
+                .block_on(try_execute_tool("mcp_probe_echo", &serde_json::json!({})))
+                .expect("half-open admits the probe")
+                .expect("mcp tool");
+            assert!(out.contains("recovered"), "{out}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                n + 1,
+                "the probe reached the server"
+            );
+
+            // Closed again: the next call passes without any probe gating.
+            rt.block_on(try_execute_tool("mcp_probe_echo", &serde_json::json!({})))
+                .expect("closed breaker admits");
+            assert_eq!(calls.load(Ordering::SeqCst), n + 2);
+            let b = lock_recover(breakers());
+            assert_eq!(b.get("probe").expect("row").strikes, 0);
+        }
     }
 }

@@ -198,6 +198,9 @@ mod tests {
             monitor_mode: false,
             last_pre_run_hash: None,
             continuity: false,
+            run_now_requested: false,
+            failure_delivery_channel: None,
+            failure_delivery_target: None,
         }
     }
 

@@ -557,6 +557,10 @@ pub struct App<'a> {
     pub last_turn_errored: bool,
     /// Whether the "[queue paused]" message has already been shown (prevents duplicates)
     pub queue_pause_notified: bool,
+    /// Terminal notification sequence queued by a finished long turn. The
+    /// event loop drains it with `take_pending_notification` and writes it
+    /// to the TTY — `App` never owns the terminal handle.
+    pub pending_notification: Option<String>,
     /// Conversation backtrack state machine
     pub backtrack: BacktrackPhase,
     pub plan_overlay: PlanOverlay,
@@ -690,6 +694,7 @@ impl<'a> App<'a> {
             queued_messages: VecDeque::new(),
             last_turn_errored: false,
             queue_pause_notified: false,
+            pending_notification: None,
             backtrack: BacktrackPhase::Inactive,
             plan_overlay: PlanOverlay::new(),
             transcript_pager: TranscriptPager::new(),

@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -390,7 +391,15 @@ impl ScriptHook {
         }
     }
 
+    /// Run the hook with nobody able to cancel it: background hooks (never
+    /// awaited) and direct test drives.
     fn execute_inner(&self, ctx: &HookContext) -> HookAction {
+        self.execute_cancellable(ctx, &HookCancel::default())
+    }
+
+    /// Run the hook to completion on the calling thread, honouring `cancel`
+    /// from the awaiting turn — see [`HookCancel`].
+    fn execute_cancellable(&self, ctx: &HookContext, cancel: &HookCancel) -> HookAction {
         if !self.matches_tool(ctx) {
             return HookAction::Continue;
         }
@@ -403,6 +412,7 @@ impl ScriptHook {
             &stdin_payload,
             self.timeout,
             self.is_pre_tool(),
+            cancel,
         );
         let duration_ms = started.elapsed().as_millis();
         // Completion trace on *every* arm, success included — a slow-but-OK hook
@@ -468,6 +478,18 @@ impl ScriptHook {
                 } else {
                     HookAction::Continue
                 }
+            }
+            Err(SubprocessError::Cancelled) => {
+                // `CancelOnDrop` already warned when it killed the child; this
+                // is the runner noticing. Nobody is awaiting the action.
+                tracing::debug!(
+                    hook = %self.name,
+                    point = ?ctx.point,
+                    outcome = "cancelled",
+                    duration_ms,
+                    "hook runner unwound after cancellation"
+                );
+                HookAction::Continue
             }
             Err(SubprocessError::Io(e)) => {
                 tracing::warn!(
@@ -539,12 +561,156 @@ impl Hook for ScriptHook {
             return HookAction::Continue;
         }
 
-        match tokio::task::spawn_blocking(move || hook.execute_inner(&ctx)).await {
+        // Dropping the awaited `JoinHandle` does *not* stop the blocking
+        // closure: a turn aborted mid-hook would otherwise leave the hook's
+        // process group running to completion (up to its full timeout) while
+        // nothing waits on it. The guard turns "this future was dropped" into
+        // a group kill; the handshake it shares with `run_subprocess` closes
+        // the window where the child has not been spawned yet.
+        let cancel = Arc::new(HookCancel::default());
+        let mut guard = CancelOnDrop {
+            cancel: Arc::clone(&cancel),
+            hook: self.name.clone(),
+            point: ctx.point,
+            armed: true,
+        };
+        let outcome =
+            tokio::task::spawn_blocking(move || hook.execute_cancellable(&ctx, &cancel)).await;
+        guard.armed = false;
+        match outcome {
             Ok(action) => action,
             Err(e) => {
                 tracing::warn!("hook {} failed to run ({e}); continuing", self.name);
                 HookAction::Continue
             }
+        }
+    }
+}
+
+/// Where a foreground hook's child stands, as seen from both the awaiting
+/// turn and the blocking runner.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum HookCancelState {
+    /// `run_subprocess` has not spawned yet.
+    #[default]
+    Pending,
+    /// The child is alive under this pid (its own process group leader).
+    Running(u32),
+    /// The awaiting turn went away. Anything running was killed; anything
+    /// not yet spawned must not be.
+    Cancelled,
+    /// The child exited and was reaped; nothing is left to kill.
+    Finished,
+}
+
+/// Cancellation handshake between [`ScriptHook::execute`]'s future and the
+/// `spawn_blocking` closure that actually runs the hook.
+///
+/// A plain "pid slot" has a race: the future can be dropped after the closure
+/// started but before it spawned, so a kill lands on nothing and the child
+/// then starts unopposed. Folding the pid and the cancel flag into one state
+/// under one lock makes every interleaving safe — whichever side moves second
+/// sees what the first one did.
+#[derive(Debug, Default)]
+pub(crate) struct HookCancel(std::sync::Mutex<HookCancelState>);
+
+impl HookCancel {
+    fn state(&self) -> std::sync::MutexGuard<'_, HookCancelState> {
+        // A poisoned lock here means a panic mid-handshake; the state itself is
+        // a plain enum and still consistent, so keep going.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the turn was cancelled before the child was spawned.
+    fn is_cancelled(&self) -> bool {
+        *self.state() == HookCancelState::Cancelled
+    }
+
+    /// Record the freshly spawned child. Returns `false` when the turn was
+    /// cancelled in the meantime: the caller spawned a child nobody wants
+    /// and must kill it itself.
+    fn register(&self, pid: u32) -> bool {
+        let mut state = self.state();
+        match *state {
+            HookCancelState::Cancelled => false,
+            _ => {
+                *state = HookCancelState::Running(pid);
+                true
+            }
+        }
+    }
+
+    /// The child exited. Returns `true` when it exited because the turn was
+    /// cancelled, so the runner can report that instead of a bogus exit code.
+    fn finish(&self) -> bool {
+        let mut state = self.state();
+        let cancelled = *state == HookCancelState::Cancelled;
+        if !cancelled {
+            *state = HookCancelState::Finished;
+        }
+        cancelled
+    }
+
+    /// The awaiting turn is gone. Returns the pid to kill if a child is
+    /// running; `None` when there is nothing to kill (not started yet — the
+    /// runner will now refuse to spawn — or already finished).
+    fn cancel(&self) -> Option<u32> {
+        let mut state = self.state();
+        match *state {
+            HookCancelState::Running(pid) => {
+                *state = HookCancelState::Cancelled;
+                Some(pid)
+            }
+            HookCancelState::Pending => {
+                *state = HookCancelState::Cancelled;
+                None
+            }
+            HookCancelState::Cancelled | HookCancelState::Finished => None,
+        }
+    }
+}
+
+/// Kills the hook's process group if the future awaiting it is dropped.
+///
+/// Armed for exactly the span of the `spawn_blocking` await in
+/// [`ScriptHook::execute`]; a normal completion disarms it, so only an abort
+/// (turn cancelled, session torn down) reaches the kill.
+struct CancelOnDrop {
+    cancel: Arc<HookCancel>,
+    hook: String,
+    point: HookPoint,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.cancel.cancel() {
+            Some(pid) => {
+                // Group, not just the child: `sh -c` plus whatever it spawned.
+                // On non-unix targets this is a no-op and the runner's own
+                // timeout remains the only bound.
+                crate::util::process_tree::kill_process_group(Some(pid));
+                // Not an error — the hook did nothing wrong — but a hook that
+                // vanished mid-run must be visible in the log.
+                tracing::warn!(
+                    hook = %self.hook,
+                    point = ?self.point,
+                    outcome = "cancelled",
+                    pid,
+                    "hook killed: the turn awaiting it was cancelled"
+                );
+            }
+            None => tracing::debug!(
+                hook = %self.hook,
+                point = ?self.point,
+                outcome = "cancelled",
+                "turn cancelled before the hook started; it will not run"
+            ),
         }
     }
 }
@@ -597,6 +763,9 @@ fn block_reason(hook: &str, exit_code: i32, stderr: &str) -> String {
 enum SubprocessError {
     Spawn(std::io::Error),
     Timeout,
+    /// The awaiting turn was cancelled: the child was killed (or never
+    /// spawned) and its exit status means nothing.
+    Cancelled,
     Io(std::io::Error),
 }
 
@@ -632,13 +801,22 @@ const STREAM_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// false the stdout pipe is still drained (that is what keeps a chatty child
 /// unblocked), but the caller does not wait around for a hook that leaked the
 /// pipe to a background process.
+///
+/// `cancel` is the awaiting turn's side of the handshake: a turn cancelled
+/// before the spawn means no child at all, and one cancelled during the wait
+/// has already killed the group by the time this returns — either way the
+/// result is [`SubprocessError::Cancelled`], never a made-up exit code.
 fn run_subprocess(
     command: &str,
     argv_payload: &str,
     stdin_payload: &str,
     timeout: Duration,
     wants_stdout: bool,
+    cancel: &HookCancel,
 ) -> Result<(i32, String, String), SubprocessError> {
+    if cancel.is_cancelled() {
+        return Err(SubprocessError::Cancelled);
+    }
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -666,6 +844,15 @@ fn run_subprocess(
     // on purpose (`some-daemon &`), and that helper must outlive it. Only the
     // timeout path below terminates the job.
     let job = mcp::job_object::contain(child.id(), "hook", mcp::job_object::OnClose::Leave);
+    // Publish the pid so a dropped `execute` future can reach the group. If
+    // the turn was cancelled between the check above and the spawn, the kill
+    // is ours to do: the guard has already run and will not run again.
+    if !cancel.register(child.id()) {
+        crate::util::process_tree::kill_process_group(Some(child.id()));
+        if let Some(job) = &job {
+            job.terminate();
+        }
+    }
 
     // Feed stdin from its own thread and let the handle drop, closing the pipe so
     // a hook blocked on `cat` sees EOF. A hook that exits without reading its
@@ -686,18 +873,29 @@ fn run_subprocess(
     let stdout_drain = child.stdout.take().map(spawn_stream_drain);
     let stderr_drain = child.stderr.take().map(spawn_stream_drain);
 
-    let outcome = match crate::util::process_tree::wait_or_kill_group(&mut child, timeout) {
-        Ok(status) => Ok(status.code().unwrap_or(-1)),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            // `wait_or_kill_group` already signalled the unix process group.
-            // On Windows the job is the only thing that reaches the tree, and
-            // a timed-out hook forfeits the "detached helpers survive" grace.
-            if let Some(job) = &job {
-                job.terminate();
-            }
-            Err(SubprocessError::Timeout)
+    let waited = crate::util::process_tree::wait_or_kill_group(&mut child, timeout);
+    // Cancellation trumps whatever the wait reported: a SIGKILLed child has
+    // no exit code worth surfacing, and even a child that happened to exit on
+    // its own first has nobody left to hand its status to.
+    let outcome = if cancel.finish() {
+        if let Some(job) = &job {
+            job.terminate();
         }
-        Err(e) => Err(SubprocessError::Io(e)),
+        Err(SubprocessError::Cancelled)
+    } else {
+        match waited {
+            Ok(status) => Ok(status.code().unwrap_or(-1)),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                // `wait_or_kill_group` already signalled the unix process group.
+                // On Windows the job is the only thing that reaches the tree, and
+                // a timed-out hook forfeits the "detached helpers survive" grace.
+                if let Some(job) = &job {
+                    job.terminate();
+                }
+                Err(SubprocessError::Timeout)
+            }
+            Err(e) => Err(SubprocessError::Io(e)),
+        }
     };
 
     // The child is gone, but its pipes are NOT necessarily at EOF: a hook that
@@ -1764,7 +1962,14 @@ mod tests {
             let pid_file = dir.path().join("grandchild.pid");
             let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
             let result = tokio::task::spawn_blocking(move || {
-                run_subprocess(&command, "{}", "{}", Duration::from_secs(1), true)
+                run_subprocess(
+                    &command,
+                    "{}",
+                    "{}",
+                    Duration::from_secs(1),
+                    true,
+                    &HookCancel::default(),
+                )
             })
             .await
             .expect("join");
@@ -1804,6 +2009,7 @@ mod tests {
                 r#"{"event":"SessionStart","turn":7}"#,
                 Duration::from_secs(10),
                 true,
+                &HookCancel::default(),
             )
             .expect("hook must run");
             assert_eq!(code, 0);
@@ -1843,7 +2049,14 @@ mod tests {
             std::env::set_var("BORG_KEK_PASSPHRASE", "kek_leak_must_not_appear");
 
             let command = format!("env > {}", out.display());
-            let result = run_subprocess(&command, "{}", "{}", Duration::from_secs(10), true);
+            let result = run_subprocess(
+                &command,
+                "{}",
+                "{}",
+                Duration::from_secs(10),
+                true,
+                &HookCancel::default(),
+            );
 
             std::env::remove_var("HOOK_PROBE_PROVIDER_API_KEY");
             std::env::remove_var("BORG_KEK_PASSPHRASE");
@@ -1885,6 +2098,7 @@ mod tests {
                 r#"{"event":"SessionEnd"}"#,
                 Duration::from_secs(10),
                 true,
+                &HookCancel::default(),
             )
             .expect("hook must run");
             assert_eq!(code, 0);
@@ -1903,14 +2117,26 @@ mod tests {
             // compact in production precisely because a single argv string
             // this big fails the spawn on Linux (`MAX_ARG_STRLEN`).
             let big_payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(128 * 1024));
-            let (code, _stdout, _stderr) =
-                run_subprocess("exit 0", "{}", &big_payload, Duration::from_secs(10), true)
-                    .expect("broken pipe must not be reported as a subprocess error");
+            let (code, _stdout, _stderr) = run_subprocess(
+                "exit 0",
+                "{}",
+                &big_payload,
+                Duration::from_secs(10),
+                true,
+                &HookCancel::default(),
+            )
+            .expect("broken pipe must not be reported as a subprocess error");
             assert_eq!(code, 0);
 
-            let (code, _stdout, _stderr) =
-                run_subprocess("exit 3", "{}", &big_payload, Duration::from_secs(10), true)
-                    .expect("broken pipe must not mask a nonzero exit either");
+            let (code, _stdout, _stderr) = run_subprocess(
+                "exit 3",
+                "{}",
+                &big_payload,
+                Duration::from_secs(10),
+                true,
+                &HookCancel::default(),
+            )
+            .expect("broken pipe must not mask a nonzero exit either");
             assert_eq!(code, 3);
         }
 
@@ -1926,6 +2152,7 @@ mod tests {
                 "{}",
                 Duration::from_secs(20),
                 true,
+                &HookCancel::default(),
             )
             .expect("a chatty hook must complete, not time out");
             assert_eq!(code, 0, "chatty hook should report its real exit code");
@@ -1939,9 +2166,15 @@ mod tests {
         #[test]
         fn hook_that_backgrounds_a_process_returns_within_its_timeout() {
             let started = Instant::now();
-            let (code, _stdout, _stderr) =
-                run_subprocess("sleep 5 & exit 0", "{}", "{}", Duration::from_secs(1), true)
-                    .expect("a hook that exits promptly must not be reported as failed");
+            let (code, _stdout, _stderr) = run_subprocess(
+                "sleep 5 & exit 0",
+                "{}",
+                "{}",
+                Duration::from_secs(1),
+                true,
+                &HookCancel::default(),
+            )
+            .expect("a hook that exits promptly must not be reported as failed");
             let elapsed = started.elapsed();
             assert_eq!(code, 0, "the hook's own exit status must be reported");
             assert!(
@@ -1949,6 +2182,124 @@ mod tests {
                 "returned after {elapsed:?}; the leaked pipe held it for the \
                  background process's lifetime instead of honoring the timeout"
             );
+        }
+
+        /// Poll until `path` holds a parsable pid, so the test never races the
+        /// shell's first line.
+        #[cfg(unix)]
+        async fn read_pid(path: &std::path::Path) -> i32 {
+            for _ in 0..200 {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("hook never wrote its pid to {}", path.display());
+        }
+
+        /// Spec: dropping the future that awaits a foreground hook must kill
+        /// the hook's whole process group, promptly, and say so.
+        ///
+        /// `spawn_blocking` does not stop on drop, so before the cancel
+        /// handshake an aborted turn left the hook (and everything it spawned)
+        /// running to completion — here that would be a 30s `sleep` followed by
+        /// the marker write. The hook's own timeout is set far past the test so
+        /// only the cancellation path can end it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "current_thread")]
+        async fn dropping_the_awaiting_future_kills_the_hook_process_group() {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(EventRecorder(events.clone()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let tmp = TempDir::new().unwrap();
+            let shell_pid = tmp.path().join("shell.pid");
+            let sleeper_pid = tmp.path().join("sleeper.pid");
+            let marker = tmp.path().join("finished");
+            let command = format!(
+                "echo $$ > {shell}; sleep 30 & echo $! > {sleeper}; wait; touch {marker}",
+                shell = shell_pid.display(),
+                sleeper = sleeper_pid.display(),
+                marker = marker.display(),
+            );
+            let mut hook = make_hook(&command, HookPoint::AfterToolCall);
+            hook.timeout = Duration::from_secs(120);
+            let ctx = make_tool_ctx(HookPoint::AfterToolCall, "run_shell");
+
+            let mut running = Box::pin(hook.execute(&ctx));
+            let (shell, sleeper) = tokio::select! {
+                _ = &mut running => panic!("a 30s hook cannot have finished already"),
+                pids = async { (read_pid(&shell_pid).await, read_pid(&sleeper_pid).await) } => pids,
+            };
+            assert!(
+                crate::util::process_tree::pid_is_alive(sleeper),
+                "precondition: the hook's grandchild must be running before the abort"
+            );
+
+            // The turn goes away: this is the only signal the runner gets.
+            drop(running);
+
+            assert!(
+                crate::util::process_tree::wait_for_pid_exit(shell).await,
+                "hook shell {shell} outlived the future that awaited it"
+            );
+            assert!(
+                crate::util::process_tree::wait_for_pid_exit(sleeper).await,
+                "hook grandchild {sleeper} survived the cancellation kill"
+            );
+            assert!(
+                !marker.exists(),
+                "a killed hook must not reach its final statement"
+            );
+            let recorded = events.lock().unwrap();
+            assert!(
+                recorded
+                    .iter()
+                    .any(|e| e.contains("outcome=\"cancelled\"") && e.contains("killed")),
+                "cancellation must be visible in the log at the moment it happens, got: {recorded:?}"
+            );
+        }
+
+        /// Spec: the cancel handshake is inert on the normal path — a hook that
+        /// finishes reports its own exit code and nothing is killed.
+        #[test]
+        fn a_completed_hook_reports_its_exit_code_under_the_cancel_handshake() {
+            let cancel = HookCancel::default();
+            let (code, _, _) =
+                run_subprocess("exit 7", "{}", "{}", Duration::from_secs(5), true, &cancel)
+                    .expect("a finished hook is not an error");
+            assert_eq!(code, 7);
+            assert_eq!(
+                cancel.cancel(),
+                None,
+                "cancelling after completion must find nothing to kill"
+            );
+        }
+
+        /// Spec: a turn cancelled before the runner reached its spawn must
+        /// leave no child at all — the race the pid-in-state design closes.
+        #[test]
+        fn a_turn_cancelled_before_spawn_never_starts_the_hook() {
+            let tmp = TempDir::new().unwrap();
+            let marker = tmp.path().join("ran");
+            let cancel = HookCancel::default();
+            assert_eq!(cancel.cancel(), None);
+            let result = run_subprocess(
+                &format!("touch {}", marker.display()),
+                "{}",
+                "{}",
+                Duration::from_secs(5),
+                true,
+                &cancel,
+            );
+            assert!(
+                matches!(result, Err(SubprocessError::Cancelled)),
+                "expected Cancelled, got {result:?}"
+            );
+            assert!(!marker.exists(), "the hook must not have been spawned");
         }
     }
 

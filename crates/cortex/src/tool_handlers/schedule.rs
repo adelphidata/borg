@@ -181,6 +181,52 @@ fn resolve_origin_delivery(
     (Some(origin.channel_name), Some(target_json))
 }
 
+/// What the `failure_delivery_channel` / `failure_delivery_target` parameters
+/// ask for, if anything.
+#[derive(Debug, PartialEq, Eq)]
+enum FailureRouteArg {
+    /// Neither parameter given: leave the row's failure route alone.
+    Unchanged,
+    /// `failure_delivery_channel: ""` — clear the override so failures fall
+    /// back to the success route.
+    Clear,
+    /// Store this `(channel, target)`; the channel may be
+    /// [`tasks::FAILURE_DELIVERY_NONE`].
+    Set(String, Option<String>),
+}
+
+/// Read the failure-route parameters. `origin` resolves the same way as the
+/// success route, and `broadcast` is refused for the same reason.
+fn parse_failure_route(args: &serde_json::Value) -> std::result::Result<FailureRouteArg, String> {
+    let channel = optional_str_param(args, "failure_delivery_channel").map(str::trim);
+    let target = optional_str_param(args, "failure_delivery_target").map(str::to_string);
+    let Some(channel) = channel else {
+        return match target {
+            Some(_) => {
+                Err("Error: failure_delivery_target needs a failure_delivery_channel.".to_string())
+            }
+            None => Ok(FailureRouteArg::Unchanged),
+        };
+    };
+    if channel.is_empty() {
+        return Ok(FailureRouteArg::Clear);
+    }
+    if channel == crate::heartbeat_task::BROADCAST_DELIVERY {
+        return Err(format!(
+            "Error: failure_delivery_channel='{channel}' is reserved for system tasks; \
+             user tasks must target a single channel."
+        ));
+    }
+    if channel == tasks::FAILURE_DELIVERY_NONE {
+        return Ok(FailureRouteArg::Set(channel.to_string(), None));
+    }
+    let (resolved, target) = resolve_origin_delivery(Some(channel.to_string()), target);
+    Ok(FailureRouteArg::Set(
+        resolved.unwrap_or_else(|| channel.to_string()),
+        target,
+    ))
+}
+
 async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Result<String> {
     let task_name = require_str_param(args, "name")?.to_string();
     let prompt = require_str_param(args, "prompt")?.to_string();
@@ -244,28 +290,41 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
                 .to_string(),
         );
     }
+    let paused = optional_bool_param(args, "paused", false);
+    let (failure_channel, failure_target) = match parse_failure_route(args) {
+        Ok(FailureRouteArg::Set(ch, tgt)) => (Some(ch), tgt),
+        Ok(FailureRouteArg::Unchanged | FailureRouteArg::Clear) => (None, None),
+        Err(msg) => return Ok(msg),
+    };
     with_db(move |db| async move {
         match db
-            .create_task(&crate::db::NewTask {
-                id: &id,
-                name: &task_name,
-                prompt: &prompt,
-                schedule_type: &schedule_type,
-                schedule_expr: &schedule_expr,
-                timezone: &timezone,
-                next_run,
-                max_retries,
-                timeout_ms,
-                delivery_channel: delivery_channel.as_deref(),
-                delivery_target: delivery_target.as_deref(),
-                allowed_tools: allowed_tools.as_deref(),
-                task_type: "prompt",
-                pre_run_command: pre_run_command.as_deref(),
-                pre_run_cwd: pre_run_cwd.as_deref(),
-                pre_run_timeout_ms,
-                min_interval_secs: None,
-                continuity,
-            })
+            .create_task_with_options(
+                &crate::db::NewTask {
+                    id: &id,
+                    name: &task_name,
+                    prompt: &prompt,
+                    schedule_type: &schedule_type,
+                    schedule_expr: &schedule_expr,
+                    timezone: &timezone,
+                    next_run,
+                    max_retries,
+                    timeout_ms,
+                    delivery_channel: delivery_channel.as_deref(),
+                    delivery_target: delivery_target.as_deref(),
+                    allowed_tools: allowed_tools.as_deref(),
+                    task_type: "prompt",
+                    pre_run_command: pre_run_command.as_deref(),
+                    pre_run_cwd: pre_run_cwd.as_deref(),
+                    pre_run_timeout_ms,
+                    min_interval_secs: None,
+                    continuity,
+                },
+                &crate::db::TaskCreateOptions {
+                    paused,
+                    failure_delivery_channel: failure_channel.as_deref(),
+                    failure_delivery_target: failure_target.as_deref(),
+                },
+            )
             .await
         {
             Ok(()) => {
@@ -279,8 +338,9 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
                         ));
                     }
                 }
+                let state = if paused { " (paused)" } else { "" };
                 Ok(format!(
-                    "Scheduled task created: {task_name} (id: {})",
+                    "Scheduled task created: {task_name} (id: {}){state}",
                     &id[..8]
                 ))
             }
@@ -375,6 +435,10 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
         .get("monitor_mode")
         .and_then(serde_json::Value::as_bool);
     let continuity = args.get("continuity").and_then(serde_json::Value::as_bool);
+    let failure_route = match parse_failure_route(args) {
+        Ok(route) => route,
+        Err(msg) => return Ok(msg),
+    };
     with_db(move |db| async move {
         // Enabling monitor_mode only makes sense on a task with a
         // pre_run_command — its output hash is what decides whether the run
@@ -419,6 +483,18 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
                     if let Err(e) = db.set_task_continuity(&task_id, c).await {
                         return Ok(format!(
                             "Error: task {task_id} updated but setting continuity failed: {e}"
+                        ));
+                    }
+                }
+                let route = match &failure_route {
+                    FailureRouteArg::Unchanged => None,
+                    FailureRouteArg::Clear => Some((None, None)),
+                    FailureRouteArg::Set(ch, tgt) => Some((Some(ch.as_str()), tgt.as_deref())),
+                };
+                if let Some((ch, tgt)) = route {
+                    if let Err(e) = db.set_task_failure_delivery(&task_id, ch, tgt).await {
+                        return Ok(format!(
+                            "Error: task {task_id} updated but setting the failure route failed: {e}"
                         ));
                     }
                 }
@@ -617,9 +693,20 @@ pub async fn handle_manage_cron(args: &serde_json::Value, config: &Config) -> Re
             with_db(move |db| async move {
                 match db.get_task_by_id(&job_id).await {
                     Ok(Some(task)) if task.task_type == "command" => {
-                        let now = chrono::Utc::now().timestamp();
-                        if let Err(e) = db.update_task_next_run(&job_id, Some(now)).await {
-                            return Ok(format!("Error: {e}"));
+                        // Mark, don't move `next_run`: the claim path would
+                        // otherwise recompute the schedule from this moment.
+                        // The write is gated on the task being active, so a
+                        // paused job is refused here exactly as in the
+                        // prompt-task lane.
+                        match db.request_task_run_now(&job_id).await {
+                            Ok(false) => {
+                                return Ok(format!(
+                                    "Cron job {job_id} is {} — resume it before running it now.",
+                                    task.status
+                                ));
+                            }
+                            Err(e) => return Ok(format!("Error: {e}")),
+                            Ok(true) => {}
                         }
                         if let Err(e) = db.clear_task_retry(&job_id).await {
                             tracing::warn!(
@@ -686,35 +773,49 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
         optional_str_param(args, "delivery_target").map(str::to_string),
     );
     let timeout_ms = optional_i64_param(args, "timeout_ms");
+    let paused = optional_bool_param(args, "paused", false);
+    let (failure_channel, failure_target) = match parse_failure_route(args) {
+        Ok(FailureRouteArg::Set(ch, tgt)) => (Some(ch), tgt),
+        Ok(FailureRouteArg::Unchanged | FailureRouteArg::Clear) => (None, None),
+        Err(msg) => return Ok(msg),
+    };
     with_db(move |db| async move {
         match db
-            .create_task(&crate::db::NewTask {
-                id: &id,
-                name: &name,
-                prompt: &command,
-                schedule_type: "cron",
-                schedule_expr: &cron_7,
-                timezone: "local",
-                next_run,
-                max_retries: Some(0),
-                timeout_ms,
-                delivery_channel: delivery_channel.as_deref(),
-                delivery_target: delivery_target.as_deref(),
-                allowed_tools: None,
-                task_type: "command",
-                pre_run_command: None,
-                pre_run_cwd: None,
-                pre_run_timeout_ms: None,
-                min_interval_secs: None,
-                // A command job has no LLM turn, so there is no context for
-                // continuity to carry.
-                continuity: false,
-            })
+            .create_task_with_options(
+                &crate::db::NewTask {
+                    id: &id,
+                    name: &name,
+                    prompt: &command,
+                    schedule_type: "cron",
+                    schedule_expr: &cron_7,
+                    timezone: "local",
+                    next_run,
+                    max_retries: Some(0),
+                    timeout_ms,
+                    delivery_channel: delivery_channel.as_deref(),
+                    delivery_target: delivery_target.as_deref(),
+                    allowed_tools: None,
+                    task_type: "command",
+                    pre_run_command: None,
+                    pre_run_cwd: None,
+                    pre_run_timeout_ms: None,
+                    min_interval_secs: None,
+                    // A command job has no LLM turn, so there is no context for
+                    // continuity to carry.
+                    continuity: false,
+                },
+                &crate::db::TaskCreateOptions {
+                    paused,
+                    failure_delivery_channel: failure_channel.as_deref(),
+                    failure_delivery_target: failure_target.as_deref(),
+                },
+            )
             .await
         {
             Ok(()) => Ok(format!(
-                "Cron job created: {name} (id: {})\n  Schedule: {schedule}\n  Command: {command}",
-                &id[..8]
+                "Cron job created: {name} (id: {}){}\n  Schedule: {schedule}\n  Command: {command}",
+                &id[..8],
+                if paused { " (paused)" } else { "" },
             )),
             Err(e) => Ok(format!("Error creating cron job: {e}")),
         }
@@ -908,6 +1009,45 @@ mod tests {
             Some(stale),
             "a refused run_now must not move next_run"
         );
+        assert!(
+            !task.run_now_requested,
+            "a refusal must not leave a marker that fires the moment someone resumes the task"
+        );
+    }
+
+    /// Both run-now lanes share one gate, and it lives in the write itself.
+    /// The cron lane used to arm the marker directly, so a paused job
+    /// reported "queued" and then fired the instant someone resumed it — an
+    /// execution nobody asked for. The write must refuse on its own, whoever
+    /// calls it.
+    #[tokio::test]
+    async fn arming_run_now_is_refused_for_any_task_that_is_not_active() {
+        let db = Database::test_db().await;
+        let stale = chrono::Utc::now().timestamp() - 10_000;
+        seed_task(&db, "armable", Some(stale)).await;
+        assert!(
+            db.request_task_run_now("armable").await.expect("arm"),
+            "an active task arms"
+        );
+
+        seed_task(&db, "gated", Some(stale)).await;
+        db.update_task_status("gated", tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+        assert!(
+            !db.request_task_run_now("gated").await.expect("arm attempt"),
+            "a paused task must refuse the marker, not store it"
+        );
+        let task = db
+            .get_task_by_id("gated")
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(
+            !task.run_now_requested,
+            "a refused arm must leave the row unarmed"
+        );
+        assert_eq!(task.next_run, Some(stale));
     }
 
     /// Resuming a recurring task must reschedule it from now: the stored
@@ -998,6 +1138,106 @@ mod tests {
             task.next_run,
             Some(imminent),
             "resume of an active task must not delay its next fire"
+        );
+    }
+
+    /// The failure-route parameters: absent leaves the row alone, an empty
+    /// channel clears the override, `none` suppresses, a channel routes, and
+    /// the same refusals as the success route apply.
+    #[test]
+    fn parse_failure_route_covers_unset_clear_none_and_channel() {
+        use FailureRouteArg::{Clear, Set, Unchanged};
+        let cases: &[(serde_json::Value, std::result::Result<FailureRouteArg, ()>)] = &[
+            (serde_json::json!({}), Ok(Unchanged)),
+            (
+                serde_json::json!({"failure_delivery_channel": ""}),
+                Ok(Clear),
+            ),
+            (
+                serde_json::json!({"failure_delivery_channel": "none"}),
+                Ok(Set("none".into(), None)),
+            ),
+            (
+                serde_json::json!({"failure_delivery_channel": "none", "failure_delivery_target": "ignored"}),
+                Ok(Set("none".into(), None)),
+            ),
+            (
+                serde_json::json!({"failure_delivery_channel": "slack", "failure_delivery_target": "C1"}),
+                Ok(Set("slack".into(), Some("C1".into()))),
+            ),
+            (
+                serde_json::json!({"failure_delivery_channel": " slack "}),
+                Ok(Set("slack".into(), None)),
+            ),
+            (
+                serde_json::json!({"failure_delivery_channel": "broadcast"}),
+                Err(()),
+            ),
+            (
+                serde_json::json!({"failure_delivery_target": "C1"}),
+                Err(()),
+            ),
+        ];
+        for (args, want) in cases {
+            let got = parse_failure_route(args).map_err(|msg| {
+                assert!(
+                    msg.starts_with("Error:"),
+                    "refusals are Error: lines: {msg}"
+                );
+            });
+            assert_eq!(&got, want, "args={args}");
+        }
+    }
+
+    /// `paused: true` at create time must not be a silent no-op: the reply
+    /// says so, and the row is claimable only after a resume. Exercised
+    /// through the DB layer the handler calls, since `with_db` opens the
+    /// global store.
+    #[tokio::test]
+    async fn a_task_created_paused_reports_paused_and_stays_unclaimed() {
+        let db = Database::test_db().await;
+        let stale = chrono::Utc::now().timestamp() - 10_000;
+        db.create_task_with_options(
+            &crate::db::NewTask {
+                id: "born-paused",
+                name: "t",
+                prompt: "do the thing",
+                schedule_type: tasks::SCHEDULE_TYPE_INTERVAL,
+                schedule_expr: "1h",
+                timezone: "",
+                next_run: Some(stale),
+                max_retries: None,
+                timeout_ms: None,
+                delivery_channel: None,
+                delivery_target: None,
+                allowed_tools: None,
+                task_type: "prompt",
+                pre_run_command: None,
+                pre_run_cwd: None,
+                pre_run_timeout_ms: None,
+                min_interval_secs: None,
+                continuity: false,
+            },
+            &crate::db::TaskCreateOptions {
+                paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create paused");
+        assert!(db
+            .claim_due_tasks(chrono::Utc::now().timestamp())
+            .await
+            .expect("claim")
+            .iter()
+            .all(|c| c.task.id != "born-paused"));
+        assert!(
+            run_task_now_in(&db, "born-paused").await.contains("paused"),
+            "run_now on a task born paused is refused like any paused task"
+        );
+        assert_eq!(
+            resume_task_in(&db, "born-paused").await,
+            "Task born-paused resumed."
         );
     }
 }

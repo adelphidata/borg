@@ -425,11 +425,22 @@ pub(in crate::doctor) async fn check_daemon_lock(checks: &mut Vec<DiagnosticChec
     }
 }
 
+/// How far past `next_run` an active task may sit before the doctor calls it
+/// "not firing". Wide enough to absorb a busy dispatcher and a laptop lid
+/// closing over lunch; narrow enough that a daemon that died this morning
+/// shows up by the time anyone wonders where the report went.
+pub(in crate::doctor) const TASK_NOT_FIRING_GRACE_SECS: i64 = 15 * 60;
+
 /// Scheduled-task health from a DB handle (injectable for tests). Surfaces a
-/// count summary plus any task whose last run errored — the genuinely
-/// actionable signal. Overdue-but-not-errored tasks are left to the nightly
-/// heal (flagging them here would be noise whenever the daemon is simply off).
+/// count summary, any task whose last run errored, and any active task that
+/// is well past due with nothing running — the silent failure mode where
+/// the daemon is down or wedged and no report ever says so.
 async fn scheduled_task_checks(db: &Database) -> Vec<DiagnosticCheck> {
+    scheduled_task_checks_at(db, chrono::Utc::now().timestamp()).await
+}
+
+/// [`scheduled_task_checks`] with the clock injected.
+async fn scheduled_task_checks_at(db: &Database, now: i64) -> Vec<DiagnosticCheck> {
     // Single fetch: `list_tasks` already returns every row including
     // `last_error`, so the count summary and the errored subset come from one
     // scan rather than a second `tasks_with_last_error` query.
@@ -501,6 +512,67 @@ async fn scheduled_task_checks(db: &Database) -> Vec<DiagnosticCheck> {
                 undeliverable.join(", ")
             ),
         ));
+    }
+
+    // An active task well past its `next_run` with no run in flight is the
+    // scheduler not firing — borgd down, wedged, or never started — and
+    // nothing else says so: no run means no error, no delivery, no notice.
+    // A task pending retry is excluded (the retry loop owns it) and so is one
+    // with a *recent* `running` row (it fired; it may be slow, which is a
+    // different finding). The recency floor matters: a daemon killed mid-run
+    // leaves a `running` row that never closes, and counting it as in-flight
+    // would hide exactly the task the outage stopped. The nightly heal
+    // re-stamps overdue tasks, so this is the only surface that names the
+    // outage while it is happening.
+    let running = match db
+        .tasks_with_running_runs(now - TASK_NOT_FIRING_GRACE_SECS)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            out.push(DiagnosticCheck::warn(
+                "Scheduled Tasks",
+                "task store",
+                format!("could not read running tasks: {e}"),
+            ));
+            return out;
+        }
+    };
+    let cutoff = now - TASK_NOT_FIRING_GRACE_SECS;
+    let mut not_firing: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t.status == crate::tasks::TASK_STATUS_ACTIVE)
+        .filter(|t| t.retry_after.is_none())
+        .filter(|t| t.next_run.is_some_and(|n| n < cutoff))
+        .filter(|t| !running.contains(&t.id))
+        .map(|t| t.name.as_str())
+        .collect();
+    not_firing.sort_unstable();
+    if !not_firing.is_empty() {
+        let sample = not_firing
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(
+            DiagnosticCheck::warn(
+                "Scheduled Tasks",
+                "tasks not firing",
+                format!(
+                    "{} active task(s) are more than {} minutes past due and have not \
+                     started (e.g. {sample}) — the scheduler is not running them",
+                    not_firing.len(),
+                    TASK_NOT_FIRING_GRACE_SECS / 60,
+                ),
+            )
+            .with_remediation(
+                RemediationKind::Manual,
+                "tasks.not_firing",
+                "check that borgd is running (`borg doctor` shows the daemon lock), \
+                 start it if it is not, then confirm with `borg tasks status`",
+            ),
+        );
     }
     out
 }
@@ -719,6 +791,138 @@ mod tests {
             crate::tasks::unknown_borg_command(msg),
             None,
             "warning must not name a command that does not exist: {msg}"
+        );
+    }
+
+    /// An active task an hour past due with nothing running is the daemon
+    /// silently not firing — the one failure no run row, error, or delivery
+    /// ever reports. Slightly-late, paused, retrying, and already-running
+    /// tasks must all stay quiet, or the warning is noise on every laptop.
+    #[tokio::test]
+    async fn scheduled_tasks_warns_when_an_active_task_is_overdue_and_not_running() {
+        let db = Database::test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        let find = |checks: Vec<DiagnosticCheck>| {
+            checks.into_iter().find(|c| c.name == "tasks not firing")
+        };
+        let seed = |id: &'static str, next_run: i64| {
+            let mut spec = task_spec(id, id, Some("telegram"), Some("42"));
+            spec.next_run = Some(next_run);
+            spec
+        };
+
+        // The seeded system rows plus the quiet cases: 5 minutes late,
+        // paused an hour late, an hour late but pending retry, an hour late
+        // but currently running.
+        db.create_task(&seed("slightly late", now - 5 * 60))
+            .await
+            .expect("create");
+        db.create_task_with_options(
+            &seed("paused late", now - 3600),
+            &crate::db::TaskCreateOptions {
+                paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create paused");
+        db.create_task(&seed("retrying late", now - 3600))
+            .await
+            .expect("create");
+        db.set_task_retry("retrying late", 1, "connection refused", now + 60)
+            .await
+            .expect("pending retry");
+        db.create_task(&seed("running late", now - 3600))
+            .await
+            .expect("create");
+        db.start_task_run("running late", now - 60)
+            .await
+            .expect("running row");
+        assert!(
+            find(scheduled_task_checks_at(&db, now).await).is_none(),
+            "no task here is silently not firing"
+        );
+
+        db.create_task(&seed("stuck digest", now - 3600))
+            .await
+            .expect("create");
+        let warn = find(scheduled_task_checks_at(&db, now).await)
+            .expect("an hour-overdue active task must warn");
+        assert!(warns(&warn));
+        let CheckStatus::Warn(msg) = &warn.status else {
+            unreachable!()
+        };
+        assert!(msg.contains("stuck digest"), "names the task: {msg}");
+        assert!(
+            !msg.contains("slightly late") && !msg.contains("paused late"),
+            "quiet cases must not be listed: {msg}"
+        );
+        let hint = warn
+            .user_hint
+            .as_deref()
+            .expect("the warning names the next action");
+        assert!(
+            hint.contains("borgd is running"),
+            "next action in plain words: {hint}"
+        );
+        assert_eq!(
+            crate::tasks::unknown_borg_command(hint),
+            None,
+            "hint must not name a command that does not exist: {hint}"
+        );
+
+        // Just inside the grace window is still quiet.
+        db.update_task_next_run("stuck digest", Some(now - TASK_NOT_FIRING_GRACE_SECS + 30))
+            .await
+            .expect("move inside grace");
+        assert!(
+            find(scheduled_task_checks_at(&db, now).await).is_none(),
+            "inside the grace window is not a finding"
+        );
+    }
+
+    /// A daemon killed mid-run leaves a `running` row that never closes. If
+    /// that corpse counted as a live run, the check would go quiet about
+    /// exactly the task the outage stopped — the one the user is asking
+    /// about. Only a *recent* run suppresses the finding.
+    #[tokio::test]
+    async fn a_stale_running_row_does_not_hide_a_task_that_stopped_firing() {
+        let db = Database::test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        let find = |checks: Vec<DiagnosticCheck>| {
+            checks.into_iter().find(|c| c.name == "tasks not firing")
+        };
+        let seed = |id: &'static str, next_run: i64| {
+            let mut spec = task_spec(id, id, Some("telegram"), Some("42"));
+            spec.next_run = Some(next_run);
+            spec
+        };
+
+        db.create_task(&seed("fresh run", now - 3600))
+            .await
+            .expect("create");
+        db.start_task_run("fresh run", now - 60)
+            .await
+            .expect("fresh running row");
+        db.create_task(&seed("abandoned run", now - 3600))
+            .await
+            .expect("create");
+        db.start_task_run("abandoned run", now - 4 * 3600)
+            .await
+            .expect("stale running row");
+
+        let warn = find(scheduled_task_checks_at(&db, now).await)
+            .expect("the task whose run was abandoned is not firing");
+        let CheckStatus::Warn(msg) = &warn.status else {
+            unreachable!()
+        };
+        assert!(
+            msg.contains("abandoned run"),
+            "a stale running row must not hide the task: {msg}"
+        );
+        assert!(
+            !msg.contains("fresh run"),
+            "a recent running row still suppresses: {msg}"
         );
     }
 

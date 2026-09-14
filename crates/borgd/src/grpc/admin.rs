@@ -37,9 +37,10 @@ use protocols::admin::{
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
     ScheduledTaskUpdate, SessionActivityEvent as PbSessionActivityEvent, SessionArchiveMutation,
     SessionDetail, SessionList, SessionRef, SessionSummary, SessionTitleMutation,
-    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
-    SettingMutation, SettingsSnapshot, SkillEntry as PbSkillEntry, SkillList as PbSkillList,
-    SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
+    SetCredentialPriorityRequest, SetCredentialPriorityResponse, SetCredentialStrategyRequest,
+    SetSubprocessPinnedRequest, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
+    SkillEntry as PbSkillEntry, SkillList as PbSkillList, SubprocessSnapshot,
+    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1292,6 +1293,13 @@ impl Admin for AdminSvc {
         req: Request<PairCredentialRequest>,
     ) -> Result<Response<PairCredentialResponse>, TStatus> {
         credentials::pair_credential(self, req).await
+    }
+
+    async fn set_credential_priority(
+        &self,
+        req: Request<SetCredentialPriorityRequest>,
+    ) -> Result<Response<SetCredentialPriorityResponse>, TStatus> {
+        credentials::set_credential_priority(self, req).await
     }
 
     async fn set_credential_strategy(

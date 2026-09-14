@@ -23,6 +23,7 @@ mod markdown;
 mod mcp_popup;
 pub(crate) mod migrate_popup;
 mod model_popup;
+mod notify;
 mod pairing_popup;
 mod paste_burst;
 mod plan_overlay;
@@ -1011,6 +1012,9 @@ async fn run_event_loop(
                 match event {
                     Some(ev) => {
                         app.process_agent_event(ev);
+                        if let Some(seq) = app.take_pending_notification() {
+                            notify::emit(tui.terminal.backend_mut(), &seq);
+                        }
                         drain_queued_if_idle(app)?
                     }
                     None => {

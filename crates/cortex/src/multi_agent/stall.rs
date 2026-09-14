@@ -250,6 +250,8 @@ mod tests {
             provider: "test".to_string(),
             model: "test-model".to_string(),
             provider_cost_usd: None,
+            response_id: None,
+            upstream: None,
         })));
         assert_eq!(w.idle_cycles(), 0);
         for _ in 0..(THRESHOLD - 1) {

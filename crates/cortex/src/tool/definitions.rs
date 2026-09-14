@@ -628,7 +628,10 @@ fn build_schedule_tool_def() -> ToolDefinition {
         "pre_run_cwd": {"type":"string","description":"Optional working directory for pre_run_command (default: $HOME)."},
         "pre_run_timeout_ms": {"type":"integer","description":"Timeout (ms) for pre_run_command (default: 60000)."},
         "continuity": {"type":"boolean","description":"Only for type=prompt: let each run see what the previous runs of this same task produced, so it can say what changed instead of repeating itself. Off by default — carrying prior output costs context on every fire, and most scheduled tasks are stateless (\"summarize today's mail\"). Use it for tasks that track something over time (\"what moved on my open PRs since yesterday\"). Settable on create and update."},
-        "monitor_mode": {"type":"boolean","description":"Only for type=prompt with a pre_run_command: hash the pre-run output each run and skip the LLM turn entirely when it is unchanged from the last run that reached the model (recorded as a no_change run). The first run always reaches the model and stores the baseline; a pre-run failure never counts as a change. Use for watch-for-changes jobs so unchanged polls cost nothing."}
+        "monitor_mode": {"type":"boolean","description":"Only for type=prompt with a pre_run_command: hash the pre-run output each run and skip the LLM turn entirely when it is unchanged from the last run that reached the model (recorded as a no_change run). The first run always reaches the model and stores the baseline; a pre-run failure never counts as a change. Use for watch-for-changes jobs so unchanged polls cost nothing."},
+        "paused": {"type":"boolean","description":"For create only: insert the task already paused (default false). It never fires until action='resume'. Use when the user wants a task set up now but switched on later — one atomic write, no window where it could fire in between."},
+        "failure_delivery_channel": {"type":"string","description":"Where the '[FAILED]' notice for this task goes, for create and update. Omit to send failures to delivery_channel/delivery_target (the default). Set to a channel (telegram, slack, discord, or 'origin') to route failure notices there instead — e.g. an ops channel while results go to the user. Set to the literal 'none' to suppress failure notices entirely; the failure is still recorded in last_error and the run history. On update, pass '' (empty string) to clear an override."},
+        "failure_delivery_target": {"type":"string","description":"Target chat/channel ID within failure_delivery_channel. Omit to reuse delivery_target (handy when the failure channel is the same channel) or when failure_delivery_channel is 'origin' or 'none'."}
     });
 
     ToolDefinition::new(
@@ -918,6 +921,39 @@ mod tests {
                 .unwrap()
                 .contains("type=prompt"),
             "pre_run_command description should restrict it to prompt tasks"
+        );
+    }
+
+    /// The model can only use what the schema names: the paused-create flag
+    /// and the failure route must be typed correctly and their descriptions
+    /// must teach the `none` sentinel and the fallback, or the parameters
+    /// exist without ever being discovered.
+    #[test]
+    fn schedule_tool_schema_teaches_paused_create_and_failure_routing() {
+        let def = build_schedule_tool_def();
+        let props = &def.function.parameters["properties"];
+        assert_eq!(props["paused"]["type"], "boolean");
+        assert_eq!(props["failure_delivery_channel"]["type"], "string");
+        assert_eq!(props["failure_delivery_target"]["type"], "string");
+        let paused = props["paused"]["description"].as_str().unwrap();
+        assert!(
+            paused.contains("create") && paused.contains("resume"),
+            "paused must say it is a create-time flag lifted by resume: {paused}"
+        );
+        let route = props["failure_delivery_channel"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            route.contains(&format!("'{}'", crate::tasks::FAILURE_DELIVERY_NONE)),
+            "must document the suppression sentinel: {route}"
+        );
+        assert!(
+            route.contains("delivery_channel") && route.contains("default"),
+            "must document the fallback to the success route: {route}"
+        );
+        assert!(
+            route.contains("last_error"),
+            "must say a suppressed notice is still recorded: {route}"
         );
     }
 

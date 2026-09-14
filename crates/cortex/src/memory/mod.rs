@@ -99,6 +99,111 @@ pub fn resolved_memory_scopes(config: &Config) -> Vec<String> {
     scopes
 }
 
+/// Record that a context item was dropped and report it at the right level.
+///
+/// Two drops deserve a `warn`, because the operator can act on them and
+/// nothing else will ever surface them: an item whose *own* size exceeds the
+/// whole budget (it can never load, on any turn, no matter what else is in
+/// memory), and the priority item (`INDEX`, `global/MEMORY.md`) that every
+/// other entry is organized around. An item skipped only because earlier
+/// items already filled the budget is routine and stays at `debug`.
+///
+/// Warnings are deduplicated per process — the loaders run on every prompt
+/// build, so an oversized file would otherwise warn on every turn.
+fn note_budget_drop(
+    kind: &str,
+    name: &str,
+    tokens: usize,
+    used_tokens: usize,
+    max_tokens: usize,
+    priority: bool,
+) {
+    match budget_drop_notice(kind, name, tokens, used_tokens, max_tokens, priority) {
+        BudgetDropNotice::Routine(msg) => debug!("{msg}"),
+        BudgetDropNotice::Actionable(msg) => {
+            if claim_budget_drop_warning(kind, name) {
+                tracing::warn!("{msg}");
+            }
+        }
+    }
+}
+
+/// How a dropped context item should be reported.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetDropNotice {
+    /// Expected under a full budget; `debug` is the right level.
+    Routine(String),
+    /// The operator can fix this and nothing else surfaces it.
+    Actionable(String),
+}
+
+/// The level-and-wording rule, separated from emitting it.
+///
+/// Split out so the rule is testable directly. Asserting on captured
+/// `tracing` events instead makes the test depend on which subscriber is
+/// installed process-wide — a thread-local recorder does not override a
+/// global one, so the same assertion passes alone and fails in a full run.
+fn budget_drop_notice(
+    kind: &str,
+    name: &str,
+    tokens: usize,
+    used_tokens: usize,
+    max_tokens: usize,
+    priority: bool,
+) -> BudgetDropNotice {
+    if tokens > max_tokens {
+        return BudgetDropNotice::Actionable(format!(
+            "{kind} {name} is ~{tokens} tokens, larger than the whole {max_tokens}-token \
+             budget, so it is never loaded into context; split it or raise the budget"
+        ));
+    }
+    let remaining = max_tokens.saturating_sub(used_tokens);
+    if priority {
+        return BudgetDropNotice::Actionable(format!(
+            "{kind} {name} (~{tokens} tokens) was dropped from context: only \
+             {remaining} of the {max_tokens}-token budget remained"
+        ));
+    }
+    BudgetDropNotice::Routine(format!(
+        "skipping {kind} {name}: {tokens} tokens would exceed the remaining budget \
+         ({used_tokens}/{max_tokens} used)"
+    ))
+}
+
+/// Names already reported, so a drop is announced once rather than on every
+/// prompt build.
+static BUDGET_DROPS_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Claim the one-per-process warning slot for `(kind, name)`. Returns `false`
+/// when the drop was already reported.
+fn claim_budget_drop_warning(kind: &str, name: &str) -> bool {
+    let warned = BUDGET_DROPS_WARNED.get_or_init(Default::default);
+    // A poisoned mutex must not silence the warning; the worst case is a
+    // repeated log line.
+    let mut set = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set.insert(format!("{kind}\0{name}"))
+}
+
+/// Forget every claimed warning.
+///
+/// The claim set is process-wide, which is right in production and hostile
+/// in tests: whether a warning fires depends on what ran before it in the
+/// same binary, so a test asserting "this warns" passes or fails by
+/// ordering. Tests that exercise the warning start from a clean set.
+#[cfg(test)]
+fn reset_budget_drop_warnings() {
+    if let Some(warned) = BUDGET_DROPS_WARNED.get() {
+        warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
 // ── DB-Backed Memory API ──
 // These functions use the `memory_entries` table as the single source of truth.
 
@@ -322,6 +427,15 @@ pub async fn load_memory_context_db_with(
             ));
             estimated_tokens += tokens;
             debug!("Loaded INDEX ({tokens} estimated tokens)");
+        } else {
+            note_budget_drop(
+                "memory entry",
+                "INDEX",
+                tokens,
+                estimated_tokens,
+                max_tokens,
+                true,
+            );
         }
     }
 
@@ -332,7 +446,14 @@ pub async fn load_memory_context_db_with(
         }
         let tokens = tokens_for_entry(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
-            debug!("Skipping {} (would exceed token budget)", entry.name);
+            note_budget_drop(
+                "memory entry",
+                &entry.name,
+                tokens,
+                estimated_tokens,
+                max_tokens,
+                false,
+            );
             continue;
         }
         let safe_name = escape_xml_attr(&entry.name);
@@ -402,6 +523,14 @@ pub async fn load_memory_context_db_ranked_with(
                     loaded: &mut std::collections::HashSet<String>| {
         let tokens = tokens_for_entry(entry, &token_cache);
         if *estimated_tokens + tokens > max_tokens {
+            note_budget_drop(
+                "memory entry",
+                &entry.name,
+                tokens,
+                *estimated_tokens,
+                max_tokens,
+                entry.name == "INDEX",
+            );
             return;
         }
         let safe_name = escape_xml_attr(&entry.name);
@@ -573,6 +702,14 @@ pub async fn load_memory_context_db_scoped_with(
         }
         let tokens = tokens_for_entry_scoped(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
+            note_budget_drop(
+                "memory entry",
+                &format!("{}/{}", entry.scope, entry.name),
+                tokens,
+                estimated_tokens,
+                max_tokens,
+                entry.name == "INDEX",
+            );
             continue;
         }
         parts.push(render_long_term_entry(entry));
@@ -631,6 +768,14 @@ pub async fn load_memory_context_db_ranked_scoped_with(
         }
         let tokens = tokens_for_entry_scoped(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
+            note_budget_drop(
+                "memory entry",
+                &format!("{}/{}", entry.scope, entry.name),
+                tokens,
+                estimated_tokens,
+                max_tokens,
+                entry.name == "INDEX",
+            );
             return;
         }
         parts.push(render_long_term_entry(entry));
@@ -933,6 +1078,14 @@ fn load_knowledge_context_in(
         };
         let tokens = estimate_tokens(&content);
         if estimated_tokens + tokens > max_tokens {
+            note_budget_drop(
+                "knowledge file",
+                &name,
+                tokens,
+                estimated_tokens,
+                max_tokens,
+                name == "global/MEMORY.md",
+            );
             continue;
         }
         let safe_name = escape_xml_attr(&name);
@@ -1115,6 +1268,14 @@ pub fn load_extra_paths(
             Ok(content) => {
                 let tokens = estimate_tokens(&content);
                 if *estimated_tokens + tokens > max_tokens {
+                    note_budget_drop(
+                        "extra path",
+                        &name,
+                        tokens,
+                        *estimated_tokens,
+                        max_tokens,
+                        false,
+                    );
                     continue;
                 }
                 let safe_name = escape_xml_attr(&name);
@@ -1683,5 +1844,149 @@ mod tests {
             !err.chars().any(|c| c.is_ascii_digit()),
             "injection error must contain no digits (anti-probing): {err}"
         );
+    }
+
+    /// Spec: a knowledge file that can never fit the budget is a
+    /// configuration problem the operator must hear about — once, not on
+    /// every prompt build. Nothing else surfaces a silently missing file.
+    #[test]
+    fn oversized_knowledge_file_warns_once_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = "zz-oversized-budget-guide.md";
+        std::fs::write(tmp.path().join(file), "oversizedbudgetguide ".repeat(2_000)).unwrap();
+        reset_budget_drop_warnings();
+
+        let load = || {
+            load_knowledge_context_in(
+                tmp.path(),
+                &["global".to_string()],
+                "oversizedbudgetguide",
+                100,
+            )
+            .unwrap()
+        };
+        let out = load();
+        assert!(
+            !out.contains("oversizedbudgetguide"),
+            "over-budget file must be dropped whole, never truncated"
+        );
+
+        // The drop is reported as actionable, and the message names the file
+        // and the budget it could never fit.
+        let notice = budget_drop_notice(
+            "knowledge file",
+            &format!("global/{file}"),
+            4_000,
+            0,
+            100,
+            false,
+        );
+        let BudgetDropNotice::Actionable(msg) = &notice else {
+            panic!("an item larger than the whole budget is actionable, got {notice:?}");
+        };
+        assert!(msg.contains(file), "message names the file: {msg}");
+        assert!(
+            msg.contains("100-token"),
+            "message states the budget it failed to fit: {msg}"
+        );
+
+        // Reported once per process, not once per prompt build.
+        reset_budget_drop_warnings();
+        assert!(claim_budget_drop_warning("knowledge file", file));
+        assert!(
+            !claim_budget_drop_warning("knowledge file", file),
+            "the same file must not be reported on every turn"
+        );
+        // Second load must not panic or start truncating.
+        assert!(!load().contains("oversizedbudgetguide"));
+    }
+
+    /// Spec: files that load, and files skipped only because *earlier* files
+    /// used up the budget, are routine and must not warn — a warning that
+    /// fires on every healthy turn is one the operator learns to ignore.
+    #[test]
+    fn knowledge_files_within_budget_do_not_warn() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("MEMORY.md"), "# Memory Index").unwrap();
+        std::fs::write(
+            tmp.path().join("zz-fits-first.md"),
+            "fitsfirst budgetfitcheck ".repeat(30),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("zz-fits-alone.md"),
+            "fitsalone budgetfitcheck ".repeat(30),
+        )
+        .unwrap();
+        reset_budget_drop_warnings();
+
+        let each = estimate_tokens(&"fitsfirst budgetfitcheck ".repeat(30));
+        // Room for the index plus one file, but not both files.
+        let budget = estimate_tokens("# Memory Index") + each + each / 2;
+        let out = load_knowledge_context_in(
+            tmp.path(),
+            &["global".to_string()],
+            "budgetfitcheck",
+            budget,
+        )
+        .unwrap();
+
+        let loaded = out.matches("<knowledge_file").count();
+        assert_eq!(
+            loaded, 2,
+            "index plus exactly one of the two files must fit: {out}"
+        );
+        // The dropped file fits the budget on its own; it lost only because
+        // earlier files spent it. That is routine, not actionable.
+        assert_eq!(
+            budget_drop_notice(
+                "knowledge file",
+                "global/zz-fits-alone.md",
+                each,
+                budget,
+                budget,
+                false
+            ),
+            BudgetDropNotice::Routine(format!(
+                "skipping knowledge file global/zz-fits-alone.md: {each} tokens would exceed \
+                 the remaining budget ({budget}/{budget} used)"
+            )),
+            "a file dropped only because the budget was already spent is not a warning"
+        );
+    }
+
+    /// Spec: the same contract holds for long-term memory entries — an entry
+    /// larger than the whole budget is named in a warning.
+    #[tokio::test]
+    async fn oversized_memory_entry_warns_by_name() {
+        let db = crate::db::Database::test_db().await;
+        let entry = "_zz_oversized_warn_entry_";
+        db.upsert_memory_entry("global", entry, &"budgetword ".repeat(5_000))
+            .await
+            .unwrap();
+        reset_budget_drop_warnings();
+
+        let out = load_memory_context_db_with(&db, 50).await.unwrap();
+        assert!(!out.contains("budgetword"));
+
+        let notice = budget_drop_notice("memory entry", entry, 5_000, 0, 50, false);
+        let BudgetDropNotice::Actionable(msg) = &notice else {
+            panic!("an entry larger than the whole budget is actionable, got {notice:?}");
+        };
+        assert!(msg.contains(entry), "message names the entry: {msg}");
+        assert!(msg.contains("50-token"), "message states the budget: {msg}");
+    }
+
+    /// The priority item is what every other entry is organized around, so
+    /// its loss is actionable even when it would have fit a fresh budget.
+    #[test]
+    fn the_priority_item_is_actionable_even_when_it_would_fit_alone() {
+        let routine = budget_drop_notice("knowledge file", "global/notes.md", 40, 80, 100, false);
+        assert!(matches!(routine, BudgetDropNotice::Routine(_)));
+        let priority = budget_drop_notice("knowledge file", "global/MEMORY.md", 40, 80, 100, true);
+        let BudgetDropNotice::Actionable(msg) = &priority else {
+            panic!("the priority item is actionable, got {priority:?}");
+        };
+        assert!(msg.contains("MEMORY.md"), "message names the item: {msg}");
     }
 }

@@ -1021,6 +1021,8 @@ mod tests {
                 provider: "test".into(),
                 model: "model".into(),
                 provider_cost_usd: None,
+                response_id: None,
+                upstream: None,
             }),
             &mut tokens,
             &mut writes,

@@ -36,6 +36,10 @@ pub enum ErrorCategory {
     Timeout,
     /// The model cannot accept image input, so a screenshot could not be sent.
     ImageUnsupported,
+    /// The provider rejected a tool call the model wrote. The bad call is
+    /// part of the conversation, so every retry replays it: this is the one
+    /// error class the user has to act on before anything else can work.
+    MalformedToolCall,
     /// Unclassified error.
     Unknown,
 }
@@ -51,6 +55,7 @@ impl fmt::Display for ErrorCategory {
             Self::ContextOverflow => write!(f, "context_overflow"),
             Self::Timeout => write!(f, "timeout"),
             Self::ImageUnsupported => write!(f, "image_unsupported"),
+            Self::MalformedToolCall => write!(f, "malformed_tool_call"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -73,6 +78,7 @@ impl std::str::FromStr for ErrorCategory {
             "context_overflow" => Self::ContextOverflow,
             "timeout" => Self::Timeout,
             "image_unsupported" => Self::ImageUnsupported,
+            "malformed_tool_call" => Self::MalformedToolCall,
             "unknown" => Self::Unknown,
             _ => return Err(()),
         })
@@ -120,6 +126,10 @@ pub fn classify_error(raw: &str) -> ErrorCategory {
         // no transport-detail sniffing needed, the class already says it.
         Some(FailoverReason::ConnectionLost) => ErrorCategory::Transport,
         Some(FailoverReason::ImageUnsupported) => ErrorCategory::ImageUnsupported,
+        // Not `Unknown`: the offending call stays in the conversation, so
+        // the next turn replays it and hits the same wall. The user needs
+        // the way out, not a truncated provider blob.
+        Some(FailoverReason::MalformedToolCall) => ErrorCategory::MalformedToolCall,
         Some(FailoverReason::ModelNotFound)
         | Some(FailoverReason::Format)
         | Some(FailoverReason::Unknown)
@@ -219,6 +229,13 @@ pub fn format_friendly_error(raw: &str) -> String {
         ErrorCategory::ImageUnsupported => {
             "The current model cannot read images, so the screenshot could not be sent. \
              Switch to a model that supports images, or ask for the page text instead."
+                .to_string()
+        }
+
+        ErrorCategory::MalformedToolCall => {
+            "The AI provider rejected a tool call in this conversation, and it will \
+             reject it again on every retry. Undo the last turn, or start a new \
+             conversation to continue."
                 .to_string()
         }
 
@@ -432,6 +449,29 @@ mod tests {
             .parse()
             .expect("token must parse back");
         assert_eq!(parsed, ErrorCategory::ImageUnsupported);
+    }
+
+    /// A rejected tool call is replayed by every retry, so the message has to
+    /// name the way out instead of dumping the provider's blob. Falling back
+    /// to `Unknown` here would leave the user with no next action.
+    #[test]
+    fn a_rejected_tool_call_names_the_way_out() {
+        let raw = "Invalid parameter: 'tool_calls[0].function.arguments' is not valid JSON";
+        assert_eq!(classify_error(raw), ErrorCategory::MalformedToolCall);
+        let msg = format_friendly_error(raw);
+        assert!(
+            msg.contains("Undo") && msg.contains("new conversation"),
+            "must name the next action, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unexpected error"),
+            "must not fall through to the generic blob, got: {msg}"
+        );
+        let parsed: ErrorCategory = ErrorCategory::MalformedToolCall
+            .to_string()
+            .parse()
+            .expect("token must parse back");
+        assert_eq!(parsed, ErrorCategory::MalformedToolCall);
     }
 
     /// Table-driven classifier check. Each row pins a real provider/transport

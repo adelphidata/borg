@@ -1327,6 +1327,43 @@ fn turn_complete_in_default_mode_returns_to_idle() {
 }
 
 #[test]
+fn turn_complete_notification_gating_table() {
+    // (enabled, streaming, elapsed_secs, expect_notification)
+    let cases: &[(bool, bool, u64, bool)] = &[
+        (true, true, 30, true),
+        (true, true, 1, false),
+        (false, true, 30, false),
+        // Already idle: no turn was in flight, nothing to announce.
+        (true, false, 30, false),
+    ];
+    for (enabled, streaming, secs, expected) in cases {
+        let mut app = make_app();
+        app.config.ui.notify_on_complete = *enabled;
+        if *streaming {
+            app.state = AppState::Streaming {
+                start: Instant::now() - std::time::Duration::from_secs(*secs),
+            };
+        }
+        app.process_agent_event(AgentEvent::TurnComplete);
+        let got = app.take_pending_notification();
+        assert_eq!(
+            got.is_some(),
+            *expected,
+            "enabled={enabled} streaming={streaming} secs={secs} got={got:?}"
+        );
+        if let Some(seq) = got {
+            assert!(seq.ends_with('\x07'), "sequence must end in BEL: {seq:?}");
+            assert!(!seq.contains("\x1b["), "no CSI in a notification: {seq:?}");
+        }
+        assert!(
+            app.take_pending_notification().is_none(),
+            "take must drain the queue"
+        );
+        assert!(matches!(app.state, AppState::Idle));
+    }
+}
+
+#[test]
 fn turn_complete_moves_final_assistant_tail_into_pending_scrollback() {
     let mut app = make_app();
     app.last_viewport_width = 80;

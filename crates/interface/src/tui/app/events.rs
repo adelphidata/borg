@@ -7,6 +7,7 @@ use cortex::config::CollaborationMode;
 use heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, SkipReason};
 
 use super::super::history::{ApprovalStatus, HistoryCell};
+use super::super::notify;
 use super::{App, AppState, BtwResult, DoctorEvent};
 
 /// Default viewport width used by [`App::flush_after_event`] before the first
@@ -404,6 +405,7 @@ impl<'a> App<'a> {
         self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
         self.last_turn_errored = false;
         self.queue_pause_notified = false;
+        self.queue_turn_notification();
         if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
             let pct = self.compute_context_pct();
             let name = self
@@ -425,6 +427,33 @@ impl<'a> App<'a> {
         // playback to avoid the feedback loop where TTS audio feeds
         // back as the next user message.
         self.maybe_speak_assistant_reply();
+    }
+
+    /// Queue a terminal notification for the turn that just ended, when it
+    /// ran long enough to matter and the user has not turned it off. Only a
+    /// `Streaming` state carries a start time, so a `TurnComplete` seen from
+    /// any other state (already idle, plan review) never notifies.
+    fn queue_turn_notification(&mut self) {
+        let elapsed = match &self.state {
+            AppState::Streaming { start } => start.elapsed(),
+            _ => return,
+        };
+        if !notify::should_notify(self.config.ui.notify_on_complete, elapsed) {
+            return;
+        }
+        let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
+        let body = format!(
+            "Finished in {}",
+            super::duration::fmt_compact_duration(elapsed.as_secs() as i64)
+        );
+        self.pending_notification =
+            notify::notification_sequence(notify::detect_from_process_env(), name, &body);
+    }
+
+    /// Hand the queued notification sequence to the event loop, which owns
+    /// the terminal handle.
+    pub fn take_pending_notification(&mut self) -> Option<String> {
+        self.pending_notification.take()
     }
 
     fn handle_event_error(&mut self, e: String) {

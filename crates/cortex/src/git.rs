@@ -83,6 +83,50 @@ pub(crate) fn hardened_prelude() -> &'static [&'static str] {
     ]
 }
 
+/// Subcommands that take git's diff options, and so can be steered by a
+/// repository's `.gitattributes` at a *named* diff driver. `stash` is handled
+/// separately because only its `show` verb takes diff options.
+const DIFF_OPTION_SUBCOMMANDS: &[&str] = &[
+    "diff",
+    "show",
+    "log",
+    "format-patch",
+    "range-diff",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+];
+
+/// Per-invocation flags that switch off named diff drivers.
+///
+/// `diff.external=` in [`hardened_prelude`] blanks the *global* external diff,
+/// but a repository can also attach a named driver to any path
+/// (`.gitattributes`: `* diff=evil`; `.git/config`: `[diff "evil"] command =
+/// …` / `textconv = …`) and `-c` cannot enumerate drivers it has never heard
+/// of. `--no-ext-diff` and `--no-textconv` refuse *every* driver's program
+/// regardless of name, so they close the hole the prelude can't.
+const DIFF_DRIVER_OVERRIDES: &[&str] = &["--no-ext-diff", "--no-textconv"];
+
+/// Insert [`DIFF_DRIVER_OVERRIDES`] after the subcommand when that subcommand
+/// takes diff options; leave every other argv untouched. `status`, `rev-parse`
+/// and friends reject the flags outright, so a blanket insertion would break
+/// them — the subcommand allowlist is what keeps this safe by default.
+///
+/// The flags go directly after the subcommand (or after `stash show`), which
+/// is before any `--` pathspec separator the caller may have added.
+pub(crate) fn harden_git_argv<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let insert_at = match args {
+        [sub, ..] if DIFF_OPTION_SUBCOMMANDS.contains(sub) => 1,
+        ["stash", "show", ..] => 2,
+        _ => return args.to_vec(),
+    };
+    let mut argv = Vec::with_capacity(args.len() + DIFF_DRIVER_OVERRIDES.len());
+    argv.extend_from_slice(&args[..insert_at]);
+    argv.extend_from_slice(DIFF_DRIVER_OVERRIDES);
+    argv.extend_from_slice(&args[insert_at..]);
+    argv
+}
+
 /// Harden a `git` invocation: scrub its environment and make it
 /// non-interactive.
 ///
@@ -611,7 +655,8 @@ pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
 }
 
 /// Shared git runner. Always prepends [`hardened_prelude`] so a repository's
-/// own `core.fsmonitor`/hooks can't execute while we work in its tree, and
+/// own `core.fsmonitor`/hooks can't execute while we work in its tree, adds
+/// the per-subcommand diff-driver overrides via [`harden_git_argv`], and
 /// applies any `extra_env` (e.g. `GIT_INDEX_FILE`, filter-neutralizing
 /// `GIT_CONFIG_*` entries).
 #[instrument(name = "run_git", skip_all, fields(git.args = ?args))]
@@ -621,7 +666,7 @@ async fn run_git_inner(
     extra_env: &[(String, String)],
 ) -> Result<String> {
     let mut argv: Vec<&str> = hardened_prelude().to_vec();
-    argv.extend_from_slice(args);
+    argv.extend(harden_git_argv(args));
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&argv).current_dir(cwd);
     harden_git_command(&mut cmd);
@@ -1397,6 +1442,145 @@ mod tests {
             "filter discovery must run under the hardening prelude: {argv:?}"
         );
         assert_eq!(argv[prelude.len()], "config");
+    }
+
+    /// Spec: every diff-producing subcommand gets both driver overrides, and
+    /// every subcommand that would reject them gets nothing. Table-driven so
+    /// the allowlist and the "leave unknown argv alone" rule are one test.
+    #[test]
+    fn harden_git_argv_adds_driver_overrides_only_where_git_accepts_them() {
+        let hardened: &[(&[&str], &[&str])] = &[
+            (&["diff"], &["diff", "--no-ext-diff", "--no-textconv"]),
+            (
+                &["diff", "--", "a.txt"],
+                &["diff", "--no-ext-diff", "--no-textconv", "--", "a.txt"],
+            ),
+            (
+                &["show", "HEAD"],
+                &["show", "--no-ext-diff", "--no-textconv", "HEAD"],
+            ),
+            (
+                &["log", "--oneline", "-5"],
+                &["log", "--no-ext-diff", "--no-textconv", "--oneline", "-5"],
+            ),
+            (
+                &["format-patch", "-1", "--stdout"],
+                &[
+                    "format-patch",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "-1",
+                    "--stdout",
+                ],
+            ),
+            (
+                &["stash", "show", "-p"],
+                &["stash", "show", "--no-ext-diff", "--no-textconv", "-p"],
+            ),
+        ];
+        for (input, expected) in hardened {
+            assert_eq!(&harden_git_argv(input), expected, "input {input:?}");
+        }
+
+        // Subcommands that reject diff options must pass through verbatim —
+        // an inserted flag here is a broken `git status` on every turn.
+        let untouched: &[&[&str]] = &[
+            &["status", "--porcelain"],
+            &["rev-parse", "HEAD"],
+            &["stash", "list"],
+            &["stash", "push", "-u"],
+            &["worktree", "list", "--porcelain"],
+            &["ls-files", "--others"],
+            &["commit", "-qm", "x"],
+            &[],
+        ];
+        for input in untouched {
+            assert_eq!(&harden_git_argv(input), input, "input {input:?}");
+        }
+    }
+
+    /// Spec: a repository's named diff driver must never run under `run_git`.
+    ///
+    /// `.gitattributes` can point any path at a driver whose `command` and
+    /// `textconv` are programs; `-c diff.external=` does not reach a *named*
+    /// driver. Each driver here writes a marker file when it runs. A control
+    /// run without the hardening proves the fixture really fires — otherwise
+    /// the assertion would pass on a driver git simply ignored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_diff_drivers_never_execute_under_run_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let command_marker = tmp.path().join("command-ran");
+        let textconv_marker = tmp.path().join("textconv-ran");
+
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("spawn git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@borg.test"]);
+        git(&["config", "user.name", "borg-test"]);
+        // `;` makes git hand the command to `sh -c`, with the diff arguments
+        // appended after it, so the marker write is unconditional.
+        git(&[
+            "config",
+            "diff.evilcmd.command",
+            &format!("touch {}; :", command_marker.display()),
+        ]);
+        git(&[
+            "config",
+            "diff.eviltc.textconv",
+            &format!("touch {}; cat", textconv_marker.display()),
+        ]);
+        std::fs::write(
+            repo.join(".gitattributes"),
+            "a.txt diff=evilcmd\nb.txt diff=eviltc\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "two\n").unwrap();
+
+        // Control: plain git runs both drivers on this fixture.
+        git(&["diff"]);
+        assert!(
+            command_marker.exists() && textconv_marker.exists(),
+            "control: the fixture's drivers must fire under an unhardened git"
+        );
+        std::fs::remove_file(&command_marker).unwrap();
+        std::fs::remove_file(&textconv_marker).unwrap();
+
+        for args in [
+            &["diff"][..],
+            &["diff", "--", "a.txt", "b.txt"],
+            &["show", "HEAD"],
+            &["log", "-p", "-1"],
+        ] {
+            run_git(args, &repo)
+                .await
+                .unwrap_or_else(|e| panic!("git {args:?} must still succeed: {e}"));
+            assert!(
+                !command_marker.exists(),
+                "git {args:?} ran the repository's diff command driver"
+            );
+            assert!(
+                !textconv_marker.exists(),
+                "git {args:?} ran the repository's textconv driver"
+            );
+        }
     }
 
     /// A command that outlives [`GIT_COMMAND_TIMEOUT`] must not leave orphans

@@ -121,6 +121,9 @@ service Admin {
   rpc RemoveCredential(RemoveCredentialRequest) returns (CredentialEntry);
   rpc ResetCredentials(ResetCredentialsRequest) returns (ResetCredentialsResponse);
   rpc SetCredentialStrategy(SetCredentialStrategyRequest) returns (Empty);
+  // Move one credential to a 1-based position in the pool's priority order
+  // and renumber the rest contiguously. Backs `borg auth priority …`.
+  rpc SetCredentialPriority(SetCredentialPriorityRequest) returns (SetCredentialPriorityResponse);
   // OAuth pairing — runs the credential-source discoverer for `kind` against
   // the daemon's home directory and seeds whatever it finds into the pool.
   rpc PairCredential(PairCredentialRequest) returns (PairCredentialResponse);
@@ -839,6 +842,10 @@ message RemoveCredentialRequest {
 
 message ResetCredentialsRequest {
   string provider = 1;
+  // Optional. Empty = clear every cooldown in the pool. Otherwise a numeric
+  // 1-based index, exact label, full id, or unique 4+ hex id-prefix — only
+  // that entry is cleared; sibling cooldowns and strike counts stay intact.
+  string target = 2;
 }
 
 message ResetCredentialsResponse {
@@ -849,6 +856,22 @@ message SetCredentialStrategyRequest {
   string provider = 1;
   // "fill_first" | "round_robin" | "least_used" | "random"
   string strategy = 2;
+}
+
+message SetCredentialPriorityRequest {
+  string provider = 1;
+  // Numeric 1-based index, exact label, full id, or unique 4+ hex id-prefix.
+  string target = 2;
+  // 1-based position in the pool's priority order (1 = tried first).
+  uint32 position = 3;
+}
+
+message SetCredentialPriorityResponse {
+  // The pool's active strategy — lets the client warn when the strategy
+  // ("round_robin" | "random") ignores priority.
+  string strategy = 1;
+  // Live entries in their new priority order.
+  repeated CredentialEntry entries = 2;
 }
 
 message PairCredentialRequest {

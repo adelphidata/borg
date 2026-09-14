@@ -39,9 +39,10 @@ use protocols::admin::{
     RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest, RevokedClientToken,
     ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
     ScheduledTaskRunList, ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList,
-    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
-    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest,
-    TunnelStatusReply, WarningList, WebhookRef,
+    SessionRef, SetCredentialPriorityRequest, SetCredentialPriorityResponse,
+    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey, SettingMutation,
+    SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList,
+    WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -1360,12 +1361,24 @@ rpc_wrappers! {
             strategy: strategy.to_string(),
         });
 
-    /// Clear all cooled credentials. Returns the count cleared (does not
+    /// Clear cooled credentials. `target` = `None` clears every cooldown in
+    /// the pool; `Some` clears exactly that entry (index / label / id prefix)
+    /// and leaves its siblings alone. Returns the count cleared (does not
     /// touch removed entries).
-    admin fn reset_credentials(provider: &str) -> u64 =
+    admin fn reset_credentials(provider: &str, target: Option<&str>) -> u64 =
         reset_credentials("Admin.ResetCredentials", ResetCredentialsRequest {
             provider: provider.to_string(),
+            target: target.unwrap_or("").to_string(),
         }).cleared;
+
+    /// Move a credential to a 1-based position in the pool's priority order.
+    /// Returns the active strategy plus the live entries in their new order.
+    admin fn set_credential_priority(provider: &str, target: &str, position: u32) -> SetCredentialPriorityResponse =
+        set_credential_priority("Admin.SetCredentialPriority", SetCredentialPriorityRequest {
+            provider: provider.to_string(),
+            target: target.to_string(),
+            position,
+        });
 
     /// Pair an OAuth credential. Runs the discoverer for `kind` against the
     /// daemon's home directory and seeds whatever it finds. Returns one entry

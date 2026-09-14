@@ -417,6 +417,20 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
     }
 }
 
+/// Clamp a child's history-token budget to `cap` (`0` = no cap).
+///
+/// The agent loop's compaction threshold is
+/// `crate::conversation::effective_history_budget_for(config)` —
+/// `conversation.max_history_tokens` bounded by the model's usable window —
+/// so lowering `max_history_tokens` on the child's config is exactly the
+/// lever. `min` keeps an already-smaller budget as is; the cap never raises.
+pub(super) fn clamp_child_history_budget(mut config: Config, cap: usize) -> Config {
+    if cap > 0 {
+        config.conversation.max_history_tokens = config.conversation.max_history_tokens.min(cap);
+    }
+    config
+}
+
 /// Run a sub-agent task. Returns the final text response.
 /// Uses Box::pin to break the async recursion cycle (Agent -> AgentControl -> spawn -> Agent).
 #[allow(clippy::too_many_arguments)]
@@ -448,6 +462,10 @@ fn run_sub_agent(
     Box::pin(async move {
         use crate::agent::{Agent, AgentEvent};
 
+        // The child's compaction trigger derives from its own `Config`, so
+        // clamping the history budget on this clone caps the child without
+        // touching the parent's threshold.
+        let config = clamp_child_history_budget(config, agents_config.compaction_threshold_tokens);
         let mut agent = Agent::new_sub_agent(
             config.clone(),
             depth,
@@ -750,4 +768,88 @@ fn run_sub_agent(
             Ok(final_text)
         }
     })
+}
+
+#[cfg(test)]
+mod compaction_cap_tests {
+    use super::*;
+    use crate::conversation::effective_history_budget_for;
+
+    /// A parent on a million-token model whose configured history budget is
+    /// far above the window, so the window (minus output reservation) is the
+    /// binding threshold — the case where an uncapped child re-sends the
+    /// whole prefix.
+    fn million_window_parent() -> Config {
+        let mut config = Config::default();
+        config.llm.model = "claude-opus-5".to_string();
+        config.conversation.max_history_tokens = 2_000_000;
+        config
+    }
+
+    #[test]
+    fn child_threshold_is_min_of_inherited_and_cap() {
+        let parent = million_window_parent();
+        let inherited = effective_history_budget_for(&parent);
+        assert!(
+            inherited > 500_000,
+            "fixture must model a window-bound threshold, got {inherited}"
+        );
+
+        let cases: &[(usize, usize)] = &[
+            (0, inherited),
+            (200_000, 200_000),
+            (inherited - 1, inherited - 1),
+            (inherited, inherited),
+            (inherited + 1, inherited),
+            (usize::MAX, inherited),
+        ];
+        for (cap, expected) in cases {
+            let child = clamp_child_history_budget(parent.clone(), *cap);
+            assert_eq!(effective_history_budget_for(&child), *expected, "cap={cap}");
+        }
+    }
+
+    #[test]
+    fn default_setting_caps_child_at_200k_on_million_window_model() {
+        let parent = million_window_parent();
+        let agents = crate::config::MultiAgentConfig::default();
+        let child = clamp_child_history_budget(parent.clone(), agents.compaction_threshold_tokens);
+        assert_eq!(effective_history_budget_for(&child), 200_000);
+        // The parent's own threshold is window-bound and untouched.
+        assert!(effective_history_budget_for(&parent) > 500_000);
+    }
+
+    #[test]
+    fn cap_never_raises_a_smaller_budget() {
+        let mut parent = Config::default();
+        parent.conversation.max_history_tokens = 32_000;
+        let child = clamp_child_history_budget(parent, 200_000);
+        assert_eq!(child.conversation.max_history_tokens, 32_000);
+    }
+
+    #[test]
+    fn setting_round_trips_through_registry_and_disables_at_zero() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.agents.compaction_threshold_tokens, 200_000);
+        cfg.apply_setting("agents.compaction_threshold_tokens", "50000")
+            .expect("must apply");
+        assert_eq!(cfg.agents.compaction_threshold_tokens, 50_000);
+        let extractor = crate::settings::SETTING_REGISTRY
+            .iter()
+            .find(|(k, _)| *k == "agents.compaction_threshold_tokens")
+            .map(|(_, f)| f)
+            .expect("registered");
+        assert_eq!(extractor(&cfg), "50000");
+
+        cfg.apply_setting("agents.compaction_threshold_tokens", "0")
+            .unwrap();
+        let parent = million_window_parent();
+        let child =
+            clamp_child_history_budget(parent.clone(), cfg.agents.compaction_threshold_tokens);
+        assert_eq!(
+            effective_history_budget_for(&child),
+            effective_history_budget_for(&parent),
+            "0 must mean inherit"
+        );
+    }
 }

@@ -121,7 +121,7 @@ fn server_config() -> McpServerConfig {
         rate_limit_per_minute: 60,
         rate_limit_burst: 10,
         tools: ToolFilter {
-            include: vec![],
+            include: None,
             exclude: vec![],
             read_only: vec![],
             max: ToolFilter::DEFAULT_MAX,

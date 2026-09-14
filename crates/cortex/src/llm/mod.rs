@@ -30,6 +30,44 @@ fn short_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// One structured line per completed call — the accounting record an
+/// operator greps for when a bill or a provider ticket needs a response id.
+/// Carries counts and identifiers only; never request or response content.
+fn log_call_completed(model: &str, usage: Option<&UsageData>, elapsed: Duration) {
+    tracing::info!(
+        target: "cortex::llm::call",
+        model = %usage.map(|u| u.model.as_str()).unwrap_or(model),
+        prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0),
+        completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0),
+        cache_read_tokens = usage.map(|u| u.cached_input_tokens).unwrap_or(0),
+        cache_creation_tokens = usage.map(|u| u.cache_creation_tokens).unwrap_or(0),
+        response_id = usage.and_then(|u| u.response_id.as_deref()).unwrap_or("-"),
+        upstream = usage.and_then(|u| u.upstream.as_deref()).unwrap_or("-"),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "llm call completed"
+    );
+}
+
+/// Host portion of a request URL for log lines; the full URL when it does
+/// not parse. Never carries a query string or credential.
+fn endpoint_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.to_string())
+}
+
+/// True when a provider error is the endpoint refusing the `stream_options`
+/// request field — a 400/422 whose body names it. Only the streaming builder
+/// sends the field, so the mention can only be about our request.
+fn stream_options_rejected(err: &LlmError) -> bool {
+    matches!(err.status_code(), Some(400) | Some(422))
+        && err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("stream_options")
+}
+
 /// Whether the (provider, model) pair accepts Anthropic-style `cache_control`
 /// markers in the request body. Always true for the native Anthropic
 /// provider. True for OpenRouter only when the model is Anthropic-backed
@@ -205,6 +243,13 @@ pub struct UsageData {
     pub model: String,
     /// Provider-reported authoritative USD cost when available (OpenRouter).
     pub provider_cost_usd: Option<String>,
+    /// The provider's response id (`chatcmpl-…`, `msg_…`, `gen-…`) — the
+    /// handle a support ticket to the provider needs. `None` when the wire
+    /// carried no id; never an empty string.
+    pub response_id: Option<String>,
+    /// The upstream that actually served the call, when an aggregator names
+    /// it (OpenRouter's chunk-level `provider`). `None` on first-party wires.
+    pub upstream: Option<String>,
 }
 
 /// Events emitted during SSE streaming from the LLM.
@@ -331,6 +376,14 @@ struct UsageOptions {
 
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
+    /// Provider response id (`chatcmpl-…`, `gen-…`). Present on every chunk
+    /// of a stream; captured from the first one that carries it.
+    #[serde(default)]
+    id: Option<String>,
+    /// OpenRouter names the upstream that served the call (`"Anthropic"`,
+    /// `"DeepInfra"`, …). Absent on first-party endpoints.
+    #[serde(default)]
+    provider: Option<String>,
     choices: Option<Vec<StreamChoice>>,
     usage: Option<StreamUsage>,
 }
@@ -651,6 +704,12 @@ pub struct LlmClient {
     /// The verdict is also recorded in [`IMAGE_REJECTED_MODELS`] for the rest
     /// of the process.
     images_rejected: bool,
+    /// Set once the endpoint has rejected `stream_options` with a 400/422.
+    /// The streaming path omits the field for the rest of this client's
+    /// life; the request that learned it is re-sent once without the field
+    /// (before any delta reaches the caller, and outside the retry budget).
+    /// Atomic because the streaming path holds `&self`.
+    stream_options_unsupported: std::sync::atomic::AtomicBool,
 }
 
 /// `provider::model` pairs the wire has reported as unable to accept image
@@ -1224,6 +1283,7 @@ impl LlmClient {
             cost_event_context: None,
             aux_concurrency: None,
             images_rejected: false,
+            stream_options_unsupported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2810,7 +2870,13 @@ impl LlmClient {
         } else {
             self.effective_base_url().into_owned()
         };
-        let body = transport.build_streaming_request(&request)?;
+        let mut body = transport.build_streaming_request(&request)?;
+        if self
+            .stream_options_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            transport::strip_stream_options(&mut body);
+        }
 
         debug!(
             "Sending streaming request to {} (model: {})",
@@ -2839,7 +2905,25 @@ impl LlmClient {
             transport.protocol_name()
         );
 
-        let response = match self.send_request(&request_url, &body, cancel).await {
+        let mut sent = self.send_request(&request_url, &body, cancel).await;
+        // Compatibility resend, not a retry: the endpoint refused the
+        // `stream_options` field itself, so the same body can never succeed
+        // and a different body is a new request. It runs before any delta
+        // has been emitted and does not touch the transient retry budget.
+        if matches!(&sent, Err(e) if stream_options_rejected(e))
+            && transport::strip_stream_options(&mut body)
+        {
+            self.stream_options_unsupported
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                target: "cortex::llm",
+                host = %endpoint_host(&request_url),
+                "endpoint rejected `stream_options`; re-sending without it and omitting it \
+                 for the rest of this client's life (streamed usage may read as zero)"
+            );
+            sent = self.send_request(&request_url, &body, cancel).await;
+        }
+        let response = match sent {
             Ok(r) => {
                 lc_log!(
                     verbose,
@@ -2954,6 +3038,7 @@ impl LlmClient {
             ),
         }
         if result.is_ok() {
+            log_call_completed(&model_str, last_usage.as_ref(), lc_start.elapsed());
             self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
         }
         result
@@ -2987,6 +3072,7 @@ impl LlmClient {
             .map_err(LlmError::fatal)?;
         let request_model = self.llm_config.model.clone();
         let cancel = CancellationToken::new();
+        let started = Instant::now();
 
         let response = self.send_request(&request_url, &body, &cancel).await?;
         // The `send_request` timeout only bounds the wait for response
@@ -3009,6 +3095,7 @@ impl LlmClient {
         let parsed = transport
             .parse_chat_response(response_json, self.provider.as_str(), &request_model)
             .map_err(LlmError::fatal)?;
+        log_call_completed(&request_model, parsed.usage.as_ref(), started.elapsed());
         self.emit_cost_event_best_effort(req_id, parsed.usage.as_ref(), &request_model);
         Ok(parsed.message)
     }

@@ -723,6 +723,8 @@ fn parse_gemini_response(
             provider: provider.to_string(),
             model: model.to_string(),
             provider_cost_usd: None,
+            response_id: None,
+            upstream: None,
         }
     });
 
@@ -885,6 +887,8 @@ pub(crate) fn parse_gemini_sse_line(
             provider: provider.to_string(),
             model: model.to_string(),
             provider_cost_usd: None,
+            response_id: None,
+            upstream: None,
         };
         state.accumulator.usage = Some(usage.clone());
         events.push(StreamEvent::Usage(usage));

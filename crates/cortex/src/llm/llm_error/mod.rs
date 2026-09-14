@@ -11,7 +11,8 @@ mod retry;
 use classify::{
     body_indicates_cloudflare_block, body_indicates_context_overflow,
     body_indicates_expired_credential, body_indicates_image_unsupported,
-    body_indicates_no_allowed_providers, body_indicates_server_injected_param, body_mentions_model,
+    body_indicates_malformed_tool_call, body_indicates_no_allowed_providers,
+    body_indicates_server_injected_param, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
@@ -70,6 +71,12 @@ pub enum FailoverReason {
     /// Malformed request with no useful recovery path (400 without
     /// context/payload keywords).
     Format,
+    /// The provider rejected the *model's own* tool-call arguments — the
+    /// assistant turn being replayed carries argument JSON the endpoint
+    /// cannot parse or validate. The broken turn is identical on every slot,
+    /// so neither a retry nor a sibling provider can serve it; the agent
+    /// layer has to repair or drop the turn instead.
+    MalformedToolCall,
     /// Request body exceeds the model's context window — compaction before
     /// retry is the recovery path.
     ContextOverflow,
@@ -98,6 +105,7 @@ impl fmt::Display for FailoverReason {
             Self::Timeout => write!(f, "timeout"),
             Self::ConnectionLost => write!(f, "connection_lost"),
             Self::Format => write!(f, "format"),
+            Self::MalformedToolCall => write!(f, "malformed_tool_call"),
             Self::ContextOverflow => write!(f, "context_overflow"),
             Self::PayloadTooLarge => write!(f, "payload_too_large"),
             Self::ModelNotFound => write!(f, "model_not_found"),
@@ -246,9 +254,15 @@ impl LlmError {
     /// `ModelNotFound` DOES fall back: the failure is specific to the active
     /// (provider, model) slot, and a sibling slot with a different model can
     /// serve the turn — aborting without trying it strands users whose
-    /// primary model id went stale.
+    /// primary model id went stale. `MalformedToolCall` does NOT: the
+    /// request replays the model's own broken tool-call arguments, which are
+    /// byte-identical on every slot, so walking the chain only multiplies
+    /// the same 400.
     pub fn should_fallback(&self) -> bool {
-        !matches!(self.reason(), FailoverReason::AuthPermanent)
+        !matches!(
+            self.reason(),
+            FailoverReason::AuthPermanent | FailoverReason::MalformedToolCall
+        )
     }
 
     /// True when retrying the *current* slot is pointless — the request is
@@ -268,6 +282,8 @@ impl LlmError {
                 // only fail the same way; the recovery is the image-strip
                 // retry the client performs before it consults this.
                 | FailoverReason::ImageUnsupported
+                // The broken tool-call arguments are in the request itself.
+                | FailoverReason::MalformedToolCall
         )
     }
 }
@@ -438,6 +454,18 @@ pub(crate) fn classify_status(
             ),
             retry_after: None,
             reason: FailoverReason::Overloaded,
+            status: Some(status.as_u16()),
+        },
+        // The model's own tool-call arguments failed the provider's parse or
+        // validation. Checked ahead of the overflow refinement (a validation
+        // message can mention tokens) and kept out of the catch-all `Format`
+        // arm: `Format` walks the fallback chain, and replaying the identical
+        // broken turn on every slot just multiplies the same 400.
+        400 if body_indicates_malformed_tool_call(body) => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} returned 400 (malformed tool call): the model emitted tool-call arguments the endpoint could not parse: {safe}"
+            ),
+            reason: FailoverReason::MalformedToolCall,
             status: Some(status.as_u16()),
         },
         400 if body_indicates_context_overflow(body) => LlmError::Fatal {
@@ -1801,5 +1829,125 @@ mod tests {
         );
         assert!(err.is_retryable(), "transient 402 should be retryable");
         assert_eq!(err.reason(), FailoverReason::RateLimit);
+    }
+
+    // ── Malformed tool-call arguments ──
+
+    #[test]
+    fn malformed_tool_call_400_is_fatal_and_does_not_fall_back() {
+        // The model's own tool-call arguments failed the provider's parse.
+        // The turn is byte-identical on every fallback slot, so walking the
+        // chain (or retrying this slot) only multiplies the same 400.
+        let cases: &[(&str, Provider, &str)] = &[
+            (
+                "openai function.arguments",
+                Provider::OpenAi,
+                r#"{"error":{"message":"Invalid parameter: 'tool_calls[0].function.arguments' must be a valid JSON string.","type":"invalid_request_error","param":"tool_calls[0].function.arguments"}}"#,
+            ),
+            (
+                "anthropic tool_use.input",
+                Provider::Anthropic,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.0.tool_use.input: Input should be a valid dictionary"}}"#,
+            ),
+            (
+                "relay prose",
+                Provider::OpenRouter,
+                r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"Invalid tool call arguments: failed to parse JSON"}}}"#,
+            ),
+            (
+                "malformed spelling",
+                Provider::Groq,
+                r#"{"error":{"message":"tool call arguments are malformed: unexpected end of JSON input"}}"#,
+            ),
+            (
+                "function_call not valid json",
+                Provider::Custom,
+                r#"{"error":{"message":"function_call arguments not valid JSON"}}"#,
+            ),
+        ];
+        for (name, provider, body) in cases {
+            let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, *provider);
+            assert_eq!(
+                err.reason(),
+                FailoverReason::MalformedToolCall,
+                "{name}: reason"
+            );
+            assert!(!err.should_fallback(), "{name}: must not walk the chain");
+            assert!(!err.is_retryable(), "{name}: must not retry this slot");
+            assert!(err.is_fast_fail(), "{name}: fast-fail");
+            assert!(!err.should_compress(), "{name}: not an overflow");
+            assert!(
+                err.to_string().contains("(malformed tool call)"),
+                "{name}: marker must round-trip through classify_error_text: {err}"
+            );
+            assert_eq!(
+                classify_error_text(&err.to_string()),
+                Some(FailoverReason::MalformedToolCall),
+                "{name}: opaque-string path"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_and_unrelated_400s_keep_failing_over() {
+        // Bodies that mention tools without blaming the arguments, or blame
+        // arguments without naming a tool call, are ordinary `Format`
+        // rejections: a sibling slot may well accept the request.
+        let cases: &[(&str, &str)] = &[
+            (
+                "generic invalid request",
+                r#"{"error":{"message":"Invalid request: messages must be a non-empty array","type":"invalid_request_error"}}"#,
+            ),
+            (
+                "tool sequencing, not arguments",
+                r#"{"error":{"message":"tool_use ids were found without tool_result blocks immediately after"}}"#,
+            ),
+            (
+                "tool schema, not a call",
+                r#"{"error":{"message":"Invalid schema for function 'foo': 'tools[0].function.parameters' is not valid"}}"#,
+            ),
+            (
+                "arguments without a tool call",
+                r#"{"error":{"message":"invalid argument: temperature must be between 0 and 2"}}"#,
+            ),
+        ];
+        for (name, body) in cases {
+            let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+            assert_eq!(err.reason(), FailoverReason::Format, "{name}: reason");
+            assert!(
+                err.should_fallback(),
+                "{name}: a generic 400 still fails over"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_tool_call_beats_overflow_wording_in_the_same_body() {
+        // A validation message can mention tokens; the argument failure is
+        // the actionable cause and must not trigger reactive compaction.
+        let body = r#"{"error":{"message":"tool_calls[0].function.arguments is not valid JSON (exceeds the maximum nesting depth)"}}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::MalformedToolCall);
+        assert!(!err.should_compress());
+    }
+
+    #[test]
+    fn anthropic_stream_invalid_request_with_bad_tool_input_is_malformed_tool_call() {
+        assert_eq!(
+            classify_anthropic_stream_error(
+                "invalid_request_error",
+                "messages.3.content.0.tool_use.input: Input should be a valid dictionary"
+            ),
+            FailoverReason::MalformedToolCall
+        );
+        // The overflow branch is still reachable for ordinary prompt-length
+        // messages on the same error type.
+        assert_eq!(
+            classify_anthropic_stream_error(
+                "invalid_request_error",
+                "prompt is too long: 210000 tokens > 200000 maximum"
+            ),
+            FailoverReason::ContextOverflow
+        );
     }
 }

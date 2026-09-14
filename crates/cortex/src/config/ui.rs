@@ -9,6 +9,10 @@ fn default_theme() -> String {
     "default".to_string()
 }
 
+fn default_notify_on_complete() -> bool {
+    true
+}
+
 /// UI presentation settings. Currently just the active TUI theme name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -27,6 +31,11 @@ pub struct UiConfig {
     /// boot — the agent must always start.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Raise a terminal notification (OSC 9 / OSC 777 / bell) when a turn
+    /// that ran longer than a few seconds finishes, so a user who switched
+    /// away from the terminal hears about it. TUI-only; the daemon ignores it.
+    #[serde(default = "default_notify_on_complete")]
+    pub notify_on_complete: bool,
 }
 
 impl Default for UiConfig {
@@ -34,6 +43,7 @@ impl Default for UiConfig {
         Self {
             theme: default_theme(),
             shell_mode_enabled: default_shell_mode_enabled(),
+            notify_on_complete: default_notify_on_complete(),
         }
     }
 }
@@ -95,6 +105,24 @@ mod tests {
             .map(|(_, f)| f)
             .expect("ui.theme must be in SETTING_REGISTRY");
         assert_eq!(extractor(&cfg), "slate");
+    }
+
+    #[test]
+    fn notify_on_complete_defaults_on_and_round_trips() {
+        let mut cfg = Config::default();
+        assert!(cfg.ui.notify_on_complete, "fresh install must notify");
+        cfg.apply_setting("ui.notify_on_complete", "false")
+            .expect("must apply");
+        assert!(!cfg.ui.notify_on_complete);
+        let extractor = SETTING_REGISTRY
+            .iter()
+            .find(|(k, _)| *k == "ui.notify_on_complete")
+            .map(|(_, f)| f)
+            .expect("ui.notify_on_complete must be in SETTING_REGISTRY");
+        assert_eq!(extractor(&cfg), "false");
+        // A config written before the field existed keeps the on default.
+        let legacy: Config = toml::from_str("[ui]\ntheme = \"mono\"").unwrap();
+        assert!(legacy.ui.notify_on_complete);
     }
 
     #[test]

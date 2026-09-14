@@ -100,12 +100,50 @@ pub(super) async fn reset_credentials(
         let config = cortex::config::Config::load_from_db().await?;
         let pool = build_primary_pool(&config, &db).await?;
         require_provider_match(&pool, &req.provider)?;
-        anyhow::Ok(pool.reset_cooldowns() as u64)
+        let target = req.target.trim();
+        if target.is_empty() {
+            return anyhow::Ok(pool.reset_cooldowns() as u64);
+        }
+        anyhow::Ok(pool.reset_cooldown_for(target)? as u64)
     }
     .await
     .map_err(|e| TStatus::invalid_argument(format!("reset_credentials: {e}")))?;
     notify_runtime_config_reload(&svc.config_notify_tx).await;
     Ok(Response::new(ResetCredentialsResponse { cleared }))
+}
+
+pub(super) async fn set_credential_priority(
+    svc: &AdminSvc,
+    req: Request<SetCredentialPriorityRequest>,
+) -> Result<Response<SetCredentialPriorityResponse>, TStatus> {
+    let req = req.into_inner();
+    if req.target.trim().is_empty() {
+        return Err(TStatus::invalid_argument("target must not be empty"));
+    }
+    if req.position == 0 {
+        return Err(TStatus::invalid_argument(
+            "position must be 1 or greater (1 = tried first)",
+        ));
+    }
+    let (strategy, entries) = async {
+        let db = Database::open().await?;
+        let config = cortex::config::Config::load_from_db().await?;
+        let pool = build_primary_pool(&config, &db).await?;
+        require_provider_match(&pool, &req.provider)?;
+        let reordered = pool.set_priority(req.target.trim(), req.position as usize)?;
+        let entries = reordered
+            .iter()
+            .map(|c| pooled_to_proto(pool.provider_str(), c))
+            .collect::<Vec<_>>();
+        anyhow::Ok((config.llm.credential_strategy.to_string(), entries))
+    }
+    .await
+    .map_err(|e| TStatus::invalid_argument(format!("set_credential_priority: {e}")))?;
+    notify_runtime_config_reload(&svc.config_notify_tx).await;
+    Ok(Response::new(SetCredentialPriorityResponse {
+        strategy,
+        entries,
+    }))
 }
 
 pub(super) async fn pair_credential(

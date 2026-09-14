@@ -37,10 +37,24 @@ pub(crate) enum AuthAction {
         /// Target — numeric index, exact label, or 4+ hex id prefix.
         target: String,
     },
-    /// Clear all cooldowns. Does **not** touch permanently-removed entries.
+    /// Clear cooldowns. With no target every cooldown in the pool is
+    /// cleared; with a target only that entry is cleared and its siblings
+    /// keep their cooldowns. Does **not** touch permanently-removed entries.
     Reset {
         /// Provider name (e.g. `openrouter`).
         provider: String,
+        /// Optional target — numeric index, exact label, or 4+ hex id prefix.
+        target: Option<String>,
+    },
+    /// Move a credential to a position in the pool's priority order
+    /// (1 = tried first). Only `fill_first` and `least_used` honor priority.
+    Priority {
+        /// Provider name (e.g. `openrouter`).
+        provider: String,
+        /// Target — numeric index, exact label, or 4+ hex id prefix.
+        target: String,
+        /// New 1-based position (1 = tried first).
+        position: u32,
     },
     /// Change the selection strategy for a provider's pool.
     SetStrategy {
@@ -70,7 +84,12 @@ pub(crate) fn dispatch_auth(action: Option<AuthAction>) -> Result<()> {
             label,
         }) => run_add(&provider, &key, label.as_deref()),
         Some(AuthAction::Remove { provider, target }) => run_remove(&provider, &target),
-        Some(AuthAction::Reset { provider }) => run_reset(&provider),
+        Some(AuthAction::Reset { provider, target }) => run_reset(&provider, target.as_deref()),
+        Some(AuthAction::Priority {
+            provider,
+            target,
+            position,
+        }) => run_priority(&provider, &target, position),
         Some(AuthAction::SetStrategy { provider, strategy }) => {
             run_set_strategy(&provider, &strategy)
         }
@@ -132,15 +151,16 @@ fn run_list(provider: Option<&str>) -> Result<()> {
             continue;
         }
         println!(
-            "  {:>3}  {:8}  {:24}  {:9}  {:24}  DETAIL",
-            "#", "ID", "LABEL", "STATUS", "SOURCE"
+            "  {:>3}  {:8}  {:24}  {:>8}  {:9}  {:24}  DETAIL",
+            "#", "ID", "LABEL", "PRIORITY", "STATUS", "SOURCE"
         );
         for (idx, e) in pp.entries.iter().enumerate() {
             println!(
-                "  {:>3}  {:8}  {:24}  {:9}  {:24}  {}",
+                "  {:>3}  {:8}  {:24}  {:>8}  {:9}  {:24}  {}",
                 idx + 1,
                 truncate(&e.id, 8),
                 truncate(&e.label, 24),
+                display_priority(e),
                 e.status,
                 truncate(&format_source(e), 24),
                 detail_line(e),
@@ -194,20 +214,69 @@ fn run_remove(provider: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_reset(provider: &str) -> Result<()> {
+fn run_reset(provider: &str, target: Option<&str>) -> Result<()> {
     let cleared = tokio::runtime::Handle::current().block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
-            .reset_credentials(provider)
+            .reset_credentials(provider, target)
             .await
-            .with_context(|| format!("resetting credential cooldowns for `{provider}`"))
+            .with_context(|| match target {
+                Some(t) => format!("resetting cooldown for credential `{t}` in `{provider}`"),
+                None => format!("resetting credential cooldowns for `{provider}`"),
+            })
     })?;
-    if cleared == 0 {
-        println!("No cooldowns to clear for provider `{provider}`.");
-    } else {
-        println!("Cleared {cleared} cooldown(s) for provider `{provider}`.");
+    match (target, cleared) {
+        (Some(t), 0) => println!("Credential `{t}` in provider `{provider}` was not cooling."),
+        (Some(t), _) => println!(
+            "Cleared the cooldown for credential `{t}` in provider `{provider}`. \
+             Other credentials keep their cooldowns."
+        ),
+        (None, 0) => println!("No cooldowns to clear for provider `{provider}`."),
+        (None, n) => println!("Cleared {n} cooldown(s) for provider `{provider}`."),
     }
     Ok(())
+}
+
+fn run_priority(provider: &str, target: &str, position: u32) -> Result<()> {
+    if position == 0 {
+        anyhow::bail!("position must be 1 or greater (1 = tried first)");
+    }
+    let resp = tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .set_credential_priority(provider, target, position)
+            .await
+            .with_context(|| {
+                format!("moving credential `{target}` to position {position} in `{provider}`")
+            })
+    })?;
+    println!("Moved credential `{target}` to position {position} in provider `{provider}`.");
+    for e in &resp.entries {
+        println!("  {:>3}  {}", e.priority + 1, e.label);
+    }
+    if let Some(note) = priority_strategy_note(&resp.strategy) {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// One-line warning when the active strategy does not consult priority —
+/// the reorder still applies, so the operator must not read silence as
+/// "the pool will try this key first now".
+fn priority_strategy_note(strategy: &str) -> Option<String> {
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "round_robin" | "roundrobin" | "random" => Some(format!(
+            "Note: the current strategy `{}` ignores priority. The order is saved and \
+             takes effect if you switch to `fill_first` or `least_used`.",
+            strategy.trim()
+        )),
+        _ => None,
+    }
+}
+
+/// Priority is stored 0-based; operators see and set 1-based positions.
+fn display_priority(e: &CredentialEntry) -> String {
+    (e.priority + 1).to_string()
 }
 
 fn run_set_strategy(provider: &str, strategy: &str) -> Result<()> {
@@ -269,4 +338,42 @@ fn detail_line(e: &CredentialEntry) -> String {
 
 fn truncate(s: &str, max: usize) -> String {
     cortex::util::truncate::pad_or_truncate(s, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_note_fires_only_for_strategies_that_ignore_priority() {
+        for strategy in ["round_robin", "random", " RoundRobin "] {
+            let note = priority_strategy_note(strategy)
+                .unwrap_or_else(|| panic!("`{strategy}` must produce a note"));
+            assert!(
+                note.contains("ignores priority") && note.contains(strategy.trim()),
+                "note must name the strategy and say it ignores priority: {note}"
+            );
+        }
+        for strategy in ["fill_first", "least_used", ""] {
+            assert_eq!(
+                priority_strategy_note(strategy),
+                None,
+                "`{strategy}` honors priority — no note expected"
+            );
+        }
+    }
+
+    #[test]
+    fn list_shows_priority_as_one_based_position() {
+        let e = CredentialEntry {
+            priority: 0,
+            ..Default::default()
+        };
+        assert_eq!(display_priority(&e), "1", "priority 0 is tried first");
+        let e = CredentialEntry {
+            priority: 4,
+            ..Default::default()
+        };
+        assert_eq!(display_priority(&e), "5");
+    }
 }

@@ -178,6 +178,59 @@ pub(super) fn body_indicates_server_injected_param(body: &str) -> bool {
     matches_any(&lower, SERVER_INJECTED_PARAMS) && matches_any(&lower, PARAM_REJECTION_NEEDLES)
 }
 
+/// Phrases that name the tool-call / function-call part of a request. One of
+/// these must be present for a body to read as a malformed tool call; a bare
+/// "invalid arguments" could be about anything.
+const TOOL_CALL_NEEDLES: &[&str] = &[
+    "tool_call",
+    "tool call",
+    "tool_use",
+    "tool use",
+    "function_call",
+    "function call",
+    "function.arguments",
+];
+
+/// Phrases that name the *arguments* of that tool call as the offending part
+/// (OpenAI `function.arguments`, Anthropic `tool_use.input`).
+const TOOL_ARGUMENT_NEEDLES: &[&str] = &["argument", "input"];
+
+/// Phrases that make the mention a parse/validation failure rather than an
+/// incidental appearance ("tool_use blocks must be followed by tool_result"
+/// is a sequencing error, not broken JSON, and is deliberately excluded).
+const MALFORMED_NEEDLES: &[&str] = &[
+    "invalid",
+    "malformed",
+    "not valid",
+    "must be a valid",
+    "should be a valid",
+    "must be valid",
+    "failed to parse",
+    "could not parse",
+    "unable to parse",
+    "cannot parse",
+    "parse error",
+    "unparseable",
+    "unexpected token",
+    "unexpected end of json",
+    "not well-formed",
+];
+
+/// True when a 400 body blames the request's own tool-call arguments — the
+/// model emitted argument JSON the endpoint refuses to parse or validate.
+///
+/// All three halves must match: a tool-call needle, an argument needle, and a
+/// malformed needle. Typical shapes:
+///   OpenAI:    `Invalid parameter: 'tool_calls[0].function.arguments' must be a valid JSON string`
+///   Anthropic: `messages.3.content.0.tool_use.input: Input should be a valid dictionary`
+///   Relays:    `Invalid tool call arguments: failed to parse JSON`
+pub(super) fn body_indicates_malformed_tool_call(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    matches_any(&lower, TOOL_CALL_NEEDLES)
+        && matches_any(&lower, TOOL_ARGUMENT_NEEDLES)
+        && matches_any(&lower, MALFORMED_NEEDLES)
+}
+
 pub(super) fn body_indicates_context_overflow(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     matches_any(&lower, OVERFLOW_NEEDLES)
@@ -320,6 +373,13 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
     if lower.contains("(auth permanent)") {
         return Some(FailoverReason::AuthPermanent);
     }
+    // Marker or raw body. The body check matters because this text path also
+    // formats errors that never went through `classify_status` — without it
+    // the user gets a truncated provider blob for the one failure they have
+    // to act on themselves.
+    if lower.contains("(malformed tool call)") || body_indicates_malformed_tool_call(lower) {
+        return Some(FailoverReason::MalformedToolCall);
+    }
 
     // Disambiguation: a context-overflow phrase wins only when nothing in
     // the body signals a rate limit. Throttle bodies routinely embed token
@@ -379,7 +439,9 @@ pub(crate) fn classify_anthropic_stream_error(err_type: &str, err_msg: &str) -> 
         "request_too_large" => FailoverReason::PayloadTooLarge,
         "invalid_request_error" => {
             let lower = err_msg.to_ascii_lowercase();
-            if matches_any(&lower, OVERFLOW_NEEDLES) {
+            if body_indicates_malformed_tool_call(&lower) {
+                FailoverReason::MalformedToolCall
+            } else if matches_any(&lower, OVERFLOW_NEEDLES) {
                 FailoverReason::ContextOverflow
             } else {
                 FailoverReason::Format

@@ -1,5 +1,6 @@
 use super::models::{
-    ClaimedTask, FailedRunGroup, NewTask, ScheduledTaskRow, TaskRunRow, UpdateTask,
+    ClaimedTask, FailedRunGroup, NewTask, ScheduledTaskRow, TaskCreateOptions, TaskRunRow,
+    UpdateTask,
 };
 use super::Database;
 use anyhow::Result;
@@ -10,7 +11,7 @@ use libsql::params;
 const CONSECUTIVE_FAILURE_WINDOW: i64 = 64;
 
 /// Column list shared by all scheduled-task SELECT queries.
-const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash, continuity";
+const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash, continuity, run_now_requested, failure_delivery_channel, failure_delivery_target";
 
 /// Returns true if `pid` is alive on this host: it exists and is not a
 /// zombie. A crashed runner whose parent has not reaped it yet still owns a
@@ -61,13 +62,33 @@ fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
         monitor_mode: row.get::<Option<i64>>(26)?.unwrap_or(0) != 0,
         last_pre_run_hash: row.get::<Option<String>>(27)?,
         continuity: row.get::<Option<i64>>(28)?.unwrap_or(0) != 0,
+        run_now_requested: row.get::<Option<i64>>(29)?.unwrap_or(0) != 0,
+        failure_delivery_channel: row.get::<Option<String>>(30)?,
+        failure_delivery_target: row.get::<Option<String>>(31)?,
     })
 }
 
 impl Database {
-    /// Insert a new scheduled task into the database.
+    /// Insert a new scheduled task into the database, active and with the
+    /// default failure route. See [`Self::create_task_with_options`].
     pub async fn create_task(&self, task: &NewTask<'_>) -> Result<()> {
+        self.create_task_with_options(task, &TaskCreateOptions::default())
+            .await
+    }
+
+    /// Insert a new scheduled task with [`TaskCreateOptions`] applied in the
+    /// same write — a `paused` task is born paused, never active for a tick.
+    pub async fn create_task_with_options(
+        &self,
+        task: &NewTask<'_>,
+        options: &TaskCreateOptions<'_>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
+        let status = if options.paused {
+            crate::tasks::TASK_STATUS_PAUSED
+        } else {
+            crate::tasks::TASK_STATUS_ACTIVE
+        };
         let max_retries = task.max_retries.unwrap_or(3);
         let timeout_ms = task
             .timeout_ms
@@ -76,11 +97,79 @@ impl Database {
             .pre_run_timeout_ms
             .unwrap_or(crate::constants::PRE_RUN_DEFAULT_TIMEOUT_MS as i64);
         self.conn.execute(
-            "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs, continuity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            params!(task.id, task.name, task.prompt, task.schedule_type, task.schedule_expr, task.timezone, task.next_run, now, max_retries, timeout_ms, task.delivery_channel, task.delivery_target, task.allowed_tools, task.task_type, task.pre_run_command, task.pre_run_cwd, pre_run_timeout_ms, task.min_interval_secs, i64::from(task.continuity)),
+            "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs, continuity, failure_delivery_channel, failure_delivery_target)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?20, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?21, ?22)",
+            params!(task.id, task.name, task.prompt, task.schedule_type, task.schedule_expr, task.timezone, task.next_run, now, max_retries, timeout_ms, task.delivery_channel, task.delivery_target, task.allowed_tools, task.task_type, task.pre_run_command, task.pre_run_cwd, pre_run_timeout_ms, task.min_interval_secs, i64::from(task.continuity), status, options.failure_delivery_channel, options.failure_delivery_target),
         ).await?;
         Ok(())
+    }
+
+    /// Ask the scheduler to fire a task on its next tick without moving its
+    /// `next_run`. The claim path clears the flag; see
+    /// [`Self::claim_due_tasks`]. Returns false when no such task exists.
+    /// Returns false when no such task exists **or** it is not active.
+    ///
+    /// The active gate lives in the `UPDATE` itself so no caller can skip
+    /// it. A marker set on a paused task would sit in the row invisibly and
+    /// fire the instant someone resumed it, which is not what either lane's
+    /// operator asked for.
+    pub async fn request_task_run_now(&self, task_id: &str) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET run_now_requested = 1 \
+                 WHERE id = ?1 AND status = ?2",
+                params!(task_id, crate::tasks::TASK_STATUS_ACTIVE),
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Set (or clear, with `None`) where a task's failure notices go. Returns
+    /// false when no such task exists. See
+    /// [`ScheduledTaskRow::failure_delivery_channel`].
+    pub async fn set_task_failure_delivery(
+        &self,
+        task_id: &str,
+        channel: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET failure_delivery_channel = ?1, \
+                 failure_delivery_target = ?2 WHERE id = ?3",
+                params!(channel, target, task_id),
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Ids of every task that currently has a run in the `running` state.
+    /// Tasks with a `running` run row that started at or after
+    /// `started_at_min`.
+    ///
+    /// The floor is what makes this usable as "is this task in flight right
+    /// now". A daemon killed mid-run leaves its `running` row behind until
+    /// the nightly sweep heals it, and an unbounded query would report that
+    /// corpse as a live run — hiding the very task whose outage the caller
+    /// is looking for.
+    pub async fn tasks_with_running_runs(
+        &self,
+        started_at_min: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT task_id FROM task_runs WHERE status = ?1 AND started_at >= ?2",
+                params!(crate::tasks::RUN_STATUS_RUNNING, started_at_min),
+            )
+            .await?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            out.insert(row.get::<String>(0)?);
+        }
+        Ok(out)
     }
 
     /// Turn run-to-run continuity on or off for a task.
@@ -451,6 +540,10 @@ impl Database {
 
     /// Atomically claim all due tasks: advances next_run and inserts a 'running' task_run
     /// row in a single IMMEDIATE transaction. Returns claimed tasks with their run IDs.
+    ///
+    /// A task with `run_now_requested` set is claimed too. When it is not
+    /// otherwise due, its `next_run` is left alone — the manual run is extra,
+    /// not a reschedule — and the flag is cleared so it fires exactly once.
     pub async fn claim_due_tasks(&self, now: i64) -> Result<Vec<ClaimedTask>> {
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = self.claim_due_tasks_inner(now).await;
@@ -465,8 +558,8 @@ impl Database {
     async fn claim_due_tasks_inner(&self, now: i64) -> Result<Vec<ClaimedTask>> {
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
-             WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1 \
-             AND retry_after IS NULL \
+             WHERE status = 'active' AND retry_after IS NULL \
+             AND ((next_run IS NOT NULL AND next_run <= ?1) OR run_now_requested = 1) \
              ORDER BY next_run ASC"
         );
         let mut rows = self.conn.query(&sql, params!(now)).await?;
@@ -478,7 +571,21 @@ impl Database {
 
         let mut claimed = Vec::with_capacity(tasks.len());
         for task in tasks {
-            self.advance_next_run_in_tx(&task).await?;
+            // A manual run of a recurring task is extra, not a reschedule:
+            // advancing here is what moved a daily 09:00 task to 14:00 for
+            // good. A one-shot is still consumed by its manual run.
+            let scheduled_fire = task.next_run.is_some_and(|n| n <= now);
+            if scheduled_fire || task.schedule_type == crate::tasks::SCHEDULE_TYPE_ONCE {
+                self.advance_next_run_in_tx(&task).await?;
+            }
+            if task.run_now_requested {
+                self.conn
+                    .execute(
+                        "UPDATE scheduled_tasks SET run_now_requested = 0 WHERE id = ?1",
+                        params!(task.id.clone()),
+                    )
+                    .await?;
+            }
 
             // Atomically consume any one-shot bypass flag so a concurrent
             // second poke (or any code reading the row mid-tick) can't lose
@@ -1814,5 +1921,117 @@ mod delivery_failure_tests {
         }
         assert_eq!(db.consecutive_failed_runs("m5").await.expect("streak"), 4);
         assert_eq!(db.consecutive_failed_runs("m6").await.expect("streak"), 0);
+    }
+}
+
+#[cfg(test)]
+mod create_options_tests {
+    use super::*;
+    use crate::db::NewTask;
+
+    fn spec<'a>(id: &'a str, next_run: i64) -> NewTask<'a> {
+        NewTask {
+            id,
+            name: id,
+            prompt: "summarize",
+            schedule_type: "interval",
+            schedule_expr: "1h",
+            timezone: "UTC",
+            next_run: Some(next_run),
+            max_retries: Some(3),
+            timeout_ms: None,
+            delivery_channel: Some("telegram"),
+            delivery_target: Some("42"),
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        }
+    }
+
+    /// A task created with `paused` is paused in the same write: an overdue
+    /// `next_run` must not be claimed, and no `task_runs` row may appear.
+    /// A create-then-pause would leave a tick in which it could fire.
+    #[tokio::test]
+    async fn a_task_created_paused_is_never_claimed_until_resumed() {
+        let db = Database::test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        db.create_task_with_options(
+            &spec("born-paused", now - 3600),
+            &TaskCreateOptions {
+                paused: true,
+                ..TaskCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create paused");
+        db.create_task_with_options(
+            &spec("born-active", now - 3600),
+            &TaskCreateOptions::default(),
+        )
+        .await
+        .expect("create active");
+
+        let claimed = db.claim_due_tasks(now).await.expect("claim");
+        let ids: Vec<&str> = claimed.iter().map(|c| c.task.id.as_str()).collect();
+        assert!(
+            ids.contains(&"born-active"),
+            "an overdue active task is claimed: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"born-paused"),
+            "a task born paused must not be claimed: {ids:?}"
+        );
+        let row = db
+            .get_task_by_id("born-paused")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.status, crate::tasks::TASK_STATUS_PAUSED);
+        assert!(
+            db.task_run_history("born-paused", 10)
+                .await
+                .expect("history")
+                .is_empty(),
+            "a paused create leaves no run behind"
+        );
+
+        // Resume through the shared path and it becomes claimable.
+        db.update_task_status("born-paused", crate::tasks::TASK_STATUS_ACTIVE)
+            .await
+            .expect("resume");
+        let claimed = db.claim_due_tasks(now).await.expect("claim after resume");
+        assert!(claimed.iter().any(|c| c.task.id == "born-paused"));
+    }
+
+    /// The failure route given at create time lands in the same row.
+    #[tokio::test]
+    async fn failure_delivery_is_persisted_at_create_time() {
+        let db = Database::test_db().await;
+        db.create_task_with_options(
+            &spec("with-route", 100),
+            &TaskCreateOptions {
+                paused: false,
+                failure_delivery_channel: Some("slack"),
+                failure_delivery_target: Some("C-ops"),
+            },
+        )
+        .await
+        .expect("create");
+        let row = db
+            .get_task_by_id("with-route")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.status, crate::tasks::TASK_STATUS_ACTIVE);
+        assert_eq!(row.failure_delivery_channel.as_deref(), Some("slack"));
+        assert_eq!(row.failure_delivery_target.as_deref(), Some("C-ops"));
+        assert_eq!(
+            crate::tasks::task_failure_delivery(&row),
+            crate::tasks::FailureDelivery::Route("slack".into(), "C-ops".into())
+        );
     }
 }

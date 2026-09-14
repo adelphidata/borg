@@ -191,6 +191,8 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             provider: String::new(),
             model: String::new(),
             provider_cost_usd: None,
+            response_id: None,
+            upstream: None,
         }),
         Kind::SubAgentUpdate(s) => CoreEvent::SubAgentUpdate {
             agent_id: s.agent_id,

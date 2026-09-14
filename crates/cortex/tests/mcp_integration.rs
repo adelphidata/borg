@@ -196,7 +196,7 @@ fn server_config(read_only: Vec<&str>, per_min: u32, burst: u32) -> McpServerCon
         rate_limit_per_minute: per_min,
         rate_limit_burst: burst,
         tools: ToolFilter {
-            include: vec![],
+            include: None,
             exclude: vec![],
             read_only: read_only.into_iter().map(String::from).collect(),
             max: ToolFilter::DEFAULT_MAX,
@@ -227,7 +227,7 @@ fn server_config_tuned(
         rate_limit_per_minute: 60,
         rate_limit_burst: 10,
         tools: ToolFilter {
-            include: include.into_iter().map(String::from).collect(),
+            include: (!include.is_empty()).then(|| include.into_iter().map(String::from).collect()),
             exclude: exclude.into_iter().map(String::from).collect(),
             read_only: vec![],
             max: per_server_max,

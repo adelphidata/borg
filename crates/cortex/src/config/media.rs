@@ -1291,6 +1291,17 @@ pub struct MultiAgentConfig {
     /// it, the ordinary stale/grace countdown resumes, so a genuinely hung
     /// tool is still cancelled.
     pub tool_stale_cycles: u32,
+    /// Absolute history-token cap at which a spawned child compacts,
+    /// regardless of its model's window. `0` disables the cap and the child
+    /// inherits the parent's window-derived threshold.
+    ///
+    /// The ordinary trigger is a ratio of the model window, so on a
+    /// million-token model a child would only compact near the top and
+    /// re-send an enormous prefix on every call. Children are short-lived
+    /// workers that rarely need that much live context; a fixed ceiling keeps
+    /// per-call cost bounded. Applied as `min(inherited, cap)` — it never
+    /// raises a threshold, and the parent's own compaction is untouched.
+    pub compaction_threshold_tokens: usize,
 }
 
 impl Default for MultiAgentConfig {
@@ -1315,6 +1326,7 @@ impl Default for MultiAgentConfig {
             // 60 x 30s = 30 minutes of headroom for one tool call, on top of
             // the ordinary stale + grace window.
             tool_stale_cycles: 60,
+            compaction_threshold_tokens: 200_000,
         }
     }
 }

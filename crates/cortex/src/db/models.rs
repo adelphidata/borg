@@ -184,6 +184,19 @@ pub struct ScheduledTaskRow {
     /// Baseline hash of the last successful `pre_run_command` output that
     /// reached the LLM. `None` until the first monitored run completes.
     pub last_pre_run_hash: Option<String>,
+    /// True while a manual run-now is pending. The claim path fires the task
+    /// on its next tick and clears the flag without touching
+    /// [`Self::next_run`], so a manual run never shifts a recurring task's
+    /// cadence (a daily 09:00 task manually run at 14:00 keeps its 09:00 slot).
+    pub run_now_requested: bool,
+    /// Where a failure notice goes. `None` falls back to the success route
+    /// ([`Self::delivery_channel`]/[`Self::delivery_target`]); the literal
+    /// [`crate::tasks::FAILURE_DELIVERY_NONE`] suppresses the notice while
+    /// `last_error` and the run history still record the failure.
+    pub failure_delivery_channel: Option<String>,
+    /// Target within [`Self::failure_delivery_channel`]. `None` reuses
+    /// [`Self::delivery_target`].
+    pub failure_delivery_target: Option<String>,
 }
 
 /// Task run log row from SQLite.
@@ -688,6 +701,21 @@ pub struct NewTask<'a> {
     /// Whether each run should see what the previous runs produced. See
     /// [`ScheduledTaskRow::continuity`].
     pub continuity: bool,
+}
+
+/// Optional knobs for [`super::Database::create_task_with_options`] that a
+/// plain [`NewTask`] does not carry. Every field has a do-nothing default so
+/// `create_task` keeps its shape.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TaskCreateOptions<'a> {
+    /// Insert the row already paused, in the same write as the create. The
+    /// scheduler never claims it until it is resumed — there is no window in
+    /// which a create-then-pause could fire.
+    pub paused: bool,
+    /// See [`ScheduledTaskRow::failure_delivery_channel`].
+    pub failure_delivery_channel: Option<&'a str>,
+    /// See [`ScheduledTaskRow::failure_delivery_target`].
+    pub failure_delivery_target: Option<&'a str>,
 }
 
 /// Parameters for enqueuing a delivery.

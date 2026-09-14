@@ -21,7 +21,7 @@ use cortex::settings::SettingsResolver;
 use protocols::admin::admin_server::Admin;
 use protocols::admin::{
     AddCredentialRequest, ListCredentialsRequest, RemoveCredentialRequest, ResetCredentialsRequest,
-    SetCredentialStrategyRequest,
+    SetCredentialPriorityRequest, SetCredentialStrategyRequest,
 };
 use std::sync::Mutex;
 use tonic::{Code, Request};
@@ -312,6 +312,7 @@ async fn reset_clears_cooled_entries_only() {
         &admin,
         Request::new(ResetCredentialsRequest {
             provider: "openrouter".into(),
+            target: String::new(),
         }),
     )
     .await
@@ -325,6 +326,7 @@ async fn reset_clears_cooled_entries_only() {
         &admin,
         Request::new(ResetCredentialsRequest {
             provider: "openrouter".into(),
+            target: String::new(),
         }),
     )
     .await
@@ -459,6 +461,84 @@ async fn list_filters_by_provider() {
         none.providers.is_empty(),
         "filter for unconfigured provider returns no rows"
     );
+
+    teardown_env();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_reset_and_priority_rpcs_validate_targets_and_positions() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (admin, _tmp) = fresh_admin_with_provider("seed-env-key-7").await;
+
+    // A targeted reset of an unknown entry must fail loudly and tell the
+    // operator what *would* have resolved — never fall back to "reset all".
+    let err = Admin::reset_credentials(
+        &admin,
+        Request::new(ResetCredentialsRequest {
+            provider: "openrouter".into(),
+            target: "no-such-key".into(),
+        }),
+    )
+    .await
+    .expect_err("unknown reset target must error");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("no-such-key") && err.message().contains("valid targets"),
+        "error must name the bad target and the valid ones: {}",
+        err.message()
+    );
+
+    // A targeted reset of a healthy entry resolves and clears nothing.
+    let cleared = Admin::reset_credentials(
+        &admin,
+        Request::new(ResetCredentialsRequest {
+            provider: "openrouter".into(),
+            target: "1".into(),
+        }),
+    )
+    .await
+    .expect("targeted reset of a healthy entry")
+    .into_inner()
+    .cleared;
+    assert_eq!(cleared, 0);
+
+    // Priority: the pool has one live entry, so position 2 is out of range.
+    let err = Admin::set_credential_priority(
+        &admin,
+        Request::new(SetCredentialPriorityRequest {
+            provider: "openrouter".into(),
+            target: "1".into(),
+            position: 2,
+        }),
+    )
+    .await
+    .expect_err("position past the live count must error");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(
+        err.message().contains("between 1 and 1"),
+        "error must state the valid range: {}",
+        err.message()
+    );
+
+    let resp = Admin::set_credential_priority(
+        &admin,
+        Request::new(SetCredentialPriorityRequest {
+            provider: "openrouter".into(),
+            target: "1".into(),
+            position: 1,
+        }),
+    )
+    .await
+    .expect("in-range move")
+    .into_inner();
+    assert_eq!(
+        resp.strategy, "fill_first",
+        "response carries the active strategy so the CLI can warn on round_robin"
+    );
+    assert_eq!(resp.entries.len(), 1);
+    assert_eq!(resp.entries[0].priority, 0);
 
     teardown_env();
 }

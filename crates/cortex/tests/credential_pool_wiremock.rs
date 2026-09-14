@@ -1460,3 +1460,128 @@ async fn sole_key_install_salvages_its_only_credential_instead_of_going_dark() {
         "the recovered answer must reach the caller, got: {events:?}"
     );
 }
+
+// ── operator surface: per-credential reset + priority reorder ─────────────
+
+/// Id of the entry labelled `label`.
+fn id_of(pool: &CredentialPool, label: &str) -> String {
+    pool.entries()
+        .into_iter()
+        .find(|c| c.label == label)
+        .unwrap_or_else(|| panic!("credential `{label}` present"))
+        .id
+}
+
+#[tokio::test]
+async fn reset_cooldown_for_leaves_sibling_cooldowns_and_strikes_intact() {
+    // `borg auth reset <provider> <target>` must be surgical: clearing one
+    // benched key must not hand a still-throttled sibling back to the
+    // rotation, and must not wipe the sibling's escalation history.
+    let (pool, clock, _dir) = cooldown_pool().await;
+    let one = id_of(&pool, "one");
+    let two = id_of(&pool, "two");
+    let now = clock.now_ms();
+    for _ in 0..2 {
+        pool.report_failure(&one, FailoverReason::RateLimit, Some(429), None, None);
+        pool.report_failure(&two, FailoverReason::RateLimit, Some(429), None, None);
+    }
+    assert!(pool.entries().iter().all(|c| c.is_cooling(now)));
+
+    let cleared = pool.reset_cooldown_for("one").expect("target resolves");
+    assert_eq!(
+        cleared, 1,
+        "the benched target counts as one cleared cooldown"
+    );
+
+    let entries = pool.entries();
+    let one_e = entries.iter().find(|c| c.id == one).unwrap();
+    let two_e = entries.iter().find(|c| c.id == two).unwrap();
+    assert!(
+        one_e.is_available(now),
+        "the target must be back in rotation"
+    );
+    assert_eq!(
+        one_e.consecutive_rate_limits, 0,
+        "the target starts a fresh strike window"
+    );
+    assert!(
+        two_e.is_cooling(now),
+        "the sibling must still be on cooldown"
+    );
+    assert_eq!(
+        two_e.consecutive_rate_limits, 2,
+        "the sibling's strike count must survive a targeted reset"
+    );
+    assert_eq!(
+        pool.reset_cooldown_for(&one).expect("id resolves"),
+        0,
+        "a second reset of a healthy entry clears nothing"
+    );
+}
+
+#[tokio::test]
+async fn reset_cooldown_for_unknown_target_names_the_valid_targets() {
+    let (pool, _clock, _dir) = cooldown_pool().await;
+    let err = pool
+        .reset_cooldown_for("nope")
+        .expect_err("an unknown target must not resolve");
+    let msg = err.to_string();
+    assert!(msg.contains("nope"), "error names the bad target: {msg}");
+    assert!(
+        msg.contains("1:one") && msg.contains("2:two"),
+        "error lists index:label of every live entry: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn set_priority_moves_entry_and_fill_first_follows() {
+    // Under fill_first the lowest priority is always leased. Promoting k2 to
+    // position 1 must make it the next lease, and the pool must renumber
+    // contiguously so `borg auth list` never shows gaps.
+    let (pool, _dir) = strategy_pool(CredentialStrategy::FillFirst).await;
+    assert_eq!(sequential_lease_ids(&pool, 1), vec![id_of(&pool, "k0")]);
+
+    let reordered = pool.set_priority("k2", 1).expect("k2 resolves");
+    let labels: Vec<&str> = reordered.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["k2", "k0", "k1"]);
+    let priorities: Vec<u32> = reordered.iter().map(|c| c.priority).collect();
+    assert_eq!(
+        priorities,
+        [0, 1, 2],
+        "renumbering must be contiguous from 0"
+    );
+
+    assert_eq!(
+        sequential_lease_ids(&pool, 3),
+        vec![id_of(&pool, "k2"); 3],
+        "fill_first must now lease the promoted credential"
+    );
+    // The pool's index order follows priority so numeric targets stay honest.
+    assert_eq!(pool.resolve_target("1").unwrap().1.label, "k2");
+
+    // Demote to the back by index; the middle entries shift up.
+    let reordered = pool.set_priority("1", 3).expect("index resolves");
+    let labels: Vec<&str> = reordered.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["k0", "k1", "k2"]);
+    let priorities: Vec<u32> = reordered.iter().map(|c| c.priority).collect();
+    assert_eq!(priorities, [0, 1, 2]);
+}
+
+#[tokio::test]
+async fn set_priority_rejects_bad_targets_and_positions() {
+    let (pool, _dir) = strategy_pool(CredentialStrategy::FillFirst).await;
+    let err = pool.set_priority("k9", 1).expect_err("unknown label");
+    assert!(err.to_string().contains("valid targets"), "{err}");
+    for bad in [0usize, 4] {
+        let err = pool
+            .set_priority("k1", bad)
+            .expect_err("out-of-range position must be rejected");
+        assert!(
+            err.to_string().contains("between 1 and 3"),
+            "position {bad}: error must state the valid range: {err}"
+        );
+    }
+    // Order must be untouched after the rejected calls.
+    let labels: Vec<String> = pool.entries().into_iter().map(|c| c.label).collect();
+    assert_eq!(labels, ["k0", "k1", "k2"]);
+}
