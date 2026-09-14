@@ -270,6 +270,54 @@ export interface OnboardingState {
   onboarded: boolean;
 }
 
+export interface ModelChoice {
+  id: string;
+  label: string;
+  /** Short qualifier ("reasoning", "fast, cheap"); "" when none. */
+  note: string;
+}
+
+export interface ProviderChoice {
+  id: string;
+  label: string;
+  blurb: string;
+  /** Page that issues the key; "" for keyless providers. */
+  keyUrl: string;
+  needsApiKey: boolean;
+  /** The preselected row. */
+  recommended: boolean;
+  /** Shown before the "more providers" fold on a first run. */
+  featured: boolean;
+  /** Preselected model id from the curated catalog. */
+  defaultModel: string;
+  models: ModelChoice[];
+}
+
+export interface DetectedCredential {
+  provider: string;
+  /** env | dotenv | claude_cli | ollama | stored | keychain | pool */
+  source: string;
+  /**
+   * A variable name, file path, command path, origin or pool label —
+   * never the secret. This crosses gRPC-Web into a browser.
+   */
+  detail: string;
+}
+
+export interface SetupStatus {
+  /**
+   * A provider is chosen AND a credential (or a reachable keyless runtime)
+   * backs it. Stored rows count because `Config::load_from_db` folds them
+   * into the resolver; `pool` entries are the ones proven to send.
+   */
+  configured: boolean;
+  /** "" when unset. */
+  provider: string;
+  model: string;
+  providers: ProviderChoice[];
+  detected: DetectedCredential[];
+}
+
 export interface LogActivityRequest {
   level: string;
   source: string;
@@ -3731,6 +3779,530 @@ export const OnboardingState: MessageFns<OnboardingState> = {
   fromPartial<I extends Exact<DeepPartial<OnboardingState>, I>>(object: I): OnboardingState {
     const message = createBaseOnboardingState();
     message.onboarded = object.onboarded ?? false;
+    return message;
+  },
+};
+
+function createBaseModelChoice(): ModelChoice {
+  return { id: "", label: "", note: "" };
+}
+
+export const ModelChoice: MessageFns<ModelChoice> = {
+  encode(message: ModelChoice, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.label !== "") {
+      writer.uint32(18).string(message.label);
+    }
+    if (message.note !== "") {
+      writer.uint32(26).string(message.note);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ModelChoice {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseModelChoice();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.id = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.label = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.note = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ModelChoice {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      label: isSet(object.label) ? globalThis.String(object.label) : "",
+      note: isSet(object.note) ? globalThis.String(object.note) : "",
+    };
+  },
+
+  toJSON(message: ModelChoice): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.label !== "") {
+      obj.label = message.label;
+    }
+    if (message.note !== "") {
+      obj.note = message.note;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ModelChoice>, I>>(base?: I): ModelChoice {
+    return ModelChoice.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ModelChoice>, I>>(object: I): ModelChoice {
+    const message = createBaseModelChoice();
+    message.id = object.id ?? "";
+    message.label = object.label ?? "";
+    message.note = object.note ?? "";
+    return message;
+  },
+};
+
+function createBaseProviderChoice(): ProviderChoice {
+  return {
+    id: "",
+    label: "",
+    blurb: "",
+    keyUrl: "",
+    needsApiKey: false,
+    recommended: false,
+    featured: false,
+    defaultModel: "",
+    models: [],
+  };
+}
+
+export const ProviderChoice: MessageFns<ProviderChoice> = {
+  encode(message: ProviderChoice, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.label !== "") {
+      writer.uint32(18).string(message.label);
+    }
+    if (message.blurb !== "") {
+      writer.uint32(26).string(message.blurb);
+    }
+    if (message.keyUrl !== "") {
+      writer.uint32(34).string(message.keyUrl);
+    }
+    if (message.needsApiKey !== false) {
+      writer.uint32(40).bool(message.needsApiKey);
+    }
+    if (message.recommended !== false) {
+      writer.uint32(48).bool(message.recommended);
+    }
+    if (message.featured !== false) {
+      writer.uint32(56).bool(message.featured);
+    }
+    if (message.defaultModel !== "") {
+      writer.uint32(66).string(message.defaultModel);
+    }
+    for (const v of message.models) {
+      ModelChoice.encode(v!, writer.uint32(74).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ProviderChoice {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseProviderChoice();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.id = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.label = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.blurb = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.keyUrl = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.needsApiKey = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.recommended = reader.bool();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.featured = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.defaultModel = reader.string();
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.models.push(ModelChoice.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ProviderChoice {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      label: isSet(object.label) ? globalThis.String(object.label) : "",
+      blurb: isSet(object.blurb) ? globalThis.String(object.blurb) : "",
+      keyUrl: isSet(object.keyUrl)
+        ? globalThis.String(object.keyUrl)
+        : isSet(object.key_url)
+        ? globalThis.String(object.key_url)
+        : "",
+      needsApiKey: isSet(object.needsApiKey)
+        ? globalThis.Boolean(object.needsApiKey)
+        : isSet(object.needs_api_key)
+        ? globalThis.Boolean(object.needs_api_key)
+        : false,
+      recommended: isSet(object.recommended) ? globalThis.Boolean(object.recommended) : false,
+      featured: isSet(object.featured) ? globalThis.Boolean(object.featured) : false,
+      defaultModel: isSet(object.defaultModel)
+        ? globalThis.String(object.defaultModel)
+        : isSet(object.default_model)
+        ? globalThis.String(object.default_model)
+        : "",
+      models: globalThis.Array.isArray(object?.models)
+        ? object.models.map((e: any) => ModelChoice.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: ProviderChoice): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.label !== "") {
+      obj.label = message.label;
+    }
+    if (message.blurb !== "") {
+      obj.blurb = message.blurb;
+    }
+    if (message.keyUrl !== "") {
+      obj.keyUrl = message.keyUrl;
+    }
+    if (message.needsApiKey !== false) {
+      obj.needsApiKey = message.needsApiKey;
+    }
+    if (message.recommended !== false) {
+      obj.recommended = message.recommended;
+    }
+    if (message.featured !== false) {
+      obj.featured = message.featured;
+    }
+    if (message.defaultModel !== "") {
+      obj.defaultModel = message.defaultModel;
+    }
+    if (message.models?.length) {
+      obj.models = message.models.map((e) => ModelChoice.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ProviderChoice>, I>>(base?: I): ProviderChoice {
+    return ProviderChoice.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ProviderChoice>, I>>(object: I): ProviderChoice {
+    const message = createBaseProviderChoice();
+    message.id = object.id ?? "";
+    message.label = object.label ?? "";
+    message.blurb = object.blurb ?? "";
+    message.keyUrl = object.keyUrl ?? "";
+    message.needsApiKey = object.needsApiKey ?? false;
+    message.recommended = object.recommended ?? false;
+    message.featured = object.featured ?? false;
+    message.defaultModel = object.defaultModel ?? "";
+    message.models = object.models?.map((e) => ModelChoice.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseDetectedCredential(): DetectedCredential {
+  return { provider: "", source: "", detail: "" };
+}
+
+export const DetectedCredential: MessageFns<DetectedCredential> = {
+  encode(message: DetectedCredential, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.provider !== "") {
+      writer.uint32(10).string(message.provider);
+    }
+    if (message.source !== "") {
+      writer.uint32(18).string(message.source);
+    }
+    if (message.detail !== "") {
+      writer.uint32(26).string(message.detail);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DetectedCredential {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDetectedCredential();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.provider = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.source = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.detail = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DetectedCredential {
+    return {
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      detail: isSet(object.detail) ? globalThis.String(object.detail) : "",
+    };
+  },
+
+  toJSON(message: DetectedCredential): unknown {
+    const obj: any = {};
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.detail !== "") {
+      obj.detail = message.detail;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<DetectedCredential>, I>>(base?: I): DetectedCredential {
+    return DetectedCredential.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<DetectedCredential>, I>>(object: I): DetectedCredential {
+    const message = createBaseDetectedCredential();
+    message.provider = object.provider ?? "";
+    message.source = object.source ?? "";
+    message.detail = object.detail ?? "";
+    return message;
+  },
+};
+
+function createBaseSetupStatus(): SetupStatus {
+  return { configured: false, provider: "", model: "", providers: [], detected: [] };
+}
+
+export const SetupStatus: MessageFns<SetupStatus> = {
+  encode(message: SetupStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.configured !== false) {
+      writer.uint32(8).bool(message.configured);
+    }
+    if (message.provider !== "") {
+      writer.uint32(18).string(message.provider);
+    }
+    if (message.model !== "") {
+      writer.uint32(26).string(message.model);
+    }
+    for (const v of message.providers) {
+      ProviderChoice.encode(v!, writer.uint32(34).fork()).join();
+    }
+    for (const v of message.detected) {
+      DetectedCredential.encode(v!, writer.uint32(42).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetupStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetupStatus();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.configured = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.provider = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.model = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.providers.push(ProviderChoice.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.detected.push(DetectedCredential.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetupStatus {
+    return {
+      configured: isSet(object.configured) ? globalThis.Boolean(object.configured) : false,
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      model: isSet(object.model) ? globalThis.String(object.model) : "",
+      providers: globalThis.Array.isArray(object?.providers)
+        ? object.providers.map((e: any) => ProviderChoice.fromJSON(e))
+        : [],
+      detected: globalThis.Array.isArray(object?.detected)
+        ? object.detected.map((e: any) => DetectedCredential.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SetupStatus): unknown {
+    const obj: any = {};
+    if (message.configured !== false) {
+      obj.configured = message.configured;
+    }
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.model !== "") {
+      obj.model = message.model;
+    }
+    if (message.providers?.length) {
+      obj.providers = message.providers.map((e) => ProviderChoice.toJSON(e));
+    }
+    if (message.detected?.length) {
+      obj.detected = message.detected.map((e) => DetectedCredential.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SetupStatus>, I>>(base?: I): SetupStatus {
+    return SetupStatus.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SetupStatus>, I>>(object: I): SetupStatus {
+    const message = createBaseSetupStatus();
+    message.configured = object.configured ?? false;
+    message.provider = object.provider ?? "";
+    message.model = object.model ?? "";
+    message.providers = object.providers?.map((e) => ProviderChoice.fromPartial(e)) || [];
+    message.detected = object.detected?.map((e) => DetectedCredential.fromPartial(e)) || [];
     return message;
   },
 };
@@ -13929,6 +14501,19 @@ export const AdminDefinition = {
       requestType: Empty as typeof Empty,
       requestStream: false,
       responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Everything a first-run screen needs in one round trip: the provider
+     * catalog with curated models, what is configured now, and the credentials
+     * the daemon can already see on this machine without being told.
+     */
+    getSetupStatus: {
+      name: "GetSetupStatus",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SetupStatus as typeof SetupStatus,
       responseStream: false,
       options: {},
     },

@@ -1233,6 +1233,10 @@ rpc_wrappers! {
     admin fn get_onboarding_state() -> OnboardingState =
         get_onboarding_state("Admin.GetOnboardingState", AdminEmpty {});
 
+    /// Provider catalog, current choice, and locally detected credentials.
+    admin fn get_setup_status() -> protocols::admin::SetupStatus =
+        get_setup_status("Admin.GetSetupStatus", AdminEmpty {});
+
     /// Mark first-run onboarding complete (`onboarded=true` in settings).
     admin fn set_onboarding_complete() =
         set_onboarding_complete("Admin.SetOnboardingComplete", AdminEmpty {});

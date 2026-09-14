@@ -295,7 +295,10 @@ pub(super) async fn get_api_key(req: Request<ApiKeyRef>) -> Result<Response<ApiK
     let provider_for_lookup = provider.clone();
     let body = async {
         let db = Database::open().await?;
-        let key = format!("credentials.{provider_for_lookup}");
+        let key = format!(
+            "{}{provider_for_lookup}",
+            cortex::config::STORED_API_KEY_PREFIX
+        );
         let raw = db.get_setting(&key).await?;
         match raw {
             Some(s) if !s.is_empty() => anyhow::Ok(Some(serde_json::from_str(&s)?)),
@@ -356,7 +359,7 @@ pub(super) async fn set_api_key(req: Request<ApiKeyValue>) -> Result<Response<Em
     let provider = req.provider;
     async {
         let db = Database::open().await?;
-        let key = format!("credentials.{provider}");
+        let key = format!("{}{provider}", cortex::config::STORED_API_KEY_PREFIX);
         let json = serde_json::to_string(&routing)?;
         db.set_setting(&key, &json).await?;
         anyhow::Ok(())
@@ -373,7 +376,7 @@ pub(super) async fn unset_api_key(req: Request<ApiKeyRef>) -> Result<Response<Em
     }
     async {
         let db = Database::open().await?;
-        let key = format!("credentials.{provider}");
+        let key = format!("{}{provider}", cortex::config::STORED_API_KEY_PREFIX);
         db.delete_setting(&key).await?;
         anyhow::Ok(())
     }
@@ -382,33 +385,37 @@ pub(super) async fn unset_api_key(req: Request<ApiKeyRef>) -> Result<Response<Em
     Ok(Response::new(Empty {}))
 }
 
+/// Every `credentials.{provider}` routing row as `(provider, backend)`.
+/// Shared by `ListApiKeys` and `GetSetupStatus` so the two cannot disagree
+/// about which providers have a saved key.
+pub(super) async fn api_key_entries(db: &Database) -> anyhow::Result<Vec<ApiKeyEntry>> {
+    let rows = db.list_settings().await?;
+    let mut out = Vec::new();
+    for (key, value, _) in rows {
+        let provider = match key.strip_prefix(cortex::config::STORED_API_KEY_PREFIX) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => continue,
+        };
+        let backend = match serde_json::from_str::<ApiKeyRouting>(&value) {
+            Ok(ApiKeyRouting::Literal { .. }) => "literal",
+            Ok(ApiKeyRouting::Keychain { .. }) => "keychain",
+            Err(e) => {
+                tracing::warn!("list_api_keys: unparseable credentials.{provider} JSON: {e}");
+                "unset"
+            }
+        };
+        out.push(ApiKeyEntry {
+            provider,
+            backend: backend.to_string(),
+        });
+    }
+    Ok(out)
+}
+
 pub(super) async fn list_api_keys(_req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
     let entries = async {
         let db = Database::open().await?;
-        let rows = db.list_settings().await?;
-        let mut out = Vec::new();
-        for (key, value, _) in rows {
-            if !key.starts_with("credentials.") {
-                continue;
-            }
-            let provider = match key.strip_prefix("credentials.") {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => continue,
-            };
-            let backend = match serde_json::from_str::<ApiKeyRouting>(&value) {
-                Ok(ApiKeyRouting::Literal { .. }) => "literal",
-                Ok(ApiKeyRouting::Keychain { .. }) => "keychain",
-                Err(e) => {
-                    tracing::warn!("list_api_keys: unparseable credentials.{provider} JSON: {e}");
-                    "unset"
-                }
-            };
-            out.push(ApiKeyEntry {
-                provider,
-                backend: backend.to_string(),
-            });
-        }
-        anyhow::Ok(out)
+        api_key_entries(&db).await
     }
     .await
     .map_err(map_internal("list_api_keys"))?;

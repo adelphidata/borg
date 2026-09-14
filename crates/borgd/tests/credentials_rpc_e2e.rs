@@ -542,3 +542,68 @@ async fn targeted_reset_and_priority_rpcs_validate_targets_and_positions() {
 
     teardown_env();
 }
+
+/// A key saved through `SetApiKey` (the only write the desktop and browser
+/// onboarding make) must be the key the LLM resolver hands out. Before the
+/// `credentials.{provider}` fold in `Config::load_from_db`, this returned
+/// "no API key" and every GUI install was a dead end after setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gui_saved_literal_key_reaches_the_llm_resolver() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // SAFETY: serialized by SERIAL. Both env vars the resolver would consult
+    // (the provider's own, and the compiled default `llm.api_key_env`) are
+    // cleared so the stored row is the only place a key could come from.
+    unsafe {
+        std::env::set_var("BORG_HOME", tmp.path());
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var(TEST_ENV_VAR);
+    }
+    let db = Database::open().await.expect("seed DB open");
+    SettingsResolver::new(db)
+        .set("provider", "openai")
+        .await
+        .expect("set provider");
+    let svc = AdminSvc::new(SessionRegistry::new());
+
+    let before = cortex::config::Config::load_from_db()
+        .await
+        .expect("config")
+        .resolve_provider();
+    assert!(
+        before.is_err(),
+        "no key yet must be an error, got {before:?}"
+    );
+
+    svc.set_api_key(Request::new(protocols::admin::ApiKeyValue {
+        provider: "openai".into(),
+        body: Some(protocols::admin::api_key_value::Body::Literal(
+            "sk-gui-literal".into(),
+        )),
+    }))
+    .await
+    .expect("set_api_key");
+
+    let (provider, key) = cortex::config::Config::load_from_db()
+        .await
+        .expect("config")
+        .resolve_provider()
+        .expect("stored key resolves");
+    assert_eq!(provider, cortex::llm::provider::Provider::OpenAi);
+    assert_eq!(key, "sk-gui-literal");
+
+    // And the pool the daemon actually sends with is built from it.
+    let listed = svc
+        .list_credentials(Request::new(ListCredentialsRequest {
+            provider: "openai".into(),
+        }))
+        .await
+        .expect("list")
+        .into_inner();
+    let pooled = listed.providers.iter().flat_map(|p| &p.entries).count();
+    assert_eq!(pooled, 1, "one pooled key from the stored row: {listed:?}");
+
+    teardown_env();
+}

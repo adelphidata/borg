@@ -386,14 +386,9 @@ pub(super) async fn notify_runtime_config_reload(
     }
 }
 
-/// Routing JSON persisted at `credentials.{provider}`. Tagged enum mirrors
-/// the discriminator the cli expects when parsing the same blob back.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub(super) enum ApiKeyRouting {
-    Literal { value: String },
-    Keychain { service: String, account: String },
-}
+/// Routing JSON persisted at `credentials.{provider}`. Lives in cortex so the
+/// LLM config resolves the same row the daemon writes.
+pub(super) use cortex::security::secrets_resolve::ApiKeyRouting;
 
 pub(super) async fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
     let db = Database::open().await?;

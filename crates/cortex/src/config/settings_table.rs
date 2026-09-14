@@ -826,7 +826,7 @@ define_settings! {
         };
         "llm.api_key" => |c| {
             c.llm.api_key.as_ref()
-                .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+                .map(crate::security::secrets_resolve::SecretRef::display_value)
                 .unwrap_or_default()
         };
         "sandbox.mode" => |c| c.sandbox.mode.clone();
@@ -839,19 +839,19 @@ define_settings! {
         // which one was active, nor revert to native with `unset`.
         "memory.provider" => |c| format!("{}", c.memory.provider);
         "memory.mem0.api_key" => |c| c.memory.mem0.api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "memory.honcho.api_key" => |c| c.memory.honcho.api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "memory.openviking.api_key" => |c| c.memory.openviking.api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "memory.letta.api_key" => |c| c.memory.letta.api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "memory.zep.api_key" => |c| c.memory.zep.api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "memory.extra_paths" => |c| c.memory.extra_paths.join(", ");
         "conversation.collaboration_mode" => |c| format!("{}", c.conversation.collaboration_mode);
@@ -860,13 +860,13 @@ define_settings! {
         "browser.engine" => |c| format!("{}", c.browser.engine);
         // browser.*_api_key: round-trip the SecretRef as JSON, empty when unset.
         "browser.browserbase_api_key" => |c| c.browser.browserbase_api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "browser.browser_use_api_key" => |c| c.browser.browser_use_api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "browser.firecrawl_api_key" => |c| c.browser.firecrawl_api_key.as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
         "tts.default_format" => |c| c.tts.default_format.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);

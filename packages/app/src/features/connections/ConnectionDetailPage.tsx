@@ -14,8 +14,8 @@ import {
 import type { BorgError } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
 import { useMutation } from "../../lib/useDaemon";
+import type { admin } from "@borg/client";
 import {
-  PROVIDER_CATALOG,
   badgeOf,
   providerLabel,
   useConnections,
@@ -37,11 +37,13 @@ function ErrorLine({ error }: { error: BorgError | undefined }) {
 function ProviderDetail({
   conn,
   configured,
+  catalog,
   refetch,
 }: {
   conn: ProviderConnection | undefined;
   /** Provider name from the route; used when no credentials exist yet. */
   configured: string;
+  catalog: admin.ProviderChoice[];
   refetch: () => void;
 }) {
   const name = conn?.name ?? configured;
@@ -66,7 +68,7 @@ function ProviderDetail({
   const entries = (conn?.entries ?? []).filter((e) => e.status !== "removed");
   const saved = conn?.apiKeyBackend;
   const isConnected = entries.length > 0 || saved !== undefined;
-  const blurb = PROVIDER_CATALOG.find((p) => p.name === name)?.blurb;
+  const blurb = catalog.find((p) => p.id === name)?.blurb;
 
   const submitKey = () => {
     const key = draftKey.trim();
@@ -82,7 +84,7 @@ function ProviderDetail({
         </Badge>
         <div className="min-w-0 flex-1">
           <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
-            {providerLabel(name)}
+            {providerLabel(catalog, name)}
           </div>
           <div className="mt-1 text-[12.5px] leading-[1.4] text-ink3">
             {isConnected ? "Connected" : (blurb ?? "Not connected yet.")}
@@ -289,7 +291,13 @@ export function ConnectionDetailPage() {
   const scroll = scrollCol(isMobile, "px-[38px] py-[34px]");
 
   return (
-    <PageChrome title={kind === "provider" ? providerLabel(name) : name}>
+    <PageChrome
+      title={
+        kind === "provider" && connections.state === "ready"
+          ? providerLabel(connections.data.catalog, name)
+          : name
+      }
+    >
       <div className={scroll}>
         <div className={DETAIL_COL}>
           <BackLink to="/connections" label="Connections" />
@@ -298,7 +306,12 @@ export function ConnectionDetailPage() {
               if (kind === "provider") {
                 const conn = data.providers.find((p) => p.name === name);
                 return (
-                  <ProviderDetail conn={conn} configured={name} refetch={connections.refetch} />
+                  <ProviderDetail
+                    conn={conn}
+                    configured={name}
+                    catalog={data.catalog}
+                    refetch={connections.refetch}
+                  />
                 );
               }
               const channel = data.channels.find((c) => c.name === name);

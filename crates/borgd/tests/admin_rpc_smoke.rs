@@ -31,7 +31,7 @@ use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
     ListSessionsRequest, ScheduledTaskCreate, ScheduledTaskUpdate, SessionArchiveMutation,
-    SessionRef, SessionTitleMutation,
+    SessionRef, SessionTitleMutation, SettingMutation,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
@@ -1326,5 +1326,133 @@ async fn turn_activity_is_reported_by_both_the_listing_and_the_feed() {
     assert!(
         !turn_active_in_listing(&mut admin).await,
         "a settled session must drop out of the working set"
+    );
+}
+
+/// The first-run screen branches on `GetSetupStatus`. Each stage below is a
+/// state a real install passes through; a wrong answer at any of them is a
+/// wizard that asks for a key it already has, or skips one it lacks.
+#[tokio::test]
+async fn setup_status_reflects_provider_credentials_and_catalog() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+    async fn status(admin: &mut AdminClient<Channel>) -> protocols::admin::SetupStatus {
+        admin
+            .get_setup_status(AdminEmpty {})
+            .await
+            .expect("get_setup_status")
+            .into_inner()
+    }
+
+    // Fresh install: nothing chosen, but a full catalog to choose from.
+    let fresh = status(&mut admin).await;
+    assert!(!fresh.configured, "fresh DB must not report configured");
+    assert_eq!(fresh.provider, "");
+    let openrouter = fresh
+        .providers
+        .iter()
+        .find(|p| p.id == "openrouter")
+        .expect("openrouter in catalog");
+    assert!(openrouter.recommended && openrouter.needs_api_key);
+    assert_eq!(openrouter.key_url, "https://openrouter.ai/keys");
+    assert_eq!(
+        Some(openrouter.default_model.as_str()),
+        cortex::llm::model_catalog::embedded_manifest()
+            .default_model("openrouter")
+            .as_deref()
+    );
+    let ollama = fresh
+        .providers
+        .iter()
+        .find(|p| p.id == "ollama")
+        .expect("ollama in catalog");
+    assert!(!ollama.needs_api_key && ollama.key_url.is_empty());
+    for p in &fresh.providers {
+        assert!(!p.models.is_empty(), "{} offers no models", p.id);
+    }
+
+    // A key in ~/.borg/.env is found, named by file, never by value.
+    std::fs::write(
+        h._tmp.path().join(".env"),
+        "ANTHROPIC_API_KEY=\"sk-ant-dotenv-secret\"\n",
+    )
+    .expect("write .env");
+    let found = status(&mut admin).await;
+    let dotenv = found
+        .detected
+        .iter()
+        .find(|d| d.provider == "anthropic" && d.source == "dotenv")
+        .expect("dotenv detection for anthropic");
+    assert!(
+        dotenv.detail.ends_with(".env"),
+        "detail names the file: {dotenv:?}"
+    );
+    for d in &found.detected {
+        assert!(!d.detail.contains("sk-ant"), "secret leaked: {d:?}");
+    }
+    assert!(!found.configured, "a found key is not a chosen provider");
+
+    // Choosing that provider makes the install configured.
+    admin
+        .set_setting(SettingMutation {
+            key: "provider".into(),
+            value: "anthropic".into(),
+        })
+        .await
+        .expect("set provider");
+    let chosen = status(&mut admin).await;
+    assert_eq!(chosen.provider, "anthropic");
+    assert!(chosen.configured, "provider with a .env key is configured");
+
+    // A key saved through the GUI counts too, and the resolver sees it.
+    admin
+        .set_api_key(ApiKeyValue {
+            provider: "openai".into(),
+            body: Some(ApiKeyBody::Literal("sk-openai-stored".into())),
+        })
+        .await
+        .expect("set_api_key");
+    admin
+        .set_setting(SettingMutation {
+            key: "provider".into(),
+            value: "openai".into(),
+        })
+        .await
+        .expect("set provider");
+    let stored = status(&mut admin).await;
+    assert!(
+        stored
+            .detected
+            .iter()
+            .any(|d| d.provider == "openai" && d.source == "stored"),
+        "stored key not detected: {:?}",
+        stored.detected
+    );
+    assert!(stored.configured);
+
+    // A keyless provider needs its runtime, not a key lying around.
+    admin
+        .set_setting(SettingMutation {
+            key: "llm.base_url".into(),
+            value: "http://127.0.0.1:1".into(),
+        })
+        .await
+        .expect("set base_url");
+    admin
+        .set_setting(SettingMutation {
+            key: "provider".into(),
+            value: "ollama".into(),
+        })
+        .await
+        .expect("set provider");
+    let ollama = status(&mut admin).await;
+    assert!(
+        !ollama.configured,
+        "ollama on a closed port must not be configured: {:?}",
+        ollama.detected
     );
 }

@@ -738,3 +738,92 @@ fn provider_setting_key_roundtrips_through_apply_setting() {
         );
     }
 }
+
+/// The GUI onboarding stores a key only as a `credentials.{provider}` row.
+/// If the loader stops folding that row into `llm.api_key`, a fresh desktop
+/// install finishes setup with no key to send — each row below is one way
+/// that fold can go wrong.
+#[test]
+fn stored_api_key_row_feeds_the_llm_resolver() {
+    let literal = r#"{"type":"literal","value":"sk-stored"}"#.to_string();
+    let keychain = r#"{"type":"keychain","service":"borg-openai","account":"borg"}"#.to_string();
+    type Case = (
+        &'static str,
+        Option<&'static str>,
+        Option<SecretRef>,
+        Vec<(String, String)>,
+        Option<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "literal row for the configured provider resolves",
+            Some("openai"),
+            None,
+            vec![("openai".into(), literal.clone())],
+            Some("sk-stored"),
+        ),
+        (
+            "provider match is case-insensitive",
+            Some("OpenAI"),
+            None,
+            vec![("openai".into(), literal.clone())],
+            Some("sk-stored"),
+        ),
+        (
+            "another provider's row is not borrowed",
+            Some("anthropic"),
+            None,
+            vec![("openai".into(), literal.clone())],
+            None,
+        ),
+        (
+            "explicit llm.api_key wins over the stored row",
+            Some("openai"),
+            Some(SecretRef::Literal {
+                value: "sk-explicit".into(),
+            }),
+            vec![("openai".into(), literal.clone())],
+            Some("sk-explicit"),
+        ),
+        (
+            "no provider means nothing to fold",
+            None,
+            None,
+            vec![("openai".into(), literal.clone())],
+            None,
+        ),
+        (
+            "malformed JSON is skipped, not adopted",
+            Some("openai"),
+            None,
+            vec![("openai".into(), "{not json".into())],
+            None,
+        ),
+    ];
+    for (name, provider, explicit, rows, want) in cases {
+        let mut cfg = Config::default();
+        cfg.llm.provider = provider.map(str::to_string);
+        cfg.llm.api_key = explicit;
+        cfg.adopt_stored_api_key(&rows);
+        let got = cfg
+            .llm
+            .api_key
+            .as_ref()
+            .map(|r| r.resolve().expect("resolves"));
+        assert_eq!(got.as_deref(), want, "{name}");
+    }
+
+    // A keychain row becomes keychain routing, not a literal.
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".into());
+    cfg.adopt_stored_api_key(&[("openai".into(), keychain)]);
+    match cfg.llm.api_key {
+        Some(SecretRef::Keychain { service, account }) => {
+            assert_eq!(
+                (service.as_str(), account.as_str()),
+                ("borg-openai", "borg")
+            );
+        }
+        other => panic!("expected keychain routing, got {other:?}"),
+    }
+}

@@ -14,6 +14,7 @@ import {
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings, type DaemonSetting } from "../../lib/settings";
 import { routes } from "../../routes";
+import { modelLabel, providerLabel, useSetupStatus } from "../onboarding/useSetupStatus";
 import { APPEARANCE_LABELS, advancedGroupOf, basicSettings } from "./catalog";
 
 /** Registry keys already surfaced by the curated list above the fold. */
@@ -45,6 +46,10 @@ export function SettingsPage() {
   const { settings } = useSettings();
   const { preference } = useTheme();
   const [advOpen, setAdvOpen] = useState(false);
+  // Provider and model read as their display names; the raw id is the
+  // honest fallback while the catalog is still on its way.
+  const setup = useSetupStatus();
+  const catalog = setup.state === "ready" ? setup.data.providers : [];
 
   // Grouping walks the whole registry (~500 rows) and sorts twice. Doing that
   // in the render body re-ran it on every keystroke elsewhere on the page.
@@ -86,8 +91,17 @@ export function SettingsPage() {
             {(map) => (
               <>
                 {basicSettings.map((s) => {
+                  const raw = s.key === null ? undefined : map.get(s.key)?.value;
                   const value =
-                    s.key === null ? APPEARANCE_LABELS[preference] : (map.get(s.key)?.value ?? "—");
+                    s.key === null
+                      ? APPEARANCE_LABELS[preference]
+                      : raw === undefined
+                        ? "—"
+                        : s.catalog === "provider"
+                          ? providerLabel(catalog, raw)
+                          : s.catalog === "model"
+                            ? modelLabel(catalog, map.get("provider")?.value ?? "", raw)
+                            : raw;
                   return (
                     <div
                       key={s.id}

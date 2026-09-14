@@ -37,6 +37,12 @@ export interface BasicSetting {
   desc: string;
   /** Enumerable choices. Absent = free-text value. */
   options?: SettingOption[];
+  /**
+   * Choices come from the daemon's catalog (`Admin.GetSetupStatus`) rather
+   * than a list here: the providers, or the models of the current provider.
+   * Free text stays reachable behind "Something else…".
+   */
+  catalog?: "provider" | "model";
 }
 
 /**
@@ -60,12 +66,14 @@ export const basicSettings: BasicSetting[] = [
     key: "provider",
     name: "Provider",
     desc: "Which service Borg's brain runs on",
+    catalog: "provider",
   },
   {
     id: "model",
     key: "model",
     name: "Model",
     desc: "Which brain Borg thinks with",
+    catalog: "model",
   },
   {
     id: "thinking",

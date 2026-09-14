@@ -6,11 +6,43 @@ import { Pill, STORAGE_KEYS } from "@borg/ui";
  *
  * The desktop app needs no equivalent: it reaches borgd over the unix socket,
  * which the filesystem already guards. A browser has no such proof, so it
- * presents a client token (`borg client-token issue <label>`) that the gateway
- * checks on every gRPC-Web call.
+ * presents a client token that the gateway checks on every gRPC-Web call.
+ *
+ * `borg web` issues a token and opens `/ui/#/?token=…`; the fragment never
+ * reaches the gateway, so the token is not in any access log. It is taken
+ * from the address bar exactly once, stored, and stripped. Pasting a token
+ * from `borg client-token issue <label>` remains the fallback.
  */
+
+/** The token carried in the hash by `borg web`, if any; strips it once read. */
+export function takeTokenFromHash(location: Location, history: History): string | null {
+  const query = location.hash.split("?")[1];
+  if (!query) return null;
+  const params = new URLSearchParams(query);
+  const token = params.get("token")?.trim();
+  if (!token) return null;
+  params.delete("token");
+  const rest = params.toString();
+  const path = location.hash.split("?")[0] || "#/";
+  history.replaceState(
+    history.state,
+    "",
+    `${location.pathname}${location.search}${path}${rest ? `?${rest}` : ""}`,
+  );
+  return token;
+}
+
+function initialToken(): string | null {
+  const fromHash = takeTokenFromHash(window.location, window.history);
+  if (fromHash) {
+    localStorage.setItem(STORAGE_KEYS.token, fromHash);
+    return fromHash;
+  }
+  return localStorage.getItem(STORAGE_KEYS.token);
+}
+
 export function TokenGate({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState(() => localStorage.getItem(STORAGE_KEYS.token));
+  const [token, setToken] = useState(initialToken);
   const [draft, setDraft] = useState("");
 
   if (token) return <>{children}</>;
@@ -30,8 +62,8 @@ export function TokenGate({ children }: { children: ReactNode }) {
             Sign in to Borg.
           </h1>
           <p className="mt-2 text-[13.5px] leading-[1.5] text-ink2">
-            Paste a client token. Create one with{" "}
-            <code className="text-ink">borg client-token issue web</code>.
+            Run <code className="text-ink">borg web</code> to open this page signed in, or paste a
+            token from <code className="text-ink">borg client-token issue web</code>.
           </p>
         </div>
 

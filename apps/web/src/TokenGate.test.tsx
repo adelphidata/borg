@@ -10,6 +10,7 @@ const box = () => screen.getByPlaceholderText("Client token");
 
 beforeEach(() => {
   localStorage.clear();
+  window.location.hash = "";
 });
 
 describe("TokenGate", () => {
@@ -20,16 +21,41 @@ describe("TokenGate", () => {
     expect(screen.getByText("Sign in to Borg.")).toBeTruthy();
   });
 
-  it("names the command that produces a token", () => {
+  it("names the commands that get someone in", () => {
     // This is the only setup step the web surface has; a gate that does not say
     // where the token comes from is a dead end.
     renderGate();
     const command = screen.getByText("borg client-token issue web");
-    // The sentence must stay readable — "with" and the command are separate
-    // JSX children, so the space between them is easy to lose.
+    // The sentence must stay readable — the commands are separate JSX
+    // children, so the spaces around them are easy to lose.
     expect(command.parentElement?.textContent).toBe(
-      "Paste a client token. Create one with borg client-token issue web.",
+      "Run borg web to open this page signed in, or paste a token from borg client-token issue web.",
     );
+  });
+
+  it("takes the token borg web put in the hash, stores it, and strips it", () => {
+    // The token must leave the address bar: a shared screenshot or a
+    // bookmark would otherwise carry a live credential.
+    window.location.hash = "#/?token=tok_from_cli";
+    renderGate();
+    expect(screen.getByText("the app")).toBeTruthy();
+    expect(localStorage.getItem(STORAGE_KEYS.token)).toBe("tok_from_cli");
+    expect(window.location.hash).toBe("#/");
+  });
+
+  it("keeps the rest of the route when it strips the token", () => {
+    window.location.hash = "#/settings?token=tok_x&tab=advanced";
+    renderGate();
+    expect(window.location.hash).toBe("#/settings?tab=advanced");
+    expect(localStorage.getItem(STORAGE_KEYS.token)).toBe("tok_x");
+  });
+
+  it("ignores a hash without a token, and a blank one", () => {
+    window.location.hash = "#/sessions?token=";
+    renderGate();
+    expect(screen.queryByText("the app")).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEYS.token)).toBeNull();
+    expect(window.location.hash).toBe("#/sessions?token=");
   });
 
   it("starts with an empty box", () => {

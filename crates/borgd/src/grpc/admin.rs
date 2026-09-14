@@ -1023,6 +1023,13 @@ impl Admin for AdminSvc {
         Ok(Response::new(OnboardingState { onboarded }))
     }
 
+    async fn get_setup_status(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<protocols::admin::SetupStatus>, TStatus> {
+        setup::get_setup_status(req).await
+    }
+
     async fn set_onboarding_complete(
         &self,
         _req: Request<Empty>,
@@ -1052,11 +1059,19 @@ impl Admin for AdminSvc {
     }
 
     async fn set_api_key(&self, req: Request<ApiKeyValue>) -> Result<Response<Empty>, TStatus> {
-        credentials::set_api_key(req).await
+        let res = credentials::set_api_key(req).await?;
+        // A `credentials.{provider}` row feeds `llm.api_key`, so a saved key
+        // is a config change like any other. Without this the running agent
+        // keeps the old credential until something else reloads it.
+        notify_runtime_config_reload(&self.config_notify_tx).await;
+        Ok(res)
     }
 
     async fn unset_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<Empty>, TStatus> {
-        credentials::unset_api_key(req).await
+        let res = credentials::unset_api_key(req).await?;
+        // "Forget" has to stop the daemon sending that key now, not later.
+        notify_runtime_config_reload(&self.config_notify_tx).await;
+        Ok(res)
     }
 
     async fn list_api_keys(&self, req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
@@ -1611,6 +1626,7 @@ mod goals;
 mod handoff;
 mod helpers;
 mod scheduled_tasks;
+mod setup;
 use helpers::{
     approved_sender_row_to_proto, build_primary_pool, credential_pool_to_proto, goal_to_detail,
     load_ambient_status, map_internal, map_invalid_arg, notify_runtime_config_reload,

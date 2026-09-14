@@ -275,6 +275,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<CronAction>,
     },
+    /// Open the browser UI, already signed in
+    Web {
+        /// Print the sign-in URL instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Manage bearer tokens for OpenAI-compat HTTP and MCP HTTP surfaces
     #[command(name = "client-token")]
     ClientToken {
@@ -852,6 +858,7 @@ async fn dispatch_command(cli: Cli, worktree_dir: Option<std::path::PathBuf>) ->
         Some(Commands::Update(args)) => {
             commands::misc::run_update(args.prerelease, args.check).await?
         }
+        Some(Commands::Web { no_open }) => commands::web::run_web(no_open).await?,
         Some(Commands::ClientToken { action }) => {
             commands::client_token::dispatch_client_token(action).await?
         }

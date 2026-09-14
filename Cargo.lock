@@ -855,6 +855,7 @@ dependencies = [
  "clap",
  "cortex",
  "dirs",
+ "dotenvy",
  "fs2",
  "futures",
  "futures-util",

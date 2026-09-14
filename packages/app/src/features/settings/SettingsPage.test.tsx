@@ -4,6 +4,7 @@ import { ThemeProvider } from "@borg/ui";
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp } from "../../test/harness";
+import { setupStatus } from "../../test/setupStatus";
 import { SettingsProvider } from "../../lib/settings";
 import { SettingsPage } from "./SettingsPage";
 import { advancedGroupOf, findBasicSetting } from "./catalog";
@@ -30,7 +31,9 @@ const REGISTRY = [
   entry("standalone", "yes"),
 ];
 
-function mount(daemon = fakeDaemon({ GetSettings: { entries: REGISTRY } })) {
+const DAEMON = { GetSettings: { entries: REGISTRY }, GetSetupStatus: setupStatus() };
+
+function mount(daemon = fakeDaemon(DAEMON)) {
   return renderApp(<SettingsPage />, {
     daemon,
     wrapper: (children) => (
@@ -63,19 +66,35 @@ describe("findBasicSetting", () => {
 });
 
 describe("SettingsPage", () => {
-  it("shows each curated setting's current value", async () => {
+  it("shows each curated setting's current value, named as the catalog names it", async () => {
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
-    expect(screen.getByText("anthropic")).toBeTruthy();
-    expect(screen.getByText("claude-opus-5")).toBeTruthy();
+    // Provider and model ids read as their display names once the catalog
+    // answers; "anthropic" and "claude-opus-5" are what the daemon stores.
+    await waitFor(() => expect(screen.getByText("Anthropic")).toBeTruthy());
+    expect(screen.getByText("Opus 5")).toBeTruthy();
+    expect(screen.queryByText("claude-opus-5")).toBeNull();
     expect(screen.getByText("medium")).toBeTruthy();
+  });
+
+  it("falls back to the raw id when the catalog cannot answer", async () => {
+    const daemon = fakeDaemon({
+      GetSettings: { entries: REGISTRY },
+      GetSetupStatus: new BorgError(GrpcStatus.Unavailable, "daemon down"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("anthropic")).toBeTruthy());
+    expect(screen.getByText("claude-opus-5")).toBeTruthy();
   });
 
   it("shows a dash for a curated setting the daemon does not report", async () => {
     // Better an honest gap than a value invented by the page.
-    const daemon = fakeDaemon({ GetSettings: { entries: [entry("provider", "anthropic")] } });
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSettings: { entries: [entry("provider", "anthropic")] },
+    });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("anthropic")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Anthropic")).toBeTruthy());
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
 

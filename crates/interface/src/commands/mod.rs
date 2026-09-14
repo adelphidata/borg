@@ -26,6 +26,7 @@ pub(crate) mod tasks;
 pub(crate) mod tunnel;
 pub(crate) mod update_args;
 pub(crate) mod wasm_plugin;
+pub(crate) mod web;
 pub(crate) mod webhook;
 pub(crate) mod worktree;
 

@@ -107,7 +107,33 @@ pub enum SecretRef {
     /// Look up a credential in the OS keychain (macOS Keychain / Linux secret-tool).
     #[serde(rename = "keychain")]
     Keychain { service: String, account: String },
+
+    /// The secret itself, stored in the settings table. This is what the
+    /// desktop and web onboarding write when no keychain is reachable from
+    /// the daemon; the row already sits behind the data dir's 0700 perms.
+    #[serde(rename = "literal")]
+    Literal { value: String },
 }
+
+impl SecretRef {
+    /// What `settings list`, `borg settings get` and `Admin.GetSettings` may
+    /// show for a field holding a secret reference.
+    ///
+    /// Every other variant only names where the secret lives, so its JSON is
+    /// safe to print and round-trips back through `set`. [`SecretRef::Literal`]
+    /// carries the credential itself, and `GetSettings` reaches a browser, so
+    /// it is reported as set and nothing more.
+    pub fn display_value(&self) -> String {
+        match self {
+            SecretRef::Literal { .. } => LITERAL_PLACEHOLDER.to_string(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        }
+    }
+}
+
+/// Stands in for a stored key wherever a settings value is displayed. Not
+/// valid JSON for a `SecretRef`, so it cannot be written back by accident.
+pub const LITERAL_PLACEHOLDER: &str = "(set)";
 
 impl std::fmt::Debug for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -120,6 +146,38 @@ impl std::fmt::Debug for SecretRef {
             }
             SecretRef::Keychain { service, account } => {
                 write!(f, "SecretRef::Keychain({service}/{account})")
+            }
+            SecretRef::Literal { .. } => write!(f, "SecretRef::Literal(<redacted>)"),
+        }
+    }
+}
+
+/// Routing JSON persisted at `credentials.{provider}` by `Admin.SetApiKey`.
+///
+/// Tagged with `type` (not `source` like [`SecretRef`]) because the cli and
+/// the daemon already agree on this discriminator; the conversion below is
+/// how the LLM config resolves the row without a second parser.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ApiKeyRouting {
+    /// The key itself.
+    Literal { value: String },
+    /// Where in the OS keychain the key lives.
+    Keychain { service: String, account: String },
+}
+
+impl std::fmt::Debug for ApiKeyRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        SecretRef::from(self.clone()).fmt(f)
+    }
+}
+
+impl From<ApiKeyRouting> for SecretRef {
+    fn from(routing: ApiKeyRouting) -> Self {
+        match routing {
+            ApiKeyRouting::Literal { value } => SecretRef::Literal { value },
+            ApiKeyRouting::Keychain { service, account } => {
+                SecretRef::Keychain { service, account }
             }
         }
     }
@@ -167,6 +225,8 @@ impl SecretRef {
     /// Resolve the secret reference to its plaintext value.
     pub fn resolve(&self) -> Result<String> {
         match self {
+            SecretRef::Literal { value } => Ok(value.clone()),
+
             SecretRef::Env { var } => {
                 std::env::var(var).with_context(|| format!("Environment variable {var} not set"))
             }
@@ -278,6 +338,86 @@ pub fn resolve_first(refs: &[SecretRef]) -> Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_secret_resolves_to_itself_but_never_prints() {
+        let sr = SecretRef::Literal {
+            value: "sk-live-DO-NOT-LEAK".into(),
+        };
+        assert_eq!(
+            sr.resolve().expect("literal resolves"),
+            "sk-live-DO-NOT-LEAK"
+        );
+        let dbg = format!("{sr:?}");
+        assert!(
+            !dbg.contains("sk-live"),
+            "literal leaked through Debug: {dbg}"
+        );
+
+        // The serde tag is what the settings table stores; a renamed tag
+        // would orphan every key already written.
+        let json = serde_json::to_string(&sr).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"source":"literal","value":"sk-live-DO-NOT-LEAK"}"#
+        );
+        let back: SecretRef = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.resolve().expect("round trip"), "sk-live-DO-NOT-LEAK");
+    }
+
+    /// `settings list` and `Admin.GetSettings` render whatever the extractor
+    /// returns, and `GetSettings` answers a browser. A literal key must not
+    /// travel that path; every other variant only names a location.
+    #[test]
+    fn only_a_location_is_ever_displayed_for_a_secret() {
+        let literal = SecretRef::Literal {
+            value: "sk-live-DO-NOT-LEAK".into(),
+        };
+        assert_eq!(literal.display_value(), LITERAL_PLACEHOLDER);
+        assert!(
+            serde_json::from_str::<SecretRef>(&literal.display_value()).is_err(),
+            "the placeholder must not deserialize back into a key"
+        );
+
+        let env = SecretRef::Env {
+            var: "OPENAI_API_KEY".into(),
+        };
+        assert_eq!(
+            env.display_value(),
+            r#"{"source":"env","var":"OPENAI_API_KEY"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SecretRef>(&env.display_value())
+                .expect("still round-trips")
+                .display_value(),
+            env.display_value()
+        );
+    }
+
+    #[test]
+    fn api_key_routing_converts_to_the_matching_secret_ref() {
+        // The daemon writes routing with a `type` tag; the config must read
+        // exactly that shape or the fold in `Config::load_from_db` is dead.
+        let literal: ApiKeyRouting =
+            serde_json::from_str(r#"{"type":"literal","value":"k"}"#).expect("literal");
+        assert_eq!(SecretRef::from(literal).resolve().expect("value"), "k");
+        let keychain: ApiKeyRouting =
+            serde_json::from_str(r#"{"type":"keychain","service":"s","account":"a"}"#)
+                .expect("keychain");
+        match SecretRef::from(keychain) {
+            SecretRef::Keychain { service, account } => {
+                assert_eq!((service, account), ("s".into(), "a".into()))
+            }
+            other => panic!("expected keychain, got {other:?}"),
+        }
+        let dbg = format!(
+            "{:?}",
+            ApiKeyRouting::Literal {
+                value: "hidden".into()
+            }
+        );
+        assert!(!dbg.contains("hidden"), "routing Debug leaked: {dbg}");
+    }
 
     #[test]
     fn debug_redacts_exec_args_and_file_path() {

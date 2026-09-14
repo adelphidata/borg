@@ -20,6 +20,18 @@ files:
   - dist/**
   - dist-electron/**
 
+# The daemon rides along as Contents/Resources/bin/borgd (borgd.exe on
+# Windows). `electron/daemon.ts` looks there first, so a packaged app starts
+# its own engine and never sends anyone to a terminal. `just
+# desktop-bundle-borgd` fills resources/bin before `dist`/`pack`; the release
+# workflow does the same per platform.
+extraResources:
+  - from: resources/bin
+    to: bin
+    filter:
+      - "borgd"
+      - "borgd.exe"
+
 # Where electron-updater looks for new builds. It reads the same block, so the
 # feed and the release target can never disagree.
 publish:

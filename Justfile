@@ -182,5 +182,13 @@ desktop-dev:
 desktop-build:
     bun run --cwd apps/desktop build
 
+# Put a release borgd where electron-builder packs it (resources/bin). Run
+# before `bun run --cwd apps/desktop pack|dist` so the installer carries its
+# own daemon. Builds the web UI first: borgd embeds it.
+desktop-bundle-borgd: web-build
+    cargo build --release --bin borgd
+    mkdir -p apps/desktop/resources/bin
+    cp target/release/borgd apps/desktop/resources/bin/borgd
+
 # Everything CI runs for the web surfaces
 web-ci: web-install gen-check web-lint web-test web-build desktop-build

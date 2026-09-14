@@ -4,6 +4,7 @@ import { Route, Routes } from "react-router-dom";
 import { STORAGE_KEYS, ThemeProvider } from "@borg/ui";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
+import { setupStatus } from "../../test/setupStatus";
 import { SettingsProvider } from "../../lib/settings";
 import { SettingDetailPage } from "./SettingDetailPage";
 
@@ -18,12 +19,15 @@ const entry = (key: string, value: string, category = "default") => ({
 
 const REGISTRY = [
   entry("llm.thinking", "medium"),
+  entry("provider", "anthropic"),
   entry("model", "claude-opus-5"),
   entry("agents.max_depth", "3", "db"),
   entry("gateway.port", "7842"),
 ];
 
-function mount(route: string, daemon = fakeDaemon({ GetSettings: { entries: REGISTRY } })) {
+const DAEMON = { GetSettings: { entries: REGISTRY }, GetSetupStatus: setupStatus() };
+
+function mount(route: string, daemon = fakeDaemon(DAEMON)) {
   return renderApp(
     <Routes>
       <Route path="/settings/:id" element={<SettingDetailPage />} />
@@ -169,6 +173,94 @@ describe("SettingDetailPage edge cases", () => {
     });
     mount("/settings/key/gateway.port", daemon);
     await waitFor(() => expect(screen.getByText("Could not load settings.")).toBeTruthy());
+  });
+});
+
+describe("SettingDetailPage for provider and model", () => {
+  it("offers the daemon's providers by name and writes the id", async () => {
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+    const selected = screen.getByRole("img", { name: "Selected" });
+    expect(selected.closest("div")?.textContent).toContain("Anthropic");
+
+    click(screen.getByText("OpenRouter"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "provider",
+        value: "openrouter",
+      }),
+    );
+  });
+
+  it("lists only the models of the provider in force", async () => {
+    mount("/settings/model");
+    await waitFor(() => expect(screen.getByText("Opus 5")).toBeTruthy());
+    expect(screen.getByText("Sonnet 5")).toBeTruthy();
+    expect(screen.queryByText("DeepSeek V4 Flash")).toBeNull();
+  });
+
+  it("keeps free text one step away, for an id the catalog does not carry", async () => {
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/model", daemon);
+    await waitFor(() => expect(screen.getByText("Something else…")).toBeTruthy());
+    expect(screen.queryByDisplayValue("claude-opus-5")).toBeNull();
+
+    click(screen.getByText("Something else…"));
+    fireEvent.change(screen.getByDisplayValue("claude-opus-5"), {
+      target: { value: "claude-opus-6-preview" },
+    });
+    click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "model",
+        value: "claude-opus-6-preview",
+      }),
+    );
+  });
+
+  it("opens straight into text for a value the catalog does not list", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSettings: { entries: [entry("provider", "anthropic"), entry("model", "my-finetune")] },
+    });
+    mount("/settings/model", daemon);
+    // The text editor can appear before the catalog lands (no options yet
+    // means text); the way back exists only once the catalog has answered.
+    await waitFor(() => expect(screen.getByText("Back to the list")).toBeTruthy());
+    expect(screen.getByDisplayValue("my-finetune")).toBeTruthy();
+    click(screen.getByText("Back to the list"));
+    expect(screen.getByText("Opus 5")).toBeTruthy();
+  });
+
+  it("falls back to text when the catalog cannot answer", async () => {
+    const daemon = fakeDaemon({
+      GetSettings: { entries: REGISTRY },
+      GetSetupStatus: new BorgError(GrpcStatus.Unavailable, "daemon down"),
+    });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByDisplayValue("anthropic")).toBeTruthy());
+    expect(screen.queryByText("Back to the list")).toBeNull();
+  });
+
+  it("says when the chosen provider has no key, and where to add one", async () => {
+    mount("/settings/provider");
+    await waitFor(() => expect(screen.getByText(/No key saved for Anthropic yet/)).toBeTruthy());
+    expect((screen.getByText("Add one") as HTMLAnchorElement).getAttribute("href")).toBe(
+      "/connections/provider/anthropic",
+    );
+  });
+
+  it("stays quiet about keys once the daemon has one for that provider", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSetupStatus: setupStatus({
+        detected: [{ provider: "anthropic", source: "stored", detail: "" }],
+      }),
+    });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+    expect(screen.queryByText(/No key saved/)).toBeNull();
   });
 });
 

@@ -332,45 +332,16 @@ impl OnboardingState {
         }
     }
 
+    /// Same probes the daemon runs for the desktop and browser first run,
+    /// so the wizard and the app agree on what already works here.
     fn check_existing_api_key_cached(provider_id: &str) -> bool {
         let Ok(provider) = Provider::from_str(provider_id) else {
             return false;
         };
-        if provider.uses_aws_credential_chain() {
-            return true;
-        }
-        // Keyless local providers substitute their own readiness signal for
-        // an API key. Each gets its own check — probing Ollama's TCP port
-        // for Claude CLI reported nonsense.
-        if provider == Provider::Ollama {
-            return Provider::ollama_available();
-        }
-        if provider == Provider::ClaudeCli {
-            return cortex::claude_cli::detect_cli_path().is_some()
-                && cortex::claude_cli::has_valid_auth();
-        }
-        if !provider.requires_api_key() {
-            // Other keyless providers (not currently onboardable) have no
-            // pre-existing local credential to detect.
-            return false;
-        }
-        let env_var_name = provider.default_env_var();
         let Ok(data_dir) = Config::data_dir() else {
             return false;
         };
-        let env_path = data_dir.join(".env");
-        if !env_path.exists() {
-            return false;
-        }
-        std::fs::read_to_string(&env_path)
-            .ok()
-            .and_then(|contents| {
-                contents.lines().find_map(|line| {
-                    line.strip_prefix(&format!("{env_var_name}="))
-                        .map(|v| v.trim().trim_matches('"').to_string())
-                })
-            })
-            .is_some_and(|k| !k.is_empty())
+        cortex::llm::credential_detect::provider_ready_locally(provider, &data_dir)
     }
 
     #[cfg(test)]
@@ -1661,8 +1632,12 @@ mod tests {
     fn build_result_uses_explicit_provider_selection() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
-        // Select Anthropic (index 2 in PROVIDERS)
-        state.provider_index = 2;
+        // By position in the shared catalog, not a literal: the picker order
+        // is the daemon's, and it may gain a row.
+        state.provider_index = crate::onboarding::PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "anthropic")
+            .expect("anthropic is offered");
         state.api_key_input = "sk-ant-test123".to_string();
         let result = state.build_result();
         assert_eq!(result.provider, "anthropic");

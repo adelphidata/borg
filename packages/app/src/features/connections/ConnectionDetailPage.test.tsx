@@ -3,6 +3,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
+import { setupStatus } from "../../test/setupStatus";
 import { ConnectionDetailPage } from "./ConnectionDetailPage";
 
 const credential = (over: Record<string, unknown> = {}) => ({
@@ -23,6 +24,7 @@ const EMPTY = {
   ListApiKeys: { entries: [] },
   ListApprovedSenders: { senders: [] },
   ListPairingRequests: { requests: [] },
+  GetSetupStatus: setupStatus(),
 };
 
 const withPool = (entries: unknown[], strategy = "fill_first") => ({

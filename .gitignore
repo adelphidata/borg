@@ -71,3 +71,7 @@ mutants.out.old/
 .stryker-tmp/
 **/reports/mutation/
 stryker-setup-*.js
+
+# The daemon binary copied in by `just desktop-bundle-borgd`; built, not tracked.
+apps/desktop/resources/bin/borgd
+apps/desktop/resources/bin/borgd.exe

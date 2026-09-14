@@ -412,7 +412,13 @@ fn sync_indices_from_config() {
     cfg.llm.model = "claude-haiku-4-5".to_string();
     open(&mut popup, &cfg);
 
-    assert_eq!(popup.provider_index, 2); // anthropic is index 2
+    // Position in the shared catalog, not a literal — the daemon owns the
+    // picker order and it may gain a row.
+    let anthropic = crate::onboarding::PROVIDERS
+        .iter()
+        .position(|(id, _, _)| *id == "anthropic")
+        .expect("anthropic is offered");
+    assert_eq!(popup.provider_index, anthropic);
     assert_eq!(popup.model_index, 2); // claude-haiku-4-5 is index 2 in the curated Anthropic block
     assert!(popup.uncurated_model.is_none());
 }
@@ -512,22 +518,26 @@ fn provider_change_updates_model_config() {
     let mut cfg = Config::default();
     open(&mut popup, &cfg);
 
-    // Start at openrouter (index 0), cycle to openai (index 1)
+    // Start at the recommended provider (row 0) and cycle one to the right.
     popup.selected = 0;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
     popup.handle_key(right, &mut cfg).unwrap();
 
-    // Config should now have openai provider and first openai model.
+    // Whichever provider sits next in the catalog; the rule under test is
+    // that the model follows the provider, not which provider that is.
+    let (next, _, _) = crate::onboarding::PROVIDERS[1];
+
+    // Config should now have that provider and its first curated model.
     // Asserted against the catalog rather than a literal: the rule under test
     // is "the model resets to the new provider's first option", and pinning
     // whatever that id happens to be today makes this test fail on every
     // routine catalog refresh for no behavioural reason.
-    assert_eq!(cfg.llm.provider.as_deref(), Some("openai"));
-    let openai = models_for_provider("openai");
-    assert!(!openai.is_empty(), "openai must have a curated block");
-    assert_eq!(cfg.llm.model, openai[0].0);
+    assert_eq!(cfg.llm.provider.as_deref(), Some(next));
+    let models = models_for_provider(next);
+    assert!(!models.is_empty(), "{next} must have a curated block");
+    assert_eq!(cfg.llm.model, models[0].0);
     assert_ne!(
         cfg.llm.model,
         Config::default().llm.model,

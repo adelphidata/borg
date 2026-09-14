@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use cortex::config::Config;
 use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE, SETUP_FILE};
@@ -18,38 +19,20 @@ pub(crate) const BORG_SUBDIRS: &[&str] = &["memory", "tools", "skills", "logs", 
 ///
 /// OpenRouter is the widest list and needs only one credential, so an id we do
 /// not recognise still lands somewhere a new operator can pick from.
-pub(crate) const FALLBACK_PROVIDER: &str = "openrouter";
+pub(crate) const FALLBACK_PROVIDER: &str = cortex::llm::provider_catalog::RECOMMENDED;
 
-/// Provider choices with display labels.
-pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
-    (
-        "openrouter",
-        "OpenRouter",
-        "Access all models via one API key",
-    ),
-    ("openai", "OpenAI", "GPT models directly"),
-    ("anthropic", "Anthropic", "Claude models via API key"),
-    (
-        "bedrock",
-        "AWS Bedrock",
-        "Claude models via the AWS credential chain",
-    ),
-    ("gemini", "Gemini", "Google Gemini models directly"),
-    ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
-    ("groq", "Groq", "Ultra-fast inference"),
-    ("xai", "xAI", "Grok models directly from xAI"),
-    (
-        "azure-openai",
-        "Azure OpenAI",
-        "OpenAI models on Microsoft tenancy (set resource/deployment in /settings)",
-    ),
-    ("ollama", "Ollama", "Run models locally"),
-    (
-        "claude-cli",
-        "Claude Code CLI",
-        "Use your Claude subscription via the local `claude` binary",
-    ),
-];
+/// Provider choices as `(id, label, blurb)`, in picker order.
+///
+/// A view over [`cortex::llm::provider_catalog::ONBOARDABLE`] — the same list
+/// the daemon serves to the desktop and browser — kept in tuple shape because
+/// the wizard and the `/settings` and `/model` popups index and destructure it.
+pub(crate) static PROVIDERS: LazyLock<Vec<(&'static str, &'static str, &'static str)>> =
+    LazyLock::new(|| {
+        cortex::llm::provider_catalog::ONBOARDABLE
+            .iter()
+            .map(|c| (c.id, c.label, c.blurb))
+            .collect()
+    });
 
 /// Assembled choices from the onboarding wizard.
 pub struct OnboardingResult {
@@ -1009,13 +992,14 @@ mod tests {
     /// picker silently hands that provider OpenRouter's list — ids the
     /// provider will not serve.
     #[test]
-    fn every_wizard_provider_has_its_own_curated_block() {
-        let catalog = cortex::llm::model_catalog::embedded_manifest().provider_names();
-        for (id, label, _) in PROVIDERS {
-            assert!(
-                catalog.iter().any(|p| p == id),
-                "provider {label} ({id}) has no catalog block"
-            );
+    fn wizard_rows_mirror_the_shared_catalog() {
+        // The popups index PROVIDERS by position and hand the id to the
+        // daemon; a view that reorders or drops a row would select the
+        // wrong provider silently.
+        let shared = cortex::llm::provider_catalog::ONBOARDABLE;
+        assert_eq!(PROVIDERS.len(), shared.len());
+        for (i, (id, label, _)) in PROVIDERS.iter().enumerate() {
+            assert_eq!((*id, *label), (shared[i].id, shared[i].label));
         }
     }
 

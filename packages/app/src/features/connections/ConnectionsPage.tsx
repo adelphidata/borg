@@ -11,9 +11,9 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useMutation } from "../../lib/useDaemon";
+import type { admin } from "@borg/client";
 import {
   PAIR_SOURCES,
-  PROVIDER_CATALOG,
   badgeOf,
   providerLabel,
   useConnections,
@@ -30,13 +30,16 @@ interface Card {
   needsAttention: boolean;
 }
 
-function cardOf(conn: ProviderConnection | ChannelConnection): Card {
+function cardOf(
+  conn: ProviderConnection | ChannelConnection,
+  catalog: admin.ProviderChoice[],
+): Card {
   if (conn.kind === "provider") {
     const live = conn.entries.filter((e) => e.status !== "removed").length;
     return {
       id: `provider/${conn.name}`,
       badge: badgeOf(conn.name),
-      name: providerLabel(conn.name),
+      name: providerLabel(catalog, conn.name),
       sub:
         live > 0
           ? `${live} key${live === 1 ? "" : "s"} · ${conn.strategy.replace(/_/g, " ")}`
@@ -108,7 +111,10 @@ function ConnList({ cards, open }: { cards: Card[]; open: (id: string) => void }
 function AddGrid({ data, open }: { data: Connections; open: (id: string) => void }) {
   const isMobile = useIsMobile();
   const configured = new Set(data.providers.map((p) => p.name));
-  const available = PROVIDER_CATALOG.filter((p) => !configured.has(p.name));
+  // The detail page behind each tile asks for a key. A provider that takes
+  // no key (Claude Code, Bedrock) has nothing to paste, so it does not
+  // belong here — it is chosen in Settings instead.
+  const available = data.catalog.filter((p) => p.needsApiKey && !configured.has(p.id));
   if (available.length === 0) return null;
   return (
     <section>
@@ -116,11 +122,11 @@ function AddGrid({ data, open }: { data: Connections; open: (id: string) => void
       <div className={`grid gap-3 ${isMobile ? "grid-cols-2" : "grid-cols-4"}`}>
         {available.map((p) => (
           <div
-            key={p.name}
+            key={p.id}
             className="flex cursor-pointer items-center gap-3 rounded-[11px] border border-line2 px-4 py-3.5 transition-[border-color] duration-150 hover:border-neon"
-            onClick={() => open(`provider/${p.name}`)}
+            onClick={() => open(`provider/${p.id}`)}
           >
-            <Badge on={false}>{badgeOf(p.name)}</Badge>
+            <Badge on={false}>{badgeOf(p.id)}</Badge>
             <span className="text-[13px] leading-[1.2] font-medium text-ink2">{p.label}</span>
           </div>
         ))}
@@ -188,7 +194,9 @@ export function ConnectionsPage() {
           <MobileTitle>Connections</MobileTitle>
           <DaemonState query={connections} label="connections">
             {(data) => {
-              const cards = [...data.providers, ...data.channels].map(cardOf);
+              const cards = [...data.providers, ...data.channels].map((c) =>
+                cardOf(c, data.catalog),
+              );
               const alerted = data.channels.find((c) => c.pending.length > 0);
               return (
                 <>

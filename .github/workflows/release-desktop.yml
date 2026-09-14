@@ -65,6 +65,40 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      # The installer carries its own borgd (see electron-builder.yml
+      # extraResources), so a fresh machine needs nothing on PATH. Same
+      # toolchain and deps as release.yml; the web UI is built first because
+      # borgd embeds it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.asset }}-borgd-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.asset }}-borgd-
+      - name: Build web UI
+        run: |
+          bun run --cwd apps/web build
+          test -f apps/web/dist/index.html
+      - name: Build borgd
+        run: cargo build --release --bin borgd
+      - name: Stage borgd for the installer
+        shell: bash
+        run: |
+          mkdir -p apps/desktop/resources/bin
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/borgd.exe apps/desktop/resources/bin/borgd.exe
+          else
+            cp target/release/borgd apps/desktop/resources/bin/borgd
+          fi
+          ls -la apps/desktop/resources/bin
       - name: Package
         # TODO(signing): no certificates are configured yet, so the artifacts are
         # unsigned. Disabling auto-discovery keeps the build from failing when a

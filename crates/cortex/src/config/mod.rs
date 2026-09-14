@@ -59,6 +59,10 @@ use tracing::warn;
 
 use crate::llm::provider::Provider;
 use crate::paths::{self, BorgSubdir};
+
+/// Settings-table prefix of the per-provider API key routing rows that
+/// `Admin.SetApiKey` writes (`credentials.openrouter`, …).
+pub const STORED_API_KEY_PREFIX: &str = "credentials.";
 use crate::policy::ExecutionPolicy;
 
 /// Top-level configuration, loaded from SQLite settings DB.
@@ -370,13 +374,46 @@ impl Config {
             }
         };
         let mut config = Self::default();
+        let mut stored_keys = Vec::new();
         for (key, value, _) in db.list_settings().await? {
+            // `credentials.{provider}` rows are per-provider key routing, not
+            // registry settings; they are folded in once the provider is known.
+            if let Some(provider) = key.strip_prefix(STORED_API_KEY_PREFIX) {
+                stored_keys.push((provider.to_string(), value));
+                continue;
+            }
             if let Err(e) = config.apply_setting(&key, &value) {
                 crate::settings::warn_invalid_setting_once(&key, &e);
             }
         }
+        config.adopt_stored_api_key(&stored_keys);
         config.validate()?;
         Ok(config)
+    }
+
+    /// Fold the `credentials.{provider}` row written by `Admin.SetApiKey`
+    /// into `llm.api_key` when nothing more explicit is configured.
+    ///
+    /// The desktop and web onboarding store a key this way and nothing else;
+    /// without this fold a GUI-onboarded install finishes setup and then has
+    /// no key to send. Because the row is keyed by provider, switching the
+    /// provider in Settings picks up that provider's saved key on its own.
+    /// An explicit `llm.api_key` still wins, so an operator's own routing is
+    /// never overridden.
+    pub fn adopt_stored_api_key(&mut self, rows: &[(String, String)]) {
+        if self.llm.api_key.is_some() {
+            return;
+        }
+        let Some(provider) = self.llm.provider.as_deref() else {
+            return;
+        };
+        let Some((_, json)) = rows.iter().find(|(p, _)| p.eq_ignore_ascii_case(provider)) else {
+            return;
+        };
+        match serde_json::from_str::<crate::security::secrets_resolve::ApiKeyRouting>(json) {
+            Ok(routing) => self.llm.api_key = Some(routing.into()),
+            Err(e) => warn!("{STORED_API_KEY_PREFIX}{provider} is not valid key routing JSON: {e}"),
+        }
     }
 
     /// Load config from a specific TOML file path.

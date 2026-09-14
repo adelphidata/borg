@@ -32,66 +32,13 @@ export interface Connections {
   channels: ChannelConnection[];
   /** Total pending pairing requests across all channels. */
   pendingCount: number;
+  /**
+   * Providers worth offering before any key exists, from the daemon's
+   * catalog (`Admin.GetSetupStatus`). Display metadata only; the same rows
+   * the first run and the settings pickers show.
+   */
+  catalog: admin.ProviderChoice[];
 }
-
-/**
- * Providers worth offering before any key exists. Display metadata only.
- *
- * `keyUrl` is the page that issues the key. Asking someone to paste a
- * credential without saying where it comes from is the one step of setup a
- * first-time user cannot finish on their own, so every provider that needs a
- * key names its source.
- */
-export const PROVIDER_CATALOG: {
-  name: string;
-  label: string;
-  blurb: string;
-  keyUrl?: string;
-}[] = [
-  {
-    name: "openrouter",
-    label: "OpenRouter",
-    blurb: "One key, every model behind it.",
-    keyUrl: "https://openrouter.ai/keys",
-  },
-  {
-    name: "anthropic",
-    label: "Anthropic",
-    blurb: "Claude, straight from the source.",
-    keyUrl: "https://console.anthropic.com/settings/keys",
-  },
-  {
-    name: "openai",
-    label: "OpenAI",
-    blurb: "GPT models with your own key.",
-    keyUrl: "https://platform.openai.com/api-keys",
-  },
-  {
-    name: "gemini",
-    label: "Gemini",
-    blurb: "Google's models with an AI Studio key.",
-    keyUrl: "https://aistudio.google.com/app/apikey",
-  },
-  {
-    name: "deepseek",
-    label: "DeepSeek",
-    blurb: "Fast, inexpensive reasoning models.",
-    keyUrl: "https://platform.deepseek.com/api_keys",
-  },
-  {
-    name: "groq",
-    label: "Groq",
-    blurb: "Open models at very high speed.",
-    keyUrl: "https://console.groq.com/keys",
-  },
-  {
-    name: "xai",
-    label: "xAI",
-    blurb: "Grok models with your own key.",
-    keyUrl: "https://console.x.ai/",
-  },
-  { name: "ollama", label: "Ollama", blurb: "A model running on this machine. Nothing leaves." },
-];
 
 /** OAuth sign-ins the daemon can import from tools already on this machine. */
 export const PAIR_SOURCES: { kind: string; label: string }[] = [
@@ -101,9 +48,7 @@ export const PAIR_SOURCES: { kind: string; label: string }[] = [
   { kind: "qwen_cli", label: "Qwen CLI" },
 ];
 
-export function providerLabel(name: string): string {
-  return PROVIDER_CATALOG.find((p) => p.name === name)?.label ?? name;
-}
+export { providerLabel } from "../onboarding/useSetupStatus";
 
 /** Two-letter tile badge for any connection name. */
 export function badgeOf(name: string): string {
@@ -116,11 +61,15 @@ export function badgeOf(name: string): string {
 }
 
 export async function loadConnections(borg: BorgClient): Promise<Connections> {
-  const [credentials, apiKeys, senders, pairings] = await Promise.all([
+  const [credentials, apiKeys, senders, pairings, setup] = await Promise.all([
     borg.admin.listCredentials({}),
     borg.admin.listApiKeys({}),
     borg.admin.listApprovedSenders({}),
     borg.admin.listPairingRequests({}),
+    // The catalog only supplies display names and the "Add" grid. It is the
+    // heaviest of the five calls, so a slow probe must not take the page
+    // down; `providerLabel` passes an unknown id straight through.
+    borg.admin.getSetupStatus({}).catch(() => ({ providers: [] })),
   ]);
 
   const providers = new Map<string, ProviderConnection>();
@@ -167,6 +116,7 @@ export async function loadConnections(borg: BorgClient): Promise<Connections> {
     providers: providerList,
     channels: channelList,
     pendingCount: channelList.reduce((n, c) => n + c.pending.length, 0),
+    catalog: setup.providers,
   };
 }
 

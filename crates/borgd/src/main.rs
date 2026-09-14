@@ -44,12 +44,29 @@ fn main() -> Result<()> {
     borgd::runtime::build_runtime()?.block_on(async_main())
 }
 
+/// Load `<home>/.env` into the process environment.
+///
+/// The cli has always done this, and the installed service units pass the
+/// file as `EnvironmentFile`; a daemon spawned by the desktop app got
+/// neither, so a key kept in `.env` worked from the terminal and not from
+/// the app. Loading it here makes the file one source for every launcher.
+/// A missing file is the common case and stays silent.
+fn load_env_file(home: &std::path::Path) {
+    let path = home.join(".env");
+    match dotenvy::from_path(&path) {
+        Ok(()) => {}
+        Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("Warning: could not load {}: {e}", path.display()),
+    }
+}
+
 async fn async_main() -> Result<()> {
     let args = Args::parse();
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     // Point config/DB resolution at the resolved home so telemetry settings
     // load from the same database the daemon will use.
     std::env::set_var("BORG_HOME", &home);
+    load_env_file(&home);
 
     // Load config once here (for telemetry init) and thread it into the daemon
     // so it isn't re-decrypted from the DB a second time. Off by default;
@@ -84,4 +101,29 @@ async fn async_main() -> Result<()> {
         core_config,
     })
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::load_env_file;
+
+    /// A key kept in `~/.borg/.env` has to reach a daemon the desktop app
+    /// spawned, and a home without that file is the ordinary first run.
+    #[test]
+    fn env_file_is_loaded_when_present_and_ignored_when_not() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let var = "BORGD_ENV_FILE_TEST_KEY";
+        std::env::remove_var(var);
+
+        // No file: nothing set, nothing printed, no panic.
+        load_env_file(home.path());
+        assert!(std::env::var(var).is_err(), "nothing to load");
+
+        std::fs::write(home.path().join(".env"), format!("{var}=from-dotenv\n")).expect("write");
+        load_env_file(home.path());
+        let got = std::env::var(var);
+        std::env::remove_var(var);
+        assert_eq!(got.as_deref(), Ok("from-dotenv"));
+    }
 }

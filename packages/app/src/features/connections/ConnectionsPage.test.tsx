@@ -4,6 +4,7 @@ import { Route, Routes, useLocation } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { fakeDaemon, renderApp } from "../../test/harness";
+import { SETUP_CATALOG, setupStatus } from "../../test/setupStatus";
 import { ConnectionsPage } from "./ConnectionsPage";
 import { badgeOf, providerLabel } from "./useConnections";
 
@@ -28,6 +29,7 @@ const EMPTY = {
   ListApiKeys: { entries: [] },
   ListApprovedSenders: { senders: [] },
   ListPairingRequests: { requests: [] },
+  GetSetupStatus: setupStatus(),
 };
 
 function Where() {
@@ -63,12 +65,12 @@ describe("badgeOf", () => {
 });
 
 describe("providerLabel", () => {
-  it("uses the catalog's display name", () => {
-    expect(providerLabel("openrouter")).toBe("OpenRouter");
+  it("uses the daemon catalog's display name", () => {
+    expect(providerLabel(SETUP_CATALOG, "openrouter")).toBe("OpenRouter");
   });
 
   it("passes an unknown provider through rather than dropping it", () => {
-    expect(providerLabel("mystery")).toBe("mystery");
+    expect(providerLabel(SETUP_CATALOG, "mystery")).toBe("mystery");
   });
 });
 
@@ -147,6 +149,28 @@ describe("ConnectionsPage", () => {
     expect(screen.getByText("Anthropic")).toBeTruthy();
     // OpenRouter appears once, as a connected card, not again as an offer.
     expect(screen.getAllByText("OpenRouter")).toHaveLength(1);
+  });
+
+  it("does not offer a provider that has no key to paste", async () => {
+    // The detail page behind a tile is a key form; Ollama needs no key.
+    const daemon = fakeDaemon(EMPTY);
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Add a model provider")).toBeTruthy());
+    expect(screen.queryByText("Ollama")).toBeNull();
+  });
+
+  it("still lists the connections when the catalog cannot be fetched", async () => {
+    // The catalog is display metadata; a slow probe must not blank the page.
+    const daemon = fakeDaemon({
+      ...EMPTY,
+      GetSetupStatus: new BorgError(GrpcStatus.Unavailable, "probe timed out"),
+      ListApiKeys: { entries: [{ provider: "anthropic", backend: "literal" }] },
+    });
+    mount(daemon);
+    // No catalog means no display name either: the id stands in for it.
+    await waitFor(() => expect(screen.getByText("anthropic")).toBeTruthy());
+    expect(screen.getByText("key saved")).toBeTruthy();
+    expect(screen.queryByText("Add a model provider")).toBeNull();
   });
 
   it("opens a provider's detail page", async () => {

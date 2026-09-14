@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import {
   BackLink,
   CheckIcon,
@@ -14,7 +14,17 @@ import {
 import type { ThemePreference } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
-import { findBasicSetting, type SettingOption } from "./catalog";
+import {
+  modelsOf,
+  providerLabel,
+  providerOf,
+  useSetupStatus,
+  type SetupStatus,
+} from "../onboarding/useSetupStatus";
+import { findBasicSetting, type BasicSetting, type SettingOption } from "./catalog";
+
+/** The row that opens the free-text editor under a catalog picker. */
+const SOMETHING_ELSE = "__something_else__";
 
 function DetailShell({ title, children }: { title: string; children: ReactNode }) {
   const isMobile = useIsMobile();
@@ -130,6 +140,111 @@ function ValueEditor({
   );
 }
 
+/**
+ * Options for a provider or model row, from the daemon's catalog.
+ *
+ * Empty when the catalog has not answered, which is the signal to fall back
+ * to the free-text editor rather than an empty picker.
+ */
+function catalogOptions(
+  kind: BasicSetting["catalog"],
+  status: SetupStatus,
+  provider: string,
+): SettingOption[] {
+  if (kind === "provider") {
+    return status.providers.map((p) => ({ value: p.id, label: p.label, desc: p.blurb }));
+  }
+  return modelsOf(status.providers, provider).map((m) => ({
+    value: m.id,
+    label: m.label,
+    desc: m.note || undefined,
+  }));
+}
+
+/**
+ * Provider and model, picked from the same catalog the first run showed.
+ *
+ * The curated rows are the whole picker for almost everyone; "Something
+ * else…" opens the plain field for an id the catalog does not carry, so the
+ * power user loses nothing and the first-time user never meets a text box.
+ * A provider with no key behind it says so here, with the way to fix it,
+ * instead of failing on the next message.
+ */
+function CatalogDetail({
+  basic,
+  entry,
+  provider,
+}: {
+  basic: BasicSetting;
+  entry: { key: string; value: string; overridden: boolean };
+  /** The provider in force, which decides the model list. */
+  provider: string;
+}) {
+  const { save, clear, saving } = useSettings();
+  const setup = useSetupStatus();
+  // Undecided until the user says; a value the catalog does not know starts
+  // as text, and "Back to the list" is still honoured after that.
+  const [freeText, setFreeText] = useState<boolean>();
+
+  const status = setup.state === "ready" ? setup.data : undefined;
+  const options = status ? catalogOptions(basic.catalog, status, provider) : [];
+  const listed = options.some((o) => o.value === entry.value);
+  const editing = options.length === 0 || (freeText ?? (!listed && entry.value !== ""));
+
+  const chosen =
+    status && basic.catalog === "provider" ? providerOf(status.providers, entry.value) : undefined;
+  const keyMissing =
+    chosen !== undefined &&
+    chosen.needsApiKey &&
+    !status!.detected.some((d) => d.provider.toLowerCase() === chosen.id.toLowerCase());
+
+  return (
+    <>
+      {!editing && (
+        <OptionPicker
+          options={[...options, { value: SOMETHING_ELSE, label: "Something else…" }]}
+          value={entry.value}
+          disabled={saving}
+          onPick={(v) => {
+            if (v === SOMETHING_ELSE) setFreeText(true);
+            else if (v !== entry.value) void save(entry.key, v);
+          }}
+        />
+      )}
+      {editing && (
+        <ValueEditor
+          initial={entry.value}
+          saving={saving}
+          onSave={(v) => void save(entry.key, v)}
+          onReset={entry.overridden ? () => void clear(entry.key) : undefined}
+        />
+      )}
+      {editing && options.length > 0 && (
+        <button
+          type="button"
+          className="cursor-pointer self-start border-0 bg-transparent p-0 text-[12.5px] leading-none text-ink3 hover:text-ink"
+          onClick={() => setFreeText(false)}
+        >
+          Back to the list
+        </button>
+      )}
+      {keyMissing && (
+        <div className="rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
+          No key saved for {providerLabel(status!.providers, chosen.id)} yet.{" "}
+          <Link to={`/connections/provider/${chosen.id}`} className="text-neon-ink no-underline">
+            Add one
+          </Link>
+        </div>
+      )}
+      <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
+        {editing
+          ? "Saved to the daemon. Invalid values are rejected with the reason above."
+          : "Changes apply straight away. Nothing to save."}
+      </div>
+    </>
+  );
+}
+
 /** The local-only theme setting — applies before paint, so it never touches borgd. */
 function AppearanceDetail() {
   const { preference, setPreference } = useTheme();
@@ -189,6 +304,20 @@ export function SettingDetailPage() {
               <div className="text-[14.5px] leading-[1.62] text-pretty text-ink2">
                 That setting doesn’t exist.
               </div>
+            );
+          }
+
+          if (basic?.catalog) {
+            return (
+              <>
+                <Heading name={title} desc={basic.desc} />
+                <SaveError message={saveError?.message} />
+                <CatalogDetail
+                  basic={basic}
+                  entry={entry}
+                  provider={map.get("provider")?.value ?? ""}
+                />
+              </>
             );
           }
 

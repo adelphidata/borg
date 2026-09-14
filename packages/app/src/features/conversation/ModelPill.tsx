@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { CheckIcon } from "@borg/ui";
-import { modelsFor } from "../onboarding/models";
+import { modelLabel, modelsOf, useSetupStatus } from "../onboarding/useSetupStatus";
 import { THINKING_OPTIONS } from "../settings/catalog";
 import { useKeybind } from "../../lib/keybinds";
 import { useSettings } from "../../lib/settings";
@@ -10,11 +10,6 @@ const ITEM =
 
 const GROUP = "px-3 pt-2 pb-1 text-[10px] font-medium tracking-[0.16em] text-ink3 uppercase";
 
-/** The short name for a model id, so the pill stays a pill. */
-function shortLabel(provider: string, model: string): string {
-  return modelsFor(provider).find((m) => m.id === model)?.label ?? model;
-}
-
 /**
  * Which model answers, and how hard it thinks — from the composer.
  *
@@ -23,13 +18,17 @@ function shortLabel(provider: string, model: string): string {
  * not part of configuring the app. This is the same two settings through the
  * same mutation, so the two surfaces cannot disagree.
  *
- * There is no search box and no full catalog here on purpose. The daemon
- * exposes no model list over gRPC, and the curated per-provider shortlist is
- * the honest extent of what we can offer; anything else the provider accepts
- * still goes in Settings, where the field takes any id.
+ * There is no search box and no full catalog here on purpose. The daemon's
+ * curated per-provider shortlist is the honest extent of what we can offer;
+ * anything else the provider accepts still goes in Settings, where the field
+ * takes any id.
  */
 export function ModelPill() {
   const { settings, save, saving, saveError, resetSaveError } = useSettings();
+  const setup = useSetupStatus();
+  // Until the catalog answers (or if it never does) the pill still names the
+  // id; only the short labels and the model list wait on it.
+  const catalog = setup.state === "ready" ? setup.data.providers : [];
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
 
@@ -54,7 +53,7 @@ export function ModelPill() {
   // model, opening a menu offering none, is worse than no pill.
   if (model === "") return null;
 
-  const models = modelsFor(provider);
+  const models = modelsOf(catalog, provider);
 
   // A rejected write would otherwise close the menu and leave the old model on
   // screen, so the pill would state a model the daemon is not using.
@@ -80,7 +79,7 @@ export function ModelPill() {
           saveError ? "text-alert" : "text-ink3"
         }`}
       >
-        {shortLabel(provider, model)}
+        {modelLabel(catalog, provider, model)}
         {thinking !== "" && thinking !== "off" && ` · ${thinking}`}
       </button>
       {saveError && (

@@ -12,6 +12,34 @@ let ready = true;
 let saveError: { message: string } | undefined;
 const resetSaveError = vi.fn();
 
+/** The daemon's provider catalog, as `Admin.GetSetupStatus` reports it. */
+const CATALOG = [
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    blurb: "",
+    keyUrl: "",
+    needsApiKey: true,
+    recommended: false,
+    featured: true,
+    defaultModel: "claude-opus-5",
+    models: [
+      { id: "claude-opus-5", label: "Opus 5", note: "" },
+      { id: "claude-sonnet-5", label: "Sonnet 5", note: "" },
+    ],
+  },
+];
+
+vi.mock("../onboarding/useSetupStatus", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../onboarding/useSetupStatus")>()),
+  useSetupStatus: () => ({
+    state: "ready",
+    data: { configured: true, provider: "anthropic", model: "", providers: CATALOG, detected: [] },
+    refetch: () => {},
+    refreshing: false,
+  }),
+}));
+
 vi.mock("../../lib/settings", () => ({
   useSettings: () => ({
     settings: ready
