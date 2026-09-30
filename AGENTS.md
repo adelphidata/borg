@@ -86,7 +86,7 @@ just desktop-dev     # Vite + Electron with hot reload
 just web-ci          # everything CI runs for the web side
 ```
 
-**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. the codegen drift step in CI's Web surfaces job fails otherwise.
+**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. The codegen drift step in CI's Web surfaces job fails otherwise.
 
 **Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 
@@ -106,7 +106,7 @@ just desktop-dev     # Vite + Electron with hot reload
 just web-ci          # everything CI runs for the web side
 ```
 
-**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. the codegen drift step in CI's Web surfaces job fails otherwise.
+**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. The codegen drift step in CI's Web surfaces job fails otherwise.
 
 **Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 

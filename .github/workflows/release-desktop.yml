@@ -54,7 +54,7 @@ jobs:
         include:
           - os: macos-14
             asset: borg-desktop-macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             asset: borg-desktop-macos-x86_64
           - os: ubuntu-latest
             asset: borg-desktop-linux-x86_64
@@ -71,7 +71,7 @@ jobs:
       # borgd embeds it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.97.1"
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
@@ -122,7 +122,8 @@ jobs:
 
   release:
     name: Publish
-    needs: build
+    needs: [tag, build]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
