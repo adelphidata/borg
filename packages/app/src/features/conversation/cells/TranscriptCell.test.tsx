@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { TranscriptCell } from "./index";
 import { registerComposer } from "../composerFocus";
 import type { Cell } from "../useConversation";
+import { formatClock } from "../../../lib/format";
 
 function renderCell(cell: Cell, over: { ordinal?: number; editable?: boolean } = {}) {
   const respond = vi.fn();
@@ -276,9 +277,24 @@ describe("TranscriptCell — other kinds", () => {
 });
 
 describe("TranscriptCell — timestamps", () => {
-  it("offers the wall-clock time of a row that has one, as a tip", () => {
-    // The transcript reads as a conversation; a column of clock times would
-    // turn it into a log.
+  it("shows the local send time under every message, the same for both sides", () => {
+    const at = Date.UTC(2026, 7, 19, 14, 32, 7);
+    const clock = formatClock(at);
+    for (const cell of [
+      { kind: "user", text: "hello", at },
+      { kind: "assistant", text: "hi", at },
+    ] satisfies Cell[]) {
+      const { container, unmount } = renderCell(cell);
+      const time = container.querySelector("time");
+      expect(time?.textContent).toBe(clock);
+      expect(time?.getAttribute("dateTime")).toBe(new Date(at).toISOString());
+      // Below the message, not inside its header: the last thing in the row.
+      expect(time?.nextElementSibling).toBeNull();
+      unmount();
+    }
+  });
+
+  it("offers the full wall-clock time of a row that has one, as a tip", () => {
     const at = Date.UTC(2026, 7, 19, 14, 32, 7);
     const { container } = renderCell({ kind: "assistant", text: "hi", at });
     const wrapper = container.firstElementChild as HTMLElement;
@@ -303,6 +319,7 @@ describe("TranscriptCell — timestamps", () => {
       cacheWrite: 0,
     });
     expect((container.firstElementChild as HTMLElement).title).toBe("");
+    expect(container.querySelector("time")).toBeNull();
   });
 });
 

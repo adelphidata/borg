@@ -7,7 +7,7 @@ import { FailureCard } from "../FailureCard";
 import { useAutoGrow } from "../useAutoGrow";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
-import { formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
+import { formatClock, formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
 import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
 
@@ -19,6 +19,21 @@ function ReplyCard({ kicker, children }: { kicker: string; children: React.React
       <div className={KICKER}>{kicker}</div>
       {children}
     </div>
+  );
+}
+
+/**
+ * The local time a message was sent, under its bottom-right corner — the same
+ * place for the user's messages and Borg's. Hover gives the full date.
+ */
+function SentAt({ at }: { at: number }) {
+  return (
+    <time
+      dateTime={new Date(at).toISOString()}
+      className="mt-1.5 block text-right text-[11px] leading-none text-ink3 tabular-nums"
+    >
+      {formatClock(at)}
+    </time>
   );
 }
 
@@ -239,12 +254,15 @@ function UserCell({
           <PencilIcon size={13} />
         </button>
       )}
-      <div className="max-w-[78%] rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
-        {/* A turn that was only its attachments has no text to make room for. */}
-        {cell.text !== "" && <div>{cell.text}</div>}
-        {cell.attachments && cell.attachments.length > 0 && (
-          <AttachmentLine attachments={cell.attachments} />
-        )}
+      <div className="max-w-[78%]">
+        <div className="rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
+          {/* A turn that was only its attachments has no text to make room for. */}
+          {cell.text !== "" && <div>{cell.text}</div>}
+          {cell.attachments && cell.attachments.length > 0 && (
+            <AttachmentLine attachments={cell.attachments} />
+          )}
+        </div>
+        {cell.at !== undefined && <SentAt at={cell.at} />}
       </div>
     </div>
   );
@@ -299,9 +317,12 @@ function renderCell(
       );
     case "assistant":
       return (
-        <ReplyCard kicker="Borg">
-          <Markdown>{cell.text}</Markdown>
-        </ReplyCard>
+        <div>
+          <ReplyCard kicker="Borg">
+            <Markdown>{cell.text}</Markdown>
+          </ReplyCard>
+          {cell.at !== undefined && <SentAt at={cell.at} />}
+        </div>
       );
     case "thinking":
       return <ThinkingCell cell={cell} />;

@@ -88,6 +88,24 @@ export function formatTimestamp(ms: number): string {
   });
 }
 
+/**
+ * When a message was sent, short enough to sit beside it: "9:02 PM" today,
+ * "28 Sep, 9:02 PM" on any other day. The user's locale and time zone format
+ * it; the hover tip keeps the long form with seconds.
+ */
+export function formatClock(ms: number, now: number = Date.now()): string {
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (at.toDateString() === new Date(now).toDateString()) return time;
+  const sameYear = at.getFullYear() === new Date(now).getFullYear();
+  const date = at.toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "short",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+  return `${date}, ${time}`;
+}
+
 /** A rounded, human duration: "2 hours", "45 seconds". */
 export function formatDuration(secs: number): string {
   if (secs >= 86_400) return plural(Math.floor(secs / 86_400), "day");
