@@ -91,9 +91,7 @@ async fn generate_and_deliver(
     let (mut rx, _cancel) = executor.start_turn(turn).await?;
     let mut response = String::new();
     while let Some(event) = rx.recv().await {
-        if let AgentEvent::TextDelta(delta) = event {
-            response.push_str(&delta);
-        }
+        apply_greeting_event(&mut response, event);
     }
 
     let greeting = response.trim().to_string();
@@ -108,4 +106,35 @@ async fn generate_and_deliver(
     };
 
     crate::channel_delivery::send(&config, channel_name, sender_id, &greeting).await
+}
+
+/// Fold one event of the greeting turn into the greeting text. A retraction
+/// removes the text of a failed LLM attempt; the full response comes again.
+fn apply_greeting_event(response: &mut String, event: AgentEvent) {
+    match event {
+        AgentEvent::TextDelta(delta) => response.push_str(&delta),
+        AgentEvent::TextRetracted { bytes } => cortex::agent::retract_text_tail(response, bytes),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec: the greeting is the text of the attempt that completes.
+    #[test]
+    fn the_greeting_drops_the_text_of_a_failed_attempt() {
+        let mut greeting = String::new();
+        for event in [
+            AgentEvent::LlmAttemptStarted { attempt: 0 },
+            AgentEvent::TextDelta("Hi, I am Bo".into()),
+            AgentEvent::TextRetracted { bytes: 11 },
+            AgentEvent::LlmAttemptStarted { attempt: 1 },
+            AgentEvent::TextDelta("Hi, I am Borg.".into()),
+        ] {
+            apply_greeting_event(&mut greeting, event);
+        }
+        assert_eq!(greeting, "Hi, I am Borg.");
+    }
 }

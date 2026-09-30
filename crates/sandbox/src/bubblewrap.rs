@@ -136,7 +136,10 @@ fn resolve_path(path: &Path) -> std::path::PathBuf {
         if let Ok(canon) = std::fs::canonicalize(&head) {
             return tail.iter().rev().fold(canon, |acc, part| acc.join(part));
         }
-        match (head.file_name().map(std::ffi::OsStr::to_os_string), head.parent()) {
+        match (
+            head.file_name().map(std::ffi::OsStr::to_os_string),
+            head.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 tail.push(name);
                 head = parent.to_path_buf();

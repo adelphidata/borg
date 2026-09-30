@@ -8,7 +8,7 @@ use super::{
     Message, Provider, Role, StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition,
     UsageData, UsageOptions,
 };
-use crate::llm::llm_error::{classify_error_text, FailoverReason};
+use crate::llm::llm_error::{classify_stream_error_frame, FailoverReason};
 
 pub(crate) struct TransportRequest<'a> {
     pub(crate) provider: Provider,
@@ -70,6 +70,18 @@ pub(crate) trait Transport: Sync {
     fn build_chat_request(&self, request: &TransportRequest<'_>) -> Result<serde_json::Value>;
 
     fn new_stream_state(&self) -> StreamState;
+
+    /// True when the parser saw the marker that ends a response on this
+    /// wire. The stream driver asks this when the connection closes cleanly,
+    /// to tell a complete answer from one that a proxy cut short.
+    fn stream_completed(&self, state: &StreamState) -> bool {
+        match state {
+            StreamState::OpenAiCompat(s) => s.completed,
+            StreamState::Anthropic(s) => s.completed,
+            StreamState::Bedrock(s) => s.completed,
+            StreamState::Gemini(s) => s.accumulator.finish_reason.is_some(),
+        }
+    }
 
     fn parse_stream_line(
         &self,
@@ -348,15 +360,24 @@ pub(crate) fn parse_openai_sse_line(
     };
 
     if data.trim() == "[DONE]" {
+        state.completed = true;
         return SseAction::Done(vec![StreamEvent::Done]);
-    }
-
-    if let Some(err) = parse_openai_stream_error(data) {
-        return SseAction::Error(err);
     }
 
     match serde_json::from_str::<StreamChunk>(data) {
         Ok(chunk) => {
+            // An error frame inside a 200 stream is a failed call. It must
+            // never pass as an empty or partial successful turn.
+            let choice_failed = chunk.choices.as_ref().is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|c| c.finish_reason.as_deref() == Some("error"))
+            });
+            let error_object = chunk.error.as_ref().filter(|e| e.is_object());
+            if error_object.is_some() || choice_failed {
+                return SseAction::Error(classify_stream_error_frame(data, provider));
+            }
+
             let mut events = Vec::new();
 
             // The first chunk that names them wins; later chunks repeat the
@@ -418,6 +439,9 @@ pub(crate) fn parse_openai_sse_line(
                                 });
                             }
                         }
+                    }
+                    if choice.finish_reason.is_some() {
+                        state.completed = true;
                     }
                     if choice.finish_reason.as_deref() == Some("length") {
                         events.push(StreamEvent::Truncated);
@@ -626,6 +650,9 @@ pub(crate) struct AnthropicStreamState {
     /// `message.id` from `message_start`, carried onto the usage record that
     /// `message_delta` emits so the per-call log can name the response.
     pending_response_id: Option<String>,
+    /// Set when `message_stop`, or a `message_delta` with a stop reason,
+    /// ended the response.
+    completed: bool,
 }
 
 /// Per-stream accumulator for the OpenAI-compatible wire. The chunk-level
@@ -636,12 +663,25 @@ pub(crate) struct AnthropicStreamState {
 pub(crate) struct OpenAiStreamState {
     response_id: Option<String>,
     upstream: Option<String>,
+    /// Set by `[DONE]` or by any `finish_reason`. Some compatible servers
+    /// omit the `[DONE]` sentinel, so a finish reason alone is sufficient.
+    completed: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct BedrockStreamState {
     current_tool_index: usize,
     current_block_is_tool: bool,
+    /// Set when `messageStop` ended the response.
+    completed: bool,
+}
+
+/// Record on `completed` that the parser ended the response.
+fn note_completion(action: crate::sse::SseAction, completed: &mut bool) -> crate::sse::SseAction {
+    if matches!(action, crate::sse::SseAction::Done(_)) {
+        *completed = true;
+    }
+    action
 }
 
 struct OpenAiCompatTransport;
@@ -799,7 +839,7 @@ impl Transport for AnthropicTransport {
             return crate::sse::SseAction::Continue;
         };
 
-        parse_anthropic_sse_line(
+        let action = parse_anthropic_sse_line(
             line,
             provider,
             model,
@@ -810,7 +850,8 @@ impl Transport for AnthropicTransport {
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
             &mut state.pending_response_id,
-        )
+        );
+        note_completion(action, &mut state.completed)
     }
 
     fn parse_chat_response(
@@ -916,7 +957,8 @@ impl Transport for BedrockTransport {
         let StreamState::Bedrock(state) = state else {
             return crate::sse::SseAction::Continue;
         };
-        parse_bedrock_event_payload(payload, provider, model, state)
+        let action = parse_bedrock_event_payload(payload, provider, model, state);
+        note_completion(action, &mut state.completed)
     }
 
     fn parse_chat_response(
@@ -978,7 +1020,7 @@ impl Transport for VertexAnthropicTransport {
             return crate::sse::SseAction::Continue;
         };
 
-        parse_anthropic_sse_line(
+        let action = parse_anthropic_sse_line(
             line,
             provider,
             model,
@@ -989,7 +1031,8 @@ impl Transport for VertexAnthropicTransport {
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
             &mut state.pending_response_id,
-        )
+        );
+        note_completion(action, &mut state.completed)
     }
 
     fn parse_chat_response(
@@ -1519,36 +1562,6 @@ fn stream_error(source: anyhow::Error, reason: FailoverReason) -> LlmError {
             status: None,
         },
     }
-}
-
-/// Recognize an OpenAI-compatible mid-stream error chunk:
-/// `data: {"error":{"message":"…","code":"…","type":"…"}}`. Such a chunk has
-/// no `choices`, so it would otherwise deserialize as an empty chunk and the
-/// stream would end as if the reply were simply short. The reason comes from
-/// the code/type plus message through the shared text classifier, so an
-/// `insufficient_quota` mid-stream is fatal `Billing` just as it is on a 429.
-fn parse_openai_stream_error(data: &str) -> Option<LlmError> {
-    // Cheap pre-check: ordinary delta chunks never carry the key.
-    if !data.contains("\"error\"") {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(data).ok()?;
-    let error = value.get("error")?.as_object()?;
-    let field = |k: &str| match error.get(k) {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-        _ => None,
-    };
-    let code = field("code").or_else(|| field("type"));
-    let message = field("message").unwrap_or_else(|| "unknown error".to_string());
-    let label = code.as_deref().unwrap_or("error");
-    let reason =
-        classify_error_text(&format!("{label} {message}")).unwrap_or(FailoverReason::Unknown);
-    let source = anyhow::anyhow!(
-        "stream error ({label}): {}",
-        crate::security::secrets::redact_secrets(&message)
-    );
-    Some(stream_error(source, reason))
 }
 
 fn parse_bedrock_chat_response(

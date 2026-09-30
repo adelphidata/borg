@@ -96,6 +96,33 @@ function appendAssistant(cells: Cell[], text: string, now: number): Cell[] {
 }
 
 /**
+ * Removes the last `bytes` UTF-8 bytes of `text`.
+ *
+ * The daemon counts a retraction in UTF-8 bytes. A JavaScript string counts
+ * UTF-16 units, so the cut is made on the encoded bytes. It moves down to a
+ * character boundary, and a count larger than the text gives an empty string.
+ */
+export function retractTail(text: string, bytes: number): string {
+  const encoded = new TextEncoder().encode(text);
+  let cut = Math.max(0, encoded.length - bytes);
+  // A continuation byte (10xxxxxx) is inside a character.
+  while (cut > 0 && cut < encoded.length && (encoded[cut]! & 0xc0) === 0x80) cut -= 1;
+  return new TextDecoder().decode(encoded.subarray(0, cut));
+}
+
+/**
+ * Drops the streamed text of a failed LLM attempt from the assistant cell in
+ * progress. The daemon sends the full response again after it.
+ */
+function retractAssistant(cells: Cell[], bytes: number): Cell[] {
+  const last = cells[cells.length - 1];
+  if (!last || last.kind !== "assistant") return cells;
+  const text = retractTail(last.text, bytes);
+  if (text === "") return cells.slice(0, -1);
+  return [...cells.slice(0, -1), { ...last, text }];
+}
+
+/**
  * Closes any still-streaming reasoning block and stamps how long it ran.
  *
  * Called whenever a non-thinking event arrives: the daemon has no
@@ -134,6 +161,7 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
   const base = sealThinking(cells, now);
 
   if (event.textDelta) return appendAssistant(base, event.textDelta.text, now);
+  if (event.textRetracted) return retractAssistant(base, event.textRetracted.bytes);
   if (event.toolExecuting) {
     return [
       ...base,

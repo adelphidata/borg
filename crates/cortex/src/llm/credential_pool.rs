@@ -2171,6 +2171,14 @@ fn seed_env_vars(
         if val.is_empty() {
             continue;
         }
+        if crate::llm::credential_detect::is_placeholder_secret(&val) {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                var = %var,
+                "environment variable holds an example placeholder, not a key; skipping it"
+            );
+            continue;
+        }
         let source = CredentialSource::Env { var: var.clone() };
         if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
             continue;

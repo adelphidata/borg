@@ -10,8 +10,24 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
-/// The single client token `borg web` owns. Re-issued on every run.
-const WEB_TOKEN_LABEL: &str = "web";
+/// Prefix of the client tokens `borg web` owns. Token labels are unique and
+/// a revoked row keeps its label, so each run takes a fresh label and revokes
+/// the earlier ones. The bare `web` label stays free for a token the user
+/// issues by hand.
+const WEB_TOKEN_PREFIX: &str = "web-";
+
+/// Label for the token issued at `now_ms` (unix milliseconds).
+fn web_token_label(now_ms: u128) -> String {
+    format!("{WEB_TOKEN_PREFIX}{now_ms}")
+}
+
+/// Labels of the live tokens an earlier `borg web` issued.
+fn stale_web_labels(rows: &[cortex::auth::tokens::TokenRow]) -> Vec<&str> {
+    rows.iter()
+        .filter(|r| r.revoked_at.is_none() && r.label.starts_with(WEB_TOKEN_PREFIX))
+        .map(|r| r.label.as_str())
+        .collect()
+}
 
 /// The sign-in URL for the web UI served by the gateway at `host:port`.
 ///
@@ -64,13 +80,26 @@ pub(crate) async fn run_web(no_open: bool) -> Result<()> {
     let config = cortex::config::Config::load_from_db()
         .await
         .context("loading gateway settings")?;
-    // One label, reused. Labels are unique, so a fresh token needs the old
-    // one gone first — that also keeps `borg web` from leaving a trail of
-    // live full-access credentials behind, one per run.
-    let label = WEB_TOKEN_LABEL;
-    if let Err(e) = client.revoke_client_token(label).await {
-        tracing::debug!("no earlier `{label}` token to revoke: {e}");
+    // Refuse a remote gateway before any token is touched: a refusal must
+    // not revoke a working token or leave a live one nobody was shown.
+    sign_in_url(&config.gateway.host, config.gateway.port, "")?;
+    // Revoke what earlier runs issued, so `borg web` does not leave a trail
+    // of live full-access credentials behind, one per run.
+    let db = cortex::db::Database::open_readonly()
+        .await
+        .context("reading client tokens")?;
+    let rows = cortex::auth::tokens::list(&db).await?;
+    for stale in stale_web_labels(&rows) {
+        if let Err(e) = client.revoke_client_token(stale).await {
+            tracing::warn!("could not revoke the earlier web token `{stale}`: {e}");
+        }
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("reading the system clock")?
+        .as_millis();
+    let label = web_token_label(now_ms);
+    let label = label.as_str();
     let issued = client
         .issue_client_token(label, "")
         .await
@@ -107,6 +136,29 @@ mod tests {
             !before_hash.contains("token"),
             "token leaked into the request URL: {url}"
         );
+    }
+
+    /// A revoked row keeps its unique label, so a fixed label made the
+    /// second `borg web` fail at the insert. Each run needs its own label,
+    /// and only live tokens of this command are revoked.
+    #[test]
+    fn each_run_takes_a_new_label_and_revokes_only_its_own_live_tokens() {
+        assert_ne!(web_token_label(1), web_token_label(2));
+        let row = |label: &str, revoked_at: Option<i64>| cortex::auth::tokens::TokenRow {
+            id: 0,
+            label: label.to_string(),
+            scopes: String::new(),
+            created_at: 0,
+            last_used_at: None,
+            revoked_at,
+        };
+        let rows = [
+            row(&web_token_label(1), Some(5)),
+            row(&web_token_label(2), None),
+            row("web", None),
+            row("laptop", None),
+        ];
+        assert_eq!(stale_web_labels(&rows), [web_token_label(2).as_str()]);
     }
 
     #[test]

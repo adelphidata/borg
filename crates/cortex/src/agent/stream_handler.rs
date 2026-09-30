@@ -154,6 +154,7 @@ impl Agent {
             StreamEvent::TextDelta(delta) => {
                 if let Some(filtered) = tag_filter.push(&delta) {
                     let redacted = self.maybe_redact(filtered);
+                    self.emitted_text_bytes += redacted.len();
                     // Send errors mean the TUI receiver dropped (e.g. UI torn down mid-turn); the loop keeps running regardless.
                     let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
                 }
@@ -230,6 +231,21 @@ impl Agent {
                 if attempt > 0 {
                     self.metrics.record_llm_retry("retry");
                 }
+                // Each attempt sends the full response again. An attempt
+                // that failed after it emitted output (a connection that
+                // closed before the completion marker, a stall in the middle
+                // of the stream, the attempt before a failover) must leave
+                // nothing in the collectors: the saved message holds the
+                // output of the attempt that completes, and only that.
+                // On the first attempt the collectors are empty already.
+                // The consumers hold the deltas of the failed attempt too;
+                // the retraction goes out before the new attempt's marker.
+                self.retract_emitted_text(event_tx).await;
+                *tag_filter = InternalTagFilter::new();
+                tool_calls.clear();
+                *truncated_due_to_length = false;
+                self.tool_intent_signalled = false;
+                self.turn_reasoning.clear();
                 if event_tx
                     .send(AgentEvent::LlmAttemptStarted { attempt })
                     .await
@@ -291,6 +307,23 @@ impl Agent {
             }
         }
         StreamEventOutcome::Continue
+    }
+
+    /// Tell the consumers to drop the text deltas of the current iteration,
+    /// because the agent discards the output that produced them. Sends
+    /// nothing when no visible text went out.
+    pub(super) async fn retract_emitted_text(&mut self, event_tx: &mpsc::Sender<AgentEvent>) {
+        let bytes = std::mem::take(&mut self.emitted_text_bytes);
+        if bytes == 0 {
+            return;
+        }
+        if event_tx
+            .send(AgentEvent::TextRetracted { bytes })
+            .await
+            .is_err()
+        {
+            trace!("Event channel closed, could not deliver text retraction");
+        }
     }
 
     /// Finalize a text-only response: fire TurnComplete hook, persist, auto-save,
@@ -537,6 +570,306 @@ mod tests {
             None,
             "a reconnect kind would double-count the attempt AttemptStarted already reports"
         );
+    }
+
+    /// Spec: the saved assistant message holds the output of the attempt
+    /// that completes, and only that.
+    ///
+    /// The event order is the one the client emits when the first attempt
+    /// sends output and the connection closes before the completion marker:
+    /// no `Done`, a reconnect notice, then a new attempt with the full answer.
+    #[tokio::test]
+    async fn a_retry_after_partial_output_saves_only_the_final_attempt() {
+        use crate::agent::AgentEvent;
+        use crate::internal_tag_filter::InternalTagFilter;
+        use crate::llm::StreamEvent;
+
+        let mut agent = crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut tag_filter = InternalTagFilter::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None;
+        let mut truncated = false;
+
+        let delta = |text: &str| StreamEvent::TextDelta(text.to_string());
+        for event in [
+            StreamEvent::AttemptStarted { attempt: 0 },
+            delta("The answer is fo"),
+            StreamEvent::ThinkingDelta("first attempt thought".to_string()),
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: "{\"path\":\"/tm".to_string(),
+            },
+            StreamEvent::Truncated,
+            StreamEvent::ToolIntent,
+            StreamEvent::Reconnecting {
+                attempt: 0,
+                delay_secs: 5,
+            },
+            StreamEvent::AttemptStarted { attempt: 1 },
+            delta("The answer is "),
+            delta("forty-two."),
+            StreamEvent::Done,
+        ] {
+            agent
+                .handle_stream_event(
+                    event,
+                    &mut tag_filter,
+                    &mut tool_calls,
+                    &mut stream_error,
+                    &mut truncated,
+                    &event_tx,
+                )
+                .await;
+        }
+
+        assert!(
+            tool_calls.is_empty(),
+            "a half tool call of the failed attempt must not run"
+        );
+        assert!(!truncated, "the length cut belongs to the failed attempt");
+        assert!(!agent.tool_intent_signalled);
+        assert!(agent.turn_reasoning.is_empty());
+        assert_eq!(tag_filter.full_clean(), "The answer is forty-two.");
+
+        agent
+            .handle_text_only_response(&tag_filter.full_clean(), None, false, false, &event_tx)
+            .await;
+        let saved: Vec<&str> = agent
+            .history
+            .iter()
+            .filter(|m| matches!(m.role, crate::types::Role::Assistant))
+            .filter_map(|m| m.text_content())
+            .collect();
+        assert_eq!(saved, vec!["The answer is forty-two."]);
+
+        // The surface learns about the new attempt through the existing
+        // event, after the deltas of the failed attempt.
+        let mut seen = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::TextDelta(text) => seen.push(format!("text:{text}")),
+                AgentEvent::LlmAttemptStarted { attempt } => {
+                    seen.push(format!("attempt:{attempt}"))
+                }
+                AgentEvent::TextRetracted { bytes } => seen.push(format!("retract:{bytes}")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "attempt:0",
+                "text:The answer is fo",
+                "retract:16",
+                "attempt:1",
+                "text:The answer is ",
+                "text:forty-two.",
+            ]
+        );
+    }
+
+    /// Drive `events` through the handler and return the text events and
+    /// retractions that a consumer receives, in order.
+    async fn consumer_view(
+        agent: &mut crate::agent::Agent,
+        events: Vec<crate::llm::StreamEvent>,
+    ) -> Vec<String> {
+        use crate::agent::AgentEvent;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut tag_filter = crate::internal_tag_filter::InternalTagFilter::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None;
+        let mut truncated = false;
+        for event in events {
+            agent
+                .handle_stream_event(
+                    event,
+                    &mut tag_filter,
+                    &mut tool_calls,
+                    &mut stream_error,
+                    &mut truncated,
+                    &event_tx,
+                )
+                .await;
+        }
+        let mut seen = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::TextDelta(text) => seen.push(format!("text:{text}")),
+                AgentEvent::TextRetracted { bytes } => seen.push(format!("retract:{bytes}")),
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    /// Spec: a retraction goes out only when a new attempt discards text
+    /// that the consumers hold, and its size is the UTF-8 length of that
+    /// text as it was sent.
+    #[tokio::test]
+    async fn a_retraction_is_sent_only_for_discarded_visible_text() {
+        use crate::llm::StreamEvent;
+        let delta = |text: &str| StreamEvent::TextDelta(text.to_string());
+        let attempt = |attempt| StreamEvent::AttemptStarted { attempt };
+        let thought = || StreamEvent::ThinkingDelta("hidden".to_string());
+        let half_call = || StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".to_string()),
+            name: Some("read_file".to_string()),
+            arguments_delta: "{".to_string(),
+        };
+
+        // (name, stream events, consumer view)
+        let cases: Vec<(&str, Vec<StreamEvent>, Vec<&str>)> = vec![
+            (
+                "first attempt",
+                vec![attempt(0), delta("hello"), StreamEvent::Done],
+                vec!["text:hello"],
+            ),
+            (
+                "retry with no visible text",
+                vec![attempt(0), thought(), half_call(), attempt(1), delta("ok")],
+                vec!["text:ok"],
+            ),
+            (
+                "retry after text held back by the tag filter",
+                vec![
+                    attempt(0),
+                    delta("<internal>secret"),
+                    attempt(1),
+                    delta("ok"),
+                ],
+                vec!["text:ok"],
+            ),
+            (
+                "multi-byte text counts bytes, not chars",
+                vec![
+                    attempt(0),
+                    delta("caf\u{e9} "),
+                    delta("\u{1f600}"),
+                    attempt(1),
+                ],
+                vec!["text:caf\u{e9} ", "text:\u{1f600}", "retract:10"],
+            ),
+            (
+                "a second retry retracts only the second attempt",
+                vec![
+                    attempt(0),
+                    delta("abc"),
+                    attempt(1),
+                    delta("abcde"),
+                    attempt(2),
+                    delta("done"),
+                ],
+                vec![
+                    "text:abc",
+                    "retract:3",
+                    "text:abcde",
+                    "retract:5",
+                    "text:done",
+                ],
+            ),
+            (
+                "the first attempt of a fallback leg retracts the failed leg",
+                vec![
+                    attempt(0),
+                    delta("partial"),
+                    StreamEvent::Failover {
+                        provider: "p".to_string(),
+                        model: "m".to_string(),
+                    },
+                    attempt(0),
+                    delta("full"),
+                ],
+                vec!["text:partial", "retract:7", "text:full"],
+            ),
+        ];
+        for (name, events, want) in cases {
+            let mut agent =
+                crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+            let seen = consumer_view(&mut agent, events).await;
+            assert_eq!(seen, want, "{name}");
+        }
+    }
+
+    /// Spec: the retraction counts the text as the consumers received it.
+    /// Redaction changes the length, so the raw length is the wrong size.
+    #[tokio::test]
+    async fn a_retraction_counts_the_redacted_text() {
+        use crate::llm::StreamEvent;
+        let mut config = crate::config::Config::default();
+        config.security.secret_detection = true;
+        let mut agent = crate::agent::tests::minimal_test_agent(config);
+        let secret = "key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH end";
+        let seen = consumer_view(
+            &mut agent,
+            vec![
+                StreamEvent::AttemptStarted { attempt: 0 },
+                StreamEvent::TextDelta(secret.to_string()),
+                StreamEvent::AttemptStarted { attempt: 1 },
+            ],
+        )
+        .await;
+        let sent = seen[0].strip_prefix("text:").expect("text first");
+        assert_ne!(sent, secret, "the fixture must trigger redaction");
+        assert_ne!(sent.len(), secret.len(), "redaction must change the length");
+        assert_eq!(seen[1], format!("retract:{}", sent.len()));
+    }
+
+    /// Spec: text of an earlier tool iteration stays. The loop sets the
+    /// count to zero when an iteration starts, so attempt 0 of the next
+    /// iteration retracts nothing.
+    #[tokio::test]
+    async fn a_new_tool_iteration_retracts_nothing() {
+        use crate::llm::StreamEvent;
+        let mut agent = crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+        let first = consumer_view(
+            &mut agent,
+            vec![
+                StreamEvent::AttemptStarted { attempt: 0 },
+                StreamEvent::TextDelta("I will read the file.".to_string()),
+                StreamEvent::Done,
+            ],
+        )
+        .await;
+        assert_eq!(first, vec!["text:I will read the file."]);
+        // What `run_agent_loop` does at the top of each iteration.
+        agent.emitted_text_bytes = 0;
+        let second = consumer_view(
+            &mut agent,
+            vec![
+                StreamEvent::AttemptStarted { attempt: 0 },
+                StreamEvent::TextDelta("Done.".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(second, vec!["text:Done."]);
+    }
+
+    #[test]
+    fn retract_text_tail_is_safe_on_any_buffer() {
+        use crate::agent::retract_text_tail;
+        // (buffer, bytes, result)
+        let cases = [
+            ("The answer is fo", 16, ""),
+            ("Earlier text. partial", 7, "Earlier text. "),
+            ("caf\u{e9} \u{1f600}", 4, "caf\u{e9} "),
+            // A cut inside a char moves down to the boundary.
+            ("a\u{1f600}", 2, "a"),
+            ("ab\u{e9}", 1, "ab"),
+            // A shorter buffer becomes empty.
+            ("short", 500, ""),
+            ("", 3, ""),
+            ("keep", 0, "keep"),
+        ];
+        for (buffer, bytes, want) in cases {
+            let mut text = buffer.to_string();
+            retract_text_tail(&mut text, bytes);
+            assert_eq!(text, want, "{buffer:?} minus {bytes}");
+        }
     }
 
     // -- stale-stream circuit breaker --

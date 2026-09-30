@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -27,6 +28,36 @@ const MEDIA_SEND_TIMEOUT: Duration = crate::constants::TELEGRAM_MEDIA_SEND_TIMEO
 const MAX_SEND_RETRIES: u32 = crate::constants::TELEGRAM_MAX_SEND_RETRIES;
 const FLOOD_FAIL_FAST_SECS: u64 = crate::constants::TELEGRAM_FLOOD_FAIL_FAST_SECS;
 
+/// Longest per-chat flood cooldown that the client keeps, whatever wait
+/// Telegram names.
+const FLOOD_COOLDOWN_CAP: Duration = Duration::from_secs(300);
+
+/// A `sendMessage` failure that the caller must tell apart from the rest.
+///
+/// Attached to the `anyhow` error so callers can `downcast_ref` it. All other
+/// failures (transport, auth, circuit breaker) stay untyped.
+#[derive(Debug, thiserror::Error)]
+pub enum TelegramSendError {
+    /// Telegram refused the markup of the text. The same text sent with no
+    /// parse mode can succeed.
+    #[error("{0}")]
+    Markup(String),
+    /// Telegram flood control refused the send. A second call inside the
+    /// window can extend the penalty.
+    #[error("{message}")]
+    Flood {
+        /// Seconds until Telegram accepts a send to this chat again.
+        retry_after_secs: u64,
+        /// Text of the error.
+        message: String,
+    },
+}
+
+/// True when Telegram refused a send because it could not parse the markup.
+fn is_markup_rejection(status: u16, description: &str) -> bool {
+    status == 400 && description.to_lowercase().contains("can't parse entities")
+}
+
 /// A client for the Telegram Bot API.
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -34,6 +65,9 @@ pub struct TelegramClient {
     token: String,
     base_url: String,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Per-chat time before which text sends are refused locally, set when
+    /// Telegram flood control refuses a send. Shared between clones.
+    flood_until: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 impl TelegramClient {
@@ -56,6 +90,46 @@ impl TelegramClient {
                 cortex::constants::TELEGRAM_CIRCUIT_FAILURE_THRESHOLD,
                 cortex::constants::TELEGRAM_CIRCUIT_SUSPENSION_SECS,
             )),
+            flood_until: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Seconds that remain of the flood cooldown of a chat, if one is active.
+    /// An expired entry is removed.
+    fn flood_cooldown_remaining(&self, chat_id: i64) -> Option<u64> {
+        let mut map = self
+            .flood_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = map.get(&chat_id)?.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            map.remove(&chat_id);
+            return None;
+        }
+        // Round up, so a part of a second does not report as 0.
+        Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
+    }
+
+    /// Record a flood refusal for a chat and build the typed error.
+    ///
+    /// The same call removes the expired entries of all chats. A chat that
+    /// does not send again never reaches the removal in
+    /// `flood_cooldown_remaining`, so without this the map grows for the
+    /// life of the process.
+    fn flood_error(&self, chat_id: i64, retry_after_secs: u64, message: String) -> anyhow::Error {
+        let wait = Duration::from_secs(retry_after_secs).min(FLOOD_COOLDOWN_CAP);
+        let now = Instant::now();
+        {
+            let mut map = self
+                .flood_until
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.retain(|_, until| *until > now);
+            map.insert(chat_id, now + wait);
+        }
+        anyhow::Error::new(TelegramSendError::Flood {
+            retry_after_secs,
+            message,
         })
     }
 
@@ -141,6 +215,16 @@ impl TelegramClient {
         if self.circuit_breaker.is_open() {
             bail!("Telegram circuit breaker open, skipping send_message");
         }
+        if let Some(remaining) = self.flood_cooldown_remaining(chat_id) {
+            // Telegram refused this chat a moment ago. A call inside the
+            // window can extend the penalty, so make none.
+            return Err(anyhow::Error::new(TelegramSendError::Flood {
+                retry_after_secs: remaining,
+                message: format!(
+                    "sendMessage flood-limited for {remaining}s — chat is in flood cooldown, no request sent"
+                ),
+            }));
+        }
 
         let body = SendMessageRequest {
             chat_id,
@@ -193,19 +277,27 @@ impl TelegramClient {
             }
 
             if status.as_u16() == 429 {
+                let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
                 if retries_exhausted(&mut attempts) {
                     self.circuit_breaker.record_failure_status(429);
-                    bail!("sendMessage rate limited after {MAX_SEND_RETRIES} retries");
+                    return Err(self.flood_error(
+                        chat_id,
+                        retry_secs,
+                        format!("sendMessage rate limited after {MAX_SEND_RETRIES} retries"),
+                    ));
                 }
-                let retry_secs = resp_body.retry_after_secs().unwrap_or(5);
                 if flood_should_fail_fast(retry_secs) {
                     // A long flood wait must fail closed, not sleep: this send
                     // is awaited inline on the polling loop, so sleeping here
                     // freezes every chat on the bot for the whole wait.
                     self.circuit_breaker.record_failure_status(429);
-                    bail!(
-                        "sendMessage flood-limited for {retry_secs}s — failing fast instead of blocking the send path"
-                    );
+                    return Err(self.flood_error(
+                        chat_id,
+                        retry_secs,
+                        format!(
+                            "sendMessage flood-limited for {retry_secs}s — failing fast instead of blocking the send path"
+                        ),
+                    ));
                 }
                 let jitter_ms = (std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -221,13 +313,14 @@ impl TelegramClient {
             }
 
             self.circuit_breaker.record_failure_status(status.as_u16());
-            bail!(
-                "sendMessage failed ({}): {}",
-                status.as_u16(),
-                resp_body
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            );
+            let description = resp_body
+                .description
+                .unwrap_or_else(|| "unknown error".into());
+            let message = format!("sendMessage failed ({}): {description}", status.as_u16());
+            if is_markup_rejection(status.as_u16(), &description) {
+                return Err(anyhow::Error::new(TelegramSendError::Markup(message)));
+            }
+            bail!(message);
         }
     }
 
@@ -1204,6 +1297,141 @@ mod tests {
             started.elapsed() < Duration::from_secs(FLOOD_FAIL_FAST_SECS),
             "fail-fast must not sleep through the flood wait"
         );
+    }
+
+    /// After a flood refusal, sends to that chat make no request until the
+    /// window ends (a call inside the window can extend the penalty). Other
+    /// chats are not affected, and the chat opens again after the window.
+    #[tokio::test]
+    async fn flood_refusal_starts_a_cooldown_for_that_chat_only() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .and(body_string_contains("\"chat_id\":7,"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Too Many Requests: retry after 60",
+                "parameters": { "retry_after": 60 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let first = client
+            .send_message(7, "one", None, None, None)
+            .await
+            .expect_err("flood refusal");
+        assert!(matches!(
+            first.downcast_ref::<TelegramSendError>(),
+            Some(TelegramSendError::Flood {
+                retry_after_secs: 60,
+                ..
+            })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // Same chat, through a clone: refused locally, no request.
+        let second = client
+            .clone()
+            .send_message(7, "two", None, None, None)
+            .await
+            .expect_err("chat is in cooldown");
+        match second.downcast_ref::<TelegramSendError>() {
+            Some(TelegramSendError::Flood {
+                retry_after_secs, ..
+            }) => assert!(
+                (1..=60).contains(retry_after_secs),
+                "remaining wait, got {retry_after_secs}"
+            ),
+            other => panic!("expected Flood, got {other:?}"),
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        // A different chat is not in cooldown.
+        client
+            .send_message(8, "three", None, None, None)
+            .await
+            .expect("other chat sends");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        // End of the window: the chat sends to the API again.
+        client
+            .flood_until
+            .lock()
+            .unwrap()
+            .insert(7, Instant::now() - Duration::from_secs(1));
+        assert!(client
+            .send_message(7, "four", None, None, None)
+            .await
+            .is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// The cooldown never exceeds the cap, whatever wait Telegram names.
+    #[test]
+    fn flood_cooldown_is_capped() {
+        let client = TelegramClient::with_base("123:ABC", "http://127.0.0.1:1").unwrap();
+        let _err = client.flood_error(7, 86_400, "flood".into());
+        let remaining = client.flood_cooldown_remaining(7).expect("cooldown set");
+        assert!(
+            remaining <= FLOOD_COOLDOWN_CAP.as_secs()
+                && remaining > FLOOD_COOLDOWN_CAP.as_secs() - 5,
+            "got {remaining}"
+        );
+        assert_eq!(client.flood_cooldown_remaining(8), None);
+    }
+
+    /// A chat that had a flood refusal and never sends again must not keep
+    /// its entry for the life of the process.
+    #[test]
+    fn a_new_flood_entry_removes_the_expired_entries_of_other_chats() {
+        let client = TelegramClient::with_base("123:ABC", "http://127.0.0.1:1").unwrap();
+        {
+            let mut map = client.flood_until.lock().unwrap();
+            map.insert(1, Instant::now() - Duration::from_secs(1));
+            map.insert(2, Instant::now() - Duration::from_secs(90));
+            map.insert(3, Instant::now() + Duration::from_secs(60));
+        }
+
+        let _err = client.flood_error(4, 30, "flood".into());
+
+        let mut chats: Vec<i64> = client.flood_until.lock().unwrap().keys().copied().collect();
+        chats.sort_unstable();
+        assert_eq!(
+            chats,
+            vec![3, 4],
+            "expired entries go, active entries and the new entry stay"
+        );
+        assert!(client.flood_cooldown_remaining(3).is_some());
+    }
+
+    #[test]
+    fn markup_rejection_classification() {
+        let cases = [
+            (400, "Bad Request: can't parse entities: Unclosed tag", true),
+            (400, "Bad Request: CAN'T PARSE ENTITIES", true),
+            (400, "Bad Request: chat not found", false),
+            (429, "can't parse entities", false),
+            (500, "can't parse entities", false),
+        ];
+        for (status, description, expected) in cases {
+            assert_eq!(
+                is_markup_rejection(status, description),
+                expected,
+                "{status} {description}"
+            );
+        }
     }
 
     /// A short flood wait (≤ the fail-fast threshold) is still worth riding

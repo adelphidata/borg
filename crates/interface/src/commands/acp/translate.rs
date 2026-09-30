@@ -146,8 +146,11 @@ pub(super) struct ToolCallStreams {
     /// happens at frame-build time so `<internal>` tags split across two
     /// deltas are still removed once reassembled.
     output: HashMap<String, String>,
-    /// Calls that already reported `completed`.
+    /// Calls that already reported a terminal status.
     completed: HashSet<String>,
+    /// Calls announced as `in_progress` with no result yet, in the order
+    /// they started.
+    open: Vec<String>,
 }
 
 impl ToolCallStreams {
@@ -192,13 +195,47 @@ impl ToolCallStreams {
                     }
                 }))
             }
+            AgentEvent::ToolExecuting { tool_call_id, .. } => {
+                if !self.open.contains(tool_call_id) {
+                    self.open.push(tool_call_id.clone());
+                }
+                event_to_update(event, session_id)
+            }
             AgentEvent::ToolResult { tool_call_id, .. } => {
                 self.output.remove(tool_call_id);
+                self.open.retain(|id| id != tool_call_id);
                 self.completed.insert(tool_call_id.clone());
                 event_to_update(event, session_id)
             }
             _ => event_to_update(event, session_id),
         }
+    }
+
+    /// Close every call that has no result, for the end of a turn.
+    ///
+    /// A turn that ends on a cancel, an error or a lost daemon connection
+    /// sends no `ToolResult` for a call in flight, and the client would show
+    /// that card as running forever. Each frame carries `status: failed` and
+    /// no `content` key: `content` replaces the collection, so an absent key
+    /// keeps the output that was streamed to the card. The ids are then
+    /// closed, so a late delta cannot open a card again.
+    pub(super) fn drain_open(&mut self, session_id: &str) -> Vec<Value> {
+        std::mem::take(&mut self.open)
+            .into_iter()
+            .map(|tool_call_id| {
+                self.output.remove(&tool_call_id);
+                let frame = json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_call_id,
+                        "status": "failed",
+                    }
+                });
+                self.completed.insert(tool_call_id);
+                frame
+            })
+            .collect()
     }
 }
 

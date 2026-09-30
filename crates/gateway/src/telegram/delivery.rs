@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::health::ChannelHealthRegistry;
 use crate::voice::{should_send_voice_reply, VoiceReplyMode};
 
-use super::api::TelegramClient;
+use super::api::{TelegramClient, TelegramSendError};
 
 /// Telegram's voice-message bubble expects OGG/Opus. Synth providers that
 /// don't natively emit Opus (Edge always returns MP3, Piper returns WAV,
@@ -450,6 +450,10 @@ pub async fn send_response(
     // message as plain text, duplicating every chunk already delivered.
     // Fallback is now per-chunk: only the failing chunk degrades to plain
     // text; delivered chunks are never re-sent.
+    //
+    // The fallback is for a markup rejection only. A flood refusal, a timeout
+    // or a transport error is not repaired by plain text, and a second call
+    // inside a flood window can extend the penalty.
     for (i, (chunk, html)) in plan_render_chunks(response_text).into_iter().enumerate() {
         // Only reply to the original message on the first chunk.
         let reply_id = if i == 0 { reply_to } else { None };
@@ -457,6 +461,16 @@ pub async fn send_response(
             .send_message(chat_id, &html, Some("HTML"), thread_id, reply_id)
             .await
         {
+            if !matches!(
+                e.downcast_ref::<TelegramSendError>(),
+                Some(TelegramSendError::Markup(_))
+            ) {
+                health
+                    .write()
+                    .await
+                    .record_error("telegram", &e.to_string());
+                return Err(e);
+            }
             warn!("HTML send failed for chunk {i}, retrying that chunk as plain text: {e}");
             if let Err(e2) = client
                 .send_message(chat_id, &chunk, None, thread_id, reply_id)
@@ -819,5 +833,101 @@ mod chunked_send_tests {
             marker_plain_sends, 1,
             "failing chunk must be retried as plain text exactly once"
         );
+    }
+
+    /// The plain-text fallback repairs a markup rejection only. For every
+    /// other failure of the HTML send, a second call cannot help, and inside
+    /// a flood window it can extend the penalty: exactly one request goes out.
+    #[tokio::test]
+    async fn non_markup_failure_is_not_retried_as_plain_text() {
+        let cases = [
+            (
+                "flood refusal",
+                429,
+                serde_json::json!({
+                    "ok": false,
+                    "description": "Too Many Requests: retry after 60",
+                    "parameters": { "retry_after": 60 }
+                }),
+                "flood-limited for 60s",
+            ),
+            (
+                "bad request that is not a markup rejection",
+                400,
+                serde_json::json!({
+                    "ok": false,
+                    "description": "Bad Request: chat not found"
+                }),
+                "chat not found",
+            ),
+            (
+                "forbidden",
+                403,
+                serde_json::json!({
+                    "ok": false,
+                    "description": "Forbidden: bot was blocked by the user"
+                }),
+                "bot was blocked",
+            ),
+        ];
+        for (name, status, body, expected) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/bot123:ABC/sendMessage"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let client = super::super::api::TelegramClient::with_base("123:ABC", &server.uri())
+                .expect("client");
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+
+            let err = send_response(&client, 7, "hello", None, None, false, None, &health, None)
+                .await
+                .expect_err(name);
+            assert!(err.to_string().contains(expected), "{name}: {err}");
+
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(requests.len(), 1, "{name}: no plain-text retry");
+            assert!(
+                String::from_utf8_lossy(&requests[0].body).contains("\"parse_mode\":\"HTML\""),
+                "{name}: the one request is the HTML send"
+            );
+        }
+    }
+
+    /// The markup match does not depend on letter case.
+    #[tokio::test]
+    async fn markup_rejection_in_other_letter_case_falls_back_to_plain_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .and(body_string_contains("\"parse_mode\":\"HTML\""))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: Can't Parse Entities: unclosed tag"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client =
+            super::super::api::TelegramClient::with_base("123:ABC", &server.uri()).expect("client");
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+
+        send_response(&client, 7, "hello", None, None, false, None, &health, None)
+            .await
+            .expect("plain-text fallback must deliver");
+
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 2);
+        assert!(!String::from_utf8_lossy(&requests[1].body).contains("parse_mode"));
     }
 }

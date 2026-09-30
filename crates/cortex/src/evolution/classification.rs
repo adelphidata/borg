@@ -733,20 +733,7 @@ pub async fn generate_evolution_name(
                 .await
                 .map_err(|e| anyhow::anyhow!("stream_chat: {e}"))
         };
-        let collect_task = async {
-            let mut acc = String::new();
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    crate::llm::StreamEvent::TextDelta(s) => acc.push_str(&s),
-                    crate::llm::StreamEvent::Done => break,
-                    crate::llm::StreamEvent::Error(e) => {
-                        return Err(anyhow::anyhow!("stream error: {e}"))
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<String, anyhow::Error>(acc)
-        };
+        let collect_task = collect_name_stream(&mut rx);
 
         let (_, accumulated) = tokio::try_join!(llm_task, collect_task)?;
         parse_name_response(&accumulated)
@@ -763,6 +750,27 @@ pub async fn generate_evolution_name(
             fallback
         }
     }
+}
+
+/// Collect the naming stream into the text of the attempt that completes.
+async fn collect_name_stream(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::llm::StreamEvent>,
+) -> anyhow::Result<String> {
+    use crate::llm::StreamEvent;
+    let mut acc = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StreamEvent::TextDelta(s) => acc.push_str(&s),
+            // Each attempt sends the full reply again. The partial JSON of a
+            // failed attempt in front of the complete reply does not parse
+            // to the name that the model gave.
+            StreamEvent::AttemptStarted { .. } => acc.clear(),
+            StreamEvent::Done => break,
+            StreamEvent::Error(e) => return Err(anyhow::anyhow!("stream error: {e}")),
+            _ => {}
+        }
+    }
+    Ok(acc)
 }
 
 /// Parse the LLM response into (name, description). Accepts raw JSON or JSON
@@ -852,6 +860,39 @@ fn archetype_fallback_description(archetype: Archetype) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec: the name comes from the attempt that completes. The partial
+    /// JSON of a failed attempt must not stay in front of the full reply.
+    #[tokio::test]
+    async fn a_retry_after_partial_output_names_from_the_final_attempt() {
+        use crate::llm::StreamEvent;
+        let delta = |text: &str| StreamEvent::TextDelta(text.to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for event in [
+            StreamEvent::AttemptStarted { attempt: 0 },
+            delta(r#"{"name":"Half Name","description":"A cut"#),
+            StreamEvent::Reconnecting {
+                attempt: 0,
+                delay_secs: 1,
+            },
+            StreamEvent::AttemptStarted { attempt: 1 },
+            delta(r#"{"name":"Pipeline Warden","#),
+            delta(r#""description":"A guardian."}"#),
+            StreamEvent::Done,
+        ] {
+            tx.send(event).await.expect("send");
+        }
+        drop(tx);
+
+        let text = collect_name_stream(&mut rx).await.expect("stream ok");
+        assert_eq!(
+            text,
+            r#"{"name":"Pipeline Warden","description":"A guardian."}"#
+        );
+        let (name, description) = parse_name_response(&text).expect("valid reply");
+        assert_eq!(name, "Pipeline Warden");
+        assert_eq!(description, "A guardian.");
+    }
 
     #[test]
     fn parse_strict_json() {

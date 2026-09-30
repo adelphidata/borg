@@ -1069,6 +1069,46 @@ fn preparing_event_adds_thinking_cell() {
     ));
 }
 
+/// Spec: the transcript shows the text of the attempt that completes. The
+/// text of an earlier tool iteration stays.
+#[test]
+fn a_text_retraction_removes_the_streamed_partial() {
+    let assistant_texts = |app: &App| -> Vec<String> {
+        app.cells
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::Assistant { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let mut app = make_app();
+    app.process_agent_event(AgentEvent::TextDelta("The answer is f\u{f6}".into()));
+    app.process_agent_event(AgentEvent::TextRetracted { bytes: 17 });
+    assert!(
+        assistant_texts(&app).is_empty(),
+        "an empty assistant cell must not stay"
+    );
+    app.process_agent_event(AgentEvent::TextDelta("The answer is forty-two.".into()));
+    assert_eq!(assistant_texts(&app), vec!["The answer is forty-two."]);
+
+    let mut app = make_app();
+    app.process_agent_event(AgentEvent::TextDelta("I will check. ".into()));
+    app.process_agent_event(AgentEvent::TextDelta("It is fo".into()));
+    app.process_agent_event(AgentEvent::TextRetracted { bytes: 8 });
+    app.process_agent_event(AgentEvent::TextDelta("It is forty-two.".into()));
+    assert_eq!(
+        assistant_texts(&app),
+        vec!["I will check. It is forty-two."]
+    );
+
+    // With no assistant cell there is nothing to remove.
+    let mut app = make_app();
+    app.process_agent_event(AgentEvent::TextRetracted { bytes: 5 });
+    assert!(assistant_texts(&app).is_empty());
+}
+
 #[test]
 fn text_delta_removes_preparing_placeholder() {
     let mut app = make_app();

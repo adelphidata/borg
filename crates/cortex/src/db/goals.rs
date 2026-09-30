@@ -306,8 +306,9 @@ pub struct GoalGate {
     pub last_exit_code: Option<i64>,
     /// Bounded tail of the last run's combined output.
     pub last_output: Option<String>,
-    /// Workspace fingerprint the last run saw. A later run against the same
-    /// fingerprint replays the recorded verdict instead of re-running.
+    /// Workspace fingerprint the last run saw. A later failure against a
+    /// different fingerprint counts as progress for the retry cap. It never
+    /// decides whether the gate runs.
     pub last_fingerprint: Option<String>,
     /// Unix seconds.
     pub created_at: i64,

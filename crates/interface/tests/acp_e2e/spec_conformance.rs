@@ -31,7 +31,7 @@ static SCHEMA_ROOT: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
 });
 
 /// Build a validator for one `$defs` entry of the vendored schema.
-fn validator_for_def(def: &str) -> jsonschema::Validator {
+pub(super) fn validator_for_def(def: &str) -> jsonschema::Validator {
     let subschema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$defs": &SCHEMA_ROOT["$defs"],
@@ -41,7 +41,7 @@ fn validator_for_def(def: &str) -> jsonschema::Validator {
         .unwrap_or_else(|e| panic!("compile validator for {def}: {e}"))
 }
 
-fn assert_valid(validator: &jsonschema::Validator, instance: &Value, context: &str) {
+pub(super) fn assert_valid(validator: &jsonschema::Validator, instance: &Value, context: &str) {
     let errors: Vec<String> = validator
         .iter_errors(instance)
         .map(|e| format!("  at {}: {e}", e.instance_path()))

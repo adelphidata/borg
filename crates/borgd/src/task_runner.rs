@@ -1042,22 +1042,54 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
     }
 }
 
+/// Redact `text` before a task run stores it.
+///
+/// The stored result is replayed by continuity, shown by `borg tasks` and
+/// sent to the delivery channel, so the secret must be gone before the first
+/// of those. The sink is the channel only when delivery can really happen
+/// (a channel and a target); otherwise the text is only persisted and the
+/// audit row must not claim a send.
+fn redact_for_run<'a>(
+    delivery: Option<(&str, &str)>,
+    task_id: &str,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    let sink = match delivery {
+        Some((channel, _)) => cortex::output_redaction::OutputSink::Channel(channel),
+        None => cortex::output_redaction::OutputSink::Log,
+    };
+    cortex::output_redaction::current_policy().apply(sink, Some(task_id), text)
+}
+
 /// How many previous runs a continuity-enabled task sees.
 ///
 /// Enough to notice a trend, few enough that a daily task does not spend its
 /// whole context window on its own history.
 const CONTINUITY_RUNS: usize = 3;
 
+/// How many stored results are read to find [`CONTINUITY_RUNS`] useful ones.
+///
+/// A monitor-style task is silent on most ticks, and silent runs are dropped
+/// after the read. The page is bounded so a task that was silent for months
+/// does not load its whole history.
+const CONTINUITY_LOOKBACK_RUNS: usize = CONTINUITY_RUNS * 8;
+
 /// Longest slice of a previous run's result that is replayed. A run that
 /// produced pages of output is still useful in summary, and the current run's
 /// own work is what the context is for.
 const CONTINUITY_RESULT_CHARS: usize = 2_000;
 
-/// Replay prior runs as alternating turns, oldest first.
+/// Replay the newest [`CONTINUITY_RUNS`] useful prior runs as alternating
+/// turns, oldest first. `runs` is newest first.
 ///
 /// Only runs that produced a result are replayed: a failed or missed run has
 /// nothing to say about the subject, and presenting its error as though the
 /// model had said it would be a lie about its own history.
+///
+/// A silent run (`[SILENT]`, `HEARTBEAT_OK`) is not replayed either. It was
+/// never delivered, it says nothing about the subject, and a window full of
+/// silence markers both hides the last real report and teaches the model to
+/// stay silent.
 ///
 /// Each replayed result is wrapped in a `<prior_run_output>` element rather
 /// than handed over as bare assistant text. A scheduled task's output
@@ -1069,11 +1101,16 @@ fn continuity_messages(
     runs: &[cortex::db::TaskRunRow],
     task_prompt: &str,
 ) -> Vec<cortex::types::Message> {
+    let mut useful: Vec<&str> = runs
+        .iter()
+        .filter_map(|run| run.result.as_deref())
+        .filter(|r| !r.trim().is_empty() && !is_silent_response(r))
+        .take(CONTINUITY_RUNS)
+        .collect();
+    useful.reverse();
+
     let mut out = Vec::new();
-    for run in runs.iter().rev() {
-        let Some(result) = run.result.as_deref().filter(|r| !r.trim().is_empty()) else {
-            continue;
-        };
+    for result in useful {
         out.push(cortex::types::Message::user(task_prompt));
         // A stored result routinely carries fetched material (web pages, mail
         // bodies); escape any smuggled closing tag so it cannot break out of
@@ -1087,14 +1124,21 @@ fn continuity_messages(
     out
 }
 
-/// Truncate on a char boundary, marking that it happened so the model does
-/// not read the cut as the end of what it said.
+/// Clip a long result to its head and its tail, on char boundaries.
+///
+/// A report states its conclusion last, so a head-only cut drops the part
+/// that matters most. The marker makes the cut visible so the model does not
+/// read the joined halves as one continuous text.
 fn truncate_for_continuity(result: &str) -> String {
-    if result.chars().count() <= CONTINUITY_RESULT_CHARS {
+    let total = result.chars().count();
+    if total <= CONTINUITY_RESULT_CHARS {
         return result.to_string();
     }
-    let kept: String = result.chars().take(CONTINUITY_RESULT_CHARS).collect();
-    format!("{kept}\n[earlier run's output truncated]")
+    let half = CONTINUITY_RESULT_CHARS / 2;
+    let omitted = total - 2 * half;
+    let head: String = result.chars().take(half).collect();
+    let tail: String = result.chars().skip(total - half).collect();
+    format!("{head}\n[... {omitted} chars omitted ...]\n{tail}")
 }
 
 async fn execute_prompt_task(ctx: &TaskExecContext) {
@@ -1257,7 +1301,10 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     // run and most scheduled tasks are stateless.
     if *continuity {
         match cortex::db::Database::open().await {
-            Ok(db) => match db.task_result_history(task_id, CONTINUITY_RUNS).await {
+            Ok(db) => match db
+                .task_result_history(task_id, CONTINUITY_LOOKBACK_RUNS)
+                .await
+            {
                 Ok(runs) => messages.extend(continuity_messages(&runs, task_prompt)),
                 Err(e) => tracing::warn!(
                     task = %task_name,
@@ -1305,7 +1352,14 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     match result {
         Ok(Ok(response)) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
-            let result_text = response.text_content().unwrap_or("");
+            // A prompt task reads untrusted content and can repeat a secret
+            // it saw. Redact once, before the text is stored or delivered.
+            let result_text = redact_for_run(
+                delivery_channel.as_deref().zip(delivery_target.as_deref()),
+                task_id,
+                response.text_content().unwrap_or(""),
+            );
+            let result_text = result_text.as_ref();
             match cortex::db::Database::open().await {
                 Ok(db) => {
                     if let Err(e) = db
@@ -1962,6 +2016,17 @@ async fn handle_task_failure(
     config: &Config,
     error: &str,
 ) {
+    // Provider and shell errors can carry a key or a URL with a token.
+    // Classify on the raw text, but store, log and deliver the redacted one.
+    let is_transient = cortex::tasks::is_transient_error(error);
+    let error = redact_for_run(
+        failure_delivery
+            .as_ref()
+            .map(|(ch, tgt)| (ch.as_str(), tgt.as_str())),
+        task_id,
+        error,
+    );
+    let error = error.as_ref();
     let mut escalation = String::new();
     match cortex::db::Database::open().await {
         Ok(db) => {
@@ -1971,7 +2036,7 @@ async fn handle_task_failure(
             {
                 tracing::warn!("Task '{task_name}': failed to record failure: {e}");
             }
-            if cortex::tasks::is_transient_error(error) && retry_count < max_retries {
+            if is_transient && retry_count < max_retries {
                 let next_attempt = retry_count + 1;
                 let delay = cortex::tasks::retry_delay_secs(next_attempt);
                 let retry_at = chrono::Utc::now().timestamp() + delay;
@@ -2058,7 +2123,11 @@ async fn deliver_task_result(
     }
     let sender = parse_sender(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    match crate::channel_delivery::send(config, channel, &sender, &msg).await {
+    // Redact here, not only inside `send`: the same string is mirrored into
+    // the chat session below, and the session must not keep the raw secret.
+    let msg = crate::channel_delivery::prepare_outbound(channel, &sender, &msg);
+    let msg = msg.as_ref();
+    match crate::channel_delivery::send(config, channel, &sender, msg).await {
         Ok(()) => {
             // Mirror the delivered message into the originating chat session so
             // the agent remembers its own proactive output and a later user
@@ -2068,7 +2137,7 @@ async fn deliver_task_result(
             // into and are skipped.
             if let (Some(exec), Some(session_key)) = (executor, origin_session_key(target)) {
                 if let Err(e) = exec
-                    .append_assistant_message(channel, &session_key, &msg)
+                    .append_assistant_message(channel, &session_key, msg)
                     .await
                 {
                     tracing::warn!(
@@ -3188,6 +3257,34 @@ mod pre_run_tests {
 }
 
 #[cfg(test)]
+mod run_redaction_tests {
+    use super::*;
+
+    const TOKEN: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk";
+
+    #[test]
+    fn a_run_text_with_a_secret_is_redacted_with_or_without_delivery() {
+        let text = format!("Deploy ok. Remote is https://{TOKEN}@github.com/org/repo");
+        for delivery in [Some(("telegram", "12345")), None] {
+            let out = redact_for_run(delivery, "task-1", &text);
+            assert!(
+                !out.contains(TOKEN),
+                "{delivery:?}: the stored text must not hold the token: {out}"
+            );
+            assert!(out.contains("[REDACTED"), "{delivery:?}: {out}");
+            assert!(out.starts_with("Deploy ok. "), "{delivery:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_clean_run_text_and_a_silence_marker_are_unchanged() {
+        for text in ["3 PRs open, none blocked.", "[SILENT]", "HEARTBEAT_OK", ""] {
+            assert_eq!(redact_for_run(Some(("slack", "C1")), "task-1", text), text);
+        }
+    }
+}
+
+#[cfg(test)]
 mod continuity_tests {
     use super::*;
 
@@ -3301,17 +3398,86 @@ mod continuity_tests {
     }
 
     #[test]
-    fn a_long_prior_result_is_truncated_and_says_so() {
-        // A run that produced pages of output must not crowd out the run
-        // that is happening now — and the cut has to be visible, or the
-        // model reads a mid-sentence stop as the end of what it said.
-        let long = "x".repeat(CONTINUITY_RESULT_CHARS * 3);
+    fn silent_runs_are_not_replayed_and_do_not_use_the_window() {
+        // A monitor task is silent on most ticks. The silent ticks must not
+        // push the last real report out of the window, and the model must
+        // not see itself saying `[SILENT]`.
+        let runs = vec![
+            run(Some("HEARTBEAT_OK"), "completed"),
+            run(Some("nothing changed\n[SILENT]"), "completed"),
+            run(Some("[SILENT]"), "completed"),
+            run(Some("PR 12 has a failed check"), "completed"),
+        ];
+
+        let msgs = continuity_messages(&runs, "check my PRs");
+
+        let texts: Vec<&str> = msgs.iter().filter_map(|m| m.text_content()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "check my PRs",
+                "<prior_run_output>\nPR 12 has a failed check\n</prior_run_output>"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_newest_useful_runs_are_replayed() {
+        // The caller reads a larger page than the window. The window limit
+        // applies after the silent runs are removed, and the newest runs win.
+        let runs = vec![
+            run(Some("r5"), "completed"),
+            run(Some("[SILENT]"), "completed"),
+            run(Some("r4"), "completed"),
+            run(Some("r3"), "completed"),
+            run(Some("r2"), "completed"),
+            run(Some("r1"), "completed"),
+        ];
+
+        let msgs = continuity_messages(&runs, "p");
+
+        let replays: Vec<&str> = msgs
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter_map(|m| m.text_content())
+            .collect();
+        assert_eq!(
+            replays,
+            vec![
+                "<prior_run_output>\nr3\n</prior_run_output>",
+                "<prior_run_output>\nr4\n</prior_run_output>",
+                "<prior_run_output>\nr5\n</prior_run_output>",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_prior_result_keeps_its_head_and_its_conclusion() {
+        // A report states its conclusion last. The clip must keep it, keep
+        // the opening, show the cut, and stay inside the budget.
+        let filler = "x".repeat(6_000);
+        let long = format!("FIRST LINE\n{filler}\nCONCLUSION: x");
+        let total = long.chars().count();
         let out = truncate_for_continuity(&long);
 
-        assert!(out.chars().count() < long.chars().count());
+        assert!(out.starts_with("FIRST LINE\n"), "the head must survive");
         assert!(
-            out.contains("truncated"),
-            "a silent cut reads as the whole answer"
+            out.ends_with("\nCONCLUSION: x"),
+            "the conclusion must survive"
+        );
+        let marker = format!(
+            "\n[... {} chars omitted ...]\n",
+            total - CONTINUITY_RESULT_CHARS
+        );
+        assert!(
+            out.contains(&marker),
+            "the cut must be visible and give the omitted count: {out}"
+        );
+        assert_eq!(
+            out.chars().count(),
+            CONTINUITY_RESULT_CHARS + marker.chars().count(),
+            "the replay must be the budget plus the marker"
         );
         assert_eq!(
             truncate_for_continuity("short"),
@@ -3323,20 +3489,22 @@ mod continuity_tests {
     #[test]
     fn truncation_never_splits_a_multibyte_character() {
         // A byte-wise cut through a multi-byte char would panic or produce
-        // mojibake. Assert the cut actually happened, on a char boundary.
+        // mojibake. Assert the cut happened, on char boundaries, both sides.
         let long = "é".repeat(CONTINUITY_RESULT_CHARS * 2);
         let out = truncate_for_continuity(&long);
 
-        assert!(out.contains("truncated"), "the input must have been cut");
-        let kept = out.split('\n').next().unwrap_or_default();
+        let parts: Vec<&str> = out.split('\n').collect();
+        assert_eq!(parts.len(), 3, "head, marker, tail: {out}");
         assert_eq!(
-            kept.chars().count(),
-            CONTINUITY_RESULT_CHARS,
-            "exactly the budgeted number of characters must survive"
+            parts[1],
+            format!("[... {CONTINUITY_RESULT_CHARS} chars omitted ...]")
         );
-        assert!(
-            kept.chars().all(|c| c == 'é'),
-            "no character may be split by the cut"
-        );
+        for side in [parts[0], parts[2]] {
+            assert_eq!(side.chars().count(), CONTINUITY_RESULT_CHARS / 2);
+            assert!(
+                side.chars().all(|c| c == 'é'),
+                "no character may be split by the cut"
+            );
+        }
     }
 }

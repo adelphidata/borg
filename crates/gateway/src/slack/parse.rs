@@ -67,7 +67,10 @@ pub(super) fn strip_bot_mention(text: &str, bot_user_id: &str) -> (String, bool)
 /// - Bot messages (to avoid self-reply loops)
 /// - Messages from the bot's own user ID (echo detection)
 /// - Messages matching recently sent text (echo cache)
-/// - Non-text message subtypes (edits, deletes, joins, etc.)
+/// - Message subtypes outside the conversational allowlist (`file_share`,
+///   `thread_broadcast`, `me_message`): joins, topic changes, pins and any
+///   subtype Slack adds later are dropped. Edits and deletes are surfaced
+///   with `metadata.event_type` set to the subtype.
 /// - Events without text
 /// - Unrecognized event types (not `message` or `app_mention`)
 pub async fn parse_event(
@@ -105,7 +108,6 @@ pub async fn parse_event(
     // whether to invoke the agent — these aren't user prompts.
     if let Some(subtype) = event.subtype.as_deref() {
         match subtype {
-            "bot_message" | "channel_join" | "channel_leave" => return None,
             "message_changed" => {
                 let nested = event.message.as_ref()?;
                 let sender = nested.user.as_deref()?.to_string();
@@ -176,7 +178,14 @@ pub async fn parse_event(
                     peer_kind,
                 });
             }
-            _ => {}
+            // Conversational subtypes continue to the normal parse.
+            "file_share" | "thread_broadcast" | "me_message" => {}
+            // Allowlist, not denylist: housekeeping subtypes (topic, pin,
+            // archive, ...) carry `user` and `text` and would start a turn.
+            other => {
+                tracing::debug!(subtype = other, "dropping non-conversational Slack subtype");
+                return None;
+            }
         }
     }
 
@@ -530,6 +539,39 @@ mod tests {
         event.subtype = Some("bot_message".to_string());
         let cb = make_event(event);
         assert!(parse_event(&cb, None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_conversational_subtypes_start_a_turn() {
+        // (subtype, admitted). Every row has a human `user` and non-empty text.
+        let cases: &[(Option<&str>, bool)] = &[
+            (None, true),
+            (Some("file_share"), true),
+            (Some("thread_broadcast"), true),
+            (Some("me_message"), true),
+            (Some("channel_leave"), false),
+            (Some("channel_topic"), false),
+            (Some("channel_purpose"), false),
+            (Some("channel_name"), false),
+            (Some("channel_archive"), false),
+            (Some("channel_convert_to_private"), false),
+            (Some("channel_convert_to_public"), false),
+            (Some("pinned_item"), false),
+            (Some("unpinned_item"), false),
+            (Some("file_comment"), false),
+            (Some("future_subtype"), false),
+        ];
+        for (subtype, admitted) in cases {
+            let mut event = make_slack_event("message");
+            event.subtype = subtype.map(str::to_string);
+            event.text = Some("set the channel topic: release day".to_string());
+            let parsed = parse_event(&make_event(event), None, None).await;
+            assert_eq!(
+                parsed.map(|m| m.text),
+                admitted.then(|| "set the channel topic: release day".to_string()),
+                "subtype {subtype:?}"
+            );
+        }
     }
 
     #[tokio::test]

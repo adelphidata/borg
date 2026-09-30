@@ -79,6 +79,26 @@ enum BudgetCheck {
     Exceeded(String),
 }
 
+/// Events to send for a budget check, and whether the turn must stop.
+///
+/// A warning is a notice, not an error: the turn goes on and succeeds, and a
+/// headless caller maps an error event to a failed exit code.
+fn budget_check_events(check: BudgetCheck) -> (Vec<AgentEvent>, bool) {
+    match check {
+        BudgetCheck::Ok => (Vec::new(), false),
+        BudgetCheck::Warning(text) => (
+            vec![AgentEvent::SystemNotice {
+                category: "budget".to_string(),
+                text,
+            }],
+            false,
+        ),
+        BudgetCheck::Exceeded(msg) => {
+            (vec![AgentEvent::Error(msg), AgentEvent::TurnComplete], true)
+        }
+    }
+}
+
 /// Result of the post-stream finalization helper. Mirrors the three control-flow
 /// branches at the end of `run_agent_loop`.
 enum IterationOutcome {
@@ -139,6 +159,16 @@ pub enum AgentEvent {
     /// watchdog can tell a slow provider from a wedged child — see
     /// [`crate::multi_agent`]'s `StallWatchdog::on_event`.
     LlmAttemptStarted { attempt: u32 },
+    /// The agent discarded visible text that it already sent as
+    /// [`Self::TextDelta`]: the attempt that produced it failed and a new
+    /// attempt sends the full response again.
+    ///
+    /// `bytes` is the UTF-8 length of the discarded deltas exactly as they
+    /// were sent (after the internal-tag filter and redaction). A consumer
+    /// that accumulates deltas removes that many bytes from the end of its
+    /// buffer — see [`retract_text_tail`]. Never sent for a first attempt, a
+    /// new tool iteration, or a retry that discards no visible text.
+    TextRetracted { bytes: usize },
     /// The connection to the provider dropped and the client is waiting before
     /// it tries again. Unlike [`Self::LlmAttemptStarted`] this one *is* for
     /// display: the wait is long enough that silence would read as a hang.
@@ -200,6 +230,20 @@ pub enum AgentEvent {
         /// User-facing text.
         text: String,
     },
+}
+
+/// Apply [`AgentEvent::TextRetracted`] to a buffer of accumulated text deltas:
+/// remove the last `bytes` bytes.
+///
+/// The cut moves down to a char boundary, and a buffer shorter than `bytes`
+/// becomes empty, so a consumer that holds less text than the agent sent (a
+/// size cap, a late subscription) never panics.
+pub fn retract_text_tail(buffer: &mut String, bytes: usize) {
+    let mut cut = buffer.len().saturating_sub(bytes);
+    while !buffer.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    buffer.truncate(cut);
 }
 
 /// Returns true if the agent should retry the LLM call because it returned
@@ -343,6 +387,10 @@ pub struct Agent {
     /// tell "the model chose to answer in text" apart from "the model
     /// signalled a tool call whose payload never arrived".
     pub(super) tool_intent_signalled: bool,
+    /// UTF-8 length of the text deltas sent to consumers in the current
+    /// iteration and not retracted. It is the size of the retraction when
+    /// the iteration's output is discarded.
+    pub(super) emitted_text_bytes: usize,
     /// Once-per-turn guard for the dropped-tool-call nudge, so a provider
     /// that persistently signals tool use without shipping a call can't
     /// loop the nudge. Reset at turn start with the other loop guards.
@@ -546,6 +594,7 @@ impl Agent {
             unknown_tool_tracker,
             turn_reasoning: String::new(),
             tool_intent_signalled: false,
+            emitted_text_bytes: 0,
             nudged_for_dropped_tools: false,
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
@@ -1287,16 +1336,12 @@ impl Agent {
 
             self.drain_sub_agent_completions().await;
 
-            match self.check_budget().await {
-                BudgetCheck::Exceeded(msg) => {
-                    let _ = event_tx.send(AgentEvent::Error(msg)).await;
-                    let _ = event_tx.send(AgentEvent::TurnComplete).await;
-                    return Ok(());
-                }
-                BudgetCheck::Warning(msg) => {
-                    let _ = event_tx.send(AgentEvent::Error(msg)).await;
-                }
-                BudgetCheck::Ok => {}
+            let (budget_events, budget_stops_turn) = budget_check_events(self.check_budget().await);
+            for event in budget_events {
+                let _ = event_tx.send(event).await;
+            }
+            if budget_stops_turn {
+                return Ok(());
             }
 
             iteration += 1;
@@ -1333,6 +1378,10 @@ impl Agent {
                     // place to halt.
                     let refusal = "Budget hard cap reached — agent paused. \
                                    Raise cap in /settings → Budgets, or wait for daily reset.";
+                    // The turn did no work, and the refusal below is saved
+                    // but not streamed. The error event shows it to the user
+                    // and lets a headless caller fail its exit code.
+                    let _ = event_tx.send(AgentEvent::Error(refusal.to_string())).await;
                     self.finalize_text_response(refusal, &event_tx).await;
                     return Ok(());
                 }
@@ -1383,6 +1432,8 @@ impl Agent {
             };
 
             let mut tag_filter = InternalTagFilter::new();
+            // Text of an earlier iteration stays with the consumers.
+            self.emitted_text_bytes = 0;
             let mut tool_calls: Vec<PartialToolCall> = Vec::new();
             let mut received_terminal = false;
             let mut stream_error: Option<String> = None;
@@ -1498,6 +1549,7 @@ impl Agent {
                     self.reactive_compact_history(&event_tx).await?;
                     // Discard partial stream state (stream_error, tool_calls,
                     // tag_filter are re-bound at the top of the outer loop).
+                    self.retract_emitted_text(&event_tx).await;
                     continue;
                 }
             }
@@ -1523,7 +1575,9 @@ impl Agent {
                         if history_tokens(&self.history) < before_tokens {
                             // Discard the truncated partial (tag_filter,
                             // tool_calls re-bind at the top of the outer
-                            // loop) and retry.
+                            // loop) and retry. The consumers hold the
+                            // partial already, so tell them to drop it.
+                            self.retract_emitted_text(&event_tx).await;
                             continue;
                         }
                         // Nothing reclaimed — surface the truncation as before.
@@ -2111,6 +2165,9 @@ impl Agent {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod budget_event_tests;
 
 #[cfg(test)]
 mod goal_integration_tests;

@@ -37,6 +37,9 @@ fn test_config(server_uri: &str) -> Config {
     config.llm.api_key_env = env_key;
     config.llm.base_url = Some(format!("{server_uri}/v1/chat/completions"));
     config.llm.max_retries = 0;
+    // The budget check reads the machine's real monthly usage. Disable the
+    // cap so a developer over their own limit still reaches the mock server.
+    config.budget.monthly_token_limit = 0;
     // Keep the agent loop tight — no compaction games on a one-shot test.
     config.conversation.max_iterations = 3;
     config
@@ -206,12 +209,15 @@ async fn heartbeat_events_fire_while_child_runs() {
     );
 }
 
-/// END-TO-END: `Stalled` event fires after the configured threshold of
-/// consecutive idle heartbeat cycles. Stalled signals the operator that
-/// the child has gone quiet — without it, a hung tool or wedged LLM
-/// would silently consume tokens with no UI indication.
+/// END-TO-END: a model call that is slower than the configured stale cycles
+/// but still inside its request timeout is not a stall. The spawn path must
+/// raise the stale threshold to the request timeout plus one tick; if it
+/// used the configured two cycles, `Stalled` would fire during this wait
+/// and an operator would see a healthy child flagged as wedged. The
+/// threshold arithmetic and the fire-once rule have unit tests next to the
+/// watchdog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stalled_event_fires_after_threshold_idle_cycles() {
+async fn a_slow_model_call_within_the_request_timeout_is_not_a_stall() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -225,7 +231,10 @@ async fn stalled_event_fires_after_threshold_idle_cycles() {
 
     let mut parent_cfg = test_config(&server.uri());
     parent_cfg.agents.heartbeat_interval_secs = 1;
-    parent_cfg.agents.heartbeat_stale_cycles = 2; // fires after 2 idle ticks
+    // Two idle ticks would be a stall on their own; the 30 s request timeout
+    // lifts the effective threshold to 31 ticks.
+    parent_cfg.agents.heartbeat_stale_cycles = 2;
+    parent_cfg.llm.request_timeout_ms = 30_000;
 
     let bus = AgentTreeBus::new();
     let mut rx = bus.subscribe();
@@ -249,23 +258,30 @@ async fn stalled_event_fires_after_threshold_idle_cycles() {
         .expect("spawn");
 
     let mut stalled_count = 0;
+    let mut heartbeats = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(4000);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-            Ok(Ok(ev)) => {
-                if ev.kind == AgentTreeEventKind::Stalled {
-                    stalled_count += 1;
-                }
-            }
+            Ok(Ok(ev)) => match ev.kind {
+                AgentTreeEventKind::Stalled => stalled_count += 1,
+                AgentTreeEventKind::Heartbeat => heartbeats += 1,
+                _ => {}
+            },
             _ => continue,
         }
     }
 
     let _ = ctrl.shutdown_agent(&agent_id).await;
 
+    // Enough ticks passed for the configured two-cycle threshold to fire,
+    // so a zero count is the floor at work, not a quiet loop.
+    assert!(
+        heartbeats >= 3,
+        "expected at least 3 heartbeats in 4 s at a 1 s cadence, got {heartbeats}"
+    );
     assert_eq!(
-        stalled_count, 1,
-        "Stalled must fire exactly once (the at-most-once contract), got {stalled_count}"
+        stalled_count, 0,
+        "a model call inside its request timeout must not be flagged as a stall"
     );
 }
 

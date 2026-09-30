@@ -2259,13 +2259,15 @@ async fn hung_server_is_torn_down_by_idle_liveness_ping() {
     // Spec: a hung-but-alive server (process running, event loop wedged)
     // must not sit registered forever, burning a full call_timeout in the
     // user's critical path on the next dispatch. After an idle window the
-    // session actor pings; unanswered ping → teardown, tools dropped, and
+    // session actor pings, and confirms an unanswered ping with one
+    // `tools/list`; silence on both → teardown, tools dropped, and
     // future dispatches fail fast. Without the watchdog this test hangs
     // at "never torn down" — the actor only ever failed reactively.
     let _g = begin_test();
     mcp_clients::testing::set_idle_ping_interval_ms(50);
 
     let transport = ScriptedTransport::new();
+    let handlers = Arc::clone(&transport.handlers);
     {
         let mut h = transport.handlers.lock().unwrap();
         h.insert(
@@ -2276,8 +2278,9 @@ async fn hung_server_is_torn_down_by_idle_liveness_ping() {
             methods::TOOLS_LIST.into(),
             Box::new(|_| tools_list(&[("search", well_formed_schema())])),
         );
-        // No `ping` handler: after install the server answers nothing —
-        // recv() blocks forever, modeling the wedged-event-loop peer.
+        // No `ping` handler. The `tools/list` handler is removed after
+        // install, so from then on the server answers nothing — recv()
+        // blocks forever, modeling the wedged-event-loop peer.
     }
 
     let cfg = enabled_config();
@@ -2291,9 +2294,11 @@ async fn hung_server_is_torn_down_by_idle_liveness_ping() {
         1,
         "tool must be registered before the hang is detected"
     );
+    handlers.lock().unwrap().remove(methods::TOOLS_LIST);
 
-    // Idle ping fires at ~50ms and its timeout expires ~100ms later; the
-    // generous deadline absorbs CI scheduling noise, not design slack.
+    // Idle ping fires at ~50ms, its timeout expires ~100ms later, and the
+    // confirmation probe takes another ~100ms; the generous deadline
+    // absorbs CI scheduling noise, not design slack.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !mcp_clients::tool_definitions().is_empty() {
         assert!(
@@ -2302,6 +2307,60 @@ async fn hung_server_is_torn_down_by_idle_liveness_ping() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn server_that_ignores_ping_but_answers_tools_list_stays_registered() {
+    // Spec: `ping` is optional in practice, and some servers drop it with no
+    // reply. Such a server is healthy. A teardown removes its tools until
+    // the operator reloads, so an unanswered ping alone must not be death:
+    // the actor confirms with `tools/list`, and the server stays up.
+    let _g = begin_test();
+    mcp_clients::testing::set_idle_ping_interval_ms(50);
+
+    let lists = Arc::new(Mutex::new(0u32));
+    let lists_probe = Arc::clone(&lists);
+    let transport = ScriptedTransport::new();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(move |_| {
+                *lists_probe.lock().unwrap() += 1;
+                tools_list(&[("search", well_formed_schema())])
+            }),
+        );
+        // No `ping` handler: the server never answers a ping.
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 100, vec![], vec![]);
+    mcp_clients::testing::install_session("noping", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    // One `tools/list` at install, then one per idle window. Three idle
+    // probes means the session lived through three windows, where the old
+    // behavior tore it down in the first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while *lists.lock().unwrap() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle probes did not reach the server; tools/list count: {}",
+            *lists.lock().unwrap()
+        );
+        assert_eq!(
+            mcp_clients::tool_definitions().len(),
+            1,
+            "a server that answers tools/list must stay registered"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(mcp_clients::tool_definitions().len(), 1);
 }
 
 #[tokio::test]

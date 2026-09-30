@@ -301,12 +301,19 @@ pub async fn advance_next_run_raw(
     Ok(())
 }
 
+/// True for the spellings that select the schedule's default zone instead of
+/// an IANA zone. `local` matches in any letter case, because the validation
+/// error recommends that word and a user can type it with a capital.
+fn is_default_zone(timezone: &str) -> bool {
+    matches!(timezone, "" | "UTC" | "utc") || timezone.eq_ignore_ascii_case("local")
+}
+
 /// Resolve a timezone string to a `chrono_tz::Tz`. Returns `None` for
 /// values that should retain the historical UTC behavior (`""`,
 /// `"local"`, `"UTC"`) and for unparseable IANA names (after logging).
 fn resolve_cron_timezone(timezone: &str) -> Option<Tz> {
     match timezone {
-        "" | "local" | "UTC" | "utc" => None,
+        tz if is_default_zone(tz) => None,
         other => match Tz::from_str(other) {
             Ok(tz) => Some(tz),
             Err(e) => {
@@ -828,6 +835,24 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
     )
 }
 
+/// Validate a timezone on the write path (task create / update).
+///
+/// Accepts the UTC-preserving spellings (`""`, `"UTC"`, `"utc"`, and
+/// `"local"` in any letter case) and any IANA zone name. Everything else is
+/// rejected: the runtime fallback
+/// in [`calculate_next_run`] exists for rows that are already stored, and a
+/// new task must not be accepted with a zone that silently evaluates as UTC.
+pub fn validate_timezone(timezone: &str) -> Result<()> {
+    match timezone {
+        tz if is_default_zone(tz) => Ok(()),
+        other => Tz::from_str(other).map(|_| ()).map_err(|_| {
+            anyhow::anyhow!(
+                "Unknown timezone '{other}'. Use an IANA name such as 'America/New_York' or 'UTC'."
+            )
+        }),
+    }
+}
+
 /// Validate a schedule expression without computing the next run time.
 pub fn validate_schedule(schedule_type: &str, schedule_expr: &str) -> Result<()> {
     match schedule_type {
@@ -926,6 +951,41 @@ pub fn is_transient_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_timezone_accepts_known_zones_and_rejects_the_rest() {
+        let cases: &[(&str, bool)] = &[
+            ("", true),
+            ("local", true),
+            ("UTC", true),
+            ("utc", true),
+            ("Europe/Berlin", true),
+            ("America/New_York", true),
+            ("New York", false),
+            ("EST5", false),
+            ("Mars/Base", false),
+            ("Local", true),
+            ("LOCAL", true),
+            ("locale", false),
+        ];
+        for (tz, ok) in cases {
+            let got = validate_timezone(tz);
+            assert_eq!(got.is_ok(), *ok, "timezone {tz:?}: {got:?}");
+            if let Err(e) = got {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(tz) && msg.contains("America/New_York") && msg.contains("'UTC'"),
+                    "the error must name the bad value and the next action, got: {msg}"
+                );
+                // A cron schedule with 'local' runs in UTC, so the message
+                // must not recommend it as the zone of the host.
+                assert!(
+                    !msg.replace(tz, "").to_lowercase().contains("local"),
+                    "the error must not recommend 'local', got: {msg}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn scheduled_command_gate_matches_run_shell_refusals() {

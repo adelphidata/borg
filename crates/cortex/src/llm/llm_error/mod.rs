@@ -289,6 +289,79 @@ impl LlmError {
     }
 }
 
+/// The HTTP-style status inside an in-stream error frame, when the frame has
+/// one. Only an integer in 400..=599 counts: a relay can send `code: 200`
+/// with `success: false`, and a string code ("rate_limit_exceeded") is a
+/// label, not a status.
+fn stream_error_status(frame: &serde_json::Value) -> Option<reqwest::StatusCode> {
+    let error = &frame["error"];
+    [
+        &error["status_code"],
+        &error["status"],
+        &error["http_status"],
+        &error["code"],
+        &frame["code"],
+    ]
+    .into_iter()
+    // The range test sits inside the search: an out-of-range first field
+    // (`status_code: 200`) must not hide a valid later one (`code: 429`).
+    .find_map(|v| v.as_u64().filter(|n| (400..=599).contains(n)))
+    .and_then(|n| u16::try_from(n).ok())
+    .and_then(|n| reqwest::StatusCode::from_u16(n).ok())
+}
+
+/// Classify an error frame that an OpenAI-compatible endpoint sent inside an
+/// HTTP 200 stream. `data` is the raw JSON payload of the frame.
+///
+/// With a status in the frame the result is the same as for a real HTTP
+/// response with that status, so key rotation and fallback behave the same.
+/// Without one, the message text decides. The result is always an error.
+pub(crate) fn classify_stream_error_frame(data: &str, provider: &str) -> LlmError {
+    let frame: serde_json::Value = serde_json::from_str(data).unwrap_or(serde_json::Value::Null);
+
+    if let Some(status) = stream_error_status(&frame) {
+        // An unknown provider name only changes the provider-specific arms.
+        let provider = provider.parse::<Provider>().unwrap_or(Provider::Custom);
+        return classify_status(status, data, provider);
+    }
+
+    let message = frame["error"]["message"]
+        .as_str()
+        .or_else(|| frame["error"].as_str())
+        .or_else(|| frame["message"].as_str())
+        .unwrap_or(data);
+    // A string code or type (`insufficient_quota`, `invalid_api_key`) is often
+    // the clearest signal, so it goes to the classifier with the message.
+    let label = frame["error"]["code"]
+        .as_str()
+        .or_else(|| frame["error"]["type"].as_str())
+        .unwrap_or("");
+    let reason =
+        classify_error_text(&format!("{label} {message}")).unwrap_or(FailoverReason::Unknown);
+    let source = anyhow::anyhow!("{provider} stream error: {}", sanitize_body(data));
+    match reason {
+        FailoverReason::Auth
+        | FailoverReason::AuthPermanent
+        | FailoverReason::Billing
+        | FailoverReason::ModelNotFound
+        | FailoverReason::PayloadTooLarge
+        | FailoverReason::ImageUnsupported
+        | FailoverReason::MalformedToolCall
+        | FailoverReason::ContextOverflow
+        | FailoverReason::Format => LlmError::Fatal {
+            source,
+            reason,
+            status: None,
+        },
+        _ => LlmError::Retryable {
+            source,
+            retry_after: parse_retry_after(data).or_else(|| parse_retry_hint_from_body(data)),
+            reason,
+            status: None,
+        },
+    }
+}
+
 pub(crate) fn classify_status(
     status: reqwest::StatusCode,
     body: &str,
@@ -332,7 +405,7 @@ pub(crate) fn classify_status(
         },
         500 | 502 | 504 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
-            retry_after: None,
+            retry_after,
             reason: FailoverReason::Overloaded,
             status: Some(status.as_u16()),
         },
@@ -344,6 +417,8 @@ pub(crate) fn classify_status(
             reason: FailoverReason::RateLimit,
             status: Some(status.as_u16()),
         },
+        // A plain outage: a body hint is not a back-off request here, so the
+        // backoff schedule decides. Only `slow_down` above honors it.
         503 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned {status} (overloaded): {safe}"),
             retry_after: None,
@@ -620,6 +695,32 @@ mod tests {
         );
         assert!(err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::RateLimit);
+    }
+
+    /// The HTTP path must agree with the text path: a 429 whose `code` says
+    /// the account is exhausted is billing, and a retry cannot clear it.
+    #[test]
+    fn classify_429_with_an_account_exhaustion_code_is_fatal_billing() {
+        for body in [
+            r#"{"error":{"message":"Your credit balance is too low","code":"credit_balance_exhausted"}}"#,
+            r#"{"error":{"code":"organization_spend_limit_exceeded"}}"#,
+            r#"{"error":{"code":"organization_usage_limit_exceeded"}}"#,
+        ] {
+            let err = classify_status(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body,
+                Provider::OpenAi,
+            );
+            assert_eq!(err.reason(), FailoverReason::Billing, "{body}");
+            assert!(!err.is_retryable(), "{body}");
+        }
+        let window = classify_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            Provider::OpenAi,
+        );
+        assert_eq!(window.reason(), FailoverReason::RateLimit);
+        assert!(window.is_retryable());
     }
 
     #[test]
@@ -1123,6 +1224,33 @@ mod tests {
             assert_eq!(overridden.status_code(), Some(code), "status for {code}");
             assert_eq!(overridden.retry_after(), Some(Duration::from_secs(7)));
         }
+    }
+
+    #[test]
+    fn server_errors_keep_the_retry_hint_from_the_body() {
+        let body = r#"{"error":{"message":"overloaded","retry_after":30}}"#;
+        // A plain 503 is left out on purpose: its hint is ignored (see the
+        // slow-down test).
+        for status in [500u16, 502, 504] {
+            let err = classify_status(
+                reqwest::StatusCode::from_u16(status).expect("valid status"),
+                body,
+                Provider::OpenAi,
+            );
+            assert_eq!(
+                err.retry_after(),
+                Some(Duration::from_secs(30)),
+                "status {status}"
+            );
+            assert_eq!(err.reason(), FailoverReason::Overloaded, "status {status}");
+        }
+        // No hint in the body: the backoff schedule decides.
+        let err = classify_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            Provider::OpenAi,
+        );
+        assert_eq!(err.retry_after(), None);
     }
 
     #[test]

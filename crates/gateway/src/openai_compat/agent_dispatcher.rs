@@ -96,6 +96,7 @@ fn translate_events(
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::TextDelta(s) => yield AgentEventChunk::Text(s),
+                AgentEvent::TextRetracted { bytes } => yield AgentEventChunk::Retract(bytes),
                 AgentEvent::ToolExecuting {
                     tool_call_id,
                     name,

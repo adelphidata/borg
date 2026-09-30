@@ -44,7 +44,43 @@ pub struct LocalCredential {
     pub detail: String,
 }
 
-/// Value of `var` in `<data_dir>/.env`, if set to something non-empty.
+/// Fixed placeholder strings that example files and guides use.
+const PLACEHOLDER_SECRETS: &[&str] = &["changeme", "replace-me", "<your-key>"];
+
+/// True when `value` is the placeholder of an example file, not a key.
+///
+/// An example file that is copied unchanged (`cp .env.example .env`) puts a
+/// string such as `your-api-key-here` where the key goes. It must count as
+/// "no credential": the user then gets the "No API key found" guidance, and
+/// the string does not go to a provider as a bearer token.
+///
+/// The rule is narrow on purpose. A real key must never match:
+/// - `your…` with `key` or `token` in it (`your-key`, `your_api_key_here`);
+/// - only the letter `x`, three or more, after an optional vendor prefix
+///   that ends at the first `-` or `_` (`xxxx`, `sk-xxx`, `ghp_xxxx`);
+/// - one of a few fixed words (`changeme`, `replace-me`, `<your-key>`).
+pub fn is_placeholder_secret(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if PLACEHOLDER_SECRETS.contains(&value.as_str()) {
+        return true;
+    }
+    if value.starts_with("your") && (value.contains("key") || value.contains("token")) {
+        return true;
+    }
+    let only_x = |s: &str| s.len() >= 3 && s.bytes().all(|b| b == b'x');
+    only_x(&value)
+        || value
+            .split_once(['-', '_'])
+            .is_some_and(|(_prefix, rest)| only_x(rest))
+}
+
+/// True when `value` can be a credential: not blank and not a placeholder.
+fn is_usable_secret(value: &str) -> bool {
+    !value.trim().is_empty() && !is_placeholder_secret(value)
+}
+
+/// Value of `var` in `<data_dir>/.env`, if set to something non-empty that
+/// is not an example placeholder.
 ///
 /// Tolerates `export ` prefixes, surrounding whitespace, single or double
 /// quotes and `#` comment lines. The name must match exactly — `KEY=` must
@@ -65,7 +101,7 @@ pub fn dotenv_value(data_dir: &Path, var: &str) -> Option<String> {
             return None;
         }
         let value = value.trim().trim_matches('"').trim_matches('\'').trim();
-        (!value.is_empty()).then(|| value.to_string())
+        is_usable_secret(value).then(|| value.to_string())
     })
 }
 
@@ -91,7 +127,7 @@ pub fn detect_keys(data_dir: &Path) -> Vec<LocalCredential> {
                 source: LocalSource::Dotenv,
                 detail: data_dir.join(".env").display().to_string(),
             });
-        } else if std::env::var(var).is_ok_and(|v| !v.trim().is_empty()) {
+        } else if std::env::var(var).is_ok_and(|v| is_usable_secret(&v)) {
             out.push(LocalCredential {
                 provider,
                 source: LocalSource::Env,
@@ -152,7 +188,7 @@ pub fn provider_ready_locally(provider: Provider, data_dir: &Path) -> bool {
             // wizard and the desktop app cannot disagree about whether this
             // machine already has a usable key.
             dotenv_value(data_dir, var).is_some()
-                || std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+                || std::env::var(var).is_ok_and(|v| is_usable_secret(&v))
         }
     }
 }
@@ -172,6 +208,77 @@ mod tests {
     }
 
     #[test]
+    fn only_example_placeholders_count_as_placeholders() {
+        let cases: &[(&str, bool)] = &[
+            // The strings in the shipped example file.
+            ("your-api-key-here", true),
+            ("your-key", true),
+            // Other shapes that guides use.
+            ("your_api_key_here", true),
+            ("your_gemini_key_here", true),
+            ("YOUR-TOKEN", true),
+            ("  your-key  ", true),
+            ("sk-xxx", true),
+            ("ghp_xxxx", true),
+            ("hf_XXXXXXXX", true),
+            ("xai-xxxxxxxx", true),
+            ("xxxxxxxx", true),
+            ("changeme", true),
+            ("replace-me", true),
+            ("<your-key>", true),
+            // Real key shapes.
+            ("sk-or-v1-9f3a5c7e1b2d4f6a8c0e9f3a5c7e1b2d", false),
+            ("sk-ant-api03-Zm9vYmFyYmF6cXV4", false),
+            ("gsk_8hQyourKeyMaterial41", false),
+            ("sk-proj-a1yourb2keyc3", false),
+            ("xai-9xx3xxq", false),
+            ("sk-x", false),
+            ("sk-xx", false),
+            ("sk-xxx-live", false),
+            ("yourself", false),
+            ("", false),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(is_placeholder_secret(value), *expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_shipped_example_file_gives_no_credential() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vars: Vec<&str> = ONBOARDABLE
+            .iter()
+            .map(|c| c.provider().default_env_var())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        for v in &vars {
+            std::env::remove_var(v);
+        }
+
+        // The example file as shipped, copied to `.env` without an edit.
+        let example = include_str!("../../../../.env.example");
+        let dir = dir_with_env(example);
+        // The daemon loads `.env` into its environment at startup.
+        std::env::set_var("OPENROUTER_API_KEY", "your-api-key-here");
+        let found = detect_keys(dir.path());
+        let ready = provider_ready_locally(Provider::OpenRouter, dir.path());
+
+        for (v, old) in saved {
+            match old {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+
+        assert_eq!(found, Vec::new(), "a placeholder is not a credential");
+        assert!(!ready, "a placeholder must not skip the key step");
+    }
+
+    #[test]
     fn dotenv_value_reads_the_shapes_people_actually_write() {
         let cases: &[(&str, Option<&str>)] = &[
             ("KEY=plain", Some("plain")),
@@ -180,6 +287,8 @@ mod tests {
             ("export KEY=exported", Some("exported")),
             ("  KEY = spaced  ", Some("spaced")),
             ("KEY=", None),
+            ("KEY=your-api-key-here", None),
+            ("KEY=\"sk-xxxx\"", None),
             ("# KEY=commented", None),
             ("MY_KEY=other", None),
             ("KEYS=other", None),

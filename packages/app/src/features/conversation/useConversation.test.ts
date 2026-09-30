@@ -4,6 +4,7 @@ import {
   contextUsed,
   historyCells,
   reduceEvent,
+  retractTail,
   retryTarget,
   stampTurnDuration,
   type Cell,
@@ -32,6 +33,43 @@ describe("reduceEvent — text", () => {
       { textDelta: { text: "two" } },
     ]);
     expect(cells.filter((c) => c.kind === "assistant")).toHaveLength(2);
+  });
+});
+
+describe("reduceEvent — a retracted attempt", () => {
+  it("keeps only the text of the attempt that completes", () => {
+    const cells = fold([
+      { textDelta: { text: "The answer is fö" } },
+      { textRetracted: { bytes: 17 } },
+      { textDelta: { text: "The answer is " } },
+      { textDelta: { text: "forty-two." } },
+    ]);
+    expect(cells).toEqual([{ kind: "assistant", text: "The answer is forty-two.", at: 0 }]);
+  });
+
+  it("keeps the text that came before the failed attempt", () => {
+    const cells = fold([
+      { textDelta: { text: "I will check. " } },
+      { textDelta: { text: "It is fo" } },
+      { textRetracted: { bytes: 8 } },
+      { textDelta: { text: "It is forty-two." } },
+    ]);
+    expect(cells).toEqual([{ kind: "assistant", text: "I will check. It is forty-two.", at: 0 }]);
+  });
+
+  it("does not change a transcript with no assistant text in progress", () => {
+    const tool = { toolExecuting: { toolCallId: "t1", name: "fs_read", argsJson: "{}" } };
+    expect(fold([tool, { textRetracted: { bytes: 4 } }])).toEqual(fold([tool]));
+  });
+
+  it.each([
+    ["ascii", "hello world", 5, "hello "],
+    ["counts bytes, not UTF-16 units", "café 😀", 4, "café "],
+    ["a cut inside a character moves down", "a😀", 2, "a"],
+    ["a count larger than the text", "short", 500, ""],
+    ["zero", "keep", 0, "keep"],
+  ])("retractTail: %s", (_name, text, bytes, want) => {
+    expect(retractTail(text, bytes)).toBe(want);
   });
 });
 

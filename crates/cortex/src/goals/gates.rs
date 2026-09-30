@@ -109,18 +109,25 @@ pub(crate) fn exhausted_message(gate: &GoalGate, max_attempts: i64) -> String {
     )
 }
 
-/// Whether a recorded failure can be replayed instead of re-run.
+/// Whether this run shows that the agent did work since the last run.
 ///
-/// A gate that failed against a workspace state identical to the current one
-/// will fail again — re-running a full test suite to learn that wastes minutes
-/// per turn. Both fingerprints must be present and equal: `None` means "we
-/// could not tell", which must fall through to a real run, because treating
-/// unknown as unchanged would suppress a check that should have happened.
-pub(crate) fn can_replay_failure(gate: &GoalGate, current: Option<&str>) -> bool {
-    match (gate.last_fingerprint.as_deref(), current) {
-        (Some(recorded), Some(now)) => gate.last_run_failed() && recorded == now,
-        _ => false,
-    }
+/// This feeds the retry cap only. It never decides whether a gate runs: a
+/// gate runs at every turn boundary, because no cheap signal can prove that
+/// its result would be the same.
+///
+/// Progress is a workspace that visibly changed, or a different exit code.
+/// The output text is deliberately not compared: most test runners print
+/// timings, so the text differs on every run and the cap would never fire
+/// for an agent that is stuck. When nothing can be compared (first run, or
+/// no git repository and the same exit code) the run counts as no progress,
+/// since the alternative is again a cap that never fires.
+pub(crate) fn made_progress(gate: &GoalGate, fingerprint: Option<&str>, exit_code: i64) -> bool {
+    let workspace_changed = matches!(
+        (fingerprint, gate.last_fingerprint.as_deref()),
+        (Some(now), Some(before)) if now != before
+    );
+    let verdict_changed = gate.last_exit_code.is_some_and(|last| last != exit_code);
+    workspace_changed || verdict_changed
 }
 
 #[cfg(test)]
@@ -173,38 +180,40 @@ mod tests {
     }
 
     #[test]
-    fn replay_requires_a_known_and_matching_fingerprint() {
-        let mut g = gate(1);
-        g.last_exit_code = Some(1);
-        g.last_fingerprint = Some("abc".into());
-
-        assert!(
-            can_replay_failure(&g, Some("abc")),
-            "same workspace, recorded failure → replay"
+    fn progress_needs_a_visible_change() {
+        // (last_fingerprint, last_exit_code, fingerprint now, exit code now, progress)
+        type Case = (
+            Option<&'static str>,
+            Option<i64>,
+            Option<&'static str>,
+            i64,
+            bool,
         );
-        assert!(
-            !can_replay_failure(&g, Some("def")),
-            "workspace changed → must re-run"
-        );
-        // Unknown fingerprint (not a git repo, or a failed probe) must never
-        // read as "unchanged" — that would silently skip the check forever.
-        assert!(!can_replay_failure(&g, None), "unknown → must re-run");
-        g.last_fingerprint = None;
-        assert!(
-            !can_replay_failure(&g, Some("abc")),
-            "unknown → must re-run"
-        );
-    }
-
-    #[test]
-    fn a_passing_gate_is_never_replayed_as_a_failure() {
-        // Replay exists to skip re-running a known-red check. A green gate has
-        // nothing to replay, and treating it as one would block completion
-        // forever on a gate that already passed.
-        let mut g = gate(1);
-        g.last_exit_code = Some(0);
-        g.last_fingerprint = Some("abc".into());
-        assert!(!can_replay_failure(&g, Some("abc")));
+        let cases: &[Case] = &[
+            // The workspace changed.
+            (Some("abc"), Some(1), Some("def"), 1, true),
+            // Nothing visible changed: the agent is stuck.
+            (Some("abc"), Some(1), Some("abc"), 1, false),
+            // A different failure is a different state, also outside git.
+            (Some("abc"), Some(101), Some("abc"), 1, true),
+            (None, Some(101), None, 1, true),
+            // An unknown fingerprint on either side is not a change.
+            (None, Some(1), Some("abc"), 1, false),
+            (Some("abc"), Some(1), None, 1, false),
+            (None, Some(1), None, 1, false),
+            // The first run has nothing to compare with.
+            (None, None, Some("abc"), 1, false),
+        ];
+        for (last_fp, last_exit, now_fp, exit_code, expected) in cases {
+            let mut g = gate(1);
+            g.last_fingerprint = last_fp.map(str::to_string);
+            g.last_exit_code = *last_exit;
+            assert_eq!(
+                made_progress(&g, *now_fp, *exit_code),
+                *expected,
+                "last=({last_fp:?}, {last_exit:?}) now=({now_fp:?}, {exit_code})"
+            );
+        }
     }
 
     /// A gate exists to make exit 0 mean "the check passed". A command whose

@@ -41,6 +41,9 @@ const AUTH_PERMANENT_NEEDLES: &[&str] = &[
     "forbidden",
     "permission_error",
     "permission_denied",
+    // Account-level block. A retry or another key of the same account cannot
+    // clear it.
+    "blocked for a previous policy violation",
 ];
 
 const AUTH_NEEDLES: &[&str] = &[

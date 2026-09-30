@@ -12,6 +12,7 @@ use anyhow::Result;
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::AgentEvent;
 use crate::config::Config;
 
 use super::{
@@ -424,6 +425,20 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
 /// `conversation.max_history_tokens` bounded by the model's usable window —
 /// so lowering `max_history_tokens` on the child's config is exactly the
 /// lever. `min` keeps an already-smaller budget as is; the cap never raises.
+/// Fold one event of the child into the text that the parent gets as the
+/// result. A retraction removes the text of a failed LLM attempt: the full
+/// response comes again, and the result is the text of the attempt that
+/// completes.
+fn fold_result_text(final_text: &mut String, event: &AgentEvent) {
+    match event {
+        AgentEvent::TextDelta(delta) => final_text.push_str(delta),
+        AgentEvent::TextRetracted { bytes } => {
+            crate::agent::retract_text_tail(final_text, *bytes);
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn clamp_child_history_budget(mut config: Config, cap: usize) -> Config {
     if cap > 0 {
         config.conversation.max_history_tokens = config.conversation.max_history_tokens.min(cap);
@@ -460,7 +475,7 @@ fn run_sub_agent(
     live: Arc<LiveActivity>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> {
     Box::pin(async move {
-        use crate::agent::{Agent, AgentEvent};
+        use crate::agent::Agent;
 
         // The child's compaction trigger derives from its own `Config`, so
         // clamping the history budget on this clone caps the child without
@@ -624,10 +639,10 @@ fn run_sub_agent(
                             live.touch();
                         }
                     }
+                    if let Some(ref ev) = event {
+                        fold_result_text(&mut final_text, ev);
+                    }
                     match event {
-                        Some(AgentEvent::TextDelta(delta)) => {
-                            final_text.push_str(&delta);
-                        }
                         Some(AgentEvent::TurnComplete) | None => {
                             break;
                         }
@@ -779,6 +794,51 @@ mod compaction_cap_tests {
     /// far above the window, so the window (minus output reservation) is the
     /// binding threshold — the case where an uncapped child re-sends the
     /// whole prefix.
+    /// Spec: the parent gets the text of the attempt that completes. Text
+    /// of an earlier tool iteration stays in the result.
+    #[test]
+    fn the_result_text_drops_a_failed_attempt() {
+        let delta = |text: &str| AgentEvent::TextDelta(text.to_string());
+        let attempt = |attempt| AgentEvent::LlmAttemptStarted { attempt };
+        // (name, events, result)
+        let cases: Vec<(&str, Vec<AgentEvent>, &str)> = vec![
+            (
+                "retry after partial output",
+                vec![
+                    attempt(0),
+                    delta("The answer is fo"),
+                    AgentEvent::TextRetracted { bytes: 16 },
+                    attempt(1),
+                    delta("The answer is "),
+                    delta("forty-two."),
+                    AgentEvent::TurnComplete,
+                ],
+                "The answer is forty-two.",
+            ),
+            (
+                "multi-byte text",
+                vec![
+                    delta("R\u{e9}sum\u{e9} \u{2014} pa"),
+                    AgentEvent::TextRetracted { bytes: 15 },
+                    delta("R\u{e9}sum\u{e9} \u{2014} page 1."),
+                ],
+                "R\u{e9}sum\u{e9} \u{2014} page 1.",
+            ),
+            (
+                "a new attempt marker alone removes nothing",
+                vec![attempt(0), delta("Step 1. "), attempt(0), delta("Step 2.")],
+                "Step 1. Step 2.",
+            ),
+        ];
+        for (name, events, want) in cases {
+            let mut text = String::new();
+            for event in &events {
+                fold_result_text(&mut text, event);
+            }
+            assert_eq!(text, want, "{name}");
+        }
+    }
+
     fn million_window_parent() -> Config {
         let mut config = Config::default();
         config.llm.model = "claude-opus-5".to_string();

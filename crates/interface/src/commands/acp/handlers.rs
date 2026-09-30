@@ -297,6 +297,19 @@ pub(super) async fn handle_request<D: AcpDaemon>(
                     }
                 }
             }
+            // Give every tool call a terminal status before the response.
+            // Empty on a clean turn. A write failure here must not replace
+            // the reason the turn ended.
+            for update in tool_streams.drain_open(&params.session_id) {
+                if let Err(e) = send_notification(&writer, "session/update", update).await {
+                    tracing::warn!(
+                        session = %params.session_id,
+                        error = %format!("{e:#}"),
+                        "ACP: could not close an open tool call at the end of the turn",
+                    );
+                    break;
+                }
+            }
             let cancel_observed = {
                 let mut sessions = state.sessions.lock().await;
                 let mut observed = false;

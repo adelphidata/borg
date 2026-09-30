@@ -86,6 +86,11 @@ pub(crate) async fn collect_heartbeat_response(
             Ok(Some(AgentEvent::TextDelta(delta))) => {
                 response.push_str(&delta);
             }
+            // The attempt that sent this text failed; the full response
+            // comes again.
+            Ok(Some(AgentEvent::TextRetracted { bytes })) => {
+                cortex::agent::retract_text_tail(&mut response, bytes);
+            }
             Ok(Some(AgentEvent::SystemNotice { category, text }))
                 if category == PROMPT_REQUEST_USER_INPUT || category == PROMPT_REQUEST_SHELL =>
             {
@@ -1363,6 +1368,30 @@ mod tests {
         assert!(
             !cancel.is_cancelled(),
             "clean channel close must not cancel the turn"
+        );
+    }
+
+    /// Spec: the heartbeat result is the text of the attempt that
+    /// completes. The text of a failed attempt must not stay in front.
+    #[tokio::test]
+    async fn collect_heartbeat_response_drops_the_text_of_a_failed_attempt() {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        for event in [
+            AgentEvent::LlmAttemptStarted { attempt: 0 },
+            AgentEvent::TextDelta("3 ungelesene E-Mails \u{2014} f\u{fc}".into()),
+            AgentEvent::TextRetracted { bytes: 28 },
+            AgentEvent::LlmAttemptStarted { attempt: 1 },
+            AgentEvent::TextDelta("3 ungelesene E-Mails \u{2014} ".into()),
+            AgentEvent::TextDelta("f\u{fc}r dich.".into()),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let outcome =
+            collect_heartbeat_response(rx, CancellationToken::new(), Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            CollectOutcome::Completed("3 ungelesene E-Mails \u{2014} f\u{fc}r dich.".into())
         );
     }
 

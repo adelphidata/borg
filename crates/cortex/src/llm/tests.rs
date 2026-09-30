@@ -1288,6 +1288,69 @@ async fn chat_streamed_aggregates_sse_text_deltas() {
     assert_eq!(message.text_content(), Some("Hello summary world"));
 }
 
+/// A retry sends the full answer again. The aggregate must hold the text of
+/// the attempt that completes, without the text of the attempt that failed.
+///
+/// The first connection sends two deltas and a length cut, then closes with
+/// no completion marker. The second connection sends a complete answer. The
+/// wait between the two is the real reconnect delay, so the test is slow.
+#[tokio::test]
+async fn chat_streamed_keeps_only_the_text_of_the_attempt_that_completes() {
+    use std::io::{Read, Write};
+    const CUT_SHORT: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summ\"},\"finish_reason\":null}]}\n\n",
+    );
+    const COMPLETE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summary world\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = listener.local_addr().expect("local addr").port();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_by_thread = served.clone();
+    std::thread::spawn(move || {
+        for body in [CUT_SHORT, COMPLETE] {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+            served_by_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
+    config.llm.max_retries = 1;
+    let mut client = LlmClient::new(&config).await.expect("client builds");
+
+    let (message, truncated) = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.chat_streamed_checked(&[Message::user("summarize")]),
+    )
+    .await
+    .expect("the retry must complete inside the reconnect delay")
+    .expect("the second attempt is complete");
+
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the test is valid only when the first attempt failed and a second one ran"
+    );
+    assert_eq!(message.text_content(), Some("Hello summary world"));
+    assert!(!truncated);
+}
+
 #[tokio::test]
 async fn ollama_connection_refused_error_says_ollama_serve() {
     // Bind then drop a listener so the port is provably closed.
@@ -4630,4 +4693,412 @@ fn anthropic_chat_response_carries_message_id() {
         .parse_chat_response(no_id, "anthropic", "claude")
         .expect("parses");
     assert_eq!(parsed.usage.expect("usage").response_id, None);
+}
+
+// ── OpenAI-compatible in-stream error frames ──
+//
+// An aggregator relays an upstream failure as an error object inside an
+// HTTP 200 stream. The frame must end the call as a classified error, so
+// key rotation and fallback see the real cause.
+
+#[test]
+fn openai_sse_error_frame_is_classified_and_never_continues() {
+    use crate::sse::SseAction;
+
+    struct Case {
+        name: &'static str,
+        line: &'static str,
+        retryable: bool,
+        reason: FailoverReason,
+        status: Option<u16>,
+    }
+    let cases = [
+        Case {
+            name: "numeric 429",
+            line: r#"data: {"error":{"code":429,"message":"Rate limit exceeded"}}"#,
+            retryable: true,
+            reason: FailoverReason::RateLimit,
+            status: Some(429),
+        },
+        Case {
+            name: "numeric 403",
+            line: r#"data: {"error":{"code":403,"message":"Key disabled"}}"#,
+            retryable: false,
+            reason: FailoverReason::AuthPermanent,
+            status: Some(403),
+        },
+        Case {
+            name: "status_code field wins over a string code",
+            line: r#"data: {"error":{"code":"upstream_error","status_code":503,"message":"no capacity"}}"#,
+            retryable: true,
+            reason: FailoverReason::Overloaded,
+            status: Some(503),
+        },
+        Case {
+            name: "code 200 with success false is not a status",
+            line: r#"data: {"code":200,"success":false,"error":{"code":200,"message":"something broke"}}"#,
+            retryable: true,
+            reason: FailoverReason::Unknown,
+            status: None,
+        },
+        Case {
+            name: "an out-of-range first field does not hide a valid later status",
+            line: r#"data: {"error":{"status_code":200,"code":429,"message":"Rate limit exceeded"}}"#,
+            retryable: true,
+            reason: FailoverReason::RateLimit,
+            status: Some(429),
+        },
+        Case {
+            name: "string code with a disconnect message",
+            line: r#"data: {"error":{"code":"server_error","message":"Provider disconnected"}}"#,
+            retryable: true,
+            reason: FailoverReason::Unknown,
+            status: None,
+        },
+        Case {
+            name: "account block text without a status",
+            line: r#"data: {"error":{"message":"Your account is blocked for a previous policy violation"}}"#,
+            retryable: false,
+            reason: FailoverReason::AuthPermanent,
+            status: None,
+        },
+        Case {
+            name: "finish_reason error without an error object",
+            line: r#"data: {"choices":[{"index":0,"delta":{"content":"par"},"finish_reason":"error"}]}"#,
+            retryable: true,
+            reason: FailoverReason::Unknown,
+            status: None,
+        },
+    ];
+
+    for case in cases {
+        let action = transport::parse_openai_sse_line(
+            case.line,
+            "openrouter",
+            "openai/gpt-4o-mini",
+            &mut Default::default(),
+        );
+        let SseAction::Error(err) = action else {
+            panic!("{}: an error frame must give SseAction::Error", case.name);
+        };
+        assert_eq!(err.is_retryable(), case.retryable, "{}", case.name);
+        assert_eq!(err.reason(), case.reason, "{}", case.name);
+        assert_eq!(err.status_code(), case.status, "{}", case.name);
+    }
+}
+
+#[test]
+fn openai_sse_error_frame_redacts_secrets_in_the_message() {
+    use crate::sse::SseAction;
+    let line = r#"data: {"error":{"code":"server_error","message":"bad token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"}}"#;
+    let action = transport::parse_openai_sse_line(line, "openrouter", "m", &mut Default::default());
+    let SseAction::Error(err) = action else {
+        panic!("expected an error");
+    };
+    assert!(
+        !err.to_string()
+            .contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+        "the key must not reach the error text: {err}"
+    );
+}
+
+#[test]
+fn openai_sse_content_chunk_with_null_error_still_emits() {
+    use crate::sse::SseAction;
+    let line = r#"data: {"error":null,"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
+    let action =
+        transport::parse_openai_sse_line(line, "openai", "gpt-4o", &mut Default::default());
+    match action {
+        SseAction::Emit(events) => {
+            assert!(matches!(events.as_slice(), [StreamEvent::TextDelta(t)] if t == "hi"));
+        }
+        _ => panic!("a normal content chunk must emit its text"),
+    }
+}
+
+// ── A clean close before the completion marker ──
+//
+// A proxy or load balancer can close the socket in the middle of an answer.
+// The byte stream then ends cleanly. Only the completion marker of the wire
+// proves that the response is complete.
+
+/// One AWS event-stream frame with no headers. The reader does not check
+/// the two CRC fields.
+fn bedrock_frame(payload: &str) -> Vec<u8> {
+    let total = 16 + payload.len();
+    let mut frame = Vec::with_capacity(total);
+    frame.extend_from_slice(&(total as u32).to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&[0; 4]);
+    frame.extend_from_slice(payload.as_bytes());
+    frame.extend_from_slice(&[0; 4]);
+    frame
+}
+
+/// Drive `chunks` through `transport` and return the result with every
+/// event that reached the consumer.
+async fn drive_fixture(
+    transport: &'static dyn transport::Transport,
+    chunks: Vec<Vec<u8>>,
+) -> (std::result::Result<(), LlmError>, Vec<StreamEvent>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stream = futures_util::stream::iter(
+        chunks
+            .into_iter()
+            .map(Ok::<Vec<u8>, std::io::Error>)
+            .collect::<Vec<_>>(),
+    );
+    let result =
+        LlmClient::drive_transport_stream(transport, stream, &tx, &cancel, 0, "test", "m", |_| {})
+            .await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    (result, events)
+}
+
+#[tokio::test]
+async fn clean_close_is_complete_only_after_the_completion_marker() {
+    const ANTHROPIC_HEAD: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
+    );
+    const OPENAI_DELTA: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n";
+    const OPENAI_FINISH: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    const GEMINI_DELTA: &str =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"half an ans\"}]}}]}\n\n";
+    const BEDROCK_DELTA: &str =
+        r#"{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"half an ans"}}}"#;
+
+    struct Case {
+        name: &'static str,
+        transport: &'static dyn transport::Transport,
+        chunks: Vec<Vec<u8>>,
+        complete: bool,
+    }
+    let text = |parts: &[&str]| vec![parts.concat().into_bytes()];
+    let cases = vec![
+        Case {
+            name: "anthropic without message_stop",
+            transport: transport::anthropic_transport(),
+            chunks: text(&[ANTHROPIC_HEAD]),
+            complete: false,
+        },
+        Case {
+            name: "anthropic with message_stop",
+            transport: transport::anthropic_transport(),
+            chunks: text(&[ANTHROPIC_HEAD, "data: {\"type\":\"message_stop\"}\n\n"]),
+            complete: true,
+        },
+        Case {
+            name: "openai deltas only",
+            transport: transport::openai_compat_transport(),
+            chunks: text(&[OPENAI_DELTA]),
+            complete: false,
+        },
+        Case {
+            name: "openai finish_reason without the [DONE] sentinel",
+            transport: transport::openai_compat_transport(),
+            chunks: text(&[OPENAI_DELTA, OPENAI_FINISH]),
+            complete: true,
+        },
+        Case {
+            name: "openai with the [DONE] sentinel",
+            transport: transport::openai_compat_transport(),
+            chunks: text(&[OPENAI_DELTA, OPENAI_FINISH, "data: [DONE]\n\n"]),
+            complete: true,
+        },
+        Case {
+            name: "gemini without finishReason",
+            transport: transport::gemini_transport(),
+            chunks: text(&[GEMINI_DELTA]),
+            complete: false,
+        },
+        Case {
+            name: "gemini with finishReason",
+            transport: transport::gemini_transport(),
+            chunks: text(&[
+                GEMINI_DELTA,
+                "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n",
+            ]),
+            complete: true,
+        },
+        Case {
+            name: "bedrock without messageStop",
+            transport: transport::bedrock_transport(),
+            chunks: vec![bedrock_frame(BEDROCK_DELTA)],
+            complete: false,
+        },
+        Case {
+            name: "bedrock with messageStop",
+            transport: transport::bedrock_transport(),
+            chunks: vec![
+                bedrock_frame(BEDROCK_DELTA),
+                bedrock_frame(r#"{"messageStop":{"stopReason":"end_turn"}}"#),
+            ],
+            complete: true,
+        },
+    ];
+
+    for case in cases {
+        let (result, events) = drive_fixture(case.transport, case.chunks).await;
+        let done_count = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Done))
+            .count();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "half an ans")),
+            "{}: the text before the close must reach the consumer",
+            case.name
+        );
+        if case.complete {
+            assert!(result.is_ok(), "{}: {:?}", case.name, result.err());
+            assert_eq!(done_count, 1, "{}: Done must arrive once", case.name);
+        } else {
+            let err = result.expect_err(case.name);
+            assert!(err.is_retryable(), "{}", case.name);
+            assert_eq!(
+                err.reason(),
+                FailoverReason::ConnectionLost,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                done_count, 0,
+                "{}: a cut response must not be reported as done",
+                case.name
+            );
+        }
+    }
+}
+
+// ── Long provider reset windows ──
+
+#[test]
+fn only_a_wait_longer_than_the_bound_ends_the_in_turn_retry() {
+    let rate_limited = |retry_after| LlmError::Retryable {
+        source: anyhow::anyhow!("429"),
+        retry_after,
+        reason: FailoverReason::RateLimit,
+        status: Some(429),
+    };
+    let cases = [
+        (None, false),
+        (Some(Duration::from_secs(5)), false),
+        (Some(MAX_IN_TURN_RETRY_WAIT), false),
+        (Some(MAX_IN_TURN_RETRY_WAIT + Duration::from_secs(1)), true),
+        (Some(Duration::from_secs(8 * 3600)), true),
+    ];
+    for (retry_after, expected) in cases {
+        assert_eq!(
+            is_long_provider_wait(&rate_limited(retry_after)),
+            expected,
+            "{retry_after:?}"
+        );
+    }
+}
+
+#[test]
+fn the_usage_limit_message_names_the_reset_time_in_plain_words() {
+    use chrono::TimeZone;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 3, 10, 9, 15, 0)
+        .single()
+        .expect("valid local time");
+
+    let cases = [
+        // The window rounds up to the minute. The clock time does not.
+        (121, "about 3 minutes (at about 09:17)"),
+        (3600, "about 1 hour (at about 10:15)"),
+        (3660, "about 1 hour 1 minute (at about 10:16)"),
+        (
+            2 * 3600 + 5 * 60,
+            "about 2 hours 5 minutes (at about 11:20)",
+        ),
+        (20 * 3600, "about 20 hours (at about 05:15 on Mar 11)"),
+    ];
+    for (secs, expected) in cases {
+        let msg = usage_limit_message(Provider::OpenRouter, Duration::from_secs(secs), now);
+        assert!(msg.contains(expected), "{secs}s: {msg}");
+        assert!(msg.starts_with("openrouter usage limit reached."), "{msg}");
+        assert!(
+            msg.contains("Add another provider or key, or try again after that."),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains(&format!("{secs}")),
+            "the message must not show raw seconds: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failover_skips_a_slot_whose_every_credential_is_benched() {
+    use crate::llm::credential_pool::{
+        ConfigEntry, CredentialPool, CredentialStrategy, PoolLoadConfig,
+    };
+
+    let mut client = make_failover_restore_client("BORG_TEST_FAILOVER_BENCHED_SLOT").await;
+
+    // Give the fallback slot a pool with one key, in its own database.
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = db_dir.path().join("pool.db");
+    let db = crate::db::Database::open_at(&db_path)
+        .await
+        .expect("open pool db");
+    let pool = CredentialPool::load(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![ConfigEntry {
+                key: "sk-ant-fallback-key".to_string(),
+                label: Some("fallback".to_string()),
+                config_name: "llm.fallback[0]".to_string(),
+            }],
+            env_vars: vec![],
+            oauth_home: Some(db_dir.path().to_path_buf()),
+        },
+    )
+    .await
+    .expect("pool loads");
+    client.provider_slots[0].pool = Some(pool.clone());
+
+    // The provider benched the only key for an hour. The slot itself has no
+    // provider cooldown.
+    let id = pool.acquire_lease(None).expect("lease").id().to_string();
+    pool.report_failure(
+        &id,
+        FailoverReason::RateLimit,
+        Some(429),
+        Some(Duration::from_secs(3600)),
+        None,
+    );
+    assert!(!pool.has_available(), "precondition: the key is benched");
+
+    assert!(
+        !client.try_failover_provider(),
+        "a slot that cannot serve must not be selected"
+    );
+    assert_eq!(client.active_slot_index, usize::MAX);
+    assert_eq!(client.provider, Provider::OpenAi);
+
+    // The same slot is selected again when its key is available.
+    pool.reset_cooldowns();
+    assert!(client.try_failover_provider());
+    assert_eq!(client.provider, Provider::Anthropic);
 }

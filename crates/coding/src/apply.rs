@@ -212,6 +212,10 @@ enum FileSnapshot {
     Existed(String),
     /// File did not exist (was created by the patch).
     DidNotExist,
+    /// The entry was a symbolic link with this target. Rollback recreates
+    /// the link itself; the target is never read or written.
+    #[cfg(unix)]
+    Symlink(PathBuf),
 }
 
 enum CommitAction {
@@ -239,13 +243,31 @@ pub fn apply_patch(patch: &Patch, base_dir: &Path) -> Result<ApplyPatchResult> {
     commit_prepared_patch(prepared, base_dir)
 }
 
-/// Refuse to write through symlinks to prevent TOCTOU attacks.
+/// What occupies `path` in its directory, without following a symlink.
+///
+/// `Path::exists` follows links, so it reports a dangling symlink as absent
+/// although the name is taken. Every existence decision here must see the
+/// entry itself.
+fn entry_kind(path: &Path) -> std::io::Result<Option<std::fs::FileType>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta.file_type())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // A parent component is a regular file, so no entry can be there. The
+        // write that follows reports the real problem.
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_symlink(path: &Path) -> std::io::Result<bool> {
+    Ok(entry_kind(path)?.is_some_and(|kind| kind.is_symlink()))
+}
+
+/// Refuse to write through symlinks to prevent TOCTOU attacks. A dangling
+/// link is refused too: a write would replace the link with a regular file.
 fn reject_symlink(path: &std::path::Path) -> Result<()> {
-    if path.exists() {
-        let meta = std::fs::symlink_metadata(path)?;
-        if meta.file_type().is_symlink() {
-            anyhow::bail!("Refusing to write through symlink: {}", path.display());
-        }
+    if is_symlink(path)? {
+        anyhow::bail!("Refusing to write through symlink: {}", path.display());
     }
     Ok(())
 }
@@ -469,7 +491,7 @@ fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
                     continue;
                 }
 
-                match virtual_file_state(path, base_dir, &overlay) {
+                match deletable_file_state(path, base_dir, &overlay) {
                     Ok(Some(previous)) => {
                         overlay.insert(path.clone(), None);
                         actions.push(CommitAction::Delete { path: path.clone() });
@@ -557,7 +579,12 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
                 }
                 CommitAction::Delete { path } => {
                     let full_path = base_dir.join(path);
-                    if full_path.exists() {
+                    // `remove_file` removes a symlink itself, never its
+                    // target, so a dangling link is deleted like a file.
+                    let occupied = entry_kind(&full_path)
+                        .with_context(|| format!("Failed to inspect {path}"))?
+                        .is_some();
+                    if occupied {
                         std::fs::remove_file(&full_path)
                             .with_context(|| format!("Failed to delete {path}"))?;
                         info!("Deleted file: {path}");
@@ -602,6 +629,15 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
                         }
                     }
                 }
+                #[cfg(unix)]
+                FileSnapshot::Symlink(target) => {
+                    if let Err(err) = restore_symlink(&full_path, &target) {
+                        warn!(
+                            "Rollback: failed to restore symlink {}: {err}",
+                            full_path.display()
+                        );
+                    }
+                }
             }
         }
         return Err(e);
@@ -619,25 +655,77 @@ fn virtual_file_state(
         return Ok(value.clone());
     }
     let full_path = base_dir.join(path);
-    if full_path.exists() {
-        return Ok(Some(
-            std::fs::read_to_string(&full_path)
-                .with_context(|| format!("Failed to read {path}"))?,
-        ));
+    let Some(kind) = entry_kind(&full_path).with_context(|| format!("Failed to inspect {path}"))?
+    else {
+        return Ok(None);
+    };
+    if kind.is_symlink() && !full_path.exists() {
+        bail!("{path} is a symlink with no target; refusing to treat it as a new file");
     }
-    Ok(None)
+    Ok(Some(
+        std::fs::read_to_string(&full_path).with_context(|| format!("Failed to read {path}"))?,
+    ))
+}
+
+/// State of `path` for a delete. Unlike a write, a delete of a symlink is
+/// valid: it removes the link and leaves the target alone. The returned text
+/// only feeds the diff, so a link whose target cannot be read yields an empty
+/// previous content.
+fn deletable_file_state(
+    path: &str,
+    base_dir: &Path,
+    overlay: &HashMap<String, Option<String>>,
+) -> Result<Option<String>> {
+    if !overlay.contains_key(path) {
+        let full_path = base_dir.join(path);
+        if is_symlink(&full_path).with_context(|| format!("Failed to inspect {path}"))? {
+            return Ok(Some(match std::fs::read_to_string(&full_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    debug!("Symlink target of {path} is not readable for the diff: {err}");
+                    String::new()
+                }
+            }));
+        }
+    }
+    virtual_file_state(path, base_dir, overlay)
 }
 
 fn snapshot_file_state(path: &str, base_dir: &Path) -> Result<FileSnapshot> {
     let full_path = base_dir.join(path);
-    if full_path.exists() {
-        Ok(FileSnapshot::Existed(
-            std::fs::read_to_string(&full_path)
-                .with_context(|| format!("Failed to read existing {path}"))?,
-        ))
-    } else {
-        Ok(FileSnapshot::DidNotExist)
+    let Some(kind) = entry_kind(&full_path).with_context(|| format!("Failed to inspect {path}"))?
+    else {
+        return Ok(FileSnapshot::DidNotExist);
+    };
+    #[cfg(unix)]
+    if kind.is_symlink() {
+        return Ok(FileSnapshot::Symlink(
+            std::fs::read_link(&full_path)
+                .with_context(|| format!("Failed to read symlink {path}"))?,
+        ));
     }
+    #[cfg(not(unix))]
+    let _ = kind;
+    Ok(FileSnapshot::Existed(
+        std::fs::read_to_string(&full_path)
+            .with_context(|| format!("Failed to read existing {path}"))?,
+    ))
+}
+
+/// Put a symlink back at `path`. A link that is still in place with the same
+/// target is left alone.
+#[cfg(unix)]
+fn restore_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
+    if is_symlink(path)? && std::fs::read_link(path)? == target {
+        return Ok(());
+    }
+    if entry_kind(path)?.is_some() {
+        std::fs::remove_file(path)?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, path)
 }
 
 struct Replacement {
@@ -2343,6 +2431,135 @@ EOF";
         let content = std::fs::read_to_string(dir.path().join("f.py")).unwrap();
         assert!(content.contains("x = 2"));
         assert!(!content.contains("x = 1"));
+    }
+
+    #[cfg(unix)]
+    fn dangling_link(dir: &TempDir, name: &str) -> (PathBuf, PathBuf) {
+        let target = dir.path().join("missing-target.txt");
+        let link = dir.path().join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.exists(), "precondition: the link has no target");
+        (link, target)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_file_onto_a_dangling_symlink_is_refused_without_writes() {
+        let dir = TempDir::new().unwrap();
+        let (link, target) = dangling_link(&dir, "link.txt");
+
+        let patch = make_patch(vec![
+            PatchOperation::AddFile {
+                path: "other.txt".to_string(),
+                content: "other".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "link.txt".to_string(),
+                content: "payload".to_string(),
+            },
+        ]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("symlink with no target"), "got: {err}");
+        assert!(err.contains("no files were modified"), "got: {err}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists(), "nothing may be written through the link");
+        assert!(!dir.path().join("other.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_onto_a_dangling_symlink_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let (link, target) = dangling_link(&dir, "dest.txt");
+        std::fs::write(dir.path().join("src.txt"), "hello\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "src.txt".to_string(),
+            move_to: Some("dest.txt".to_string()),
+            hunks: vec![],
+        }]);
+        assert!(apply_patch(&patch, dir.path()).is_err());
+
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src.txt")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_on_a_dangling_symlink_removes_the_link() {
+        let dir = TempDir::new().unwrap();
+        let (link, _) = dangling_link(&dir, "link.txt");
+
+        let patch = make_patch(vec![PatchOperation::DeleteFile {
+            path: "link.txt".to_string(),
+        }]);
+        let result = apply_patch(&patch, dir.path()).unwrap();
+
+        assert_eq!(result.affected.deleted, vec!["link.txt".to_string()]);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link must be gone from the directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_file_on_a_live_symlink_keeps_the_target() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "keep me").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let patch = make_patch(vec![PatchOperation::DeleteFile {
+            path: "link.txt".to_string(),
+        }]);
+        apply_patch(&patch, dir.path()).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_a_deleted_symlink_as_a_symlink() {
+        let dir = TempDir::new().unwrap();
+        let (link, target) = dangling_link(&dir, "link.txt");
+        // The second operation passes preflight and fails in the commit
+        // phase: a write through a live symlink is refused there.
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "original").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("live.txt")).unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::DeleteFile {
+                path: "link.txt".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "live.txt".to_string(),
+                content: "hacked".to_string(),
+            },
+        ]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "got: {err:#}");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rollback must put a link back, not a regular file"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "original");
+        assert!(std::fs::symlink_metadata(dir.path().join("live.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]

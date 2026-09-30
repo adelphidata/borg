@@ -533,3 +533,136 @@ async fn open_rejects_an_sse_event_that_never_ends() {
     );
     drop(shutdown_tx);
 }
+
+/// Raw TCP event-stream server. The axum fixture always writes complete,
+/// well-formed events, so the size-cap tests need control of the exact bytes
+/// and of the TCP write seams. Writes the `endpoint` event, then each script
+/// entry as one TCP write with a pause after it, then holds the socket open
+/// so a closed stream is never the reason a test sees an error.
+async fn spawn_raw_event_stream(script: Vec<Vec<u8>>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        sock.set_nodelay(true).expect("nodelay");
+        let mut buf = [0u8; 2048];
+        let _ = sock.read(&mut buf).await;
+        // A write fails when the client has already closed the stream, which
+        // is the expected end of the over-cap test.
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                  event: endpoint\ndata: /messages\n\n",
+            )
+            .await;
+        for piece in script {
+            if sock.write_all(&piece).await.is_err() {
+                return;
+            }
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    format!("http://{addr}/sse")
+}
+
+fn raw_config(url: String, max_response_bytes: usize) -> SseConfig {
+    SseConfig {
+        server_name: "raw-sse".into(),
+        url,
+        headers: HashMap::new(),
+        timeout: Duration::from_secs(2),
+        policy: HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        },
+        client_identity: None,
+        ca_cert_path: None,
+        max_response_bytes,
+    }
+}
+
+/// A `message` event of about 200 bytes, without its final blank line.
+fn padded_event(id: u64) -> String {
+    let payload = json!({"jsonrpc": "2.0", "id": id, "result": {"pad": "x".repeat(150)}});
+    format!("event: message\r\ndata: {payload}")
+}
+
+async fn recv_id(transport: &mut impl Transport) -> Option<u64> {
+    tokio::time::timeout(Duration::from_secs(2), transport.recv())
+        .await
+        .expect("recv timed out")
+        .expect("recv error")
+        .expect("eof before frame")
+        .id
+}
+
+#[tokio::test]
+async fn an_event_with_no_end_closes_the_transport_and_names_the_cap() {
+    // Spec: one event may not be larger than the cap. A server that sends
+    // data with no event end must not make the client buffer it all. The
+    // stream stops, and `recv` reports a closed transport, which is the
+    // signal the supervisor uses to tear the session down.
+    let mut script = vec![b"data: ".to_vec()];
+    script.extend(std::iter::repeat_n(vec![b'x'; 128], 64));
+    let url = spawn_raw_event_stream(script).await;
+    let mut transport = open(raw_config(url, 256), Duration::from_secs(2))
+        .await
+        .expect("open");
+
+    let err = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("the cap must stop the read; recv must not hang")
+        .expect_err("an oversized event must be an error");
+    match err {
+        mcp::McpError::TransportClosed(msg) => assert!(
+            msg.contains("max_response_bytes (256 bytes)"),
+            "the message must name the cap; got: {msg}"
+        ),
+        other => panic!("expected TransportClosed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn many_small_events_above_the_cap_in_total_keep_the_transport_open() {
+    // Spec: the cap is per event. A long-lived stream sends much more than
+    // the cap in total, and that is normal operation.
+    let script: Vec<Vec<u8>> = (1..=10)
+        .map(|id| format!("{}\r\n\r\n", padded_event(id)).into_bytes())
+        .collect();
+    let url = spawn_raw_event_stream(script).await;
+    let mut transport = open(raw_config(url, 256), Duration::from_secs(2))
+        .await
+        .expect("open");
+
+    for id in 1..=10 {
+        assert_eq!(recv_id(&mut transport).await, Some(id));
+    }
+    // About 2 KB passed through a 256-byte cap. The stream must be open:
+    // `recv` waits for the next event and does not report an error or EOF.
+    let idle = tokio::time::timeout(Duration::from_millis(200), transport.recv()).await;
+    assert!(idle.is_err(), "transport must stay open; got {idle:?}");
+}
+
+#[tokio::test]
+async fn an_event_boundary_split_across_two_writes_resets_the_counter() {
+    // Spec: the blank line that ends an event can arrive in two pieces. The
+    // two events are about 200 bytes each. If the split hid the boundary
+    // from the counter, the second event would add to the first, exceed the
+    // 256-byte cap, and close a healthy stream.
+    let script = vec![
+        format!("{}\r\n\r", padded_event(1)).into_bytes(),
+        format!("\n{}\r\n\r\n", padded_event(2)).into_bytes(),
+    ];
+    let url = spawn_raw_event_stream(script).await;
+    let mut transport = open(raw_config(url, 256), Duration::from_secs(2))
+        .await
+        .expect("open");
+
+    assert_eq!(recv_id(&mut transport).await, Some(1));
+    assert_eq!(recv_id(&mut transport).await, Some(2));
+}

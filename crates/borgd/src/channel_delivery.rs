@@ -69,6 +69,24 @@ pub async fn send(config: &Config, channel: &str, sender_id: &str, text: &str) -
     send_threaded(config, channel, sender_id, text, None).await
 }
 
+/// The text that really goes to the channel: `text` with secrets redacted.
+///
+/// Every daemon-originated send (task results, failure and skip notices,
+/// heartbeat, greetings) passes through here, so no lane can hand a raw
+/// credential to a chat channel. Clean text comes back borrowed and
+/// byte-identical, so a caller that already redacted pays nothing.
+pub(crate) fn prepare_outbound<'a>(
+    channel: &str,
+    sender_id: &str,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    cortex::output_redaction::current_policy().apply(
+        cortex::output_redaction::OutputSink::Channel(channel),
+        Some(sender_id),
+        text,
+    )
+}
+
 async fn send_threaded(
     config: &Config,
     channel: &str,
@@ -76,6 +94,8 @@ async fn send_threaded(
     text: &str,
     thread_id: Option<&str>,
 ) -> Result<()> {
+    let text = prepare_outbound(channel, sender_id, text);
+    let text = text.as_ref();
     let token_env = channel_token_env(channel)
         .ok_or_else(|| anyhow!("Channel '{channel}' not supported for delivery"))?;
     let token = config
@@ -114,6 +134,44 @@ async fn send_threaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_text_has_its_secrets_redacted() {
+        let cases = [
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
+            "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
+        ];
+        for token in cases {
+            let text = format!("[Task: sync]\nError: auth failed for {token} on push");
+            for (channel, _) in CHANNEL_TOKENS {
+                let out = prepare_outbound(channel, "12345", &text);
+                assert!(
+                    !out.contains(token),
+                    "{channel}: the token must not reach the channel: {out}"
+                );
+                assert!(
+                    out.contains("[REDACTED"),
+                    "{channel}: the cut must be visible: {out}"
+                );
+                assert!(
+                    out.starts_with("[Task: sync]\nError: auth failed for ")
+                        && out.ends_with(" on push"),
+                    "{channel}: the text around the secret must survive: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clean_outbound_text_is_byte_identical() {
+        let text = "[Task: brief]\n3 PRs open, 1 has a failed check.\n*bold* `code` <tag>";
+        let out = prepare_outbound("telegram", "12345", text);
+        assert_eq!(out, text);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "clean text must not be copied"
+        );
+    }
 
     #[test]
     fn a_credentialled_channel_passes() {

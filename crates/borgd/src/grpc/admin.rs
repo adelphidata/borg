@@ -343,6 +343,9 @@ impl Admin for AdminSvc {
         }))
     }
 
+    /// Write order: a write of `provider` that moves to a different provider
+    /// resets `llm.base_url`. A client that sets both must send `provider`
+    /// first and `llm.base_url` second, or the endpoint is lost.
     async fn set_setting(&self, req: Request<SettingMutation>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
         let resolver = open_settings_resolver().await?;

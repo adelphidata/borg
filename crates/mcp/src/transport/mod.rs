@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 pub mod http;
 pub mod sse;
+mod sse_framing;
 pub mod stdio;
 pub mod url_guard;
 

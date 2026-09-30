@@ -280,6 +280,11 @@ pub struct ToolCallResult {
     /// as a structured error result to the LLM (never silently swallows).
     #[serde(rename = "isError", default)]
     pub is_error: bool,
+    /// Machine-readable result (`structuredContent`). Servers that declare
+    /// an `outputSchema` put the real payload here, often with an empty or
+    /// summary-only `content`, so it must reach the LLM.
+    #[serde(rename = "structuredContent", default)]
+    pub structured_content: Option<serde_json::Value>,
 }
 
 /// One content block in a `tools/call` response.
@@ -465,8 +470,25 @@ pub fn render_call_result(result: &ToolCallResult) -> String {
         }
         out.push_str(&block.render_text());
     }
+    let Some(structured) = result.structured_content.as_ref().filter(|v| !v.is_null()) else {
+        return out;
+    };
+    if out.trim().is_empty() {
+        return structured.to_string();
+    }
+    // A server may mirror the structured payload as JSON text for older
+    // clients. Value equality ignores key order and whitespace, so the
+    // same data is not sent to the LLM twice.
+    if serde_json::from_str::<serde_json::Value>(&out).is_ok_and(|text| text == *structured) {
+        return out;
+    }
+    out.push_str(STRUCTURED_CONTENT_HEADER);
+    out.push_str(&structured.to_string());
     out
 }
+
+/// Separator between the rendered content blocks and the structured payload.
+const STRUCTURED_CONTENT_HEADER: &str = "\n\n[structured content]\n";
 
 /// Method names — a tiny module so typos don't compile.
 pub mod methods {
@@ -659,6 +681,7 @@ mod tests {
                 },
             ],
             is_error: false,
+            structured_content: None,
         };
         assert_eq!(render_call_result(&r), "hello\n{\"k\":1}");
     }
@@ -681,6 +704,7 @@ mod tests {
                 },
             ],
             is_error: false,
+            structured_content: None,
         };
         let out = render_call_result(&r);
         assert!(
@@ -885,8 +909,63 @@ mod tests {
         let r = ToolCallResult {
             content: vec![],
             is_error: false,
+            structured_content: None,
         };
         assert_eq!(render_call_result(&r), "");
+    }
+
+    #[test]
+    fn structured_content_reaches_the_rendered_output() {
+        // (name, wire response, expected render, expected isError)
+        let cases: &[(&str, &str, &str, bool)] = &[
+            (
+                "structured only",
+                r#"{"content":[],"structuredContent":{"id":"doc-42"}}"#,
+                r#"{"id":"doc-42"}"#,
+                false,
+            ),
+            (
+                "whitespace-only text counts as empty",
+                r#"{"content":[{"type":"text","text":"  \n"}],"structuredContent":{"id":"doc-42"}}"#,
+                r#"{"id":"doc-42"}"#,
+                false,
+            ),
+            (
+                "mirrored text with other key order and spacing is not repeated",
+                r#"{"content":[{"type":"text","text":"{ \"b\": 2, \"a\": 1 }"}],"structuredContent":{"a":1,"b":2}}"#,
+                r#"{ "b": 2, "a": 1 }"#,
+                false,
+            ),
+            (
+                "prose summary keeps the structured payload",
+                r#"{"content":[{"type":"text","text":"Created 1 page"}],"structuredContent":{"id":"doc-42"}}"#,
+                "Created 1 page\n\n[structured content]\n{\"id\":\"doc-42\"}",
+                false,
+            ),
+            (
+                "JSON text with different data keeps both",
+                r#"{"content":[{"type":"text","text":"{\"a\":1}"}],"structuredContent":{"a":2}}"#,
+                "{\"a\":1}\n\n[structured content]\n{\"a\":2}",
+                false,
+            ),
+            (
+                "null structured content changes nothing",
+                r#"{"content":[{"type":"text","text":"ok"}],"structuredContent":null}"#,
+                "ok",
+                false,
+            ),
+            (
+                "error result keeps the flag and both parts",
+                r#"{"content":[{"type":"text","text":"quota hit"}],"isError":true,"structuredContent":{"code":"E_QUOTA"}}"#,
+                "quota hit\n\n[structured content]\n{\"code\":\"E_QUOTA\"}",
+                true,
+            ),
+        ];
+        for (name, wire, expected, is_error) in cases {
+            let result: ToolCallResult = serde_json::from_str(wire).expect(name);
+            assert_eq!(render_call_result(&result), *expected, "case: {name}");
+            assert_eq!(result.is_error, *is_error, "case: {name}");
+        }
     }
 
     #[test]

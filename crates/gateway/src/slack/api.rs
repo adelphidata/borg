@@ -64,18 +64,50 @@ const TYPING_CB_SUSPENSION_SECS: u64 = crate::constants::SLACK_TYPING_CB_SUSPENS
 /// Max file download size for Slack attachments.
 const MAX_FILE_DOWNLOAD: usize = cortex::constants::SLACK_MAX_FILE_SIZE;
 
-/// Hostname prefix that `download_file` accepts in production. Slack file
-/// `url_private` links always live under this host.
-const SLACK_FILE_DOWNLOAD_PREFIX: &str = "https://files.slack.com/";
+/// Hosts that `download_file` accepts in production. `url_private` links
+/// live on the first; Enterprise Grid workspaces redirect to the second.
+const SLACK_FILE_HOSTS: &[&str] = &["files.slack.com", "files-origin.slack.com"];
+
+/// Most redirects that one file download follows.
+const MAX_FILE_REDIRECTS: usize = 3;
+
+/// SSRF and token-scope guard for file downloads: true when the bot token
+/// can go to `url`.
+///
+/// Production (`test_base` is `None`): `https` on the default port, host
+/// exactly one of [`SLACK_FILE_HOSTS`]. Under a custom base: only the scheme,
+/// host and port of that base. The host comparison is exact on the parsed
+/// URL, so `files.slack.com.evil.example` and `files.slack.com@evil.example`
+/// both fail.
+fn is_allowed_download_url(url: &url::Url, test_base: Option<&url::Url>) -> bool {
+    match test_base {
+        None => {
+            url.scheme() == "https"
+                && url.port_or_known_default() == Some(443)
+                && url
+                    .host_str()
+                    .is_some_and(|h| SLACK_FILE_HOSTS.contains(&h))
+        }
+        Some(base) => {
+            url.scheme() == base.scheme()
+                && url.host_str() == base.host_str()
+                && url.port_or_known_default() == base.port_or_known_default()
+        }
+    }
+}
 
 /// A client for the Slack Web API.
 #[derive(Clone)]
 pub struct SlackClient {
     client: Client,
+    /// Client for file downloads. It follows no redirect by itself, so
+    /// `download_file` can check each hop before the token goes there.
+    download_client: Client,
     token: String,
     base_url: String,
-    /// URL prefix that `download_file` is allowed to fetch from (SSRF guard).
-    download_prefix: String,
+    /// `None` in production (downloads pinned to [`SLACK_FILE_HOSTS`]).
+    /// Under a custom base, downloads are pinned to that base.
+    download_test_base: Option<url::Url>,
     circuit_breaker: Arc<CircuitBreaker>,
     bot_user_id: Option<String>,
     echo_cache: Arc<Mutex<EchoCache>>,
@@ -92,12 +124,18 @@ impl SlackClient {
     /// custom base they are pinned to that base instead.
     pub(crate) fn with_base(token: &str, base_url: &str) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
-        let download_prefix = if base_url == SLACK_API_BASE {
-            SLACK_FILE_DOWNLOAD_PREFIX.to_string()
+        let download_test_base = if base_url == SLACK_API_BASE {
+            None
         } else {
-            format!("{base_url}/")
+            Some(url::Url::parse(&base_url).context("Invalid Slack API base URL")?)
         };
+        let download_client = Client::builder()
+            .timeout(GATEWAY_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("Failed to build Slack file download HTTP client")?;
         Ok(Self {
+            download_client,
             client: crate::resilience::http_retry::build_channel_client(
                 "Slack",
                 GATEWAY_HTTP_TIMEOUT,
@@ -105,7 +143,7 @@ impl SlackClient {
             )?,
             token: token.to_string(),
             base_url,
-            download_prefix,
+            download_test_base,
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 TYPING_CB_FAILURE_THRESHOLD,
                 TYPING_CB_SUSPENSION_SECS,
@@ -377,20 +415,49 @@ impl SlackClient {
     /// Download a file from Slack using `url_private` with Bearer auth.
     /// Returns the file bytes and content-type.
     /// Rejects files larger than the configured max size.
-    /// Only downloads from `files.slack.com` to prevent SSRF.
+    ///
+    /// Only Slack file hosts get a request. Redirects are followed by hand:
+    /// each hop is checked against the same host pin before the token goes
+    /// there, and the token stays attached on an allowed hop. An error status
+    /// or an HTML body is a failed download, not file content.
     pub async fn download_file(&self, url: &str) -> Result<(Vec<u8>, String)> {
-        // Validate URL domain to prevent SSRF
-        if !url.starts_with(&self.download_prefix) {
-            bail!("Refusing to download file from non-Slack domain");
-        }
+        let mut current = url::Url::parse(url).context("Invalid Slack file URL")?;
+        let mut redirects = 0usize;
+        let resp = loop {
+            if !is_allowed_download_url(&current, self.download_test_base.as_ref()) {
+                bail!("Refusing to download file from non-Slack domain");
+            }
 
-        let resp = self
-            .client
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .context("Failed to download Slack file")?;
+            let resp = self
+                .download_client
+                .get(current.clone())
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .context("Failed to download Slack file")?;
+
+            if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                break resp;
+            }
+            redirects += 1;
+            if redirects > MAX_FILE_REDIRECTS {
+                bail!("Too many Slack file redirects");
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("Slack file redirect has no Location header")?
+                .to_str()
+                .context("Slack file redirect Location is not valid text")?;
+            current = current
+                .join(location)
+                .context("Slack file redirect Location is not a valid URL")?;
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("Slack file download failed ({})", status.as_u16());
+        }
 
         let content_type = resp
             .headers()
@@ -398,6 +465,18 @@ impl SlackClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or(crate::constants::DEFAULT_ATTACHMENT_MIME)
             .to_string();
+
+        // Slack answers a request it does not accept with a sign-in page and
+        // status 200. That page is not the file.
+        if content_type
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("text/html")
+        {
+            bail!(
+                "Slack returned a sign-in page instead of the file — check that the bot token has the files:read scope and that the bot can see the file"
+            );
+        }
 
         // Streamed read with a running cap — Content-Length can lie or be
         // absent, so the ceiling is enforced chunk-by-chunk while streaming.
@@ -1469,6 +1548,194 @@ mod tests {
                 err.to_string().contains("non-Slack domain"),
                 "must fail at the guard, not the request: {err}"
             );
+        }
+
+        /// A redirect to the allowed host is followed, the token stays
+        /// attached on the second request, and the file bytes come back.
+        #[tokio::test]
+        async fn download_file_follows_allowed_redirect_with_token() {
+            for status in [301u16, 302, 303, 307, 308] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/files-pri/T1-F1/photo.png"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("location", "/files-origin/T1-F1/photo.png"),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path("/files-origin/T1-F1/photo.png"))
+                    .and(header("authorization", format!("Bearer {TOKEN}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(b"PNG-PAYLOAD".to_vec())
+                            .insert_header("content-type", "image/png"),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                let url = format!("{}/files-pri/T1-F1/photo.png", server.uri());
+                let (bytes, content_type) = client(&server)
+                    .download_file(&url)
+                    .await
+                    .unwrap_or_else(|e| panic!("status {status}: {e}"));
+                assert_eq!(bytes, b"PNG-PAYLOAD", "status {status}");
+                assert_eq!(content_type, "image/png", "status {status}");
+            }
+        }
+
+        /// A redirect to a host outside the pin fails, and that host gets no
+        /// request (so it never sees the token).
+        #[tokio::test]
+        async fn download_file_refuses_redirect_to_foreign_host() {
+            for status in [301u16, 302, 303, 307, 308] {
+                let server = MockServer::start().await;
+                let foreign = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/files-pri/T1-F1/photo.png"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("location", format!("{}/steal", foreign.uri())),
+                    )
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+                    .mount(&foreign)
+                    .await;
+
+                let url = format!("{}/files-pri/T1-F1/photo.png", server.uri());
+                let err = client(&server)
+                    .download_file(&url)
+                    .await
+                    .expect_err("foreign redirect must fail");
+                assert!(
+                    err.to_string().contains("non-Slack domain"),
+                    "status {status}: {err}"
+                );
+                assert_eq!(
+                    foreign.received_requests().await.unwrap().len(),
+                    0,
+                    "status {status}: foreign host must get no request"
+                );
+            }
+        }
+
+        /// Three redirects are followed; the fourth is refused.
+        #[tokio::test]
+        async fn download_file_limits_redirect_chain() {
+            for (hops, succeeds) in [(3usize, true), (4, false)] {
+                let server = MockServer::start().await;
+                for i in 0..hops {
+                    Mock::given(method("GET"))
+                        .and(path(format!("/hop{i}")))
+                        .respond_with(
+                            ResponseTemplate::new(302)
+                                .insert_header("location", format!("/hop{}", i + 1)),
+                        )
+                        .mount(&server)
+                        .await;
+                }
+                Mock::given(method("GET"))
+                    .and(path(format!("/hop{hops}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_bytes(b"DATA".to_vec())
+                            .insert_header("content-type", "image/png"),
+                    )
+                    .mount(&server)
+                    .await;
+
+                let result = client(&server)
+                    .download_file(&format!("{}/hop0", server.uri()))
+                    .await;
+                if succeeds {
+                    assert_eq!(result.expect("3 hops are allowed").0, b"DATA");
+                } else {
+                    let err = result.expect_err("4 hops must fail");
+                    assert!(err.to_string().contains("Too many Slack file redirects"));
+                    assert_eq!(
+                        server.received_requests().await.unwrap().len(),
+                        4,
+                        "the target after the 4th redirect gets no request"
+                    );
+                }
+            }
+        }
+
+        /// An error body or a sign-in page is a failed download, never file
+        /// content.
+        #[tokio::test]
+        async fn download_file_rejects_error_status_and_html_body() {
+            let cases = [
+                (403u16, "application/json", "failed (403)"),
+                (404, "text/plain", "failed (404)"),
+                (500, "image/png", "failed (500)"),
+                (200, "text/html; charset=utf-8", "files:read"),
+                (200, "Text/HTML", "files:read"),
+            ];
+            for (status, content_type, expected) in cases {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/files-pri/T1-F1/photo.png"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .set_body_bytes(b"<html>sign in</html>".to_vec())
+                            .insert_header("content-type", content_type),
+                    )
+                    .mount(&server)
+                    .await;
+                let url = format!("{}/files-pri/T1-F1/photo.png", server.uri());
+                let err = client(&server)
+                    .download_file(&url)
+                    .await
+                    .expect_err("must not report success");
+                assert!(
+                    err.to_string().contains(expected),
+                    "{status} {content_type}: {err}"
+                );
+            }
+        }
+
+        /// The production pin: https, exact Slack file hosts, default port.
+        #[test]
+        fn download_url_pin_is_exact() {
+            let cases = [
+                ("https://files.slack.com/files-pri/T1-F1/a.png", true),
+                ("https://files-origin.slack.com/files-pri/T1-F1/a.png", true),
+                ("http://files.slack.com/files-pri/T1-F1/a.png", false),
+                ("https://files.slack.com:8443/a.png", false),
+                ("https://files.slack.com.evil.example/a.png", false),
+                ("https://files.slack.com@evil.example/a.png", false),
+                ("https://evilfiles.slack.com/a.png", false),
+                ("https://slack.com/a.png", false),
+                ("https://127.0.0.1/a.png", false),
+            ];
+            for (raw, expected) in cases {
+                let url = url::Url::parse(raw).unwrap();
+                assert_eq!(is_allowed_download_url(&url, None), expected, "{raw}");
+            }
+
+            // Under a custom base: that scheme, host and port only.
+            let base = url::Url::parse("http://127.0.0.1:4010").unwrap();
+            let cases = [
+                ("http://127.0.0.1:4010/files/a.png", true),
+                ("http://127.0.0.1:4011/files/a.png", false),
+                ("https://127.0.0.1:4010/files/a.png", false),
+                ("http://localhost:4010/files/a.png", false),
+                ("https://files.slack.com/a.png", false),
+            ];
+            for (raw, expected) in cases {
+                let url = url::Url::parse(raw).unwrap();
+                assert_eq!(
+                    is_allowed_download_url(&url, Some(&base)),
+                    expected,
+                    "{raw}"
+                );
+            }
         }
 
         /// conversations.history must pass channel+limit as query params

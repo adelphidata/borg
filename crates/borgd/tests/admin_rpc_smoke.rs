@@ -1158,6 +1158,97 @@ async fn creating_a_scheduled_task_resolves_its_first_run_and_rejects_a_bad_expr
     );
 }
 
+/// A zone the scheduler cannot resolve must be refused on create and on
+/// update. A stored unknown zone makes the schedule evaluate in UTC with no
+/// message to the user, so the task fires at the wrong hour.
+#[tokio::test]
+async fn scheduled_task_rpcs_refuse_an_unknown_timezone_and_store_nothing() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    let create = |name: &str, timezone: &str| ScheduledTaskCreate {
+        name: name.into(),
+        prompt: "say hello".into(),
+        schedule_type: "cron".into(),
+        schedule_expr: "0 0 8 * * *".into(),
+        timezone: timezone.into(),
+        task_type: "prompt".into(),
+        delivery_channel: String::new(),
+        delivery_target: String::new(),
+        next_run_unix: 0,
+        max_retries: -1,
+        timeout_ms: 0,
+        allowed_tools: String::new(),
+        pre_run_command: String::new(),
+        pre_run_cwd: String::new(),
+        pre_run_timeout_ms: 0,
+    };
+    let assert_refusal = |status: tonic::Status, bad: &str| {
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{bad}");
+        assert!(
+            status.message().contains(bad) && status.message().contains("America/New_York"),
+            "the error must name the bad value and the accepted form, got: {}",
+            status.message()
+        );
+    };
+
+    // A numeric offset is the value an old CLI sent. It is not a zone name.
+    for bad in ["+02:00", "Mars/Base"] {
+        let status = admin
+            .create_scheduled_task(create("refused", bad))
+            .await
+            .expect_err("an unknown zone must be refused");
+        assert_refusal(status, bad);
+    }
+
+    let kept = admin
+        .create_scheduled_task(create("kept", "Europe/Berlin"))
+        .await
+        .expect("an IANA zone is accepted")
+        .into_inner();
+    admin
+        .create_scheduled_task(create("local-zone", "Local"))
+        .await
+        .expect("'Local' is accepted in any letter case");
+
+    let status = admin
+        .update_scheduled_task(ScheduledTaskUpdate {
+            id: kept.id.clone(),
+            name: "renamed".into(),
+            prompt: String::new(),
+            schedule_type: String::new(),
+            schedule_expr: String::new(),
+            timezone: "Mars/Base".into(),
+        })
+        .await
+        .expect_err("an unknown zone must be refused on update");
+    assert_refusal(status, "Mars/Base");
+
+    let tasks = admin
+        .list_scheduled_tasks(AdminEmpty {})
+        .await
+        .expect("list")
+        .into_inner()
+        .tasks;
+    assert!(
+        tasks.iter().all(|t| t.name != "refused"),
+        "a refused task must not be left behind in the table"
+    );
+    let row = tasks
+        .iter()
+        .find(|t| t.id == kept.id)
+        .expect("the accepted task is stored");
+    assert_eq!(
+        row.name, "kept",
+        "a refused update must not apply its other fields"
+    );
+    assert_eq!(row.timezone, "Europe/Berlin");
+}
+
 /// Renaming is what the conversation list's Rename action calls.
 ///
 /// `update_session_title` is a no-op for an unknown id, so the handler has to
@@ -1434,14 +1525,9 @@ async fn setup_status_reflects_provider_credentials_and_catalog() {
     );
     assert!(stored.configured);
 
-    // A keyless provider needs its runtime, not a key lying around.
-    admin
-        .set_setting(SettingMutation {
-            key: "llm.base_url".into(),
-            value: "http://127.0.0.1:1".into(),
-        })
-        .await
-        .expect("set base_url");
+    // A keyless provider needs its runtime, not a key lying around. The
+    // provider goes first: a change of provider clears the endpoint of the
+    // previous one.
     admin
         .set_setting(SettingMutation {
             key: "provider".into(),
@@ -1449,6 +1535,13 @@ async fn setup_status_reflects_provider_credentials_and_catalog() {
         })
         .await
         .expect("set provider");
+    admin
+        .set_setting(SettingMutation {
+            key: "llm.base_url".into(),
+            value: "http://127.0.0.1:1".into(),
+        })
+        .await
+        .expect("set base_url");
     let ollama = status(&mut admin).await;
     assert!(
         !ollama.configured,

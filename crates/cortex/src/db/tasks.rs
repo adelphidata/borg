@@ -1193,11 +1193,16 @@ impl Database {
         let schedule_expr = update.schedule_expr.unwrap_or(&existing.schedule_expr);
         let timezone = update.timezone.unwrap_or(&existing.timezone);
 
-        let next_run = if update.schedule_type.is_some() || update.schedule_expr.is_some() {
-            crate::tasks::calculate_next_run(schedule_type, schedule_expr, timezone)?
-        } else {
-            existing.next_run
-        };
+        // A timezone-only change moves the next fire too: without the
+        // recompute the task fires once more at the old zone's hour.
+        let timezone_changed = update.timezone.is_some_and(|tz| tz != existing.timezone);
+        let next_run =
+            if update.schedule_type.is_some() || update.schedule_expr.is_some() || timezone_changed
+            {
+                crate::tasks::calculate_next_run(schedule_type, schedule_expr, timezone)?
+            } else {
+                existing.next_run
+            };
 
         self.conn.execute(
             "UPDATE scheduled_tasks SET name = ?1, prompt = ?2, schedule_type = ?3, schedule_expr = ?4, timezone = ?5, next_run = ?6 WHERE id = ?7",
@@ -1315,6 +1320,86 @@ mod tests {
         let pid = child.id();
         let _ = child.wait().expect("wait on /usr/bin/true");
         pid
+    }
+
+    fn cron_task<'a>(id: &'a str, timezone: &'a str, next_run: Option<i64>) -> NewTask<'a> {
+        NewTask {
+            id,
+            name: "daily",
+            prompt: "do the thing",
+            schedule_type: "cron",
+            schedule_expr: "0 0 9 * * * *",
+            timezone,
+            next_run,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        }
+    }
+
+    /// 09:00 in Tokyo is not 09:00 UTC. A timezone-only update must move
+    /// `next_run`, or the next fire still uses the old zone.
+    #[tokio::test]
+    async fn timezone_only_update_recomputes_next_run() {
+        let db = test_db().await;
+        let utc_next = crate::tasks::calculate_next_run("cron", "0 0 9 * * * *", "UTC")
+            .unwrap()
+            .expect("cron has a next run");
+        db.create_task(&cron_task("tz-task", "UTC", Some(utc_next)))
+            .await
+            .expect("create task");
+
+        let update = UpdateTask {
+            name: None,
+            prompt: None,
+            schedule_type: None,
+            schedule_expr: None,
+            timezone: Some("Asia/Tokyo"),
+        };
+        assert!(db.update_task("tz-task", &update).await.unwrap());
+
+        let tokyo_next = crate::tasks::calculate_next_run("cron", "0 0 9 * * * *", "Asia/Tokyo")
+            .unwrap()
+            .expect("cron has a next run");
+        let row = db.get_task_by_id("tz-task").await.unwrap().unwrap();
+        assert_eq!(row.timezone, "Asia/Tokyo");
+        assert_eq!(row.next_run, Some(tokyo_next));
+        assert_ne!(
+            row.next_run,
+            Some(utc_next),
+            "09:00 Tokyo and 09:00 UTC are different instants"
+        );
+    }
+
+    /// An update that does not change the schedule or the zone keeps the
+    /// stored `next_run` (for example a `run_now` reservation).
+    #[tokio::test]
+    async fn update_without_a_timezone_change_keeps_next_run() {
+        let db = test_db().await;
+        db.create_task(&cron_task("same-tz", "Asia/Tokyo", Some(1234)))
+            .await
+            .expect("create task");
+
+        let update = UpdateTask {
+            name: Some("renamed"),
+            prompt: None,
+            schedule_type: None,
+            schedule_expr: None,
+            timezone: Some("Asia/Tokyo"),
+        };
+        assert!(db.update_task("same-tz", &update).await.unwrap());
+
+        let row = db.get_task_by_id("same-tz").await.unwrap().unwrap();
+        assert_eq!(row.name, "renamed");
+        assert_eq!(row.next_run, Some(1234));
     }
 
     /// The pin has to survive a write/read round trip through the schema —

@@ -120,6 +120,9 @@ pub(crate) fn convert_pb_event(
     let kind = pb.kind?;
     Some(match kind {
         Kind::TextDelta(d) => CoreEvent::TextDelta(d.text),
+        Kind::TextRetracted(r) => CoreEvent::TextRetracted {
+            bytes: usize::try_from(r.bytes).unwrap_or(usize::MAX),
+        },
         Kind::ThinkingDelta(d) => CoreEvent::ThinkingDelta(d.text),
         Kind::ToolExecuting(t) => CoreEvent::ToolExecuting {
             tool_call_id: t.tool_call_id,

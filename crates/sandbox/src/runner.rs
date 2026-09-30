@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, instrument};
 
@@ -49,6 +49,36 @@ fn kill_process_group(pid: Option<u32>) {
         Some(_) => {}
         None => {}
     }
+}
+
+/// Read one line as bytes and decode it lossily, without the line ending.
+///
+/// A script may print bytes that are not UTF-8 (binary data, Latin-1). A
+/// strict decode would fail on such a line, the pipe would no longer be read,
+/// and the child would block on a full pipe until the timeout. `Ok(None)` is
+/// end of stream; an `Err` is a real I/O error.
+///
+/// `pending` must be one buffer per stream that lives across calls: when the
+/// future is dropped in a `select!`, the bytes read so far stay in it and the
+/// next call continues the same line.
+async fn next_line_lossy<R>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let read = reader.read_until(b'\n', pending).await?;
+    if read == 0 && pending.is_empty() {
+        return Ok(None);
+    }
+    let mut line = pending.as_slice();
+    if let Some(rest) = line.strip_suffix(b"\n") {
+        line = rest.strip_suffix(b"\r").unwrap_or(rest);
+    }
+    let decoded = String::from_utf8_lossy(line).into_owned();
+    pending.clear();
+    Ok(Some(decoded))
 }
 
 impl<'a> ScriptRunner<'a> {
@@ -187,8 +217,10 @@ impl<'a> ScriptRunner<'a> {
         const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
         let streaming_future = async {
-            let mut stdout_lines = stdout_pipe.map(|p| BufReader::new(p).lines());
-            let mut stderr_lines = stderr_pipe.map(|p| BufReader::new(p).lines());
+            let mut stdout_lines = stdout_pipe.map(BufReader::new);
+            let mut stderr_lines = stderr_pipe.map(BufReader::new);
+            let mut stdout_pending: Vec<u8> = Vec::new();
+            let mut stderr_pending: Vec<u8> = Vec::new();
             let mut stdout_done = stdout_lines.is_none();
             let mut stderr_done = stderr_lines.is_none();
 
@@ -196,7 +228,7 @@ impl<'a> ScriptRunner<'a> {
                 tokio::select! {
                     line = async {
                         match stdout_lines.as_mut() {
-                            Some(reader) => reader.next_line().await,
+                            Some(reader) => next_line_lossy(reader, &mut stdout_pending).await,
                             None => std::future::pending().await,
                         }
                     }, if !stdout_done => {
@@ -213,12 +245,20 @@ impl<'a> ScriptRunner<'a> {
                                     stdout_truncated = true;
                                 }
                             }
-                            _ => { stdout_done = true; }
+                            Ok(None) => { stdout_done = true; }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    sandbox.name = %self.name,
+                                    "script stdout read failed"
+                                );
+                                stdout_done = true;
+                            }
                         }
                     }
                     line = async {
                         match stderr_lines.as_mut() {
-                            Some(reader) => reader.next_line().await,
+                            Some(reader) => next_line_lossy(reader, &mut stderr_pending).await,
                             None => std::future::pending().await,
                         }
                     }, if !stderr_done => {
@@ -235,7 +275,15 @@ impl<'a> ScriptRunner<'a> {
                                     stderr_truncated = true;
                                 }
                             }
-                            _ => { stderr_done = true; }
+                            Ok(None) => { stderr_done = true; }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    sandbox.name = %self.name,
+                                    "script stderr read failed"
+                                );
+                                stderr_done = true;
+                            }
                         }
                     }
                 }
@@ -1015,5 +1063,114 @@ mod tests {
         assert!(output.success());
         assert!(stderr_seen, "should have received stderr callback");
         assert!(output.stderr.contains("stderr_line"));
+    }
+
+    #[cfg(unix)]
+    fn streaming_runner<'a>(script: &'a Path, work_dir: &'a Path) -> ScriptRunner<'a> {
+        ScriptRunner {
+            runtime: "bash",
+            script_path: script,
+            work_dir,
+            sandbox_policy: SandboxPolicy::default(),
+            timeout_ms: 20_000,
+            extra_env: &[],
+            name: "non-utf8-test",
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_streaming_keeps_reading_after_a_non_utf8_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("binary.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\nprintf '\\377\\376\\n'\necho after\nprintf '\\377\\n' >&2\necho err_after >&2\n",
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let output = streaming_runner(&script, dir.path())
+            .run_streaming("{}", |line, is_stderr| {
+                seen.push((line.to_string(), is_stderr));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "\u{FFFD}\u{FFFD}\nafter\n");
+        assert_eq!(output.stderr, "\u{FFFD}\nerr_after\n");
+        assert!(
+            seen.contains(&("after".to_string(), false)),
+            "got: {seen:?}"
+        );
+        assert!(
+            seen.contains(&("err_after".to_string(), true)),
+            "got: {seen:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_streaming_drains_the_pipe_after_a_non_utf8_line() {
+        // 200 KB is more than a pipe holds. If the reader stops at the bad
+        // line, the child blocks on the write and the run ends in a timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("binary-then-big.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\nprintf '\\377\\n'\nline=$(head -c 1000 /dev/zero | tr '\\0' x)\n\
+             for i in $(seq 1 200); do echo \"$line\"; done\n",
+        )
+        .unwrap();
+        let output = streaming_runner(&script, dir.path())
+            .run_streaming("{}", |_line, _is_stderr| {})
+            .await
+            .expect("the run must finish before the timeout");
+
+        assert_eq!(output.exit_code, Some(0), "stderr: {}", output.stderr);
+        assert_eq!(
+            output.stdout.matches('x').count(),
+            200 * 1000,
+            "all output after the bad line must be captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_line_lossy_strips_line_endings_and_returns_an_unterminated_tail() {
+        let data: &[u8] = b"crlf\r\nlf\n\nbare\rcr\ntail";
+        let mut reader = BufReader::new(data);
+        let mut pending = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(line) = next_line_lossy(&mut reader, &mut pending).await.unwrap() {
+            lines.push(line);
+        }
+        assert_eq!(lines, vec!["crlf", "lf", "", "bare\rcr", "tail"]);
+    }
+
+    #[tokio::test]
+    async fn next_line_lossy_continues_a_line_left_by_a_dropped_read() {
+        // A read that was dropped in `select!` leaves its bytes in `pending`.
+        let data: &[u8] = b"lo\nnext\n";
+        let mut reader = BufReader::new(data);
+        let mut pending = b"hel".to_vec();
+        assert_eq!(
+            next_line_lossy(&mut reader, &mut pending).await.unwrap(),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            next_line_lossy(&mut reader, &mut pending).await.unwrap(),
+            Some("next".to_string())
+        );
+
+        let mut empty = BufReader::new(&b""[..]);
+        let mut pending = b"partial".to_vec();
+        assert_eq!(
+            next_line_lossy(&mut empty, &mut pending).await.unwrap(),
+            Some("partial".to_string())
+        );
+        assert_eq!(
+            next_line_lossy(&mut empty, &mut pending).await.unwrap(),
+            None
+        );
     }
 }

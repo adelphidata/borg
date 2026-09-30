@@ -6,7 +6,6 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::settings::warn_invalid_setting_once;
 
 /// Poll interval for cross-process change detection (e.g. CLI while TUI runs).
 /// Uses `PRAGMA data_version` (in-memory check, no disk I/O) so a short
@@ -68,12 +67,8 @@ impl ConfigWatcher {
 
 /// Load config from a persistent DB handle.
 async fn load_config_from(db: &Database) -> Result<Config> {
-    let mut config = Config::default();
-    for (key, value, _) in db.list_settings().await? {
-        if let Err(e) = config.apply_setting(&key, &value) {
-            warn_invalid_setting_once(&key, &e);
-        }
-    }
+    let rows = db.list_settings().await?;
+    let config = Config::from_setting_rows(rows.into_iter().map(|(k, v, _)| (k, v)));
     config.validate()?;
     Ok(config)
 }
@@ -303,6 +298,30 @@ mod tests {
         rx.mark_changed(); // consume
         let config = rx.borrow();
         assert!((config.llm.temperature - 1.9).abs() < f32::EPSILON);
+    }
+
+    /// The poll loop reloads on every cross-connection write. If its loader
+    /// skipped the `credentials.{provider}` fold, the key a GUI just saved
+    /// would vanish from the live config on the next poll.
+    #[tokio::test]
+    async fn reload_keeps_the_stored_api_key() {
+        let db = Database::test_db().await;
+        db.set_setting("provider", "openai").await.unwrap();
+        db.set_setting(
+            "credentials.openai",
+            r#"{"type":"literal","value":"sk-stored"}"#,
+        )
+        .await
+        .unwrap();
+        let config = load_config_from(&db).await.unwrap();
+        let key = config
+            .llm
+            .api_key
+            .as_ref()
+            .expect("the stored key must survive a watcher reload")
+            .resolve()
+            .unwrap();
+        assert_eq!(key, "sk-stored");
     }
 
     #[test]

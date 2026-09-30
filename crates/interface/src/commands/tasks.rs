@@ -576,6 +576,26 @@ fn display_cron_5field(expr: &str) -> String {
     }
 }
 
+/// The zone that `borg cron add` stores when the zone of the host is not
+/// known. A cron schedule with this value runs in UTC.
+const CRON_JOB_FALLBACK_TIMEZONE: &str = "local";
+
+/// The zone that `borg cron add` stores: the IANA zone of the host, so that
+/// `0 8 * * *` runs at 08:00 on the clock of the user. It must be a value
+/// that `cortex::tasks::validate_timezone` accepts: a numeric UTC offset
+/// such as `+02:00` is not a zone name, and the daemon refuses it. The same
+/// value computes the first run, so the stored row and the first run agree.
+fn cron_job_timezone() -> String {
+    cron_job_timezone_from(cortex::config::Config::detect_host_timezone())
+}
+
+fn cron_job_timezone_from(host_zone: Option<String>) -> String {
+    host_zone.unwrap_or_else(|| {
+        tracing::warn!("the timezone of the host is not known; the cron job will run in UTC");
+        CRON_JOB_FALLBACK_TIMEZONE.to_string()
+    })
+}
+
 pub(crate) fn run_cron_add(
     line: Option<&str>,
     schedule: Option<&str>,
@@ -609,14 +629,15 @@ pub(crate) fn run_cron_add(
             format!("cron: {short_cmd}")
         });
 
-    let next_run = cortex::tasks::calculate_next_run("cron", &cron_7, "local")?;
+    let timezone = cron_job_timezone();
+    let next_run = cortex::tasks::calculate_next_run("cron", &cron_7, &timezone)?;
 
     let spec = ScheduledTaskCreate {
         name: job_name.clone(),
         prompt: cmd.clone(),
         schedule_type: "cron".to_string(),
         schedule_expr: cron_7.clone(),
-        timezone: chrono::Local::now().offset().to_string(),
+        timezone,
         task_type: "command".to_string(),
         delivery_channel: delivery_channel.unwrap_or("").to_string(),
         delivery_target: delivery_target.unwrap_or("").to_string(),
@@ -699,4 +720,58 @@ enum MutateOutcome {
     Ok,
     WrongType,
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cron_job_timezone, cron_job_timezone_from, CRON_JOB_FALLBACK_TIMEZONE};
+
+    /// The daemon validates the zone of every new task. A value that the
+    /// validator refuses makes `borg cron add` fail for every user.
+    #[test]
+    fn cron_add_sends_a_zone_the_daemon_accepts() {
+        let zones = [
+            cron_job_timezone(),
+            cron_job_timezone_from(Some("Asia/Tokyo".to_string())),
+            cron_job_timezone_from(None),
+        ];
+        for zone in zones {
+            cortex::tasks::validate_timezone(&zone)
+                .unwrap_or_else(|e| panic!("zone {zone:?} must pass validation: {e}"));
+            // The value also resolves a first run, so the row is schedulable.
+            let next = cortex::tasks::calculate_next_run("cron", "0 0 8 * * * *", &zone)
+                .expect("a valid expression in the CLI zone must resolve");
+            assert!(
+                next.is_some_and(|ts| ts > chrono::Utc::now().timestamp()),
+                "{zone:?}"
+            );
+        }
+    }
+
+    /// Spec: a cron job runs on the clock of the host. The CLI sends the
+    /// IANA zone of the host, and the fallback only when there is none.
+    #[test]
+    fn cron_add_sends_the_zone_of_the_host() {
+        assert_eq!(
+            cron_job_timezone_from(Some("Asia/Tokyo".to_string())),
+            "Asia/Tokyo"
+        );
+        assert_eq!(cron_job_timezone_from(None), CRON_JOB_FALLBACK_TIMEZONE);
+
+        // 08:00 in Tokyo is 23:00 UTC. The fallback runs at 08:00 UTC.
+        let hour_utc = |zone: &str| {
+            use chrono::Timelike;
+            let ts = cortex::tasks::calculate_next_run("cron", "0 0 8 * * * *", zone)
+                .expect("resolves")
+                .expect("has a next run");
+            chrono::DateTime::from_timestamp(ts, 0)
+                .expect("valid timestamp")
+                .hour()
+        };
+        assert_eq!(
+            hour_utc(&cron_job_timezone_from(Some("Asia/Tokyo".to_string()))),
+            23
+        );
+        assert_eq!(hour_utc(&cron_job_timezone_from(None)), 8);
+    }
 }

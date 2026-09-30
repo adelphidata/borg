@@ -827,3 +827,47 @@ fn stored_api_key_row_feeds_the_llm_resolver() {
         other => panic!("expected keychain routing, got {other:?}"),
     }
 }
+
+/// An example file that is copied unchanged puts a placeholder where the key
+/// goes. It must give the same guidance as a missing key, and it must not be
+/// returned as the key.
+#[test]
+fn resolve_provider_treats_an_example_placeholder_as_no_key() {
+    let _env = openrouter_env_lock();
+    let saved = std::env::var("OPENROUTER_API_KEY").ok();
+    let custom_var = "BORG_TEST_PLACEHOLDER_KEY_ENV";
+
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openrouter".to_string());
+    cfg.llm.api_key = None;
+
+    // Through the provider default variable.
+    std::env::set_var("OPENROUTER_API_KEY", "your-api-key-here");
+    let default_var = cfg.resolve_provider();
+
+    // Through an explicit `llm.api_key_env`.
+    std::env::remove_var("OPENROUTER_API_KEY");
+    std::env::set_var(custom_var, "sk-xxxx");
+    cfg.llm.api_key_env = custom_var.to_string();
+    let explicit_var = cfg.resolve_provider();
+
+    // A real key in the same variable still resolves.
+    std::env::set_var(custom_var, "sk-or-v1-9f3a5c7e1b2d4f6a");
+    let real = cfg.resolve_provider();
+
+    std::env::remove_var(custom_var);
+    match saved {
+        Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+        None => std::env::remove_var("OPENROUTER_API_KEY"),
+    }
+
+    for (name, result) in [("default var", default_var), ("explicit var", explicit_var)] {
+        let msg = result.expect_err("a placeholder is not a key").to_string();
+        assert!(
+            msg.contains("No API key found for openrouter"),
+            "{name}: {msg}"
+        );
+    }
+    let (_, key) = real.expect("a real key resolves");
+    assert_eq!(key, "sk-or-v1-9f3a5c7e1b2d4f6a");
+}

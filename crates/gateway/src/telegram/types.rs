@@ -26,6 +26,9 @@ pub struct TelegramMessage {
     pub date: i64,
     /// Text content of the message.
     pub text: Option<String>,
+    /// Formatting entities of `text` (links, mentions, styles).
+    #[serde(default)]
+    pub entities: Option<Vec<MessageEntity>>,
     /// Unix timestamp of the last edit.
     pub edit_date: Option<i64>,
     /// Identifier for a group of related media messages.
@@ -42,6 +45,9 @@ pub struct TelegramMessage {
     pub photo: Option<Vec<PhotoSize>>,
     /// Caption for media messages.
     pub caption: Option<String>,
+    /// Formatting entities of `caption`.
+    #[serde(default)]
+    pub caption_entities: Option<Vec<MessageEntity>>,
     /// Attached document file.
     pub document: Option<Document>,
     /// Attached video.
@@ -58,6 +64,20 @@ pub struct TelegramMessage {
     pub forward_date: Option<i64>,
     /// Forum topic creation event data.
     pub forum_topic_created: Option<serde_json::Value>,
+}
+
+/// One formatting entity of a message text or caption.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageEntity {
+    /// Entity kind (e.g. "text_link", "url", "mention", "bold").
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Start of the entity, in UTF-16 code units.
+    pub offset: i64,
+    /// Length of the entity, in UTF-16 code units.
+    pub length: i64,
+    /// Target of a `text_link` entity: the URL hidden behind the label.
+    pub url: Option<String>,
 }
 
 /// A Telegram chat.

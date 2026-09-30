@@ -391,6 +391,11 @@ pub struct GhostCommit {
     pub parent_id: Option<String>,
     /// Untracked files that existed before the snapshot (preserved on restore).
     pub preexisting_untracked: Vec<PathBuf>,
+    /// Nested git repositories in the working tree. The snapshot holds each
+    /// one only as a commit pointer, not its files, so a restore cannot bring
+    /// their content back and must refuse.
+    #[serde(default)]
+    pub uncaptured_nested_repos: Vec<PathBuf>,
 }
 
 /// Summary of git repo state for system prompt enrichment.
@@ -623,17 +628,23 @@ async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
     shared.await
 }
 
-/// A cheap "has the tree changed?" token: `HEAD` plus a digest of
-/// `git status --porcelain`.
+/// A cheap "has the tree changed?" token: `HEAD`, `git status --porcelain`,
+/// and the size and modification time of each path that status lists.
 ///
 /// Returns `None` outside a git repo, or when either probe fails — callers must
-/// treat that as "unknown, assume changed" rather than as "unchanged", since a
-/// fingerprint that silently matched would suppress real work.
+/// treat that as "unknown" rather than as "unchanged".
+///
+/// This is a progress hint, not a proof. The status text alone is the same
+/// before and after a second edit to a file that is already modified or
+/// untracked, which is the normal state of a worktree during a goal loop, so
+/// the listed paths are also stat-ed. It still cannot see edits to ignored
+/// files, inputs outside the repository, or files inside an untracked
+/// directory. An equal fingerprint therefore never proves that a check would
+/// give the same result, and no caller may skip work because of it.
 ///
 /// Deliberately not a content hash of the worktree: this runs at every goal
-/// turn boundary, and two bounded git probes are affordable where walking the
-/// tree is not. It follows `git status`, so it sees tracked edits, staged
-/// changes, and untracked files, but not edits to ignored files.
+/// turn boundary, and two bounded git probes plus a stat per dirty path are
+/// affordable where walking the tree is not.
 pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
     let repo_root = find_repo_root(cwd)?;
     let (head, status) = tokio::join!(
@@ -648,10 +659,56 @@ pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
     sha2::Digest::update(&mut hasher, head.as_bytes());
     sha2::Digest::update(&mut hasher, b"\0");
     sha2::Digest::update(&mut hasher, status.as_bytes());
+    for line in status.lines() {
+        let Some(path) = porcelain_line_path(line) else {
+            continue;
+        };
+        // A path that cannot be stat-ed (deleted, or quoted in a way this
+        // does not decode) adds nothing; its status line is already hashed.
+        let Ok(meta) = tokio::fs::symlink_metadata(repo_root.join(path)).await else {
+            continue;
+        };
+        let modified_nanos = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        sha2::Digest::update(&mut hasher, b"\0");
+        sha2::Digest::update(&mut hasher, path.as_bytes());
+        sha2::Digest::update(&mut hasher, meta.len().to_le_bytes());
+        sha2::Digest::update(&mut hasher, modified_nanos.to_le_bytes());
+    }
     Some(format!(
         "{:x}",
         <sha2::Sha256 as sha2::Digest>::finalize(hasher)
     ))
+}
+
+/// The worktree path a `git status --porcelain` line refers to.
+///
+/// A line is `XY <path>`, or `XY <old> -> <new>` for a rename, where the new
+/// path is the one on disk. Git wraps a path with unusual characters in
+/// double quotes; the quotes are removed but escapes are not decoded, so such
+/// a path may fail to resolve and the caller skips it.
+///
+/// The status text is trimmed as a whole, so the first line can have lost the
+/// leading space of an ` M` code; then the path starts one byte earlier.
+fn porcelain_line_path(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let rest = if bytes.get(2) == Some(&b' ') {
+        line.get(3..)?
+    } else if bytes.get(1) == Some(&b' ') {
+        line.get(2..)?
+    } else {
+        return None;
+    };
+    let path = rest.rsplit_once(" -> ").map_or(rest, |(_, new)| new);
+    let path = path
+        .strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .unwrap_or(path);
+    (!path.is_empty()).then_some(path)
 }
 
 /// Shared git runner. Always prepends [`hardened_prelude`] so a repository's
@@ -665,6 +722,18 @@ async fn run_git_inner(
     cwd: &Path,
     extra_env: &[(String, String)],
 ) -> Result<String> {
+    let stdout = run_git_bytes(args, cwd, extra_env).await?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// [`run_git_inner`] with stdout as raw bytes, for NUL-separated (`-z`)
+/// output. A path list must not be trimmed or decoded lossily: a path can
+/// start with a space or hold bytes that are not UTF-8.
+async fn run_git_bytes(
+    args: &[&str],
+    cwd: &Path,
+    extra_env: &[(String, String)],
+) -> Result<Vec<u8>> {
     let mut argv: Vec<&str> = hardened_prelude().to_vec();
     argv.extend(harden_git_argv(args));
     let mut cmd = tokio::process::Command::new("git");
@@ -683,7 +752,49 @@ async fn run_git_inner(
         anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout)
+}
+
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Every untracked, non-ignored path in the working tree. `-z` gives the
+/// literal names; the default output quotes and escapes a name with a quote,
+/// a newline or a non-ASCII byte, and such a name would match no file.
+async fn list_untracked(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let stdout = run_git_bytes(
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        repo_root,
+        &[],
+    )
+    .await?;
+    Ok(stdout
+        .split(|b| *b == 0)
+        .filter(|record| !record.is_empty())
+        .map(path_from_git_bytes)
+        .collect())
+}
+
+/// Paths of the gitlink entries (mode 160000) in `ls-tree -r -z` output.
+fn gitlink_paths(ls_tree_stdout: &[u8]) -> Vec<PathBuf> {
+    const GITLINK_PREFIX: &[u8] = b"160000 commit ";
+    ls_tree_stdout
+        .split(|b| *b == 0)
+        .filter(|record| record.starts_with(GITLINK_PREFIX))
+        .filter_map(|record| {
+            let tab = record.iter().position(|b| *b == b'\t')?;
+            Some(path_from_git_bytes(&record[tab + 1..]))
+        })
+        .collect()
 }
 
 /// Collect rich git context for system prompt injection.
@@ -731,22 +842,17 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
     let tmp_index = tempfile::NamedTempFile::new().context("create temp index")?;
     let tmp_path = tmp_index.path().to_string_lossy().to_string();
 
-    // Collect untracked files before snapshot for restore filtering
-    let untracked_output = run_git(&["ls-files", "--others", "--exclude-standard"], repo_root)
-        .await
-        .unwrap_or_default();
-
     // Every untracked file that exists now, unfiltered. This list is the
     // "do not delete" set for `restore_ghost_commit`, so it must be complete:
     // anything omitted here is treated at restore time as agent-created and
     // removed. Filtering it by size or directory name deleted the user's own
     // untracked files (a 12 MB dataset, a non-ignored `build/`) that the agent
     // never touched — unrecoverable, since they were in no commit.
-    let preexisting_untracked: Vec<PathBuf> = untracked_output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect();
+    // A failed listing fails the snapshot for the same reason: an empty list
+    // would mark every untracked file for removal.
+    let preexisting_untracked = list_untracked(repo_root)
+        .await
+        .context("list untracked files for ghost snapshot")?;
 
     // `add`/`read-tree` would otherwise run repo-configured content filters
     // (`filter.<name>.clean`/`.process`) against an untrusted tree.
@@ -759,6 +865,14 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
     run_git_with_index(&tmp_path, &["add", "--all"], repo_root, &filter_env).await?;
 
     let tree_id = run_git_with_index(&tmp_path, &["write-tree"], repo_root, &filter_env).await?;
+
+    // `add --all` records a nested repository as a gitlink: a commit id with
+    // none of the files. Record those paths so restore can refuse.
+    let uncaptured_nested_repos = gitlink_paths(
+        &run_git_bytes(&["ls-tree", "-r", "-z", &tree_id], repo_root, &[])
+            .await
+            .context("list nested repositories in ghost snapshot")?,
+    );
 
     let parent_id = if has_head {
         Some(run_git(&["rev-parse", "HEAD"], repo_root).await?)
@@ -778,12 +892,26 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         commit_id,
         parent_id,
         preexisting_untracked,
+        uncaptured_nested_repos,
     })
 }
 
 /// Restore working tree to match a ghost commit.
 #[instrument(skip_all)]
 pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Result<()> {
+    if !commit.uncaptured_nested_repos.is_empty() {
+        let paths = commit
+            .uncaptured_nested_repos
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "ghost undo refused: the snapshot did not capture the content of nested \
+             repositories ({paths}); nothing was changed"
+        );
+    }
+
     // Restore all tracked files from the ghost commit. Worktree checkout runs
     // `filter.<name>.smudge`/`.process` drivers, so neutralize them too.
     let filter_env = filter_neutralizing_env(repo_root).await;
@@ -806,19 +934,16 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
     )
     .await;
 
-    // Remove files that were created after the snapshot (not in preexisting_untracked)
-    let current_untracked = run_git(&["ls-files", "--others", "--exclude-standard"], repo_root)
-        .await
-        .unwrap_or_default();
+    // Remove files that were created after the snapshot (not in
+    // preexisting_untracked). A failed listing is not an empty listing: skip
+    // the removal and report it.
+    let current_untracked = list_untracked(repo_root).await;
 
-    for line in current_untracked.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(line);
-        if !commit.preexisting_untracked.contains(&path) {
-            let full = repo_root.join(line);
-            if full.exists() {
+    for path in current_untracked.iter().flatten() {
+        if !commit.preexisting_untracked.contains(path) {
+            let full = repo_root.join(path);
+            // `symlink_metadata`, so a dangling link counts as present.
+            if std::fs::symlink_metadata(&full).is_ok() {
                 tracing::info!(
                     "Ghost restore: removing post-snapshot file: {}",
                     full.display()
@@ -835,6 +960,10 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
     restored.context(
         "ghost undo failed partway: the working tree may hold a mix of \
          snapshot and post-snapshot content — inspect `git status` before continuing",
+    )?;
+    current_untracked.context(
+        "ghost undo incomplete: the untracked files could not be listed, so files \
+         created after the snapshot were not removed",
     )?;
 
     Ok(())
@@ -900,6 +1029,51 @@ mod tests {
         run(&["init", "-q"]);
         std::fs::write(dir.path().join("tracked.txt"), "hello").unwrap();
         dir
+    }
+
+    #[test]
+    fn porcelain_line_path_finds_the_path_on_disk() {
+        let cases: &[(&str, Option<&str>)] = &[
+            (" M src/lib.rs", Some("src/lib.rs")),
+            ("?? notes.txt", Some("notes.txt")),
+            ("A  new file.rs", Some("new file.rs")),
+            // The first line of a trimmed status text.
+            ("M src/lib.rs", Some("src/lib.rs")),
+            ("D gone.rs", Some("gone.rs")),
+            ("R  old.rs -> new.rs", Some("new.rs")),
+            ("?? \"odd name.txt\"", Some("odd name.txt")),
+            ("?? dir/", Some("dir/")),
+            ("", None),
+            ("??", None),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(porcelain_line_path(line), *expected, "line {line:?}");
+        }
+    }
+
+    /// Spec: the fingerprint is how the goal loop sees that the agent did
+    /// work. During a goal loop the files are already dirty, so a second
+    /// edit leaves the status text unchanged; the fingerprint must still
+    /// move. An untouched tree must keep its fingerprint.
+    #[tokio::test]
+    async fn fingerprint_moves_on_a_second_edit_to_a_dirty_file() {
+        let repo = temp_repo();
+        let file = repo.path().join("tracked.txt");
+
+        let first = workspace_fingerprint(repo.path()).await.expect("in a repo");
+        let again = workspace_fingerprint(repo.path()).await.expect("in a repo");
+        assert_eq!(first, again, "an untouched tree keeps its fingerprint");
+
+        let status_before = git_status_porcelain(repo.path()).await.unwrap();
+        std::fs::write(&file, "hello, with a longer second edit").unwrap();
+        let status_after = git_status_porcelain(repo.path()).await.unwrap();
+        assert_eq!(
+            status_before, status_after,
+            "precondition: the status text alone cannot see this edit"
+        );
+
+        let second = workspace_fingerprint(repo.path()).await.expect("in a repo");
+        assert_ne!(first, second, "the second edit must move the fingerprint");
     }
 
     /// Spec: concurrent callers for one repository share a single
@@ -984,7 +1158,7 @@ mod tests {
     /// entry. A stranded entry is permanent — the resolved `Shared` future
     /// would serve the same answer to every later caller for that repository,
     /// so `workspace_fingerprint` would stop seeing real edits and the goal
-    /// quality gates would replay instead of re-running.
+    /// quality gates would count real work as no progress.
     #[tokio::test]
     async fn an_abandoned_scan_releases_its_slot() {
         let repo = temp_repo();
@@ -1153,6 +1327,7 @@ mod tests {
             commit_id: "abc123".to_string(),
             parent_id: Some("def456".to_string()),
             preexisting_untracked: vec![PathBuf::from("file.txt"), PathBuf::from("dir/other.rs")],
+            uncaptured_nested_repos: vec![],
         };
         let json = serde_json::to_string(&gc).unwrap();
         let deserialized: GhostCommit = serde_json::from_str(&json).unwrap();
@@ -1167,11 +1342,34 @@ mod tests {
             commit_id: "abc123".to_string(),
             parent_id: None,
             preexisting_untracked: vec![],
+            uncaptured_nested_repos: vec![PathBuf::from("vendor/lib")],
         };
         let json = serde_json::to_string(&gc).unwrap();
         let deserialized: GhostCommit = serde_json::from_str(&json).unwrap();
         assert!(deserialized.parent_id.is_none());
         assert!(deserialized.preexisting_untracked.is_empty());
+        assert_eq!(
+            deserialized.uncaptured_nested_repos,
+            vec![PathBuf::from("vendor/lib")]
+        );
+    }
+
+    #[test]
+    fn ghost_commit_without_the_nested_repo_field_still_loads() {
+        let old = r#"{"commit_id":"abc","parent_id":null,"preexisting_untracked":["a.txt"]}"#;
+        let gc: GhostCommit = serde_json::from_str(old).unwrap();
+        assert_eq!(gc.preexisting_untracked, vec![PathBuf::from("a.txt")]);
+        assert!(gc.uncaptured_nested_repos.is_empty());
+    }
+
+    #[test]
+    fn gitlink_paths_selects_only_mode_160000_records() {
+        let out = b"100644 blob aaaa\ta.txt\x00160000 commit bbbb\tvendor/my lib\0\
+                    040000 tree cccc\tdir\x00160000 commit dddd\tnested\0";
+        assert_eq!(
+            gitlink_paths(out),
+            vec![PathBuf::from("vendor/my lib"), PathBuf::from("nested")]
+        );
     }
 
     #[test]
@@ -1908,6 +2106,136 @@ mod tests {
             !dir.join("agent-made.txt").exists(),
             "genuinely post-snapshot files must still be removed"
         );
+    }
+
+    fn object_file_count(repo: &Path) -> usize {
+        fn count(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    if e.path().is_dir() {
+                        count(&e.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+        count(&repo.join(".git/objects"))
+    }
+
+    #[tokio::test]
+    async fn ghost_snapshot_fails_when_the_untracked_listing_fails() {
+        // An incomplete "pre-existing untracked" list makes restore delete the
+        // user's files, so a failed listing must fail the snapshot.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        std::fs::write(dir.join("notes.txt"), "user's untracked file\n").unwrap();
+        // `ls-files` reads the repository index; the snapshot's own index is
+        // a temp file, so every other step still works.
+        std::fs::write(dir.join(".git/index"), b"not an index").unwrap();
+        let objects_before = object_file_count(dir);
+
+        let err = create_ghost_commit(dir)
+            .await
+            .expect_err("a failed listing must fail the snapshot");
+
+        assert!(
+            format!("{err:#}").contains("list untracked files for ghost snapshot"),
+            "got: {err:#}"
+        );
+        assert_eq!(
+            object_file_count(dir),
+            objects_before,
+            "no snapshot object may be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn ghost_restore_refuses_when_a_nested_repository_was_not_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        let nested = dir.join("vendor lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repo_with_commit(&nested);
+        std::fs::write(nested.join("a.txt"), "nested at snapshot\n").unwrap();
+
+        let ghost = create_ghost_commit(dir).await.expect("snapshot");
+        assert_eq!(
+            ghost.uncaptured_nested_repos,
+            vec![PathBuf::from("vendor lib")]
+        );
+
+        std::fs::write(nested.join("a.txt"), "nested after snapshot\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "outer after snapshot\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "created later\n").unwrap();
+
+        let err = restore_ghost_commit(dir, &ghost)
+            .await
+            .expect_err("restore must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vendor lib"),
+            "error must name the path: {msg}"
+        );
+        assert!(msg.contains("nested repositories"), "{msg}");
+
+        // Refused before any write: nothing moved, inside or outside.
+        assert_eq!(
+            std::fs::read_to_string(nested.join("a.txt")).unwrap(),
+            "nested after snapshot\n"
+        );
+        assert!(nested.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "outer after snapshot\n"
+        );
+        assert!(dir.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn ghost_restore_compares_untracked_names_literally() {
+        // Without `-z`, git prints such names quoted and escaped. They then
+        // match no file on disk and no entry in the pre-existing list.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        let kept = [" caf\u{e9} notes.txt", "say \"hi\".txt"];
+        for name in kept {
+            std::fs::write(dir.join(name), "user's own\n").unwrap();
+        }
+
+        let ghost = create_ghost_commit(dir).await.expect("snapshot");
+        for name in kept {
+            assert!(
+                ghost.preexisting_untracked.contains(&PathBuf::from(name)),
+                "{name:?} missing from {:?}",
+                ghost.preexisting_untracked
+            );
+        }
+
+        let created = ["na\u{ef}ve new.txt", "plain-new.txt"];
+        for name in created {
+            std::fs::write(dir.join(name), "agent-made\n").unwrap();
+        }
+        restore_ghost_commit(dir, &ghost).await.expect("restore");
+
+        for name in kept {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(name)).unwrap(),
+                "user's own\n",
+                "{name:?} must survive"
+            );
+        }
+        for name in created {
+            assert!(
+                !dir.join(name).exists(),
+                "post-snapshot file {name:?} must be removed"
+            );
+        }
     }
 
     /// Create a linked worktree at `wt` off the repo at `repo`, isolated from

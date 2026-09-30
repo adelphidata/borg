@@ -244,6 +244,28 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             true,
             None,
         ),
+        // Credential in a URL query string or fragment: a pre-signed storage
+        // URL (`X-Amz-Signature=`), an OAuth callback (`#access_token=`), an
+        // `?api_key=` call. The generic assignment pattern below cannot see
+        // these, because its key must follow whitespace or `;`. The name must
+        // sit directly after the delimiter, so `?keyboard=` and `&page_token=`
+        // do not match. Hyphenated names stay literal. Only the value is
+        // masked; host, path and parameter name stay readable.
+        (
+            r#"(?i)[?&#;](?:access_token|refresh_token|id_token|auth_token|token|api[-_]?key|client_secret|secret|password|signature|sig|x-amz-signature|x-amz-security-token|x-amz-credential)=([^&#;\s"'<>]{8,})"#,
+            "URL Query Credential",
+            true,
+            None,
+        ),
+        // `user:pass@` userinfo on a non-database scheme. Only the password is
+        // masked. `?` and `#` cannot occur raw in userinfo, and their
+        // exclusion keeps `http://host:3000?email=a@b.example` untouched.
+        (
+            r"(?:https?|wss?|ftp|ssh|git\+https?)://[^/\s:@?#]+:([^/\s@?#]{3,})@",
+            "URL Credential",
+            true,
+            None,
+        ),
         // Generic assignment patterns — run last so specific patterns above take priority.
         // capture_only=true: only the captured value (group 1) is replaced, preserving the
         // variable name prefix so the surrounding text remains readable.
@@ -527,16 +549,24 @@ pub fn redact_with_audit(text: &str) -> RedactionOutcome {
                 .regex
                 .replace_all(&result, |caps: &regex::Captures| {
                     let full = &caps[0];
-                    let value = &caps[1];
-                    if value.starts_with("[REDACTED") {
+                    let Some(value) = caps.get(1) else {
+                        return full.to_string();
+                    };
+                    if value.as_str().starts_with("[REDACTED") {
                         return full.to_string();
                     }
                     if pattern.validator.is_some_and(|v| !v(full)) {
                         return full.to_string();
                     }
                     count += 1;
-                    let prefix_len = full.len() - value.len();
-                    format!("{}[REDACTED {label}]", &full[..prefix_len])
+                    // The value can sit mid-match (`user:pass@`), so keep the
+                    // text on both sides of it.
+                    let offset = caps.get(0).map_or(0, |m| m.start());
+                    format!(
+                        "{}[REDACTED {label}]{}",
+                        &full[..value.start() - offset],
+                        &full[value.end() - offset..]
+                    )
                 })
                 .into_owned();
         } else {
@@ -622,6 +652,8 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "Authorization: Basic dXNlcjpwYXNzd29yZA==",
     "x-api-key: AbCdEf0123456789TokenValue",
     "API_KEY=AbCdEf0123456789TokenValue",
+    "https://app.example/cb?access_token=AbCdEf0123456789Value",
+    "https://alice:hunter2pw@git.example/repo",
 ];
 
 #[cfg(test)]
@@ -1047,6 +1079,95 @@ mod tests {
             !result.contains("my_database_secret_key_here"),
             "raw exported credential value must not survive redaction: {result}"
         );
+    }
+
+    #[test]
+    fn redacts_url_embedded_credentials_and_keeps_the_rest_of_the_url() {
+        let signature = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        // (input, secret that must go, label, fragments that must stay)
+        let cases: &[(String, &str, &str, &[&str])] = &[
+            (
+                format!(
+                    "https://bucket.s3.amazonaws.com/k?X-Amz-Signature={signature}&X-Amz-Expires=300"
+                ),
+                signature,
+                "URL Query Credential",
+                &[
+                    "https://bucket.s3.amazonaws.com/k?X-Amz-Signature=",
+                    "&X-Amz-Expires=300",
+                ],
+            ),
+            (
+                "https://app.example/cb#access_token=ZxCvBnM1234567890qWeRtY&state=xyz".to_string(),
+                "ZxCvBnM1234567890qWeRtY",
+                "URL Query Credential",
+                &["https://app.example/cb#access_token=", "&state=xyz"],
+            ),
+            (
+                "GET https://api.example/v1/items?page=2&api_key=QwErTy0987654321 done".to_string(),
+                "QwErTy0987654321",
+                "URL Query Credential",
+                &["https://api.example/v1/items?page=2&api_key=", " done"],
+            ),
+            (
+                "https://s3.example/o?x-amz-security-token=FwoGZXIvYXdzEJr0123456".to_string(),
+                "FwoGZXIvYXdzEJr0123456",
+                "URL Query Credential",
+                &["https://s3.example/o?x-amz-security-token="],
+            ),
+            (
+                "clone https://alice:hunter2pw@git.example/repo now".to_string(),
+                "hunter2pw",
+                "URL Credential",
+                &["clone https://alice:", "@git.example/repo now"],
+            ),
+            (
+                "wss://svc:s3cr3tvalue@stream.example/socket".to_string(),
+                "s3cr3tvalue",
+                "URL Credential",
+                &["wss://svc:", "@stream.example/socket"],
+            ),
+        ];
+        for (input, secret, label, kept) in cases {
+            let outcome = redact_with_audit(input);
+            assert!(
+                !outcome.text.contains(secret),
+                "secret survived in: {}",
+                outcome.text
+            );
+            assert!(
+                outcome.text.contains(&format!("[REDACTED {label}]")),
+                "expected the {label} pattern to mask {input}, got: {}",
+                outcome.text
+            );
+            for fragment in *kept {
+                assert!(
+                    outcome.text.contains(fragment),
+                    "fragment {fragment:?} must stay readable, got: {}",
+                    outcome.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_urls_are_not_redacted() {
+        let cases = [
+            "https://example.com/search?q=rust+tokens&page=2",
+            "https://example.com/?keyboard=qwertyuiop",
+            "https://user@host/path",
+            "https://example.com/list?page_token=abcdefghijkl&sort=signature_desc",
+            "https://example.com/?tokenizer=wordpiece1&secretary=jane.doe.smith",
+            "http://localhost:3000?email=someone@example.com",
+            "https://example.com:8443/users/@alice",
+            "https://example.com/docs#installation-guide",
+            "see https://example.com:8080/a and mail bob@example.com",
+        ];
+        for input in cases {
+            let outcome = redact_with_audit(input);
+            assert_eq!(outcome.text, input, "over-redacted: {input}");
+            assert!(outcome.hits.is_empty(), "unexpected hits for {input}");
+        }
     }
 
     /// Guard against prefilter/pattern-list drift: the RegexSet indices must

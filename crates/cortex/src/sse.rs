@@ -23,6 +23,20 @@ pub enum SseAction {
     Error(LlmError),
 }
 
+/// How a stream driver stopped without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The parser reported the end of the response. Its terminal events are
+    /// already sent.
+    Marker,
+    /// The connection closed cleanly and the parser did not report the end.
+    /// No `StreamEvent::Done` was sent. The caller decides whether the
+    /// response is complete.
+    Eof,
+    /// The call was cancelled, or the receiver is gone. Nothing more to send.
+    Stopped,
+}
+
 /// Replace any URL in a transport error with `<url>`.
 ///
 /// Transport errors are the one error class that routinely carries the request
@@ -55,6 +69,11 @@ fn strip_urls(text: &str) -> String {
 /// Handles: cancellation, per-chunk timeouts, buffer overflow, line splitting,
 /// and async event sending. The `parse_line` callback is sync — it returns
 /// `SseAction` variants and never needs to await.
+///
+/// A clean end of the byte stream is not proof of a complete response: a
+/// proxy can close the socket in the middle of an answer. This function
+/// therefore never sends `StreamEvent::Done` by itself. It reports
+/// [`StreamEnd::Eof`] and the caller decides.
 pub async fn process_sse_stream<S, B, E, F>(
     mut stream: S,
     tx: &mpsc::Sender<StreamEvent>,
@@ -62,7 +81,7 @@ pub async fn process_sse_stream<S, B, E, F>(
     chunk_timeout_secs: u64,
     max_buffer: usize,
     mut parse_line: F,
-) -> std::result::Result<(), LlmError>
+) -> std::result::Result<StreamEnd, LlmError>
 where
     S: futures_util::Stream<Item = Result<B, E>> + Unpin,
     B: AsRef<[u8]>,
@@ -88,7 +107,7 @@ where
                 // revocation-driven cancel the retry loop must rotate to a
                 // healthy credential and stream the real response on the same
                 // channel.
-                return Ok(());
+                return Ok(StreamEnd::Stopped);
             }
             maybe_chunk = async {
                 if chunk_timeout_secs > 0 {
@@ -125,24 +144,27 @@ where
                         // delta or the sentinel `[DONE]`.
                         buffer.push_str(&decoder.flush());
                         let tail = buffer.trim();
+                        let mut end = StreamEnd::Eof;
                         if !tail.is_empty() && !tail.starts_with(':') {
-                            match parse_line(tail) {
-                                SseAction::Continue => {}
-                                SseAction::Emit(events) | SseAction::Done(events) => {
-                                    for event in events {
-                                        if tx.send(event).await.is_err() {
-                                            tracing::debug!(
-                                                "SSE: stream receiver closed during EOF flush"
-                                            );
-                                            return Ok(());
-                                        }
-                                    }
+                            let events = match parse_line(tail) {
+                                SseAction::Continue => Vec::new(),
+                                SseAction::Emit(events) => events,
+                                SseAction::Done(events) => {
+                                    end = StreamEnd::Marker;
+                                    events
                                 }
                                 SseAction::Error(e) => return Err(e),
+                            };
+                            for event in events {
+                                if tx.send(event).await.is_err() {
+                                    tracing::debug!(
+                                        "SSE: stream receiver closed during EOF flush"
+                                    );
+                                    return Ok(StreamEnd::Stopped);
+                                }
                             }
                         }
-                        let _ = tx.send(StreamEvent::Done).await;
-                        return Ok(());
+                        return Ok(end);
                     }
                     Err(_) => {
                         return Err(LlmError::Retryable {
@@ -183,7 +205,7 @@ where
                     for event in events {
                         if tx.send(event).await.is_err() {
                             tracing::trace!("SSE: stream receiver closed");
-                            return Ok(());
+                            return Ok(StreamEnd::Stopped);
                         }
                     }
                 }
@@ -191,10 +213,10 @@ where
                     for event in events {
                         if tx.send(event).await.is_err() {
                             tracing::trace!("SSE: stream receiver closed");
-                            return Ok(());
+                            return Ok(StreamEnd::Stopped);
                         }
                     }
-                    return Ok(());
+                    return Ok(StreamEnd::Marker);
                 }
                 SseAction::Error(e) => return Err(e),
             }
@@ -234,14 +256,17 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
+        // A bare end of the byte stream is reported, not turned into Done.
+        assert_eq!(result.expect("clean EOF"), StreamEnd::Eof);
         let e1 = rx.recv().await.unwrap();
         assert!(matches!(e1, StreamEvent::TextDelta(ref s) if s == "hello"));
         let e2 = rx.recv().await.unwrap();
         assert!(matches!(e2, StreamEvent::TextDelta(ref s) if s == "world"));
-        // Stream ended → Done event
-        let e3 = rx.recv().await.unwrap();
-        assert!(matches!(e3, StreamEvent::Done));
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "the driver must not send Done on a bare EOF"
+        );
     }
 
     #[tokio::test]
@@ -368,7 +393,7 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
+        assert_eq!(result.expect("marker end"), StreamEnd::Marker);
         let e1 = rx.recv().await.unwrap();
         assert!(matches!(e1, StreamEvent::TextDelta(ref s) if s == "first"));
         let e2 = rx.recv().await.unwrap();
@@ -391,9 +416,9 @@ mod tests {
             SseAction::Continue
         })
         .await;
-        assert!(
-            result.is_ok(),
-            "cancel arm returns Ok so the outer reclassifier can decide"
+        assert_eq!(
+            result.expect("cancel arm returns Ok so the outer reclassifier can decide"),
+            StreamEnd::Stopped
         );
 
         drop(tx);
@@ -424,8 +449,8 @@ mod tests {
     }
 
     /// Provider closes the connection right after the final delta with no
-    /// trailing newline. The previous behaviour silently dropped that line;
-    /// the EOF-flush path must surface it before sending Done.
+    /// trailing newline. The EOF-flush path must surface that line. The end
+    /// stays an EOF because the parser saw no completion marker.
     #[tokio::test]
     async fn eof_flushes_trailing_line_without_newline() {
         let (tx, mut rx) = mpsc::channel(16);
@@ -442,10 +467,11 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
+        assert_eq!(result.expect("clean EOF"), StreamEnd::Eof);
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "first"));
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "last"));
-        assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 
     /// Sentinel `[DONE]` arriving without a trailing newline must still
@@ -469,7 +495,7 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
+        assert_eq!(result.expect("marker end"), StreamEnd::Marker);
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "hello"));
         assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
     }
@@ -495,10 +521,10 @@ mod tests {
         assert!(matches!(result, Err(LlmError::Retryable { .. })));
     }
 
-    /// Trailing whitespace/blank only — no parse_line call, no extra event
-    /// before `Done`. Guards against double-emitting on benign EOF.
+    /// Trailing whitespace/blank only — no parse_line call and no extra
+    /// event on EOF.
     #[tokio::test]
-    async fn eof_with_only_blank_trailing_buffer_emits_done_once() {
+    async fn eof_with_only_blank_trailing_buffer_emits_nothing_more() {
         let (tx, mut rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
         let stream = make_stream(vec!["data: only\n", "   "]);
@@ -512,9 +538,8 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_ok());
+        assert_eq!(result.expect("clean EOF"), StreamEnd::Eof);
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "only"));
-        assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
         // Drop the sender so rx.recv() can return None instead of blocking on
         // the still-live Sender held by this scope.
         drop(tx);

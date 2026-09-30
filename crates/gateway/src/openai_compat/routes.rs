@@ -176,6 +176,7 @@ async fn accumulate_response(
     while let Some(chunk) = stream.next().await {
         match chunk {
             AgentEventChunk::Text(t) => text.push_str(&t),
+            AgentEventChunk::Retract(bytes) => cortex::agent::retract_text_tail(&mut text, bytes),
             AgentEventChunk::ToolCall {
                 id: cid,
                 name,
@@ -287,6 +288,10 @@ fn sse_response(
                     ));
                     break;
                 }
+                // The OpenAI stream format has no way to take back a
+                // chunk that went out; the client keeps the text of the
+                // failed attempt in front of the full response.
+                AgentEventChunk::Retract(_) => {}
                 AgentEventChunk::Error(e) => {
                     let delta = ChatCompletionDelta {
                         content: Some(format!("[error] {e}")),

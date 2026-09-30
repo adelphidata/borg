@@ -351,6 +351,7 @@ impl Agent {
 
         // One fingerprint for the whole pass: the workspace cannot change
         // between gates, and probing per gate would double the git calls.
+        // It feeds the retry cap only, never the decision to run a gate.
         let fingerprint =
             crate::git::workspace_fingerprint(self.execution_context.workspace_cwd()).await;
         // Both are operator-settable and unvalidated at the settings layer. A
@@ -381,47 +382,32 @@ impl Agent {
                     ),
                 };
             }
-            // Replay a known failure against an unchanged workspace instead of
-            // re-running it: the result cannot differ, and a full test suite
-            // per turn is minutes of wall clock for no information.
-            let (exit_code, output) =
-                if crate::goals::gates::can_replay_failure(gate, fingerprint.as_deref()) {
-                    tracing::debug!(
-                        ordinal = gate.ordinal,
-                        "goal gate: workspace unchanged, replaying recorded failure"
-                    );
-                    (
-                        gate.last_exit_code.unwrap_or(-1),
-                        gate.last_output.clone().unwrap_or_default(),
-                    )
-                } else {
-                    let run = crate::tool_handlers::shell::run_gate_command(
-                        &self.execution_context,
-                        &self.config,
-                        &self.policy,
-                        &gate.command,
-                        timeout,
-                        cancel,
-                    )
-                    .await;
-                    (i64::from(run.exit_code), run.output)
-                };
+            // Always a real run. A recorded failure is never reused: no cheap
+            // signal proves the result would be the same (the agent can repair
+            // an ignored file, or an input outside the repository), and a
+            // reused failure turns a real fix into a paused goal. The retry cap
+            // below is what bounds a suite that stays red.
+            let run = crate::tool_handlers::shell::run_gate_command(
+                &self.execution_context,
+                &self.config,
+                &self.policy,
+                &gate.command,
+                timeout,
+                cancel,
+            )
+            .await;
+            let (exit_code, output) = (i64::from(run.exit_code), run.output);
 
             // The retry cap counts failures the agent made *no progress*
             // against, not failing turns. A turn-boundary count gives a Ralph
             // loop ~3 edit-compile-test cycles before the goal is parked, which
             // is far too tight; what actually signals "stuck" is failing again
-            // without having touched the workspace. Outside a git repo the
-            // fingerprint is unknown and we fall back to counting turns, since
-            // the alternative is a cap that never fires.
-            let made_progress = match (fingerprint.as_deref(), gate.last_fingerprint.as_deref()) {
-                (Some(now), Some(before)) => now != before,
-                _ => false,
-            };
+            // the same way without having touched the workspace.
+            let made_progress =
+                crate::goals::gates::made_progress(gate, fingerprint.as_deref(), exit_code);
 
-            // Record every run — including replays, so a repeated failure on an
-            // untouched workspace still advances the attempt count rather than
-            // looping forever.
+            // Record every run, so a repeated failure on an untouched
+            // workspace advances the attempt count rather than looping forever.
             {
                 let guard = self.db_guard().await;
                 if let Some(db) = guard.as_ref() {
@@ -644,5 +630,195 @@ impl Agent {
             steering.body
         );
         self.log_and_persist(Message::user(body)).await;
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::db::Database;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with one commit that holds `flag` = "bad" and `other`.
+    fn committed_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("flag"), "bad\n").unwrap();
+        std::fs::write(repo.join("other"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        dir
+    }
+
+    /// An agent in `workspace` with one gate on its session.
+    async fn agent_with_gate(
+        workspace: &std::path::Path,
+        command: &str,
+        max_attempts: i64,
+    ) -> Agent {
+        let mut config = crate::config::Config::default();
+        config.goals.gate_max_attempts = max_attempts;
+        let mut agent = super::super::tests::minimal_test_agent(config);
+        agent.execution_context =
+            crate::execution_context::ExecutionContext::unrestricted(workspace.to_path_buf());
+
+        let db = Database::test_db().await;
+        let session_id = agent.session.meta.id.clone();
+        db.upsert_session(&session_id, 0, 0, 0, "test-model", "test")
+            .await
+            .expect("seed session row");
+        db.add_goal_gate(&session_id, command)
+            .await
+            .expect("add gate");
+        *agent.db.lock().await = Some(db);
+        agent
+    }
+
+    async fn only_gate(agent: &Agent) -> crate::db::GoalGate {
+        let guard = agent.db.lock().await;
+        let db = guard.as_ref().expect("db");
+        let mut gates = db
+            .list_goal_gates(&agent.session.meta.id)
+            .await
+            .expect("list gates");
+        assert_eq!(gates.len(), 1);
+        gates.remove(0)
+    }
+
+    /// Regression: the agent repairs a file that is already modified. The
+    /// `git status` text is the same before and after, so a verdict keyed on
+    /// it reported the old failure and the goal was paused on a green check.
+    #[tokio::test]
+    async fn a_fix_in_an_already_dirty_file_passes_the_gate() {
+        let repo = committed_repo();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let agent = agent_with_gate(repo.path(), "grep -q good flag", 3).await;
+
+        // The tree is dirty and the check is red.
+        std::fs::write(repo.path().join("flag"), "bad\nstill bad\n").unwrap();
+        let first = agent.evaluate_goal_gates(&cancel).await;
+        assert!(
+            matches!(first, GateVerdict::Failed { ordinal: 1, .. }),
+            "the check is red: {first:?}"
+        );
+        assert_eq!(only_gate(&agent).await.attempts, 1);
+
+        // The fix lands in the same, already modified file.
+        let status = |repo: &std::path::Path| {
+            let out = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(repo)
+                .output()
+                .expect("git status");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let before = status(repo.path());
+        std::fs::write(repo.path().join("flag"), "good\n").unwrap();
+        assert_eq!(
+            before,
+            status(repo.path()),
+            "precondition: the status text cannot see the fix"
+        );
+
+        let second = agent.evaluate_goal_gates(&cancel).await;
+        assert_eq!(second, GateVerdict::AllPassed);
+        let gate = only_gate(&agent).await;
+        assert_eq!(gate.last_exit_code, Some(0));
+        assert_eq!(gate.attempts, 0, "a pass resets the retry budget");
+    }
+
+    /// A fix that git cannot see at all (the input is outside the
+    /// repository) must pass too: the gate runs for real on every boundary.
+    #[tokio::test]
+    async fn a_fix_outside_the_repository_passes_the_gate() {
+        let repo = committed_repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let input = outside.path().join("input");
+        std::fs::write(&input, "bad\n").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let command = format!("grep -q good '{}'", input.display());
+        let agent = agent_with_gate(repo.path(), &command, 3).await;
+
+        let first = agent.evaluate_goal_gates(&cancel).await;
+        assert!(matches!(first, GateVerdict::Failed { .. }), "{first:?}");
+
+        std::fs::write(&input, "good\n").unwrap();
+        assert_eq!(
+            agent.evaluate_goal_gates(&cancel).await,
+            GateVerdict::AllPassed
+        );
+    }
+
+    /// The retry cap still bounds an agent that is stuck: the same failure
+    /// against an untouched workspace reaches the cap and parks the goal.
+    #[tokio::test]
+    async fn the_same_failure_without_a_change_exhausts_the_retries() {
+        let repo = committed_repo();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let agent = agent_with_gate(repo.path(), "grep -q good flag", 3).await;
+
+        for attempt in 1..=2 {
+            let verdict = agent.evaluate_goal_gates(&cancel).await;
+            assert!(
+                matches!(verdict, GateVerdict::Failed { ordinal: 1, .. }),
+                "attempt {attempt}: {verdict:?}"
+            );
+            assert_eq!(only_gate(&agent).await.attempts, attempt);
+        }
+        let last = agent.evaluate_goal_gates(&cancel).await;
+        assert!(
+            matches!(last, GateVerdict::Exhausted { ordinal: 1, .. }),
+            "the third identical failure must park the goal: {last:?}"
+        );
+    }
+
+    /// Work in an already dirty file that does not yet fix the check is
+    /// still work. It must restart the retry budget, not use it up.
+    #[tokio::test]
+    async fn failed_work_in_a_dirty_file_does_not_use_up_the_retries() {
+        let repo = committed_repo();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let agent = agent_with_gate(repo.path(), "grep -q good flag", 3).await;
+
+        for round in 0..5 {
+            std::fs::write(
+                repo.path().join("flag"),
+                format!("bad\n{}\n", "x".repeat(round + 1)),
+            )
+            .unwrap();
+            let verdict = agent.evaluate_goal_gates(&cancel).await;
+            assert!(
+                matches!(verdict, GateVerdict::Failed { .. }),
+                "round {round}: the goal must not be parked while the agent works: {verdict:?}"
+            );
+        }
+        assert_eq!(only_gate(&agent).await.attempts, 1);
     }
 }

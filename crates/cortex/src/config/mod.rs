@@ -373,9 +373,22 @@ impl Config {
                 crate::db::Database::open().await?
             }
         };
+        let rows = db.list_settings().await?;
+        let config = Self::from_setting_rows(rows.into_iter().map(|(k, v, _)| (k, v)));
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Compiled defaults overlaid with settings-table rows.
+    ///
+    /// Every loader that replays the settings table goes through here, so the
+    /// `credentials.{provider}` fold cannot be present in one and missing in
+    /// another: a config watcher that skipped it would broadcast a config
+    /// with no key moments after `Admin.SetApiKey` stored one.
+    pub fn from_setting_rows(rows: impl IntoIterator<Item = (String, String)>) -> Self {
         let mut config = Self::default();
         let mut stored_keys = Vec::new();
-        for (key, value, _) in db.list_settings().await? {
+        for (key, value) in rows {
             // `credentials.{provider}` rows are per-provider key routing, not
             // registry settings; they are folded in once the provider is known.
             if let Some(provider) = key.strip_prefix(STORED_API_KEY_PREFIX) {
@@ -387,8 +400,7 @@ impl Config {
             }
         }
         config.adopt_stored_api_key(&stored_keys);
-        config.validate()?;
-        Ok(config)
+        config
     }
 
     /// Fold the `credentials.{provider}` row written by `Admin.SetApiKey`
@@ -849,8 +861,17 @@ impl Config {
 /// Read an env var and return its value only when it's set AND non-empty.
 /// Centralizes the "empty env var counts as unset" rule that both explicit
 /// and auto-detect API-key resolution paths need.
+///
+/// An example placeholder (`your-api-key-here`) also counts as unset, so a
+/// copied example file gives the "No API key found" guidance and the
+/// placeholder does not go to a provider.
 fn try_resolve_env(var: &str) -> Option<String> {
-    std::env::var(var).ok().filter(|v| !v.is_empty())
+    let value = std::env::var(var).ok().filter(|v| !v.is_empty())?;
+    if crate::llm::credential_detect::is_placeholder_secret(&value) {
+        warn!("{var} holds an example placeholder, not a key; ignoring it");
+        return None;
+    }
+    Some(value)
 }
 
 /// Read a credential from the on-disk fallback file

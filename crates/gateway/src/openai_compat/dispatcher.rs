@@ -14,6 +14,11 @@ use futures::stream::BoxStream;
 pub enum AgentEventChunk {
     /// Incremental text delta from the LLM.
     Text(String),
+    /// The agent discarded the last `n` bytes of the text that it sent: the
+    /// LLM attempt failed and the full response comes again. The response
+    /// that is not streamed drops them. The OpenAI stream format has no
+    /// retraction, so the streamed response cannot.
+    Retract(usize),
     /// Tool execution starting. Surfaced as an OpenAI `tool_calls`
     /// delta on the wire.
     ToolCall {

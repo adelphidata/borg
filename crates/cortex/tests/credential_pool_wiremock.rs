@@ -1585,3 +1585,217 @@ async fn set_priority_rejects_bad_targets_and_positions() {
     let labels: Vec<String> = pool.entries().into_iter().map(|c| c.label).collect();
     assert_eq!(labels, ["k0", "k1", "k2"]);
 }
+
+// ── A provider reset window that is too long to wait for in the turn ──────
+
+/// One key, three retries, and an optional fallback slot on a second server.
+fn sole_key_with_retries_config(primary_uri: &str, fallback_uri: Option<&str>) -> Config {
+    let mut config = sole_key_no_fallback_config(primary_uri);
+    config.llm.max_retries = 3;
+    if let Some(fallback_uri) = fallback_uri {
+        config.llm.fallback.push(cortex::config::LlmFallback {
+            provider: "openai".into(),
+            model: config.llm.model.clone(),
+            api_key: None,
+            api_key_env: Some(config.llm.api_key_env.clone()),
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: Some(format!("{fallback_uri}/v1/chat/completions")),
+        });
+    }
+    config
+}
+
+async fn mount_rate_limit(server: &MockServer, retry_after: &str, times: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", retry_after)
+                .set_body_string(r#"{"error":{"message":"plan limit reached"}}"#),
+        )
+        .up_to_n_times(times)
+        .mount(server)
+        .await;
+}
+
+/// A turn that sleeps through the reset window would not return in this time.
+const TURN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[tokio::test]
+async fn a_long_reset_window_goes_to_the_fallback_without_a_wait() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let config = sole_key_with_retries_config(&primary.uri(), Some(&fallback.uri()));
+
+    mount_rate_limit(&primary, "3600", 10).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_done("fallback-ok"), "text/event-stream"),
+        )
+        .mount(&fallback)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    tokio::time::timeout(
+        TURN_DEADLINE,
+        client.stream_chat(&user_message("hi"), None, tx),
+    )
+    .await
+    .expect("the turn must not sleep through the reset window")
+    .expect("the fallback must serve the request");
+
+    assert_eq!(collect_events(rx).await, vec!["text:fallback-ok", "done"]);
+    assert_eq!(
+        primary.received_requests().await.expect("recording").len(),
+        1,
+        "the primary must not be tried again inside the reset window"
+    );
+}
+
+#[tokio::test]
+async fn a_long_reset_window_without_a_fallback_tells_the_reset_time() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    // Streaming and non-streaming share the rule.
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        let config = sole_key_with_retries_config(&server.uri(), None);
+        mount_rate_limit(&server, "3600", 10).await;
+        let mut client = LlmClient::new(&config).await.expect("client");
+
+        let error = if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            let res = tokio::time::timeout(
+                TURN_DEADLINE,
+                client.stream_chat(&user_message("hi"), None, tx),
+            )
+            .await
+            .expect("the turn must not sleep through the reset window");
+            let events = collect_events(rx).await;
+            let text = res.expect_err("no provider can serve").to_string();
+            assert_eq!(
+                events,
+                vec![format!("error:{text}")],
+                "the consumer must get the same message"
+            );
+            text
+        } else {
+            tokio::time::timeout(TURN_DEADLINE, client.chat(&user_message("hi"), None))
+                .await
+                .expect("the call must not sleep through the reset window")
+                .expect_err("no provider can serve")
+                .to_string()
+        };
+
+        assert!(
+            error.contains("usage limit reached. It resets in about 1 hour"),
+            "streaming={streaming}: {error}"
+        );
+        assert!(
+            error.contains("Add another provider or key"),
+            "streaming={streaming}: {error}"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            1,
+            "streaming={streaming}: no retry inside the reset window"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_short_reset_window_waits_and_retries_the_same_provider() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let config = sole_key_with_retries_config(&server.uri(), None);
+
+    mount_rate_limit(&server, "1", 1).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_done("recovered"), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    let started = std::time::Instant::now();
+    tokio::time::timeout(
+        TURN_DEADLINE,
+        client.stream_chat(&user_message("hi"), None, tx),
+    )
+    .await
+    .expect("a one second window must not end the turn")
+    .expect("the retry must succeed");
+
+    assert_eq!(collect_events(rx).await, vec!["text:recovered", "done"]);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "the retry must wait for the window that the provider gave"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        2
+    );
+}
+
+// ── An example placeholder in the environment is not a credential ─────────
+
+#[tokio::test]
+async fn pool_load_skips_an_example_placeholder_in_the_environment() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let placeholder_var = format!("BORG_TEST_POOL_PLACEHOLDER_{n}");
+    let real_var = format!("BORG_TEST_POOL_REAL_{n}");
+    // SAFETY: serialized by SERIAL.
+    unsafe {
+        std::env::set_var(&placeholder_var, "your-api-key-here");
+        std::env::set_var(&real_var, "sk-ant-real-key-material");
+    }
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("pool.db");
+    let db = Database::open_at(&db_path).await.unwrap();
+    let pool = CredentialPool::load(
+        &db,
+        &db_path,
+        Provider::Anthropic,
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            billing_cooldown_secs: 3600,
+            max_concurrent_per_credential: 4,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
+            config_entries: vec![],
+            env_vars: vec![placeholder_var.clone(), real_var.clone()],
+            oauth_home: Some(db_dir.path().to_path_buf()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let labels: Vec<String> = pool.entries().into_iter().map(|c| c.label).collect();
+    assert_eq!(
+        labels,
+        vec![real_var],
+        "only the variable with a real key becomes a credential"
+    );
+}

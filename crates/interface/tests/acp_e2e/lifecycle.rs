@@ -161,6 +161,113 @@ impl ClientInjector {
 }
 
 #[tokio::test]
+async fn cancel_with_a_tool_call_in_flight_closes_the_call_before_the_response() {
+    // Real failure mode: the turn ends on a cancel while a tool runs, no
+    // result arrives for that call, and the IDE shows its card as running
+    // forever. The call must get a terminal status before the response.
+    let backend = ScriptedBackend::new("cancel-open-tool", move |_t, _i, tx, cancel, _b| {
+        tokio::spawn(async move {
+            let _ = tx
+                .send(AgentEvent::ToolExecuting {
+                    tool_call_id: "call-1".into(),
+                    name: "run_shell".into(),
+                    args: r#"{"command":"sleep 60"}"#.into(),
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::ToolOutputDelta {
+                    tool_call_id: "call-1".into(),
+                    name: "run_shell".into(),
+                    delta: "partial\n".into(),
+                    is_stderr: false,
+                })
+                .await;
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(AgentEvent::Error("cancelled".into())).await;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    // Watchdog: a cancel that never fires must fail the
+                    // test, not hang it.
+                    let _ = tx.send(AgentEvent::TurnComplete).await;
+                }
+            }
+        })
+    });
+    let fixture = BorgdFixture::with_backend(backend).await;
+    let mut client = AcpClient::spawn(&fixture).await.expect("spawn");
+    let _ = client
+        .request("initialize", initialize_params_with_fs())
+        .await
+        .expect("initialize");
+    let cwd = fixture.workspace_path().display().to_string();
+    let new = client
+        .request("session/new", json!({"cwd": cwd}))
+        .await
+        .expect("session/new");
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let mut cancel_bytes = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": sid},
+    }))
+    .expect("serialize cancel");
+    cancel_bytes.push(b'\n');
+    let injector = ClientInjector::from(&client);
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        injector.inject(cancel_bytes).await
+    });
+
+    let outcome = client.run_prompt(&sid, "park").await.expect("prompt");
+    cancel_task
+        .await
+        .expect("cancel task join")
+        .expect("inject");
+
+    assert_eq!(outcome.stop_reason.as_deref(), Some("cancelled"));
+    // `outcome.updates` holds only the frames that came before the response.
+    let tool_frames: Vec<&Value> = outcome
+        .updates
+        .iter()
+        .filter(|u| {
+            u["update"]["sessionUpdate"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("tool_call"))
+        })
+        .collect();
+    let shape: Vec<(&str, &str)> = tool_frames
+        .iter()
+        .map(|u| {
+            (
+                u["update"]["sessionUpdate"].as_str().unwrap_or(""),
+                u["update"]["status"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("tool_call", "in_progress"),
+            ("tool_call_update", "in_progress"),
+            ("tool_call_update", "failed"),
+        ],
+        "frames: {tool_frames:?}"
+    );
+    let closing = tool_frames[2];
+    assert_eq!(closing["update"]["toolCallId"], json!("call-1"));
+    assert!(
+        closing["update"].get("content").is_none(),
+        "content replaces the card's collection, so the closing frame must not carry it: {closing}"
+    );
+    let validator = super::spec_conformance::validator_for_def("SessionNotification");
+    for frame in tool_frames {
+        super::spec_conformance::assert_valid(&validator, frame, "session/update params");
+    }
+}
+
+#[tokio::test]
 async fn cancel_after_completion_is_a_silent_noop_response() {
     // Real failure mode: a regression that errored on cancel-after-end
     // would surface a spurious error in the IDE every time the user

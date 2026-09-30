@@ -1,8 +1,10 @@
 //! Streamable HTTP transport.
 //!
 //! Each outbound JSON-RPC message is POSTed; responses are parsed from the
-//! HTTP body. Servers that prefer SSE for streaming responses use the [`super::sse`]
-//! transport instead.
+//! HTTP body. The server chooses the framing of the reply with its
+//! `Content-Type`: a JSON body, or a `text/event-stream` body that carries
+//! each JSON-RPC message as one event. Servers on the older two-endpoint
+//! protocol use the [`super::sse`] transport instead.
 //!
 //! Security posture:
 //!
@@ -17,6 +19,7 @@
 //!   authoritative DNS server cannot rebind the host between the check and
 //!   the connect.
 
+use super::sse_framing::SseParser;
 use super::Transport;
 use crate::errors::{McpError, Result};
 use crate::protocol::Message;
@@ -331,6 +334,19 @@ impl HttpTransport {
             }
         }
 
+        let is_event_stream = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_event_stream_content_type);
+        if is_event_stream {
+            // `resp` drops at the return, which closes the stream. A server
+            // may hold it open after the response; we do not wait for that.
+            return self
+                .read_event_stream(&mut resp, awaited_response_id(msg))
+                .await;
+        }
+
         // Read the body chunk-by-chunk with a hard cap enforced *as we read*,
         // rather than `resp.bytes()` which buffers the whole body first. A
         // hostile server streaming a multi-GB chunked response is aborted after
@@ -341,16 +357,57 @@ impl HttpTransport {
                 McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
             })?;
         if truncated {
-            return Err(McpError::Protocol(format!(
-                "{}: response body exceeds max_response_bytes ({} bytes)",
-                self.server_name, self.max_response_bytes
-            )));
+            return Err(self.response_too_large());
         }
         // Streamable HTTP framing: either one JSON object, or newline-delimited
         // JSON objects when the server batches a response + notifications.
         let mut messages = Vec::new();
         for line in body.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
             messages.push(crate::protocol::decode_line(line)?);
+        }
+        Ok(messages)
+    }
+
+    fn response_too_large(&self) -> McpError {
+        McpError::Protocol(format!(
+            "{}: response body exceeds max_response_bytes ({} bytes)",
+            self.server_name, self.max_response_bytes
+        ))
+    }
+
+    /// Read a reply that the server framed as `text/event-stream`.
+    ///
+    /// The read stops when the response to `awaited` has arrived. Messages
+    /// that the server sent before it (notifications, server requests) are
+    /// returned in order in front of it. With nothing to wait for, the HTTP
+    /// status was the whole answer and the stream is not read.
+    ///
+    /// `max_response_bytes` applies to one event. The stream has no total
+    /// limit of its own; the request timeout bounds it.
+    async fn read_event_stream(
+        &self,
+        resp: &mut reqwest::Response,
+        awaited: Option<u64>,
+    ) -> Result<Vec<Message>> {
+        let mut messages = Vec::new();
+        let Some(awaited) = awaited else {
+            return Ok(messages);
+        };
+        let mut parser = SseParser::new(self.max_response_bytes);
+        let mut answered = false;
+        while !answered {
+            let chunk = resp.chunk().await.map_err(|e| {
+                McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
+            })?;
+            // End of stream with no response: `recv` reports the missing
+            // response after it drains what did arrive.
+            let Some(chunk) = chunk else { break };
+            let events = parser.feed(&chunk).map_err(|_| self.response_too_large())?;
+            for event in events.iter().filter(|e| e.is_message()) {
+                let message = crate::protocol::decode_line(event.data.as_bytes())?;
+                answered |= message.method.is_none() && message.id == Some(awaited);
+                messages.push(message);
+            }
         }
         Ok(messages)
     }
@@ -498,6 +555,23 @@ impl Transport for HttpTransport {
         // unreachable server must not be able to block shutdown.
         Ok(())
     }
+}
+
+/// True for a `Content-Type` that names an event stream, with or without
+/// parameters (`text/event-stream; charset=utf-8`).
+fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// The id of the response that `msg` makes the server send, if any. Only a
+/// request has one: a notification has no id, and a reply of ours to a
+/// server request has an id but no method.
+fn awaited_response_id(msg: &Value) -> Option<u64> {
+    msg.get("method")?;
+    msg.get("id")?.as_u64()
 }
 
 /// How much of a non-2xx body is shown in the error message. The status code
@@ -786,5 +860,213 @@ mod tests {
             .expect("body under the cap should parse");
         let msg = transport.recv().await.expect("recv should succeed");
         assert!(msg.is_some(), "a message should have been decoded");
+    }
+
+    /// Bind a one-shot event-stream server on loopback. It answers the first
+    /// request with a `text/event-stream` body, writes each entry of `pieces`
+    /// as one TCP write with a pause after it, and then holds the socket
+    /// open. A real server may keep the stream open after the response, so
+    /// the tests must not depend on the close.
+    async fn spawn_event_stream_http(pieces: Vec<Vec<u8>>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                sock.set_nodelay(true).unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+                for piece in pieces {
+                    // The client closes the stream when it has its response
+                    // or refuses the body, so a failed write is expected.
+                    if sock.write_all(&piece).await.is_err() {
+                        return;
+                    }
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        port
+    }
+
+    fn request(id: u64) -> Value {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/list"})
+    }
+
+    /// Send `msg` with a deadline far below the 5 s request timeout and the
+    /// 30 s for which the test server holds the stream open.
+    async fn send_promptly(transport: &mut HttpTransport, msg: Value) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), transport.send(msg))
+            .await
+            .expect("send must return when the response has arrived")
+    }
+
+    fn drain(transport: &mut HttpTransport) -> Vec<Message> {
+        transport.inbox.drain(..).collect()
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_reply_decodes_to_the_same_message_as_a_json_reply() {
+        // The server chooses the framing. The session must see the same
+        // message for the two forms.
+        let json = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}"#;
+        let port = spawn_oneshot_http(json.to_vec()).await;
+        let mut plain = open(local_http_config(port, 1024)).await.unwrap();
+        plain.send(request(1)).await.expect("json reply");
+        let from_json = drain(&mut plain);
+
+        let mut framed = b"event: message\ndata: ".to_vec();
+        framed.extend_from_slice(json);
+        framed.extend_from_slice(b"\n\n");
+        let port = spawn_event_stream_http(vec![framed]).await;
+        let mut stream = open(local_http_config(port, 1024)).await.unwrap();
+        send_promptly(&mut stream, request(1))
+            .await
+            .expect("event-stream reply");
+        let from_stream = drain(&mut stream);
+
+        assert_eq!(from_stream.len(), 1);
+        assert_eq!(from_json.len(), 1);
+        assert_eq!(from_stream[0].id, Some(1));
+        assert_eq!(from_stream[0].id, from_json[0].id);
+        assert_eq!(from_stream[0].result, from_json[0].result);
+        assert_eq!(
+            from_stream[0].result.as_ref().unwrap()["tools"][0]["name"],
+            "a"
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_before_the_response_are_returned_in_order() {
+        // A keep-alive comment, a named non-message event, a notification
+        // with no event name, and then the response with a multi-line data
+        // field. The CRLF between the writes is split across the seam.
+        let pieces = vec![
+            b": keep-alive\r\n\r\nevent: other\r\ndata: ignored\r\n\r\n".to_vec(),
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\n\r"
+                .to_vec(),
+            b"\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":7,\"result\":{}}\r\n\r\n"
+                .to_vec(),
+        ];
+        let port = spawn_event_stream_http(pieces).await;
+        let mut transport = open(local_http_config(port, 1024)).await.unwrap();
+        send_promptly(&mut transport, request(7))
+            .await
+            .expect("send");
+
+        let messages = drain(&mut transport);
+        let seen: Vec<(Option<u64>, Option<&str>)> = messages
+            .iter()
+            .map(|m| (m.id, m.method.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (None, Some("notifications/tools/list_changed")),
+                (Some(7), None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_cap_applies_to_one_event() {
+        // Three events of about 70 bytes each are more than the 128-byte cap
+        // in total. They pass, because the cap is per event.
+        let notification =
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\n";
+        let response = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let port = spawn_event_stream_http(vec![
+            notification.to_vec(),
+            notification.to_vec(),
+            response.to_vec(),
+        ])
+        .await;
+        let mut transport = open(local_http_config(port, 128)).await.unwrap();
+        send_promptly(&mut transport, request(1))
+            .await
+            .expect("small events must pass");
+        assert_eq!(drain(&mut transport).len(), 3);
+
+        // One event larger than the cap is refused while it streams, with
+        // the same error as an oversized JSON body.
+        let mut oversized = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"pad\":\"".to_vec();
+        oversized.extend_from_slice(&[b'x'; 4096]);
+        oversized.extend_from_slice(b"\"}}\n\n");
+        let port = spawn_event_stream_http(vec![oversized]).await;
+        let mut transport = open(local_http_config(port, 128)).await.unwrap();
+        let err = send_promptly(&mut transport, request(1))
+            .await
+            .expect_err("an event over the cap must error");
+        match err {
+            McpError::Protocol(msg) => assert!(
+                msg.contains("exceeds max_response_bytes (128 bytes)"),
+                "unexpected message: {msg}"
+            ),
+            e => panic!("expected Protocol error, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_to_a_different_id_does_not_end_the_read() {
+        // Only the response to this request ends the read. A response with
+        // another id in front of it is kept, and the read continues.
+        let pieces = vec![
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\n\n".to_vec(),
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\n\n".to_vec(),
+        ];
+        let port = spawn_event_stream_http(pieces).await;
+        let mut transport = open(local_http_config(port, 1024)).await.unwrap();
+        send_promptly(&mut transport, request(4))
+            .await
+            .expect("send");
+        let ids: Vec<Option<u64>> = drain(&mut transport).iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![Some(3), Some(4)]);
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_response_to_wait_for_returns_after_the_status() {
+        // A notification has no response, and neither has our reply to a
+        // server request. The server sends no event and holds the stream
+        // open; the send must not wait for the request timeout.
+        let cases = [
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            serde_json::json!({"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no"}}),
+        ];
+        for msg in cases {
+            let port = spawn_event_stream_http(vec![]).await;
+            let mut transport = open(local_http_config(port, 1024)).await.unwrap();
+            send_promptly(&mut transport, msg.clone())
+                .await
+                .unwrap_or_else(|e| panic!("send of {msg} failed: {e}"));
+            assert!(drain(&mut transport).is_empty());
+        }
+    }
+
+    #[test]
+    fn event_stream_content_type_is_matched_by_media_type() {
+        // (content type, is an event stream)
+        let cases = [
+            ("text/event-stream", true),
+            ("text/event-stream; charset=utf-8", true),
+            ("Text/Event-Stream", true),
+            ("application/json", false),
+            ("application/json; note=text/event-stream", false),
+            ("text/event-streams", false),
+        ];
+        for (content_type, expected) in cases {
+            assert_eq!(
+                is_event_stream_content_type(content_type),
+                expected,
+                "{content_type}"
+            );
+        }
     }
 }

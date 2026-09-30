@@ -48,6 +48,12 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::A
             text: format!("Reconnecting — waiting for network. Retrying in {delay_secs}s."),
         }),
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
+        // Every surface behind the wire accumulates the deltas, so each one
+        // needs the retraction to show the text of the attempt that
+        // completes, and only that.
+        CoreEvent::TextRetracted { bytes } => Kind::TextRetracted(pb::TextRetracted {
+            bytes: bytes as u64,
+        }),
         CoreEvent::ThinkingDelta(text) => Kind::ThinkingDelta(pb::ThinkingDelta { text }),
         CoreEvent::ToolExecuting {
             tool_call_id,
@@ -165,6 +171,9 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
     let kind = event.kind?;
     Some(match kind {
         Kind::TextDelta(t) => CoreEvent::TextDelta(t.text),
+        Kind::TextRetracted(t) => CoreEvent::TextRetracted {
+            bytes: usize::try_from(t.bytes).unwrap_or(usize::MAX),
+        },
         Kind::ThinkingDelta(t) => CoreEvent::ThinkingDelta(t.text),
         Kind::ToolExecuting(t) => CoreEvent::ToolExecuting {
             tool_call_id: t.tool_call_id,
@@ -387,6 +396,10 @@ mod tests {
                 Kind::TextDelta(pb::TextDelta { text: "hi".into() }),
             ),
             (
+                "TextRetracted",
+                Kind::TextRetracted(pb::TextRetracted { bytes: 3 }),
+            ),
+            (
                 "ThinkingDelta",
                 Kind::ThinkingDelta(pb::ThinkingDelta { text: "t".into() }),
             ),
@@ -500,6 +513,30 @@ mod tests {
         assert!(is_terminal(&wire(CoreEvent::Error("boom".into()))));
         assert!(!is_terminal(&wire(CoreEvent::TextDelta("hi".into()))));
         assert!(!is_terminal(&wire(CoreEvent::Preparing)));
+    }
+
+    /// Spec: a consumer behind the wire (a channel, a heartbeat, a remote
+    /// client) gets the retraction with the same size, so the text that it
+    /// accumulates is the text of the attempt that completes.
+    #[test]
+    fn a_text_retraction_crosses_the_wire_with_its_size() {
+        let prompts = Arc::new(PromptRegistry::default());
+        let mut text = String::new();
+        for event in [
+            CoreEvent::TextDelta("The answer is f\u{f6}".into()),
+            CoreEvent::TextRetracted { bytes: 17 },
+            CoreEvent::TextDelta("The answer is forty-two.".into()),
+        ] {
+            let wire = to_proto(event, &prompts).expect("the event has a wire form");
+            match from_proto(wire).expect("the event has a core form") {
+                CoreEvent::TextDelta(delta) => text.push_str(&delta),
+                CoreEvent::TextRetracted { bytes } => {
+                    cortex::agent::retract_text_tail(&mut text, bytes)
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(text, "The answer is forty-two.");
     }
 
     #[test]

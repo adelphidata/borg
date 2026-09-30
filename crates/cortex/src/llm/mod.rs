@@ -388,6 +388,11 @@ struct StreamChunk {
     provider: Option<String>,
     choices: Option<Vec<StreamChoice>>,
     usage: Option<StreamUsage>,
+    /// An error object delivered inside an HTTP 200 stream. Aggregators relay
+    /// an upstream failure (rate limit, disconnect, account block) this way.
+    /// Kept as raw JSON because the shape differs per relay.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,6 +626,59 @@ struct PrimaryIdentity {
 /// Multi-provider streaming LLM client with failover and key rotation.
 /// First wait after the connection to the provider drops.
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(5);
+
+/// The longest wait that a provider can request and that the client still
+/// sleeps through inside the turn. A longer window (a plan quota that resets
+/// in hours) ends the attempt: the fallback chain takes over, or the user
+/// gets the reset time. A turn that sleeps for hours looks like a dead agent.
+const MAX_IN_TURN_RETRY_WAIT: Duration = Duration::from_secs(120);
+
+/// True when the provider asked for a wait longer than the turn can hold.
+fn is_long_provider_wait(err: &LlmError) -> bool {
+    err.retry_after()
+        .is_some_and(|wait| wait > MAX_IN_TURN_RETRY_WAIT)
+}
+
+/// A wait in hours and minutes, rounded up to the minute: "2 hours 5 minutes".
+fn plain_wait(wait: Duration) -> String {
+    let unit = |n: u64, name: &str| format!("{n} {name}{}", if n == 1 { "" } else { "s" });
+    let total_minutes = wait.as_secs().div_ceil(60).max(1);
+    let (hours, minutes) = (total_minutes / 60, total_minutes % 60);
+    match (hours, minutes) {
+        (0, m) => unit(m, "minute"),
+        (h, 0) => unit(h, "hour"),
+        (h, m) => format!("{} {}", unit(h, "hour"), unit(m, "minute")),
+    }
+}
+
+/// What the user reads when the provider limit resets too late for this
+/// turn. It names the reset time and the next action. The provider body
+/// goes to the log, not to the user.
+fn usage_limit_message(
+    provider: Provider,
+    wait: Duration,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    let window = plain_wait(wait);
+    let reset_at = chrono::Duration::from_std(wait)
+        .ok()
+        .and_then(|w| now.checked_add_signed(w));
+    let clock = match reset_at {
+        Some(at) if at.date_naive() == now.date_naive() => {
+            format!(" (at about {})", at.format("%H:%M"))
+        }
+        Some(at) => format!(
+            " (at about {} on {})",
+            at.format("%H:%M"),
+            at.format("%b %-d")
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{provider} usage limit reached. It resets in about {window}{clock}. \
+         Add another provider or key, or try again after that."
+    )
+}
 /// Ceiling on the reconnect wait.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
@@ -1576,6 +1634,15 @@ impl LlmClient {
                 );
                 continue;
             }
+            // A slot whose every credential is benched cannot serve the
+            // request. Do not move to it.
+            if slot.pool.as_ref().is_some_and(|pool| !pool.has_available()) {
+                debug!(
+                    "Provider {} has no available credential, skipping",
+                    slot.provider
+                );
+                continue;
+            }
             // Leaving the primary head: snapshot its identity so it can be
             // restored once its cooldown expires. Fallback→fallback switches
             // keep the existing snapshot.
@@ -1773,6 +1840,86 @@ impl LlmClient {
         }
     }
 
+    /// Read one response stream to its end through `transport`.
+    ///
+    /// `observe` sees every parsed action before its events are sent.
+    ///
+    /// A connection that closes cleanly is a complete response only when the
+    /// parser saw the completion marker of the wire. Without the marker the
+    /// answer is cut short (a proxy or load balancer closed the socket), so
+    /// the call fails as a lost connection and the retry path takes over. No
+    /// `StreamEvent::Done` is sent in that case: the consumer treats `Done`
+    /// as the authoritative end of the turn.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn drive_transport_stream<S, B, E>(
+        transport: &dyn transport::Transport,
+        stream: S,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+        chunk_timeout_secs: u64,
+        provider: &str,
+        model: &str,
+        mut observe: impl FnMut(&crate::sse::SseAction),
+    ) -> std::result::Result<(), LlmError>
+    where
+        S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+        B: AsRef<[u8]>,
+        E: std::fmt::Display,
+    {
+        use crate::sse::StreamEnd;
+
+        let mut state = transport.new_stream_state();
+        let end = match transport.stream_protocol() {
+            transport::StreamProtocol::Sse => {
+                crate::sse::process_sse_stream(
+                    stream,
+                    tx,
+                    cancel,
+                    chunk_timeout_secs,
+                    MAX_SSE_BUFFER,
+                    |line| {
+                        let action = transport.parse_stream_line(line, provider, model, &mut state);
+                        observe(&action);
+                        action
+                    },
+                )
+                .await?
+            }
+            transport::StreamProtocol::AwsEventStream => {
+                Self::process_bedrock_stream(
+                    stream,
+                    tx,
+                    cancel,
+                    chunk_timeout_secs,
+                    MAX_SSE_BUFFER,
+                    |payload| {
+                        let action =
+                            transport.parse_stream_payload(payload, provider, model, &mut state);
+                        observe(&action);
+                        action
+                    },
+                )
+                .await?
+            }
+        };
+
+        match end {
+            StreamEnd::Marker | StreamEnd::Stopped => Ok(()),
+            StreamEnd::Eof if transport.stream_completed(&state) => {
+                // Best-effort: a closed receiver means the turn was torn
+                // down first.
+                let _ = tx.send(StreamEvent::Done).await;
+                Ok(())
+            }
+            StreamEnd::Eof => Err(LlmError::Retryable {
+                source: anyhow::anyhow!("{provider} stream ended before the completion marker"),
+                retry_after: None,
+                reason: FailoverReason::ConnectionLost,
+                status: None,
+            }),
+        }
+    }
+
     async fn process_bedrock_stream<S, B, E, F>(
         mut stream: S,
         tx: &mpsc::Sender<StreamEvent>,
@@ -1780,7 +1927,7 @@ impl LlmClient {
         chunk_timeout_secs: u64,
         max_buffer: usize,
         mut parse_payload: F,
-    ) -> std::result::Result<(), LlmError>
+    ) -> std::result::Result<crate::sse::StreamEnd, LlmError>
     where
         S: futures_util::Stream<Item = Result<B, E>> + Unpin,
         B: AsRef<[u8]>,
@@ -1794,7 +1941,7 @@ impl LlmClient {
                 _ = cancel.cancelled() => {
                     // Best-effort: a closed receiver just means the turn was torn down first.
                     let _ = tx.send(StreamEvent::Done).await;
-                    return Ok(());
+                    return Ok(crate::sse::StreamEnd::Stopped);
                 }
                 maybe_chunk = async {
                     if chunk_timeout_secs > 0 {
@@ -1816,10 +1963,9 @@ impl LlmClient {
                                 status: None,
                             });
                         }
-                        Ok(None) => {
-                            let _ = tx.send(StreamEvent::Done).await;
-                            return Ok(());
-                        }
+                        // The caller decides whether a clean close is a
+                        // complete response.
+                        Ok(None) => return Ok(crate::sse::StreamEnd::Eof),
                         Err(_) => {
                             return Err(LlmError::Retryable {
                                 source: anyhow::anyhow!("No Bedrock stream data received for {chunk_timeout_secs}s"),
@@ -1850,17 +1996,17 @@ impl LlmClient {
                     crate::sse::SseAction::Emit(events) => {
                         for event in events {
                             if tx.send(event).await.is_err() {
-                                return Ok(());
+                                return Ok(crate::sse::StreamEnd::Stopped);
                             }
                         }
                     }
                     crate::sse::SseAction::Done(events) => {
                         for event in events {
                             if tx.send(event).await.is_err() {
-                                return Ok(());
+                                return Ok(crate::sse::StreamEnd::Stopped);
                             }
                         }
-                        return Ok(());
+                        return Ok(crate::sse::StreamEnd::Marker);
                     }
                     crate::sse::SseAction::Error(e) => return Err(e),
                 }
@@ -2004,8 +2150,20 @@ impl LlmClient {
     /// events would be silently discarded by the aggregation below. Callers
     /// that need tools use [`Self::chat`] or [`Self::stream_chat`].
     pub async fn chat_streamed(&mut self, messages: &[Message]) -> Result<Message> {
+        self.chat_streamed_checked(messages)
+            .await
+            .map(|(message, _truncated)| message)
+    }
+
+    /// [`Self::chat_streamed`], plus whether the provider cut the output at
+    /// its length limit. A caller that stores the text as a complete
+    /// document (a compaction summary) must reject a cut one.
+    ///
+    /// The flag is always `false` on the plain `chat` fallback: that path
+    /// does not report the stop reason.
+    pub async fn chat_streamed_checked(&mut self, messages: &[Message]) -> Result<(Message, bool)> {
         if !self.provider.supports_tools(&self.llm_config.model) {
-            return self.chat(messages, None).await;
+            return Ok((self.chat(messages, None).await?, false));
         }
 
         // Ceiling: 0 chunk-timeout means the operator disabled idle
@@ -2031,6 +2189,7 @@ impl LlmClient {
         tokio::pin!(stream_fut);
 
         let mut text = String::new();
+        let mut truncated = false;
         let mut stream_result: Option<Result<()>> = None;
         loop {
             tokio::select! {
@@ -2042,6 +2201,15 @@ impl LlmClient {
                 ev = rx.recv() => {
                     match ev {
                         Some(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+                        Some(StreamEvent::Truncated) => truncated = true,
+                        // Each attempt sends the full answer again. The
+                        // output of a failed attempt (a retry, or the
+                        // attempt before a failover) must not stay in
+                        // front of the text of the attempt that completes.
+                        Some(StreamEvent::AttemptStarted { .. }) => {
+                            text.clear();
+                            truncated = false;
+                        }
                         Some(_) => {}
                         None => break,
                     }
@@ -2068,7 +2236,7 @@ impl LlmClient {
             // Channel closed before the driving future resolved — settle it.
             stream_fut.await?;
         }
-        Ok(Message::assistant(&text))
+        Ok((Message::assistant(&text), truncated))
     }
 
     /// Try rotating to the next fallback API key. Returns true if rotation succeeded.
@@ -2349,7 +2517,11 @@ impl LlmClient {
                             continue;
                         }
 
-                        if !e.is_retryable() || attempt == max_retries {
+                        // A reset window longer than the turn can hold
+                        // ends the attempts on this slot, the same as
+                        // exhausted retries.
+                        let long_wait = is_long_provider_wait(&e);
+                        if !e.is_retryable() || attempt == max_retries || long_wait {
                             // Record failure and attempt provider failover.
                             // AuthPermanent opts out — the account is denied
                             // and burning the fallback chain just delays the
@@ -2376,7 +2548,17 @@ impl LlmClient {
                                 break;
                             }
                             // No more providers — propagate error
-                            let msg = format!("{e}");
+                            let msg = match e.retry_after().filter(|_| long_wait) {
+                                Some(wait) => {
+                                    warn!(
+                                        target: "cortex::llm",
+                                        wait_secs = wait.as_secs(),
+                                        "provider reset window is too long to wait in the turn: {e}"
+                                    );
+                                    usage_limit_message(self.provider, wait, chrono::Local::now())
+                                }
+                                None => format!("{e}"),
+                            };
                             if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
                                 tracing::trace!("llm: stream receiver closed while sending error");
                             }
@@ -2969,61 +3151,27 @@ impl LlmClient {
                 configured.max(reasoning_timeouts::stale_timeout_floor_secs(&model_str))
             }
         };
-        let mut state = transport.new_stream_state();
         let mut first_byte_ms: Option<u64> = None;
         let mut line_count: u64 = 0;
         let mut last_usage: Option<UsageData> = None;
 
-        let result = match transport.stream_protocol() {
-            transport::StreamProtocol::Sse => {
-                crate::sse::process_sse_stream(
-                    stream,
-                    tx,
-                    cancel,
-                    chunk_timeout_secs,
-                    MAX_SSE_BUFFER,
-                    |line| {
-                        if first_byte_ms.is_none() {
-                            first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
-                        }
-                        line_count += 1;
-                        let action = transport.parse_stream_line(
-                            line,
-                            &provider_str,
-                            &model_str,
-                            &mut state,
-                        );
-                        Self::maybe_capture_usage_from_action(&action, &mut last_usage);
-                        action
-                    },
-                )
-                .await
-            }
-            transport::StreamProtocol::AwsEventStream => {
-                Self::process_bedrock_stream(
-                    stream,
-                    tx,
-                    cancel,
-                    chunk_timeout_secs,
-                    MAX_SSE_BUFFER,
-                    |payload| {
-                        if first_byte_ms.is_none() {
-                            first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
-                        }
-                        line_count += 1;
-                        let action = transport.parse_stream_payload(
-                            payload,
-                            &provider_str,
-                            &model_str,
-                            &mut state,
-                        );
-                        Self::maybe_capture_usage_from_action(&action, &mut last_usage);
-                        action
-                    },
-                )
-                .await
-            }
-        };
+        let result = Self::drive_transport_stream(
+            transport,
+            stream,
+            tx,
+            cancel,
+            chunk_timeout_secs,
+            &provider_str,
+            &model_str,
+            |action| {
+                if first_byte_ms.is_none() {
+                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                }
+                line_count += 1;
+                Self::maybe_capture_usage_from_action(action, &mut last_usage);
+            },
+        )
+        .await;
 
         match &result {
             Ok(()) => lc_log!(
@@ -3257,8 +3405,23 @@ impl LlmClient {
                             }
                         }
 
-                        if !e.is_retryable() || attempt == max_retries {
+                        // See the streaming path: a reset window longer
+                        // than the turn can hold ends the attempts here.
+                        let long_wait = is_long_provider_wait(&e);
+                        if !e.is_retryable() || attempt == max_retries || long_wait {
                             self.record_provider_failure(reason);
+                            if let Some(wait) = e.retry_after().filter(|_| long_wait) {
+                                warn!(
+                                    target: "cortex::llm",
+                                    wait_secs = wait.as_secs(),
+                                    "provider reset window is too long to wait in the turn: {e}"
+                                );
+                                last_error = Some(usage_limit_message(
+                                    self.provider,
+                                    wait,
+                                    chrono::Local::now(),
+                                ));
+                            }
                             if self.try_failover_provider() {
                                 should_failover = true;
                                 break;

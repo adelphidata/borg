@@ -240,6 +240,9 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
     if let Err(e) = tasks::validate_schedule(&schedule_type, &schedule_expr) {
         return Ok(invalid_schedule(e));
     }
+    if let Err(e) = tasks::validate_timezone(&timezone) {
+        return Ok(invalid_schedule(e));
+    }
     let next_run = match tasks::calculate_next_run(&schedule_type, &schedule_expr, &timezone) {
         Ok(nr) => nr,
         Err(e) => return Ok(invalid_schedule(e)),
@@ -406,6 +409,11 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
     let schedule_type = optional_str_param(args, "schedule_type").map(str::to_string);
     let schedule_expr = optional_str_param(args, "schedule_expr").map(str::to_string);
     let timezone = optional_str_param(args, "timezone").map(str::to_string);
+    if let Some(tz) = timezone.as_deref() {
+        if let Err(e) = tasks::validate_timezone(tz) {
+            return Ok(invalid_schedule(e));
+        }
+    }
     if let Some(st) = schedule_type.as_deref() {
         let expr = schedule_expr.as_deref().unwrap_or("");
         if let Err(e) = tasks::validate_schedule(st, expr) {
@@ -861,6 +869,40 @@ pub async fn update_task_status(task_id: &str, status: &str, verb: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unknown zone would be stored and then evaluated as UTC, so the task
+    /// fires at the wrong hour while the tool reports success. Both write
+    /// paths refuse before they reach the database.
+    #[tokio::test]
+    async fn create_and_update_refuse_an_unknown_timezone() {
+        for tz in ["Nowhere/City", "New York", "EST5"] {
+            let create = serde_json::json!({
+                "name": "brief",
+                "prompt": "summarize",
+                "schedule_type": "cron",
+                "schedule_expr": "0 0 9 * * * *",
+                "timezone": tz,
+            });
+            let out = manage_tasks_create(&create, &Config::default())
+                .await
+                .expect("handler returns Ok with an error string");
+            assert!(
+                out.starts_with("Error: Invalid schedule: Unknown timezone")
+                    && out.contains(tz)
+                    && out.contains("America/New_York"),
+                "create with timezone {tz:?} must be refused, got: {out}"
+            );
+
+            let update = serde_json::json!({ "task_id": "any-task", "timezone": tz });
+            let out = manage_tasks_update(&update)
+                .await
+                .expect("handler returns Ok with an error string");
+            assert!(
+                out.starts_with("Error: Invalid schedule: Unknown timezone") && out.contains(tz),
+                "update with timezone {tz:?} must be refused, got: {out}"
+            );
+        }
+    }
 
     /// A refused command must be rejected *before* `with_db`, so this test
     /// needs no database — and the absence of a DB is itself the assertion

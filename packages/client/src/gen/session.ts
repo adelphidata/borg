@@ -176,10 +176,23 @@ export interface AgentEvent {
   historyCompacted?: HistoryCompacted | undefined;
   error?: ErrorEvent | undefined;
   systemNotice?: SystemNotice | undefined;
+  textRetracted?: TextRetracted | undefined;
 }
 
 export interface TextDelta {
   text: string;
+}
+
+/**
+ * The agent discarded text that it already sent as TextDelta: the LLM
+ * attempt that produced it failed, and a new attempt sends the full response
+ * again. `bytes` is the UTF-8 length of the discarded deltas. A client
+ * removes that many bytes from the end of the assistant text that it
+ * accumulates for the turn, cuts on a character boundary, and accepts a
+ * count larger than the text that it holds.
+ */
+export interface TextRetracted {
+  bytes: number;
 }
 
 export interface ThinkingDelta {
@@ -2420,6 +2433,7 @@ function createBaseAgentEvent(): AgentEvent {
     historyCompacted: undefined,
     error: undefined,
     systemNotice: undefined,
+    textRetracted: undefined,
   };
 }
 
@@ -2475,6 +2489,9 @@ export const AgentEvent: MessageFns<AgentEvent> = {
     }
     if (message.systemNotice !== undefined) {
       SystemNotice.encode(message.systemNotice, writer.uint32(202).fork()).join();
+    }
+    if (message.textRetracted !== undefined) {
+      TextRetracted.encode(message.textRetracted, writer.uint32(210).fork()).join();
     }
     return writer;
   },
@@ -2622,6 +2639,14 @@ export const AgentEvent: MessageFns<AgentEvent> = {
           message.systemNotice = SystemNotice.decode(reader, reader.uint32());
           continue;
         }
+        case 26: {
+          if (tag !== 210) {
+            break;
+          }
+
+          message.textRetracted = TextRetracted.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2706,6 +2731,11 @@ export const AgentEvent: MessageFns<AgentEvent> = {
         : isSet(object.system_notice)
         ? SystemNotice.fromJSON(object.system_notice)
         : undefined,
+      textRetracted: isSet(object.textRetracted)
+        ? TextRetracted.fromJSON(object.textRetracted)
+        : isSet(object.text_retracted)
+        ? TextRetracted.fromJSON(object.text_retracted)
+        : undefined,
     };
   },
 
@@ -2762,6 +2792,9 @@ export const AgentEvent: MessageFns<AgentEvent> = {
     if (message.systemNotice !== undefined) {
       obj.systemNotice = SystemNotice.toJSON(message.systemNotice);
     }
+    if (message.textRetracted !== undefined) {
+      obj.textRetracted = TextRetracted.toJSON(message.textRetracted);
+    }
     return obj;
   },
 
@@ -2816,6 +2849,9 @@ export const AgentEvent: MessageFns<AgentEvent> = {
       : undefined;
     message.systemNotice = (object.systemNotice !== undefined && object.systemNotice !== null)
       ? SystemNotice.fromPartial(object.systemNotice)
+      : undefined;
+    message.textRetracted = (object.textRetracted !== undefined && object.textRetracted !== null)
+      ? TextRetracted.fromPartial(object.textRetracted)
       : undefined;
     return message;
   },
@@ -2875,6 +2911,64 @@ export const TextDelta: MessageFns<TextDelta> = {
   fromPartial<I extends Exact<DeepPartial<TextDelta>, I>>(object: I): TextDelta {
     const message = createBaseTextDelta();
     message.text = object.text ?? "";
+    return message;
+  },
+};
+
+function createBaseTextRetracted(): TextRetracted {
+  return { bytes: 0 };
+}
+
+export const TextRetracted: MessageFns<TextRetracted> = {
+  encode(message: TextRetracted, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.bytes !== 0) {
+      writer.uint32(8).uint64(message.bytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TextRetracted {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTextRetracted();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.bytes = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TextRetracted {
+    return { bytes: isSet(object.bytes) ? globalThis.Number(object.bytes) : 0 };
+  },
+
+  toJSON(message: TextRetracted): unknown {
+    const obj: any = {};
+    if (message.bytes !== 0) {
+      obj.bytes = Math.round(message.bytes);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<TextRetracted>, I>>(base?: I): TextRetracted {
+    return TextRetracted.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<TextRetracted>, I>>(object: I): TextRetracted {
+    const message = createBaseTextRetracted();
+    message.bytes = object.bytes ?? 0;
     return message;
   },
 };

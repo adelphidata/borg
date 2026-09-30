@@ -310,6 +310,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         unknown_tool_tracker: UnknownToolTracker::default(),
         turn_reasoning: String::new(),
         tool_intent_signalled: false,
+        emitted_text_bytes: 0,
         nudged_for_dropped_tools: false,
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),

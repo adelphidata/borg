@@ -1,4 +1,4 @@
-use super::types::{CallbackQuery, TelegramMessage, Update};
+use super::types::{CallbackQuery, MessageEntity, TelegramMessage, Update};
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use crate::handler::InboundMessage;
 
@@ -135,6 +135,56 @@ fn effective_thread_id(msg: &TelegramMessage) -> Option<i64> {
     }
 }
 
+/// Make the hidden URL of each `text_link` entity visible in the text.
+///
+/// A formatted link shows only its label; the URL travels in the entity.
+/// Without this step the agent gets the label and cannot see the target.
+/// Each URL is inserted as ` (<url>)` directly after its label. The URL is
+/// sender-controlled and stays part of the message text, so it takes the same
+/// sanitize and trust-boundary path as the rest of the message.
+///
+/// Entity offsets are UTF-16 code units. An entity that is out of range or
+/// that does not sit on character boundaries is skipped.
+fn expand_text_links(text: &str, entities: &[MessageEntity]) -> String {
+    if !entities.iter().any(|e| e.kind == "text_link") {
+        return text.to_string();
+    }
+
+    // UTF-16 offset of each char boundary -> byte index, plus the end of text.
+    let mut boundaries = std::collections::HashMap::new();
+    let mut utf16_len = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        boundaries.insert(utf16_len, byte_idx);
+        utf16_len += ch.len_utf16();
+    }
+    boundaries.insert(utf16_len, text.len());
+
+    // (byte index of the label end, url)
+    let mut inserts: Vec<(usize, &str)> = entities
+        .iter()
+        .filter(|e| e.kind == "text_link")
+        .filter_map(|e| {
+            let url = e.url.as_deref().map(str::trim).filter(|u| !u.is_empty())?;
+            let start = usize::try_from(e.offset).ok()?;
+            let length = usize::try_from(e.length).ok().filter(|l| *l > 0)?;
+            let end = start.checked_add(length)?;
+            boundaries.get(&start)?;
+            Some((*boundaries.get(&end)?, url))
+        })
+        .collect();
+
+    // Last insert first, so the earlier byte indexes stay valid.
+    inserts.sort_by_key(|insert| std::cmp::Reverse(insert.0));
+    let mut out = text.to_string();
+    for (at, url) in inserts {
+        let suffix = format!(" ({url})");
+        if !out[at..].starts_with(&suffix) {
+            out.insert_str(at, &suffix);
+        }
+    }
+    out
+}
+
 /// Derive display text (and any audio ref needed for transcription) from a
 /// Telegram message. Prefers text, then caption, then a per-media-type
 /// placeholder. Returns `None` if there's nothing routable.
@@ -145,10 +195,12 @@ fn derive_message_text(
         if t.is_empty() || is_binary_content(t) {
             return None;
         }
-        return Some((t.clone(), None, TelegramInputKind::Text));
+        let text = expand_text_links(t, msg.entities.as_deref().unwrap_or_default());
+        return Some((text, None, TelegramInputKind::Text));
     }
     if let Some(caption) = msg.caption.as_deref().filter(|c| !is_binary_content(c)) {
-        return Some((caption.to_string(), None, TelegramInputKind::Other));
+        let text = expand_text_links(caption, msg.caption_entities.as_deref().unwrap_or_default());
+        return Some((text, None, TelegramInputKind::Other));
     }
     if msg.photo.is_some() {
         return Some(("[Photo]".to_string(), None, TelegramInputKind::Other));
@@ -265,6 +317,141 @@ mod tests {
             text_json = serde_json::to_string(text).unwrap()
         ))
         .unwrap()
+    }
+
+    fn entity(kind: &str, offset: i64, length: i64, url: Option<&str>) -> MessageEntity {
+        MessageEntity {
+            kind: kind.to_string(),
+            offset,
+            length,
+            url: url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn expand_text_links_table() {
+        let link = |o, l, u| entity("text_link", o, l, Some(u));
+        let cases: Vec<(&str, &str, Vec<MessageEntity>, &str)> = vec![
+            (
+                "ascii label",
+                "read this now",
+                vec![link(5, 4, "https://x.example")],
+                "read this (https://x.example) now",
+            ),
+            (
+                "astral emoji before the label counts as 2 UTF-16 units",
+                "\u{1F600} read this now",
+                vec![link(8, 4, "https://x.example")],
+                "\u{1F600} read this (https://x.example) now",
+            ),
+            (
+                "two links, given in document order",
+                "one and two",
+                vec![
+                    link(0, 3, "https://a.example"),
+                    link(8, 3, "https://b.example"),
+                ],
+                "one (https://a.example) and two (https://b.example)",
+            ),
+            (
+                "two links, given in reverse order",
+                "one and two",
+                vec![
+                    link(8, 3, "https://b.example"),
+                    link(0, 3, "https://a.example"),
+                ],
+                "one (https://a.example) and two (https://b.example)",
+            ),
+            (
+                "end past the text",
+                "short",
+                vec![link(3, 40, "https://x.example")],
+                "short",
+            ),
+            (
+                "negative offset",
+                "short",
+                vec![link(-1, 3, "https://x.example")],
+                "short",
+            ),
+            (
+                "zero length",
+                "short",
+                vec![link(0, 0, "https://x.example")],
+                "short",
+            ),
+            (
+                "end inside a surrogate pair",
+                "\u{1F600}x",
+                vec![link(0, 1, "https://x.example")],
+                "\u{1F600}x",
+            ),
+            ("blank url", "label", vec![link(0, 5, "   ")], "label"),
+            (
+                "url already written after the label",
+                "label (https://x.example) tail",
+                vec![link(0, 5, "https://x.example")],
+                "label (https://x.example) tail",
+            ),
+            (
+                "plain url, mention and bold entities change nothing",
+                "see https://x.example @bob now",
+                vec![
+                    entity("url", 4, 17, None),
+                    entity("mention", 22, 4, None),
+                    entity("bold", 27, 3, Some("https://ignored.example")),
+                ],
+                "see https://x.example @bob now",
+            ),
+        ];
+        for (name, text, entities, expected) in cases {
+            assert_eq!(expand_text_links(text, &entities), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn text_link_entities_reach_the_inbound_text() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "text": "see the report",
+                    "entities": [
+                        { "type": "text_link", "offset": 8, "length": 6, "url": "https://x.example/r" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "see the report (https://x.example/r)");
+    }
+
+    #[test]
+    fn caption_entities_reach_the_inbound_text() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 4,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "photo": [{ "file_id": "abc", "file_unique_id": "u1", "width": 100, "height": 100 }],
+                    "caption": "full story here",
+                    "caption_entities": [
+                        { "type": "text_link", "offset": 11, "length": 4, "url": "https://x.example/s" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "full story here (https://x.example/s)");
     }
 
     #[test]

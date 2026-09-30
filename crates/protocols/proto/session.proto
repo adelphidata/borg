@@ -234,10 +234,18 @@ message AgentEvent {
     HistoryCompacted history_compacted = 23;
     ErrorEvent error = 24;
     SystemNotice system_notice = 25;
+    TextRetracted text_retracted = 26;
   }
 }
 
 message TextDelta { string text = 1; }
+// The agent discarded text that it already sent as TextDelta: the LLM
+// attempt that produced it failed, and a new attempt sends the full response
+// again. `bytes` is the UTF-8 length of the discarded deltas. A client
+// removes that many bytes from the end of the assistant text that it
+// accumulates for the turn, cuts on a character boundary, and accepts a
+// count larger than the text that it holds.
+message TextRetracted { uint64 bytes = 1; }
 message ThinkingDelta { string text = 1; }
 message ToolExecuting {
   string tool_call_id = 1;

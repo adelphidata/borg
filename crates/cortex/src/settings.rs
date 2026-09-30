@@ -183,6 +183,23 @@ fn truncate_setting_value_for_audit(v: &str) -> String {
     }
 }
 
+/// The setting that selects the LLM provider.
+const PROVIDER_KEY: &str = "provider";
+
+/// The endpoint override. It belongs to the provider that was active when
+/// the user set it.
+const BASE_URL_KEY: &str = "llm.base_url";
+
+/// True when a write of `new` over `prior` moves to a different provider.
+/// A first selection (no prior provider) is not a change: a fresh install
+/// has no endpoint of an earlier provider to clear.
+fn provider_changed(prior: Option<&str>, new: &str) -> bool {
+    prior
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .is_some_and(|p| !p.eq_ignore_ascii_case(new.trim()))
+}
+
 /// Merges settings from two layers: DB overrides → compiled defaults.
 pub struct SettingsResolver {
     db: Database,
@@ -204,23 +221,34 @@ impl SettingsResolver {
 
     /// Resolve a full Config from defaults + DB overrides.
     pub async fn resolve(&self) -> Result<Config> {
-        let mut config = Config::default();
         let db_settings = self.db.list_settings().await?;
-        for (key, value, _) in &db_settings {
-            if let Err(e) = config.apply_setting(key, value) {
-                warn_invalid_setting_once(key, &e);
-            }
-        }
-        Ok(config)
+        Ok(Config::from_setting_rows(
+            db_settings.into_iter().map(|(k, v, _)| (k, v)),
+        ))
     }
 
     /// Validate and write a setting to the database.
     /// Returns the confirmation string from `apply_setting`.
+    ///
+    /// # Write order
+    ///
+    /// A write of `provider` that moves to a different provider resets
+    /// `llm.base_url` to its default. A caller that sets both must write
+    /// `provider` first and `llm.base_url` second. In the opposite order the
+    /// provider write removes the endpoint that the caller just stored.
+    ///
+    /// The reset is written before the provider row. If one of the two
+    /// writes fails, the new provider is never stored with the endpoint of
+    /// the old one.
     pub async fn set(&self, key: &str, value: &str) -> Result<String> {
         // Validate by applying to a throwaway config
         let mut scratch = Config::default();
         let confirmation = scratch.apply_setting(key, value)?;
-        let prev = self.read_prior_for_audit(key).await;
+        let prev = self.read_prior(key).await?;
+        if key == PROVIDER_KEY {
+            self.clear_base_url_on_provider_change(prev.as_deref(), value)
+                .await?;
+        }
         self.db.set_setting(key, value).await?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value)).await;
         // Clearing a parent blob (`llm.aux = ""`) must also wipe its
@@ -236,11 +264,18 @@ impl SettingsResolver {
     /// Revert a setting to its compiled default value.
     /// Writes the default back to the DB rather than deleting the row,
     /// keeping the settings table as the complete source of truth.
+    ///
+    /// An unset of `provider` follows the write-order contract of
+    /// [`Self::set`]: it resets `llm.base_url` when the provider changes.
     pub async fn unset(&self, key: &str) -> Result<()> {
         let defaults = Config::default();
         let default_value = config_value_for_key(&defaults, key)
             .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
-        let prev = self.read_prior_for_audit(key).await;
+        let prev = self.read_prior(key).await?;
+        if key == PROVIDER_KEY {
+            self.clear_base_url_on_provider_change(prev.as_deref(), &default_value)
+                .await?;
+        }
         self.db.set_setting(key, &default_value).await?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value)).await;
         // `unset llm.aux` writes the default ("") for the parent and must
@@ -248,6 +283,49 @@ impl SettingsResolver {
         if key == "llm.aux" {
             self.cascade_clear_aux_subkeys().await;
         }
+        Ok(())
+    }
+
+    /// Reset `llm.base_url` to its default when the provider is about to
+    /// change. The caller does this before it writes the provider row: a
+    /// failure here leaves the old provider with its own endpoint, and a
+    /// failure of the provider write leaves the old provider with the
+    /// default endpoint. The opposite order can leave the new provider with
+    /// the endpoint of the old one.
+    ///
+    /// The endpoint override has precedence over the provider default for
+    /// every provider. If it stays after a change of provider, the requests
+    /// of the new provider, with the new API key, go to the host of the old
+    /// one. A failure is propagated, not logged: a stale endpoint is the
+    /// defect, so the caller must not report success.
+    ///
+    /// A flow that sets both must write the provider first, then the URL.
+    async fn clear_base_url_on_provider_change(
+        &self,
+        prior_provider: Option<&str>,
+        new_provider: &str,
+    ) -> Result<()> {
+        if !provider_changed(prior_provider, new_provider) {
+            return Ok(());
+        }
+        let stale = self.db.get_setting(BASE_URL_KEY).await?;
+        let Some(stale) = stale.filter(|url| !url.trim().is_empty()) else {
+            return Ok(());
+        };
+        let default_value = config_value_for_key(&Config::default(), BASE_URL_KEY)
+            .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {BASE_URL_KEY}"))?;
+        self.db
+            .set_setting(BASE_URL_KEY, &default_value)
+            .await
+            .with_context(|| {
+                format!("Failed to clear {BASE_URL_KEY}; the {PROVIDER_KEY} is not changed")
+            })?;
+        emit_settings_changed_if_relevant(BASE_URL_KEY, Some(&stale), Some(&default_value)).await;
+        tracing::info!(
+            from = prior_provider.unwrap_or_default(),
+            to = new_provider,
+            "settings: provider changed; cleared the endpoint override of the previous provider"
+        );
         Ok(())
     }
 
@@ -267,6 +345,22 @@ impl SettingsResolver {
                 );
             }
         }
+    }
+
+    /// Read the value that a write of `key` replaces.
+    ///
+    /// For the provider the value decides the endpoint cascade, so a read
+    /// failure is an error and the write does not start: with no prior
+    /// value the cascade cannot know that the provider changed, and the
+    /// endpoint of the old provider would stay. For all other keys the
+    /// value feeds the audit row only, and the write continues.
+    async fn read_prior(&self, key: &str) -> Result<Option<String>> {
+        if key == PROVIDER_KEY {
+            return self.db.get_setting(key).await.with_context(|| {
+                format!("Failed to read the current {PROVIDER_KEY}; the setting is not changed")
+            });
+        }
+        Ok(self.read_prior_for_audit(key).await)
     }
 
     /// Read the prior value of `key` for the `SETTINGS_CHANGED` audit row.
@@ -457,6 +551,233 @@ mod tests {
         let out = truncate_setting_value_for_audit(&long);
         assert!(out.ends_with("<truncated>"));
         assert!(out.len() < long.len());
+    }
+
+    const CUSTOM_URL: &str = "http://127.0.0.1:8080/v1/chat/completions";
+
+    async fn base_url_after(steps: &[(&str, Option<&str>)]) -> Option<String> {
+        let resolver = test_resolver().await;
+        for (key, value) in steps {
+            match value {
+                Some(value) => {
+                    resolver.set(key, value).await.unwrap();
+                }
+                None => resolver.unset(key).await.unwrap(),
+            }
+        }
+        resolver.resolve().await.unwrap().llm.base_url
+    }
+
+    #[tokio::test]
+    async fn a_provider_change_clears_the_endpoint_of_the_previous_provider() {
+        #[allow(clippy::type_complexity)]
+        let cases: &[(&str, &[(&str, Option<&str>)], Option<&str>)] = &[
+            (
+                "change to a different provider",
+                &[
+                    ("provider", Some("custom")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("provider", Some("anthropic")),
+                ],
+                None,
+            ),
+            (
+                "unset of the provider",
+                &[
+                    ("provider", Some("ollama")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("provider", None),
+                ],
+                None,
+            ),
+            (
+                "same provider again",
+                &[
+                    ("provider", Some("anthropic")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("provider", Some("anthropic")),
+                ],
+                Some(CUSTOM_URL),
+            ),
+            (
+                "same provider, different case and spaces",
+                &[
+                    ("provider", Some("custom")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("provider", Some(" Custom ")),
+                ],
+                Some(CUSTOM_URL),
+            ),
+            (
+                "first selection of a provider",
+                &[
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("provider", Some("custom")),
+                ],
+                Some(CUSTOM_URL),
+            ),
+            (
+                "provider first, then the endpoint",
+                &[
+                    ("provider", Some("openai")),
+                    ("provider", Some("custom")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                ],
+                Some(CUSTOM_URL),
+            ),
+            (
+                "a change of another setting",
+                &[
+                    ("provider", Some("custom")),
+                    ("llm.base_url", Some(CUSTOM_URL)),
+                    ("model", Some("other-model")),
+                ],
+                Some(CUSTOM_URL),
+            ),
+        ];
+        for (name, steps, expected) in cases {
+            assert_eq!(base_url_after(steps).await.as_deref(), *expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_of_the_prior_provider_stops_the_write() {
+        // A NULL in the provider row makes the read fail, while a write to
+        // the same row still succeeds. With a swallowed read error the
+        // provider changes and the endpoint of the old provider stays.
+        // The table of the schema refuses NULL, so the test makes a copy of
+        // the table that accepts it.
+        for unset in [false, true] {
+            let resolver = test_resolver().await;
+            resolver.set("provider", "custom").await.unwrap();
+            resolver.set("llm.base_url", CUSTOM_URL).await.unwrap();
+            resolver
+                .database()
+                .conn()
+                .execute_batch(
+                    "ALTER TABLE settings RENAME TO settings_strict;
+                     CREATE TABLE settings (
+                         key TEXT PRIMARY KEY,
+                         value TEXT,
+                         updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                     );
+                     INSERT INTO settings SELECT key, value, updated_at FROM settings_strict;
+                     UPDATE settings SET value = NULL WHERE key = 'provider';",
+                )
+                .await
+                .unwrap();
+
+            let err = if unset {
+                resolver.unset("provider").await.map(|()| String::new())
+            } else {
+                resolver.set("provider", "anthropic").await
+            }
+            .expect_err("the write must not report success");
+            assert!(
+                format!("{err:#}").contains("provider"),
+                "unset={unset}: {err:#}"
+            );
+
+            let mut rows = resolver
+                .database()
+                .conn()
+                .query(
+                    "SELECT typeof(value) FROM settings WHERE key = 'provider'",
+                    (),
+                )
+                .await
+                .unwrap();
+            let kind: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(
+                kind, "null",
+                "unset={unset}: the provider row must not change"
+            );
+            assert_eq!(
+                resolver
+                    .database()
+                    .get_setting("llm.base_url")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(CUSTOM_URL),
+                "unset={unset}: a refused write must not touch the endpoint"
+            );
+        }
+    }
+
+    /// Spec: no failure of one write leaves the new provider with the
+    /// endpoint of the old one. A trigger refuses each write of one row.
+    #[tokio::test]
+    async fn a_failed_write_never_leaves_the_new_provider_with_the_old_endpoint() {
+        for blocked_key in ["llm.base_url", "provider"] {
+            for unset in [false, true] {
+                let name = format!("blocked={blocked_key} unset={unset}");
+                let resolver = test_resolver().await;
+                resolver.set("provider", "custom").await.unwrap();
+                resolver.set("llm.base_url", CUSTOM_URL).await.unwrap();
+                resolver
+                    .database()
+                    .conn()
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER refuse_insert BEFORE INSERT ON settings
+                         WHEN NEW.key = '{blocked_key}'
+                         BEGIN SELECT RAISE(ABORT, 'write refused'); END;
+                         CREATE TRIGGER refuse_update BEFORE UPDATE ON settings
+                         WHEN NEW.key = '{blocked_key}'
+                         BEGIN SELECT RAISE(ABORT, 'write refused'); END;"
+                    ))
+                    .await
+                    .unwrap();
+
+                let result = if unset {
+                    resolver.unset("provider").await.map(|()| String::new())
+                } else {
+                    resolver.set("provider", "anthropic").await
+                };
+                assert!(result.is_err(), "{name}: the write must not report success");
+
+                let provider = resolver.database().get_setting("provider").await.unwrap();
+                let base_url = resolver
+                    .database()
+                    .get_setting("llm.base_url")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.as_deref(),
+                    Some("custom"),
+                    "{name}: the provider must not change when a write fails"
+                );
+                // The endpoint belongs to the provider that is stored, or it
+                // is the default.
+                let expected_url = if blocked_key == "llm.base_url" {
+                    CUSTOM_URL
+                } else {
+                    ""
+                };
+                assert_eq!(base_url.as_deref(), Some(expected_url), "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cleared_endpoint_row_holds_the_default_and_stays_in_the_table() {
+        // The settings table is the complete source of truth: the cascade
+        // writes the default, the same as `unset`.
+        let resolver = test_resolver().await;
+        resolver.set("provider", "custom").await.unwrap();
+        resolver.set("llm.base_url", CUSTOM_URL).await.unwrap();
+        resolver.set("provider", "openai").await.unwrap();
+        let (value, source) = resolver.get_with_source("llm.base_url").await.unwrap();
+        assert_eq!(value, "");
+        assert_eq!(source, SettingSource::Default);
+        assert_eq!(
+            resolver
+                .database()
+                .get_setting("llm.base_url")
+                .await
+                .unwrap(),
+            Some(String::new())
+        );
     }
 
     #[tokio::test]

@@ -281,45 +281,21 @@ pub async fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
 
 /// Restore `file` into `borg_home`. Refuses if `borg_home` already
 /// contains state and `force` is false. With `force = true`, renames the
-/// existing dir to `<borg_home>.bak.<unix_ts>` before extracting.
+/// existing dir to `<borg_home>.bak.<unix_ts>` — but only after the whole
+/// archive is extracted into a staging directory, so a failed extraction
+/// leaves the live directory untouched.
 pub async fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> {
     let report = verify_backup(file).await?;
-    if borg_home.exists() && has_existing_state(borg_home)? {
-        if !force {
-            bail!(
-                "{} contains existing state — pass --force to rename it to .bak.<ts>",
-                borg_home.display()
-            );
-        }
-        let stamp = chrono::Utc::now().timestamp();
-        let bak = borg_home.with_file_name(format!(
-            "{}.bak.{stamp}",
-            borg_home
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("borg")
-        ));
-        fs::rename(borg_home, &bak).with_context(|| {
-            format!(
-                "force-restore: failed to rename {} → {}",
-                borg_home.display(),
-                bak.display()
-            )
-        })?;
-    }
-    fs::create_dir_all(borg_home)
-        .with_context(|| format!("restore: create {}", borg_home.display()))?;
-
-    let tmp = tempfile::tempdir().context("restore: tempdir")?;
-    let (_, body_tar) = extract_outer(file, tmp.path())?;
-    let f = fs::File::open(&body_tar).context("restore: open body.tar")?;
-    let mut archive = tar::Archive::new(BufReader::new(f));
-    harden_archive(&mut archive);
-    archive
-        .unpack(tmp.path())
-        .context("restore: extract body.tar")?;
-    let staged = tmp.path().join("borg_home");
-    move_dir_contents(&staged, borg_home)?;
+    restore_staged(borg_home, force, |staging| {
+        let (_, body_tar) = extract_outer(file, staging)?;
+        let f = fs::File::open(&body_tar).context("restore: open body.tar")?;
+        let mut archive = tar::Archive::new(BufReader::new(f));
+        harden_archive(&mut archive);
+        archive
+            .unpack(staging)
+            .context("restore: extract body.tar")?;
+        Ok(staging.join("borg_home"))
+    })?;
 
     // Open the restored DB and append a `state_restored` event so the
     // audit chain captures the cutover. Best-effort — if the restore is
@@ -354,6 +330,114 @@ pub async fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Resul
 }
 
 // ── helpers ──
+
+/// The filesystem half of a restore. `stage` fills the staging directory and
+/// returns the path of the staged home inside it.
+///
+/// Order is the contract: nothing in `borg_home` changes until `stage` has
+/// returned `Ok`. The staging directory is a sibling of `borg_home`, so the
+/// final move is a rename on one filesystem.
+fn restore_staged(
+    borg_home: &Path,
+    force: bool,
+    stage: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<()> {
+    let has_state = borg_home.exists() && has_existing_state(borg_home)?;
+    if has_state && !force {
+        bail!(
+            "{} contains existing state — pass --force to rename it to .bak.<ts>",
+            borg_home.display()
+        );
+    }
+
+    let parent = match borg_home.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).with_context(|| format!("restore: create {}", parent.display()))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".borg-restore-")
+        .tempdir_in(parent)
+        .with_context(|| format!("restore: create staging dir in {}", parent.display()))?;
+    let staged_home = stage(staging.path()).with_context(|| {
+        format!(
+            "restore stopped before any change to {}",
+            borg_home.display()
+        )
+    })?;
+
+    let bak = if has_state {
+        let stamp = chrono::Utc::now().timestamp();
+        let bak = borg_home.with_file_name(format!(
+            "{}.bak.{stamp}",
+            borg_home
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("borg")
+        ));
+        fs::rename(borg_home, &bak).with_context(|| {
+            format!(
+                "force-restore: failed to rename {} → {}",
+                borg_home.display(),
+                bak.display()
+            )
+        })?;
+        Some(bak)
+    } else {
+        None
+    };
+
+    let Err(install_err) = install_staged_home(&staged_home, borg_home) else {
+        return Ok(());
+    };
+    let Some(bak) = bak else {
+        return Err(install_err);
+    };
+    match put_back_original(&bak, borg_home) {
+        Ok(()) => Err(install_err.context(format!(
+            "restore failed; the original state was put back at {}",
+            borg_home.display()
+        ))),
+        Err(rollback_err) => Err(install_err.context(format!(
+            "restore failed and the original state could not be put back \
+             ({rollback_err:#}); it is kept at {}",
+            bak.display()
+        ))),
+    }
+}
+
+/// Move the staged home into place. A plain rename when `borg_home` is
+/// absent; else (or when the rename fails) a per-entry move into it.
+fn install_staged_home(staged_home: &Path, borg_home: &Path) -> Result<()> {
+    if !staged_home.is_dir() {
+        bail!(
+            "restore: the archive has no borg_home directory ({})",
+            staged_home.display()
+        );
+    }
+    if !borg_home.exists() {
+        match fs::rename(staged_home, borg_home) {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::debug!(
+                "restore: rename of the staged home failed ({e}); moving entries one by one"
+            ),
+        }
+    }
+    fs::create_dir_all(borg_home)
+        .with_context(|| format!("restore: create {}", borg_home.display()))?;
+    move_dir_contents(staged_home, borg_home)
+}
+
+/// Undo a failed install: remove the partly filled `borg_home` and rename the
+/// `.bak` directory back.
+fn put_back_original(bak: &Path, borg_home: &Path) -> Result<()> {
+    if borg_home.exists() {
+        fs::remove_dir_all(borg_home)
+            .with_context(|| format!("remove partial {}", borg_home.display()))?;
+    }
+    fs::rename(bak, borg_home)
+        .with_context(|| format!("rename {} → {}", bak.display(), borg_home.display()))
+}
 
 /// Produce a consistent point-in-time copy of the SQLite database at
 /// `db_path` into `work_dir`, using `VACUUM INTO` over a live connection.
@@ -552,7 +636,8 @@ fn move_dir_contents(src: &Path, dst: &Path) -> Result<()> {
         let from = ent.path();
         let to = dst.join(ent.file_name());
         if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent).ok();
+            fs::create_dir_all(parent)
+                .with_context(|| format!("restore: create {}", parent.display()))?;
         }
         if let Err(e) = fs::rename(&from, &to) {
             // Cross-device rename — fall back to copy.
@@ -841,6 +926,131 @@ mod tests {
 
         let restored = fs::read(home.join("hooks.json")).unwrap();
         assert_eq!(restored, b"{}");
+    }
+
+    /// Every file under `root` with its content, for before/after comparison.
+    fn tree_contents(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out: Vec<(PathBuf, Vec<u8>)> = walk_dir(root)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.is_file())
+            .map(|p| {
+                (
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(&p).unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn sibling_names(home: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(home.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn failed_extraction_leaves_the_live_home_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        populate_borg_home(&home);
+        fs::write(home.join("borg.db"), b"live database bytes").unwrap();
+        let before = tree_contents(&home);
+        assert!(!before.is_empty());
+
+        let err = restore_staged(&home, true, |staging| {
+            // A half-written staging tree, then the failure.
+            fs::create_dir_all(staging.join("borg_home")).unwrap();
+            fs::write(staging.join("borg_home/borg.db"), b"partial").unwrap();
+            Err(anyhow!("unexpected end of archive member"))
+        })
+        .expect_err("a failed extraction must fail the restore");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unexpected end of archive member"), "{msg}");
+        assert!(msg.contains("before any change"), "{msg}");
+        assert_eq!(tree_contents(&home), before, "live home must be unchanged");
+        assert_eq!(
+            sibling_names(&home),
+            vec!["borg_home".to_string()],
+            "no .bak and no staging directory may remain"
+        );
+    }
+
+    #[test]
+    fn failed_install_puts_the_original_home_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        populate_borg_home(&home);
+        fs::write(home.join("borg.db"), b"live database bytes").unwrap();
+        let before = tree_contents(&home);
+
+        // Staging reports success but the staged home is not there, so the
+        // failure occurs after the live home was moved aside.
+        let err = restore_staged(&home, true, |staging| Ok(staging.join("borg_home")))
+            .expect_err("a missing staged home must fail the restore");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("original state was put back"), "{msg}");
+        assert_eq!(tree_contents(&home), before);
+        assert_eq!(sibling_names(&home), vec!["borg_home".to_string()]);
+    }
+
+    #[test]
+    fn staged_restore_replaces_the_home_and_keeps_one_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        populate_borg_home(&home);
+        fs::write(home.join("borg.db"), b"old").unwrap();
+        let before = tree_contents(&home);
+
+        restore_staged(&home, true, |staging| {
+            let staged = staging.join("borg_home");
+            fs::create_dir_all(staged.join("skills")).unwrap();
+            fs::write(staged.join("borg.db"), b"new").unwrap();
+            Ok(staged)
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(home.join("borg.db")).unwrap(), b"new");
+        assert!(
+            !home.join("hooks.json").exists(),
+            "old entries must not leak into the restored home"
+        );
+        let names = sibling_names(&home);
+        let baks: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("borg_home.bak."))
+            .collect();
+        assert_eq!(baks.len(), 1, "siblings: {names:?}");
+        assert_eq!(names.len(), 2, "staging dir must be gone: {names:?}");
+        assert_eq!(tree_contents(&tmp.path().join(baks[0])), before);
+    }
+
+    #[test]
+    fn restore_into_a_home_without_state_merges_and_makes_no_bak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("borg_home");
+        fs::create_dir_all(home.join("logs")).unwrap();
+        fs::write(home.join("logs/daemon.log"), b"log").unwrap();
+
+        restore_staged(&home, false, |staging| {
+            let staged = staging.join("borg_home");
+            fs::create_dir_all(&staged).unwrap();
+            fs::write(staged.join("borg.db"), b"new").unwrap();
+            Ok(staged)
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(home.join("borg.db")).unwrap(), b"new");
+        assert_eq!(fs::read(home.join("logs/daemon.log")).unwrap(), b"log");
+        assert_eq!(sibling_names(&home), vec!["borg_home".to_string()]);
     }
 
     #[tokio::test]

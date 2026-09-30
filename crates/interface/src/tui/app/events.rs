@@ -122,6 +122,7 @@ impl<'a> App<'a> {
             // Liveness marker for the sub-agent stall watchdog — nothing to
             // render. The spinner already covers "a request is in flight".
             AgentEvent::LlmAttemptStarted { .. } => {}
+            AgentEvent::TextRetracted { bytes } => self.handle_event_text_retracted(bytes),
             AgentEvent::LlmReconnecting { delay_secs, .. } => {
                 self.handle_event_llm_reconnecting(delay_secs)
             }
@@ -200,6 +201,24 @@ impl<'a> App<'a> {
         if self.stream_status.header != "Responding" {
             self.stream_status.set_header("Responding");
             self.stream_status.set_details(None);
+        }
+    }
+
+    /// The attempt that streamed this text failed and the full response
+    /// comes again. Remove the streamed partial from the assistant cell that
+    /// is in progress. A cell that is in the terminal scrollback already
+    /// cannot change.
+    fn handle_event_text_retracted(&mut self, bytes: usize) {
+        let last = self.cells.len().saturating_sub(1);
+        if last < self.cells_emitted {
+            return;
+        }
+        let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() else {
+            return;
+        };
+        cortex::agent::retract_text_tail(text, bytes);
+        if text.is_empty() {
+            self.cells.pop();
         }
     }
 

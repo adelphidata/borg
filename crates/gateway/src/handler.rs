@@ -653,6 +653,16 @@ async fn collect_agent_response(
                             }
                         }
                     }
+                    // The attempt that sent this text failed and the full
+                    // response comes again. The channel gets one message at
+                    // the end of the turn, so the message holds the text of
+                    // the attempt that completes. After the size cap the
+                    // tail is the cap notice, not the deltas, and it stays.
+                    AgentEvent::TextRetracted { bytes } => {
+                        if !response_capped {
+                            cortex::agent::retract_text_tail(&mut response_text, bytes);
+                        }
+                    }
                     AgentEvent::Error(e) => {
                         warn!("Agent error on channel '{}': {e}", channel_name);
                         let friendly = cortex::error_format::format_error_with_context(
@@ -2021,6 +2031,69 @@ mod tests {
         cfg.gateway.inactivity_notify_secs = notify_secs;
         cfg.gateway.request_timeout_ms = wall_clock_ms;
         cfg
+    }
+
+    /// Spec: the channel message is the text of the attempt that completes.
+    /// Text of an earlier tool iteration stays.
+    #[tokio::test]
+    async fn collect_drops_the_text_of_a_failed_attempt() {
+        // (name, events, response)
+        let cases: Vec<(&str, Vec<AgentEvent>, &str)> = vec![
+            (
+                "retry after partial output",
+                vec![
+                    AgentEvent::LlmAttemptStarted { attempt: 0 },
+                    AgentEvent::TextDelta("The answer is fo".to_string()),
+                    AgentEvent::TextRetracted { bytes: 16 },
+                    AgentEvent::LlmAttemptStarted { attempt: 1 },
+                    AgentEvent::TextDelta("The answer is ".to_string()),
+                    AgentEvent::TextDelta("forty-two.".to_string()),
+                ],
+                "The answer is forty-two.",
+            ),
+            (
+                "multi-byte text",
+                vec![
+                    AgentEvent::TextDelta("Gr\u{fc}\u{df}e, \u{1f600} hal".to_string()),
+                    AgentEvent::TextRetracted { bytes: 17 },
+                    AgentEvent::TextDelta("Gr\u{fc}\u{df}e, \u{1f600} hallo.".to_string()),
+                ],
+                "Gr\u{fc}\u{df}e, \u{1f600} hallo.",
+            ),
+            (
+                "text of an earlier iteration stays",
+                vec![
+                    AgentEvent::LlmAttemptStarted { attempt: 0 },
+                    AgentEvent::TextDelta("I will check. ".to_string()),
+                    AgentEvent::LlmAttemptStarted { attempt: 0 },
+                    AgentEvent::TextDelta("It is fo".to_string()),
+                    AgentEvent::TextRetracted { bytes: 8 },
+                    AgentEvent::LlmAttemptStarted { attempt: 1 },
+                    AgentEvent::TextDelta("It is forty-two.".to_string()),
+                ],
+                "I will check. It is forty-two.",
+            ),
+            (
+                "a retraction larger than the text",
+                vec![
+                    AgentEvent::TextDelta("abc".to_string()),
+                    AgentEvent::TextRetracted { bytes: 4000 },
+                    AgentEvent::TextDelta("done".to_string()),
+                ],
+                "done",
+            ),
+        ];
+        for (name, events, want) in cases {
+            let config = Config::default();
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+            for event in events {
+                tx.send(event).await.unwrap();
+            }
+            drop(tx);
+            let cancel = CancellationToken::new();
+            let result = collect_agent_response("test", &config, &mut rx, &cancel, None).await;
+            assert_eq!(result, want, "{name}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -16,10 +16,19 @@ pub(super) async fn list_scheduled_tasks(
     }))
 }
 
+/// Refuse a zone the scheduler cannot resolve. Without this gate the row is
+/// stored and the schedule silently evaluates in UTC. The status message is
+/// the validator's text: it names the bad value and the accepted forms.
+#[allow(clippy::result_large_err)]
+fn validate_timezone_arg(timezone: &str) -> Result<(), TStatus> {
+    cortex::tasks::validate_timezone(timezone).map_err(|e| TStatus::invalid_argument(e.to_string()))
+}
+
 pub(super) async fn create_scheduled_task(
     req: Request<ScheduledTaskCreate>,
 ) -> Result<Response<ScheduledTask>, TStatus> {
     let req = req.into_inner();
+    validate_timezone_arg(&req.timezone)?;
     let id = uuid::Uuid::new_v4().to_string();
     let id_for_lookup = id.clone();
     let inserted = async {
@@ -99,6 +108,8 @@ pub(super) async fn update_scheduled_task(
     req: Request<ScheduledTaskUpdate>,
 ) -> Result<Response<ScheduledTask>, TStatus> {
     let req = req.into_inner();
+    // An empty zone means "leave unchanged" here, and the validator accepts it.
+    validate_timezone_arg(&req.timezone)?;
     let id_for_lookup = req.id.clone();
     let updated = async {
         use cortex::db::UpdateTask;

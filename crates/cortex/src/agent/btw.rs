@@ -105,36 +105,11 @@ pub async fn run_btw(
             .await
     });
 
-    let mut buf = String::new();
-    let mut saw_tool_call = false;
-    let mut stream_error: Option<String> = None;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            StreamEvent::TextDelta(delta) => buf.push_str(&delta),
-            StreamEvent::ToolCallDelta { .. } => {
-                // We passed `tools=None`; a provider that still emits a tool
-                // call is misbehaving. Drop it and note it so the caller can
-                // surface a clearer error than "empty answer".
-                saw_tool_call = true;
-            }
-            StreamEvent::Error(msg) => {
-                stream_error = Some(msg);
-            }
-            StreamEvent::Done => break,
-            // Failover identity only matters for the conversational
-            // <environment> section; this one-shot helper has none to sync.
-            // AttemptStarted is a liveness marker for the sub-agent stall
-            // watchdog, which this one-shot path does not run under.
-            StreamEvent::ThinkingDelta(_)
-            | StreamEvent::Usage(_)
-            | StreamEvent::Truncated
-            | StreamEvent::ToolIntent
-            | StreamEvent::AttemptStarted { .. }
-            | StreamEvent::Reconnecting { .. }
-            | StreamEvent::Failover { .. } => {}
-        }
-    }
+    let BtwStream {
+        text: buf,
+        saw_tool_call,
+        error: mut stream_error,
+    } = collect_btw_stream(&mut rx).await;
 
     // Surface any error the client raised after the stream task returned.
     // We await the handle so a panic in the stream task doesn't silently hang.
@@ -170,6 +145,58 @@ pub async fn run_btw(
     Ok(buf)
 }
 
+/// What one `/btw` stream produced.
+struct BtwStream {
+    text: String,
+    saw_tool_call: bool,
+    error: Option<String>,
+}
+
+/// Collect the stream of a `/btw` request into the output of the attempt
+/// that completes.
+async fn collect_btw_stream(rx: &mut mpsc::Receiver<StreamEvent>) -> BtwStream {
+    let mut text = String::new();
+    let mut saw_tool_call = false;
+    let mut error: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::TextDelta(delta) => text.push_str(&delta),
+            StreamEvent::ToolCallDelta { .. } => {
+                // We passed `tools=None`; a provider that still emits a tool
+                // call is misbehaving. Drop it and note it so the caller can
+                // surface a clearer error than "empty answer".
+                saw_tool_call = true;
+            }
+            StreamEvent::Error(msg) => {
+                error = Some(msg);
+            }
+            StreamEvent::Done => break,
+            // Each attempt sends the full answer again. The output of a
+            // failed attempt (a retry, or the attempt before a failover)
+            // must not stay in front of the answer of the attempt that
+            // completes.
+            StreamEvent::AttemptStarted { .. } => {
+                text.clear();
+                saw_tool_call = false;
+            }
+            // Failover identity only matters for the conversational
+            // <environment> section; this one-shot helper has none to sync.
+            StreamEvent::ThinkingDelta(_)
+            | StreamEvent::Usage(_)
+            | StreamEvent::Truncated
+            | StreamEvent::ToolIntent
+            | StreamEvent::Reconnecting { .. }
+            | StreamEvent::Failover { .. } => {}
+        }
+    }
+    BtwStream {
+        text,
+        saw_tool_call,
+        error,
+    }
+}
+
 /// Parse a `/btw` slash-command from a raw message body.
 ///
 /// Matches `/btw`, `/btw:`, `/btw <question>`, `/btw: <question>` (case-insensitive,
@@ -196,6 +223,67 @@ pub fn parse_btw_command(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn collect(events: Vec<StreamEvent>) -> BtwStream {
+        let (tx, mut rx) = mpsc::channel(64);
+        for event in events {
+            tx.send(event).await.expect("send");
+        }
+        drop(tx);
+        collect_btw_stream(&mut rx).await
+    }
+
+    /// Spec: the answer is the output of the attempt that completes. A
+    /// failed attempt leaves no text and no tool-call flag behind.
+    #[tokio::test]
+    async fn a_retry_after_partial_output_keeps_only_the_final_attempt() {
+        let delta = |text: &str| StreamEvent::TextDelta(text.to_string());
+        let stream = collect(vec![
+            StreamEvent::AttemptStarted { attempt: 0 },
+            delta("The answer is fo"),
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: "{".to_string(),
+            },
+            StreamEvent::Reconnecting {
+                attempt: 0,
+                delay_secs: 1,
+            },
+            StreamEvent::AttemptStarted { attempt: 1 },
+            delta("The answer is "),
+            delta("forty-two."),
+            StreamEvent::Done,
+        ])
+        .await;
+        assert_eq!(stream.text, "The answer is forty-two.");
+        assert!(
+            !stream.saw_tool_call,
+            "the tool call belongs to the failed attempt"
+        );
+        assert!(stream.error.is_none());
+    }
+
+    /// Spec: a tool call in the attempt that completes is still reported.
+    #[tokio::test]
+    async fn a_tool_call_in_the_final_attempt_is_reported() {
+        let stream = collect(vec![
+            StreamEvent::AttemptStarted { attempt: 0 },
+            StreamEvent::TextDelta("partial".to_string()),
+            StreamEvent::AttemptStarted { attempt: 1 },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_string()),
+                name: Some("read_file".to_string()),
+                arguments_delta: "{}".to_string(),
+            },
+            StreamEvent::Done,
+        ])
+        .await;
+        assert_eq!(stream.text, "");
+        assert!(stream.saw_tool_call);
+    }
 
     #[test]
     fn parse_btw_positive_cases() {

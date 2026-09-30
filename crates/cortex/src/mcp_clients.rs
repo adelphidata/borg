@@ -2816,6 +2816,95 @@ async fn drain_peer_side_traffic(
     }
 }
 
+/// Result of one idle liveness probe.
+#[derive(Debug, PartialEq, Eq)]
+enum Liveness {
+    /// The peer answered. An error reply is an answer too.
+    Alive,
+    /// The peer is silent or its transport is closed.
+    Dead {
+        /// Matches `McpError::kind()`, for the audit row.
+        error_kind: &'static str,
+    },
+}
+
+/// Silence (timeout) or a closed transport. Each other error is a reply, and
+/// a reply proves that the peer is alive.
+fn is_unanswered(e: &mcp::errors::McpError) -> bool {
+    matches!(
+        e,
+        mcp::errors::McpError::Timeout { .. } | mcp::errors::McpError::TransportClosed(_)
+    )
+}
+
+/// Probe an idle session.
+///
+/// Some servers do not implement `ping` and drop it with no reply. For such
+/// a server a `ping` timeout says nothing about its health, and a teardown
+/// removes its tools until the operator reloads. So a `ping` timeout is
+/// confirmed with one `tools/list`, a request that each server implements.
+/// A wedged server fails that request too, so the watchdog keeps its purpose.
+///
+/// When the confirmation succeeds, `ping_unsupported` is set and later probes
+/// use `tools/list` directly. Each idle window then costs one round trip,
+/// not a full `ping` timeout first.
+///
+/// The probe result is not registered. `tools/list_changed` owns registration.
+async fn probe_liveness(
+    session: &mut SessionActor,
+    server_name: &str,
+    ping_unsupported: &mut bool,
+) -> Liveness {
+    let ping_failure = if *ping_unsupported {
+        None
+    } else {
+        match session.ping().await {
+            Ok(()) => return Liveness::Alive,
+            // A closed transport is final. There is nothing to confirm.
+            Err(e @ mcp::errors::McpError::TransportClosed(_)) => {
+                return Liveness::Dead {
+                    error_kind: e.kind(),
+                }
+            }
+            Err(e @ mcp::errors::McpError::Timeout { .. }) => Some(e),
+            Err(e) => {
+                tracing::debug!(
+                    server = %server_name,
+                    error = %e,
+                    "MCP liveness ping got an error reply (peer alive)",
+                );
+                return Liveness::Alive;
+            }
+        }
+    };
+
+    match session.list_tools().await {
+        Ok(_) => {
+            if ping_failure.is_some() {
+                *ping_unsupported = true;
+                tracing::info!(
+                    server = %server_name,
+                    "MCP server does not answer ping but answers tools/list; \
+                     idle liveness probes use tools/list for this session",
+                );
+            }
+            Liveness::Alive
+        }
+        Err(e) if is_unanswered(&e) => Liveness::Dead {
+            // The failure that started the teardown is the `ping` failure.
+            error_kind: ping_failure.as_ref().unwrap_or(&e).kind(),
+        },
+        Err(e) => {
+            tracing::debug!(
+                server = %server_name,
+                error = %e,
+                "MCP liveness tools/list got an error reply (peer alive)",
+            );
+            Liveness::Alive
+        }
+    }
+}
+
 async fn run_session_task(
     mut session: SessionActor,
     server_name: String,
@@ -2824,6 +2913,7 @@ async fn run_session_task(
     filter: mcp::manifest::ToolFilter,
     builtin: Vec<String>,
 ) {
+    let mut ping_unsupported = false;
     loop {
         let idle =
             Duration::from_millis(IDLE_PING_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed));
@@ -2833,33 +2923,22 @@ async fn run_session_task(
             Ok(None) => break,
             // No traffic for a full idle window: probe liveness. Any reply —
             // even an error from a server that never implemented `ping` —
-            // proves the peer is alive; only silence (timeout) or a closed
-            // transport is death.
+            // proves the peer is alive; only silence (timeout) on both
+            // probes, or a closed transport, is death.
             Err(_idle_elapsed) => {
-                match session.ping().await {
-                    Ok(()) => {}
-                    Err(
-                        e @ (mcp::errors::McpError::Timeout { .. }
-                        | mcp::errors::McpError::TransportClosed(_)),
-                    ) => {
-                        teardown_dead_session(
-                            &server_name,
-                            &registry,
-                            "idle liveness ping went unanswered",
-                            e.kind(),
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            server = %server_name,
-                            error = %e,
-                            "MCP liveness ping got an error reply (peer alive)",
-                        );
-                    }
+                if let Liveness::Dead { error_kind } =
+                    probe_liveness(&mut session, &server_name, &mut ping_unsupported).await
+                {
+                    teardown_dead_session(
+                        &server_name,
+                        &registry,
+                        "idle liveness ping went unanswered",
+                        error_kind,
+                    )
+                    .await;
+                    break;
                 }
-                // The ping is a full round-trip, so the peer may have pushed
+                // The probe is a full round-trip, so the peer may have pushed
                 // notifications or server-initiated requests at us during it.
                 drain_peer_side_traffic(&mut session, &server_name, &registry, &filter, &builtin)
                     .await;
@@ -3142,6 +3221,218 @@ mod tests {
             "trust=\"untrusted\" attribute missing — every MCP tool result \
              must declare itself untrusted to the prompt assembler"
         );
+    }
+
+    mod liveness {
+        use super::*;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        /// A server that answers only the methods in `answers`. Each other
+        /// request gets no reply at all: `recv` waits with no end, which is
+        /// how a server that drops a request looks from the client side.
+        struct SelectiveServer {
+            answers: &'static [&'static str],
+            closed: bool,
+            seen: Arc<StdMutex<Vec<String>>>,
+            replies: VecDeque<mcp::protocol::Message>,
+        }
+
+        #[async_trait::async_trait]
+        impl Transport for SelectiveServer {
+            async fn send(&mut self, msg: serde_json::Value) -> mcp::errors::Result<()> {
+                if self.closed {
+                    return Err(mcp::McpError::TransportClosed("peer is gone".into()));
+                }
+                let method = msg["method"].as_str().unwrap_or_default().to_string();
+                if self.answers.contains(&method.as_str()) {
+                    self.replies.push_back(mcp::protocol::Message {
+                        jsonrpc: Some("2.0".into()),
+                        id: msg["id"].as_u64(),
+                        method: None,
+                        result: Some(serde_json::json!({"tools": []})),
+                        error: None,
+                        params: None,
+                    });
+                }
+                self.seen.lock().unwrap().push(method);
+                Ok(())
+            }
+
+            async fn recv(&mut self) -> mcp::errors::Result<Option<mcp::protocol::Message>> {
+                match self.replies.pop_front() {
+                    Some(m) => Ok(Some(m)),
+                    None => std::future::pending().await,
+                }
+            }
+
+            async fn close(&mut self) -> mcp::errors::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// The 50 ms call timeout is how long an unanswered probe takes.
+        fn manifest() -> ServerManifest {
+            ServerManifest {
+                name: "srv".into(),
+                transport: mcp::Transport::Stdio {
+                    command: "unused".into(),
+                    args: vec![],
+                    env: Default::default(),
+                },
+                connect_timeout: Duration::from_millis(50),
+                call_timeout: Duration::from_millis(50),
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: Default::default(),
+            }
+        }
+
+        /// Run `probes` idle probes against the server and return the result
+        /// of each probe and the requests that the server received.
+        async fn run_probes(
+            answers: &'static [&'static str],
+            closed: bool,
+            probes: usize,
+        ) -> (Vec<Liveness>, Vec<String>) {
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let mut session = SessionActor::new(
+                &manifest(),
+                Box::new(SelectiveServer {
+                    answers,
+                    closed,
+                    seen: seen.clone(),
+                    replies: VecDeque::new(),
+                }),
+            );
+            let mut ping_unsupported = false;
+            let mut results = Vec::new();
+            for _ in 0..probes {
+                results.push(probe_liveness(&mut session, "srv", &mut ping_unsupported).await);
+            }
+            // Requests only. The session also sends `notifications/cancelled`
+            // for a request that timed out.
+            let requests = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| !m.starts_with("notifications/"))
+                .cloned()
+                .collect();
+            (results, requests)
+        }
+
+        const DEAD_BY_TIMEOUT: Liveness = Liveness::Dead {
+            error_kind: "timeout",
+        };
+
+        #[tokio::test]
+        async fn idle_probe_confirms_a_ping_timeout_before_teardown() {
+            // (name, methods the server answers, transport closed, probes,
+            //  expected results, expected requests)
+            type Case = (
+                &'static str,
+                &'static [&'static str],
+                bool,
+                usize,
+                Vec<Liveness>,
+                Vec<&'static str>,
+            );
+            let cases: Vec<Case> = vec![
+                (
+                    // A healthy server that drops `ping` keeps its session
+                    // through two idle windows. It gets one `ping` in total:
+                    // the second window goes to `tools/list` directly.
+                    "ping dropped, tools/list answered",
+                    &["tools/list"],
+                    false,
+                    2,
+                    vec![Liveness::Alive, Liveness::Alive],
+                    vec!["ping", "tools/list", "tools/list"],
+                ),
+                (
+                    // A wedged server fails the two probes. The audit kind
+                    // is that of the `ping` failure.
+                    "silent on both",
+                    &[],
+                    false,
+                    1,
+                    vec![DEAD_BY_TIMEOUT],
+                    vec!["ping", "tools/list"],
+                ),
+                (
+                    // A server that answers `ping` never gets the fallback.
+                    "ping answered",
+                    &["ping", "tools/list"],
+                    false,
+                    2,
+                    vec![Liveness::Alive, Liveness::Alive],
+                    vec!["ping", "ping"],
+                ),
+                (
+                    // A closed transport is death at once, with no
+                    // confirmation request.
+                    "transport closed",
+                    &[],
+                    true,
+                    1,
+                    vec![Liveness::Dead {
+                        error_kind: "transport_closed",
+                    }],
+                    vec![],
+                ),
+            ];
+            for (name, answers, closed, probes, expected, expected_requests) in cases {
+                let (results, requests) = run_probes(answers, closed, probes).await;
+                assert_eq!(results, expected, "case: {name}");
+                assert_eq!(requests, expected_requests, "case: {name}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_server_that_stops_answering_the_fallback_probe_is_dead() {
+            // The `tools/list` probe must keep the watchdog's purpose. The
+            // server answers one `tools/list` (the confirmation) and then
+            // wedges; the next idle probe must report death.
+            struct WedgesAfterOne(SelectiveServer, usize);
+
+            #[async_trait::async_trait]
+            impl Transport for WedgesAfterOne {
+                async fn send(&mut self, msg: serde_json::Value) -> mcp::errors::Result<()> {
+                    if msg["method"] == "tools/list" {
+                        self.1 += 1;
+                        if self.1 > 1 {
+                            self.0.answers = &[];
+                        }
+                    }
+                    self.0.send(msg).await
+                }
+                async fn recv(&mut self) -> mcp::errors::Result<Option<mcp::protocol::Message>> {
+                    self.0.recv().await
+                }
+                async fn close(&mut self) -> mcp::errors::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let server = SelectiveServer {
+                answers: &["tools/list"],
+                closed: false,
+                seen: Arc::new(StdMutex::new(Vec::new())),
+                replies: VecDeque::new(),
+            };
+            let mut session = SessionActor::new(&manifest(), Box::new(WedgesAfterOne(server, 0)));
+            let mut ping_unsupported = false;
+            assert_eq!(
+                probe_liveness(&mut session, "srv", &mut ping_unsupported).await,
+                Liveness::Alive
+            );
+            assert!(ping_unsupported);
+            assert_eq!(
+                probe_liveness(&mut session, "srv", &mut ping_unsupported).await,
+                DEAD_BY_TIMEOUT
+            );
+        }
     }
 
     mod start_registry {

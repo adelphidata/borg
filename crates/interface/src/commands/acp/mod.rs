@@ -979,6 +979,182 @@ mod tests {
         assert!(streams.update_for(&other, "s").is_some());
     }
 
+    fn executing(id: &str) -> AgentEvent {
+        AgentEvent::ToolExecuting {
+            tool_call_id: id.into(),
+            name: "run_shell".into(),
+            args: "{}".into(),
+        }
+    }
+
+    fn tool_result(id: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            tool_call_id: id.into(),
+            name: "run_shell".into(),
+            result: "done".into(),
+        }
+    }
+
+    #[test]
+    fn drain_open_closes_each_call_that_has_no_result() {
+        let mut streams = ToolCallStreams::default();
+        for event in [executing("c1"), executing("c2"), executing("c3")] {
+            streams.update_for(&event, "s").expect("tool_call frame");
+        }
+        let streamed = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c3".into(),
+            name: "run_shell".into(),
+            delta: "partial output".into(),
+            is_stderr: false,
+        };
+        streams.update_for(&streamed, "s").expect("delta frame");
+        streams.update_for(&tool_result("c2"), "s").expect("result");
+
+        let frames = streams.drain_open("s");
+
+        assert_eq!(
+            frames,
+            vec![
+                json!({"sessionId": "s", "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "c1",
+                    "status": "failed",
+                }}),
+                json!({"sessionId": "s", "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "c3",
+                    "status": "failed",
+                }}),
+            ],
+            "one failed frame per open call, in start order, with no content key"
+        );
+        assert!(
+            streams.drain_open("s").is_empty(),
+            "a second drain has nothing left to close"
+        );
+
+        // A reader that outlives the turn must not open a closed card again.
+        let late = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            delta: "stray".into(),
+            is_stderr: false,
+        };
+        assert!(streams.update_for(&late, "s").is_none());
+    }
+
+    /// Run one prompt against the fake daemon and return the frames that
+    /// belong to it: the `tool_call*` updates and the prompt response.
+    async fn tool_frames_for_turn(daemon: FakeDaemon, events: Vec<AgentEvent>) -> Vec<Value> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy();
+        daemon.events.lock().await.insert("sess-1".into(), events);
+        let input = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{{\"sessionId\":\"sess-1\",\"prompt\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n"
+            ),
+            cwd
+        );
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            daemon,
+            BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines: Vec<Value> = String::from_utf8(output.lock().unwrap().clone())
+            .expect("utf8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        lines
+            .into_iter()
+            .filter(|line| {
+                line["id"] == json!(2)
+                    || line["params"]["update"]["sessionUpdate"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("tool_call"))
+            })
+            .collect()
+    }
+
+    /// (id and status of each tool frame in order, the prompt response)
+    fn statuses_and_response(frames: &[Value]) -> (Vec<(String, String)>, Value) {
+        let (response, updates): (Vec<&Value>, Vec<&Value>) =
+            frames.iter().partition(|frame| frame["id"] == json!(2));
+        assert_eq!(response.len(), 1, "one prompt response: {frames:?}");
+        assert_eq!(
+            frames.last(),
+            Some(response[0]),
+            "the response must come after every tool frame: {frames:?}"
+        );
+        let statuses = updates
+            .iter()
+            .map(|frame| {
+                let update = &frame["params"]["update"];
+                (
+                    update["toolCallId"].as_str().unwrap_or("").to_string(),
+                    update["status"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        (statuses, response[0].clone())
+    }
+
+    fn pair(id: &str, status: &str) -> (String, String) {
+        (id.to_string(), status.to_string())
+    }
+
+    #[tokio::test]
+    async fn open_tool_calls_get_a_terminal_status_for_every_way_a_turn_ends() {
+        // (name, turn events, expected tool frames, check on the response)
+        type ResponseCheck = fn(&Value) -> bool;
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Vec<AgentEvent>, Vec<(String, String)>, ResponseCheck)> = vec![
+            (
+                "cancel",
+                vec![executing("c1"), AgentEvent::Error("cancelled".into())],
+                vec![pair("c1", "in_progress"), pair("c1", "failed")],
+                |r| r["result"]["stopReason"] == json!("cancelled"),
+            ),
+            (
+                "turn error",
+                vec![
+                    executing("c1"),
+                    executing("c2"),
+                    AgentEvent::Error("boom".into()),
+                ],
+                vec![
+                    pair("c1", "in_progress"),
+                    pair("c2", "in_progress"),
+                    pair("c1", "failed"),
+                    pair("c2", "failed"),
+                ],
+                |r| r["error"]["data"] == json!("boom"),
+            ),
+            (
+                "daemon disconnect",
+                vec![executing("c1")],
+                vec![pair("c1", "in_progress"), pair("c1", "failed")],
+                |r| r["error"]["data"]["kind"] == json!("daemon_disconnected"),
+            ),
+            (
+                "clean turn",
+                vec![executing("c1"), tool_result("c1"), AgentEvent::TurnComplete],
+                vec![pair("c1", "in_progress"), pair("c1", "completed")],
+                |r| r["result"]["stopReason"] == json!("end_turn"),
+            ),
+        ];
+        for (name, events, expected, response_ok) in cases {
+            let frames = tool_frames_for_turn(fake_daemon(), events).await;
+            let (statuses, response) = statuses_and_response(&frames);
+            assert_eq!(statuses, expected, "case {name}: {frames:?}");
+            assert!(response_ok(&response), "case {name}: response {response}");
+        }
+    }
+
     #[tokio::test]
     async fn cancel_notification_marks_stop_reason_cancelled() {
         let dir = tempfile::tempdir().expect("tempdir");
