@@ -28,6 +28,132 @@ impl BwrapVersion {
     pub fn supports_cap_drop(&self) -> bool {
         (self.major, self.minor) >= (0, 3)
     }
+
+    /// Returns true if this version supports `--perms` (added in 0.5.0).
+    pub fn supports_perms(&self) -> bool {
+        (self.major, self.minor) >= (0, 5)
+    }
+}
+
+/// Where WSL keeps its Windows-interop sockets. A process that can reach them
+/// can launch Windows executables — outside every Linux namespace bwrap sets up.
+const WSL_INTEROP_DIR: &str = "/run/WSL";
+
+/// WSLg's view of the distro's own root filesystem. On WSLg it can be the very
+/// same mount as `/`, so a bind of `/` exposes every file a second time under
+/// this prefix — where no `deny_read` overlay names it.
+pub const WSLG_DISTRO_DIR: &str = "/mnt/wslg/distro";
+
+/// Host facts the argument builder depends on, gathered once per call so
+/// tests can fake a WSL host on any machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HostProbe {
+    /// `/run/WSL` exists as a directory.
+    pub wsl_interop_dir: bool,
+    /// `/mnt/wslg/distro` is the same inode as `/` (see [`is_wslg_duplicate_root`]).
+    pub wslg_duplicate_root: bool,
+}
+
+impl HostProbe {
+    /// Probe the running host. Both facts are Linux-only; elsewhere they are
+    /// false, which emits nothing extra.
+    pub fn detect() -> Self {
+        if cfg!(target_os = "linux") {
+            Self {
+                wsl_interop_dir: Path::new(WSL_INTEROP_DIR).is_dir(),
+                wslg_duplicate_root: is_wslg_duplicate_root(),
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// True when `/mnt/wslg/distro` is the same directory as `/` — same device,
+/// same inode — which is how WSLg exposes the distro root.
+pub fn is_wslg_duplicate_root() -> bool {
+    same_inode(Path::new(WSLG_DISTRO_DIR), Path::new("/"))
+}
+
+/// True when both paths exist and name the same (dev, ino). A path that cannot
+/// be stat-ed is not a duplicate: absent is the normal, non-WSLg case.
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_inode(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+/// The first `fs_read`/`fs_write` entry at or under `/mnt/wslg/distro`, if any.
+///
+/// Such a grant can only be honored by binding the duplicate root itself, which
+/// would re-expose every masked path through it. The caller refuses to run.
+pub fn wslg_distro_grant(policy: &SandboxPolicy) -> Option<&str> {
+    grant_under(policy, Path::new(WSLG_DISTRO_DIR))
+}
+
+/// The first `fs_read`/`fs_write` entry that resolves to `dir` or below it.
+/// `..` segments and symlinks are resolved first, so `/mnt/wslg/x/../distro`
+/// or a symlink into `dir` cannot slip past a plain prefix test.
+fn grant_under<'a>(policy: &'a SandboxPolicy, dir: &Path) -> Option<&'a str> {
+    let dir_canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    policy
+        .fs_read
+        .iter()
+        .chain(&policy.fs_write)
+        .find(|p| {
+            let resolved = resolve_path(Path::new(p.as_str()));
+            resolved.starts_with(dir) || resolved.starts_with(&dir_canon)
+        })
+        .map(String::as_str)
+}
+
+/// Collapse `.`/`..` lexically, then canonicalize the longest existing
+/// ancestor and re-append the rest. A path that does not exist yet still
+/// resolves through any symlinked parent.
+fn resolve_path(path: &Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut lexical = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let mut head = lexical.clone();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&head) {
+            return tail.iter().rev().fold(canon, |acc, part| acc.join(part));
+        }
+        match (head.file_name().map(std::ffi::OsStr::to_os_string), head.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                head = parent.to_path_buf();
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// True when some `fs_read`/`fs_write` entry is `target` or one of its
+/// ancestors — so `target` is visible inside the sandbox.
+fn bind_covers(policy: &SandboxPolicy, target: &str) -> bool {
+    policy
+        .fs_read
+        .iter()
+        .chain(&policy.fs_write)
+        .any(|p| Path::new(target).starts_with(p))
 }
 
 /// Detect the installed bwrap version by running `bwrap --version`.
@@ -133,11 +259,71 @@ fn hide_path(args: &mut Vec<String>, path: &str) {
     }
 }
 
+/// Shadow every unix socket at `path`, or directly inside it, with `/dev/null`.
+///
+/// A read-only bind does not stop `connect(2)`: Linux checks the read-only
+/// mount flag only for regular files, directories and symlinks, never sockets.
+/// So `--ro-bind ~/.borg` still lets a sandboxed child connect to
+/// `~/.borg/borgd.sock` and drive the daemon as the user. Binding `/dev/null`
+/// over the socket inode leaves nothing to connect to. A tmpfs over the whole
+/// directory would also work but would hide the tool dir under
+/// `~/.borg/tools`, which the sandbox needs.
+///
+/// Only the top level is scanned: borgd's sockets live there, and a recursive
+/// walk of `~/.borg` on every spawn would cost more than it protects.
+#[cfg(unix)]
+fn hide_sockets(args: &mut Vec<String>, path: &str) {
+    use std::os::unix::fs::FileTypeExt;
+    let p = Path::new(path);
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if meta.file_type().is_socket() {
+        hide_path(args, path);
+        return;
+    }
+    if !meta.is_dir() {
+        return;
+    }
+    let entries = match std::fs::read_dir(p) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Fail closed: sockets we cannot enumerate may still be live, so
+            // hide the whole directory instead.
+            tracing::warn!(
+                path,
+                error = %e,
+                "sandbox: could not list a write-denied dir; masking it with a tmpfs"
+            );
+            args.extend(["--tmpfs".to_string(), path.to_string()]);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_socket()) {
+            hide_path(args, &entry.path().to_string_lossy());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn hide_sockets(_args: &mut Vec<String>, _path: &str) {}
+
 /// Build bwrap args with an explicit version for testability.
 pub fn build_bwrap_args_versioned(
     policy: &SandboxPolicy,
     tool_dir: &Path,
     version: Option<&BwrapVersion>,
+) -> Vec<String> {
+    build_bwrap_args_probed(policy, tool_dir, version, HostProbe::detect())
+}
+
+/// [`build_bwrap_args_versioned`] with the host facts supplied by the caller.
+pub fn build_bwrap_args_probed(
+    policy: &SandboxPolicy,
+    tool_dir: &Path,
+    version: Option<&BwrapVersion>,
+    host: HostProbe,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -167,7 +353,12 @@ pub fn build_bwrap_args_versioned(
     }
 
     for path in &policy.fs_write {
-        let denied = policy.deny_write.iter().any(|d| path.starts_with(d));
+        // Component-wise, not string, prefix: a deny of `/home/u/.borg` must
+        // not swallow a sibling grant like `/home/u/.borg-tools`.
+        let denied = policy
+            .deny_write
+            .iter()
+            .any(|d| Path::new(path).starts_with(d));
         if !denied {
             push_write_bind(&mut args, path);
         }
@@ -175,6 +366,11 @@ pub fn build_bwrap_args_versioned(
 
     for path in &policy.deny_write {
         push_bind_if_exists(&mut args, "--ro-bind", path);
+    }
+
+    // After every bind that could expose them, so these overlays win.
+    for path in &policy.deny_write {
+        hide_sockets(&mut args, path);
     }
 
     // Deny reads. Emitted AFTER the fs_read `--ro-bind`s so these overlays win
@@ -193,6 +389,29 @@ pub fn build_bwrap_args_versioned(
             let path = format!("{}/{sensitive}", home.to_string_lossy());
             hide_path(&mut args, &path);
         }
+    }
+
+    // WSL interop: the sockets under `/run/WSL` let a process start Windows
+    // executables, which run outside this sandbox entirely. Mask them whenever
+    // a bind makes them visible.
+    if host.wsl_interop_dir && bind_covers(policy, WSL_INTEROP_DIR) {
+        args.extend(["--tmpfs".to_string(), WSL_INTEROP_DIR.to_string()]);
+    }
+
+    // WSLg duplicate root: when `/mnt/wslg/distro` is `/` again, a bind of `/`
+    // shows every masked path a second time under it. Replace it with an
+    // empty, read-only, mode-000 tmpfs. Last among the filesystem args so no
+    // later bind can land inside it.
+    if host.wslg_duplicate_root && bind_covers(policy, WSLG_DISTRO_DIR) {
+        if version.is_none_or(BwrapVersion::supports_perms) {
+            args.extend(["--perms".to_string(), "000".to_string()]);
+        }
+        args.extend([
+            "--tmpfs".to_string(),
+            WSLG_DISTRO_DIR.to_string(),
+            "--remount-ro".to_string(),
+            WSLG_DISTRO_DIR.to_string(),
+        ]);
     }
 
     if !policy.network {
@@ -783,6 +1002,309 @@ mod tests {
                 args.contains(&"--unshare-pid".to_string()),
                 "--unshare-pid must always be present (ver={ver:?})"
             );
+        }
+    }
+
+    /// Regression: the deny check compared strings, so a deny of
+    /// `/home/u/.borg` also swallowed the unrelated sibling write grant
+    /// `/home/u/.borg-tools` — the tool ran, wrote into a throwaway view, and
+    /// its output never reached the host.
+    #[test]
+    fn a_write_grant_beside_a_denied_dir_is_still_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let denied = tmp.path().join(".borg");
+        let sibling = tmp.path().join(".borg-tools");
+        let nested = denied.join("tools");
+        for dir in [&denied, &sibling, &nested] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let policy = SandboxPolicy {
+            fs_write: vec![s(&sibling), s(&nested)],
+            deny_write: vec![s(&denied)],
+            ..Default::default()
+        };
+        let args = build_bwrap_args_versioned(&policy, Path::new(TEST_TOOL_DIR), None);
+        let writable = |p: &str| args.windows(3).any(|w| w[0] == "--bind" && w[1] == p);
+        assert!(
+            writable(&s(&sibling)),
+            "a sibling of a denied dir must stay writable: {args:?}"
+        );
+        assert!(
+            !writable(&s(&nested)),
+            "a path inside a denied dir must not become writable: {args:?}"
+        );
+    }
+
+    /// Spec: a read-only bind does not stop `connect(2)` on a unix socket, so
+    /// every socket directly inside a write-denied dir (borgd's control socket
+    /// in `~/.borg`) is shadowed by `/dev/null` — after the dir's own bind, so
+    /// the overlay wins. Regular files there stay readable, and a socket
+    /// outside every denied dir is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn unlistable_write_denied_dir_is_masked_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&dir).is_ok() {
+            // Running as root: permissions do not stop the listing.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let path = dir.to_string_lossy().into_owned();
+        let mut args = Vec::new();
+        hide_sockets(&mut args, &path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(args, vec!["--tmpfs".to_string(), path]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sockets_in_a_write_denied_dir_are_shadowed() {
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let denied = tmp.path().join("b");
+        let open = tmp.path().join("o");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        let daemon_sock = denied.join("d.sock");
+        let open_sock = open.join("d.sock");
+        let _l1 = UnixListener::bind(&daemon_sock).unwrap();
+        let _l2 = UnixListener::bind(&open_sock).unwrap();
+        let config = denied.join("config.toml");
+        std::fs::write(&config, b"x").unwrap();
+
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let policy = SandboxPolicy {
+            fs_read: vec![s(tmp.path())],
+            deny_write: vec![s(&denied)],
+            ..Default::default()
+        };
+        let args = build_bwrap_args_versioned(&policy, Path::new(TEST_TOOL_DIR), None);
+        let shadow_at = |p: &Path| {
+            args.windows(3)
+                .position(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == s(p))
+        };
+        let dir_bind_at = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == s(&denied))
+            .expect("the denied dir is bound read-only");
+
+        let at = shadow_at(&daemon_sock)
+            .unwrap_or_else(|| panic!("the socket in the denied dir must be shadowed: {args:?}"));
+        assert!(
+            at > dir_bind_at,
+            "the shadow must follow the dir bind: {args:?}"
+        );
+        assert_eq!(shadow_at(&config), None, "regular files must stay readable");
+        assert_eq!(
+            shadow_at(&open_sock),
+            None,
+            "sockets outside must stay reachable"
+        );
+    }
+
+    fn wsl_host() -> HostProbe {
+        HostProbe {
+            wsl_interop_dir: true,
+            wslg_duplicate_root: true,
+        }
+    }
+
+    /// Spec: `/run/WSL` is masked with a tmpfs exactly when the host has it and
+    /// some read or write bind makes it visible. Masking when nothing binds it
+    /// would make bwrap create a mount point in an unrelated tree.
+    #[test]
+    fn wsl_interop_is_masked_only_when_a_bind_reaches_it() {
+        let cases: &[(bool, &[&str], &[&str], bool)] = &[
+            // interop dir present, fs_read, fs_write, expect mask
+            (true, &["/"], &[], true),
+            (true, &["/run"], &[], true),
+            (true, &[], &["/run/WSL"], true),
+            (true, &["/home"], &[], false),
+            (true, &["/run/WSLx"], &[], false),
+            (false, &["/"], &[], false),
+        ];
+        for (present, read, write, want) in cases.iter().copied() {
+            let policy = SandboxPolicy {
+                fs_read: read.iter().map(|p| p.to_string()).collect(),
+                fs_write: write.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            };
+            let host = HostProbe {
+                wsl_interop_dir: present,
+                wslg_duplicate_root: false,
+            };
+            let args = build_bwrap_args_probed(&policy, Path::new(TEST_TOOL_DIR), None, host);
+            let masked = args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == WSL_INTEROP_DIR);
+            assert_eq!(
+                masked, want,
+                "present={present} read={read:?} write={write:?}"
+            );
+        }
+    }
+
+    /// Spec: on a WSLg duplicate root, a bind of `/` gets an empty, read-only,
+    /// mode-000 tmpfs over `/mnt/wslg/distro`, as the final filesystem args so
+    /// no later bind lands inside it. `--perms` only on a bwrap that has it.
+    #[test]
+    fn wslg_duplicate_root_is_masked_as_the_last_filesystem_args() {
+        let policy = SandboxPolicy {
+            fs_read: vec!["/".to_string()],
+            ..Default::default()
+        };
+        let old = BwrapVersion {
+            major: 0,
+            minor: 4,
+            patch: 1,
+        };
+        let cases: &[(Option<&BwrapVersion>, bool)] = &[(None, true), (Some(&old), false)];
+        for (version, want_perms) in cases.iter().copied() {
+            let args =
+                build_bwrap_args_probed(&policy, Path::new(TEST_TOOL_DIR), version, wsl_host());
+            let mut expected: Vec<&str> = Vec::new();
+            if want_perms {
+                expected.extend(["--perms", "000"]);
+            }
+            expected.extend([
+                "--tmpfs",
+                WSLG_DISTRO_DIR,
+                "--remount-ro",
+                WSLG_DISTRO_DIR,
+                "--unshare-net",
+            ]);
+            let start = args
+                .windows(expected.len())
+                .position(|w| w == expected.as_slice())
+                .unwrap_or_else(|| panic!("no WSLg mask for {version:?}: {args:?}"));
+            assert!(
+                args[..start].iter().any(|a| a == WSL_INTEROP_DIR),
+                "the interop mask comes first: {args:?}"
+            );
+            assert!(
+                !args[start + expected.len()..]
+                    .iter()
+                    .any(|a| ["--bind", "--ro-bind", "--tmpfs"].contains(&a.as_str())),
+                "no filesystem arg may follow the WSLg mask: {args:?}"
+            );
+        }
+    }
+
+    /// Spec: no mask when the duplicate root is absent or no bind covers it.
+    #[test]
+    fn wslg_mask_needs_both_the_duplicate_root_and_a_covering_bind() {
+        let root = SandboxPolicy {
+            fs_read: vec!["/".to_string()],
+            ..Default::default()
+        };
+        let home = SandboxPolicy {
+            fs_read: vec!["/home".to_string()],
+            ..Default::default()
+        };
+        let plain = HostProbe::default();
+        for (policy, host) in [(&root, plain), (&home, wsl_host())] {
+            let args = build_bwrap_args_probed(policy, Path::new(TEST_TOOL_DIR), None, host);
+            assert!(
+                !args.iter().any(|a| a == WSLG_DISTRO_DIR),
+                "unexpected WSLg mask for {host:?}: {args:?}"
+            );
+        }
+    }
+
+    /// Spec: any grant at or under `/mnt/wslg/distro` is reported, read or
+    /// write, so the caller can refuse it; a lookalike sibling is not.
+    #[test]
+    fn grants_under_the_wslg_distro_are_found() {
+        let cases: &[(&[&str], &[&str], Option<&str>)] = &[
+            (
+                &["/mnt/wslg/distro/home/u"],
+                &[],
+                Some("/mnt/wslg/distro/home/u"),
+            ),
+            (&[], &["/mnt/wslg/distro"], Some("/mnt/wslg/distro")),
+            (&["/mnt/wslg/distro-other"], &[], None),
+            (&["/", "/mnt/wslg"], &["/home/u"], None),
+        ];
+        for &(read, write, want) in cases {
+            let policy = SandboxPolicy {
+                fs_read: read.iter().map(|p| p.to_string()).collect(),
+                fs_write: write.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            };
+            assert_eq!(
+                wslg_distro_grant(&policy),
+                want,
+                "read={read:?} write={write:?}"
+            );
+        }
+    }
+
+    /// Spec: a grant that only reaches the protected dir through `..` or a
+    /// symlink is still caught; an unrelated grant is not.
+    #[cfg(unix)]
+    #[test]
+    fn grants_reaching_the_dir_through_dotdot_or_symlinks_are_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let distro = root.join("distro");
+        let other = root.join("other");
+        std::fs::create_dir_all(distro.join("home")).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&distro, &link).unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let cases = [
+            (s(root.join("other/../distro/home")), true),
+            (s(link.join("home")), true),
+            (s(link.join("not-yet-created/file")), true),
+            (s(other.join("x")), false),
+            (s(root.join("distro-other")), false),
+        ];
+        for (grant, want) in cases {
+            let policy = SandboxPolicy {
+                fs_write: vec![grant.clone()],
+                ..Default::default()
+            };
+            assert_eq!(
+                grant_under(&policy, &distro).is_some(),
+                want,
+                "grant={grant}"
+            );
+        }
+    }
+
+    /// Spec: the duplicate-root probe compares (dev, ino). A directory matches
+    /// itself through any spelling (a symlink here), not a different directory,
+    /// and a missing path never matches.
+    #[cfg(unix)]
+    #[test]
+    fn same_inode_compares_device_and_inode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        assert!(same_inode(&a, &alias));
+        assert!(!same_inode(&a, &b));
+        assert!(!same_inode(&a, &tmp.path().join("missing")));
+    }
+
+    #[test]
+    fn perms_cutoff_is_0_5_0() {
+        for (minor, want) in [(4, false), (5, true), (9, true)] {
+            let v = BwrapVersion {
+                major: 0,
+                minor,
+                patch: 0,
+            };
+            assert_eq!(v.supports_perms(), want, "0.{minor}.0");
         }
     }
 }

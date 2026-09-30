@@ -165,6 +165,15 @@ impl<'a> App<'a> {
         if is_suspend_key(&key) && !self.any_popup_visible() && !self.wants_alt_screen() {
             return Ok(AppAction::Suspend);
         }
+        // A Tab inside a non-bracketed paste burst is pasted whitespace. Route
+        // it into the burst before popup completion (Idle) or the streaming
+        // no-op binding can claim it — either would drop the tab and split
+        // the paste in two.
+        if matches!(self.state, AppState::Idle | AppState::Streaming { .. })
+            && self.composer.capture_burst_tab(&key)
+        {
+            return Ok(AppAction::Continue);
+        }
         match &self.state {
             AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
             AppState::AwaitingApproval { .. } => self.handle_key_awaiting_approval(key),

@@ -173,6 +173,7 @@ impl SseFixture {
             },
             client_identity: None,
             ca_cert_path: None,
+            max_response_bytes: 0,
         }
     }
 }
@@ -248,6 +249,7 @@ async fn open_times_out_when_endpoint_event_missing() {
         },
         client_identity: None,
         ca_cert_path: None,
+        max_response_bytes: 0,
     };
     let res = open(cfg, Duration::from_millis(300)).await;
     let err = match res {
@@ -286,6 +288,7 @@ async fn open_refuses_url_pointing_at_metadata_service_even_with_local_network_a
         },
         client_identity: None,
         ca_cert_path: None,
+        max_response_bytes: 0,
     };
     let res = open(cfg, Duration::from_secs(1)).await;
     let err = match res {
@@ -468,4 +471,65 @@ async fn open_refuses_endpoint_event_that_only_changes_the_port() {
         format!("{err}").contains("origin"),
         "error should name the origin mismatch; got: {err}",
     );
+}
+
+#[tokio::test]
+async fn open_rejects_an_sse_event_that_never_ends() {
+    // Spec: one SSE event is bounded by `max_response_bytes`. A hostile
+    // server that opens an event and streams bytes with no terminating blank
+    // line must be cut off with a size error, not buffered until the process
+    // runs out of memory. Without the cap this test ends in a timeout
+    // instead, with the whole stream held in memory.
+    use futures::StreamExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Router::new().route(
+        "/sse",
+        get(|| async {
+            let chunks = futures::stream::iter(
+                std::iter::once(b"data: ".to_vec())
+                    .chain(std::iter::repeat_with(|| vec![b'x'; 1024])),
+            )
+            .map(|c| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(c)));
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                axum::body::Body::from_stream(chunks),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve");
+    });
+
+    let cfg = SseConfig {
+        server_name: "endless-event".into(),
+        url: format!("http://{addr}/sse"),
+        headers: HashMap::new(),
+        timeout: Duration::from_secs(5),
+        policy: HttpPolicy {
+            allow_plaintext_http: true,
+            allow_local_network: true,
+        },
+        client_identity: None,
+        ca_cert_path: None,
+        max_response_bytes: 16 * 1024,
+    };
+    let err = match open(cfg, Duration::from_secs(5)).await {
+        Ok(_) => panic!("an endless event must not yield a transport"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("exceeds max_response_bytes"),
+        "expected the frame-size error, not a timeout; got: {msg}",
+    );
+    drop(shutdown_tx);
 }

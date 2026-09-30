@@ -70,16 +70,7 @@ pub async fn refresh_anthropic_against(
         .send()
         .await
         .context("anthropic oauth refresh: send")?;
-    let status = resp.status();
-    let body = resp.text().await.context("anthropic oauth refresh: body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "anthropic oauth refresh: HTTP {status}: {}",
-            truncate(&body, 256)
-        ));
-    }
-    let parsed: OAuthTokenResponse = serde_json::from_str(&body)
-        .with_context(|| format!("parse anthropic refresh body: {}", truncate(&body, 256)))?;
+    let parsed = read_token_response(resp, "anthropic").await?;
     if parsed.access_token.is_empty() {
         return Err(anyhow!("anthropic refresh response missing access_token"));
     }
@@ -121,16 +112,7 @@ pub async fn refresh_codex_against(refresh_token: &str, endpoint: &str) -> Resul
         .send()
         .await
         .context("codex oauth refresh: send")?;
-    let status = resp.status();
-    let body = resp.text().await.context("codex oauth refresh: body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "codex oauth refresh: HTTP {status}: {}",
-            truncate(&body, 256)
-        ));
-    }
-    let parsed: OAuthTokenResponse = serde_json::from_str(&body)
-        .with_context(|| format!("parse codex refresh body: {}", truncate(&body, 256)))?;
+    let parsed = read_token_response(resp, "codex").await?;
     if parsed.access_token.is_empty() {
         return Err(anyhow!("codex refresh response missing access_token"));
     }
@@ -146,6 +128,39 @@ pub async fn refresh_codex_against(refresh_token: &str, endpoint: &str) -> Resul
         refresh_token: next_refresh,
         expires_at_ms: now_ms() + (expires_in as i64) * 1000,
     })
+}
+
+/// Read and parse a token-endpoint response with a bounded body. A non-2xx
+/// status keeps a short, redacted excerpt of the error body (`invalid_grant`
+/// and friends are the useful part). A success body holds the new tokens, so
+/// a parse failure reports only where it broke, never the content.
+async fn read_token_response(resp: reqwest::Response, label: &str) -> Result<OAuthTokenResponse> {
+    let status = resp.status();
+    let read = crate::media::read_body_capped(
+        resp,
+        crate::constants::OAUTH_TOKEN_BODY_MAX_BYTES,
+        &format!("{label} oauth refresh response"),
+    )
+    .await;
+    // A failed status must survive a failed body read: callers key on the
+    // HTTP status (e.g. a 400 `invalid_grant` means re-login).
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(e) if !status.is_success() => {
+            return Err(anyhow!(
+                "{label} oauth refresh: HTTP {status}: body unreadable: {e}"
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if !status.is_success() {
+        let body = crate::security::secrets::redact_secrets(&String::from_utf8_lossy(&bytes));
+        return Err(anyhow!(
+            "{label} oauth refresh: HTTP {status}: {}",
+            truncate(&body, 256)
+        ));
+    }
+    crate::media::parse_json_body(&bytes, &format!("parse {label} refresh body"))
 }
 
 fn now_ms() -> i64 {
@@ -245,6 +260,40 @@ mod tests {
         let r = refresh_codex_against("cx-old", &url).await.unwrap();
         assert_eq!(r.access_token, "cx-new");
         assert_eq!(r.refresh_token, "cx-new-r");
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_bad_success_bodies_without_echoing_tokens() {
+        // (body, expected error fragment). A 200 body carries the new tokens,
+        // so neither a type error (serde quotes the value) nor an oversized
+        // body may put its content in the error chain.
+        let oversized = format!(
+            r#"{{"access_token":"tok-LEAKED","pad":"{}"}}"#,
+            "x".repeat(crate::constants::OAUTH_TOKEN_BODY_MAX_BYTES as usize)
+        );
+        // An oversized failure body must still surface its HTTP status.
+        let cases = [
+            (
+                200,
+                r#"{"access_token":"tok-LEAKED","expires_in":"tok-LEAKED"}"#.to_string(),
+                "invalid JSON (Data error at line 1",
+            ),
+            (200, oversized.clone(), "too large"),
+            (400, oversized, "HTTP 400 Bad Request: body unreadable"),
+        ];
+        for (status, body, fragment) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            let url = format!("{}/oauth/token", server.uri());
+            let err = refresh_codex_against("cx-old", &url).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(fragment), "want {fragment:?}, got: {msg}");
+            assert!(!msg.contains("LEAKED"), "token leaked: {msg}");
+        }
     }
 
     #[tokio::test]

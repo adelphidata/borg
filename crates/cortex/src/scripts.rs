@@ -379,8 +379,9 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
             );
         }
 
-        let sandbox_policy = build_script_sandbox_policy(&script, &script_dir)
-            .with_blocked_paths_filtered(&config.security.blocked_paths);
+        let sandbox_policy =
+            build_script_sandbox_policy(&script, &script_dir, &config.security.blocked_paths)
+                .with_blocked_paths_filtered(&config.security.blocked_paths);
 
         let entrypoint_path = script_dir.join(&script.entrypoint);
         if !entrypoint_path.exists() {
@@ -497,9 +498,17 @@ pub async fn list_scripts(db: &Database) -> Result<String> {
 
 // ── Sandbox Policy ──
 
+/// Build the sandbox policy for `script`.
+///
+/// Every profile gets the configured `blocked_paths` as OS-level denies
+/// anchored at `$HOME` (`~/.aws`, `~/.env`, …): `trusted` reads all of `/`, so
+/// without them a script could read those files straight off disk. A `custom`
+/// policy also gets them anchored at each root it declares, because its roots
+/// are script-supplied and may be a directory that holds such a file.
 fn build_script_sandbox_policy(
     script: &ScriptRow,
     script_dir: &Path,
+    blocked_paths: &[String],
 ) -> sandbox::policy::SandboxPolicy {
     use sandbox::policy::SandboxPolicy;
 
@@ -512,11 +521,12 @@ fn build_script_sandbox_policy(
             fs_write: vec!["/tmp".to_string(), dir_str()],
             ..Default::default()
         }
-        .with_borg_dir_protected(),
+        .with_borg_dir_protected()
+        .with_blocked_paths_denied(blocked_paths, &[]),
         "custom" => {
             let fs_read: Vec<String> = serde_json::from_str(&script.fs_read).unwrap_or_default();
             let fs_write: Vec<String> = serde_json::from_str(&script.fs_write).unwrap_or_default();
-            SandboxPolicy {
+            let policy = SandboxPolicy {
                 network: script.network_access,
                 fs_read,
                 fs_write,
@@ -524,7 +534,16 @@ fn build_script_sandbox_policy(
             }
             .with_borg_dir_protected()
             .with_tildes_expanded()
-            .with_defaults_applied()
+            .with_defaults_applied();
+            // Anchor at the expanded roots, so `~/data` yields `/home/u/data/.env`.
+            // `with_blocked_paths_denied` dedupes, so a root in both lists is fine.
+            let roots: Vec<String> = policy
+                .fs_read
+                .iter()
+                .chain(&policy.fs_write)
+                .cloned()
+                .collect();
+            policy.with_blocked_paths_denied(blocked_paths, &roots)
         }
         // "default" and anything else
         _ => SandboxPolicy {
@@ -533,7 +552,8 @@ fn build_script_sandbox_policy(
             ..Default::default()
         }
         .with_borg_dir_protected()
-        .with_defaults_applied(),
+        .with_defaults_applied()
+        .with_blocked_paths_denied(blocked_paths, &[]),
     }
 }
 
@@ -712,7 +732,7 @@ mod tests {
             run_count: 0,
         };
         let dir = TempDir::new().unwrap();
-        let policy = build_script_sandbox_policy(&script, dir.path());
+        let policy = build_script_sandbox_policy(&script, dir.path(), &[]);
         assert!(!policy.network);
     }
 
@@ -736,7 +756,7 @@ mod tests {
             run_count: 0,
         };
         let dir = TempDir::new().unwrap();
-        let policy = build_script_sandbox_policy(&script, dir.path());
+        let policy = build_script_sandbox_policy(&script, dir.path(), &[]);
         assert!(policy.network);
     }
 
@@ -760,10 +780,81 @@ mod tests {
             run_count: 0,
         };
         let dir = TempDir::new().unwrap();
-        let policy = build_script_sandbox_policy(&script, dir.path());
+        let policy = build_script_sandbox_policy(&script, dir.path(), &[]);
         assert!(policy.network);
         assert!(policy.fs_read.iter().any(|p| p == "/data"));
         assert!(policy.fs_write.iter().any(|p| p == "/output"));
+    }
+
+    fn script_with_profile(profile: &str, fs_read: &str, fs_write: &str) -> ScriptRow {
+        ScriptRow {
+            id: "test".to_string(),
+            name: "test".to_string(),
+            description: String::new(),
+            runtime: "python".to_string(),
+            entrypoint: "main.py".to_string(),
+            sandbox_profile: profile.to_string(),
+            network_access: true,
+            fs_read: fs_read.to_string(),
+            fs_write: fs_write.to_string(),
+            ephemeral: false,
+            hmac: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            last_run_at: None,
+            run_count: 0,
+        }
+    }
+
+    /// Spec: a custom policy's declared write root is script-supplied, so the
+    /// configured blocked paths are denied there (read and write) as well as
+    /// under `$HOME` — otherwise a script granted `/output` could read
+    /// `/output/.aws` or `~/.env` straight off disk.
+    #[test]
+    fn custom_policy_denies_configured_blocked_paths_at_home_and_its_roots() {
+        let script = script_with_profile("custom", r#"["/data"]"#, r#"["/output"]"#);
+        let dir = TempDir::new().unwrap();
+        let blocked = vec![".aws".to_string(), ".env".to_string()];
+        let policy = build_script_sandbox_policy(&script, dir.path(), &blocked);
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        for path in [
+            format!("{home}/.aws"),
+            format!("{home}/.env"),
+            "/output/.aws".to_string(),
+            "/output/.env".to_string(),
+            "/data/.env".to_string(),
+        ] {
+            assert!(
+                policy.deny_read.contains(&path),
+                "{path} must be read-denied: {:?}",
+                policy.deny_read
+            );
+            assert!(
+                policy.deny_write.contains(&path),
+                "{path} must be write-denied: {:?}",
+                policy.deny_write
+            );
+        }
+    }
+
+    /// Spec: `trusted` reads all of `/`, so without home-anchored denies a
+    /// configured blocked path like `~/.env` is plainly readable. The default
+    /// profile gets the same backstop.
+    #[test]
+    fn trusted_and_default_policies_deny_configured_blocked_paths_under_home() {
+        let dir = TempDir::new().unwrap();
+        let blocked = vec![".env".to_string()];
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        let want = format!("{home}/.env");
+        for profile in ["trusted", "default"] {
+            let script = script_with_profile(profile, "[]", "[]");
+            let policy = build_script_sandbox_policy(&script, dir.path(), &blocked);
+            assert!(
+                policy.deny_read.contains(&want),
+                "{profile}: {want} must be read-denied: {:?}",
+                policy.deny_read
+            );
+        }
     }
 
     #[test]

@@ -321,7 +321,7 @@ pub mod client {
         code: &str,
         device_label: &str,
     ) -> Result<PairResult> {
-        let mut stream = UnixStream::connect(socket_path)
+        let mut stream = protocols::uds::connect(socket_path)
             .await
             .with_context(|| format!("connect bootstrap socket {socket_path:?}"))?;
 

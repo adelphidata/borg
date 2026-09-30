@@ -7,6 +7,8 @@
 #![warn(missing_docs)]
 
 pub mod capabilities;
+#[cfg(unix)]
+pub mod uds;
 
 /// Session service — agent interaction.
 pub mod session {

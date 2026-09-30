@@ -499,7 +499,19 @@ impl SandboxPolicy {
             tracing::warn!("bwrap not found; running without sandbox");
             return SandboxCommand::passthrough(program, args);
         }
-        use crate::bubblewrap::build_bwrap_args;
+        use crate::bubblewrap::{build_bwrap_args, wslg_distro_grant, WSLG_DISTRO_DIR};
+        // A grant under WSLg's duplicate root reaches, by a second name, the
+        // very paths `deny_read` masks — and no overlay can mask both names
+        // while honoring the grant. Refuse rather than silently widen it.
+        if let Some(path) = wslg_distro_grant(self) {
+            return fail_closed(
+                "sandbox grant under the WSLg duplicate root",
+                &format!(
+                    "{path:?} is under {WSLG_DISTRO_DIR}, which mirrors `/`; \
+                     grant the path by its real location instead"
+                ),
+            );
+        }
         let mut bwrap_args = build_bwrap_args(self, tool_dir);
         bwrap_args.push(program.to_string());
         bwrap_args.extend(args.iter().cloned());

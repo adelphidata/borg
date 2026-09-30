@@ -17,5 +17,8 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [build-dependencies]
 tonic-build = { workspace = true }

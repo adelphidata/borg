@@ -2,7 +2,6 @@ use crossterm::terminal;
 use ratatui::style::Color;
 use std::io::Write;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 /// Cached terminal background RGB, queried once via OSC 11.
 static TERMINAL_BG: OnceLock<Option<(u8, u8, u8)>> = OnceLock::new();
@@ -65,9 +64,11 @@ pub(super) fn is_light_terminal() -> bool {
 
 /// Send an OSC 10/11 query and parse the terminal's color response.
 /// Briefly enters raw mode, sends the query, reads raw bytes from stdin
-/// using `poll(2)` with a 100ms timeout, then restores terminal state.
+/// using `poll(2)` with a [`TERMINAL_COLOR_PROBE_TIMEOUT`] deadline, then
+/// restores terminal state.
 #[cfg(unix)]
 fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
+    use super::constants::TERMINAL_COLOR_PROBE_TIMEOUT;
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
 
@@ -87,7 +88,7 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
 
     let mut buf = [0u8; 128];
     let mut total = 0usize;
-    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + TERMINAL_COLOR_PROBE_TIMEOUT;
 
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();

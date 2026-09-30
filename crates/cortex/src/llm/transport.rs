@@ -8,7 +8,7 @@ use super::{
     Message, Provider, Role, StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition,
     UsageData, UsageOptions,
 };
-use crate::llm::llm_error::FailoverReason;
+use crate::llm::llm_error::{classify_error_text, FailoverReason};
 
 pub(crate) struct TransportRequest<'a> {
     pub(crate) provider: Provider,
@@ -351,6 +351,10 @@ pub(crate) fn parse_openai_sse_line(
         return SseAction::Done(vec![StreamEvent::Done]);
     }
 
+    if let Some(err) = parse_openai_stream_error(data) {
+        return SseAction::Error(err);
+    }
+
     match serde_json::from_str::<StreamChunk>(data) {
         Ok(chunk) => {
             let mut events = Vec::new();
@@ -605,26 +609,7 @@ pub(crate) fn parse_anthropic_sse_line(
                 .unwrap_or("unknown error");
             let reason = classify_anthropic_stream_error(err_type, err_msg);
             let source = anyhow::anyhow!("Anthropic stream error ({err_type}): {err_msg}");
-            let llm_err = match reason {
-                FailoverReason::Auth
-                | FailoverReason::AuthPermanent
-                | FailoverReason::Billing
-                | FailoverReason::ModelNotFound
-                | FailoverReason::PayloadTooLarge
-                | FailoverReason::MalformedToolCall
-                | FailoverReason::Format => LlmError::Fatal {
-                    source,
-                    reason,
-                    status: None,
-                },
-                _ => LlmError::Retryable {
-                    source,
-                    retry_after: None,
-                    reason,
-                    status: None,
-                },
-            };
-            SseAction::Error(llm_err)
+            SseAction::Error(stream_error(source, reason))
         }
         _ => SseAction::Continue,
     }
@@ -1507,7 +1492,15 @@ fn parse_bedrock_event_error(event: &serde_json::Value) -> Option<LlmError> {
         _ => FailoverReason::Unknown,
     };
     let source = anyhow::anyhow!("Bedrock stream error ({error_type}): {message}");
-    Some(match reason {
+    Some(stream_error(source, reason))
+}
+
+/// Build the `LlmError` for an error the provider reported *inside* a stream
+/// (no HTTP status: the response was already 200). Reasons no retry can fix —
+/// a bad or denied key, a spent account, a missing model, a malformed
+/// request — are fatal; everything else is retryable.
+fn stream_error(source: anyhow::Error, reason: FailoverReason) -> LlmError {
+    match reason {
         FailoverReason::Auth
         | FailoverReason::AuthPermanent
         | FailoverReason::Billing
@@ -1525,7 +1518,37 @@ fn parse_bedrock_event_error(event: &serde_json::Value) -> Option<LlmError> {
             reason,
             status: None,
         },
-    })
+    }
+}
+
+/// Recognize an OpenAI-compatible mid-stream error chunk:
+/// `data: {"error":{"message":"…","code":"…","type":"…"}}`. Such a chunk has
+/// no `choices`, so it would otherwise deserialize as an empty chunk and the
+/// stream would end as if the reply were simply short. The reason comes from
+/// the code/type plus message through the shared text classifier, so an
+/// `insufficient_quota` mid-stream is fatal `Billing` just as it is on a 429.
+fn parse_openai_stream_error(data: &str) -> Option<LlmError> {
+    // Cheap pre-check: ordinary delta chunks never carry the key.
+    if !data.contains("\"error\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error")?.as_object()?;
+    let field = |k: &str| match error.get(k) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    let code = field("code").or_else(|| field("type"));
+    let message = field("message").unwrap_or_else(|| "unknown error".to_string());
+    let label = code.as_deref().unwrap_or("error");
+    let reason =
+        classify_error_text(&format!("{label} {message}")).unwrap_or(FailoverReason::Unknown);
+    let source = anyhow::anyhow!(
+        "stream error ({label}): {}",
+        crate::security::secrets::redact_secrets(&message)
+    );
+    Some(stream_error(source, reason))
 }
 
 fn parse_bedrock_chat_response(
@@ -2275,6 +2298,69 @@ mod tests {
                 assert_eq!(reason, FailoverReason::AuthPermanent);
             }
             _ => panic!("expected fatal auth-permanent error"),
+        }
+    }
+
+    #[test]
+    fn openai_mid_stream_error_chunk_aborts_with_classified_error() {
+        // (data line, expected reason, expected fatal). Before this, an error
+        // chunk parsed as an empty delta and the stream ended looking like a
+        // short, successful reply.
+        let cases: &[(&str, FailoverReason, bool)] = &[
+            (
+                r#"data: {"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+                FailoverReason::Billing,
+                true,
+            ),
+            (
+                r#"data: {"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#,
+                FailoverReason::RateLimit,
+                false,
+            ),
+            (
+                r#"data: {"error":{"message":"Please reduce your request rate","code":"slow_down"}}"#,
+                FailoverReason::RateLimit,
+                false,
+            ),
+            // OpenRouter shape: numeric code echoing the upstream status.
+            (
+                r#"data: {"error":{"message":"Provider returned error","code":502}}"#,
+                FailoverReason::Overloaded,
+                false,
+            ),
+            (
+                r#"data: {"error":{"message":"Invalid API key","code":"invalid_api_key"}}"#,
+                FailoverReason::Auth,
+                true,
+            ),
+            // Unrecognized error: still an error, retryable.
+            (
+                r#"data: {"error":{"message":"something odd"}}"#,
+                FailoverReason::Unknown,
+                false,
+            ),
+        ];
+        for (line, reason, fatal) in cases {
+            let mut state = OpenAiStreamState::default();
+            match parse_openai_sse_line(line, "openai", "gpt-5", &mut state) {
+                crate::sse::SseAction::Error(e) => {
+                    assert_eq!(e.reason(), *reason, "{line}");
+                    assert_eq!(!e.is_retryable(), *fatal, "{line}");
+                }
+                _ => panic!("error chunk must abort the stream: {line}"),
+            }
+        }
+
+        // A delta whose *text* mentions "error" is ordinary content.
+        let mut state = OpenAiStreamState::default();
+        let benign =
+            r#"data: {"choices":[{"delta":{"content":"the \"error\" key"}}],"error":null}"#;
+        match parse_openai_sse_line(benign, "openai", "gpt-5", &mut state) {
+            crate::sse::SseAction::Emit(events) => assert!(matches!(
+                &events[0],
+                StreamEvent::TextDelta(t) if t == "the \"error\" key"
+            )),
+            _ => panic!("benign delta must emit its text"),
         }
     }
 

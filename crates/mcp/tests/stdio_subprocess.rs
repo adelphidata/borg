@@ -376,3 +376,43 @@ fn b64_decode_round_trip() {
         assert_eq!(decoded, plain.as_bytes(), "decode({b64}) != {plain:?}");
     }
 }
+
+#[tokio::test]
+async fn spawned_server_does_not_inherit_non_stdio_fds() {
+    // Spec: a stdio MCP server is untrusted code and must receive stdin,
+    // stdout, and stderr only. An inheritable descriptor held by the daemon
+    // (opened by a C library without `O_CLOEXEC`) must not reach it.
+    //
+    // SAFETY: FFI calls on a NUL-terminated literal and on the fd opened here.
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    assert!(fd > 2, "open failed: {}", std::io::Error::last_os_error());
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert_ne!(
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+            -1
+        );
+    }
+
+    let script = format!(
+        r#"if [ -e /dev/fd/{fd} ]; then s=leaked; else s=closed; fi; printf '{{"jsonrpc":"2.0","method":"fd","params":{{"state":"%s"}}}}\n' "$s""#
+    );
+    let (sink, _) = collecting_sink();
+    let mut transport = spawn(cfg("/bin/sh", &["-c", &script], HashMap::new()), sink)
+        .await
+        .expect("spawn sh");
+    let msg = tokio::time::timeout(Duration::from_secs(2), transport.recv())
+        .await
+        .expect("recv timed out")
+        .expect("recv error")
+        .expect("eof before frame");
+    transport.close().await.expect("close");
+    // SAFETY: closing the fd this test opened.
+    unsafe { libc::close(fd) };
+
+    assert_eq!(
+        msg.params.expect("params")["state"],
+        "closed",
+        "fd {fd} leaked into the MCP server"
+    );
+}

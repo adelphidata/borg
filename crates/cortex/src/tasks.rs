@@ -550,7 +550,9 @@ pub enum FailureDelivery {
 ///   before the column existed.
 /// - `failure_channel == "none"` → [`FailureDelivery::Suppress`].
 /// - `failure_channel` set → that channel, with `failure_target` falling back
-///   to the success target so a same-channel override needs only one field.
+///   to the success target *only when the channels match*, so a same-channel
+///   override needs one field and a cross-channel one never borrows an id
+///   that means nothing on the other channel.
 ///
 /// One definition, two consumers: the task runner sends by it and the
 /// `schedule` tool validates against it.
@@ -565,9 +567,16 @@ pub fn resolve_failure_delivery(
     }
     let (channel, target) = match non_blank(failure_channel) {
         Some(FAILURE_DELIVERY_NONE) => return FailureDelivery::Suppress,
+        // The success target is an id *within the success channel*; lending
+        // it to a different channel would address a chat that does not exist
+        // there (or, worse, someone else's).
         Some(ch) => (
             Some(ch),
-            non_blank(failure_target).or(non_blank(delivery_target)),
+            non_blank(failure_target).or_else(|| {
+                (non_blank(delivery_channel) == Some(ch))
+                    .then(|| non_blank(delivery_target))
+                    .flatten()
+            }),
         ),
         None => (non_blank(delivery_channel), non_blank(delivery_target)),
     };
@@ -1823,6 +1832,8 @@ mod tests {
             ),
             // a channel with no target anywhere cannot be routed
             (None, None, Some("slack"), None, Unrouted),
+            // a different channel never borrows the success channel's target
+            (Some("telegram"), Some("42"), Some("slack"), None, Unrouted),
         ];
         for (dc, dt, fc, ft, want) in cases {
             assert_eq!(

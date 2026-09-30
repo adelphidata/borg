@@ -66,6 +66,83 @@ mod imp {
         Ok(())
     }
 
+    /// `pre_exec` hook that stops every descriptor above stderr from reaching
+    /// the exec'd program.
+    ///
+    /// Rust opens its own descriptors with `O_CLOEXEC`, but a C library, a
+    /// dependency, or a descriptor inherited from our own parent can still be
+    /// inheritable. Without this hook an untrusted child (a stdio MCP server)
+    /// would receive those descriptors — a database handle, a listening
+    /// socket, a keychain pipe — and could read or write through them.
+    ///
+    /// The descriptors are marked close-on-exec rather than closed on the
+    /// spot. The spawn machinery keeps its own `O_CLOEXEC` pipe open across
+    /// this hook to report an `exec` failure back to the parent; closing it
+    /// here would turn every "command not found" into a silent success. With
+    /// the flag set, the kernel closes everything at the `exec` itself.
+    ///
+    /// # Safety
+    ///
+    /// Called between `fork` and `exec`, so it must only use async-signal-safe
+    /// calls. `fcntl`, `getrlimit`, and the raw `close_range` syscall qualify;
+    /// nothing here allocates or locks.
+    pub fn close_nonstdio_fds() -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            /// `CLOSE_RANGE_CLOEXEC` from `<linux/close_range.h>`.
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            // SAFETY: raw syscall taking only integers. On kernels without
+            // `close_range` (< 5.9) or without the CLOEXEC flag (< 5.11) it
+            // fails with ENOSYS/EINVAL and we fall back to the loop below.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    CLOSE_RANGE_CLOEXEC,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+        }
+        for fd in 3..fd_upper_bound() {
+            // SAFETY: FFI calls taking only integers. An fd that is not open
+            // fails with EBADF, which is the common case and harmless.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
+                // SAFETY: as above; sets a flag on an fd we just saw open.
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One past the highest descriptor number the process can hold.
+    ///
+    /// The soft `RLIMIT_NOFILE` bounds new descriptors. An unlimited or huge
+    /// limit is clamped so a spawn never spends seconds walking empty slots;
+    /// the clamp sits well above any per-process table macOS or Linux allow
+    /// by default.
+    fn fd_upper_bound() -> libc::c_int {
+        const CLAMP: libc::c_int = 1 << 20;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: FFI call writing into a local we own.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return CLAMP;
+        }
+        if limit.rlim_cur == libc::RLIM_INFINITY || limit.rlim_cur > CLAMP as libc::rlim_t {
+            CLAMP
+        } else {
+            limit.rlim_cur as libc::c_int
+        }
+    }
+
     /// Send `sig` to every process in `pgid`, falling back to per-member
     /// signalling when the group call is refused.
     ///
@@ -376,6 +453,67 @@ mod imp {
             signal_group_or_members(-1, libc::SIGKILL);
         }
 
+        /// Open `/dev/null` as an fd a child would inherit (no `FD_CLOEXEC`).
+        fn open_inheritable_fd() -> libc::c_int {
+            // SAFETY: FFI call with a NUL-terminated literal path.
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd > 2, "open failed: {}", std::io::Error::last_os_error());
+            // SAFETY: FFI calls on the fd we just opened.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                assert_ne!(
+                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                    -1
+                );
+            }
+            fd
+        }
+
+        /// Whether a `sh` child can see descriptor `fd`, with or without the hook.
+        fn child_sees_fd(fd: libc::c_int, with_hook: bool) -> bool {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(format!("[ -e /dev/fd/{fd} ]"));
+            if with_hook {
+                // SAFETY: `close_nonstdio_fds` is async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(close_nonstdio_fds);
+                }
+            }
+            cmd.status().expect("spawn sh").success()
+        }
+
+        /// Spec: a child spawned through the hook receives stdio only. The
+        /// control run without the hook proves the fd really was inheritable,
+        /// so the assertion cannot pass for the wrong reason.
+        #[test]
+        fn close_nonstdio_fds_keeps_an_inheritable_fd_out_of_the_child() {
+            let fd = open_inheritable_fd();
+            let leaked_without_hook = child_sees_fd(fd, false);
+            let leaked_with_hook = child_sees_fd(fd, true);
+            // SAFETY: closing the fd this test opened.
+            unsafe { libc::close(fd) };
+
+            assert!(leaked_without_hook, "control: the fd must be inheritable");
+            assert!(
+                !leaked_with_hook,
+                "the hook must keep fd {fd} out of the child"
+            );
+        }
+
+        /// Spec: the hook must not break exec-failure reporting. The spawn
+        /// machinery reports a failed exec over its own pipe; a hook that
+        /// closed that pipe would turn "command not found" into a success.
+        #[test]
+        fn close_nonstdio_fds_keeps_exec_failures_visible() {
+            let mut cmd = Command::new("/nonexistent/borg-no-such-binary");
+            // SAFETY: `close_nonstdio_fds` is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(close_nonstdio_fds);
+            }
+            let err = cmd.spawn().expect_err("exec of a missing binary must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+
         /// Spec: the fallback must reach a real group member. Enumerating and
         /// re-checking `getpgid` is what makes the EPERM path work, so exercise
         /// that machinery directly against a live child.
@@ -412,6 +550,8 @@ mod imp {
     }
 }
 
+#[cfg(unix)]
+pub use imp::close_nonstdio_fds;
 #[cfg(unix)]
 pub use imp::detach_from_tty;
 #[cfg(unix)]

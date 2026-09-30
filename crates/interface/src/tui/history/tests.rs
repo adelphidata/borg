@@ -1596,3 +1596,66 @@ fn sanitize_user_text_strips_control_sequences_but_keeps_text() {
     assert!(matches!(clean, std::borrow::Cow::Borrowed(_)));
     assert_eq!(&*clean, "just words 123");
 }
+
+#[test]
+fn unclosed_link_destination_start_finds_only_real_open_destinations() {
+    // (input, expected cut offset)
+    let cases: &[(&str, Option<usize>)] = &[
+        ("see [docs](https://exa", Some(10)),
+        ("see [docs](https://example.com) done", None),
+        ("![img](pic.pn", Some(6)),
+        // Balanced parens inside the URL do not close the destination.
+        ("[w](https://x/Foo_(bar)", Some(3)),
+        ("[w](https://x/Foo_(bar)) ok", None),
+        // Last unclosed destination wins over an earlier closed one.
+        ("[a](x) and [b](htt", Some(14)),
+        // Inside a closed code span: literal text, never a link.
+        ("use `[a](` here", None),
+        ("use ``x ` [a](`` here", None),
+        // Code span closes, then a real open link follows.
+        ("`c` [a](ht", Some(7)),
+        // Unclosed code span: scan stops, nothing is held back.
+        ("`[a](par", None),
+        // Escaped brackets are literal text.
+        ("\\[a\\](x", None),
+        ("[a\\](x", None),
+        // `](` with no opening `[` is not a link.
+        ("foo](bar", None),
+        ("plain text", None),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            unclosed_link_destination_start(input),
+            *expected,
+            "input: {input:?}"
+        );
+    }
+}
+
+#[test]
+fn streaming_preview_hides_unfinished_link_destination() {
+    let open = HistoryCell::assistant("see [docs](https://exa".to_string(), true);
+    let text = flatten_plain(&open.render(60, None));
+    assert!(text.contains("see [docs]"), "label stays visible: {text}");
+    assert!(
+        !text.contains("https"),
+        "partial URL must be held back: {text}"
+    );
+
+    let closed = HistoryCell::assistant("see [docs](https://example.com) ok".to_string(), true);
+    let text = flatten_plain(&closed.render(60, None));
+    assert!(text.contains("docs"), "closed link renders: {text}");
+    assert!(text.contains("ok"), "text after the link renders: {text}");
+    assert!(
+        !text.contains("]("),
+        "closed link is not raw markdown: {text}"
+    );
+
+    // Finalized cells never hold anything back.
+    let done = HistoryCell::assistant("see [docs](https://exa".to_string(), false);
+    let text = flatten_plain(&done.render(60, None));
+    assert!(
+        text.contains("https://exa"),
+        "finalized cell shows all: {text}"
+    );
+}

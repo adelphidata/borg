@@ -12,7 +12,6 @@ use identity::{KekStore, KeychainStore, PkiError};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::net::UnixStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 
@@ -112,7 +111,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
         .connect_with_connector(service_fn(move |_: Uri| {
             let p = path_owned.clone();
             async move {
-                let stream = UnixStream::connect(&p).await?;
+                let stream = protocols::uds::connect(&p).await?;
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }
         }))
@@ -187,7 +186,7 @@ fn spawn_detached_daemon() -> Result<()> {
 async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if path.exists() && UnixStream::connect(path).await.is_ok() {
+        if path.exists() && protocols::uds::connect(path).await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(SOCKET_POLL_INTERVAL).await;

@@ -542,7 +542,14 @@ async fn fetch_manifest(url: &str, timeout: Duration) -> anyhow::Result<Manifest
         .send()
         .await?
         .error_for_status()?;
-    let manifest: Manifest = resp.json().await?;
+    // Bounded read, and a parse error that never quotes the payload.
+    let bytes = crate::media::read_body_capped(
+        resp,
+        crate::constants::MODEL_CATALOG_MAX_BYTES,
+        "model catalog",
+    )
+    .await?;
+    let manifest: Manifest = crate::media::parse_json_body(&bytes, "model catalog")?;
     manifest.validate()?;
     Ok(manifest)
 }
@@ -1403,16 +1410,33 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn fetch_errors_on_malformed_body() {
-            let server = server_returning(serde_json::json!({"nope": true}), 200).await;
+        async fn fetch_errors_on_malformed_body_without_echoing_it() {
+            // A wrong-typed field makes serde quote the value in its own
+            // message; the fetch error must carry only position and size.
+            let body = serde_json::json!({"version": "tok-SECRET-VALUE", "providers": {}});
+            let server = server_returning(body, 200).await;
             let err = fetch_manifest(&url(&server), Duration::from_secs(2))
                 .await
                 .expect_err("malformed body must error");
-            assert!(
-                err.downcast_ref::<reqwest::Error>()
-                    .is_some_and(reqwest::Error::is_decode),
-                "expected a decode error, got: {err}"
-            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains("model catalog: invalid JSON"), "{msg}");
+            assert!(msg.contains("line 1"), "{msg}");
+            assert!(!msg.contains("SECRET"), "payload leaked: {msg}");
+        }
+
+        #[tokio::test]
+        async fn fetch_rejects_an_oversized_body() {
+            let server = MockServer::start().await;
+            let huge = "x".repeat(crate::constants::MODEL_CATALOG_MAX_BYTES as usize + 1);
+            Mock::given(method("GET"))
+                .and(path("/catalog.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+                .mount(&server)
+                .await;
+            let err = fetch_manifest(&url(&server), Duration::from_secs(5))
+                .await
+                .expect_err("oversized body must error");
+            assert!(err.to_string().contains("too large"), "{err}");
         }
 
         /// A well-formed but semantically invalid manifest must be rejected at

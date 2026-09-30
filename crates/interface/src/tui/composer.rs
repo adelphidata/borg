@@ -381,6 +381,20 @@ impl<'a> Composer<'a> {
         }
     }
 
+    /// Capture an unmodified Tab into an active paste burst. Without
+    /// bracketed paste a pasted tab arrives as a bare `KeyCode::Tab`, which
+    /// callers otherwise treat as popup completion or ignore mid-stream.
+    /// Callers that bind Tab must ask here first; returns `true` when the
+    /// Tab was consumed as pasted text.
+    pub fn capture_burst_tab(&mut self, key: &KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        key.code == KeyCode::Tab
+            && key.modifiers == KeyModifiers::NONE
+            && self
+                .paste_burst
+                .append_control_char_if_active('\t', Instant::now())
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -390,6 +404,11 @@ impl<'a> Composer<'a> {
         // match, keep in composer"; user presses Enter again to submit).
         if self.search.is_some() {
             return self.handle_search_key(key);
+        }
+
+        // Tab mid-burst is pasted whitespace, not a completion/focus key.
+        if self.capture_burst_tab(&key) {
+            return None;
         }
 
         // Ctrl+R enters reverse-incremental search.
@@ -402,7 +421,7 @@ impl<'a> Composer<'a> {
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 // During a paste burst, treat Enter as newline instead of submit
                 let now = Instant::now();
-                if self.paste_burst.append_newline_if_active(now) {
+                if self.paste_burst.append_control_char_if_active('\n', now) {
                     return None;
                 }
 
@@ -760,6 +779,22 @@ impl<'a> Composer<'a> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         self.set_text(text);
         self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Feed `text` through the paste-burst detector on a synthetic 1ms clock
+    /// so a burst is active on return regardless of real test timing. Chars
+    /// the detector does not buffer are inserted as normal typing, exactly as
+    /// `handle_key` would.
+    #[cfg(test)]
+    pub(crate) fn feed_paste_burst_for_test(&mut self, text: &str) {
+        use super::paste_burst::CharAction;
+        let t0 = Instant::now();
+        for (i, ch) in text.chars().enumerate() {
+            let at = t0 + std::time::Duration::from_millis(i as u64);
+            if let CharAction::Insert = self.paste_burst.on_char(ch, at) {
+                self.textarea.insert_char(ch);
+            }
+        }
     }
 
     /// Type text into the composer (for tests). Uses set_text to avoid paste burst detection.

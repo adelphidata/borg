@@ -73,11 +73,16 @@ impl PasteBurst {
         CharAction::Insert
     }
 
-    /// Append a newline to the buffer if a burst is active.
-    /// Returns true if the newline was captured (burst is active).
-    pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
+    /// Append a control character (`\n` from Enter, `\t` from Tab) to the
+    /// buffer if a burst is active. Without bracketed paste these arrive as
+    /// separate key events, not `KeyCode::Char`, so the caller routes them
+    /// here before treating them as submit/completion keys.
+    /// Returns true if the character was captured (burst is active). A
+    /// capture refreshes the burst clock so the idle flush does not split
+    /// the paste at the control character.
+    pub fn append_control_char_if_active(&mut self, ch: char, now: Instant) -> bool {
         if self.active {
-            self.buffer.push('\n');
+            self.buffer.push(ch);
             self.last_char_time = Some(now);
             true
         } else {
@@ -218,29 +223,53 @@ mod tests {
     }
 
     #[test]
-    fn test_newline_during_burst() {
-        let mut pb = PasteBurst::new();
-        let t0 = Instant::now();
+    fn test_control_chars_during_burst_are_kept_in_order() {
+        for ctrl in ['\n', '\t'] {
+            let mut pb = PasteBurst::new();
+            let t0 = Instant::now();
 
-        pb.on_char('a', t0);
-        pb.on_char('b', t0 + Duration::from_millis(1));
-        pb.on_char('c', t0 + Duration::from_millis(2));
-        assert!(pb.is_active());
+            pb.on_char('a', t0);
+            pb.on_char('b', t0 + Duration::from_millis(1));
+            pb.on_char('c', t0 + Duration::from_millis(2));
+            assert!(pb.is_active());
 
-        // Newline during burst should be captured
-        assert!(pb.append_newline_if_active(t0 + Duration::from_millis(3)));
+            assert!(pb.append_control_char_if_active(ctrl, t0 + Duration::from_millis(3)));
+            pb.on_char('d', t0 + Duration::from_millis(4));
 
-        pb.on_char('d', t0 + Duration::from_millis(4));
-
-        let result = pb.flush_immediate();
-        assert_eq!(result, Some("c\nd".to_string()));
+            let result = pb.flush_immediate();
+            assert_eq!(result, Some(format!("c{ctrl}d")), "ctrl {ctrl:?}");
+        }
     }
 
     #[test]
-    fn test_newline_not_captured_when_inactive() {
+    fn test_control_char_not_captured_when_inactive() {
         let mut pb = PasteBurst::new();
         let now = Instant::now();
-        assert!(!pb.append_newline_if_active(now));
+        assert!(!pb.append_control_char_if_active('\n', now));
+        assert!(!pb.append_control_char_if_active('\t', now));
+        assert!(pb.flush_immediate().is_none());
+    }
+
+    /// A control char refreshes the burst clock: a tick that would have
+    /// timed out relative to the last *plain* char must not flush while the
+    /// paste is still streaming its whitespace.
+    #[test]
+    fn test_control_char_refreshes_idle_deadline() {
+        let mut pb = PasteBurst::new();
+        let t0 = Instant::now();
+        pb.on_char('a', t0);
+        pb.on_char('b', t0 + Duration::from_millis(1));
+        pb.on_char('c', t0 + Duration::from_millis(2));
+
+        let tab_at = t0 + Duration::from_millis(2) + BURST_IDLE_TIMEOUT;
+        assert!(pb.append_control_char_if_active('\t', tab_at));
+        // Past the idle timeout measured from 'c', within it measured from Tab.
+        let probe = t0 + Duration::from_millis(3) + BURST_IDLE_TIMEOUT;
+        assert!(pb.flush_if_due(probe).is_none());
+        assert_eq!(
+            pb.flush_if_due(tab_at + BURST_IDLE_TIMEOUT + Duration::from_millis(1)),
+            Some("c\t".to_string())
+        );
     }
 
     #[test]

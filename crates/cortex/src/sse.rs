@@ -70,6 +70,10 @@ where
     F: FnMut(&str) -> SseAction,
 {
     let mut buffer = String::new();
+    // Network chunks split anywhere, including inside a multibyte character;
+    // the decoder holds an incomplete trailing sequence until the next chunk
+    // completes it instead of turning each half into U+FFFD.
+    let mut decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
 
     loop {
         let chunk = tokio::select! {
@@ -119,6 +123,7 @@ where
                         // newline on the final data line. Feed any remaining buffered
                         // content through parse_line once so we don't drop the last
                         // delta or the sentinel `[DONE]`.
+                        buffer.push_str(&decoder.flush());
                         let tail = buffer.trim();
                         if !tail.is_empty() && !tail.starts_with(':') {
                             match parse_line(tail) {
@@ -151,7 +156,7 @@ where
             }
         };
 
-        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+        buffer.push_str(&decoder.decode(chunk.as_ref()));
 
         if buffer.len() > max_buffer {
             return Err(LlmError::Retryable {
@@ -258,6 +263,59 @@ mod tests {
         assert!(result.is_ok());
         let e = rx.recv().await.unwrap();
         assert!(matches!(e, StreamEvent::TextDelta(ref s) if s == "hello"));
+    }
+
+    /// Collect every `TextDelta` from a byte-chunked stream whose data lines
+    /// are echoed back as text.
+    async fn decode_chunks(chunks: Vec<Vec<u8>>) -> String {
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let stream = stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        process_sse_stream(stream, &tx, &cancel, 0, 1024 * 1024, |line| {
+            match line.strip_prefix("data: ") {
+                Some(data) => SseAction::Emit(vec![StreamEvent::TextDelta(data.to_string())]),
+                None => SseAction::Continue,
+            }
+        })
+        .await
+        .expect("stream must complete");
+        drop(tx);
+        let mut out = String::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::TextDelta(t) = event {
+                out.push_str(&t);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn multibyte_char_split_across_chunks_decodes_intact() {
+        // Regression: each chunk was decoded on its own, so a character cut
+        // by a chunk boundary became U+FFFD. Split every multibyte char at
+        // every interior byte offset.
+        for text in ["héllo", "日本語", "ok 🦀 done"] {
+            let line = format!("data: {text}\n").into_bytes();
+            for split in 1..line.len() {
+                let (a, b) = line.split_at(split);
+                let got = decode_chunks(vec![a.to_vec(), b.to_vec()]).await;
+                assert_eq!(got, text, "split at byte {split}");
+            }
+        }
+        // One byte per chunk: a 4-byte char spans four chunks.
+        let bytes = "data: 🦀\n".as_bytes().iter().map(|b| vec![*b]).collect();
+        assert_eq!(decode_chunks(bytes).await, "🦀");
+    }
+
+    #[tokio::test]
+    async fn invalid_and_truncated_utf8_still_decode_lossily() {
+        // Genuinely invalid bytes are replaced, not held forever.
+        let got = decode_chunks(vec![b"data: a\xFFb\n".to_vec()]).await;
+        assert_eq!(got, "a\u{FFFD}b");
+        // A stream that ends mid-character surfaces one replacement char on
+        // the EOF flush rather than dropping the tail.
+        let got = decode_chunks(vec![b"data: x".to_vec(), vec![0xE6, 0x97]]).await;
+        assert_eq!(got, "x\u{FFFD}");
     }
 
     #[tokio::test]

@@ -523,10 +523,10 @@ fn handle_apply_patch_via_text_bridge(
         {
             return Ok(instruction_write_denied_message(&raw_path));
         }
-        let rel = resolved
-            .strip_prefix(ctx.workspace_root())
-            .map_err(|_| anyhow::anyhow!("path {} escaped workspace root", resolved.display()))?
-            .to_path_buf();
+        // Key staging and the writeback on the canonical path: the writeback
+        // rebuilds each path as `workspace_root.join(rel)`, so an alias such
+        // as macOS `/tmp` → `/private/tmp` must not survive into `originals`.
+        let (resolved, rel) = canonical_in_workspace(&resolved, ctx)?;
         resolved_paths.insert(raw_path, (resolved, rel));
     }
 
@@ -856,10 +856,7 @@ fn normalize_patch_paths_to_workspace_root(
         if let Some(normalized_move) = normalize_move_file_line_to_workspace_root(line, ctx)? {
             output.push_str(&normalized_move);
         } else if let Some((prefix, path)) = split_marker_line(line) {
-            let resolved = ctx.resolve_path_maybe_missing(path)?;
-            let rel = resolved.strip_prefix(ctx.workspace_root()).map_err(|_| {
-                anyhow::anyhow!("path {} escaped workspace root", resolved.display())
-            })?;
+            let (_, rel) = canonical_in_workspace(&ctx.resolve_path_maybe_missing(path)?, ctx)?;
             output.push_str(prefix);
             output.push_str(&rel.to_string_lossy());
         } else {
@@ -892,11 +889,27 @@ fn normalize_patch_path_fragment_to_workspace_root(
     path: &str,
     ctx: &ExecutionContext,
 ) -> Result<String> {
-    let resolved = ctx.resolve_path_maybe_missing(path)?;
-    let rel = resolved
-        .strip_prefix(ctx.workspace_root())
-        .map_err(|_| anyhow::anyhow!("path {} escaped workspace root", resolved.display()))?;
+    let (_, rel) = canonical_in_workspace(&ctx.resolve_path_maybe_missing(path)?, ctx)?;
     Ok(rel.to_string_lossy().to_string())
+}
+
+/// Canonical form of `path` and its location under the workspace root.
+///
+/// The workspace root is canonical, but a path to a file that does not exist
+/// yet comes back from resolution as typed. Through an alias — macOS `/tmp`
+/// is `/private/tmp` — it then shares no prefix with the root, and a new file
+/// in the workspace looks like an escape. Canonicalizing the existing
+/// ancestors first makes both sides agree.
+fn canonical_in_workspace(
+    path: &std::path::Path,
+    ctx: &ExecutionContext,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let canonical = crate::execution_context::synthesize_canonical_for_write(path)?;
+    let rel = canonical
+        .strip_prefix(ctx.workspace_root())
+        .map_err(|_| anyhow::anyhow!("path {} escaped workspace root", canonical.display()))?
+        .to_path_buf();
+    Ok((canonical, rel))
 }
 
 /// Split a patch DSL marker line into (prefix_with_space, path), if it's a path line.
@@ -999,6 +1012,52 @@ mod tests {
         assert!(result.contains("Patch applied successfully"));
         let writes = bridge.writes.lock().unwrap();
         assert_eq!(writes.get(&file).map(String::as_str), Some("new line\n"));
+    }
+
+    /// Spec: a patch may name workspace files through a symlinked alias of
+    /// the workspace (macOS `/tmp` is itself one, for `/private/tmp`). New
+    /// and existing files alike must land in the workspace, not be refused
+    /// as escapes because the typed path and the canonical root differ.
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_with_bridge_accepts_paths_through_a_symlinked_alias() {
+        let config = Config::default();
+        // Under `/tmp` so macOS adds its own `/tmp` alias on top of ours.
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = real.canonicalize().unwrap();
+        std::fs::write(root.join("old.txt"), "disk\n").unwrap();
+
+        let bridge = Arc::new(FakeTextBridge::default());
+        bridge
+            .reads
+            .lock()
+            .unwrap()
+            .insert(root.join("old.txt"), "old line\n".to_string());
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone())
+            .unwrap()
+            .with_text_file_bridge(Some(bridge.clone()));
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {alias}/new.rs\n+fn main() {{}}\n\
+             *** Update File: {alias}/old.txt\n@@\n-old line\n+new line\n*** End Patch",
+            alias = alias.display()
+        );
+
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(result.contains("Patch applied successfully"), "{result}");
+        let writes = bridge.writes.lock().unwrap();
+        assert_eq!(
+            writes.get(&root.join("new.rs")).map(String::as_str),
+            Some("fn main() {}")
+        );
+        assert_eq!(
+            writes.get(&root.join("old.txt")).map(String::as_str),
+            Some("new line\n")
+        );
     }
 
     #[test]

@@ -172,10 +172,16 @@ mod unix {
         // straight through us without a copy.
         let mut command = Command::new(&cmd);
         command.args(&args);
-        // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid`, both
+        // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid` and
+        // `close_nonstdio_fds` only `fcntl`/`getrlimit`/`close_range`, all
         // async-signal-safe, as `pre_exec` requires.
         unsafe {
-            command.pre_exec(crate::process_group::detach_from_tty);
+            command.pre_exec(|| {
+                crate::process_group::detach_from_tty()?;
+                // The server is untrusted third-party code: it gets stdio and
+                // nothing else this process happens to hold open.
+                crate::process_group::close_nonstdio_fds()
+            });
         }
         let mut child = match command.spawn() {
             Ok(c) => c,

@@ -2591,3 +2591,56 @@ fn bang_is_inert_when_shell_mode_is_disabled() {
         "with shell mode off, `!ls` is just text for the model"
     );
 }
+
+/// A non-bracketed paste delivers a tab as a bare `KeyCode::Tab` between the
+/// burst's `Char` events. In every state that binds Tab — streaming (no-op),
+/// command popup (accept completion), file popup (accept mention) — the tab
+/// must land in the pasted text and no completion may fire.
+#[test]
+fn tab_inside_paste_burst_is_pasted_not_bound() {
+    use crate::tui::file_popup::FileMatch;
+
+    type Setup = fn(&mut App<'static>);
+    let cases: &[(&str, &str, Setup)] = &[
+        ("streaming", "", |app| {
+            app.state = AppState::Streaming {
+                start: Instant::now(),
+            };
+        }),
+        ("command popup", "/", |app| {
+            app.command_popup.update_filter("/");
+            assert!(app.command_popup.selected_command().is_some());
+        }),
+        ("file popup", "@sr", |app| {
+            app.file_popup.set_pending_query("sr");
+            app.file_popup.apply_results(
+                "sr".to_string(),
+                vec![FileMatch {
+                    display: "src/main.rs".to_string(),
+                    full_path: std::path::PathBuf::from("/tmp/src/main.rs"),
+                    is_dir: false,
+                }],
+            );
+            assert!(app.file_popup.is_visible());
+        }),
+    ];
+
+    for (label, prefix, setup) in cases {
+        let mut app = make_app();
+        app.composer.set_text(prefix);
+        setup(&mut app);
+
+        app.composer.feed_paste_burst_for_test("abc");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        app.handle_key(key(KeyCode::Char('d'))).unwrap();
+        // A non-char key flushes the burst into the textarea.
+        app.handle_key(key(KeyCode::End)).unwrap();
+
+        assert_eq!(
+            app.composer.text(),
+            format!("{prefix}abc\td"),
+            "case: {label}"
+        );
+    }
+}

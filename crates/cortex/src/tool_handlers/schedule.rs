@@ -1050,6 +1050,40 @@ mod tests {
         assert_eq!(task.next_run, Some(stale));
     }
 
+    /// A run-now armed on an active task and then paused before the next
+    /// tick must not survive the pause: resuming would otherwise fire a run
+    /// nobody asked for.
+    #[tokio::test]
+    async fn pausing_a_task_drops_a_pending_run_now() {
+        let db = Database::test_db().await;
+        let later = chrono::Utc::now().timestamp() + 10_000;
+        seed_task(&db, "armed-then-paused", Some(later)).await;
+        assert!(db
+            .request_task_run_now("armed-then-paused")
+            .await
+            .expect("arm"));
+        db.update_task_status("armed-then-paused", tasks::TASK_STATUS_PAUSED)
+            .await
+            .expect("pause");
+        db.update_task_status("armed-then-paused", tasks::TASK_STATUS_ACTIVE)
+            .await
+            .expect("resume");
+        let row = db
+            .get_task_by_id("armed-then-paused")
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(!row.run_now_requested, "the pause must disarm run-now");
+        assert!(
+            db.claim_due_tasks(chrono::Utc::now().timestamp())
+                .await
+                .expect("claim")
+                .iter()
+                .all(|c| c.task.id != "armed-then-paused"),
+            "a resumed task must not fire a run armed before its pause"
+        );
+    }
+
     /// Resuming a recurring task must reschedule it from now: the stored
     /// `next_run` went stale while paused, and firing immediately on resume
     /// was the half-paused failure mode.

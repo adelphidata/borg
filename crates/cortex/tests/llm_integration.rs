@@ -306,6 +306,64 @@ async fn rate_limit_429() {
     }
 }
 
+/// Drive one `stream_chat` against a single canned response and return the
+/// error text it fails with.
+async fn stream_error_for(response: ResponseTemplate) -> String {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let config = test_config(&server.uri());
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, _rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("hi"), None, tx)
+        .await
+        .expect_err("request must fail")
+        .to_string()
+}
+
+#[tokio::test]
+async fn quota_429_fails_as_billing_not_rate_limit() {
+    let err = stream_error_for(ResponseTemplate::new(429).set_body_string(
+        r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+    ))
+    .await;
+    assert!(err.contains("billing error"), "got: {err}");
+}
+
+#[tokio::test]
+async fn oversized_error_body_is_not_read_past_the_cap() {
+    // The billing code sits at the front of a body over the 64 KiB cap. The
+    // capped read drops the whole body, so the 429 classifies on its status
+    // alone; an uncapped read would find the code and say "billing".
+    let body = format!(
+        r#"{{"error":{{"code":"insufficient_quota","message":"{}"}}}}"#,
+        "x".repeat(70 * 1024)
+    );
+    let err = stream_error_for(ResponseTemplate::new(429).set_body_string(body)).await;
+    assert!(err.contains("429 (rate limited)"), "got: {err}");
+}
+
+#[tokio::test]
+async fn mid_stream_error_chunk_fails_the_stream() {
+    // A 200 stream that reports an error chunk must fail, not end as a
+    // short successful reply.
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
+        r#"{"error":{"message":"You exceeded your current quota","code":"insufficient_quota"}}"#,
+    ]);
+    let err = stream_error_for(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(body),
+    )
+    .await;
+    assert!(err.contains("insufficient_quota"), "got: {err}");
+}
+
 // ── Test: auth error 401 ──
 
 #[tokio::test]

@@ -95,6 +95,7 @@ pub async fn open(
                 policy,
                 client_identity: client_identity.clone(),
                 ca_cert_path: ca_cert_path.clone(),
+                max_response_bytes: 0,
             };
             let t = sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))

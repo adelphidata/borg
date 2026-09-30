@@ -66,6 +66,27 @@ pub async fn read_body_capped(
     Ok(buf)
 }
 
+/// Deserialize a JSON response body without echoing any of it on failure.
+///
+/// A serde error's `Display` quotes offending values (`invalid type: string
+/// "…"`), and a remote body can hold tokens or anything else a server chose to
+/// send. The error keeps only the category, position, and byte length — enough
+/// to debug a bad payload, nothing of its content.
+pub(crate) fn parse_json_body<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    what: &str,
+) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "{what}: invalid JSON ({:?} error at line {}, column {}; {} bytes)",
+            e.classify(),
+            e.line(),
+            e.column(),
+            bytes.len()
+        )
+    })
+}
+
 /// Parse a data URI like `data:image/png;base64,abc123` into a MediaData struct.
 ///
 /// Validates the `;base64` marker is present and the data portion is non-empty.

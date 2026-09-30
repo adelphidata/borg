@@ -2635,6 +2635,11 @@ async fn open_transport(
         } => {
             let mut headers = headers.clone();
             auth.apply_to(&mut headers);
+            // Same ceiling as the streamable-HTTP body, applied per SSE event
+            // since the stream itself never ends.
+            let max_response_bytes = MAX_RESPONSE_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_mul(TRANSPORT_BODY_HEADROOM_FACTOR);
             let cfg = mcp::transport::sse::SseConfig {
                 server_name: manifest.name.clone(),
                 url: url.clone(),
@@ -2643,6 +2648,7 @@ async fn open_transport(
                 policy,
                 client_identity: client_identity.clone(),
                 ca_cert_path: ca_cert_path.clone(),
+                max_response_bytes,
             };
             let t = mcp::transport::sse::open(cfg, manifest.connect_timeout).await?;
             Ok(Box::new(t))

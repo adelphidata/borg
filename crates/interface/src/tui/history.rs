@@ -1044,6 +1044,69 @@ fn render_user_message(text: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Byte offset of the `(` that opens the last still-unclosed inline link
+/// destination in `s` (`[label](dest` with no matching `)` yet), or `None`
+/// when every destination is closed.
+///
+/// A small scanner, not a markdown parser: it skips backslash escapes and
+/// code spans (a backtick run up to the next run of the same length) so
+/// `` `[a](` `` and `\[a\](` are never mistaken for links. An unclosed
+/// backtick run ends the scan — mid-stream it is most likely a code span
+/// still arriving, and cutting inside it would hide code text. Parentheses
+/// nest inside a destination the way URLs such as `wiki/Foo_(bar)` need.
+pub(super) fn unclosed_link_destination_start(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut open_brackets = 0usize;
+    // Set only when the previous byte was a `]` that closed a `[`.
+    let mut after_label = false;
+    // `(` offset and nesting depth of the destination being scanned.
+    let mut dest: Option<(usize, usize)> = None;
+    while i < b.len() {
+        let byte = b[i];
+        let was_after_label = std::mem::take(&mut after_label);
+        match (byte, dest.as_mut()) {
+            (b'\\', _) => {
+                i += 2;
+                continue;
+            }
+            (b'(', Some((_, depth))) => *depth += 1,
+            (b')', Some((_, 0))) => dest = None,
+            (b')', Some((_, depth))) => *depth -= 1,
+            (_, Some(_)) => {}
+            (b'`', None) => {
+                let run = b[i..].iter().take_while(|&&c| c == b'`').count();
+                let mut j = i + run;
+                loop {
+                    if j >= b.len() {
+                        return None;
+                    }
+                    if b[j] == b'`' {
+                        let close = b[j..].iter().take_while(|&&c| c == b'`').count();
+                        j += close;
+                        if close == run {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            (b'[', None) => open_brackets += 1,
+            (b']', None) if open_brackets > 0 => {
+                open_brackets -= 1;
+                after_label = true;
+            }
+            (b'(', None) if was_after_label => dest = Some((i, 0)),
+            _ => {}
+        }
+        i += 1;
+    }
+    dest.map(|(start, _)| start)
+}
+
 /// Render an assistant message with the newline-gated streaming markdown
 /// cache. Finalized (non-streaming) cells collapse long bodies.
 fn render_assistant_message(
@@ -1088,8 +1151,18 @@ fn render_assistant_message(
         cache.committed_byte_len = commit_end;
         cache.cached_width = Some(inner_width);
     }
-    let pending_lines = if commit_end < visible_text.len() {
-        markdown::render_markdown(&visible_text[commit_end..], inner_width)
+    // While streaming, hold back an unfinished link destination: rendered
+    // early, `[label](https://parti` shows as raw markdown and then snaps to
+    // a styled link once `)` arrives. The held-back bytes appear on the next
+    // frame that closes the link (or at finalize).
+    let pending_end = if streaming {
+        unclosed_link_destination_start(&visible_text[commit_end..])
+            .map_or(visible_text.len(), |cut| commit_end + cut)
+    } else {
+        visible_text.len()
+    };
+    let pending_lines = if commit_end < pending_end {
+        markdown::render_markdown(&visible_text[commit_end..pending_end], inner_width)
     } else {
         Vec::new()
     };

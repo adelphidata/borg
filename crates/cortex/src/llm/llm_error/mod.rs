@@ -9,15 +9,16 @@ mod retry;
 
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
-    body_indicates_cloudflare_block, body_indicates_context_overflow,
-    body_indicates_expired_credential, body_indicates_image_unsupported,
-    body_indicates_malformed_tool_call, body_indicates_no_allowed_providers,
-    body_indicates_server_injected_param, body_mentions_model,
+    body_indicates_billing_exhaustion, body_indicates_cloudflare_block,
+    body_indicates_context_overflow, body_indicates_expired_credential,
+    body_indicates_image_unsupported, body_indicates_malformed_tool_call,
+    body_indicates_no_allowed_providers, body_indicates_server_injected_param,
+    body_indicates_slow_down, body_mentions_model,
 };
 
 pub use classify::{classify_402, classify_error_text};
 pub(crate) use classify::{classify_anthropic_stream_error, classify_network_error};
-pub(crate) use retry::override_retry_after;
+pub(crate) use retry::{in_loop_retry_delay, override_retry_after};
 pub use retry::{parse_retry_after, parse_retry_after_header, parse_retry_hint_from_body};
 
 /// Maximum bytes of provider response body retained in error messages.
@@ -302,6 +303,17 @@ pub(crate) fn classify_status(
     let safe = sanitize_body(body);
 
     match status.as_u16() {
+        // A 429 that names a spent balance or a spend cap is not a throttle:
+        // no cooldown clears it, so retrying (or honoring a short Retry-After)
+        // only re-probes a dead account. Fatal `Billing` sends the credential
+        // to the long billing bench instead.
+        429 if body_indicates_billing_exhaustion(body) => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} returned 429 (billing error: quota or spend limit exhausted): {safe}"
+            ),
+            reason: FailoverReason::Billing,
+            status: Some(status.as_u16()),
+        },
         429 => LlmError::Retryable {
             source: anyhow::anyhow!("{provider} returned 429 (rate limited): {safe}"),
             retry_after,
@@ -322,6 +334,14 @@ pub(crate) fn classify_status(
             source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
+            status: Some(status.as_u16()),
+        },
+        // `slow_down` is a throttle that borrowed the outage status: honor
+        // the provider's back-off hint and treat it as a rate limit.
+        503 if body_indicates_slow_down(body) => LlmError::Retryable {
+            source: anyhow::anyhow!("{provider} returned {status} (rate limited: slow down): {safe}"),
+            retry_after,
+            reason: FailoverReason::RateLimit,
             status: Some(status.as_u16()),
         },
         503 => LlmError::Retryable {
@@ -600,6 +620,114 @@ mod tests {
         );
         assert!(err.is_retryable());
         assert_eq!(err.reason(), FailoverReason::RateLimit);
+    }
+
+    #[test]
+    fn classify_429_splits_account_exhaustion_from_throttling() {
+        // (body, expect fatal billing). Account exhaustion never clears on a
+        // cooldown, so it must not be retried; a per-window throttle must.
+        let cases: &[(&str, bool)] = &[
+            // Structured `error.code` / `error.type`.
+            (
+                r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+                true,
+            ),
+            (r#"{"error":{"code":"credit_balance_exhausted"}}"#, true),
+            (
+                r#"{"error":{"code":"organization_spend_limit_exceeded"}}"#,
+                true,
+            ),
+            (r#"{"error":{"code":"project_spend_limit_exceeded"}}"#, true),
+            (
+                r#"{"error":{"code":"organization_usage_limit_exceeded"}}"#,
+                true,
+            ),
+            (r#"{"error":{"type":"billing_hard_limit_reached"}}"#, true),
+            // Aggregator re-wrap: numeric code, upstream error as prose.
+            (
+                r#"{"error":{"code":429,"message":"upstream: insufficient_quota"}}"#,
+                true,
+            ),
+            ("You exceeded your current quota", true),
+            // Throttles stay retryable.
+            (
+                r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached on tokens per min (TPM)"}}"#,
+                false,
+            ),
+            // A structured throttle code is authoritative over billing prose.
+            (
+                r#"{"error":{"code":"rate_limit_exceeded","message":"see insufficient_quota docs"}}"#,
+                false,
+            ),
+            // Gemini per-minute quota: "quota exceeded" wording, still a throttle.
+            (
+                r#"{"error":{"code":429,"message":"Quota exceeded for metric generate_content_requests per minute","status":"RESOURCE_EXHAUSTED"}}"#,
+                false,
+            ),
+            // Gemini free-tier throttle reuses the OpenAI quota sentence.
+            (
+                r#"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"37s"}]}}"#,
+                false,
+            ),
+            ("", false),
+        ];
+        for (body, billing) in cases {
+            let err = classify_status(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body,
+                Provider::OpenAi,
+            );
+            assert_eq!(err.status_code(), Some(429), "{body}");
+            if *billing {
+                assert!(!err.is_retryable(), "billing 429 must be fatal: {body}");
+                assert_eq!(err.reason(), FailoverReason::Billing, "{body}");
+                // The rendered message must re-classify as billing on the
+                // text-only paths (error_format, scheduled-task retry).
+                assert_eq!(
+                    classify_error_text(&err.to_string()),
+                    Some(FailoverReason::Billing),
+                    "{body}"
+                );
+            } else {
+                assert!(err.is_retryable(), "throttle 429 must retry: {body}");
+                assert_eq!(err.reason(), FailoverReason::RateLimit, "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn classify_503_slow_down_is_a_rate_limit_with_its_hint() {
+        // (body, expected reason, expected retry_after)
+        let cases: &[(&str, FailoverReason, Option<Duration>)] = &[
+            (
+                r#"{"error":{"code":"slow_down","message":"Please reduce your request rate","retry_after":12}}"#,
+                FailoverReason::RateLimit,
+                Some(Duration::from_secs(12)),
+            ),
+            (
+                r#"{"error":{"code":"slow_down"}}"#,
+                FailoverReason::RateLimit,
+                None,
+            ),
+            // A plain outage keeps the Overloaded path and no hint.
+            (
+                r#"{"error":{"code":"service_unavailable","retry_after":12}}"#,
+                FailoverReason::Overloaded,
+                None,
+            ),
+            ("", FailoverReason::Overloaded, None),
+        ];
+        for (body, reason, retry_after) in cases {
+            let err = classify_status(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                body,
+                Provider::OpenAi,
+            );
+            assert!(err.is_retryable(), "{body}");
+            assert_eq!(err.reason(), *reason, "{body}");
+            assert_eq!(err.retry_after(), *retry_after, "{body}");
+            assert_eq!(err.status_code(), Some(503), "{body}");
+        }
     }
 
     #[test]
@@ -891,9 +1019,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_header_rejects_zero_and_negative() {
-        assert_eq!(parse_retry_after_header("0"), None);
+    fn parse_retry_after_header_zero_means_retry_now_and_negative_is_rejected() {
+        // `0` is the provider saying "retry now" — a zero delay, not `None`
+        // (which would fall back to the slower local backoff schedule).
+        assert_eq!(parse_retry_after_header("0"), Some(Duration::ZERO));
         assert_eq!(parse_retry_after_header("-5"), None);
+        assert_eq!(parse_retry_after_header("NaN"), None);
+    }
+
+    #[test]
+    fn in_loop_retry_delay_floors_zero_hints_but_keeps_real_ones() {
+        // `Retry-After: 0` must not turn the retry loop into a tight spin.
+        let zero = parse_retry_after_header("0").expect("0 parses");
+        assert_eq!(in_loop_retry_delay(zero), Duration::from_millis(250));
+        assert_eq!(
+            in_loop_retry_delay(Duration::from_millis(10)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            in_loop_retry_delay(Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_header_reads_http_date_forms() {
+        use chrono::Utc;
+        let fmt = |t: chrono::DateTime<Utc>| t.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let now = Utc::now();
+
+        // Future date: the delay is the time left until it (allow slack for
+        // the second-granular format and the test's own runtime).
+        let future = parse_retry_after_header(&fmt(now + chrono::Duration::seconds(120)))
+            .expect("a future HTTP-date parses");
+        assert!(
+            (Duration::from_secs(118)..=Duration::from_secs(120)).contains(&future),
+            "future HTTP-date must map to ~120s, got {future:?}"
+        );
+
+        // Past date: retry now, not `None`.
+        assert_eq!(
+            parse_retry_after_header(&fmt(now - chrono::Duration::seconds(600))),
+            Some(Duration::ZERO)
+        );
+
+        // Far future: clamped to the 24h ceiling like the seconds form.
+        assert_eq!(
+            parse_retry_after_header(&fmt(now + chrono::Duration::days(30))),
+            Some(Duration::from_secs(86_400))
+        );
     }
 
     #[test]
@@ -904,15 +1078,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_header_rejects_non_numeric() {
-        // HTTP-date form is technically valid per RFC 7231 but we don't
-        // parse it — providers we talk to always emit the seconds form.
-        assert_eq!(
-            parse_retry_after_header("Wed, 21 Oct 2026 07:28:00 GMT"),
-            None
-        );
+    fn parse_retry_after_header_rejects_garbage() {
         assert_eq!(parse_retry_after_header(""), None);
         assert_eq!(parse_retry_after_header("abc"), None);
+        assert_eq!(
+            parse_retry_after_header("Wed, 99 Oct 2026 07:28:00 GMT"),
+            None
+        );
     }
 
     // ── override_retry_after ──
@@ -930,6 +1102,26 @@ mod tests {
             assert_eq!(retry_after, Some(Duration::from_secs(300)));
         } else {
             panic!("variant preserved");
+        }
+    }
+
+    #[test]
+    fn override_retry_after_keeps_the_http_status() {
+        // Regression: the header override rebuilt the error with
+        // `status: None`, so the pool recorded a benched key with no status.
+        for (code, body) in [
+            (429u16, r#"{"error":{"message":"slow"}}"#),
+            (503, r#"{"error":{"code":"slow_down"}}"#),
+            (503, "upstream down"),
+        ] {
+            let err = classify_status(
+                reqwest::StatusCode::from_u16(code).unwrap(),
+                body,
+                Provider::OpenAi,
+            );
+            let overridden = override_retry_after(err, Some(Duration::from_secs(7)));
+            assert_eq!(overridden.status_code(), Some(code), "status for {code}");
+            assert_eq!(overridden.retry_after(), Some(Duration::from_secs(7)));
         }
     }
 
@@ -1355,6 +1547,16 @@ mod tests {
         (
             r#"HTTP 429 {"error":{"code":"organization_usage_limit_exceeded"}}"#,
             FailoverReason::Billing,
+        ),
+        (
+            r#"HTTP 429 {"error":{"type":"billing_hard_limit_reached"}}"#,
+            FailoverReason::Billing,
+        ),
+        ("Project spend limit exceeded", FailoverReason::Billing),
+        // A 503 back-off code is a throttle, not an outage.
+        (
+            r#"HTTP 503 {"error":{"code":"slow_down"}}"#,
+            FailoverReason::RateLimit,
         ),
         // The same status with a genuine window code stays a rate limit.
         (

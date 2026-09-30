@@ -101,6 +101,17 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
         // inherits this filtered env and passes it to the real server.
         .env_clear();
 
+    // Only stdio crosses into the child. Without this, any inheritable fd the
+    // daemon holds (a socket, a database handle a C library opened without
+    // `O_CLOEXEC`) is handed to untrusted server code. Applies to the
+    // watchdog too, which re-applies it to the real server it spawns.
+    // SAFETY: `close_nonstdio_fds` only calls async-signal-safe
+    // `fcntl`/`getrlimit`/`close_range`, as `pre_exec` requires.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(crate::process_group::close_nonstdio_fds);
+    }
+
     for (key, value) in std::env::vars() {
         if is_env_allowed(&key) {
             let value = super::absolutize_ca_path(&key, &value);

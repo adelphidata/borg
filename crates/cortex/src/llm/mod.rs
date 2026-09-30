@@ -2700,13 +2700,19 @@ impl LlmClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(crate::llm::llm_error::parse_retry_after_header);
-            // Bound the error-body read too — an error status with a stalled
-            // body must not hang the failover chain. Best-effort: a timeout
-            // degrades to classifying on the status alone.
-            let body = match tokio::time::timeout(timeout, response.text()).await {
-                Ok(Ok(text)) => text,
+            // Bound the error-body read in time and size — an error status
+            // with a stalled or huge body must not hang the failover chain or
+            // buffer megabytes. Best-effort: either failure degrades to
+            // classifying on the status alone.
+            let read = crate::media::read_body_capped(
+                response,
+                crate::constants::LLM_ERROR_BODY_MAX_BYTES,
+                "error response",
+            );
+            let body = match tokio::time::timeout(timeout, read).await {
+                Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
                 Ok(Err(e)) => {
-                    tracing::warn!("Failed to read error response body: {e}");
+                    tracing::warn!("Failed to read error response body: {e:#}");
                     String::new()
                 }
                 Err(_) => {
@@ -3260,12 +3266,15 @@ impl LlmClient {
                             bail!("{}", last_error.unwrap_or_default());
                         }
 
-                        let delay = e.retry_after().unwrap_or_else(|| {
-                            backoff_with_config(
-                                attempt,
-                                &backoff_config_for(e.reason(), initial_delay),
-                            )
-                        });
+                        let delay = e
+                            .retry_after()
+                            .map(crate::llm::llm_error::in_loop_retry_delay)
+                            .unwrap_or_else(|| {
+                                backoff_with_config(
+                                    attempt,
+                                    &backoff_config_for(e.reason(), initial_delay),
+                                )
+                            });
                         info!(
                             "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
                             attempt + 1,

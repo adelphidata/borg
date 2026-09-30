@@ -74,13 +74,35 @@ fn push_subpath_rule(
     operation: &str,
     path: &str,
 ) -> Result<(), String> {
+    push_path_rule(profile, path, |p| {
+        format!("({effect} {operation} (subpath \"{p}\"))\n")
+    })
+}
+
+/// Deny `connect(2)` to any unix socket at or below `path`, in both the raw
+/// and the symlink-resolved spelling.
+///
+/// Verified against `sandbox-exec`: the socket filter is matched against the
+/// resolved path, so a rule on `/tmp/x` alone does not stop a connect to a
+/// socket there — only the `/private/tmp/x` form does.
+fn push_unix_connect_deny(profile: &mut String, path: &str) -> Result<(), String> {
+    push_path_rule(profile, path, |p| {
+        format!("(deny network-outbound (remote unix-socket (subpath \"{p}\")))\n")
+    })
+}
+
+/// Shared body of the path-rule emitters: validate `path`, emit `render(path)`,
+/// then `render(resolved)` when symlink resolution changes it.
+fn push_path_rule(
+    profile: &mut String,
+    path: &str,
+    render: impl Fn(&str) -> String,
+) -> Result<(), String> {
     validate_seatbelt_path(path)?;
-    profile.push_str(&format!("({effect} {operation} (subpath \"{path}\"))\n"));
+    profile.push_str(&render(path));
     let resolved = resolve_symlinks_best_effort(Path::new(path));
     if resolved != path && validate_seatbelt_path(&resolved).is_ok() {
-        profile.push_str(&format!(
-            "({effect} {operation} (subpath \"{resolved}\"))\n"
-        ));
+        profile.push_str(&render(&resolved));
     }
     Ok(())
 }
@@ -156,6 +178,9 @@ fn push_rename_guards(profile: &mut String, protected: &[String]) {
     }
 }
 
+/// Refuses every XPC service name while leaving plain Mach lookups allowed.
+const XPC_DENY_RULE: &str = "(deny mach-lookup (xpc-service-name-prefix \"\"))\n";
+
 /// Generate a macOS Seatbelt profile string for sandbox-exec.
 ///
 /// `runtime_bin` is the absolute path to the runtime binary (e.g.
@@ -219,6 +244,13 @@ pub fn generate_profile(
     profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow sysctl-read)\n");
     profile.push_str("(allow mach-lookup)\n");
+    // The blanket lookup above also resolves XPC services, and an XPC service
+    // runs *outside* this profile with its own entitlements — a sandboxed child
+    // that reaches one borrows whatever that service may do. Runtimes need
+    // plain Mach services (notifyd, logd, opendirectoryd) to start, but no XPC
+    // service, so refuse the whole XPC namespace. Placed directly after the
+    // allow: under last-match-wins this deny carves XPC out of it.
+    profile.push_str(XPC_DENY_RULE);
 
     // Allow unrestricted file reads — runtimes need to read from many system
     // paths for dynamic linking, config, locale, etc. The security boundary is
@@ -313,6 +345,18 @@ pub fn generate_profile(
 
     if policy.network {
         profile.push_str("(allow network*)\n");
+    }
+
+    // `(allow network*)` covers `connect(2)` on a unix socket, and no file rule
+    // stops it — so a sandboxed child could connect to borgd's control socket in
+    // `~/.borg` and drive the daemon as the user. POSIX requires write
+    // permission on the socket file to connect, so a `deny_write` path is exactly
+    // the set a sandboxed child has no business connecting into; the policy
+    // always carries `~/.borg` there (`with_borg_dir_protected`). Emitted after
+    // the network allow so these win, and unconditionally so a later, narrower
+    // network allow cannot reopen them.
+    for path in &policy.deny_write {
+        push_unix_connect_deny(&mut profile, path)?;
     }
 
     // A sandboxed child inherits our controlling terminal. `TIOCSTI` lets it
@@ -1369,6 +1413,238 @@ mod tests {
         assert!(
             sandboxed.contains("STI ERR"),
             "a sandboxed child injected keystrokes into its terminal: {sandboxed:?}"
+        );
+    }
+
+    /// Spec: the XPC deny must win over the blanket `(allow mach-lookup)`.
+    /// Under last-match-wins that means it comes after the allow; before it,
+    /// the allow would swallow it and every XPC service would stay reachable.
+    #[test]
+    fn xpc_services_are_denied_after_the_mach_lookup_allow() {
+        let profile = generate_profile(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            TEST_RUNTIME_BIN,
+        )
+        .unwrap();
+        let allow = profile
+            .find("(allow mach-lookup)")
+            .expect("runtimes need plain Mach lookups");
+        let deny = profile
+            .find("(deny mach-lookup (xpc-service-name-prefix \"\"))")
+            .unwrap_or_else(|| panic!("XPC services must be denied:\n{profile}"));
+        assert!(
+            deny > allow,
+            "the XPC deny is shadowed by the allow:\n{profile}"
+        );
+    }
+
+    /// Absolute path of `name` on `PATH`, or `None` when it is not installed.
+    #[cfg(target_os = "macos")]
+    fn find_on_path(name: &str) -> Option<String> {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("command -v {name}")])
+            .output()
+            .ok()?;
+        let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && found.starts_with('/')).then_some(found)
+    }
+
+    /// Spec, against the real kernel: denying XPC must not stop the runtimes
+    /// borg actually sandboxes from starting and doing ordinary work (TLS
+    /// setup, JSON, a subprocess). A deny that breaks `python3` or `node` is a
+    /// regression even if it is more secure.
+    ///
+    /// Each runtime first runs under the same profile *minus* the XPC rule. A
+    /// `PATH` runtime that already fails there (Homebrew Python re-execs a
+    /// `Python.app` outside the exec allow-list) is skipped with a message —
+    /// that failure is not this rule's, and asserting through it would say
+    /// nothing. `/bin/sh` and `/usr/bin/perl` ship with macOS and must pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn common_runtimes_still_start_under_the_xpc_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy {
+            network: true,
+            fs_write: vec![tmp.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut cases: Vec<(String, Vec<&str>, bool)> = vec![
+            (
+                "/bin/sh".to_string(),
+                vec![
+                    "-c",
+                    "echo $((40 + 2)); /bin/ls / >/dev/null && echo listed",
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/perl".to_string(),
+                vec!["-e", "print 40 + 2, qq(\\n); print `/bin/echo listed`"],
+                true,
+            ),
+        ];
+        // `/usr/bin/python3` is not used: it is an `xcrun` shim that execs the
+        // Command Line Tools copy, which the exec allow-list refuses whether or
+        // not XPC is denied. The `python3` borg resolves from `PATH` is the one
+        // that runs in practice.
+        for name in ["python3", "node"] {
+            let Some(bin) = find_on_path(name) else {
+                eprintln!("skipping {name}: not installed on this host");
+                continue;
+            };
+            let args = if name == "node" {
+                vec![
+                    "-e",
+                    "require('crypto').randomBytes(4); console.log(42); \
+                     console.log(require('child_process').execFileSync('/bin/echo', ['listed']).toString().trim())",
+                ]
+            } else {
+                vec![
+                    "-c",
+                    "import ssl, json, subprocess; ssl.create_default_context(); \
+                     print(json.dumps(42)); print(subprocess.check_output(['/bin/echo', 'listed']).decode().strip())",
+                ]
+            };
+            cases.push((bin, args, false));
+        }
+
+        let run = |profile: &str, bin: &str, args: &[&str]| {
+            let out = std::process::Command::new("sandbox-exec")
+                .arg("-p")
+                .arg(profile)
+                .arg(bin)
+                .args(args)
+                .output()
+                .expect("sandbox-exec must be present on macOS");
+            let ok =
+                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "42\nlisted";
+            (ok, String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+
+        for (bin, args, required) in cases {
+            let profile = generate_profile(&policy, tmp.path(), &bin).unwrap();
+            let control = profile.replacen(XPC_DENY_RULE, "", 1);
+            assert_ne!(control, profile, "the profile must carry the XPC rule");
+
+            let (control_ok, control_err) = run(&control, &bin, &args);
+            if !control_ok {
+                assert!(
+                    !required,
+                    "{bin} fails even without the XPC rule: {control_err}"
+                );
+                eprintln!("skipping {bin}: fails without the XPC rule too: {control_err}");
+                continue;
+            }
+            let (ok, err) = run(&profile, &bin, &args);
+            assert!(
+                ok,
+                "{bin} starts without the XPC rule but not with it: {err}"
+            );
+        }
+    }
+
+    /// Spec: `connect(2)` into a `deny_write` path is denied for unix sockets,
+    /// after the network allow so the allow cannot shadow it, and in both the
+    /// raw and resolved spelling.
+    #[test]
+    fn unix_socket_connects_into_denied_write_paths_are_refused() {
+        let policy = SandboxPolicy {
+            network: true,
+            deny_write: vec!["/tmp/borg-home".to_string()],
+            ..Default::default()
+        };
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        let network = profile.find("(allow network*)").unwrap();
+        for form in ["/tmp/borg-home", "/private/tmp/borg-home"] {
+            let rule = format!("(deny network-outbound (remote unix-socket (subpath \"{form}\")))");
+            let at = profile
+                .find(&rule)
+                .unwrap_or_else(|| panic!("missing {rule}:\n{profile}"));
+            assert!(at > network, "{rule} is shadowed by the network allow");
+        }
+    }
+
+    /// Spec: a policy with the borg dir protected refuses connects to the
+    /// daemon's own sockets. This is the path that matters — `borgd.sock`
+    /// lives directly in `~/.borg`.
+    #[test]
+    fn a_borg_protected_policy_refuses_connects_into_the_borg_dir() {
+        let Some(home) = expressible_home() else {
+            return;
+        };
+        let policy = SandboxPolicy {
+            network: true,
+            ..Default::default()
+        }
+        .with_borg_dir_protected();
+        let profile =
+            generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(deny network-outbound (remote unix-socket (subpath \"{home}/.borg\")))"
+            )),
+            "the daemon socket dir must be unreachable:\n{profile}"
+        );
+    }
+
+    /// Spec, against the real kernel: a sandboxed child with network access
+    /// cannot connect to a unix socket inside a `deny_write` directory, while a
+    /// socket outside it still works — so the deny is real and not just a
+    /// broken network stack. The directory is the raw temp path (`/var/…`, a
+    /// symlink to `/private/var/…`), which is the spelling that fails silently
+    /// if only the raw form is emitted. Never touches the real `~/.borg`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_refuses_unix_connects_into_a_protected_dir_end_to_end() {
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let protected = tmp.path().join("prot");
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&protected).unwrap();
+        std::fs::create_dir(&open).unwrap();
+        let protected_sock = protected.join("d.sock");
+        let open_sock = open.join("d.sock");
+        let _protected_listener = UnixListener::bind(&protected_sock).unwrap();
+        let _open_listener = UnixListener::bind(&open_sock).unwrap();
+
+        let policy = SandboxPolicy {
+            network: true,
+            deny_write: vec![protected.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let profile = generate_profile(&policy, tmp.path(), "/usr/bin/perl").unwrap();
+        let connect = |sock: &Path| {
+            std::process::Command::new("sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .args([
+                    "/usr/bin/perl",
+                    "-e",
+                    "use Socket; socket(my $s, PF_UNIX, SOCK_STREAM, 0) or die qq($!\\n); \
+                     connect($s, pack_sockaddr_un($ARGV[0])) or die qq($!\\n); print qq(connected\\n)",
+                ])
+                .arg(sock)
+                .output()
+                .expect("sandbox-exec must be present on macOS")
+        };
+
+        let open_out = connect(&open_sock);
+        assert!(
+            open_out.status.success(),
+            "control: a socket outside the protected dir must stay reachable: {}",
+            String::from_utf8_lossy(&open_out.stderr)
+        );
+        let protected_out = connect(&protected_sock);
+        assert!(
+            !protected_out.status.success(),
+            "a sandboxed child connected to a socket in a protected dir"
+        );
+        assert!(
+            String::from_utf8_lossy(&protected_out.stderr).contains("Operation not permitted"),
+            "the connect must fail on the sandbox, not on something else: {}",
+            String::from_utf8_lossy(&protected_out.stderr)
         );
     }
 }

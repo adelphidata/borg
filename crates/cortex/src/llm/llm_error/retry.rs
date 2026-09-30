@@ -11,33 +11,68 @@ use super::LlmError;
 /// (`retry_after: 999999999`) must not park a credential for a month.
 const MAX_RETRY_SECS: u64 = 24 * 60 * 60;
 
-/// Parse an HTTP `Retry-After` header value. RFC 7231 allows two forms:
-/// a delta in seconds (e.g. `"300"`) or an HTTP-date. We accept the seconds
-/// form (provider servers we talk to use it exclusively) and clamp to a
-/// 24-hour ceiling so a degenerate `Retry-After: 99999999` can't park a
-/// credential for a month.
+/// Parse an HTTP `Retry-After` header value. RFC 9110 allows two forms: a
+/// delta in seconds (e.g. `"300"`) or an HTTP-date
+/// (`"Wed, 21 Oct 2026 07:28:00 GMT"`), read as the time left until that
+/// instant. Both clamp to a 24-hour ceiling so a degenerate
+/// `Retry-After: 99999999` can't park a credential for a month.
+///
+/// `Retry-After: 0` and a date already in the past mean "retry now", so they
+/// return a zero delay rather than `None` — `None` would hand the decision to
+/// the local backoff schedule and wait longer than the provider asked.
+/// Negative, non-finite, and unparseable values return `None`.
 pub fn parse_retry_after_header(value: &str) -> Option<Duration> {
-    let secs: f64 = value.trim().parse().ok()?;
-    if !secs.is_finite() || secs <= 0.0 {
-        return None;
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<f64>() {
+        if !secs.is_finite() || secs < 0.0 {
+            return None;
+        }
+        return Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)));
     }
-    Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)))
+    retry_after_http_date(value, chrono::Utc::now())
+}
+
+/// Delay until an HTTP-date `Retry-After` value, measured from `now`. The
+/// IMF-fixdate form every current server emits is an RFC 2822 date with a
+/// `GMT` zone, which chrono's RFC 2822 parser reads directly.
+fn retry_after_http_date(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta_ms = (at.with_timezone(&chrono::Utc) - now).num_milliseconds();
+    let delta_ms = delta_ms.clamp(0, (MAX_RETRY_SECS * 1000) as i64);
+    Some(Duration::from_millis(delta_ms as u64))
+}
+
+/// Shortest in-loop wait the request retry path honours. A provider (or proxy)
+/// that always answers `Retry-After: 0` would otherwise burn every retry in a
+/// few milliseconds.
+const MIN_IN_LOOP_RETRY: Duration = Duration::from_millis(250);
+
+/// Delay the request retry loop sleeps for a provider hint: the hint itself,
+/// floored at [`MIN_IN_LOOP_RETRY`].
+pub(crate) fn in_loop_retry_delay(hint: Duration) -> Duration {
+    hint.max(MIN_IN_LOOP_RETRY)
 }
 
 /// Replace the `retry_after` field on a `Retryable` error with the supplied
 /// override. Used by the request path to plumb the HTTP `Retry-After` header
 /// in after `classify_status` has already inspected the body. Header wins
-/// when both are present (it's authoritative from the provider).
+/// when both are present (it's authoritative from the provider). The HTTP
+/// status is kept: the pool records it on the benched credential.
 pub(crate) fn override_retry_after(err: LlmError, override_value: Option<Duration>) -> LlmError {
     let Some(ra) = override_value else {
         return err;
     };
     match err {
-        LlmError::Retryable { source, reason, .. } => LlmError::Retryable {
+        LlmError::Retryable {
+            source,
+            reason,
+            status,
+            ..
+        } => LlmError::Retryable {
             source,
             retry_after: Some(ra),
             reason,
-            status: None,
+            status,
         },
         other => other,
     }

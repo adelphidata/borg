@@ -9,10 +9,12 @@
 use super::Transport;
 use crate::errors::{McpError, Result};
 use crate::protocol::Message;
-use crate::transport::http::{build_client, resolve_endpoint, HttpPolicy};
+use crate::transport::http::{
+    build_client, resolve_endpoint, HttpPolicy, DEFAULT_MAX_RESPONSE_BYTES,
+};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -39,6 +41,12 @@ pub struct SseConfig {
     /// Optional PEM bundle of extra certificate authorities to trust, added to
     /// the built-in roots. Loaded at connect time.
     pub ca_cert_path: Option<String>,
+    /// Hard cap on the bytes of a single SSE event (one blank-line-delimited
+    /// frame). The stream is long-lived, so the whole body cannot be capped;
+    /// the per-frame bound is what stops a server from growing one event
+    /// without end. 0 means "unset" and falls back to
+    /// [`DEFAULT_MAX_RESPONSE_BYTES`].
+    pub max_response_bytes: usize,
 }
 
 /// Connected SSE transport.
@@ -111,7 +119,12 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
         )));
     }
 
-    let mut stream = resp.bytes_stream().eventsource();
+    let frame_cap = if config.max_response_bytes == 0 {
+        DEFAULT_MAX_RESPONSE_BYTES
+    } else {
+        config.max_response_bytes
+    };
+    let mut stream = Box::pin(cap_sse_frames(resp.bytes_stream(), frame_cap).eventsource());
     let (tx, rx) = mpsc::channel::<Message>(64);
 
     // Wait for the first `endpoint` event so we know where to POST.
@@ -240,6 +253,112 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
     })
 }
 
+/// Error from the capped SSE byte stream.
+#[derive(Debug)]
+enum SseBodyError<E> {
+    /// The underlying body stream failed.
+    Transport(E),
+    /// One event grew past the cap before its terminating blank line.
+    FrameTooLarge { cap: usize },
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SseBodyError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "{e}"),
+            Self::FrameTooLarge { cap } => {
+                write!(f, "sse event exceeds max_response_bytes ({cap} bytes)")
+            }
+        }
+    }
+}
+
+/// Byte counter for the SSE event currently in flight.
+///
+/// An event ends at a blank line. Lines end in LF, CR, or CRLF, and a CRLF can
+/// be split across two chunks, so the state carries over between
+/// [`FrameLimit::feed`] calls.
+struct FrameLimit {
+    cap: usize,
+    /// Bytes of the current event, line terminators excluded.
+    frame_len: usize,
+    /// True when no byte has arrived on the current line yet.
+    at_line_start: bool,
+    /// The previous byte was a CR, so an LF right after it closes the same
+    /// line rather than adding a blank one.
+    after_cr: bool,
+}
+
+impl FrameLimit {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            frame_len: 0,
+            at_line_start: true,
+            after_cr: false,
+        }
+    }
+
+    /// Account for `chunk`. Returns `Err(())` once the current event is over
+    /// the cap.
+    fn feed(&mut self, chunk: &[u8]) -> std::result::Result<(), ()> {
+        for &b in chunk {
+            let after_cr = std::mem::replace(&mut self.after_cr, false);
+            match b {
+                b'\n' if after_cr => {}
+                b'\r' | b'\n' => {
+                    if self.at_line_start {
+                        // Blank line: the event is complete.
+                        self.frame_len = 0;
+                    }
+                    self.at_line_start = true;
+                    self.after_cr = b == b'\r';
+                }
+                _ => {
+                    self.at_line_start = false;
+                    self.frame_len += 1;
+                    if self.frame_len > self.cap {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pass `inner` through unchanged while bounding every SSE event to `cap`
+/// bytes. When an event goes over, yield one [`SseBodyError::FrameTooLarge`]
+/// and end the stream, so the parser downstream never buffers past the cap.
+fn cap_sse_frames<S, B, E>(
+    inner: S,
+    cap: usize,
+) -> impl Stream<Item = std::result::Result<B, SseBodyError<E>>>
+where
+    S: Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    let state = (Box::pin(inner), FrameLimit::new(cap), false);
+    futures::stream::unfold(state, move |(mut inner, mut limit, over)| async move {
+        if over {
+            return None;
+        }
+        let item = match inner.next().await? {
+            Ok(chunk) => match limit.feed(chunk.as_ref()) {
+                Ok(()) => Ok(chunk),
+                Err(()) => {
+                    return Some((
+                        Err(SseBodyError::FrameTooLarge { cap }),
+                        (inner, limit, true),
+                    ))
+                }
+            },
+            Err(e) => Err(SseBodyError::Transport(e)),
+        };
+        Some((item, (inner, limit, false)))
+    })
+}
+
 #[async_trait]
 impl Transport for SseTransport {
     async fn send(&mut self, msg: Value) -> Result<()> {
@@ -295,5 +414,108 @@ impl Transport for SseTransport {
             p.abort();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `chunks` through the capped stream and the real SSE parser and
+    /// collect what comes out: event data on success, the error text on
+    /// failure.
+    async fn parse(
+        chunks: Vec<&'static [u8]>,
+        cap: usize,
+    ) -> Vec<std::result::Result<String, String>> {
+        let inner = futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+        cap_sse_frames(inner, cap)
+            .eventsource()
+            .map(|r| r.map(|ev| ev.data).map_err(|e| e.to_string()))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_event_over_the_cap_errors_and_ends_the_stream() {
+        // 40 bytes of data in one event against a 32-byte cap. The event is
+        // split over several chunks so the count must carry across them. The
+        // event after it is never reached: the stream ends at the error.
+        let out = parse(
+            vec![
+                b"data: 0123456789",
+                b"0123456789",
+                b"0123456789\n\n",
+                b"data: next\n\n",
+            ],
+            32,
+        )
+        .await;
+        assert_eq!(out.len(), 1, "stream must end at the error: {out:?}");
+        let err = out[0].as_ref().expect_err("oversized event must error");
+        assert!(
+            err.contains("exceeds max_response_bytes (32 bytes)"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn many_small_events_pass_even_when_their_total_exceeds_the_cap() {
+        // 50 events of 10 bytes each is 500 bytes against a 32-byte cap. The
+        // bound is per event, so a long-lived stream must never trip it.
+        let chunks: Vec<&'static [u8]> = vec![b"data: abcd\n\n"; 50];
+        let out = parse(chunks, 32).await;
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().all(|r| r.as_deref() == Ok("abcd")), "{out:?}");
+    }
+
+    #[test]
+    fn each_line_ending_style_closes_an_event() {
+        // Every terminator style from the SSE grammar must reset the count.
+        // Each event alone is under the cap; two together are over it.
+        for (style, event) in [
+            ("LF", &b"data: 0123456789\n\n"[..]),
+            ("CR", &b"data: 0123456789\r\r"[..]),
+            ("CRLF", &b"data: 0123456789\r\n\r\n"[..]),
+        ] {
+            let mut limit = FrameLimit::new(20);
+            assert_eq!(limit.feed(event), Ok(()), "{style}: first event");
+            assert_eq!(limit.feed(event), Ok(()), "{style}: count was not reset");
+        }
+    }
+
+    #[test]
+    fn a_crlf_split_across_chunks_is_one_line_ending() {
+        // A CRLF whose LF starts the next chunk ends one line, not two. Read
+        // as two, the LF would look like a blank line, reset the count, and
+        // let an event with many short lines grow past the cap.
+        let mut limit = FrameLimit::new(25);
+        assert_eq!(limit.feed(b"data: 01234\r"), Ok(()));
+        assert_eq!(limit.feed(b"\ndata: 56789\r"), Ok(()));
+        assert_eq!(limit.feed(b"\ndata: overflow"), Err(()));
+
+        // And a blank line whose final LF arrives alone still closes the
+        // event, so the next event starts from zero.
+        let mut limit = FrameLimit::new(25);
+        assert_eq!(limit.feed(b"data: 0123456789\r\n\r"), Ok(()));
+        assert_eq!(limit.feed(b"\n"), Ok(()));
+        assert_eq!(limit.feed(b"data: 0123456789\r\n\r\n"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_pass_through_without_ending_the_stream_early() {
+        // A body error is the underlying stream's own; the cap must forward
+        // it verbatim rather than mask it as a size error.
+        let inner = futures::stream::iter(vec![
+            Ok(&b"data: ok\n\n"[..]),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+        let out: Vec<_> = cap_sse_frames(inner, 32).collect().await;
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_ok());
+        match &out[1] {
+            Err(SseBodyError::Transport(e)) => assert_eq!(e.to_string(), "connection reset"),
+            other => panic!("expected the transport error, got {other:?}"),
+        }
     }
 }

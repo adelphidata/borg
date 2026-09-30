@@ -122,49 +122,46 @@ fn builtin_defs() -> Vec<SlashCommandDef> {
         .collect()
 }
 
-/// True when every char of `needle` appears in `haystack` in order
-/// (not necessarily contiguously). Both inputs are expected lowercase.
-/// Return the char-indices in `haystack` that match `needle` greedily
-/// left-to-right (case-insensitive). Used to underline matched characters
-/// in the command popup. Empty/no-match returns an empty set.
-fn subsequence_match_positions(needle: &str, haystack: &str) -> std::collections::HashSet<usize> {
-    let mut out = std::collections::HashSet::new();
-    if needle.is_empty() {
-        return out;
-    }
-    let needle_lower: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    let mut ni = 0usize;
-    for (hi, hc) in haystack.chars().enumerate() {
-        if ni >= needle_lower.len() {
-            break;
+/// Greedy case-insensitive subsequence match of `needle` against
+/// `haystack`. Returns the char indices of `haystack` that matched, or
+/// `None` when `needle` is not a subsequence.
+///
+/// Both sides are lowercased with the full `to_lowercase` expansion, and
+/// matching runs over the flattened haystack stream. One haystack char can
+/// expand to several (`'İ'` → `"i\u{307}"`), so each flattened char keeps
+/// a map back to its original index — a needle char that hits the second
+/// char of an expansion still highlights the right original char.
+fn subsequence_match(needle: &str, haystack: &str) -> Option<Vec<usize>> {
+    let mut needle = needle.chars().flat_map(char::to_lowercase).peekable();
+    let flat = haystack
+        .chars()
+        .enumerate()
+        .flat_map(|(orig, c)| c.to_lowercase().map(move |lc| (orig, lc)));
+    let mut matched: Vec<usize> = Vec::new();
+    for (orig, lc) in flat {
+        let Some(&want) = needle.peek() else { break };
+        if lc == want {
+            needle.next();
+            if matched.last() != Some(&orig) {
+                matched.push(orig);
+            }
         }
-        if hc.to_lowercase().next() == Some(needle_lower[ni]) {
-            out.insert(hi);
-            ni += 1;
-        }
     }
-    if ni < needle_lower.len() {
-        out.clear();
-    }
-    out
+    needle.peek().is_none().then_some(matched)
 }
 
+/// Char indices in `haystack` to underline for `needle` in the command
+/// popup. Empty needle or no match returns an empty set.
+fn subsequence_match_positions(needle: &str, haystack: &str) -> std::collections::HashSet<usize> {
+    subsequence_match(needle, haystack)
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// True when every char of `needle` appears in `haystack` in order (not
+/// necessarily contiguously), case-insensitively.
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let mut n = needle.chars();
-    let mut curr = n.next();
-    for hc in haystack.chars() {
-        match curr {
-            Some(nc) if nc == hc => curr = n.next(),
-            _ => {}
-        }
-        if curr.is_none() {
-            return true;
-        }
-    }
-    curr.is_none()
+    subsequence_match(needle, haystack).is_some()
 }
 
 pub struct CommandPopup {
@@ -554,6 +551,38 @@ mod tests {
         assert!(is_subsequence("stg", "settings"));
         assert!(!is_subsequence("xyz", "settings"));
         assert!(!is_subsequence("ts", "st"));
+        // Case-insensitive on both sides, including multi-char expansions.
+        assert!(is_subsequence("STG", "Settings"));
+        assert!(is_subsequence("\u{307}", "İ"));
+        assert!(is_subsequence("İx", "aİbx"));
+        assert!(!is_subsequence("İ", "i"));
+    }
+
+    #[test]
+    fn match_positions_report_original_char_indices() {
+        // (needle, haystack, expected original char indices)
+        let cases: &[(&str, &str, &[usize])] = &[
+            ("stg", "/settings", &[1, 3, 7]),
+            ("STG", "/settings", &[1, 3, 7]),
+            ("hlp", "/Help", &[1, 3, 4]),
+            ("", "/help", &[]),
+            ("xyz", "/settings", &[]),
+            ("ts", "/st", &[]),
+            // 'İ' lowercases to "i\u{307}": a needle char that lands on the
+            // second char of the expansion must still map back to 'İ'.
+            ("\u{307}", "/İ", &[1]),
+            ("i\u{307}x", "/İx", &[1, 2]),
+            ("İx", "/aİbx", &[2, 4]),
+            // Both expansion chars come from one original char: one index.
+            ("İ", "/İ", &[1]),
+        ];
+        for (needle, haystack, expected) in cases {
+            let mut got: Vec<usize> = subsequence_match_positions(needle, haystack)
+                .into_iter()
+                .collect();
+            got.sort_unstable();
+            assert_eq!(&got[..], *expected, "needle {needle:?} in {haystack:?}");
+        }
     }
 
     #[test]

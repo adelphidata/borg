@@ -212,11 +212,17 @@ impl Database {
 
     /// Update a task's status. Returns true if the task was found.
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<bool> {
+        // Leaving `active` drops a pending run-now: a marker armed before a
+        // pause would otherwise fire the instant the task is resumed — the
+        // same unrequested run `request_task_run_now` refuses to arm on a
+        // paused task.
         let updated = self
             .conn
             .execute(
-                "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2",
-                params!(status, id),
+                "UPDATE scheduled_tasks SET status = ?1, \
+                 run_now_requested = CASE WHEN ?1 = ?3 THEN run_now_requested ELSE 0 END \
+                 WHERE id = ?2",
+                params!(status, id, crate::tasks::TASK_STATUS_ACTIVE),
             )
             .await?;
         Ok(updated > 0)

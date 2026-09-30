@@ -74,9 +74,48 @@ const BILLING_NEEDLES: &[&str] = &[
     // clear these — the operator has to top up or raise the cap — so they
     // must classify as billing ahead of the 429 rate-limit needles.
     "credit_balance_exhausted",
+    "billing_hard_limit_reached",
     "spend_limit_exceeded",
+    "spend limit exceeded",
     "organization_usage_limit_exceeded",
 ];
+
+/// Structured `error.code` / `error.type` values that mean the *account* is
+/// exhausted — a prepaid balance at zero, a hard billing cap, or an
+/// organization / project spend cap. Providers send these with a 429 status,
+/// but no cooldown clears them: the operator has to top up or raise the cap.
+///
+/// Deliberately narrower than [`BILLING_NEEDLES`]. A 429 body only turns into
+/// a billing verdict on one of these exact codes (or the unmistakable OpenAI
+/// quota sentence below); generic wording like "quota exceeded" also appears
+/// on per-minute quota throttles (Gemini `RESOURCE_EXHAUSTED`), which must
+/// stay retryable.
+const BILLING_ERROR_CODES: &[&str] = &[
+    "insufficient_quota",
+    "billing_hard_limit_reached",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+];
+
+/// Free-text fallback for a 429 body whose structured code did not survive a
+/// proxy re-wrap. OpenAI's message for `insufficient_quota`.
+const BILLING_QUOTA_PHRASE: &str = "exceeded your current quota";
+
+/// Markers of a per-window throttle. Gemini's free-tier 429 reuses the
+/// "exceeded your current quota" sentence with a numeric code, so the prose
+/// fallback must not fire when any of these are present.
+const THROTTLE_MARKERS: &[&str] = &[
+    "resource_exhausted",
+    "retrydelay",
+    "perminute",
+    "per minute",
+];
+
+/// Structured code a 503 carries when the provider asks the client to back
+/// off (a throttle), as opposed to a genuine outage.
+const SLOW_DOWN_CODE: &str = "slow_down";
 
 const RATE_LIMIT_NEEDLES: &[&str] = &[
     " 429 ",
@@ -96,6 +135,8 @@ const RATE_LIMIT_NEEDLES: &[&str] = &[
     // too large" or "too many tokens".
     "tokens per min",
     "requests per min",
+    // Structured 503 back-off code — a throttle wearing an outage status.
+    "slow_down",
 ];
 
 const OVERLOADED_NEEDLES: &[&str] = &[
@@ -229,6 +270,53 @@ pub(super) fn body_indicates_malformed_tool_call(body: &str) -> bool {
     matches_any(&lower, TOOL_CALL_NEEDLES)
         && matches_any(&lower, TOOL_ARGUMENT_NEEDLES)
         && matches_any(&lower, MALFORMED_NEEDLES)
+}
+
+/// Lower-cased string values of the structured `error.code` and `error.type`
+/// fields of a JSON error body. Numeric codes (OpenRouter echoes the HTTP
+/// status there) carry no extra meaning and are skipped. Empty for a
+/// non-JSON body.
+fn structured_error_codes(body: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    ["code", "type"]
+        .iter()
+        .filter_map(|k| v["error"][*k].as_str())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Decide a body against a set of structured codes. When the body carries a
+/// string `error.code` / `error.type`, that verdict is authoritative — a
+/// `rate_limit_exceeded` code stays a rate limit even if its prose mentions a
+/// billing word. Only a body without one (non-JSON, or an aggregator that
+/// re-wrapped the upstream error as a message with a numeric code) falls back
+/// to a substring match on the raw text.
+fn body_has_code(body: &str, codes: &[&str], fallback_phrases: &[&str]) -> bool {
+    let structured = structured_error_codes(body);
+    if !structured.is_empty() {
+        return structured.iter().any(|c| codes.contains(&c.as_str()));
+    }
+    let lower = body.to_ascii_lowercase();
+    matches_any(&lower, codes) || matches_any(&lower, fallback_phrases)
+}
+
+/// True when a 429 body says the account is out of money or over a spend cap
+/// rather than over a request-rate window — see [`BILLING_ERROR_CODES`].
+pub(super) fn body_indicates_billing_exhaustion(body: &str) -> bool {
+    if structured_error_codes(body).is_empty()
+        && matches_any(&body.to_ascii_lowercase(), THROTTLE_MARKERS)
+    {
+        return false;
+    }
+    body_has_code(body, BILLING_ERROR_CODES, &[BILLING_QUOTA_PHRASE])
+}
+
+/// True when a 503 body carries the `slow_down` back-off code: the provider is
+/// throttling this client, so it is a rate limit, not an outage.
+pub(super) fn body_indicates_slow_down(body: &str) -> bool {
+    body_has_code(body, &[SLOW_DOWN_CODE], &[])
 }
 
 pub(super) fn body_indicates_context_overflow(body: &str) -> bool {

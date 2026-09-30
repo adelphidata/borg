@@ -67,3 +67,9 @@ pub const TOOL_STREAM_MAX_LINES: usize = 64;
 /// past this cap can never be shown live. The full output still arrives in
 /// the ToolResult cell when the call finishes.
 pub const TOOL_STREAM_MAX_LINE_BYTES: usize = 4 * 1024;
+
+/// How long to wait for the terminal's reply to the OSC 10/11 color probe.
+/// Local terminals answer in a few milliseconds, but SSH sessions and tmux
+/// add a round trip, so a tight deadline misreads a slow reply as "no
+/// answer" and picks the wrong light/dark palette.
+pub const TERMINAL_COLOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);

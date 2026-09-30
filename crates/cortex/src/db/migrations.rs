@@ -103,19 +103,27 @@ impl Database {
         if self.get_meta(DONE_MARKER).await?.is_some() {
             return Ok(());
         }
-        // Stamped before the rewrite, and on every early return below: a
-        // database with nothing to rewrite is just as finished as one that
-        // was rewritten, and leaving it unmarked would arm the rewrite
-        // against lock-downs written later.
+        // Rewrite first, stamp after: a database with nothing to rewrite is
+        // just as finished as one that was rewritten, and leaving it unmarked
+        // would arm the rewrite against lock-downs written later. Stamping
+        // *before* the write would instead let a failed write (a busy
+        // database, a full disk) mark the legacy rows as done, and every
+        // stored `[]` would then read as a lock-down forever.
+        self.rewrite_legacy_empty_includes(KEY).await?;
         self.set_meta(DONE_MARKER, "1").await?;
-        let Some(raw) = self.get_setting(KEY).await? else {
+        Ok(())
+    }
+
+    /// The body of [`Self::migrate_v4`], without the marker bookkeeping.
+    async fn rewrite_legacy_empty_includes(&self, key: &str) -> Result<()> {
+        let Some(raw) = self.get_setting(key).await? else {
             return Ok(());
         };
         let mut servers: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    key = KEY,
+                    key,
                     error = %e,
                     "settings row is not valid JSON; leaving it for the config loader to report"
                 );
@@ -130,7 +138,7 @@ impl Database {
             servers = ?rewritten,
             "upgraded legacy empty MCP include lists to \"no allowlist\""
         );
-        self.set_setting(KEY, &serde_json::to_string(&servers)?)
+        self.set_setting(key, &serde_json::to_string(&servers)?)
             .await?;
         Ok(())
     }

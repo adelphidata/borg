@@ -6478,6 +6478,7 @@ dependencies = [
  "futures-util",
  "prost 0.13.5",
  "prost-types 0.13.5",
+ "tempfile",
  "tokio",
  "tonic 0.13.1",
  "tonic-build",

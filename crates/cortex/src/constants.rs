@@ -543,6 +543,19 @@ pub const FLUSH_MESSAGE_TRUNCATE_CHARS: usize = 500;
 /// Cap on total transcript characters for memory flush.
 pub const FLUSH_TRANSCRIPT_CAP_CHARS: usize = 20_000;
 
+/// Max bytes read from an LLM provider's error response body (64 KiB). Real
+/// error bodies are a few hundred bytes; a larger one (an HTML error page, a
+/// misbehaving proxy) is classified on its status alone.
+pub const LLM_ERROR_BODY_MAX_BYTES: u64 = 64 * 1024;
+
+/// Max bytes read from an OAuth token-refresh response (64 KiB). A token
+/// response is well under 8 KiB.
+pub const OAUTH_TOKEN_BODY_MAX_BYTES: u64 = 64 * 1024;
+
+/// Max bytes of a remote model-catalog manifest (1 MiB). The embedded
+/// snapshot is a few KiB; anything near this cap is not a catalog.
+pub const MODEL_CATALOG_MAX_BYTES: u64 = 1024 * 1024;
+
 // ── Conversation / Tokens ─────────────────────────────────────────
 
 /// Approximate token overhead per chat message for role + formatting framing
