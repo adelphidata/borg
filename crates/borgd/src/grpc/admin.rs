@@ -424,10 +424,15 @@ impl Admin for AdminSvc {
                 .unwrap_or_default();
             let previews = db.last_message_previews(&ids).await.unwrap_or_default();
             // Rows from before turns titled their session would otherwise list
-            // as "Untitled" until a next turn that may never come.
+            // as "Untitled" until a next turn that may never come. A live
+            // session is left to its own turn, which titles it on the way out.
             let untitled: Vec<String> = kept
                 .iter()
-                .filter(|(r, _)| r.title.is_empty() && counts.get(&r.id).is_some_and(|&n| n > 0))
+                .filter(|(r, _)| {
+                    r.title.is_empty()
+                        && !live.contains(&r.id)
+                        && counts.get(&r.id).is_some_and(|&n| n > 0)
+                })
                 .map(|(r, _)| r.id.clone())
                 .collect();
             let healed = match db.backfill_session_titles(&untitled).await {

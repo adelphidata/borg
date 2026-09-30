@@ -218,13 +218,15 @@ impl Database {
             .conn
             .query(
                 &format!(
+                    // One grouped pass for each session's first user
+                    // message, not a subquery per message row.
                     "SELECT m.session_id, m.content FROM messages m \
                      JOIN sessions s ON s.id = m.session_id \
-                     WHERE s.title = '' AND m.session_id IN ({placeholders}) \
-                       AND m.id = (SELECT MIN(f.id) FROM messages f \
-                                   WHERE f.session_id = m.session_id AND f.role = 'user' \
-                                     AND f.event_kind IS NULL \
-                                     AND COALESCE(f.content, '') != '')"
+                     WHERE s.title = '' AND m.id IN ( \
+                       SELECT MIN(id) FROM messages \
+                       WHERE session_id IN ({placeholders}) AND role = 'user' \
+                         AND event_kind IS NULL AND COALESCE(content, '') != '' \
+                       GROUP BY session_id)"
                 ),
                 args,
             )
@@ -245,13 +247,21 @@ impl Database {
             if title.is_empty() {
                 continue;
             }
-            self.conn
+            // One row that cannot be written must not cost the others the
+            // titles they already got.
+            match self
+                .conn
                 .execute(
                     "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title = ''",
                     params!(id.as_str(), title.as_str()),
                 )
-                .await?;
-            out.insert(id, title);
+                .await
+            {
+                Ok(_) => {
+                    out.insert(id, title);
+                }
+                Err(e) => tracing::warn!(session_id = %id, error = %e, "could not title session"),
+            }
         }
         Ok(out)
     }
