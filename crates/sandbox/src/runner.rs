@@ -476,6 +476,10 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    // Tests that run a bash script through the sandbox are `cfg(unix)`: on
+    // Windows the sandbox re-launches the current binary as its helper, and
+    // inside a test that binary is the test harness, not borg.
+
     #[test]
     fn script_output_success_only_for_exit_zero() {
         // success() is true iff the process exited normally with code 0.
@@ -542,6 +546,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_sandboxed_script_returns_the_real_success_and_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -629,6 +634,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_forwards_the_minimal_safe_env_after_clearing() {
         // Spec: `env_clear()` strips everything, and the SAFE_ENV_VARS
@@ -666,7 +672,7 @@ mod tests {
     fn resolve_bash_returns_absolute_path() {
         let (program, args) = resolve_runtime("bash", Path::new("/tmp")).unwrap();
         assert!(
-            program.starts_with('/'),
+            Path::new(&program).is_absolute(),
             "bash should resolve to absolute path: {program}"
         );
         assert!(args.is_empty());
@@ -706,6 +712,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_captures_stdout() {
         let dir = tempfile::tempdir().unwrap();
@@ -730,6 +737,7 @@ mod tests {
         assert_eq!(output.stdout.trim(), "hello world");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_captures_stderr() {
         let dir = tempfile::tempdir().unwrap();
@@ -754,6 +762,7 @@ mod tests {
         assert!(output.stderr.contains("error msg"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_passes_stdin_to_script() {
         let dir = tempfile::tempdir().unwrap();
@@ -778,6 +787,7 @@ mod tests {
         assert_eq!(output.stdout.trim(), r#"{"key":"value"}"#);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_does_not_leak_parent_env_to_child() {
         let leak_key = format!("BORG_TEST_SECRET_LEAK_{}", std::process::id());
@@ -822,6 +832,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_injects_extra_env() {
         let dir = tempfile::tempdir().unwrap();
@@ -938,6 +949,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_streaming_captures_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -975,6 +987,7 @@ mod tests {
         assert!(lines.iter().any(|(l, s)| l == "line1" && !s));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_streaming_bounds_the_callback_but_captures_multi_megabyte_output() {
         // Spec: live streaming to the callback stops at 120KB to bound UI/log
@@ -1028,6 +1041,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_streaming_captures_stderr_lines() {
         let dir = tempfile::tempdir().unwrap();

@@ -1163,7 +1163,6 @@ mod tests {
     #[test]
     fn with_tildes_expanded_applies_to_all_paths() {
         let home = dirs::home_dir().expect("home dir must exist for test");
-        let home_str = home.to_string_lossy();
 
         let policy = SandboxPolicy {
             fs_read: vec!["~/Library/Messages".into(), "/etc/ssl".into()],
@@ -1172,16 +1171,16 @@ mod tests {
         };
         let expanded = policy.with_tildes_expanded();
 
+        // `~/rest` joins `rest` onto the home dir, so the separator after home
+        // is the platform's (`\` on Windows).
+        let under_home = |rest: &str| home.join(rest).to_string_lossy().into_owned();
         assert_eq!(
             expanded.fs_read,
-            vec![
-                format!("{home_str}/Library/Messages"),
-                "/etc/ssl".to_string(),
-            ]
+            vec![under_home("Library/Messages"), "/etc/ssl".to_string()]
         );
         assert_eq!(
             expanded.fs_write,
-            vec![format!("{home_str}/.borg/channels/imessage"),]
+            vec![under_home(".borg/channels/imessage")]
         );
         assert!(!expanded.network);
     }
@@ -1222,15 +1221,20 @@ mod tests {
         let result = policy.configured(&blocked);
 
         assert!(
-            result.deny_write.iter().any(|p| p.ends_with("/.borg")),
+            result
+                .deny_write
+                .iter()
+                .any(|p| std::path::Path::new(p).ends_with(".borg")),
             "borg dir should be protected"
         );
         assert!(
             result.fs_read.iter().any(|p| p.starts_with(&*home_str)),
             "tildes should be expanded"
         );
-        assert!(
+        // TLS roots are added only where they exist (none on Windows).
+        assert_eq!(
             result.fs_read.contains(&"/etc/ssl".to_string()),
+            std::path::Path::new("/etc/ssl").exists(),
             "TLS paths should be added for network"
         );
         assert!(

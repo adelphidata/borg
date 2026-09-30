@@ -282,7 +282,10 @@ mod tests {
 
     #[tokio::test]
     async fn core_tool_definitions_count_reduced() {
-        let config = Config::default();
+        // computer_use defaults on only on macOS; pin it so the count is the
+        // same on every CI platform.
+        let mut config = Config::default();
+        config.computer_use.enabled = true;
         let defs = core_tool_definitions(&config).await;
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
@@ -292,7 +295,7 @@ mod tests {
              video_analyze, computer_use), got: {names:?}"
         );
 
-        let mut minimal_config = Config::default();
+        let mut minimal_config = config.clone();
         minimal_config.web.enabled = false;
         minimal_config.browser.enabled = false;
         let defs = core_tool_definitions(&minimal_config).await;

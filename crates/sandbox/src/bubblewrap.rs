@@ -1221,6 +1221,8 @@ mod tests {
 
     /// Spec: any grant at or under `/mnt/wslg/distro` is reported, read or
     /// write, so the caller can refuse it; a lookalike sibling is not.
+    /// Unix-only: WSLg is a Linux mount, and Windows resolves `/` to a drive.
+    #[cfg(unix)]
     #[test]
     fn grants_under_the_wslg_distro_are_found() {
         let cases: &[(&[&str], &[&str], Option<&str>)] = &[

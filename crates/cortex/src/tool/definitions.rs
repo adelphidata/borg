@@ -755,6 +755,8 @@ mod tests {
         config.audio.enabled = true;
         config.image_gen.enabled = true;
         config.goals.enabled = true;
+        // Defaults on only on macOS; its summary must still match on Linux.
+        config.computer_use.enabled = true;
         // Turn on MCP tool-search deferral so `search_tools` is produced and
         // matched against its summary (both directions of the guard).
         config.mcp.enabled = true;
