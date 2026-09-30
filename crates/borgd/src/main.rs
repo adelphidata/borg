@@ -4,6 +4,10 @@
 //! Session, Capability, Status, and Admin gRPC services over a Unix Domain
 //! Socket.
 
+// The binary is its own crate, so it needs the lib's limit too: a release
+// build lays out the gateway's deep async futures here and exceeds the default.
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use borgd::daemon;
 use clap::Parser;
