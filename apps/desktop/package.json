@@ -5,6 +5,7 @@
   "description": "Desktop client for Borg \u2014 your personal assistant, employee, developer, analyst, and sidekick",
   "license": "MIT",
   "author": "Adelphi Data, Inc.",
+  "homepage": "https://github.com/adelphidata/borg",
   "main": "dist-electron/main.js",
   "type": "commonjs",
   "scripts": {

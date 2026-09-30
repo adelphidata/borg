@@ -62,6 +62,11 @@ win:
 
 linux:
   category: Utility
+  # The package name (`@borg/desktop`) is not a valid file name, and `borg`
+  # would shadow the CLI the .deb puts on PATH next to it.
+  executableName: borg-desktop
+  # `author` carries no email, which .deb needs for its Maintainer field.
+  maintainer: Adelphi Data, Inc.
   target:
     - AppImage
     - deb
