@@ -6,6 +6,7 @@ import { fakeDaemon, renderApp } from "../../test/harness";
 import { clearNotice, pendingNotice } from "../../lib/notice";
 import { resetActivity } from "./activityStore";
 import { SessionsPage } from "./SessionsPage";
+import { sessionsVersion } from "./sessionsVersion";
 
 const NOW = Date.UTC(2026, 7, 22, 12, 0, 0);
 
@@ -446,5 +447,109 @@ describe("SessionsPage export", () => {
       HTMLAnchorElement.prototype.click = realClick;
       vi.unstubAllGlobals();
     }
+  });
+});
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("SessionsPage rename", () => {
+  async function startRename(daemon: ReturnType<typeof fakeDaemon>) {
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
+    act(() => within(screen.getByRole("menu")).getByText("Rename").click());
+    return screen.getByDisplayValue("Ship the daemon");
+  }
+
+  it.each(IME_ENTERS)("keeps the title open on an Enter %s", async (_name, init) => {
+    const daemon = fakeDaemon({ ...listing([summary()]), SetSessionTitle: {} });
+    const input = await startRename(daemon);
+    fireEvent.change(input, { target: { value: "出荷" } });
+
+    fireEvent.keyDown(input, init);
+
+    // Still a text field holding what was typed, and nothing written.
+    expect(screen.getByDisplayValue("出荷")).toBeTruthy();
+    expect(daemon.calls.some((c) => c.method === "SetSessionTitle")).toBe(false);
+  });
+
+  it("tells every list that a title changed", async () => {
+    // The sidebar runs a query of its own; only the shared counter reaches it.
+    const daemon = fakeDaemon({ ...listing([summary()]), SetSessionTitle: {} });
+    const input = await startRename(daemon);
+    const before = sessionsVersion();
+    const listed = () => daemon.calls.filter((c) => c.method === "ListSessions").length;
+    const listedBefore = listed();
+
+    fireEvent.change(input, { target: { value: "Ship it" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(sessionsVersion()).toBe(before + 1));
+    // This page reads the new title through the same counter.
+    await waitFor(() => expect(listed()).toBe(listedBefore + 1));
+  });
+
+  it("tells no list about a rename the daemon refused", async () => {
+    const daemon = fakeDaemon({
+      ...listing([summary()]),
+      SetSessionTitle: new BorgError(GrpcStatus.Internal, "database is locked"),
+    });
+    const input = await startRename(daemon);
+    const before = sessionsVersion();
+
+    fireEvent.change(input, { target: { value: "Ship it" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("locked"));
+    expect(sessionsVersion()).toBe(before);
+  });
+});
+
+describe("SessionsPage keys inside a row", () => {
+  const kebab = () => screen.getByRole("button", { name: "Conversation actions" });
+
+  async function ready(daemon: ReturnType<typeof fakeDaemon>) {
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    return screen.getByTestId("path").textContent;
+  }
+
+  it.each(["Enter", " "])("leaves %j on the menu button to the button", async (key) => {
+    const daemon = fakeDaemon(listing([summary()]));
+    const path = await ready(daemon);
+
+    // fireEvent returns false when a handler cancelled the key. A cancelled
+    // keydown never becomes the click that opens the menu.
+    expect(fireEvent.keyDown(kebab(), { key })).toBe(true);
+    expect(screen.getByTestId("path").textContent).toBe(path);
+
+    // The click the browser makes of an Enter or Space it was allowed to keep.
+    fireEvent.click(kebab());
+    expect(screen.getByRole("menu")).toBeTruthy();
+    expect(screen.getByTestId("path").textContent).toBe(path);
+  });
+
+  it("archives once, and goes nowhere, on Enter on Archive", async () => {
+    const daemon = fakeDaemon({ ...listing([summary()]), SetSessionArchived: {} });
+    const path = await ready(daemon);
+    fireEvent.click(kebab());
+    const archive = within(screen.getByRole("menu")).getByText("Archive");
+
+    expect(fireEvent.keyDown(archive, { key: "Enter" })).toBe(true);
+    fireEvent.click(archive);
+
+    await waitFor(() =>
+      expect(daemon.calls.filter((c) => c.method === "SetSessionArchived")).toHaveLength(1),
+    );
+    expect(daemon.calls.find((c) => c.method === "SetSessionArchived")?.request).toEqual({
+      id: "s1",
+      archived: true,
+    });
+    expect(screen.getByTestId("path").textContent).toBe(path);
   });
 });

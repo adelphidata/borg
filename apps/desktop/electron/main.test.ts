@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { isRecoveryReload, RECOVERY_RELOAD_URL } from "./recovery";
+
 vi.mock("electron", () => import("./test/electron-stub"));
 
 // The subsystems main wires together have their own suites; here they are
@@ -63,6 +65,8 @@ vi.mock("./window-state", () => ({
   loadWindowState: (...args: unknown[]) =>
     spies.loadWindowState(...args) ?? { width: 1240, height: 800 },
   trackWindowState: (...args: unknown[]) => spies.trackWindowState(...args),
+  MIN_WIDTH: 360,
+  MIN_HEIGHT: 600,
 }));
 
 type Stub = typeof import("./test/electron-stub");
@@ -369,6 +373,163 @@ describe("window security", () => {
     restores.push(await launch());
     const event = navigate("http://[::");
     expect(event.preventDefault).toHaveBeenCalled();
+  });
+});
+
+describe("renderer recovery", () => {
+  const crash = (reason = "crashed") =>
+    mainWindow().webContents.emit("render-process-gone", {}, { reason, exitCode: 1 });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it.each(["crashed", "oom", "killed"])("reloads the window when its renderer is %s", async (r) => {
+    // Without this the window stays blank until the user quits the app.
+    restores.push(await launch());
+    crash(r);
+    expect(mainWindow().reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops reloading a renderer that keeps crashing, and says so", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch());
+    for (let i = 0; i < 5; i++) {
+      vi.setSystemTime(i * 1_000);
+      crash("oom");
+    }
+    expect(mainWindow().reload).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[0][0]).toContain("oom");
+  });
+
+  it("shows the recovery page once the budget is spent, not a blank window", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch());
+    for (let i = 0; i < 3; i++) crash();
+    expect(mainWindow().loadURL).not.toHaveBeenCalled();
+    crash();
+    expect(mainWindow().loadURL).toHaveBeenCalledTimes(1);
+    const page = decodeURIComponent(mainWindow().loadURL.mock.calls[0][0]);
+    expect(page).toMatch(/^data:text\/html/);
+    expect(page).toContain("Borg's window stopped working");
+    expect(page).toContain(`href="${RECOVERY_RELOAD_URL}"`);
+    // It runs no script: a page shown because scripts keep crashing must not
+    // depend on one.
+    expect(page).not.toMatch(/<script/i);
+    expect(page).toContain("default-src 'none'");
+  });
+
+  it("loads the recovery page once, even if it crashes too", async () => {
+    // A recovery page that brought itself back on every crash would be the
+    // same loop one level down.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch());
+    for (let i = 0; i < 6; i++) crash();
+    expect(mainWindow().loadURL).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["packaged", false],
+    ["dev", true],
+  ])("reloads the app with a fresh budget from the recovery page (%s)", async (_name, dev) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch({ dev }));
+    const win = mainWindow();
+    const appLoads = () => (dev ? win.loadURL : win.loadFile);
+    for (let i = 0; i < 4; i++) crash();
+    appLoads().mockClear();
+    win.reload.mockClear();
+
+    const event = navigate(RECOVERY_RELOAD_URL);
+    // Never handed to the browser: it is a signal, not a destination.
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(stub.externalOpens).toEqual([]);
+    expect(appLoads()).toHaveBeenCalledWith(dev ? "http://localhost:5173" : INDEX_HTML);
+
+    // The budget is whole again: the next crash reloads rather than giving up.
+    crash();
+    expect(win.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores the reload link when the recovery page is not showing", async () => {
+    // Only the recovery page may reset the budget; the app hitting the same
+    // address must neither reload it nor send the address to the browser.
+    restores.push(await launch());
+    mainWindow().loadFile.mockClear();
+    const event = navigate(RECOVERY_RELOAD_URL);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(mainWindow().loadFile).not.toHaveBeenCalled();
+    expect(stub.externalOpens).toEqual([]);
+  });
+
+  it("says so when the recovery page cannot be shown", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    restores.push(await launch());
+    mainWindow().loadURL.mockRejectedValueOnce(new Error("gone"));
+    for (let i = 0; i < 4; i++) crash();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(error).toHaveBeenCalledWith("could not show the recovery page", expect.any(Error));
+  });
+
+  it("recovers again from a crash long after a crash loop", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch());
+    for (let i = 0; i < 4; i++) crash();
+    vi.setSystemTime(10 * 60_000);
+    crash();
+    expect(mainWindow().reload).toHaveBeenCalledTimes(4);
+  });
+
+  it("gives each window its own budget", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    restores.push(await launch({ platform: "darwin" }));
+    for (let i = 0; i < 4; i++) crash();
+    mainWindow().emit("closed");
+    stub.emitApp("activate");
+    const second = stub.constructedWindows[1];
+    second.webContents.emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+    expect(second.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a renderer that exited cleanly alone", async () => {
+    restores.push(await launch());
+    crash("clean-exit");
+    expect(mainWindow().reload).not.toHaveBeenCalled();
+  });
+
+  it("does not reload a destroyed window", async () => {
+    restores.push(await launch());
+    mainWindow().destroy();
+    crash();
+    expect(mainWindow().reload).not.toHaveBeenCalled();
+  });
+
+  it("does not reload while the app quits", async () => {
+    // Renderers go away as part of a quit; a reload would fight the shutdown.
+    restores.push(await launch());
+    stub.emitApp("before-quit");
+    crash("killed");
+    expect(mainWindow().reload).not.toHaveBeenCalled();
+  });
+});
+
+describe("isRecoveryReload", () => {
+  it.each([
+    [RECOVERY_RELOAD_URL, true],
+    ["https://reload.borg.invalid", true],
+    ["https://reload.borg.invalid/other", false],
+    ["https://evil.example.com/", false],
+    ["not a url", false],
+  ])("%s → %s", (url, expected) => {
+    expect(isRecoveryReload(url)).toBe(expected);
   });
 });
 

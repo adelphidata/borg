@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { highlight } from "../lib/highlight";
+import { highlight, peekHighlight } from "../lib/highlight";
 import { CheckIcon, CopyIcon } from "./icons";
 
 /**
@@ -12,15 +12,23 @@ import { CheckIcon, CopyIcon } from "./icons";
  * The pass is debounced because tokenising is O(block), not O(delta): a fence
  * that arrives over hundreds of deltas would otherwise re-tokenise itself from
  * the top hundreds of times and throw away every result but the last.
+ *
+ * A block that was highlighted before skips both waits: its markup is read
+ * back synchronously, so a reopened conversation paints in colour at once.
  */
 const HIGHLIGHT_DEBOUNCE_MS = 100;
 
 export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
-  const [html, setHtml] = useState<string | null>(null);
+  const [html, setHtml] = useState<string | null>(() => peekHighlight(code, lang) ?? null);
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
+    const known = peekHighlight(code, lang);
+    if (known !== undefined) {
+      setHtml(known);
+      return;
+    }
     let live = true;
     const pending = setTimeout(() => {
       highlight(code, lang)

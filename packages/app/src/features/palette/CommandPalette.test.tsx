@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes, useLocation } from "react-router-dom";
 import { ThemeProvider } from "@borg/ui";
@@ -212,5 +212,67 @@ describe("CommandPalette", () => {
     open();
     open();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("CommandPalette and an input method", () => {
+  it.each(IME_ENTERS)("runs nothing on an Enter %s", async (_name, init) => {
+    mount();
+    open();
+    type("usage");
+    await waitFor(() => expect(rows().some((r) => r?.includes("Usage"))).toBe(true));
+
+    fireEvent.keyDown(box(), init);
+
+    expect(screen.getByTestId("path").textContent).not.toBe("/usage");
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+});
+
+describe("CommandPalette row labels", () => {
+  const restores: Array<() => void> = [];
+  afterEach(() => {
+    while (restores.length) restores.pop()?.();
+  });
+
+  /** jsdom lays nothing out, so the widths a browser would measure are given. */
+  function stubWidths(scrollWidth: number, clientWidth: number) {
+    const scroll = Object.getOwnPropertyDescriptor(Element.prototype, "scrollWidth");
+    const client = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(Element.prototype, "scrollWidth", {
+      configurable: true,
+      value: scrollWidth,
+    });
+    Object.defineProperty(Element.prototype, "clientWidth", {
+      configurable: true,
+      value: clientWidth,
+    });
+    restores.push(() => {
+      if (scroll) Object.defineProperty(Element.prototype, "scrollWidth", scroll);
+      if (client) Object.defineProperty(Element.prototype, "clientWidth", client);
+    });
+  }
+
+  it("gives the full text of a label that is cut off", async () => {
+    stubWidths(400, 100);
+    mount();
+    open();
+    await waitFor(() =>
+      expect(screen.getByText("Ship the daemon").getAttribute("title")).toBe("Ship the daemon"),
+    );
+  });
+
+  it("gives no tip for a label that fits", async () => {
+    stubWidths(100, 100);
+    mount();
+    open();
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(screen.getByText("Ship the daemon").getAttribute("title")).toBeNull();
   });
 });

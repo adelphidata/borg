@@ -9,8 +9,10 @@ import {
   cellWeight,
   cutHidesEverything,
   itemWeight,
+  pageKeyDirection,
   revealEarlier,
   shouldRevealOnScroll,
+  shouldRevealOnWheel,
 } from "./renderBudget";
 
 const user = (text = "ask"): Cell => ({ kind: "user", text });
@@ -189,5 +191,117 @@ describe("shouldRevealOnScroll", () => {
     // height; that is not a request for more.
     expect(shouldRevealOnScroll(20, 900)).toBe(false);
     expect(shouldRevealOnScroll(0, 0)).toBe(false);
+  });
+});
+
+describe("shouldRevealOnWheel", () => {
+  it.each([
+    { name: "an upward wheel at the very top", deltaY: -4, top: 0, pending: false, want: true },
+    {
+      name: "an upward wheel inside the edge",
+      deltaY: -4,
+      top: TOP_EDGE_PX,
+      pending: false,
+      want: true,
+    },
+    {
+      name: "an upward wheel short of the edge",
+      deltaY: -4,
+      top: TOP_EDGE_PX + 1,
+      pending: false,
+      want: false,
+    },
+    { name: "a downward wheel at the top", deltaY: 4, top: 0, pending: false, want: false },
+    { name: "a sideways wheel at the top", deltaY: 0, top: 0, pending: false, want: false },
+    { name: "a reveal still settling", deltaY: -4, top: 0, pending: true, want: false },
+  ])("$name → $want", ({ deltaY, top, pending, want }) => {
+    expect(shouldRevealOnWheel(deltaY, top, pending)).toBe(want);
+  });
+});
+
+describe("pageKeyDirection", () => {
+  const bare = {
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    defaultPrevented: false,
+  };
+  const composer = document.createElement("div");
+  const draft = composer.appendChild(document.createElement("textarea"));
+  const picker = composer.appendChild(document.createElement("input"));
+  const editable = document.createElement("div");
+  editable.contentEditable = "true";
+  const transcript = document.createElement("div");
+  const toolToggle = transcript.appendChild(document.createElement("button"));
+  const answerBox = transcript.appendChild(document.createElement("textarea"));
+
+  it.each([
+    { name: "PageUp with nothing focused", key: "PageUp", focused: null, want: -1 },
+    { name: "PageDown from the page body", key: "PageDown", focused: document.body, want: 1 },
+    { name: "PageUp from the composer", key: "PageUp", focused: draft, want: -1 },
+    {
+      name: "PageDown from a button in the transcript",
+      key: "PageDown",
+      focused: toolToggle,
+      want: 1,
+    },
+    {
+      name: "a button in another panel",
+      key: "PageDown",
+      focused: document.createElement("button"),
+      want: undefined,
+    },
+    {
+      name: "a list in another panel",
+      key: "PageUp",
+      focused: Object.assign(document.createElement("ul"), { tabIndex: 0 }),
+      want: undefined,
+    },
+    { name: "an answer box in the transcript", key: "PageUp", focused: answerBox, want: undefined },
+    { name: "another key", key: "ArrowUp", focused: null, want: undefined },
+    {
+      name: "the find input",
+      key: "PageUp",
+      focused: document.createElement("input"),
+      want: undefined,
+    },
+    {
+      name: "a textarea that is not the composer",
+      key: "PageUp",
+      focused: document.createElement("textarea"),
+      want: undefined,
+    },
+    {
+      name: "a select",
+      key: "PageDown",
+      focused: document.createElement("select"),
+      want: undefined,
+    },
+    { name: "an editable region", key: "PageDown", focused: editable, want: undefined },
+    { name: "an input inside the composer", key: "PageDown", focused: picker, want: undefined },
+  ])("$name → $want", ({ key, focused, want }) => {
+    expect(pageKeyDirection({ ...bare, key }, focused, composer, transcript)).toBe(want);
+  });
+
+  it.each(["shiftKey", "ctrlKey", "altKey", "metaKey"] as const)(
+    "leaves the key alone with %s held",
+    (modifier) => {
+      expect(
+        pageKeyDirection({ ...bare, key: "PageUp", [modifier]: true }, null, composer, transcript),
+      ).toBe(undefined);
+    },
+  );
+
+  it("leaves a key another control already used", () => {
+    // A menu open over the composer pages its own list.
+    expect(
+      pageKeyDirection(
+        { ...bare, key: "PageDown", defaultPrevented: true },
+        draft,
+        composer,
+        transcript,
+      ),
+    ).toBe(undefined);
   });
 });

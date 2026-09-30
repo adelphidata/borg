@@ -10,7 +10,12 @@ import {
 import { MAX_DELAY_MS } from "../../lib/backoff";
 import { PlatformProvider } from "../../lib/platform";
 import { isSessionWorking, resetActivity } from "./activityStore";
-import { useSessionActivityFeed } from "./useSessionActivity";
+import { sessionsVersion } from "./sessionsVersion";
+import {
+  SESSIONS_REFRESH_DEBOUNCE_MS,
+  SESSIONS_REFRESH_MAX_WAIT_MS,
+  useSessionActivityFeed,
+} from "./useSessionActivity";
 
 /** A transport that answers `ListSessions` from a mutable fixture. */
 function fakeTransport(working: Set<string>) {
@@ -34,8 +39,8 @@ function fakeTransport(working: Set<string>) {
   return { transport, subscriptions, listings: () => listings };
 }
 
-function Probe() {
-  useSessionActivityFeed();
+function Probe({ listed }: { listed?: Set<string> }) {
+  useSessionActivityFeed(listed && ((id) => listed.has(id)));
   return null;
 }
 
@@ -56,12 +61,12 @@ describe("useSessionActivityFeed", () => {
     vi.useRealTimers();
   });
 
-  const mount = async () => {
+  const mount = async (listed?: Set<string>) => {
     const result = render(
       <PlatformProvider
         platform={{ kind: "web", transport: harness.transport, titleBarDrag: false }}
       >
-        <Probe />
+        <Probe listed={listed} />
       </PlatformProvider>,
     );
     // Let the mount-time listing resolve.
@@ -153,6 +158,118 @@ describe("useSessionActivityFeed", () => {
     });
 
     expect(isSessionWorking("started-mid-listing")).toBe(true);
+  });
+
+  describe("renewing the session lists", () => {
+    const emit = async (sessionId: string, turnActive: boolean) => {
+      await act(async () => {
+        harness.subscriptions.at(-1)?.onMessage?.({ sessionId, turnActive });
+      });
+    };
+    const settle = () => act(() => vi.advanceTimersByTime(SESSIONS_REFRESH_DEBOUNCE_MS + 1));
+
+    it("renews the lists once a turn ends, after a short wait", async () => {
+      // The unread dot reads from the listing's figures, and until now the
+      // listing only re-read itself on navigation: a reply that landed in the
+      // background showed nothing until the user happened to click somewhere.
+      await mount(new Set(["s1"]));
+      const before = sessionsVersion();
+      await emit("s1", false);
+      expect(sessionsVersion()).toBe(before);
+      await settle();
+      expect(sessionsVersion()).toBe(before + 1);
+    });
+
+    it("renews the lists for a conversation none of them has", async () => {
+      // A schedule opening a conversation is a new row nobody clicked for.
+      await mount(new Set(["s1"]));
+      const before = sessionsVersion();
+      await emit("from-a-schedule", true);
+      await settle();
+      expect(sessionsVersion()).toBe(before + 1);
+    });
+
+    it("leaves the lists alone when a listed conversation starts a turn", async () => {
+      // The working dot comes from the activity store, not the listing; a
+      // re-read here would be a listing per turn for nothing.
+      await mount(new Set(["s1"]));
+      const before = sessionsVersion();
+      await emit("s1", true);
+      await settle();
+      expect(sessionsVersion()).toBe(before);
+    });
+
+    it("folds a burst of settles into one renewal", async () => {
+      await mount(new Set(["a", "b", "c"]));
+      const before = sessionsVersion();
+      for (const id of ["a", "b", "c"]) {
+        await emit(id, false);
+        await act(() => vi.advanceTimersByTime(SESSIONS_REFRESH_DEBOUNCE_MS / 2));
+      }
+      await settle();
+      expect(sessionsVersion()).toBe(before + 1);
+    });
+
+    it("renews within the maximum wait under a steady stream of settles", async () => {
+      // Settles closer together than the debounce would otherwise put the
+      // renewal off for as long as they keep coming.
+      await mount(new Set(["a"]));
+      const before = sessionsVersion();
+      const step = SESSIONS_REFRESH_DEBOUNCE_MS / 2;
+      let waited = 0;
+      while (sessionsVersion() === before && waited <= SESSIONS_REFRESH_MAX_WAIT_MS * 2) {
+        await emit("a", false);
+        await act(() => vi.advanceTimersByTime(step));
+        waited += step;
+      }
+      expect(sessionsVersion()).toBe(before + 1);
+      expect(waited).toBeLessThanOrEqual(SESSIONS_REFRESH_MAX_WAIT_MS + step);
+      expect(waited).toBeGreaterThanOrEqual(SESSIONS_REFRESH_MAX_WAIT_MS);
+    });
+
+    it("starts the maximum wait afresh after each renewal", async () => {
+      // The deadline belongs to one pending renewal; carrying it over would
+      // make the next one fire on the first event, with no debounce at all.
+      await mount(new Set(["a"]));
+      const before = sessionsVersion();
+      await emit("a", false);
+      await settle();
+      expect(sessionsVersion()).toBe(before + 1);
+      await act(() => vi.advanceTimersByTime(SESSIONS_REFRESH_MAX_WAIT_MS * 2));
+      await emit("a", false);
+      await act(() => vi.advanceTimersByTime(SESSIONS_REFRESH_DEBOUNCE_MS - 1));
+      expect(sessionsVersion()).toBe(before + 1);
+      await act(() => vi.advanceTimersByTime(2));
+      expect(sessionsVersion()).toBe(before + 2);
+    });
+
+    it("renews once for a conversation the lists never return", async () => {
+      // A session the listing never includes stays unlisted after its renewal,
+      // so without a memory every event it sends would re-read the lists.
+      await mount(new Set(["s1"]));
+      const before = sessionsVersion();
+      await emit("hidden", true);
+      await settle();
+      expect(sessionsVersion()).toBe(before + 1);
+      for (const turnActive of [false, true, false]) {
+        await emit("hidden", turnActive);
+        await settle();
+      }
+      expect(sessionsVersion()).toBe(before + 1);
+      // A different unknown id still gets its own renewal.
+      await emit("another", true);
+      await settle();
+      expect(sessionsVersion()).toBe(before + 2);
+    });
+
+    it("drops a pending renewal when it unmounts", async () => {
+      const { unmount } = await mount(new Set(["s1"]));
+      const before = sessionsVersion();
+      await emit("s1", false);
+      unmount();
+      await settle();
+      expect(sessionsVersion()).toBe(before);
+    });
   });
 
   it("reads one listing per subscription, not one per event", async () => {

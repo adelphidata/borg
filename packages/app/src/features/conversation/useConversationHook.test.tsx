@@ -267,15 +267,103 @@ describe("useConversation side channels", () => {
     const conv = mount(daemon);
     await ready(conv);
     act(() => conv.current.send("go"));
-    act(() => conv.current.steer("actually, stop"));
+    let accepted: boolean | undefined;
+    await act(async () => {
+      accepted = await conv.current.steer("actually, stop");
+    });
 
-    await waitFor(() =>
-      expect(daemon.calls.find((c) => c.method === "Steer")?.request).toEqual({
-        sessionId: "live-1",
-        text: "actually, stop",
-      }),
-    );
+    expect(daemon.calls.find((c) => c.method === "Steer")?.request).toEqual({
+      sessionId: "live-1",
+      text: "actually, stop",
+    });
+    expect(accepted).toBe(true);
     expect(conv.current.cells.filter((c) => c.kind === "user")).toHaveLength(1);
+  });
+
+  it("reports a refused steer as false, so the caller can keep the text", async () => {
+    const daemon = fakeDaemon({
+      ...OPEN,
+      Steer: new BorgError(FAILED_PRECONDITION, "no turn in flight"),
+    });
+    const conv = mount(daemon);
+    await ready(conv);
+    let accepted: boolean | undefined;
+    await act(async () => {
+      accepted = await conv.current.steer("nudge");
+    });
+    expect(accepted).toBe(false);
+  });
+
+  it("refuses a steer before the session is open, without calling the daemon", async () => {
+    const daemon = fakeDaemon({ ...OPEN, Open: new Promise(() => {}) });
+    const conv = mount(daemon);
+    await waitFor(() => expect(conv.current.ready).toBe(false));
+    let accepted: boolean | undefined;
+    await act(async () => {
+      accepted = await conv.current.steer("nudge");
+    });
+    expect(accepted).toBe(false);
+    expect(daemon.calls.some((c) => c.method === "Steer")).toBe(false);
+  });
+
+  it("is ready once the session id is known, and not before", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    expect(conv.current.ready).toBe(false);
+    await ready(conv);
+    expect(conv.current.ready).toBe(true);
+  });
+
+  it("says Stopped once when a turn the user cancelled ends", async () => {
+    const daemon = fakeDaemon({ ...OPEN, Cancel: {} });
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    emit(daemon, { textDelta: { text: "half a" } as never });
+    await act(async () => conv.current.cancel());
+    emit(daemon, { turnComplete: {} as never });
+    emit(daemon, { turnComplete: {} as never });
+
+    const notices = conv.current.cells.filter((c) => c.kind === "notice");
+    expect(notices).toEqual([expect.objectContaining({ text: "Stopped" })]);
+    // The next turn ends on its own and must not inherit the label.
+    act(() => conv.current.send("again"));
+    emit(daemon, { turnComplete: {} as never });
+    expect(conv.current.cells.filter((c) => c.kind === "notice")).toHaveLength(1);
+  });
+
+  it("does not say Stopped for a cancel the daemon refused", async () => {
+    const daemon = fakeDaemon({
+      ...OPEN,
+      Cancel: new BorgError(FAILED_PRECONDITION, "no turn in flight"),
+    });
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    await act(async () => conv.current.cancel());
+    await waitFor(() => expect(daemon.calls.some((c) => c.method === "Cancel")).toBe(true));
+    emit(daemon, { turnComplete: {} as never });
+    expect(conv.current.cells.some((c) => c.kind === "notice")).toBe(false);
+  });
+
+  it("remembers what was attached by kind and name, never by count", async () => {
+    const daemon = fakeDaemon({ ...OPEN, Send: {} });
+    const conv = mount(daemon);
+    await ready(conv);
+    const bytes = new Uint8Array([1]);
+    act(() =>
+      conv.current.send("", [
+        { kind: "image", mimeType: "image/png", data: bytes, filename: "a.png" },
+        { kind: "document", mimeType: "text/plain", data: bytes, filename: "pasted-text.txt" },
+      ]),
+    );
+    expect(conv.current.cells[0]).toMatchObject({
+      kind: "user",
+      attachments: [
+        { kind: "image", filename: "a.png" },
+        { kind: "document", filename: "pasted-text.txt" },
+      ],
+    });
   });
 
   it("retires open prompts when the turn is cancelled", async () => {
@@ -327,7 +415,9 @@ describe("useConversation side channels", () => {
     const conv = mount(daemon);
     await ready(conv);
 
-    act(() => conv.current.steer("nudge"));
+    await act(async () => {
+      await conv.current.steer("nudge");
+    });
     await waitFor(() => expect(conv.current.sendError?.message).toBe("no turn in flight"));
   });
 });
@@ -465,5 +555,286 @@ describe("useConversation stream health", () => {
 
     emit(daemon, { textDelta: { text: "back" } as never });
     expect(conv.current.streamError).toBeUndefined();
+  });
+});
+
+describe("useConversation title", () => {
+  it("re-reads the title when a turn ends, so a new conversation gets its name", async () => {
+    const daemon = fakeDaemon({ ...OPEN, GetState: { ...OPEN.GetState, title: "" } });
+    const conv = mount(daemon, "new");
+    await ready(conv);
+    expect(conv.current.opened.data?.title).toBe("");
+
+    daemon.answer("GetState", { ...OPEN.GetState, title: "Ship it" });
+    const before = daemon.calls.filter((c) => c.method === "GetState").length;
+    emit(daemon, { turnComplete: {} as never });
+    await waitFor(() => expect(conv.current.opened.data?.title).toBe("Ship it"));
+    // One read per turn end, not one per event.
+    expect(daemon.calls.filter((c) => c.method === "GetState")).toHaveLength(before + 1);
+  });
+
+  it("keeps the model and session id the open reported", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("GetState", { ...OPEN.GetState, title: "Renamed" });
+    emit(daemon, { turnComplete: {} as never });
+    await waitFor(() => expect(conv.current.opened.data?.title).toBe("Renamed"));
+    expect(conv.current.opened.data).toMatchObject({
+      model: "claude-opus-5",
+      agentSessionId: "agent-1",
+    });
+  });
+});
+
+describe("useConversation session gone", () => {
+  const notFound = () => new BorgError(GrpcStatus.NotFound, "session live-1 not found");
+  const lastStream = (daemon: ReturnType<typeof fakeDaemon>) =>
+    daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
+  const opens = (daemon: ReturnType<typeof fakeDaemon>) =>
+    daemon.calls.filter((c) => c.method === "Open");
+  // The daemon resumes a session under the live id it already had, so every
+  // reopen here answers with "live-1"; only the seq tells the streams apart.
+  const resubscribed = (daemon: ReturnType<typeof fakeDaemon>, sinceEventSeq: number) =>
+    waitFor(() =>
+      expect(lastStream(daemon).request).toEqual({ sessionId: "live-1", sinceEventSeq }),
+    );
+
+  it("opens the conversation again by its agent session id, not by the route", async () => {
+    // A daemon restart forgets every live session. Re-running the open for
+    // "new" would start an empty conversation and abandon this one.
+    const daemon = fakeDaemon({
+      ...OPEN,
+      GetSession: { messages: [{ role: "user", text: "hello" }] },
+    });
+    const conv = mount(daemon, "new");
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    expect(conv.current.busy).toBe(true);
+
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 3 });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+
+    await resubscribed(daemon, 3);
+    expect(opens(daemon).map((c) => c.request)).toEqual([{}, { resumeId: "agent-1" }]);
+    expect(conv.current.sessionId).toBe("live-1");
+    expect(conv.current.cells.map((c) => c.kind)).toEqual(["user"]);
+    expect(conv.current.busy).toBe(false);
+    expect(conv.current.turnStartedAt).toBeUndefined();
+    expect(conv.current.streamError).toBeUndefined();
+  });
+
+  it("resubscribes the moment the reopen lands, without waiting out the backoff", async () => {
+    // The live id is unchanged, so nothing but the reopen itself can restart
+    // the stream. Pin the backoff draw near its ceiling: a retry timer could
+    // then not fire inside the short window this waits.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.99);
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 4 });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+
+    await waitFor(
+      () => expect(lastStream(daemon).request).toEqual({ sessionId: "live-1", sinceEventSeq: 4 }),
+      { timeout: 300 },
+    );
+    expect(conv.current.sendError).toBeUndefined();
+    random.mockRestore();
+  });
+
+  it("stays busy when the reopened session still has a turn running", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 0 });
+    daemon.answer("GetState", { ...OPEN.GetState, turnInFlight: true });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await resubscribed(daemon, 0);
+    expect(conv.current.busy).toBe(true);
+  });
+
+  it("gives up after one failed reopen instead of redialling forever", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    daemon.answer("Open", notFound());
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+
+    await waitFor(() => expect(conv.current.sendError).toBeDefined());
+    expect(conv.current.sendError?.message).toMatch(/no longer open/);
+    expect(conv.current.busy).toBe(false);
+    expect(conv.current.streamError).toBeUndefined();
+    expect(opens(daemon)).toHaveLength(2);
+    // A later error from the retry loop must not start another attempt.
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await act(async () => {});
+    expect(opens(daemon)).toHaveLength(2);
+  });
+
+  it("gives up when the reopened session is missing at once, rather than looping", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 0 });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await resubscribed(daemon, 0);
+
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await waitFor(() => expect(conv.current.sendError?.message).toMatch(/no longer open/));
+    expect(opens(daemon)).toHaveLength(2);
+  });
+
+  it("gives an idle conversation a fresh reopen after a second restart", async () => {
+    // No event arrives after the first reopen, so only the outage that opens
+    // the second restart can say the first try belongs to an older outage.
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 4 });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await resubscribed(daemon, 4);
+
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 5 });
+    const stream = lastStream(daemon);
+    act(() => stream.handlers.onError?.(new BorgError(GrpcStatus.Unavailable, "restarting")));
+    act(() => stream.handlers.onError?.(notFound()));
+
+    await resubscribed(daemon, 5);
+    expect(opens(daemon)).toHaveLength(3);
+    expect(conv.current.sendError).toBeUndefined();
+  });
+
+  it("reports the reopen's own failure when it is not a missing session", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    daemon.answer("Open", new BorgError(GrpcStatus.Unavailable, "daemon down"));
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await waitFor(() => expect(conv.current.sendError?.message).toBe("daemon down"));
+  });
+
+  it("does not reopen a conversation it has no id for, once there is something to lose", async () => {
+    // Nobody has sent yet, so the daemon issued no agent session id; but a
+    // steer replay put a row on screen. A fresh session would drop it.
+    const daemon = fakeDaemon({ ...OPEN, GetState: { ...OPEN.GetState, agentSessionId: "" } });
+    const conv = mount(daemon, "new");
+    await ready(conv);
+    emit(daemon, { steerReceived: { text: "hi" } as never });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await waitFor(() => expect(conv.current.sendError?.message).toMatch(/no longer open/));
+    expect(opens(daemon)).toHaveLength(1);
+  });
+
+  it("ignores a NotFound raised before the reopen landed, under the same live id", async () => {
+    // The retry loop keeps dialling until the reopen lands. Its fresh NotFound
+    // must not turn a reopen that worked into "no longer open", though the
+    // session it names has the same id as the one now on screen.
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    let finishOpen: (value: unknown) => void = () => {};
+    daemon.answer("Open", () => new Promise((resolve) => (finishOpen = resolve)));
+    const oldStream = lastStream(daemon);
+    act(() => oldStream.handlers.onError?.(notFound()));
+    await waitFor(() => expect(opens(daemon)).toHaveLength(2));
+
+    act(() => oldStream.handlers.onError?.(notFound()));
+    await act(async () => finishOpen({ sessionId: "live-1", lastEventSeq: 4 }));
+
+    await resubscribed(daemon, 4);
+    await act(async () => {});
+    expect(conv.current.sendError).toBeUndefined();
+    expect(opens(daemon)).toHaveLength(2);
+  });
+
+  it("keeps an event that arrived during the reopen exactly once", async () => {
+    // A redial can succeed while the history loads. What it delivers belongs
+    // after the snapshot, and the resubscribe from the reopen's seq replays it.
+    // Applied early as well, its turn end would read the title twice.
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    let finishOpen: (value: unknown) => void = () => {};
+    daemon.answer("Open", () => new Promise((resolve) => (finishOpen = resolve)));
+    daemon.answer("GetSession", { messages: [{ role: "user", text: "hello" }] });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await waitFor(() => expect(opens(daemon)).toHaveLength(2));
+    const reads = () => daemon.calls.filter((c) => c.method === "GetState").length;
+    const turn = () => {
+      emit(daemon, { eventSeq: 5, textDelta: { text: "early" } as never });
+      emit(daemon, { eventSeq: 6, turnComplete: {} as never });
+    };
+
+    turn();
+    await act(async () => finishOpen({ sessionId: "live-1", lastEventSeq: 4 }));
+    await resubscribed(daemon, 4);
+    const afterReopen = reads();
+    turn();
+    await act(async () => {});
+
+    expect(conv.current.cells.map((c) => c.kind)).toEqual(["user", "assistant"]);
+    expect(conv.current.cells[1]).toMatchObject({ text: "early" });
+    // The open, the reopen, and one title read for the one turn end.
+    expect(afterReopen).toBe(2);
+    expect(reads()).toBe(3);
+  });
+
+  it("carries on with the reopened session when only the history read fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const daemon = fakeDaemon({
+      ...OPEN,
+      GetSession: { messages: [{ role: "user", text: "hello" }] },
+    });
+    const conv = mount(daemon);
+    await ready(conv);
+    await waitFor(() => expect(conv.current.cells).toHaveLength(1));
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 0 });
+    daemon.answer("GetSession", new BorgError(GrpcStatus.Unavailable, "db locked"));
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+
+    await resubscribed(daemon, 0);
+    expect(conv.current.cells).toEqual([{ kind: "user", text: "hello" }]);
+    expect(conv.current.sendError).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      "reloading the conversation history failed",
+      expect.objectContaining({ message: "db locked" }),
+    );
+    warn.mockRestore();
+  });
+
+  it("learns a new conversation's id during its first turn, so a restart can resume it", async () => {
+    // At "new" the daemon has issued no agent session id when the page opens,
+    // and the turn-end read that would learn it never comes if the daemon
+    // restarts mid-turn.
+    const daemon = fakeDaemon({ ...OPEN, GetState: { ...OPEN.GetState, agentSessionId: "" } });
+    const conv = mount(daemon, "new");
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    daemon.answer("GetState", { ...OPEN.GetState, agentSessionId: "agent-7" });
+    daemon.answer("GetSession", { messages: [{ role: "user", text: "go" }] });
+    const reads = daemon.calls.filter((c) => c.method === "GetState").length;
+    emit(daemon, { preparing: {} as never });
+    emit(daemon, { textDelta: { text: "work" } as never });
+    await waitFor(() =>
+      expect(daemon.calls.filter((c) => c.method === "GetState")).toHaveLength(reads + 1),
+    );
+    await act(async () => {});
+
+    daemon.answer("Open", { sessionId: "live-1", lastEventSeq: 0 });
+    act(() => lastStream(daemon).handlers.onError?.(notFound()));
+    await resubscribed(daemon, 0);
+    expect(opens(daemon).map((c) => c.request)).toEqual([{}, { resumeId: "agent-7" }]);
+    expect(conv.current.sendError).toBeUndefined();
+  });
+
+  it("treats a lost connection as an outage, not a missing session", async () => {
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => lastStream(daemon).handlers.onError?.(new BorgError(GrpcStatus.Unavailable, "x")));
+    await waitFor(() => expect(conv.current.streamError).toBeDefined());
+    expect(daemon.calls.filter((c) => c.method === "Open")).toHaveLength(1);
   });
 });

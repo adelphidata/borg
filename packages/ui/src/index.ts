@@ -8,6 +8,7 @@
 
 export type { AppRoute, BannerAlert, NavUser, RecentItem } from "./types";
 
+export { isImeKey, isSubmitEnter, type ComposableKeyEvent } from "./lib/imeKey";
 export { AlertBanner } from "./components/AlertBanner";
 export { BackLink } from "./components/BackLink";
 export { Badge } from "./components/Badge";

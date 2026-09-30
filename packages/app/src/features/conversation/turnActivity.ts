@@ -54,6 +54,12 @@ export function turnActivity(cells: readonly Cell[]): TurnActivity {
   const last = cells[cells.length - 1];
   if (!last) return { label: "Waiting for the model" };
 
+  // The provider dropped and the daemon is redialling. Not "Working": nothing
+  // is, and the wait is the provider's.
+  if (last.kind === "notice" && last.reconnecting) {
+    return { label: "Provider unreachable, retrying…" };
+  }
+
   switch (last.kind) {
     // Every live tool row was handled above, so a tool on the tail is a
     // finished one: the gap before whatever comes next.

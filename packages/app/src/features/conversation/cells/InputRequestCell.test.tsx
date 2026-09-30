@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { InputRequestCell } from "./InputRequestCell";
+import { registerComposer } from "../composerFocus";
 import type { Cell } from "../useConversation";
 
 const question = (over: Record<string, unknown> = {}) => ({
@@ -161,5 +162,60 @@ describe("InputRequestCell", () => {
   it("offers no send control once the question has been answered", () => {
     renderCell({ answered: true });
     expect(screen.queryByText("Send answer")).toBeNull();
+  });
+});
+
+describe("InputRequestCell — input methods and answered prompts", () => {
+  it("does not send on an input method's Enter in the free-text box", () => {
+    const { respond } = renderCell();
+    fireEvent.click(screen.getByText("Other"));
+    const box = screen.getByPlaceholderText("Your answer");
+    fireEvent.change(box, { target: { value: "duckdb" } });
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  it("does not send on an input method's Enter with the chord held", () => {
+    const { respond } = renderCell();
+    fireEvent.click(screen.getByText("postgres"));
+    fireEvent.keyDown(screen.getByText("postgres"), { key: "Enter", metaKey: true, keyCode: 229 });
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  it("ignores the pills and Enter once the prompt is answered", () => {
+    const respond = vi.fn();
+    const cell = {
+      kind: "input-request",
+      promptId: "p1",
+      answered: false,
+      questions: [question()],
+    } as Cell & { kind: "input-request" };
+    const view = render(<InputRequestCell cell={cell} respond={respond} />);
+    fireEvent.click(screen.getByText("Other"));
+    const box = screen.getByPlaceholderText("Your answer");
+    fireEvent.change(box, { target: { value: "duckdb" } });
+
+    view.rerender(<InputRequestCell cell={{ ...cell, answered: true }} respond={respond} />);
+    fireEvent.click(screen.getByText("postgres"));
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    expect(respond).not.toHaveBeenCalled();
+    expect((screen.getByText("postgres") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("hands focus back to the composer once the answer is sent", () => {
+    const composer = document.createElement("textarea");
+    document.body.appendChild(composer);
+    const unregister = registerComposer(() => composer);
+    try {
+      renderCell();
+      fireEvent.click(screen.getByText("postgres"));
+      fireEvent.click(screen.getByText("Send answer"));
+      expect(document.activeElement).toBe(composer);
+    } finally {
+      unregister();
+      composer.remove();
+    }
   });
 });

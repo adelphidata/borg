@@ -14,7 +14,7 @@ vi.mock("@borg/client/node", () => ({ createNodeTransport: () => transport }));
 const { handlers, invoke, makeWindow, resetElectron, windows } =
   await import("./test/electron-stub");
 const { BorgError } = await import("@borg/client");
-const { registerBorgIpc } = await import("./ipc");
+const { registerBorgIpc, loadOf } = await import("./ipc");
 
 let win: ReturnType<typeof makeWindow>;
 
@@ -210,5 +210,104 @@ describe("registerBorgIpc streams", () => {
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(transport.close).toHaveBeenCalledTimes(1);
     for (const channel of Object.values(CHANNELS)) expect(handlers.has(channel)).toBe(false);
+  });
+});
+
+describe("registerBorgIpc when the page goes away", () => {
+  /** Opens a stream and keeps its handlers, so late daemon events can be sent. */
+  function open(id: string) {
+    const cancel = vi.fn();
+    let captured!: { onMessage: (m: unknown) => void; onComplete: () => void };
+    transport.serverStream.mockImplementationOnce((_m, _r, h) => {
+      captured = h;
+      return cancel;
+    });
+    invoke(CHANNELS.streamOpen, event(), id, "Sessions/Watch", {});
+    return { cancel, handlers: captured };
+  }
+
+  it.each([
+    ["the renderer crashes", () => win.webContents.emit("render-process-gone", {}, {})],
+    ["the window's page is destroyed", () => win.webContents.emit("destroyed")],
+  ])("closes every stream the page opened when %s", (_name, leave) => {
+    // A page that dies never cancels its own streams: without this the
+    // daemon subscriptions stay open until the app quits.
+    const ipc = registerBorgIpc();
+    const a = open("load-1:s0");
+    const b = open("load-1:s1");
+
+    leave();
+    expect(a.cancel).toHaveBeenCalledTimes(1);
+    expect(b.cancel).toHaveBeenCalledTimes(1);
+    ipc.dispose();
+    expect(a.cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the previous page's streams when a reloaded page opens its first", () => {
+    const ipc = registerBorgIpc();
+    const a = open("load-1:s0");
+    const b = open("load-1:s1");
+
+    const fresh = open("load-2:s0");
+    expect(a.cancel).toHaveBeenCalledTimes(1);
+    expect(b.cancel).toHaveBeenCalledTimes(1);
+    expect(fresh.cancel).not.toHaveBeenCalled();
+    ipc.dispose();
+    expect(fresh.cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the streams of a page whose navigation was blocked", () => {
+    // A file dropped on the page starts a navigation the window then refuses;
+    // the page lives on, so its streams must too.
+    const ipc = registerBorgIpc();
+    const a = open("load-1:s0");
+
+    win.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+    open("load-1:s1");
+    expect(a.cancel).not.toHaveBeenCalled();
+    ipc.dispose();
+  });
+
+  it("never hands the new page an event or a cancel meant for the old one", () => {
+    const ipc = registerBorgIpc();
+    const old = open("load-1:s0");
+    const fresh = open("load-2:s0");
+
+    // A late event from the old subscription goes out under the old id, which
+    // the new page does not listen for.
+    old.handlers.onMessage({ stale: true });
+    expect(streamed().at(-1)?.id).toBe("load-1:s0");
+
+    // The old stream's late completion must not remove the new entry…
+    old.handlers.onComplete();
+    invoke(CHANNELS.streamCancel, event(), "load-2:s0");
+    expect(fresh.cancel).toHaveBeenCalledTimes(1);
+    expect(old.cancel).toHaveBeenCalledTimes(1);
+    ipc.dispose();
+  });
+
+  it("does not pile up page listeners across reloads and crashes", () => {
+    const ipc = registerBorgIpc();
+    const count = () =>
+      [...win.webContents.listeners.values()].reduce((n, list) => n + list.length, 0);
+    open("load-0:s0");
+    const perWindow = count();
+    for (let i = 1; i <= 5; i++) {
+      open(`load-${i}:s0`);
+      if (i % 2 === 0) win.webContents.emit("render-process-gone", {}, {});
+    }
+    open("load-9:s0");
+    expect(count()).toBe(perWindow);
+    ipc.dispose();
+  });
+});
+
+describe("loadOf", () => {
+  it.each([
+    ["3f2a:s0", "3f2a"],
+    ["a:b:s12", "a:b"],
+    ["s0", ""],
+  ])("%s belongs to load %j", (id, load) => {
+    expect(loadOf(id)).toBe(load);
   });
 });

@@ -129,6 +129,42 @@ describe("Sidebar recents", () => {
     expect(props.onNewConversation).toHaveBeenCalledTimes(1);
   });
 
+  // Keyboard reach. A `div` with an onClick is invisible to Tab, so a person
+  // who does not use a mouse could see the list and never open anything in
+  // it. Both controls are native buttons: the browser turns Enter and Space
+  // into the click the test fires, and the tab order comes for free.
+  it.each([
+    ["+ New", "onNewConversation", undefined],
+    ["a past conversation", "onOpenRecent", "s1"],
+  ] as const)("reaches %s from the keyboard", (name, prop, arg) => {
+    const props = renderSidebar();
+    const control = screen.getByRole("button", { name });
+    expect(control).toBeInstanceOf(HTMLButtonElement);
+    control.focus();
+    expect(document.activeElement).toBe(control);
+    fireEvent.click(control);
+    if (arg === undefined) expect(props[prop]).toHaveBeenCalledTimes(1);
+    else expect(props[prop]).toHaveBeenCalledWith(arg);
+  });
+
+  it("keeps the row's dot inside the control that opens it", () => {
+    // The state must be read out together with the title, not as a separate
+    // stop in the tab order.
+    renderSidebar();
+    const row = screen.getByText("one still running").closest("button");
+    expect(row?.querySelector('[role="img"]')).not.toBeNull();
+  });
+
+  it("keeps the archive × a separate tab stop from the row", () => {
+    // A button cannot contain a button; if the × were nested it would either
+    // vanish from the tab order or open the conversation it is closing.
+    renderSidebar();
+    const open = screen.getByRole("button", { name: "a past conversation" });
+    const archive = screen.getByRole("button", { name: "Archive a past conversation" });
+    expect(open.contains(archive)).toBe(false);
+    expect(archive.contains(open)).toBe(false);
+  });
+
   it("lists only the routes that asked to be in the sidebar", () => {
     renderSidebar();
     expect(screen.getByText("Chat")).toBeTruthy();

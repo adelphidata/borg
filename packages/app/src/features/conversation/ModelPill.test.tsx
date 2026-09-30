@@ -1,6 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { dispatchKeybind, resetKeybinds } from "../../lib/keybinds";
+import { Composer } from "./Composer";
+import { draftKeyFor } from "./draftStore";
 import { ModelPill } from "./ModelPill";
+
+/** The composer's menus talk to the daemon; here it is only the box to return to. */
+vi.mock("../palette/useCommands", () => ({
+  useCommands: () => ({ commands: [], saveError: undefined, clearSaveError: () => {} }),
+}));
+vi.mock("./usePathCompletions", () => ({ usePathCompletions: () => [] }));
 
 const save = vi.fn(() => Promise.resolve(true));
 
@@ -68,7 +77,10 @@ beforeEach(() => {
   stored = { provider: "anthropic", model: "claude-opus-5", "llm.thinking": "medium" };
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetKeybinds();
+});
 
 /** The pill itself, found by the one label that never changes. */
 function pill() {
@@ -168,5 +180,52 @@ describe("ModelPill", () => {
     render(<ModelPill />);
     openMenu();
     expect(resetSaveError).toHaveBeenCalled();
+  });
+});
+
+describe("ModelPill beside the composer", () => {
+  /** A half-written message with the caret in the middle of it, menu open. */
+  function midSentence() {
+    // jsdom has no matchMedia, and the composer asks it for the page width.
+    window.matchMedia = vi.fn(() => ({
+      matches: false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={() => {}}
+        onSteer={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "compare these two" } });
+    box.setSelectionRange(8, 13);
+    // A click moves focus to the pill, which is where it used to stay.
+    pill()!.focus();
+    openMenu();
+    return box;
+  }
+
+  it.each([
+    {
+      name: "a model is picked",
+      close: () => void fireEvent.click(screen.getByRole("button", { name: /Sonnet 5/ })),
+    },
+    { name: "Escape closes the menu", close: () => act(() => void dispatchKeybind("cancel-turn")) },
+  ])("hands the cursor back where it was once $name", ({ close }) => {
+    const box = midSentence();
+    expect(document.activeElement).not.toBe(box);
+
+    close();
+
+    expect(screen.queryByRole("button", { name: /Sonnet 5/ })).toBeNull();
+    expect(document.activeElement).toBe(box);
+    expect([box.selectionStart, box.selectionEnd]).toEqual([8, 13]);
+    expect(box.value).toBe("compare these two");
   });
 });

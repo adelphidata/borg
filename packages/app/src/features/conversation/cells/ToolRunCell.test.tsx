@@ -36,6 +36,14 @@ describe("ToolRunCell", () => {
     expect(screen.getAllByText("read_file")).toHaveLength(3);
   });
 
+  it("renders every call even when the provider reused an id", () => {
+    // Two rows under one React key would collapse into one.
+    render(<ToolRunCell tools={[tool("a", "x.ts"), tool("a", "y.ts")]} live={false} />);
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByText("x.ts")).toBeTruthy();
+    expect(screen.getByText("y.ts")).toBeTruthy();
+  });
+
   it("collapses again on a second click", () => {
     render(<ToolRunCell tools={RUN} live={false} />);
     const summary = screen.getByRole("button", { expanded: false });

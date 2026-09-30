@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pill } from "@borg/ui";
+import { Pill, isSubmitEnter } from "@borg/ui";
 import { useMutation } from "../../lib/useDaemon";
 import {
   detectionNote,
@@ -268,7 +268,7 @@ function Picker({
             placeholder={`${selected.label} API key`}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && start()}
+            onKeyDown={(e) => isSubmitEnter(e) && start()}
           />
           {/* The one step of setup nobody can finish unaided: where the key
               comes from. Opens in the system browser on both surfaces. */}

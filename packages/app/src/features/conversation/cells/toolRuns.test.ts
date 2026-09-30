@@ -45,15 +45,47 @@ describe("groupCells", () => {
     expect(items).toMatchObject([{ type: "run" }, { type: "cell" }]);
   });
 
-  it("keeps a call that wrote to stderr visible, and splits the run around it", () => {
+  it.each([
+    ["failed", { output: "Exit code: 1\n--- stdout ---\n--- stderr ---\nnope" }],
+    ["was stopped", { output: "[tool call cancelled by user]" }],
+  ])("keeps a call that %s visible, and splits the run around it", (_, over) => {
     const items = groupCells(
-      [tool("a"), tool("b"), tool("bad", { stderr: true }), tool("d"), tool("e")],
+      [tool("a"), tool("b"), tool("bad", over), tool("d"), tool("e")],
       false,
     );
     expect(items).toMatchObject([
       { type: "run", key: "run:a" },
       { type: "cell" },
       { type: "run", key: "run:d" },
+    ]);
+  });
+
+  it("folds a call that only wrote to stderr, because stderr is not failure", () => {
+    const noisy = tool("b", {
+      stderr: true,
+      output: "Exit code: 0\n--- stdout ---\n--- stderr ---\nwarn",
+    });
+    expect(groupCells([tool("a"), noisy, tool("c")], false)).toMatchObject([{ type: "run" }]);
+  });
+
+  it("numbers a second run whose first call reuses an id, so keys stay unique", () => {
+    const items = groupCells(
+      [
+        tool("a"),
+        tool("b"),
+        user("more"),
+        tool("a"),
+        tool("b"),
+        user("again"),
+        tool("a"),
+        tool("c"),
+      ],
+      false,
+    );
+    expect(items.filter((i) => i.type === "run").map((i) => i.key)).toEqual([
+      "run:a",
+      "run:a#2",
+      "run:a#3",
     ]);
   });
 

@@ -2,6 +2,21 @@ import { useCallback, useEffect, useRef } from "react";
 import type { admin as adminPb } from "@borg/client";
 import { useBorg, useRetryingServerStream } from "../../lib/useDaemon";
 import { applyActivity, replaceActivity } from "./activityStore";
+import { sessionsChanged } from "./sessionsVersion";
+
+/**
+ * How long after the last transition the lists re-read themselves. Several
+ * sessions settling together — a batch of schedules, say — cost one listing,
+ * not one each.
+ */
+export const SESSIONS_REFRESH_DEBOUNCE_MS = 300;
+
+/**
+ * The longest a renewal waits, counted from the first transition it covers. A
+ * steady stream of transitions less than the debounce apart would otherwise
+ * put the renewal off for as long as the stream lasts.
+ */
+export const SESSIONS_REFRESH_MAX_WAIT_MS = 2_000;
 
 /**
  * Keeps [`activityStore`] fed from the daemon.
@@ -14,9 +29,42 @@ import { applyActivity, replaceActivity } from "./activityStore";
  * stream opens we re-read a listing. That snapshot is what makes a dropped
  * connection harmless — the feed carries only transitions, so on its own it
  * would strand whatever dot was lit when the connection fell over.
+ *
+ * The feed is also what tells the lists to renew themselves. A turn that ends
+ * in the background changes a row's figures — its unread mark reads from
+ * them — and a turn that starts in a conversation nobody has listed yet is a
+ * new row. `isListed` says whether a session id is already on screen; omit it
+ * and only settles trigger a refresh.
+ *
+ * An id the lists do not have asks for one renewal, not one per transition:
+ * a session the listing never returns would otherwise re-read the lists on
+ * every event it sends.
  */
-export function useSessionActivityFeed(): void {
+export function useSessionActivityFeed(
+  isListed: (sessionId: string) => boolean = () => true,
+): void {
   const borg = useBorg();
+  const isListedRef = useRef(isListed);
+  isListedRef.current = isListed;
+
+  const refresh = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** When the first transition the pending renewal covers arrived. */
+  const pendingSince = useRef<number | undefined>(undefined);
+  const scheduleRefresh = useCallback(() => {
+    clearTimeout(refresh.current);
+    const now = Date.now();
+    pendingSince.current ??= now;
+    const deadline = pendingSince.current + SESSIONS_REFRESH_MAX_WAIT_MS;
+    const delay = Math.max(0, Math.min(SESSIONS_REFRESH_DEBOUNCE_MS, deadline - now));
+    refresh.current = setTimeout(() => {
+      refresh.current = undefined;
+      pendingSince.current = undefined;
+      sessionsChanged();
+    }, delay);
+  }, []);
+  /** Unlisted ids that have already had their one renewal. */
+  const renewedFor = useRef(new Set<string>());
+  useEffect(() => () => clearTimeout(refresh.current), []);
 
   /**
    * Transitions that arrived while a listing was in flight.
@@ -62,6 +110,13 @@ export function useSessionActivityFeed(): void {
       // from when the turn really started rather than from when this client
       // heard about it.
       applyActivity(event.sessionId, event.turnActive, Number(event.emittedAtUnix) * 1000);
+      if (!isListedRef.current(event.sessionId)) {
+        if (renewedFor.current.has(event.sessionId)) return;
+        renewedFor.current.add(event.sessionId);
+        scheduleRefresh();
+      } else if (!event.turnActive) {
+        scheduleRefresh();
+      }
     },
   );
 

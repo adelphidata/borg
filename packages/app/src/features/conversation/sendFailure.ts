@@ -58,6 +58,13 @@ interface Rule {
   settings?: boolean;
 }
 
+const RATE_LIMIT_TITLE = "The model provider is throttling Borg";
+const RATE_LIMIT_WHAT = "The provider is taking too many requests right now.";
+const RATE_LIMIT_MESSAGE = `${RATE_LIMIT_WHAT} Wait a moment, then try again.`;
+const BILLING_TITLE = "The model provider needs paying";
+const BILLING_MESSAGE =
+  "The provider refused the request for billing reasons. Add credit with the provider, or switch Borg to another one in Settings.";
+
 /**
  * First match wins, so the order is the priority.
  *
@@ -68,6 +75,36 @@ interface Rule {
  * failure would be branded unpayable and its retry withheld.
  */
 const RULES: readonly Rule[] = [
+  // The daemon's own diagnosis, which it writes in brackets after the status.
+  // These lead because the daemon read the response body and the bare status
+  // codes below did not: a 403 from the provider's edge is not a bad key, and a
+  // 429 for a spent balance is not a throttle.
+  {
+    layer: "connection",
+    pattern: /\(request blocked by cloudflare/,
+    title: "The provider blocked this network",
+    message:
+      "Your network or region was blocked by the provider. Try another network, or switch provider in Settings.",
+    retryable: false,
+    settings: true,
+  },
+  {
+    layer: "billing",
+    pattern: /\(billing error/,
+    title: BILLING_TITLE,
+    message: BILLING_MESSAGE,
+    retryable: false,
+    settings: true,
+  },
+  {
+    // A usage window that reopens on its own, which some providers report
+    // with the status others keep for an unpaid bill.
+    layer: "rate-limit",
+    pattern: /\(usage limit\)/,
+    title: RATE_LIMIT_TITLE,
+    message: RATE_LIMIT_MESSAGE,
+    retryable: true,
+  },
   {
     // libsql, the OS, and the filesystem each phrase this differently, and the
     // message reaches us as whichever layer noticed first.
@@ -92,17 +129,16 @@ const RULES: readonly Rule[] = [
   {
     layer: "rate-limit",
     pattern: /\b429\b|rate[ _-]?limit|too many requests|overloaded/,
-    title: "The model provider is throttling Borg",
-    message: "The provider is taking too many requests right now. Wait a moment, then try again.",
+    title: RATE_LIMIT_TITLE,
+    message: RATE_LIMIT_MESSAGE,
     retryable: true,
   },
   {
     layer: "billing",
     pattern:
       /\b402\b|insufficient_quota|insufficient (credit|funds)|out of credit|payment required|billing/,
-    title: "The model provider needs paying",
-    message:
-      "The provider refused the request for billing reasons. Add credit with the provider, or switch Borg to another one in Settings.",
+    title: BILLING_TITLE,
+    message: BILLING_MESSAGE,
     retryable: false,
     settings: true,
   },
@@ -143,6 +179,29 @@ const RULES: readonly Rule[] = [
   },
 ];
 
+/** "try again in 5 minutes", "retry after 45 seconds", "try again in 1.234s". */
+const RETRY_HINT =
+  /(?:try again in|retry after|retry in)\s+(?:about\s+)?(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m)\b/;
+
+/**
+ * How long the provider said to wait, in the card's words.
+ *
+ * "Wait a moment" is a guess; when the provider named the wait, the guess is
+ * the worse of the two — a user told "a moment" retries a five-minute window
+ * ten times.
+ */
+export function retryHint(raw: string): string | undefined {
+  const match = RETRY_HINT.exec(raw.toLowerCase());
+  if (!match) return undefined;
+  // Rounded up: retrying a fraction early only earns another refusal.
+  const amount = Math.ceil(Number(match[1]));
+  if (amount <= 0) return undefined;
+  if (match[2]!.startsWith("m")) return `Try again in about ${amount} min.`;
+  // Nobody counts to ninety; past that the minute is the unit people use.
+  if (amount >= 90) return `Try again in about ${Math.round(amount / 60)} min.`;
+  return `Try again in about ${amount} ${amount === 1 ? "second" : "seconds"}.`;
+}
+
 /** Sorts a failure into its layer. */
 export function classifyFailure(error: { message: string } | undefined): Failure | undefined {
   if (!error) return undefined;
@@ -151,10 +210,11 @@ export function classifyFailure(error: { message: string } | undefined): Failure
   if (!rule) {
     return { layer: "unknown", message: error.message, retryable: true, settings: false };
   }
+  const hint = rule.layer === "rate-limit" ? retryHint(error.message) : undefined;
   return {
     layer: rule.layer,
     title: rule.title,
-    message: rule.message,
+    message: hint ? `${RATE_LIMIT_WHAT} ${hint}` : rule.message,
     retryable: rule.retryable,
     settings: rule.settings ?? false,
   };

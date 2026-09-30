@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { CompletionList, rowDomId, type CompletionRow } from "./CompletionList";
 
@@ -136,5 +136,45 @@ describe("CompletionList", () => {
     } finally {
       Element.prototype.scrollIntoView = original;
     }
+  });
+});
+
+describe("CompletionList row labels", () => {
+  const restores: Array<() => void> = [];
+  afterEach(() => {
+    while (restores.length) restores.pop()?.();
+  });
+
+  /** jsdom lays nothing out, so the widths a browser would measure are given. */
+  function stubWidths(scrollWidth: number, clientWidth: number) {
+    const scroll = Object.getOwnPropertyDescriptor(Element.prototype, "scrollWidth");
+    const client = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(Element.prototype, "scrollWidth", {
+      configurable: true,
+      value: scrollWidth,
+    });
+    Object.defineProperty(Element.prototype, "clientWidth", {
+      configurable: true,
+      value: clientWidth,
+    });
+    restores.push(() => {
+      if (scroll) Object.defineProperty(Element.prototype, "scrollWidth", scroll);
+      if (client) Object.defineProperty(Element.prototype, "clientWidth", client);
+    });
+  }
+
+  it("gives the full text of a label that is cut off", () => {
+    stubWidths(400, 100);
+    renderList();
+    expect(screen.getByText("/model").getAttribute("title")).toBe("/model");
+    // Only the label can be cut off; the detail and the hint never shrink.
+    expect(screen.getByText("opus").getAttribute("title")).toBeNull();
+    expect(screen.getByText("Session").getAttribute("title")).toBeNull();
+  });
+
+  it("gives no tip for a label that fits", () => {
+    stubWidths(100, 100);
+    renderList();
+    expect(screen.getByText("/model").getAttribute("title")).toBeNull();
   });
 });

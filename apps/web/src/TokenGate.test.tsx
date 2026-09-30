@@ -124,3 +124,21 @@ describe("TokenGate", () => {
     expect(document.activeElement).toBe(box());
   });
 });
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("TokenGate and an input method", () => {
+  it.each(IME_ENTERS)("does not sign in on an Enter %s", (_name, init) => {
+    renderGate();
+    fireEvent.change(box(), { target: { value: "tok_live" } });
+
+    fireEvent.keyDown(box(), init);
+
+    expect(localStorage.getItem(STORAGE_KEYS.token)).toBeNull();
+    expect(screen.queryByText("the app")).toBeNull();
+  });
+});

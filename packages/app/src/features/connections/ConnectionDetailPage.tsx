@@ -8,6 +8,7 @@ import {
   Pill,
   SECTION_LABEL,
   StatusDot,
+  isSubmitEnter,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
@@ -178,7 +179,7 @@ function ProviderDetail({
             placeholder="API key"
             value={draftKey}
             onChange={(e) => setDraftKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && submitKey()}
+            onKeyDown={(e) => isSubmitEnter(e) && submitKey()}
           />
           <Pill variant="primary" onClick={submitKey}>
             {saveKey.pending ? "Saving…" : "Save"}

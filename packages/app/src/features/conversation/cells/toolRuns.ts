@@ -1,6 +1,7 @@
 import type { Cell } from "../useConversation";
 import { collectEdits } from "../turnEdits";
 import { parseArgs, summarize } from "./ToolCell";
+import { toolOutcome } from "./toolOutcome";
 import { capitalize } from "../../../lib/format";
 
 /** A tool cell, narrowed once so the grouping code stops re-proving it. */
@@ -129,18 +130,26 @@ const MIN_RUN = 2;
  *
  * A turn that touches thirty files should not cost thirty rows of transcript to
  * say so. Anything that still wants attention refuses to collapse — a call
- * still running, and one that wrote to stderr — and because those are not
- * collapsible they also end the run they sit in, so they keep their place in
- * the order and stay readable on their own.
+ * still running, one that failed, one the user stopped — and because those are
+ * not collapsible they also end the run they sit in, so they keep their place
+ * in the order and stay readable on their own.
  *
  * Runs are keyed by their first call's id, never by position: the live
  * transcript and the one rehydrated from history agree on which calls belong
  * together but not on where they sit in the array, and an index key makes the
- * whole run remount the moment a turn settles.
+ * whole run remount the moment a turn settles. A provider that reuses call ids
+ * would hand two runs the same key, so a repeat is numbered.
  */
 export function groupCells(cells: Cell[], busy: boolean): RenderItem[] {
   const collapsible = (cell: Cell): cell is ToolCellData =>
-    cell.kind === "tool" && cell.done && !cell.stderr;
+    cell.kind === "tool" && toolOutcome(cell) === "ok";
+
+  const seen = new Map<string, number>();
+  const keyFor = (id: string) => {
+    const count = (seen.get(id) ?? 0) + 1;
+    seen.set(id, count);
+    return count === 1 ? `run:${id}` : `run:${id}#${count}`;
+  };
 
   const items: RenderItem[] = [];
   for (let i = 0; i < cells.length;) {
@@ -161,7 +170,7 @@ export function groupCells(cells: Cell[], busy: boolean): RenderItem[] {
       items.push({ type: "cell", cell: run[0]!, index: i - 1 });
       continue;
     }
-    items.push({ type: "run", key: `run:${run[0]!.id}`, tools: run, live: false, index: start });
+    items.push({ type: "run", key: keyFor(run[0]!.id), tools: run, live: false, index: start });
   }
 
   // Only the trailing run of a turn still in flight is live; an earlier one has

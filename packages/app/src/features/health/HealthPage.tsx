@@ -1,5 +1,14 @@
 import { useState } from "react";
-import { CheckIcon, MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from "@borg/ui";
+import {
+  CheckIcon,
+  MobileTitle,
+  PageChrome,
+  Pill,
+  StatusDot,
+  scrollCol,
+  useIsMobile,
+  type DotTone,
+} from "@borg/ui";
 import type { BorgClient, admin } from "@borg/client";
 import { useMutation, useQuery } from "../../lib/useDaemon";
 import { DaemonState } from "../../components/DaemonState";
@@ -9,7 +18,11 @@ interface HealthCheck {
   id: string;
   name: string;
   value: string;
-  ok: boolean;
+  /**
+   * `unchecked` is its own state, not a pass: the call did not answer, so
+   * the page knows nothing either way and must not paint it green.
+   */
+  state: "ok" | "alert" | "unchecked";
   /** Plain-language explanation revealed when the row is expanded. */
   detail: string;
   /** Optional lines rendered as a bullet list under the detail. */
@@ -29,92 +42,150 @@ function fmtAgo(unixTs: number): string {
   return `${fmtDuration(secs)} ago`;
 }
 
-/** Everything the check rows need, fetched together so one refetch renews it all. */
+/** A row whose call did not answer. Nothing is wrong with Borg that we know of. */
+const UNCHECKED = {
+  value: "Couldn't check",
+  state: "unchecked",
+  detail: "Borg did not answer this check. Choose Check again in a moment.",
+} as const;
+
+/** What each state looks like as a dot; a row that did not answer is grey. */
+const DOT: Record<HealthCheck["state"], DotTone> = { ok: "ok", alert: "alert", unchecked: "idle" };
+
+/**
+ * The value when the call succeeded, `undefined` when it did not. The row
+ * says only "Couldn't check", so the reason goes to the console.
+ */
+const settled = <T,>(what: string, result: PromiseSettledResult<T>): T | undefined => {
+  if (result.status === "fulfilled") return result.value;
+  console.warn(`health: ${what} did not answer`, result.reason);
+  return undefined;
+};
+
+/**
+ * Everything the check rows need, fetched together so one refetch renews it
+ * all. Each call fails on its own: one row saying it could not be checked is
+ * the truth, while a page that goes blank over one dropped call throws away
+ * six answers it has. Only the daemon status is load-bearing — without it
+ * there is no Borg to report on.
+ */
 async function loadHealth(borg: BorgClient) {
-  const [daemon, warnings, subprocesses, posture, heartbeat, tokens, cost] = await Promise.all([
-    borg.admin.getDaemonStatus({}),
-    borg.admin.getPersistentWarnings({}),
-    borg.admin.getSubprocesses({}),
-    borg.status.getPosture({}),
-    borg.status.getHeartbeat({}),
-    borg.admin.getMonthlyTokenTotal({}),
-    borg.admin.getMonthlyTotalCost({}),
-  ]);
-  return { daemon, warnings, subprocesses, posture, heartbeat, tokens, cost };
+  const [daemon, warnings, subprocesses, posture, heartbeat, tokens, cost] =
+    await Promise.allSettled([
+      borg.admin.getDaemonStatus({}),
+      borg.admin.getPersistentWarnings({}),
+      borg.admin.getSubprocesses({}),
+      borg.status.getPosture({}),
+      borg.status.getHeartbeat({}),
+      borg.admin.getMonthlyTokenTotal({}),
+      borg.admin.getMonthlyTotalCost({}),
+    ]);
+  if (daemon.status === "rejected") throw daemon.reason;
+  return {
+    daemon: daemon.value,
+    warnings: settled("warnings", warnings),
+    subprocesses: settled("subprocesses", subprocesses),
+    posture: settled("posture", posture),
+    heartbeat: settled("heartbeat", heartbeat),
+    tokens: settled("token total", tokens),
+    cost: settled("cost", cost),
+  };
 }
 
 type HealthData = Awaited<ReturnType<typeof loadHealth>>;
 
 function buildChecks(d: HealthData): HealthCheck[] {
-  const running = d.subprocesses.running.length;
+  const running = d.subprocesses?.running.length;
   // The daemon sends "Reduced" / "Default" / "Boosted"; compare case-blind.
-  const posture = (d.posture.posture || "default").toLowerCase();
-  const heartbeatOn = d.heartbeat.nextInSeconds > 0;
+  const posture = d.posture && (d.posture.posture || "default").toLowerCase();
+  const heartbeatOn = d.heartbeat && d.heartbeat.nextInSeconds > 0;
+
+  const warnings: HealthCheck = d.warnings
+    ? {
+        id: "warnings",
+        name: "Warnings",
+        value:
+          d.warnings.warnings.length === 0 ? "None" : plural(d.warnings.warnings.length, "warning"),
+        state: d.warnings.warnings.length === 0 ? "ok" : "alert",
+        detail:
+          d.warnings.warnings.length === 0
+            ? "The last check-up found nothing that needs you."
+            : "These checks need a look:",
+        items: d.warnings.warnings.length === 0 ? undefined : d.warnings.warnings,
+      }
+    : { id: "warnings", name: "Warnings", ...UNCHECKED };
+
+  const security: HealthCheck =
+    d.posture && posture
+      ? {
+          id: "posture",
+          name: "Security posture",
+          value: capitalize(posture),
+          state: posture === "reduced" ? "alert" : "ok",
+          detail:
+            posture === "reduced"
+              ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust."
+              : `Protections are at their normal level. XP multiplier ×${d.posture.xpMultiplier.toFixed(2)}.`,
+        }
+      : { id: "posture", name: "Security posture", ...UNCHECKED };
+
+  const checkIns: HealthCheck = d.heartbeat
+    ? {
+        id: "heartbeat",
+        name: "Proactive check-ins",
+        value: heartbeatOn ? `next in ${fmtDuration(d.heartbeat.nextInSeconds)}` : "off",
+        state: "ok",
+        detail: heartbeatOn
+          ? `Borg checks in on its own. Last one ${fmtAgo(d.heartbeat.lastUnixTs)}, next in ${fmtDuration(d.heartbeat.nextInSeconds)}.`
+          : "Proactive check-ins are off, so Borg only acts when you ask.",
+      }
+    : { id: "heartbeat", name: "Proactive check-ins", ...UNCHECKED };
+
+  const work: HealthCheck =
+    running !== undefined
+      ? {
+          id: "work",
+          name: "Background work",
+          value: `${plural(d.daemon.activeTasks, "schedule")} · ${plural(running, "process")}`,
+          state: "ok",
+          detail:
+            `${plural(d.daemon.activeTasks, "scheduled task")} active` +
+            (d.daemon.pausedTasks > 0 ? `, ${d.daemon.pausedTasks} paused` : "") +
+            `. ${plural(running, "subprocess")} running right now.`,
+        }
+      : { id: "work", name: "Background work", ...UNCHECKED };
+
+  // A missing price is the same news as "no price data": the tokens still count.
+  const cost = d.cost?.present ? d.cost.cost.toFixed(2) : undefined;
+  const usage: HealthCheck = d.tokens
+    ? {
+        id: "usage",
+        name: "Usage this month",
+        value: `${d.tokens.total.toLocaleString()} tokens` + (cost ? ` · $${cost}` : ""),
+        state: "ok",
+        detail: cost
+          ? `Borg has used ${d.tokens.total.toLocaleString()} tokens this month, costing about $${cost}.`
+          : `Borg has used ${d.tokens.total.toLocaleString()} tokens this month. No price data yet, so there is no cost estimate.`,
+      }
+    : { id: "usage", name: "Usage this month", ...UNCHECKED };
 
   return [
     {
       id: "daemon",
       name: "Borg is running",
       value: `${fmtDuration(d.daemon.uptimeSecs)} without a restart`,
-      ok: true,
+      state: "ok",
       detail:
         `Version ${d.daemon.version}, up for ${fmtDuration(d.daemon.uptimeSecs)}. ` +
         (d.daemon.llmProvider
           ? `Thinking with ${d.daemon.llmModel || "the default model"} on ${d.daemon.llmProvider}.`
           : "No model provider is configured yet."),
     },
-    {
-      id: "warnings",
-      name: "Warnings",
-      value:
-        d.warnings.warnings.length === 0 ? "None" : plural(d.warnings.warnings.length, "warning"),
-      ok: d.warnings.warnings.length === 0,
-      detail:
-        d.warnings.warnings.length === 0
-          ? "The last check-up found nothing that needs you."
-          : "These checks need a look:",
-      items: d.warnings.warnings.length === 0 ? undefined : d.warnings.warnings,
-    },
-    {
-      id: "posture",
-      name: "Security posture",
-      value: capitalize(posture),
-      ok: posture !== "reduced",
-      detail:
-        posture === "reduced"
-          ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust."
-          : `Protections are at their normal level. XP multiplier ×${d.posture.xpMultiplier.toFixed(2)}.`,
-    },
-    {
-      id: "heartbeat",
-      name: "Proactive check-ins",
-      value: heartbeatOn ? `next in ${fmtDuration(d.heartbeat.nextInSeconds)}` : "off",
-      ok: true,
-      detail: heartbeatOn
-        ? `Borg checks in on its own. Last one ${fmtAgo(d.heartbeat.lastUnixTs)}, next in ${fmtDuration(d.heartbeat.nextInSeconds)}.`
-        : "Proactive check-ins are off, so Borg only acts when you ask.",
-    },
-    {
-      id: "work",
-      name: "Background work",
-      value: `${plural(d.daemon.activeTasks, "schedule")} · ${plural(running, "process")}`,
-      ok: true,
-      detail:
-        `${plural(d.daemon.activeTasks, "scheduled task")} active` +
-        (d.daemon.pausedTasks > 0 ? `, ${d.daemon.pausedTasks} paused` : "") +
-        `. ${plural(running, "subprocess")} running right now.`,
-    },
-    {
-      id: "usage",
-      name: "Usage this month",
-      value:
-        `${d.tokens.total.toLocaleString()} tokens` +
-        (d.cost.present ? ` · $${d.cost.cost.toFixed(2)}` : ""),
-      ok: true,
-      detail: d.cost.present
-        ? `Borg has used ${d.tokens.total.toLocaleString()} tokens this month, costing about $${d.cost.cost.toFixed(2)}.`
-        : `Borg has used ${d.tokens.total.toLocaleString()} tokens this month. No price data yet, so there is no cost estimate.`,
-    },
+    warnings,
+    security,
+    checkIns,
+    work,
+    usage,
   ];
 }
 
@@ -146,7 +217,14 @@ export function HealthPage() {
   const refreshing = vitals.refreshing || health.refreshing;
   const lastChecked = refreshing ? "checking…" : "just now";
   const checks = health.state === "ready" ? buildChecks(health.data) : [];
-  const failing = checks.filter((c) => !c.ok);
+  const failing = checks.filter((c) => c.state === "alert");
+  const unchecked = checks.filter((c) => c.state === "unchecked");
+  const headline =
+    failing.length > 0
+      ? "Borg needs a look."
+      : unchecked.length > 0
+        ? "Some checks did not answer."
+        : "Borg is healthy.";
   const healReport = heal.error
     ? `Tidy-up failed: ${heal.error.message}`
     : heal.pending
@@ -164,17 +242,27 @@ export function HealthPage() {
           <div className="flex items-start gap-[22px]">
             <span
               className={`flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] ${
-                failing.length > 0 ? "border-alert" : "border-neon shadow-(--plateGlow)"
+                failing.length > 0
+                  ? "border-alert"
+                  : unchecked.length > 0
+                    ? "border-ink3"
+                    : "border-neon shadow-(--plateGlow)"
               }`}
             >
               <CheckIcon size={22} />
             </span>
             <div className="flex-1 pt-0.5">
               <h1 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">
-                {failing.length > 0 ? "Borg needs a look." : "Borg is healthy."}
+                {headline}
               </h1>
               <p className="mt-[9px] mb-0 text-[14.5px] leading-[1.6] text-pretty text-ink2">
                 {failing.length > 0 && <>Needs you: {failing.map((c) => c.name).join(", ")}. </>}
+                {unchecked.length > 0 && (
+                  <>
+                    No answer from: {unchecked.map((c) => c.name).join(", ")}. Try again in a
+                    moment.{" "}
+                  </>
+                )}
                 Everything else checked out {lastChecked}.
               </p>
             </div>
@@ -216,11 +304,7 @@ export function HealthPage() {
                         className="flex cursor-pointer items-center gap-[15px] border-b border-line2 px-0.5 py-[15px]"
                         onClick={() => setOpenId((id) => (id === c.id ? null : c.id))}
                       >
-                        <span
-                          className={`h-[7px] w-[7px] flex-none rounded-full ${
-                            c.ok ? "bg-neon" : "bg-alert"
-                          }`}
-                        />
+                        <StatusDot tone={DOT[c.state]} />
                         <span className="flex-1 text-[14px] leading-[1.35] text-ink">{c.name}</span>
                         <span className="text-right text-[12.5px] leading-[1.35] text-ink3">
                           {c.value}

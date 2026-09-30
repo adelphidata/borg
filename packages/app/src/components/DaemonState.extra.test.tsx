@@ -113,6 +113,43 @@ describe("DaemonState in general", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 
+  it("offers the page's own ways out beside the failure", () => {
+    const leave = vi.fn();
+    renderApp(
+      <DaemonState
+        query={{ state: "error", error: new BorgError(GrpcStatus.NotFound, "no such session") }}
+        label="the conversation"
+        actions={
+          <button type="button" onClick={leave}>
+            Start a new conversation
+          </button>
+        }
+      >
+        {body}
+      </DaemonState>,
+    );
+    expect(screen.getByText("Could not load the conversation.")).toBeTruthy();
+    screen.getByRole("button", { name: "Start a new conversation" }).click();
+    expect(leave).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { name: "while loading", query: { state: "loading" as const } },
+    { name: "once loaded", query: { state: "ready" as const, data: "the goods" } },
+  ])("keeps the ways out off screen $name", ({ query }) => {
+    // They are remedies for a failure, and there is none.
+    renderApp(
+      <DaemonState
+        query={query}
+        label="sessions"
+        actions={<button type="button">Try again</button>}
+      >
+        {body}
+      </DaemonState>,
+    );
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
   it("renders the data once it is there", () => {
     renderApp(
       <DaemonState query={{ state: "ready", data: "the goods" }} label="sessions">

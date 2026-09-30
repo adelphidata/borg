@@ -107,8 +107,26 @@ describe("transport.serverStream", () => {
     const first = await open(borg);
     const second = await open(borg);
     expect(first.id).not.toBe(second.id);
-    const numeric = (id: string) => Number(id.slice(1));
+    const numeric = (id: string) => Number(id.slice(id.lastIndexOf(":s") + 2));
     expect(numeric(second.id)).toBeGreaterThan(numeric(first.id));
+  });
+
+  it("names the page load in every stream id, fresh on each load", async () => {
+    // The main process closes a dead page's streams when the next load opens
+    // its first, and keeps two loads' `s0` apart. That needs the load in the id.
+    const load = (id: string) => id.slice(0, id.lastIndexOf(":"));
+    const firstLoad = await loadPreload();
+    const a = await open(firstLoad);
+    const b = await open(firstLoad);
+    expect(load(a.id)).not.toBe("");
+    expect(load(b.id)).toBe(load(a.id));
+
+    // A page reload runs the preload again from scratch.
+    vi.resetModules();
+    await import("./preload");
+    const reloaded = contextBridgeState.exposed.get("borg") as ExposedBorg;
+    const c = await open(reloaded);
+    expect(load(c.id)).not.toBe(load(a.id));
   });
 
   it("rehydrates a stream error and stops listening", async () => {

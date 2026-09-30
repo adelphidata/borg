@@ -70,12 +70,13 @@ export function BootGate({ children }: { children: ReactNode }) {
                 Try again
               </Pill>
             )}
-            <span
-              className="cursor-pointer text-[12.5px] leading-none text-ink3 hover:text-ink"
+            <button
+              type="button"
+              className="cursor-pointer border-0 bg-transparent p-0 text-[12.5px] leading-none text-ink3 hover:text-ink"
               onClick={() => setDismissed(true)}
             >
               Look around anyway
-            </span>
+            </button>
           </div>
         )}
       </div>

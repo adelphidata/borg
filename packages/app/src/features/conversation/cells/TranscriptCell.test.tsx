@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TranscriptCell } from "./index";
+import { registerComposer } from "../composerFocus";
 import type { Cell } from "../useConversation";
 
 function renderCell(cell: Cell, over: { ordinal?: number; editable?: boolean } = {}) {
@@ -29,9 +30,73 @@ describe("TranscriptCell — user turns", () => {
     expect(screen.getByText("ship it")).toBeTruthy();
   });
 
-  it("counts attachments the transcript no longer holds the bytes for", () => {
-    renderCell({ kind: "user", text: "look at this", attachments: 2 });
+  it("counts images and names documents, none of whose bytes it still holds", () => {
+    renderCell({
+      kind: "user",
+      text: "look at this",
+      attachments: [
+        { kind: "image", filename: "IMG_1.png" },
+        { kind: "document", filename: "notes.md" },
+        { kind: "image", filename: "IMG_2.png" },
+      ],
+    });
     expect(screen.getByText("2 images attached")).toBeTruthy();
+    expect(screen.getByText("notes.md")).toBeTruthy();
+    expect(screen.queryByText(/IMG_/)).toBeNull();
+  });
+
+  it("calls a long paste what the user did, not what the file was named", () => {
+    renderCell({
+      kind: "user",
+      text: "",
+      attachments: [
+        { kind: "document", filename: "pasted-text.txt" },
+        { kind: "document", filename: "pasted-text-2.txt" },
+      ],
+    });
+    expect(screen.getAllByText("Pasted text")).toHaveLength(2);
+  });
+
+  it("singular for one image", () => {
+    renderCell({ kind: "user", text: "", attachments: [{ kind: "image", filename: "a.png" }] });
+    expect(screen.getByText("1 image attached")).toBeTruthy();
+  });
+
+  it("renders no empty text block for a turn that was only its attachments", () => {
+    const { container } = renderCell({
+      kind: "user",
+      text: "",
+      attachments: [{ kind: "document", filename: "notes.md" }],
+    });
+    const bubble = container.querySelector(".whitespace-pre-wrap")!;
+    // Only the attachment line, so the bubble has no blank first line.
+    expect(bubble.children).toHaveLength(1);
+    expect(bubble.firstElementChild!.textContent).toBe("notes.md");
+  });
+
+  it("ignores an input method's Enter in the edit box, which would rewind mid-word", () => {
+    const { onEdit } = renderCell({ kind: "user", text: "ship it" }, { ordinal: 0 });
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+    const box = screen.getByDisplayValue("ship it");
+    fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(screen.getByDisplayValue("ship it")).toBeTruthy();
+  });
+
+  it("opens the edit box at the height of the text, not of its line breaks", () => {
+    Object.defineProperty(HTMLTextAreaElement.prototype, "scrollHeight", {
+      configurable: true,
+      get: () => 96,
+    });
+    try {
+      renderCell({ kind: "user", text: "one long paragraph".repeat(20) }, { ordinal: 0 });
+      fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+      const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+      expect(box.style.height).toBe("96px");
+    } finally {
+      delete (HTMLTextAreaElement.prototype as { scrollHeight?: unknown }).scrollHeight;
+    }
   });
 
   it("rewrites a turn and re-runs from there", () => {
@@ -106,6 +171,23 @@ describe("TranscriptCell — other kinds", () => {
 
     fireEvent.click(screen.getByText("Deny"));
     expect(respond).toHaveBeenCalledWith("p1", "false");
+  });
+
+  it("hands focus back to the composer once a command is allowed or denied", () => {
+    for (const choice of ["Allow", "Deny"]) {
+      const composer = document.createElement("textarea");
+      document.body.appendChild(composer);
+      const unregister = registerComposer(() => composer);
+      try {
+        renderCell({ kind: "shell-confirm", promptId: "p1", command: "ls", answered: false });
+        fireEvent.click(screen.getByText(choice));
+        expect(document.activeElement).toBe(composer);
+      } finally {
+        unregister();
+        composer.remove();
+        cleanup();
+      }
+    }
   });
 
   it("drops the answer controls once the prompt is answered", () => {
@@ -221,5 +303,53 @@ describe("TranscriptCell — timestamps", () => {
       cacheWrite: 0,
     });
     expect((container.firstElementChild as HTMLElement).title).toBe("");
+  });
+});
+
+describe("TranscriptCell — tool rows", () => {
+  const tool = (output: string, over: Partial<Cell & { kind: "tool" }> = {}): Cell => ({
+    kind: "tool",
+    id: "t1",
+    name: "run_shell",
+    args: '{"command":"make"}',
+    output,
+    done: true,
+    stderr: false,
+    ...over,
+  });
+  const dot = (container: HTMLElement) => container.querySelector("button > span")!;
+  // The last <pre> is the output; an opened row shows the arguments above it.
+  const output = (container: HTMLElement) => Array.from(container.querySelectorAll("pre")).at(-1)!;
+
+  it("marks a command that exited non-zero as a failure, in red", () => {
+    const { container } = renderCell(tool("Exit code: 2\n--- stdout ---\n--- stderr ---\nno rule"));
+    fireEvent.click(screen.getByRole("button"));
+    expect(dot(container).className).toContain("bg-alert");
+    expect(output(container).className).toContain("text-alert");
+  });
+
+  it("keeps a clean exit green even when it wrote to stderr", () => {
+    // Progress on stderr is what most build tools do; red here teaches the
+    // user to ignore red.
+    const { container } = renderCell(
+      tool("Exit code: 0\n--- stdout ---\n--- stderr ---\nwarning: unused", { stderr: true }),
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(dot(container).className).toContain("bg-neon");
+    expect(output(container).className).not.toContain("text-alert");
+  });
+
+  it("reads the same failure off a reloaded row, which carries no stderr flag", () => {
+    const { container } = renderCell(tool("Shell command denied: matches a blocked pattern"));
+    expect(dot(container).className).toContain("bg-alert");
+  });
+
+  it("shows a cancelled call as Stopped, neither green nor red", () => {
+    const { container } = renderCell(tool("[tool call cancelled by user]"));
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("Stopped")).toBeTruthy();
+    expect(screen.queryByText("[tool call cancelled by user]")).toBeNull();
+    expect(dot(container).className).not.toContain("bg-alert");
+    expect(dot(container).className).not.toContain("bg-neon");
   });
 });

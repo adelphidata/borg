@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CheckIcon, ChevronDownIcon, ChevronIcon, StatusDot, Truncated } from "@borg/ui";
 import type { PlanStep } from "../useConversation";
 
@@ -14,6 +14,21 @@ function isActive(status: string): boolean {
 }
 
 /**
+ * Scrolls `list` just far enough to show `item`, and not at all when it is
+ * already in view. `item.offsetTop` is measured from the list, which is why
+ * the list is positioned.
+ */
+export function revealInList(
+  list: Pick<HTMLElement, "scrollTop" | "clientHeight">,
+  item: Pick<HTMLElement, "offsetTop" | "offsetHeight">,
+): void {
+  const top = item.offsetTop;
+  const bottom = top + item.offsetHeight;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
+}
+
+/**
  * The agent's todo list, pinned above the composer.
  *
  * Hoisted out of the transcript on purpose: a plan is current state, not
@@ -22,6 +37,17 @@ function isActive(status: string): boolean {
  */
 export function PlanPanel({ steps }: { steps: PlanStep[] }) {
   const [open, setOpen] = useState(true);
+  // The list is capped, so on a long plan the step in hand can sit below the
+  // fold. Moved by hand rather than with `scrollIntoView`, which would also
+  // scroll every scrollable ancestor — the page under a reader included.
+  const listRef = useRef<HTMLUListElement>(null);
+  const activeRef = useRef<HTMLLIElement>(null);
+  const activeId = steps.find((s) => isActive(s.status))?.id;
+  useEffect(() => {
+    const list = listRef.current;
+    const item = activeRef.current;
+    if (open && activeId !== undefined && list && item) revealInList(list, item);
+  }, [activeId, open]);
   if (steps.length === 0) return null;
 
   const done = steps.filter((s) => isDone(s.status)).length;
@@ -60,10 +86,15 @@ export function PlanPanel({ steps }: { steps: PlanStep[] }) {
         </span>
       </button>
       {open && (
-        <ul className="m-0 list-none px-3.5 pt-0 pb-3">
+        // Capped: a twenty-step plan would otherwise take the transcript's room.
+        <ul
+          ref={listRef}
+          className="relative m-0 max-h-[30vh] list-none overflow-y-auto px-3.5 pt-0 pb-3"
+        >
           {steps.map((step) => (
             <li
               key={step.id}
+              ref={step.id === activeId ? activeRef : undefined}
               className="flex items-start gap-2 py-[3px] text-[12.5px] leading-[1.5]"
             >
               <span className="mt-[3px] flex h-3 w-3 flex-none items-center justify-center">

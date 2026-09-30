@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Pill, STORAGE_KEYS } from "@borg/ui";
+import { Pill, STORAGE_KEYS, isSubmitEnter } from "@borg/ui";
 
 /**
  * Sign-in for the browser surface.
@@ -73,7 +73,7 @@ export function TokenGate({ children }: { children: ReactNode }) {
           autoFocus
           placeholder="Client token"
           onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && save()}
+          onKeyDown={(e) => isSubmitEnter(e) && save()}
           className="w-full rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon"
         />
 

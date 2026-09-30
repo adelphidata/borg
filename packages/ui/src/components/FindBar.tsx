@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { isSubmitEnter } from "../lib/imeKey";
 import { ChevronDownIcon, CloseIcon, SearchIcon } from "./icons";
 
 export interface FindBarProps {
@@ -17,6 +18,11 @@ export interface FindBarProps {
    * say.
    */
   onSearchAll?: () => void;
+  /**
+   * Any change puts the cursor back in the box with the query selected. The
+   * find shortcut pressed again while the bar is open lands here.
+   */
+  focusRequest?: number;
 }
 
 function Step({
@@ -62,11 +68,16 @@ export function FindBar({
   onPrevious,
   onClose,
   onSearchAll,
+  focusRequest,
 }: FindBarProps) {
   const box = useRef<HTMLInputElement>(null);
   // Opening a search box that is not focused makes the user click the thing
   // they just asked for.
-  useEffect(() => box.current?.focus(), []);
+  useEffect(() => {
+    box.current?.focus();
+    // Selected, so typing replaces the last search instead of extending it.
+    box.current?.select();
+  }, [focusRequest]);
 
   const empty = query !== "" && count === 0;
 
@@ -85,7 +96,7 @@ export function FindBar({
         onChange={(e) => onQueryChange(e.target.value)}
         onKeyDown={(e) => {
           // Enter walks the results, which is what every find bar does.
-          if (e.key === "Enter") {
+          if (isSubmitEnter(e)) {
             e.preventDefault();
             if (e.shiftKey) onPrevious();
             else onNext();

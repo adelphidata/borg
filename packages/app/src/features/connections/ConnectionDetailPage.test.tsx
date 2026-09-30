@@ -316,3 +316,26 @@ describe("ConnectionDetailPage for a channel", () => {
     await waitFor(() => expect(screen.getByText("No one is approved yet.")).toBeTruthy());
   });
 });
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("ConnectionDetailPage and an input method", () => {
+  it.each(IME_ENTERS)("does not save the key on an Enter %s", async (_name, init) => {
+    const daemon = fakeDaemon({ ...EMPTY, SetApiKey: {} });
+    mount("/connections/provider/anthropic", daemon);
+    await waitFor(() => expect(screen.getByPlaceholderText("API key")).toBeTruthy());
+
+    fireEvent.change(screen.getByPlaceholderText("API key"), { target: { value: "sk-live" } });
+    fireEvent.keyDown(screen.getByPlaceholderText("API key"), init);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(daemon.calls.some((c) => c.method === "SetApiKey")).toBe(false);
+    expect(screen.getByPlaceholderText("API key")).toHaveProperty("value", "sk-live");
+  });
+});

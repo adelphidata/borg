@@ -6,8 +6,10 @@ import { registerBorgIpc } from "./ipc";
 import { installApplicationMenu } from "./menu";
 import { raise, registerNativeIpc } from "./native";
 import { registerQuickEntry } from "./quick-entry";
+import { isRecoveryReload, RECOVERY_PAGE_URL } from "./recovery";
+import { createReloadBudget } from "./reload-budget";
 import { registerUpdater } from "./updater";
-import { loadWindowState, trackWindowState } from "./window-state";
+import { loadWindowState, MIN_HEIGHT, MIN_WIDTH, trackWindowState } from "./window-state";
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL;
 // Resolve against the app root (the directory holding package.json), not
@@ -22,6 +24,8 @@ const preloadJs = path.join(appRoot, "dist-electron", "preload.js");
 const QUICK_ENTRY_HOTKEY = "CmdOrCtrl+Shift+Space";
 
 let mainWindow: BrowserWindow | null = null;
+/** Set once a quit is under way, when a renderer that goes away is expected. */
+let quitting = false;
 
 function createWindow() {
   const saved = loadWindowState();
@@ -30,8 +34,8 @@ function createWindow() {
     height: saved.height,
     x: saved.x,
     y: saved.y,
-    minWidth: 360,
-    minHeight: 600,
+    minWidth: MIN_WIDTH,
+    minHeight: MIN_HEIGHT,
     show: false, // shown on ready-to-show to avoid a blank-window flash
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 15, y: 14 },
@@ -44,6 +48,17 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+
+  const loadApp = () => {
+    if (isDev) {
+      win.loadURL(process.env.VITE_DEV_SERVER_URL!);
+    } else {
+      win.loadFile(indexHtml);
+    }
+  };
+  let reloads = createReloadBudget();
+  /** True while the recovery page is on screen in place of the app. */
+  let recovering = false;
 
   win.once("ready-to-show", () => {
     if (saved.maximized) win.maximize();
@@ -71,6 +86,17 @@ function createWindow() {
   // Exact origin/file comparison — prefix checks would let localhost:51737 (dev) or any
   // local file:// path (prod) count as internal.
   win.webContents.on("will-navigate", (event, url) => {
+    // The recovery page's Reload link. Never a real destination, so it is
+    // stopped here whether or not the page is showing.
+    if (isRecoveryReload(url)) {
+      event.preventDefault();
+      if (recovering) {
+        recovering = false;
+        reloads = createReloadBudget();
+        loadApp();
+      }
+      return;
+    }
     let internal = false;
     try {
       const target = new URL(url);
@@ -88,11 +114,27 @@ function createWindow() {
     }
   });
 
-  if (isDev) {
-    win.loadURL(process.env.VITE_DEV_SERVER_URL!);
-  } else {
-    win.loadFile(indexHtml);
-  }
+  // A renderer that was killed or ran out of memory leaves a blank window
+  // that only a quit clears. Reload it, within a budget: a page that dies on
+  // every load must not reload forever. Once the budget is spent the window
+  // shows the recovery page instead, whose Reload starts a fresh budget.
+  win.webContents.on("render-process-gone", (_event, details) => {
+    if (details.reason === "clean-exit" || quitting || win.isDestroyed()) return;
+    if (!reloads.take()) {
+      console.warn(`renderer keeps failing (${details.reason}); showing the recovery page`);
+      // Once only: a recovery page that itself crashes must not loop.
+      if (!recovering) {
+        recovering = true;
+        win.loadURL(RECOVERY_PAGE_URL).catch((error: unknown) => {
+          console.error("could not show the recovery page", error);
+        });
+      }
+      return;
+    }
+    win.reload();
+  });
+
+  loadApp();
 
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
@@ -111,6 +153,9 @@ function createWindow() {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  app.on("before-quit", () => {
+    quitting = true;
+  });
   app.on("second-instance", () => {
     if (mainWindow) raise(mainWindow);
   });

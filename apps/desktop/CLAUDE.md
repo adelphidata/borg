@@ -23,7 +23,7 @@ Feature code must not read `window.borg`. It calls `useNative()`, which hands ba
 ## Gotchas
 
 - A new IPC channel means editing all three of `channels.ts`, `ipc.ts`, and `preload.ts`. A renamed channel is a type error only because `CHANNELS` is shared — keep it that way.
-- Every server stream in `ipc.ts` must be cancellable and removed from the `streams` map on error and on complete, or a window reload leaks subscriptions.
+- Every server stream in `ipc.ts` must be cancellable and removed from its page's stream map on error and on complete. Stream ids are `<page-load>:s<n>` (a fresh load id per preload run). The main process keeps one page load per window: the first stream a new load opens closes the previous load's streams, and a crash or a destroyed window closes them at once. Do not close streams on navigation events — `did-start-navigation` fires before `will-navigate` can block the navigation, so a refused drop would silently kill a live page's streams.
 - `just desktop-dev` builds the main process once up front. Edits under `electron/` need a restart; only the renderer hot-reloads.
 - Boot statuses are user-facing copy: plain language, and never a path, a command, or a code. Paths belong in `console.error`, which lands in the app's stderr.
 - `bun run pack` is the cheap check that a packaging change works — `bun run dist` builds full installers and is slow.

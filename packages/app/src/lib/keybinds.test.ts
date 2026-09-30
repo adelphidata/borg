@@ -173,3 +173,90 @@ describe("dispatchKeybind", () => {
     expect(page).toHaveBeenCalledOnce();
   });
 });
+
+describe("keys that are not a chord", () => {
+  /** A keydown as autofill sends it: no `key` at all. */
+  function keyless(): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "key", { value: undefined });
+    return event;
+  }
+
+  it("names no chord for a keydown that carries no key", () => {
+    expect(chordOf(keyless(), true)).toBe("");
+  });
+
+  it("runs nothing for a keydown that carries no key", () => {
+    const uninstall = installKeybinds(window, true);
+    const handlers = ["command-palette", "cancel-turn"].map((action) => {
+      const handler = vi.fn();
+      bind(action, handler, true);
+      return handler;
+    });
+
+    const event = keyless();
+    document.body.dispatchEvent(event);
+
+    for (const handler of handlers) expect(handler).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+    uninstall();
+  });
+
+  const owned: [string, KeyboardEventInit & { key: string }][] = [
+    ["an Escape that abandons a composition", { key: "Escape", isComposing: true }],
+    ["an Escape the input method reports as 229", { key: "Escape", keyCode: 229 }],
+    ["a chord typed mid-composition", { key: "k", metaKey: true, isComposing: true }],
+    ["a held chord bound to nothing", { key: "y", metaKey: true, repeat: true }],
+  ];
+
+  // The repeat of a bound chord must not re-run the handler, and must not fall
+  // through to the browser either: a held ⌘F would open its own find bar.
+  it.each([
+    ["a held chord repeating", { key: "b", metaKey: true, repeat: true }],
+    ["a held Escape repeating", { key: "Escape", repeat: true }],
+  ] as [string, KeyboardEventInit & { key: string }][])(
+    "keeps %s from the browser without running it again",
+    (_name, init) => {
+      const uninstall = installKeybinds(window, true);
+      const handlers = ["cancel-turn", "toggle-sidebar"].map((action) => {
+        const handler = vi.fn();
+        bind(action, handler, true);
+        return handler;
+      });
+
+      const event = press(init);
+
+      for (const handler of handlers) expect(handler).not.toHaveBeenCalled();
+      expect(event.defaultPrevented).toBe(true);
+      uninstall();
+    },
+  );
+
+  it.each(owned)("leaves %s alone", (_name, init) => {
+    const uninstall = installKeybinds(window, true);
+    const handlers = ["cancel-turn", "command-palette", "toggle-sidebar"].map((action) => {
+      const handler = vi.fn();
+      bind(action, handler, true);
+      return handler;
+    });
+
+    const event = press(init);
+
+    for (const handler of handlers) expect(handler).not.toHaveBeenCalled();
+    // The key still belongs to whoever it was meant for.
+    expect(event.defaultPrevented).toBe(false);
+    uninstall();
+  });
+
+  it("fires a held chord once, on the first press", () => {
+    const uninstall = installKeybinds(window, true);
+    const handler = vi.fn();
+    bind("toggle-sidebar", handler);
+
+    press({ key: "b", metaKey: true });
+    for (let i = 0; i < 4; i++) press({ key: "b", metaKey: true, repeat: true });
+
+    expect(handler).toHaveBeenCalledOnce();
+    uninstall();
+  });
+});

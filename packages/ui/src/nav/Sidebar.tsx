@@ -121,8 +121,7 @@ function RecentRow({
 }) {
   return (
     <div
-      className="group flex cursor-pointer items-center gap-1 rounded-md px-3 py-[7px] text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
-      onClick={onOpen}
+      className="group flex items-center gap-1 rounded-md pr-3 text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
       // Right-click reaches the same action the hover × does. The menu itself
       // belongs to the app, which owns both the archive call and the stacked
       // Escape handling this package cannot see.
@@ -134,18 +133,22 @@ function RecentRow({
         })
       }
     >
-      {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
-      <Truncated className="min-w-0 flex-1">{item.title}</Truncated>
+      {/* The row's own control, and a sibling of the archive × rather than its
+          parent: a button cannot hold another button, and Tab has to reach
+          each of them on its own. */}
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 border-0 bg-transparent py-[7px] pr-0 pl-3 text-left text-[length:inherit] leading-[inherit] text-inherit [font-family:inherit]"
+      >
+        {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
+        <Truncated className="min-w-0 flex-1">{item.title}</Truncated>
+      </button>
       <button
         type="button"
         aria-label={`Archive ${item.title}`}
         title="Archive conversation"
-        // Without this the row's own onClick would open the conversation the
-        // user just asked to close.
-        onClick={(e) => {
-          e.stopPropagation();
-          onArchive();
-        }}
+        onClick={onArchive}
         className="flex-none rounded px-1 text-[13px] leading-none text-ink3 hover-reveal hover:text-ink"
       >
         ×
@@ -232,12 +235,13 @@ export function Sidebar({
         <span className="flex-1 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
           Recent
         </span>
-        <span
-          className="cursor-pointer rounded px-1.5 py-0.5 text-[11px] leading-none text-ink3 hover:bg-surface3 hover:text-ink"
+        <button
+          type="button"
           onClick={onNewConversation}
+          className="cursor-pointer rounded border-0 bg-transparent px-1.5 py-0.5 text-[11px] leading-none text-ink3 hover:bg-surface3 hover:text-ink"
         >
           + New
-        </span>
+        </button>
       </div>
       <div className="flex flex-col gap-px">
         {recents.map((r) => (

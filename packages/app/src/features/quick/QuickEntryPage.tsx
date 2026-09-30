@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { LogoIcon, SendIcon } from "@borg/ui";
+import { LogoIcon, SendIcon, isSubmitEnter } from "@borg/ui";
 import { asBorgError, useBorg } from "../../lib/useDaemon";
 import { useNative } from "../../lib/platform";
 
@@ -71,7 +71,7 @@ export function QuickEntryPage() {
               native.hideWindow();
               return;
             }
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (isSubmitEnter(e) && !e.shiftKey) {
               e.preventDefault();
               void submit();
             }

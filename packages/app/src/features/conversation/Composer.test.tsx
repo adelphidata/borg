@@ -52,6 +52,13 @@ vi.mock("./usePathCompletions", () => ({
     sessionId === undefined || prefix === null ? [] : workspace.rows,
 }));
 
+/** The width the page is rendered at; a phone must not be handed the keyboard. */
+const device = vi.hoisted(() => ({ mobile: false }));
+vi.mock("@borg/ui", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@borg/ui")>()),
+  useIsMobile: () => device.mobile,
+}));
+
 const noop = () => {};
 
 function setup(props: { draftKey: string; conversationKey: string }) {
@@ -69,6 +76,7 @@ async function attach(container: HTMLElement) {
 beforeEach(() => {
   sessionStorage.clear();
   registry.commands = [];
+  device.mobile = false;
   globalThis.URL.revokeObjectURL = vi.fn();
   // jsdom implements neither of these, and the composer reaches for both.
   window.matchMedia = vi.fn(() => ({
@@ -749,5 +757,321 @@ describe("Composer pasted text", () => {
 
     expect(screen.getByRole("textbox")).toHaveProperty("value", "");
     expect(readDraft(draftKeyFor("sess-2"))).toBe("");
+  });
+});
+
+describe("sending before the conversation is open", () => {
+  function opening() {
+    const props = {
+      busy: false,
+      ready: false,
+      draftKey: draftKeyFor("new"),
+      conversationKey: "new",
+      onSend: vi.fn<(text: string, attachments: { filename: string }[]) => void>(),
+      onSteer: vi.fn<(text: string) => void>(),
+      onCancel: noop,
+    };
+    return { props, ...render(<Composer {...props} />) };
+  }
+
+  it("holds the message and its attachment, then sends both once", async () => {
+    const { props, container, rerender } = opening();
+    await attach(container);
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: "first question" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(screen.getByText(/Sends next · first question/)).toBeTruthy();
+
+    // The daemon issues the id: the draft is re-keyed and the page is ready.
+    moveDraft(draftKeyFor("new"), draftKeyFor("sess-1"));
+    rerender(<Composer {...props} ready draftKey={draftKeyFor("sess-1")} />);
+    rerender(<Composer {...props} ready draftKey={draftKeyFor("sess-1")} />);
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    const [text, attached] = props.onSend.mock.calls[0]!;
+    expect(text).toBe("first question");
+    expect(attached.map((a) => a.filename)).toEqual(["shot.png"]);
+    expect(screen.queryByText(/Sends next/)).toBeNull();
+    // Sent, so it must not also come back as a draft to send again.
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+  });
+
+  it("keeps holding while a turn is still running", () => {
+    const { props, rerender } = opening();
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: "first question" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    rerender(<Composer {...props} busy ready />);
+    expect(props.onSend).not.toHaveBeenCalled();
+
+    rerender(<Composer {...props} busy={false} ready />);
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("steering a running turn", () => {
+  function steering(onSteer: (text: string) => Promise<boolean> | boolean | void) {
+    const props = {
+      busy: true,
+      draftKey: draftKeyFor("sess-1"),
+      conversationKey: "sess-1",
+      onSend: noop,
+      onSteer: vi.fn(onSteer),
+      onCancel: noop,
+    };
+    return { props, ...render(<Composer {...props} />) };
+  }
+
+  async function submit(text: string) {
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(box).toHaveProperty("value", "");
+    // Lets the answer arrive.
+    await act(async () => {});
+  }
+
+  it.each([
+    { name: "a promise of false", answer: () => Promise.resolve(false) },
+    { name: "a plain false", answer: () => false },
+    { name: "a call that failed", answer: () => Promise.reject(new Error("offline")) },
+  ])("gives the text back on $name", async ({ answer }) => {
+    const { props } = steering(answer);
+    await submit("use the staging db");
+
+    expect(props.onSteer).toHaveBeenCalledWith("use the staging db");
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "use the staging db");
+  });
+
+  it.each([
+    { name: "true", answer: () => Promise.resolve(true) },
+    { name: "nothing", answer: () => undefined },
+  ])("leaves the box empty when the turn answers $name", async ({ answer }) => {
+    const { props } = steering(answer);
+    await submit("use the staging db");
+
+    expect(props.onSteer).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+  });
+
+  it("reports a steer call that failed instead of swallowing it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failure = new Error("offline");
+    steering(() => Promise.reject(failure));
+    await submit("use the staging db");
+
+    expect(warn).toHaveBeenCalledWith(expect.any(String), failure);
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "use the staging db");
+    warn.mockRestore();
+  });
+
+  it("adds the text after what was typed in the meantime", async () => {
+    let refuse: (taken: boolean) => void = () => {};
+    steering(() => new Promise<boolean>((resolve) => (refuse = resolve)));
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: "use the staging db" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.change(box, { target: { value: "and then" } });
+
+    await act(async () => refuse(false));
+
+    expect(box).toHaveProperty("value", "and then use the staging db");
+  });
+
+  it("returns the text to its own conversation when the user has moved on", async () => {
+    let refuse: (taken: boolean) => void = () => {};
+    const { props, rerender } = steering(
+      () => new Promise<boolean>((resolve) => (refuse = resolve)),
+    );
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: "use the staging db" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    rerender(<Composer {...props} draftKey={draftKeyFor("sess-2")} conversationKey="sess-2" />);
+    await act(async () => refuse(false));
+
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+    expect(sessionStorage.getItem(draftKeyFor("sess-1"))).toBe("use the staging db");
+    expect(readDraft(draftKeyFor("sess-1"))).toBe("use the staging db");
+  });
+});
+
+describe("dropping onto the composer", () => {
+  const image = new File([new Uint8Array([1])], "shot.png", { type: "image/png" });
+  const shortcut = new File(["[InternetShortcut]"], "Example.url", { type: "" });
+
+  function transfer(data: Record<string, string>, files: File[] = []) {
+    return {
+      dataTransfer: {
+        types: [...Object.keys(data), ...(files.length > 0 ? ["Files"] : [])],
+        files,
+        getData: (format: string) => data[format] ?? "",
+      },
+    };
+  }
+
+  function mount() {
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    return { box, frame: box.parentElement! };
+  }
+
+  beforeEach(() => void vi.mocked(collectAttachments).mockClear());
+
+  it("attaches a dropped image", async () => {
+    const { frame } = mount();
+    const delivered = fireEvent.drop(frame, transfer({}, [image]));
+
+    // Cancelled, or the browser would navigate to the file.
+    expect(delivered).toBe(false);
+    await waitFor(() => expect(screen.getByAltText("shot.png")).toBeTruthy());
+  });
+
+  it("shows the drop target for files only", () => {
+    const { frame } = mount();
+
+    fireEvent.dragOver(frame, transfer({ "text/plain": "some words" }));
+    expect(frame.className).not.toContain("border-neon");
+
+    expect(fireEvent.dragOver(frame, transfer({}, [image]))).toBe(false);
+    expect(frame.className).toContain("border-neon");
+  });
+
+  it("leaves text dragged onto the box for the browser to place", () => {
+    const { box } = mount();
+    const data = transfer({ "text/plain": "some words" });
+
+    expect(fireEvent.dragOver(box, data)).toBe(true);
+    expect(fireEvent.drop(box, data)).toBe(true);
+    expect(collectAttachments).not.toHaveBeenCalled();
+  });
+
+  it("accepts text dragged onto the frame around the box", () => {
+    const { frame } = mount();
+    // Without this the browser never delivers the drop at all.
+    expect(fireEvent.dragOver(frame, transfer({ "text/plain": "some words" }))).toBe(false);
+  });
+
+  it("writes a link dropped on the frame at the caret", () => {
+    const { box, frame } = mount();
+    fireEvent.change(box, { target: { value: "read  please" } });
+    box.setSelectionRange(5, 5);
+
+    const delivered = fireEvent.drop(
+      frame,
+      transfer({ "text/uri-list": "https://example.com/doc", "text/plain": "Example" }),
+    );
+
+    expect(delivered).toBe(false);
+    expect(box).toHaveProperty("value", "read https://example.com/doc please");
+  });
+
+  it("ignores the shortcut file that comes with a dragged link", () => {
+    const { box, frame } = mount();
+    fireEvent.dragOver(frame, transfer({ "text/uri-list": "https://example.com/" }, [shortcut]));
+    fireEvent.drop(box, transfer({ "text/uri-list": "https://example.com/" }, [shortcut]));
+
+    expect(box).toHaveProperty("value", "https://example.com/");
+    expect(collectAttachments).not.toHaveBeenCalled();
+    expect(frame.className).not.toContain("border-neon");
+  });
+
+  it("still says why a shortcut file dropped alone cannot be attached", async () => {
+    vi.mocked(collectAttachments).mockResolvedValueOnce({
+      attachments: [],
+      errors: ["Example.url is not an image or a text file."],
+    });
+    const { frame } = mount();
+    fireEvent.drop(frame, transfer({}, [shortcut]));
+
+    await waitFor(() => expect(screen.getByText(/Example.url is not an image/)).toBeTruthy());
+  });
+});
+
+describe("where the cursor is when a conversation opens", () => {
+  it("is in the composer", () => {
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    expect(document.activeElement).toBe(screen.getByRole("textbox"));
+  });
+
+  it("returns to the composer when another conversation is opened", () => {
+    const { rerender } = setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    const box = screen.getByRole("textbox");
+    box.blur();
+
+    rerender(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("t")}
+        conversationKey="t"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+    expect(document.activeElement).toBe(box);
+  });
+
+  it("stays out of the box on a phone, so no keyboard covers the page", () => {
+    device.mobile = true;
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+    expect(document.activeElement).not.toBe(screen.getByRole("textbox"));
+  });
+
+  it("does not take the cursor from a field the user is typing in", () => {
+    const search = document.createElement("input");
+    document.body.appendChild(search);
+    search.focus();
+
+    setup({ draftKey: draftKeyFor("s"), conversationKey: "s" });
+
+    expect(document.activeElement).toBe(search);
+    search.remove();
+  });
+});
+
+describe("Enter while an input method is composing", () => {
+  function typed(onSend: () => void) {
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+      />,
+    );
+    const box = screen.getByRole("textbox");
+    fireEvent.change(box, { target: { value: "こんにちは" } });
+    return box;
+  }
+
+  it.each([
+    { name: "confirms a candidate flagged as composing", init: { isComposing: true } },
+    { name: "confirms a candidate that only carries keyCode 229", init: { keyCode: 229 } },
+    { name: "breaks the line with Shift", init: { shiftKey: true } },
+  ])("$name, and does not send", ({ init }) => {
+    const onSend = vi.fn();
+    const box = typed(onSend);
+
+    const delivered = fireEvent.keyDown(box, { key: "Enter", ...init });
+
+    // Not cancelled either: the keystroke is the browser's to finish.
+    expect(delivered).toBe(true);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box).toHaveProperty("value", "こんにちは");
+  });
+
+  it("sends on a plain Enter", () => {
+    const onSend = vi.fn();
+    const box = typed(onSend);
+
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 13 });
+    expect(onSend).toHaveBeenCalledWith("こんにちは", []);
   });
 });

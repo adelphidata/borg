@@ -255,3 +255,24 @@ describe("marking every conversation read", () => {
     expect(markAllRead).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("starting over", () => {
+  const cases: [string, Partial<CommandContext>][] = [
+    ["nothing is unread", {}],
+    ["mark-all-read is on offer too", { markAllRead: () => {} }],
+  ];
+
+  it.each(cases)("answers `clear` with a new conversation when %s", (_name, over) => {
+    const commands = buildCommands(context({ searching: true, ...over }), ROUTES);
+
+    expect(rank(commands, "clear")[0]?.id).toBe("action:new");
+    expect(rank(commands, "reset")[0]?.id).toBe("action:new");
+  });
+
+  it("still finds mark-all-read by the words that name it", () => {
+    const commands = buildCommands(context({ searching: true, markAllRead: () => {} }), ROUTES);
+
+    expect(rank(commands, "unread")[0]?.id).toBe("action:mark-read");
+    expect(rank(commands, "clear").map((c) => c.id)).toContain("action:mark-read");
+  });
+});

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { BorgError, session as sessionPb } from "@borg/client";
+import { BorgError, GrpcStatus, type session as sessionPb } from "@borg/client";
 import {
   asBorgError,
   useBorg,
@@ -42,8 +42,23 @@ export interface Attachment {
  */
 export type Cell = CellBody & { at?: number };
 
+/**
+ * What the transcript remembers of a file sent with a turn: enough to say what
+ * it was, and none of its bytes.
+ */
+export interface SentAttachment {
+  kind: "image" | "document";
+  filename: string;
+}
+
+/** `SystemNotice.category` for a provider connection the daemon is redialling. */
+const NOTICE_RECONNECTING = "reconnecting";
+
+/** What a turn the user cut short says in the transcript. */
+const STOPPED = "Stopped";
+
 type CellBody =
-  | { kind: "user"; text: string; attachments?: number }
+  | { kind: "user"; text: string; attachments?: SentAttachment[] }
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string; streaming: boolean; startedAt: number; seconds?: number }
   | {
@@ -65,7 +80,16 @@ type CellBody =
       elapsedMs?: number;
     }
   | { kind: "sub-agent"; agentId: string; nickname: string; status: string }
-  | { kind: "notice"; text: string }
+  | {
+      kind: "notice";
+      text: string;
+      /**
+       * True for the one notice that describes a wait rather than an event: the
+       * provider dropped and the daemon is retrying. It is replaced by the next
+       * one and removed when the turn moves again.
+       */
+      reconnecting?: boolean;
+    }
   | { kind: "error"; text: string }
   | {
       kind: "shell-confirm";
@@ -145,8 +169,42 @@ function appendThinking(cells: Cell[], text: string, now: number): Cell[] {
   return [...cells, { kind: "thinking", text, streaming: true, startedAt: now, at: now }];
 }
 
+/**
+ * Patches the call an event is about: the newest one with this id that is
+ * still running.
+ *
+ * Ids are the provider's, and some reuse them within a conversation. Matching
+ * on the id alone would write the new call's output over every finished call
+ * that once carried it.
+ */
 function patchTool(cells: Cell[], id: string, patch: (c: Cell & { kind: "tool" }) => Cell): Cell[] {
-  return cells.map((c) => (c.kind === "tool" && c.id === id ? patch(c) : c));
+  for (let i = cells.length - 1; i >= 0; i -= 1) {
+    const cell = cells[i]!;
+    if (cell.kind === "tool" && cell.id === id && !cell.done) {
+      return [...cells.slice(0, i), patch(cell), ...cells.slice(i + 1)];
+    }
+  }
+  return cells;
+}
+
+/** Takes the retry notice down. The array is untouched when there is none. */
+function dropReconnecting(cells: Cell[]): Cell[] {
+  const isLive = (c: Cell) => c.kind === "notice" && c.reconnecting === true;
+  return cells.some(isLive) ? cells.filter((c) => !isLive(c)) : cells;
+}
+
+/** True for an event that proves the turn is moving again, or is over. */
+function endsReconnecting(event: sessionPb.AgentEvent): boolean {
+  return Boolean(
+    event.textDelta ||
+    event.thinkingDelta ||
+    event.toolExecuting ||
+    event.toolOutputDelta ||
+    event.toolResult ||
+    event.turnComplete ||
+    event.error ||
+    event.systemNotice?.category === NOTICE_RECONNECTING,
+  );
 }
 
 /**
@@ -154,14 +212,28 @@ function patchTool(cells: Cell[], id: string, patch: (c: Cell & { kind: "tool" }
  *
  * `now` is injected so the thinking timer is testable without a clock.
  */
-export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Date.now()): Cell[] {
+export function reduceEvent(
+  transcript: Cell[],
+  event: sessionPb.AgentEvent,
+  now = Date.now(),
+): Cell[] {
+  // A retry notice describes a wait, so it lasts only as long as the wait does.
+  const cells = endsReconnecting(event) ? dropReconnecting(transcript) : transcript;
   if (event.thinkingDelta) return appendThinking(cells, event.thinkingDelta.text, now);
 
   // Everything below ends a reasoning block if one was open.
   const base = sealThinking(cells, now);
 
-  if (event.textDelta) return appendAssistant(base, event.textDelta.text, now);
   if (event.textRetracted) return retractAssistant(base, event.textRetracted.bytes);
+  if (event.textDelta) {
+    // A stream that fails part-way sends its marker as one last delta of its
+    // own, `\n\n[stream interrupted: …]`, so it reads the same as on reload.
+    const delta = event.textDelta.text;
+    const marker = delta.startsWith("\n\n") && !delta.slice(2).includes("\n");
+    const notice = marker ? interruptionNotice(delta) : undefined;
+    if (notice) return [...base, { kind: "notice", text: notice, at: now }];
+    return appendAssistant(base, delta, now);
+  }
   if (event.toolExecuting) {
     return [
       ...base,
@@ -257,8 +329,13 @@ export function reduceEvent(cells: Cell[], event: sessionPb.AgentEvent, now = Da
       { kind: "notice", text: "Older messages were compacted to save space.", at: now },
     ];
   }
-  if (event.systemNotice)
-    return [...base, { kind: "notice", text: event.systemNotice.text, at: now }];
+  if (event.systemNotice) {
+    const { category, text } = event.systemNotice;
+    if (category === NOTICE_RECONNECTING) {
+      return [...base, { kind: "notice", text, reconnecting: true, at: now }];
+    }
+    return [...base, { kind: "notice", text, at: now }];
+  }
   if (event.error) return [...base, { kind: "error", text: event.error.message, at: now }];
   // preparing / turnComplete / planUpdated add nothing here — planUpdated
   // drives the pinned plan panel, the other two only move `busy`.
@@ -309,13 +386,13 @@ export function stampTurnDuration(cells: Cell[], elapsedMs: number): Cell[] {
  * is the residue. Closing it means asking the daemon what it has, which is the
  * rewind this deliberately is not.
  *
- * Attachments also close the door: the transcript keeps their count, not their
+ * Attachments also close the door: the transcript keeps their names, not their
  * bytes, so a resend would carry none while the cell above went on claiming
  * they were sent.
  */
 export function retryTarget(cells: Cell[]): string | undefined {
   const last = cells[cells.length - 1];
-  if (!last || last.kind !== "user" || last.attachments) return undefined;
+  if (!last || last.kind !== "user" || last.attachments?.length) return undefined;
   return last.text;
 }
 
@@ -351,6 +428,73 @@ function parseToolCalls(json: string | undefined): StoredToolCall[] {
   }
 }
 
+/** What a reply that failed part-way says in the transcript. */
+const CUT_SHORT = "Reply cut short";
+
+/** The marker the daemon stores on a reply the user stopped. */
+const USER_STOP_MARKER = "[response interrupted]";
+
+/**
+ * How every "this turn did not finish" marker the daemon writes begins. Only
+ * the exact user-stop marker is a stop; the rest name a stream that failed or
+ * tool calls it had to throw away, sometimes wrapped as
+ * `[response interrupted — [stream interrupted: …]]`.
+ */
+const INTERRUPTION_PREFIXES = [
+  "[response interrupted",
+  "[stream interrupted",
+  "[incomplete tool calls discarded",
+];
+
+/** The notice an interruption marker line stands for, or undefined for prose. */
+function interruptionNotice(line: string): string | undefined {
+  const marker = line.trim();
+  if (!marker.endsWith("]") || !INTERRUPTION_PREFIXES.some((p) => marker.startsWith(p))) {
+    return undefined;
+  }
+  return marker === USER_STOP_MARKER ? STOPPED : CUT_SHORT;
+}
+
+/**
+ * Splits the daemon's "this reply did not finish" marker off a stored reply.
+ *
+ * The daemon appends the marker as the last line of what it persists, as a
+ * record for itself. On screen it is a bracketed string the user never wrote
+ * and the model never said, so it becomes a notice instead.
+ */
+function splitInterruption(text: string): { text: string; notice?: string } {
+  const trimmed = text.trimEnd();
+  const lineStart = trimmed.lastIndexOf("\n") + 1;
+  const notice = interruptionNotice(trimmed.slice(lineStart));
+  if (!notice) return { text };
+  return { text: trimmed.slice(0, lineStart).trimEnd(), notice };
+}
+
+/**
+ * The daemon's boundary tag names, whose closing tags it escapes inside a
+ * stored tool result so the output cannot close its own wrapper.
+ */
+const BOUNDARY_CLOSE =
+  /&lt;\/(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file|compaction_summary|mcp_tool_result|untrusted_content|prior_run_output)&gt;/gi;
+
+/** `<tool_output name="…" trust="external">\n…\n</tool_output>`, whole. */
+const TOOL_OUTPUT_WRAPPER = /^<tool_output(?:\s[^>]*)?>\n?([\s\S]*?)\n?<\/tool_output>$/;
+
+/**
+ * A stored tool result as the live stream showed it.
+ *
+ * The daemon stores a result wrapped for the model — the wrapper marks it as
+ * untrusted — and escapes any boundary closing tags inside it; the live event
+ * carries the text bare. Undoing both is what lets the row read its outcome,
+ * and keeps markup the user never saw out of the transcript. A result stored
+ * without the wrapper (a cancelled or crashed call) comes back unchanged.
+ */
+function unwrapToolOutput(text: string): string {
+  const wrapped = TOOL_OUTPUT_WRAPPER.exec(text.trim());
+  if (!wrapped) return text;
+  return wrapped[1]!.replace(BOUNDARY_CLOSE, "</$1>");
+}
+
 /**
  * Turns persisted history rows into transcript cells.
  *
@@ -359,6 +503,13 @@ function parseToolCalls(json: string | undefined): StoredToolCall[] {
  * per result, and only the pair names a call — a tool row on its own has an id
  * and nothing else. So the calls are carried forward in a map and joined as
  * their results arrive.
+ *
+ * A turn that did not finish says so: the marker the daemon stores on a
+ * cut-off reply becomes a notice — "Stopped" when the user stopped it, "Reply
+ * cut short" when something failed — and a cancelled call keeps its marker as
+ * its output, which is what the tool row reads its state from. A tool result
+ * loses the wrapper it was stored in, so the row reads the text the live
+ * stream carried.
  *
  * Two things genuinely cannot come back: reasoning blocks, which the daemon
  * never persists, and per-turn usage. System rows are skipped because that
@@ -384,7 +535,9 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
         }
       }
       // An assistant row can be tool calls only, with no prose to show.
-      if (m.text.trim() !== "") cells.push({ kind: "assistant", text: m.text, at });
+      const reply = splitInterruption(m.text);
+      if (reply.text.trim() !== "") cells.push({ kind: "assistant", text: reply.text, at });
+      if (reply.notice) cells.push({ kind: "notice", text: reply.notice, at });
       return;
     }
 
@@ -400,7 +553,7 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
         id: m.toolCallId || `history-${i}`,
         name: call?.name ?? "tool",
         args: call?.args ?? "",
-        output: m.text,
+        output: unwrapToolOutput(m.text),
         done: true,
         stderr: false,
         at,
@@ -433,6 +586,8 @@ export interface Conversation {
    * workspace-scoped call such as path completion needs.
    */
   sessionId: string | undefined;
+  /** True once the session is open, which is when a send can go anywhere. */
+  ready: boolean;
   cells: Cell[];
   /** Current todo list, empty when the agent has not published one. */
   plan: PlanStep[];
@@ -464,8 +619,11 @@ export interface Conversation {
    * A no-op mid-turn, and when nothing has been sent yet.
    */
   retryLast: () => void;
-  /** Mid-turn nudge. Only meaningful while `busy`. */
-  steer: (text: string) => void;
+  /**
+   * Mid-turn nudge. Only meaningful while `busy`. Resolves false when the
+   * daemon refused it or the call failed, so the caller can keep the text.
+   */
+  steer: (text: string) => Promise<boolean>;
   cancel: () => void;
   respond: (promptId: string, value: string) => void;
   /**
@@ -516,6 +674,60 @@ export function useConversation(target: string | undefined): Conversation {
    */
   const clock = useRef(createTurnClock());
   const [turnStartedAt, setTurnStartedAt] = useState<number | undefined>(undefined);
+  /** Read by callbacks that must see the current value, not the rendered one. */
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const cellsRef = useRef(cells);
+  cellsRef.current = cells;
+  /**
+   * Counts opens. Work that outlives a render — a title read, a reopen —
+   * compares it before writing, so an answer about the conversation just left
+   * never lands on the one now on screen.
+   */
+  const generation = useRef(0);
+  /** The id a session resumes by. Empty until somebody has sent to it. */
+  const agentSessionId = useRef("");
+  /** The title as of the last finished turn; the open's own title until then. */
+  const [title, setTitle] = useState<string>();
+  /** True between the user pressing stop and the turn reporting that it ended. */
+  const stopRequested = useRef(false);
+  /**
+   * True once the daemon has no such session and opening it again did not
+   * help. The stream stops redialling: there is nothing to dial.
+   */
+  const [gone, setGone] = useState(false);
+  const reopening = useRef(false);
+  /**
+   * Set by a reopen; cleared by the first event after it, or by an outage that
+   * is not a missing session (a restart starts with the daemon unreachable).
+   * One try per outage, so a reopen that is missing at once still gives up.
+   */
+  const reopenSpent = useRef(false);
+  /**
+   * Counts reopens that worked. The daemon resumes a session under the same
+   * live id, so the id alone cannot restart the stream or date an error.
+   */
+  const [reopens, setReopens] = useState(0);
+  /**
+   * The stream error last acted on. The stream's state outlives the session
+   * it reports on by a render — the new session's subscription resets it a
+   * commit later — so the same error object seen again is old news.
+   */
+  const handledError = useRef<BorgError | undefined>(undefined);
+  /**
+   * Which subscription each stream error was raised for: the open, the reopen
+   * and the live id. While a reopen is in flight the retry loop still dials
+   * and collects fresh NotFounds; once the reopen lands, those are old news —
+   * even under the same live id.
+   */
+  const errorSession = useRef(new WeakMap<BorgError, string>());
+  const subscriptionKey = (id: string, reopen: number) => `${generation.current}:${reopen}:${id}`;
+  /**
+   * Set by a send while the conversation has no agent session id yet, cleared
+   * by the next event, which asks the daemon for it. A daemon restart during
+   * the very first turn otherwise has nothing to reopen by.
+   */
+  const learnAgentId = useRef(false);
   const startTurnClock = useCallback((at: number = Date.now()) => {
     clock.current.start(at);
     setTurnStartedAt(clock.current.startedAt());
@@ -530,6 +742,45 @@ export function useConversation(target: string | undefined): Conversation {
     return elapsedMs;
   }, []);
 
+  /**
+   * Reads the title again once a turn has ended.
+   *
+   * The daemon names a conversation after its first exchange, which is after
+   * the open that fetched the title. One call per turn end, and a failure costs
+   * nothing but a stale heading.
+   */
+  const refreshTitle = () => {
+    if (!sessionId) return;
+    const forGeneration = generation.current;
+    borg.session
+      .getState({ sessionId })
+      .then((live) => {
+        if (forGeneration !== generation.current) return;
+        if (live.agentSessionId) agentSessionId.current = live.agentSessionId;
+        if (live.title) setTitle(live.title);
+      })
+      .catch((error: unknown) => console.warn("reading the conversation title failed", error));
+  };
+
+  /**
+   * Asks the daemon, once, which agent session the first turn created.
+   *
+   * A conversation opened at "new" has no agent session id until somebody
+   * sends, and the turn-end title read that would learn it comes too late for a
+   * daemon that restarts mid-turn: the reopen would have nothing to resume by.
+   */
+  const learnAgentSessionId = () => {
+    if (!sessionId || agentSessionId.current) return;
+    const forGeneration = generation.current;
+    borg.session
+      .getState({ sessionId })
+      .then((live) => {
+        if (forGeneration !== generation.current || agentSessionId.current) return;
+        agentSessionId.current = live.agentSessionId;
+      })
+      .catch((error: unknown) => console.warn("reading the conversation id failed", error));
+  };
+
   const opened = useQuery(
     async (borg) => {
       setSessionId(undefined);
@@ -539,7 +790,14 @@ export function useConversation(target: string | undefined): Conversation {
       setSendError(undefined);
       setStreamError(undefined);
       setContext(undefined);
+      setTitle(undefined);
+      setGone(false);
       stopTurnClock();
+      generation.current += 1;
+      agentSessionId.current = "";
+      stopRequested.current = false;
+      reopenSpent.current = false;
+      learnAgentId.current = false;
 
       let resumeId = target === "new" ? undefined : target;
       if (resumeId === undefined && target === undefined) {
@@ -555,6 +813,7 @@ export function useConversation(target: string | undefined): Conversation {
       }
 
       lastSeq.current = Number(open.lastEventSeq);
+      agentSessionId.current = state.agentSessionId;
       setSessionId(open.sessionId);
       setBusy(state.turnInFlight);
       // A conversation opened at `/c/new` has no id to file a draft under, so
@@ -582,11 +841,32 @@ export function useConversation(target: string | undefined): Conversation {
 
   const state = useRetryingServerStream<sessionPb.AgentEvent>(
     (borg, handlers) => {
-      if (!sessionId) return () => {};
-      return borg.session.stream({ sessionId, sinceEventSeq: lastSeq.current }, handlers);
+      if (!sessionId || gone) return () => {};
+      const key = subscriptionKey(sessionId, reopens);
+      return borg.session.stream(
+        { sessionId, sinceEventSeq: lastSeq.current },
+        {
+          ...handlers,
+          onError: (error) => {
+            const tagged = asBorgError(error);
+            errorSession.current.set(tagged, key);
+            handlers.onError?.(tagged);
+          },
+        },
+      );
     },
     (event) => {
+      // A reopen replaces the transcript with the stored history and rewinds
+      // `lastSeq` to the reopen's seq. An event applied meanwhile would be
+      // wiped by that snapshot; dropped here, the resubscribe replays it.
+      if (reopening.current) return;
       lastSeq.current = Math.max(lastSeq.current, Number(event.eventSeq));
+      if (learnAgentId.current) {
+        learnAgentId.current = false;
+        learnAgentSessionId();
+      }
+      // An event is proof the session exists, so a later loss earns a new try.
+      reopenSpent.current = false;
       setStreamError(undefined);
       if (event.turnComplete || event.error) setBusy(false);
       // A turn the daemon started on its own — a resumed one, or a scheduled
@@ -597,7 +877,12 @@ export function useConversation(target: string | undefined): Conversation {
       }
       if (event.planUpdated) setPlan(event.planUpdated.steps);
       setCells((prev) => reduceEvent(prev, event));
+      if (event.turnComplete && stopRequested.current) {
+        setCells((prev) => [...prev, { kind: "notice", text: STOPPED, at: Date.now() }]);
+      }
       if (event.turnComplete || event.error) {
+        stopRequested.current = false;
+        if (event.turnComplete) refreshTitle();
         // The turn that raised any open prompt is over, so retire them: a cell
         // left waiting keeps the composer queueing instead of steering.
         setCells(retirePrompts);
@@ -607,7 +892,7 @@ export function useConversation(target: string | undefined): Conversation {
         }
       }
     },
-    [sessionId],
+    [sessionId, gone, reopens],
   );
 
   // A dropped stream leaves the transcript frozen with no explanation. Surface
@@ -619,8 +904,88 @@ export function useConversation(target: string | undefined): Conversation {
   // the reply simply stops mid-sentence with nothing on screen to say why.
   useEffect(() => {
     if (state.status === "open" || !sessionId) return;
+    // A missing session is not a lost connection, and is handled below.
+    if (state.error?.code === GrpcStatus.NotFound) return;
+    // An idle session sends no event after a reopen, so this is what earns the
+    // next restart its own try. A reopen that is missing at once never passes
+    // through here, which is what stops that case from looping.
+    if (state.error && !reopening.current) reopenSpent.current = false;
     setStreamError(state.error ?? asBorgError("The connection to Borg ended."));
   }, [state.status, state.error, sessionId]);
+
+  // The daemon answers, but no longer has this session: it restarted, or the
+  // conversation was archived from another surface. Redialling the same id can
+  // never succeed, so open the conversation again instead.
+  //
+  // It resumes by the agent session id rather than re-running the open above.
+  // For a conversation that began at "new" that query would start a second,
+  // empty one and leave this transcript attached to nothing.
+  useEffect(() => {
+    if (state.error?.code !== GrpcStatus.NotFound || !sessionId || gone) return;
+    if (reopening.current || handledError.current === state.error) return;
+    // An error about a session this conversation has already left — raised by
+    // the retry loop while a reopen was in flight — says nothing about now.
+    if (errorSession.current.get(state.error) !== subscriptionKey(sessionId, reopens)) return;
+    handledError.current = state.error;
+    const forGeneration = generation.current;
+    const current = () => forGeneration === generation.current;
+    const giveUp = (error: BorgError) => {
+      if (!current()) return;
+      setGone(true);
+      setStreamError(undefined);
+      setSendError(
+        error.code === GrpcStatus.NotFound
+          ? new BorgError(
+              GrpcStatus.NotFound,
+              "This conversation is no longer open in Borg. Open it again from the conversation list.",
+            )
+          : error,
+      );
+      setBusy(false);
+      stopTurnClock();
+    };
+
+    const resumeId = agentSessionId.current;
+    // One try per outage, and nothing to resume by is the same dead end: a
+    // fresh session would silently drop what is on screen.
+    if (reopenSpent.current || (!resumeId && cellsRef.current.length > 0)) {
+      giveUp(state.error);
+      return;
+    }
+    reopenSpent.current = true;
+    reopening.current = true;
+    void (async () => {
+      try {
+        const open = await borg.session.open(resumeId ? { resumeId } : {});
+        const live = await borg.session.getState({ sessionId: open.sessionId });
+        // The session is back either way; a failed history read only means the
+        // transcript on screen stays as it is, which beats giving up on it.
+        const history = live.agentSessionId
+          ? await borg.admin.getSession({ id: live.agentSessionId }).catch((error: unknown) => {
+              console.warn("reloading the conversation history failed", error);
+              return undefined;
+            })
+          : undefined;
+        if (!current()) return;
+        if (history) setCells(historyCells(history.messages));
+        lastSeq.current = Number(open.lastEventSeq);
+        agentSessionId.current = live.agentSessionId;
+        stopRequested.current = false;
+        setStreamError(undefined);
+        setSessionId(open.sessionId);
+        // The live id usually comes back unchanged, so the id alone would not
+        // resubscribe: the stream would wait out its backoff timer instead.
+        setReopens((n) => n + 1);
+        setBusy(live.turnInFlight);
+        if (live.turnInFlight) armTurnClock();
+        else stopTurnClock();
+      } catch (error) {
+        giveUp(asBorgError(error));
+      } finally {
+        reopening.current = false;
+      }
+    })();
+  }, [state.error, sessionId, gone, reopens, borg, armTurnClock, stopTurnClock]);
 
   const send = useCallback(
     // `startedAt` lets a caller that had work to do first — the rewind an
@@ -635,11 +1000,15 @@ export function useConversation(target: string | undefined): Conversation {
       echo: boolean = true,
     ) => {
       if (!sessionId) return;
-      if (echo)
+      if (echo) {
+        const sent = attachments.map(({ kind, filename }) => ({ kind, filename }));
         setCells((prev) => [
           ...prev,
-          { kind: "user", text, attachments: attachments.length || undefined, at: startedAt },
+          { kind: "user", text, attachments: sent.length ? sent : undefined, at: startedAt },
         ]);
+      }
+      stopRequested.current = false;
+      if (!agentSessionId.current) learnAgentId.current = true;
       setBusy(true);
       setSendError(undefined);
       startTurnClock(startedAt);
@@ -686,7 +1055,8 @@ export function useConversation(target: string | undefined): Conversation {
   );
 
   const steer = useCallback(
-    (text: string) => {
+    async (text: string) => {
+      if (!sessionId) return false;
       // Deliberately NOT echoed locally: the daemon persists a steer as a real
       // user message and replays it as `steerReceived` on this same stream, so
       // a local echo renders the turn twice and — worse — shifts every later
@@ -696,15 +1066,23 @@ export function useConversation(target: string | undefined): Conversation {
       // via `preparing` a moment later; arm now so that gap is counted. `arm`,
       // not `start`: a mid-turn steer must not restart the turn's clock.
       armTurnClock();
-      void steerMutation.run(text);
+      // `run` reports a refusal as undefined, and the error itself reaches the
+      // transcript through the effect below.
+      return (await steerMutation.run(text)) !== undefined;
     },
-    [armTurnClock, steerMutation.run],
+    [armTurnClock, sessionId, steerMutation.run],
   );
   const cancel = useCallback(() => {
     // A cancelled turn leaves nobody waiting on its prompts, so retire them —
     // live Allow/Deny pills wired to an abandoned prompt id are a dead end.
     setCells(retirePrompts);
-    void cancelMutation.run(undefined);
+    // Only a running turn can be stopped; the flag is what makes its end read
+    // as "Stopped" rather than as a reply that simply ran out.
+    stopRequested.current = busyRef.current;
+    void cancelMutation.run(undefined).then((result) => {
+      // A stop the daemon never heard did not stop anything.
+      if (result === undefined) stopRequested.current = false;
+    });
   }, [cancelMutation.run]);
 
   /**
@@ -808,9 +1186,19 @@ export function useConversation(target: string | undefined): Conversation {
     if (sessionId && !busy) refreshContext();
   }, [sessionId, busy, refreshContext]);
 
+  // The title the last turn left behind outranks the one the open fetched.
+  const titled = useMemo(
+    () =>
+      opened.state === "ready" && title !== undefined
+        ? { ...opened, data: { ...opened.data, title } }
+        : opened,
+    [opened, title],
+  );
+
   return {
-    opened,
+    opened: titled,
     sessionId,
+    ready: sessionId !== undefined,
     cells,
     plan,
     busy,

@@ -1,6 +1,15 @@
 import { useMemo, useState } from "react";
 import { CodeBlock, StatusDot } from "@borg/ui";
 import type { Cell } from "../useConversation";
+import { toolOutcome, type ToolOutcome } from "./toolOutcome";
+
+/** The dot each outcome wears. A stopped call is neither a success nor a fault. */
+const TONES = {
+  running: "busy",
+  ok: "ok",
+  failed: "alert",
+  stopped: "idle",
+} as const satisfies Record<ToolOutcome, string>;
 
 /** Tools whose output is terminal text rather than structured data. */
 const SHELL_TOOLS = new Set(["run_shell", "shell", "bash", "exec_shell"]);
@@ -76,7 +85,11 @@ export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
   const args = useMemo(() => parseArgs(cell.args), [cell.args]);
   const subtitle = useMemo(() => summarize(args), [args]);
   const expanded = open || !cell.done;
-  const summary = cell.output.length > 400 ? `${cell.output.slice(0, 400)}…` : cell.output;
+  const outcome = toolOutcome(cell);
+  // The daemon's cancel marker is a record for the model, not a sentence for
+  // the reader.
+  const output = outcome === "stopped" ? "Stopped" : cell.output;
+  const summary = output.length > 400 ? `${output.slice(0, 400)}…` : output;
 
   return (
     <div className="rounded-[10px] border border-line2">
@@ -86,7 +99,7 @@ export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
         onClick={() => setOpen((v) => !v)}
         className="flex w-full cursor-pointer items-center gap-2 border-0 bg-transparent px-4 py-3 text-left"
       >
-        <StatusDot tone={cell.done ? (cell.stderr ? "alert" : "ok") : "busy"} />
+        <StatusDot tone={TONES[outcome]} />
         <span className="text-[11px] leading-none font-medium tracking-[0.08em] text-ink3 uppercase">
           {cell.name}
         </span>
@@ -101,13 +114,13 @@ export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
       {expanded && (
         <div className="px-4 pb-3">
           {open && <ArgsView name={cell.name} args={args} raw={cell.args} />}
-          {cell.output !== "" && (
+          {output !== "" && (
             <pre
               className={`m-0 max-h-[300px] overflow-auto text-[11.5px] leading-[1.5] whitespace-pre-wrap select-text ${
-                cell.stderr ? "text-alert" : "text-ink2"
+                outcome === "failed" ? "text-alert" : "text-ink2"
               }`}
             >
-              {open ? cell.output : summary}
+              {open ? output : summary}
             </pre>
           )}
         </div>

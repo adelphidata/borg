@@ -126,3 +126,66 @@ export const TOP_EDGE_PX = 120;
 export function shouldRevealOnScroll(previousTop: number, top: number): boolean {
   return top < previousTop && top <= TOP_EDGE_PX;
 }
+
+/**
+ * Whether a turn of the wheel should reveal earlier history.
+ *
+ * A view already resting at the top cannot move, so the browser sends no
+ * scroll event for the wheel that asks for more — the wheel itself is the only
+ * sign of it. `pending` is a reveal that has yet to re-anchor the scroller; a
+ * second one would measure a page that is mid-move.
+ */
+export function shouldRevealOnWheel(deltaY: number, top: number, pending: boolean): boolean {
+  return deltaY < 0 && top <= TOP_EDGE_PX && !pending;
+}
+
+/**
+ * Which way a key press pages the transcript: -1 up, 1 down, undefined when
+ * the key is not ours to take.
+ *
+ * Focus rests in the composer, which sits beside the scroller rather than
+ * inside it, so the browser's own paging has nothing to scroll. Only the bare
+ * keys count, and only from where the transcript is what the user is on: the
+ * page itself, a control inside the transcript, or the composer's text box.
+ * Everything else keeps its keys — the find input, a rename field, a settings
+ * box, and any other panel's own list.
+ */
+export function pageKeyDirection(
+  event: Pick<
+    KeyboardEvent,
+    "key" | "shiftKey" | "ctrlKey" | "altKey" | "metaKey" | "defaultPrevented"
+  >,
+  focused: Element | null,
+  composer: Element | null,
+  transcript: Element | null,
+): -1 | 1 | undefined {
+  if (event.key !== "PageUp" && event.key !== "PageDown") return undefined;
+  if (event.defaultPrevented) return undefined;
+  if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return undefined;
+  if (!pagesTranscript(focused, composer, transcript)) return undefined;
+  return event.key === "PageUp" ? -1 : 1;
+}
+
+function pagesTranscript(
+  focused: Element | null,
+  composer: Element | null,
+  transcript: Element | null,
+): boolean {
+  // Nothing focused: the keys reach the page, and the page is the transcript.
+  if (focused === null || focused === focused.ownerDocument.body) return true;
+  // A field inside the transcript, such as an answer box, keeps its keys.
+  if (transcript?.contains(focused)) return !isField(focused);
+  return composer?.contains(focused) === true && focused.tagName === "TEXTAREA";
+}
+
+function isField(el: Element | null): el is HTMLElement {
+  if (!(el instanceof HTMLElement)) return false;
+  // `contentEditable` rather than `isContentEditable`: the second is computed
+  // from layout, which a test environment does not have.
+  return (
+    el.tagName === "INPUT" ||
+    el.tagName === "TEXTAREA" ||
+    el.tagName === "SELECT" ||
+    el.contentEditable === "true"
+  );
+}

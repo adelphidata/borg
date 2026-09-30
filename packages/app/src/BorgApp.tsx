@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArchiveIcon,
@@ -43,7 +43,8 @@ import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { UpdatePill } from "./components/UpdatePill";
 import { SettingsProvider } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
-import { useMutation, useQuery } from "./lib/useDaemon";
+import { useBorg, useMutation, useQuery } from "./lib/useDaemon";
+import type { admin } from "@borg/client";
 import { routes } from "./routes";
 
 // TODO(daemon): no RPC carries an operator identity yet; the footer stays static.
@@ -87,6 +88,22 @@ function Shell({ platform }: { platform: Platform }) {
   // A write on the conversations page must renew this list too — the two
   // queries are independent, so only a shared counter connects them.
   const listVersion = useSyncExternalStore(subscribeSessions, sessionsVersion, sessionsVersion);
+  // The last listing that arrived. A refresh that fails — one dropped call
+  // during a daemon restart — must not empty the sidebar and zero the unread
+  // badge; the rows it had are still the best answer until a later read
+  // replaces them. Only a first load has nothing to fall back on.
+  //
+  // Only the same daemon's rows, though. A new client is a different daemon,
+  // or the same one reached another way, and its conversations are not the
+  // old one's: a failed first read there must show nothing rather than rows
+  // that belong somewhere else.
+  const client = useBorg();
+  const lastListed = useRef<admin.SessionSummary[]>([]);
+  const listedFrom = useRef(client);
+  if (listedFrom.current !== client) {
+    listedFrom.current = client;
+    lastListed.current = [];
+  }
   const sessions = useQuery(
     async (borg) => {
       const list = await borg.admin.listSessions({});
@@ -99,22 +116,31 @@ function Shell({ platform }: { platform: Platform }) {
           messageCount: Number(s.messageCount),
         })),
       );
-      return list;
+      // Tagged with the client this render holds: `useQuery` keeps the last
+      // answer on screen across a client change, and that answer must not
+      // refill the rows. The closure's client, not `borg`: each `useBorg()`
+      // builds its own object, so the two never compare equal.
+      return { list, from: client };
     },
     [location.key, listVersion],
   );
   // Same naming rule as the full list: an unsent session is called after what
   // has been typed into it. The version counter re-renders as that changes.
   useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
+  if (sessions.state === "ready" && sessions.data.from === client) {
+    lastListed.current = sessions.data.list.sessions;
+  }
   // One subscription for the whole app; every list reads the store it fills.
-  useSessionActivityFeed();
+  // It also renews this list when a turn ends or a conversation it has never
+  // listed starts one, so a reply that lands in the background gets its dot
+  // — and a conversation a schedule opened gets its row — without a click.
+  useSessionActivityFeed((id) => lastListed.current.some((s) => s.id === id));
   useSyncExternalStore(subscribeActivity, activityVersion, activityVersion);
   // And the read marks, so opening a conversation drops its dot here at once
   // rather than on the next refetch. Lighting a dot still waits for one: the
-  // mark is compared against the listing's own figures, and this list only
-  // re-reads those on navigation.
+  // mark is compared against the listing's own figures.
   useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
-  const listed = (sessions.state === "ready" ? sessions.data.sessions : []).map((s) => ({
+  const listed = lastListed.current.map((s) => ({
     id: s.id,
     title: rowTitle(s.title, Number(s.messageCount), s.id),
     activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),

@@ -195,7 +195,9 @@ export function useSessions(deps: unknown[] = []): Sessions {
 
   const renameMutation = useMutation(
     (borg, vars: { id: string; title: string }) => borg.admin.setSessionTitle(vars),
-    { onSuccess: () => query.refetch() },
+    // The sidebar lists the same titles from a query of its own, so the shared
+    // counter is what renews both.
+    { onSuccess: () => sessionsChanged() },
   );
   const setArchivedMutation = useMutation(
     // `title` never reaches the daemon; it rides along so the undo offer can

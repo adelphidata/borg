@@ -34,13 +34,22 @@ const HEALTHY = {
 
 const mount = (daemon: ReturnType<typeof fakeDaemon>) => renderApp(<HealthPage />, { daemon });
 const click = (name: string) => act(() => screen.getByText(name).click());
+/** The status dot in the row named `name`. */
+const dotOf = (name: string) => {
+  const dot = screen.getByText(name).parentElement?.querySelector("span.rounded-full");
+  if (!dot) throw new Error(`no dot in the ${name} row`);
+  return dot;
+};
+let warn: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   vi.setSystemTime(NOW);
+  warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  warn.mockRestore();
 });
 
 describe("splitWarning", () => {
@@ -263,6 +272,71 @@ describe("HealthPage", () => {
     await waitFor(() =>
       expect(screen.getByText("Tidy-up failed: database is locked")).toBeTruthy(),
     );
+  });
+
+  // One dropped call must not blank the page: the other six answers are still
+  // true, and the row that could not be checked says so in its own words.
+  it.each([
+    ["GetPersistentWarnings", "Warnings"],
+    ["GetPosture", "Security posture"],
+    ["GetHeartbeat", "Proactive check-ins"],
+    ["GetSubprocesses", "Background work"],
+    ["GetMonthlyTokenTotal", "Usage this month"],
+  ])("keeps the other rows when %s fails", async (method, row) => {
+    const daemon = fakeDaemon({
+      ...HEALTHY,
+      [method]: new BorgError(GrpcStatus.Unavailable, "timed out"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Borg is running")).toBeTruthy());
+    expect(screen.getByText("2 hours without a restart")).toBeTruthy();
+    expect(screen.queryByText("Could not load health checks.")).toBeNull();
+    expect(screen.getAllByText("Couldn't check")).toHaveLength(1);
+
+    click(row);
+    expect(screen.getByText(/Borg did not answer this check/)).toBeTruthy();
+    // Nothing is known to be wrong, but nothing is known to be right either:
+    // the headline must not call Borg healthy, nor raise an alarm.
+    expect(screen.queryByText("Borg is healthy.")).toBeNull();
+    expect(screen.queryByText("Borg needs a look.")).toBeNull();
+    expect(screen.getByText("Some checks did not answer.")).toBeTruthy();
+    expect(screen.getByText(new RegExp(`No answer from: ${row}\\. Try again`))).toBeTruthy();
+    // Its dot is neutral grey, neither the healthy green nor the alert red.
+    const dot = dotOf(row);
+    expect(dot.className).toContain("bg-ink3");
+    expect(dot.className).not.toMatch(/bg-neon|bg-alert/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not answer"), expect.anything());
+  });
+
+  it("paints answered rows green and a failing one red", async () => {
+    mount(fakeDaemon({ ...HEALTHY, GetPosture: { posture: "Reduced", xpMultiplier: 0.85 } }));
+    await waitFor(() => expect(screen.getByText("Borg needs a look.")).toBeTruthy());
+    expect(dotOf("Security posture").className).toContain("bg-alert");
+    expect(dotOf("Warnings").className).toContain("bg-neon");
+  });
+
+  it("puts an alert ahead of a check that did not answer", async () => {
+    mount(
+      fakeDaemon({
+        ...HEALTHY,
+        GetPosture: { posture: "Reduced", xpMultiplier: 0.85 },
+        GetHeartbeat: new BorgError(GrpcStatus.Unavailable, "timed out"),
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Borg needs a look.")).toBeTruthy());
+    expect(
+      screen.getByText(/Needs you: Security posture\. No answer from: Proactive/),
+    ).toBeTruthy();
+  });
+
+  it("still counts tokens when only the price call fails", async () => {
+    const daemon = fakeDaemon({
+      ...HEALTHY,
+      GetMonthlyTotalCost: new BorgError(GrpcStatus.Unavailable, "timed out"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("1,200,000 tokens")).toBeTruthy());
+    expect(screen.queryByText("Couldn't check")).toBeNull();
   });
 
   it("reports a failed health load without hiding the vitals it did get", async () => {

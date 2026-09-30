@@ -19,6 +19,13 @@ import {
  */
 let nextStreamId = 0;
 
+/**
+ * Names this page load in every stream id, so the main process can tell a
+ * reloaded page's `s0` from the one the dead page opened, and close the dead
+ * page's streams when the new page opens its first.
+ */
+const pageLoad = crypto.randomUUID();
+
 const transport: BorgTransport = {
   async unary(method, request, signal) {
     signal?.throwIfAborted();
@@ -28,7 +35,7 @@ const transport: BorgTransport = {
   },
 
   serverStream(method: MethodPath, request, handlers: StreamHandlers<never>) {
-    const id = `s${nextStreamId++}`;
+    const id = `${pageLoad}:s${nextStreamId++}`;
 
     const onEvent = (_e: unknown, streamId: string, payload: StreamEvent) => {
       if (streamId !== id) return;

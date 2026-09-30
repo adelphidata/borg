@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { isImeKey } from "@borg/ui";
 import { CHORDS } from "./chords";
 
 export { CHORDS, hintFor, isMacPlatform } from "./chords";
@@ -59,6 +60,9 @@ export function chordOf(event: KeyboardEvent, isMac: boolean): string {
   if (isMac ? event.ctrlKey : event.metaKey) parts.push("ctrl");
   if (event.altKey) parts.push("alt");
   if (event.shiftKey) parts.push("shift");
+  // Autofill and synthetic keydowns arrive with no `key` at all. They name no
+  // chord, so they must resolve to one that is bound to nothing.
+  if (typeof event.key !== "string") return "";
   // "K" and "k" are the same chord; "Escape" keeps its name, lowercased.
   parts.push(event.key.toLowerCase());
   return parts.join("+");
@@ -84,6 +88,9 @@ export function isEditable(target: EventTarget | null): boolean {
 export function installKeybinds(target: Window, isMac: boolean): () => void {
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.defaultPrevented) return;
+    // A key the input method owns is part of writing a word: the Escape that
+    // abandons a candidate must not also stop a running turn.
+    if (isImeKey(event)) return;
     const chord = chordOf(event, isMac);
     const action = byChord.get(chord);
     if (!action) return;
@@ -95,6 +102,10 @@ export function installKeybinds(target: Window, isMac: boolean): () => void {
     if (!top.inInputs && isEditable(event.target) && !/\+/.test(chord)) return;
 
     event.preventDefault();
+    // A held chord repeats, and a toggle that fires on every repeat flickers.
+    // The repeat is still ours, though: let through, a held ⌘F would open the
+    // browser's own find bar over ours.
+    if (event.repeat) return;
     top.handler();
   };
 

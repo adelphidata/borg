@@ -10,8 +10,10 @@ const cell = (over: Partial<Cell>): Cell => ({ id: "c", kind: "assistant", ...ov
 let native: ReturnType<typeof fakeNative>;
 let focused = false;
 
+let title: string | undefined;
+
 function Probe({ cells, busy }: { cells: Cell[]; busy: boolean }) {
-  useTurnNotifications(cells, busy, "sess-1");
+  useTurnNotifications(cells, busy, "sess-1", title);
   return null;
 }
 
@@ -38,6 +40,7 @@ function mount(cells: Cell[], busy: boolean) {
 beforeEach(() => {
   native = fakeNative();
   focused = false;
+  title = undefined;
   vi.spyOn(document, "hasFocus").mockImplementation(() => focused);
 });
 
@@ -69,7 +72,7 @@ describe("useTurnNotifications", () => {
     expect(native.notifications).toEqual([
       {
         title: "Borg",
-        body: "Your turn is finished.",
+        body: "Finished.",
         sessionId: "sess-1",
         key: "turn-complete:sess-1",
       },
@@ -105,9 +108,45 @@ describe("useTurnNotifications", () => {
     rerender([cell({ kind: "input-request", answered: false })], false);
     expect(native.badges).toEqual([1]);
     expect(native.notifications.at(-1)).toMatchObject({
-      title: "Borg needs you",
+      title: "Borg",
+      body: "Borg is waiting on an answer.",
       key: "prompt:sess-1",
     });
+  });
+
+  it("titles the banner with the conversation and quotes the reply", () => {
+    title = "Ship it";
+    const { rerender } = mount([cell({ kind: "user", text: "go" })], true);
+    rerender(
+      [cell({ kind: "user", text: "go" }), cell({ kind: "assistant", text: "All 12 tests pass." })],
+      false,
+    );
+    expect(native.notifications).toEqual([
+      {
+        title: "Ship it",
+        body: "All 12 tests pass.",
+        sessionId: "sess-1",
+        key: "turn-complete:sess-1",
+      },
+    ]);
+  });
+
+  it("names the command a prompt is asking to run", () => {
+    title = "Ship it";
+    const { rerender } = mount([], true);
+    rerender([cell({ kind: "shell-confirm", command: "git push", answered: false })], true);
+    expect(native.notifications.at(-1)).toMatchObject({
+      title: "Ship it",
+      body: "Borg wants to run: git push",
+    });
+  });
+
+  it("does not notify again because the reply or the title changed", () => {
+    const { rerender } = mount([], true);
+    rerender([cell({ kind: "assistant", text: "one" })], false);
+    title = "Named late";
+    rerender([cell({ kind: "assistant", text: "one two" })], false);
+    expect(native.notifications).toHaveLength(1);
   });
 
   it("does not ask again while the count is unchanged", () => {

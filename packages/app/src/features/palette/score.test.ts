@@ -67,3 +67,39 @@ describe("rank", () => {
     expect(results).toHaveLength(1);
   });
 });
+
+describe("word separators", () => {
+  it("ranks a hyphenated name first for the same words typed with a space", () => {
+    const results = rank(
+      [cmd("Core overview"), cmd("Decode previews"), cmd("code-review")],
+      "code review",
+    );
+    expect(results[0]!.label).toBe("code-review");
+  });
+
+  const pairs: [string, string][] = [
+    ["gpt-4o", "gpt.4o"],
+    ["gpt-4o", "gpt 4o"],
+    ["gpt-4o", "gpt_4o"],
+    ["tts.timeout_ms", "tts timeout ms"],
+    ["code review", "code-review"],
+  ];
+
+  it.each(pairs)("scores %s the same for %s as for its own spelling", (text, query) => {
+    const own = score(text, text);
+    expect(own).not.toBeNull();
+    expect(score(text, query)).toBe(own);
+  });
+
+  it("still tells a separator from a letter", () => {
+    // Folding is between separators only: "gpt4o" has no gap to match.
+    expect(score("gpt4o", "gpt 4o")).toBeNull();
+  });
+
+  it("leaves the score of a query without separators as it was", () => {
+    // 8 for a word-initial first letter, less 5 for the distance to it, 5 for
+    // each letter that follows it, less 0.05 per character of the text.
+    expect(score("llm.thinking", "think")).toBeCloseTo(8 - 5 + 5 * 4 - 12 * 0.05, 10);
+    expect(score("code-review", "review")).toBe(score("code review", "review"));
+  });
+});

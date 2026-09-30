@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure } from "./sendFailure";
+import { classifyFailure, retryHint } from "./sendFailure";
 
 describe("classifyFailure — the layer", () => {
   it.each([
@@ -141,5 +141,82 @@ describe("classifyFailure — the actions it earns", () => {
     // Unknown means unclassified, not unrecoverable: the user is left the one
     // action that costs nothing to try.
     expect(failure.retryable).toBe(true);
+  });
+});
+
+describe("classifyFailure — the daemon's own diagnosis", () => {
+  it.each([
+    // The exact texts `classify_status` writes, which carry the daemon's
+    // reading of the response body in brackets after the status.
+    [
+      "anthropic returned 403 (request blocked by Cloudflare — usually a restricted region or a flagged VPN/proxy; try a different network or region): <html>Attention Required!</html>",
+      { layer: "connection", retryable: false, settings: true },
+    ],
+    [
+      "openrouter returned 429 (billing error: quota or spend limit exhausted): insufficient credits",
+      { layer: "billing", retryable: false, settings: true },
+    ],
+    [
+      "openrouter returned 402 (billing error): insufficient_quota",
+      { layer: "billing", retryable: false, settings: true },
+    ],
+    [
+      "anthropic returned 402 (usage limit): usage limit reached, try again in 5 minutes",
+      { layer: "rate-limit", retryable: true, settings: false },
+    ],
+    [
+      "openai returned 429 (rate limited): slow down",
+      { layer: "rate-limit", retryable: true, settings: false },
+    ],
+    [
+      "anthropic returned 403 (auth permanent): forbidden",
+      { layer: "auth", retryable: false, settings: true },
+    ],
+  ] as const)("trusts %j over the bare status code", (raw, expected) => {
+    expect(classifyFailure({ message: raw })).toMatchObject(expected);
+  });
+
+  it("tells the user the network was blocked, and where the switch is", () => {
+    const failure = classifyFailure({
+      message:
+        "anthropic returned 403 (request blocked by Cloudflare — try a different network): x",
+    })!;
+    expect(failure.message).toBe(
+      "Your network or region was blocked by the provider. Try another network, or switch provider in Settings.",
+    );
+  });
+});
+
+describe("classifyFailure — the provider's own wait", () => {
+  it.each([
+    ["usage limit reached, try again in 5 minutes", "Try again in about 5 min."],
+    ["please retry after 45 seconds", "Try again in about 45 seconds."],
+    ["429 Too Many Requests: retry after 20s", "Try again in about 20 seconds."],
+    ["rate limited; try again in 1 second", "Try again in about 1 second."],
+    ["rate limited; try again in 1 min", "Try again in about 1 min."],
+    ["rate limited; retry after 300 seconds", "Try again in about 5 min."],
+    // Providers name sub-second precision; a wait is only ever rounded up.
+    ["Rate limit reached. Please try again in 1.234s.", "Try again in about 2 seconds."],
+    ["rate limited; try again in 0.4s", "Try again in about 1 second."],
+    ["quota exhausted; retry in 1.5 minutes", "Try again in about 2 min."],
+  ])("turns %j into %j", (raw, hint) => {
+    expect(retryHint(raw)).toBe(hint);
+    const failure = classifyFailure({ message: `429 ${raw}` })!;
+    expect(failure.message.endsWith(hint)).toBe(true);
+    expect(failure.message).not.toContain("Wait a moment");
+  });
+
+  it.each(["429 too many requests", "429 retry after a while", "429 try again in 0 seconds"])(
+    "keeps the plain wording when no wait is named (%j)",
+    (raw) => {
+      expect(retryHint(raw)).toBeUndefined();
+      expect(classifyFailure({ message: raw })!.message).toContain("Wait a moment");
+    },
+  );
+
+  it("adds no wait to a failure that is not a throttle", () => {
+    const failure = classifyFailure({ message: "402 payment required, try again in 5 minutes" })!;
+    expect(failure.layer).toBe("billing");
+    expect(failure.message).not.toContain("Try again in about");
   });
 });

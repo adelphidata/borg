@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { highlight, resolveLanguage } from "./highlight";
+import {
+  HIGHLIGHT_ENTRY_MAX,
+  HighlightCache,
+  highlight,
+  peekHighlight,
+  resolveLanguage,
+} from "./highlight";
 
-/** Every grammar handed to the highlighter, recorded to observe the cache. */
-const loadCalls = vi.hoisted(() => ({ count: 0 }));
+/**
+ * Every grammar handed to the highlighter and every tokenising pass it ran,
+ * recorded to observe the two caches.
+ */
+const loadCalls = vi.hoisted(() => ({ count: 0, tokenised: 0 }));
 
 vi.mock("shiki/core", async (importOriginal) => {
   const mod = await importOriginal<typeof import("shiki/core")>();
@@ -14,6 +23,11 @@ vi.mock("shiki/core", async (importOriginal) => {
       core.loadLanguage = async (...langs) => {
         loadCalls.count += 1;
         return original(...langs);
+      };
+      const tokenise = core.codeToHtml.bind(core);
+      core.codeToHtml = (...args) => {
+        loadCalls.tokenised += 1;
+        return tokenise(...args);
       };
       return core;
     }) as typeof mod.createHighlighterCore,
@@ -124,6 +138,92 @@ describe("highlight", () => {
     await highlight("func main() {}", "go");
     expect(loadCalls.count).toBe(afterFirst);
   }, 20000);
+});
+
+describe("highlight cache", () => {
+  it("tokenises equal input once", async () => {
+    const first = await highlight("SELECT 1;", "sql");
+    const after = loadCalls.tokenised;
+    const second = await highlight("SELECT 1;", "sql");
+    expect(loadCalls.tokenised).toBe(after);
+    expect(second).toBe(first);
+  }, 20000);
+
+  it("hands back finished markup without waiting", async () => {
+    expect(peekHighlight("SELECT 2;", "sql")).toBeUndefined();
+    const html = await highlight("SELECT 2;", "sql");
+    expect(peekHighlight("SELECT 2;", "sql")).toBe(html);
+  }, 20000);
+
+  it("shares an entry between a fence tag and its alias", async () => {
+    const html = await highlight("echo one", "sh");
+    expect(peekHighlight("echo one", "bash")).toBe(html);
+  }, 20000);
+
+  it("keeps equal code in two languages apart", async () => {
+    // The same text tokenises differently per grammar; one key for both would
+    // paint a Python block with Ruby's colours.
+    await highlight("x = 1", "python");
+    expect(peekHighlight("x = 1", "ruby")).toBeUndefined();
+  }, 20000);
+
+  it("has nothing for a fence it cannot highlight", async () => {
+    await highlight("hello", "brainfuck");
+    expect(peekHighlight("hello", "brainfuck")).toBeUndefined();
+  });
+
+  it("does not keep a block larger than one entry's share", async () => {
+    // One huge paste would otherwise push out every small block on screen.
+    const huge = "k = 1\n".repeat(Math.ceil(HIGHLIGHT_ENTRY_MAX / 6));
+    const html = await highlight(huge, "toml");
+    expect(html).toContain("<pre");
+    expect(peekHighlight(huge, "toml")).toBeUndefined();
+  }, 60000);
+});
+
+describe("HighlightCache", () => {
+  it("stays inside its budget however many large entries arrive", () => {
+    // A streaming block adds a new, slightly longer entry on every pass.
+    const cache = new HighlightCache(1_000, 400);
+    for (let i = 0; i < 50; i += 1) {
+      cache.set(`k${i}`, "c".repeat(100 + i), "h".repeat(200));
+      expect(cache.size).toBeLessThanOrEqual(1_000);
+    }
+    expect(cache.get("k49")).toBe("h".repeat(200));
+    expect(cache.get("k0")).toBeUndefined();
+  });
+
+  it("keeps a block that was just used ahead of older ones", () => {
+    const cache = new HighlightCache(300, 300);
+    cache.set("a", "", "a".repeat(100));
+    cache.set("b", "", "b".repeat(100));
+    cache.set("c", "", "c".repeat(100));
+    // Reading `a` makes it the newest; `b` is now the one used longest ago.
+    expect(cache.get("a")).toBeDefined();
+    cache.set("d", "", "d".repeat(100));
+    expect(cache.get("a")).toBeDefined();
+    expect(cache.get("b")).toBeUndefined();
+    expect(cache.get("c")).toBeDefined();
+    expect(cache.get("d")).toBeDefined();
+  });
+
+  it("does not keep an entry above the per-entry cap, nor evict for it", () => {
+    const cache = new HighlightCache(1_000, 300);
+    cache.set("small", "x", "y");
+    cache.set("big", "x".repeat(200), "y".repeat(101));
+    expect(cache.get("big")).toBeUndefined();
+    expect(cache.get("small")).toBe("y");
+    expect(cache.size).toBe(2);
+  });
+
+  it("replaces an entry written twice rather than counting it twice", () => {
+    // Two callers can race to highlight one block.
+    const cache = new HighlightCache(1_000, 1_000);
+    cache.set("k", "code", "first");
+    cache.set("k", "code", "second");
+    expect(cache.get("k")).toBe("second");
+    expect(cache.size).toBe("code".length + "second".length);
+  });
 });
 
 describe("registered grammars", () => {

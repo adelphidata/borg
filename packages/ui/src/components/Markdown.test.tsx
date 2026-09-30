@@ -5,7 +5,7 @@ import { codeText, Markdown } from "./Markdown";
 // Highlighting is async and irrelevant here; a never-settling promise keeps
 // every block on its plain-text fallback while still recording the call.
 const highlight = vi.hoisted(() => vi.fn(() => new Promise<string>(() => {})));
-vi.mock("../lib/highlight", () => ({ highlight }));
+vi.mock("../lib/highlight", () => ({ highlight, peekHighlight: () => undefined }));
 
 describe("Markdown", () => {
   it("drops raw HTML from model output", () => {
@@ -88,6 +88,77 @@ describe("Markdown", () => {
   it("renders GFM strikethrough, which plain markdown would not", () => {
     const { container } = render(<Markdown>{"~~gone~~"}</Markdown>);
     expect(container.querySelector("del")?.textContent).toBe("gone");
+  });
+
+  // A single tilde is how people write "about" and a range. Two of them in
+  // one paragraph must not strike out the text between them.
+  it.each([
+    ["two ranges", "Pages 1~10,11~20 are done"],
+    ["a range and an estimate", "Takes 3~5 days and costs ~¥0.089 per call"],
+  ])("leaves single tildes as text: %s", (_name, source) => {
+    const { container } = render(<Markdown>{source}</Markdown>);
+    expect(container.querySelector("del")).toBeNull();
+    expect(container.textContent).toBe(source);
+  });
+
+  it("keeps a single line break the reply was written with", () => {
+    // An address arrives one part per line; folded into one line it reads as
+    // a sentence.
+    const { container } = render(<Markdown>{"Name\nStreet\nCity"}</Markdown>);
+    const paragraph = container.querySelector("p");
+    expect(paragraph?.querySelectorAll("br")).toHaveLength(2);
+    expect(paragraph?.innerHTML).toMatch(/^Name<br>\s*Street<br>\s*City$/);
+  });
+
+  it.each([
+    ["Windows", "a\r\nb"],
+    ["old Mac", "a\rb"],
+  ])("keeps a %s line break with no stray carriage return", (_name, source) => {
+    const { container } = render(<Markdown>{source}</Markdown>);
+    const paragraph = container.querySelector("p");
+    expect(paragraph?.querySelectorAll("br")).toHaveLength(1);
+    expect(paragraph?.innerHTML).toMatch(/^a<br>\s*b$/);
+    expect(paragraph?.innerHTML).not.toContain("\r");
+  });
+
+  it("keeps line breaks inside list items and emphasis", () => {
+    const { container } = render(<Markdown>{"- one\n  two\n\n*a\nb*"}</Markdown>);
+    expect(container.querySelector("li br")).not.toBeNull();
+    expect(container.querySelector("em br")).not.toBeNull();
+  });
+
+  it("still separates paragraphs on a blank line, with no break added", () => {
+    const { container } = render(<Markdown>{"first\n\nsecond"}</Markdown>);
+    expect(container.querySelectorAll("p")).toHaveLength(2);
+    expect(container.querySelector("br")).toBeNull();
+  });
+
+  it("leaves the newlines in a fenced block as they are", () => {
+    const { container } = render(<Markdown>{"```\none\ntwo\n```"}</Markdown>);
+    expect(container.querySelector("pre")?.textContent).toBe("one\ntwo");
+    expect(container.querySelector("br")).toBeNull();
+  });
+
+  it("leaves inline code alone beside a kept line break", () => {
+    // Markdown itself folds a newline inside a code span into a space; the
+    // span must come out whole, with no break put inside it.
+    const { container } = render(<Markdown>{"run `a\nb` now\nthen stop"}</Markdown>);
+    const code = container.querySelector("code");
+    expect(code?.textContent).toBe("a b");
+    expect(code?.querySelector("br")).toBeNull();
+    expect(container.querySelectorAll("p > br")).toHaveLength(1);
+  });
+
+  it("renders a table with no breaks added to it", () => {
+    const { container } = render(
+      <Markdown>{"| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |"}</Markdown>,
+    );
+    expect(container.querySelector("table br")).toBeNull();
+    expect([...container.querySelectorAll("tr")].map((r) => r.textContent)).toEqual([
+      "ab",
+      "12",
+      "34",
+    ]);
   });
 
   it("renders headings, lists and blockquotes with the prose styles", () => {

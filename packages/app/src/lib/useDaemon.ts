@@ -204,7 +204,8 @@ export type RetryingStreamState = StreamState & {
 
 /**
  * A [`useServerStream`] that resubscribes itself after a drop, with
- * full-jitter backoff (see `./backoff`).
+ * full-jitter backoff (see `./backoff`), and at once when the window or the
+ * network comes back.
  *
  * A subscribe function that returns a no-op — the usual way to wait for an id
  * — simply never errors, so the retry loop stays dormant until there is
@@ -253,13 +254,33 @@ export function useRetryingServerStream<T>(
     if (state.status === "open") return;
     const startedAt = outageSince.current ?? Date.now();
     outageSince.current = startedAt;
-    const retry = setTimeout(() => setAttempt((n) => n + 1), retryDelayMs(failures.current));
+    const redial = () => setAttempt((n) => n + 1);
+    const retry = setTimeout(redial, retryDelayMs(failures.current));
     failures.current += 1;
     const untilEscalation = Math.max(0, OUTAGE_ESCALATION_MS - (Date.now() - startedAt));
     const escalate = setTimeout(() => setSustained(true), untilEscalation);
+    // The window coming back to the front, or the network coming back at all,
+    // is the moment the user looks for the connection — up to thirty seconds
+    // of a long-backed-off timer is exactly when a frozen screen gets noticed.
+    // Redial now; the failure count stays, so a daemon that is still down does
+    // not get its backoff reset by a tab switch.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        clearTimeout(retry);
+        redial();
+      }
+    };
+    const onOnline = () => {
+      clearTimeout(retry);
+      redial();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onOnline);
     return () => {
       clearTimeout(retry);
       clearTimeout(escalate);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onOnline);
     };
   }, [state.status, state.error]);
 

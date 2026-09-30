@@ -100,14 +100,19 @@ describe("QuickEntryPage", () => {
     expect(daemon.calls).toEqual([]);
   });
 
-  it("does not send mid-composition", async () => {
+  it.each([
+    ["while a word is still being composed", { key: "Enter", isComposing: true }],
+    ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+  ])("does not send on an Enter %s", async (_name, init) => {
     // An IME's Enter commits the candidate; sending there would truncate it.
-    const { daemon } = mount();
+    const { daemon, native } = mount();
     type("にほんご");
     await act(async () => {
-      fireEvent.keyDown(box(), { key: "Enter", isComposing: true });
+      fireEvent.keyDown(box(), init);
     });
     expect(daemon.calls).toEqual([]);
+    expect(native.hidden).toBe(0);
+    expect(box()).toHaveProperty("value", "にほんご");
   });
 
   it("dismisses on Escape without sending", async () => {

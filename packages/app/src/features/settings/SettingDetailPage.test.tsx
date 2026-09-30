@@ -284,3 +284,24 @@ describe("appearance, which never reaches the daemon", () => {
     expect(localStorage.getItem(STORAGE_KEYS.theme)).toBe("light");
   });
 });
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("SettingDetailPage and an input method", () => {
+  it.each(IME_ENTERS)("does not save on an Enter %s", async (_name, init) => {
+    const daemon = fakeDaemon({ GetSettings: { entries: REGISTRY }, SetSetting: {} });
+    mount("/settings/key/gateway.port", daemon);
+    await waitFor(() => expect(screen.getByDisplayValue("7842")).toBeTruthy());
+
+    fireEvent.keyDown(screen.getByDisplayValue("7842"), init);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
+  });
+});

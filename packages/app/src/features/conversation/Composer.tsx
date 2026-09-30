@@ -3,6 +3,7 @@ import {
   AttachIcon,
   CloseIcon,
   CompletionList,
+  isSubmitEnter,
   Pill,
   rowDomId,
   SendIcon,
@@ -11,9 +12,12 @@ import {
 import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
+import { useAutoGrow } from "./useAutoGrow";
 import { collectAttachments } from "./attachments";
+import { focusComposer, registerComposer } from "./composerFocus";
 import { appendPastedText, composerOwnsPaste, pastedTextFile } from "./documentPaste";
-import { draftTitle, publishDraft } from "./draftStore";
+import { draftTitle, publishDraft, readDraft } from "./draftStore";
+import { carriesFiles, carriesText, insertAt, readDrop } from "./dropContent";
 import { ModelPill } from "./ModelPill";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
 import { mergeQueued } from "./queuedTurn";
@@ -36,18 +40,6 @@ const SLASH_LIST_ID = "composer-slash-menu";
 /** Same, for the `@` path menu. Only one of the two is ever open. */
 const PATH_LIST_ID = "composer-path-menu";
 
-function useAutoGrow(value: string) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    // Collapse first: scrollHeight only shrinks if the box is not already tall.
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, MAX_ROWS_PX)}px`;
-  }, [value]);
-  return ref;
-}
-
 interface ComposerProps {
   busy: boolean;
   /**
@@ -57,6 +49,12 @@ interface ComposerProps {
    * waiting. Absent means no prompt is open.
    */
   awaitingInput?: boolean;
+  /**
+   * False until the conversation is open and can take a message. What is sent
+   * before then is held the same way and goes out once it is. Absent means
+   * ready.
+   */
+  ready?: boolean;
   /** Persists the draft per session so switching conversations does not lose it. */
   draftKey: string;
   /**
@@ -71,7 +69,8 @@ interface ComposerProps {
    */
   sessionId?: string;
   onSend: (text: string, attachments: Attachment[]) => void;
-  onSteer: (text: string) => void;
+  /** Resolves to false when the running turn did not take the text. */
+  onSteer: (text: string) => Promise<boolean> | boolean | void;
   onCancel: () => void;
 }
 
@@ -86,6 +85,7 @@ interface ComposerProps {
 export function Composer({
   busy,
   awaitingInput = false,
+  ready = true,
   draftKey,
   conversationKey,
   sessionId,
@@ -105,7 +105,7 @@ export function Composer({
   const [queued, setQueued] = useState<{ text: string; attachments: Attachment[] }>();
   const [error, setError] = useState<string>();
   const [dragging, setDragging] = useState(false);
-  const textarea = useAutoGrow(draft);
+  const textarea = useAutoGrow(draft, MAX_ROWS_PX);
   /** Sent messages, newest last — recalled with ArrowUp on an empty composer. */
   const history = useRef<string[]>([]);
   const historyAt = useRef<number | null>(null);
@@ -125,6 +125,19 @@ export function Composer({
   // would otherwise see the attachment list as it was when it was registered.
   const attachmentsRef = useRef<Attachment[]>(attachments);
   attachmentsRef.current = attachments;
+  const draftKeyRef = useRef(draftKey);
+  draftKeyRef.current = draftKey;
+  const isMobileRef = useRef(isMobile);
+  isMobileRef.current = isMobile;
+
+  useEffect(() => registerComposer(() => textarea.current), [textarea]);
+
+  // Opening a conversation is a request to type in it. Not on a phone, where
+  // focus raises the keyboard over the conversation that was just opened.
+  useEffect(() => {
+    if (!isMobileRef.current) focusComposer();
+  }, [conversationKey]);
+
   useEffect(
     () => () => {
       for (const url of objectUrls.current) URL.revokeObjectURL(url);
@@ -388,6 +401,16 @@ export function Composer({
     return () => document.removeEventListener("paste", onPaste);
   }, [addFiles, pasteText, textarea]);
 
+  /** Writes dropped text at the caret, as the browser would have. */
+  const dropText = (text: string) => {
+    const el = textarea.current;
+    const start = el?.selectionStart ?? draft.length;
+    const next = insertAt(draft, text, start, el?.selectionEnd ?? start);
+    setDraft(next.text);
+    setCaret(next.caret);
+    restoreCaret(next.caret);
+  };
+
   const forget = (urls: (string | undefined)[]) => {
     const real = urls.filter((u): u is string => u !== undefined);
     for (const url of real) URL.revokeObjectURL(url);
@@ -420,7 +443,10 @@ export function Composer({
     }
     const text = draft.trim();
     if (text === "" && attachments.length === 0) return;
-    if (awaitingInput) {
+    // Before the conversation is open there is nowhere to send to, so the
+    // message waits for it rather than vanishing.
+    const hold = awaitingInput || !ready;
+    if (hold) {
       // Held, not steered: the agent is parked on the prompt above, so a steer
       // would sit in a channel nobody is draining and surface much later as a
       // synthetic mid-turn message.
@@ -433,7 +459,7 @@ export function Composer({
           : { text, attachments },
       );
     } else if (busy) {
-      onSteer(text);
+      steer(text);
     } else {
       onSend(text, attachments);
     }
@@ -444,25 +470,54 @@ export function Composer({
     // to release, and the sent turn renders a count rather than thumbnails.
     // Queued previews are the exception — they have to survive to be handed
     // back if the queue is returned to the box.
-    if (!awaitingInput) forget(attachments.map((a) => a.previewUrl));
+    if (!hold) forget(attachments.map((a) => a.previewUrl));
     setAttachments([]);
     setError(undefined);
   };
 
   /**
+   * Steers the running turn, and hands the text back if the turn did not take
+   * it.
+   *
+   * Added to whatever is in the box by then, never written over it: the answer
+   * arrives after the user has had time to start the next sentence.
+   */
+  const steer = (text: string) => {
+    const forConversation = conversationKeyRef.current;
+    const forDraft = draftKeyRef.current;
+    void Promise.resolve(onSteer(text))
+      .catch((err: unknown) => {
+        console.warn("steer failed", err);
+        return false;
+      })
+      .then((taken) => {
+        if (taken !== false) return;
+        if (forConversation === conversationKeyRef.current) {
+          setDraft((prev) => appendPastedText(prev, text));
+          return;
+        }
+        // The user has moved on. The text goes back to the conversation it was
+        // typed in, where its draft is waiting on their return.
+        const stored = appendPastedText(readDraft(forDraft), text);
+        sessionStorage.setItem(forDraft, stored);
+        publishDraft(forDraft, stored);
+      });
+  };
+
+  /**
    * Sends the queue once the turn ends.
    *
-   * Gated on `busy` alone, deliberately not on `awaitingInput`: while a prompt
-   * is parked `busy` is true, so this cannot fire early, and a turn that errors
-   * out leaving an unanswered prompt cell behind cannot strand the queue
+   * Gated on `busy` and `ready`, deliberately not on `awaitingInput`: while a
+   * prompt is parked `busy` is true, so this cannot fire early, and a turn that
+   * errors out leaving an unanswered prompt cell behind cannot strand the queue
    * forever. `onSend` sets `busy` synchronously, so it cannot fire twice.
    */
   useEffect(() => {
-    if (busy || !queued) return;
+    if (busy || !ready || !queued) return;
     onSend(queued.text, queued.attachments);
     forget(queued.attachments.map((a) => a.previewUrl));
     setQueued(undefined);
-  }, [busy, queued, onSend]);
+  }, [busy, ready, queued, onSend]);
 
   /** Hands the queue back to the box. Cancelling must not bin what was typed. */
   const restoreQueued = () => {
@@ -512,7 +567,7 @@ export function Composer({
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+    if (isSubmitEnter(e) && !e.shiftKey) {
       e.preventDefault();
       submit();
       return;
@@ -638,14 +693,30 @@ export function Composer({
 
         <div
           onDragOver={(e) => {
-            e.preventDefault();
-            setDragging(true);
+            if (carriesFiles(e.dataTransfer)) {
+              e.preventDefault();
+              setDragging(true);
+              return;
+            }
+            // Text over the box itself is the browser's to place. Anywhere else
+            // on the frame a drop is only delivered if it is asked for here.
+            if (carriesText(e.dataTransfer) && e.target !== textarea.current) e.preventDefault();
           }}
           onDragLeave={() => setDragging(false)}
           onDrop={(e) => {
-            e.preventDefault();
             setDragging(false);
-            void addFiles(Array.from(e.dataTransfer.files));
+            const { files, text } = readDrop(e.dataTransfer);
+            if (files.length > 0) {
+              e.preventDefault();
+              void addFiles(files);
+              return;
+            }
+            if (text === "") return;
+            // A plain text drag onto the box lands at the caret natively. One
+            // that came with files would be opened as a file instead.
+            if (e.target === textarea.current && !carriesFiles(e.dataTransfer)) return;
+            e.preventDefault();
+            dropText(text);
           }}
           className={`flex items-end gap-3 border bg-surface2 py-2 pr-2 pl-[19px] ${
             isMobile ? "rounded-[22px]" : "rounded-[13px]"

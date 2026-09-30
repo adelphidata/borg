@@ -110,6 +110,19 @@ describe("BootGate", () => {
     expect(screen.getByText("the app")).toBeTruthy();
   });
 
+  it("reaches the way past a failed boot from the keyboard", () => {
+    // A clickable span is invisible to Tab. A native button is what the
+    // browser turns Enter and Space into the click below.
+    const { native } = bridge(FAILED);
+    mount(native);
+    const control = screen.getByRole("button", { name: "Look around anyway" });
+    expect(control).toBeInstanceOf(HTMLButtonElement);
+    control.focus();
+    expect(document.activeElement).toBe(control);
+    fireEvent.click(control);
+    expect(screen.getByText("the app")).toBeTruthy();
+  });
+
   it("does not gate a surface with no native shell", () => {
     // The browser reached the gateway to load this page at all, so there is
     // no local daemon for it to start and no screen to show.

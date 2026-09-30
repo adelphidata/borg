@@ -1,13 +1,14 @@
 import { memo, type ReactNode } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { remarkLineBreaks } from "../lib/remarkLineBreaks";
 import { CodeBlock } from "./CodeBlock";
 
 /**
  * Assistant prose.
  *
- * Deliberately narrow: GFM (tables, strikethrough, task lists) and nothing
- * else. No raw HTML — `react-markdown` drops it by default and we keep that,
+ * Deliberately narrow: GFM (tables, strikethrough, task lists), kept line
+ * breaks, and nothing else. No raw HTML — `react-markdown` drops it by default and we keep that,
  * because model output is untrusted text and a rendered `<img onerror>` or
  * `<iframe>` in the transcript is a real injection surface.
  *
@@ -102,12 +103,22 @@ const components: Components = {
   },
 };
 
+/**
+ * Strikethrough needs the doubled tilde. A single one is how people write
+ * "about" and a range — `3~5`, `~$20` — and two of those in one paragraph
+ * would otherwise strike out everything between them.
+ */
+const remarkPlugins: Options["remarkPlugins"] = [
+  [remarkGfm, { singleTilde: false }],
+  remarkLineBreaks,
+];
+
 export const Markdown = memo(function Markdown({ children }: { children: string }) {
   return (
     // `select-text` overrides the app-wide `user-select: none`; a transcript
     // you cannot copy out of is not a transcript.
     <div className="borg-prose text-[14.5px] leading-[1.6] text-pretty text-ink select-text">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
         {children}
       </ReactMarkdown>
     </div>

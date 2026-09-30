@@ -6,6 +6,7 @@ import { BorgApp } from "./BorgApp";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { dispatchKeybind } from "./lib/keybinds";
 import { clearNotice } from "./lib/notice";
+import { sessionsChanged } from "./features/sessions/sessionsVersion";
 import { STORAGE_KEYS } from "@borg/ui";
 import { fakeDaemon, fakeNative } from "./test/harness";
 import { setupStatus } from "./test/setupStatus";
@@ -68,6 +69,9 @@ afterEach(() => {
   window.location.hash = "";
 });
 
+/** The toast: the one status region without a name (the conversation page names its own). */
+const toast = () => screen.getAllByRole("status").find((el) => !el.getAttribute("aria-label"))!;
+
 describe("BorgApp shell", () => {
   it("opens on the conversation with the navigation around it", async () => {
     mount();
@@ -123,9 +127,7 @@ describe("BorgApp shell", () => {
 
     await act(async () => screen.getByRole("button", { name: "Archive Ship the daemon" }).click());
     // Named, so two archives in a row are told apart.
-    await waitFor(() =>
-      expect(screen.getByRole("status").textContent).toContain("Ship the daemon"),
-    );
+    await waitFor(() => expect(toast().textContent).toContain("Ship the daemon"));
 
     await act(async () => screen.getByRole("button", { name: "Undo" }).click());
     await waitFor(() =>
@@ -198,9 +200,7 @@ describe("BorgApp shell", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy());
 
     await act(async () => screen.getByRole("button", { name: "Undo" }).click());
-    await waitFor(() =>
-      expect(screen.getByRole("status").textContent).toContain("database is locked"),
-    );
+    await waitFor(() => expect(toast().textContent).toContain("database is locked"));
     // Nothing left to press — the offer was spent and the restore failed.
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
@@ -230,6 +230,78 @@ describe("BorgApp shell", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert").textContent).toContain("database is locked"),
     );
+  });
+
+  it("keeps the sidebar rows through a refresh that fails", async () => {
+    // A daemon restart drops one listing. The rows it had are still the best
+    // answer; emptying the sidebar and zeroing the unread badge over one
+    // transient failure reads as every conversation having vanished.
+    let down = false;
+    let failed = 0;
+    const daemon = fakeDaemon({
+      ...BASE,
+      ListSessions: () => {
+        if (!down) return { sessions: [session()] };
+        failed += 1;
+        return new BorgError(GrpcStatus.Unavailable, "daemon restarting");
+      },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    down = true;
+    act(() => sessionsChanged());
+    await waitFor(() => expect(failed).toBeGreaterThan(0));
+    // Let the rejection land before asserting the row is still there.
+    await act(async () => {});
+    expect(screen.getByText("Ship the daemon")).toBeTruthy();
+  });
+
+  it("drops the old daemon's rows when the client changes", async () => {
+    // The kept rows are a fallback for one daemon's dropped call, not a
+    // stand-in for a different daemon whose first listing failed.
+    const { rerender } = mount();
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    let failed = 0;
+    const next = fakeDaemon({
+      ...BASE,
+      ListSessions: () => {
+        failed += 1;
+        return new BorgError(GrpcStatus.Unavailable, "not ready");
+      },
+    });
+    rerender(
+      <BorgApp
+        platform={{
+          kind: "desktop",
+          transport: next.transport,
+          titleBarDrag: false,
+          native: fakeNative(),
+        }}
+      />,
+    );
+    await waitFor(() => expect(failed).toBeGreaterThan(0));
+    await act(async () => {});
+    expect(screen.queryByText("Ship the daemon")).toBeNull();
+  });
+
+  it("renews the sidebar on its own when a turn ends elsewhere", async () => {
+    // The listing is what carries the figures the unread dot reads from.
+    let title = "Ship the daemon";
+    const daemon = fakeDaemon({
+      ...BASE,
+      ListSessions: () => ({ sessions: [session({ title })] }),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    title = "Ship the daemon (done)";
+
+    const feed = daemon.streams.find((s) => s.method === "SubscribeSessionActivity");
+    act(() => {
+      feed?.handlers.onMessage({ sessionId: "s1", turnActive: false, emittedAtUnix: 0 } as never);
+    });
+    await waitFor(() => expect(screen.getByText("Ship the daemon (done)")).toBeTruthy());
   });
 
   it("lights the nav for a health warning and a waiting pairing", async () => {

@@ -1,8 +1,10 @@
 import { memo, useState } from "react";
-import { Brackets, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
-import type { Cell } from "../useConversation";
+import { Brackets, isSubmitEnter, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
+import type { Cell, SentAttachment } from "../useConversation";
 import { classifyStatus } from "../../agents/useAgentTree";
+import { focusComposer } from "../composerFocus";
 import { FailureCard } from "../FailureCard";
+import { useAutoGrow } from "../useAutoGrow";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
 import { formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
@@ -27,6 +29,12 @@ function ShellConfirmCell({
   cell: Cell & { kind: "shell-confirm" };
   respond: (promptId: string, value: string) => void;
 }) {
+  // The pills unmount on answer, dropping focus on <body>; the composer is
+  // where the next keystrokes belong.
+  const answer = (value: string) => {
+    respond(cell.promptId, value);
+    focusComposer();
+  };
   return (
     <div className="rounded-xl border border-line2 px-[18px] py-4">
       <div className={KICKER}>Borg wants to run a command</div>
@@ -35,10 +43,10 @@ function ShellConfirmCell({
       </pre>
       {!cell.answered && (
         <div className="mt-3.5 flex flex-wrap gap-2">
-          <Pill variant="primary" square onClick={() => respond(cell.promptId, "true")}>
+          <Pill variant="primary" square onClick={() => answer("true")}>
             Allow
           </Pill>
-          <Pill square onClick={() => respond(cell.promptId, "false")}>
+          <Pill square onClick={() => answer("false")}>
             Deny
           </Pill>
         </div>
@@ -98,6 +106,78 @@ function SubAgentCell({ cell }: { cell: Cell & { kind: "sub-agent" } }) {
   );
 }
 
+/** A long paste made from the clipboard, named by `pastedTextFile`. */
+const PASTED_TEXT = /^pasted-text(-\d+)?\.txt$/;
+
+/**
+ * What went with the message, in as few words as a chip allows.
+ *
+ * Documents are named because the name is what distinguishes them; images are
+ * counted because "IMG_4021.HEIC" tells nobody anything. A pasted block of text
+ * is called what the user did, not what the file was named on its behalf.
+ */
+function AttachmentLine({ attachments }: { attachments: SentAttachment[] }) {
+  const documents = attachments.filter((a) => a.kind === "document");
+  const images = attachments.length - documents.length;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] leading-none text-ink3">
+      {documents.map((doc, i) => (
+        <span
+          key={`${doc.filename}:${i}`}
+          className="rounded-md border border-line2 px-1.5 py-1 leading-none"
+        >
+          {PASTED_TEXT.test(doc.filename) ? "Pasted text" : doc.filename}
+        </span>
+      ))}
+      {images > 0 && (
+        <span>
+          {images} image{images === 1 ? "" : "s"} attached
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Tall enough for a long rewrite; the composer stops at the same height. */
+const EDIT_BOX_MAX_PX = 200;
+
+/**
+ * The rewrite box. Its own component so the auto-grow measures on the mount
+ * of the textarea itself, not on the mount of the turn it belongs to.
+ */
+function EditBox({
+  draft,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  draft: string;
+  onChange: (text: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const box = useAutoGrow(draft, EDIT_BOX_MAX_PX);
+  return (
+    <textarea
+      autoFocus
+      ref={box}
+      rows={1}
+      className="w-full resize-none rounded-[13px] border border-line bg-surface2 px-4 py-[11px] text-[13.5px] leading-[1.45] text-ink outline-none select-text"
+      value={draft}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onCancel();
+        // Never an input method's Enter: that one picks a character, and
+        // reading it as a submit would rewind the conversation mid-word.
+        if (isSubmitEnter(e) && !e.shiftKey) {
+          e.preventDefault();
+          onSubmit();
+        }
+      }}
+    />
+  );
+}
+
 /**
  * A user turn, rewritable in place.
  *
@@ -114,26 +194,20 @@ function UserCell({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(cell.text);
+  const resend = () => {
+    if (draft.trim() === "") return;
+    setEditing(false);
+    onEdit?.(draft.trim());
+  };
 
   if (editing) {
     return (
       <div className="flex flex-col items-end gap-2">
-        <textarea
-          autoFocus
-          rows={Math.min(10, draft.split("\n").length + 1)}
-          className="w-full resize-none rounded-[13px] border border-line bg-surface2 px-4 py-[11px] text-[13.5px] leading-[1.45] text-ink outline-none select-text"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") setEditing(false);
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if (draft.trim() !== "") {
-                setEditing(false);
-                onEdit?.(draft.trim());
-              }
-            }
-          }}
+        <EditBox
+          draft={draft}
+          onChange={setDraft}
+          onSubmit={resend}
+          onCancel={() => setEditing(false)}
         />
         <div className="flex items-center gap-2">
           <span className="text-[11px] leading-none text-ink3">
@@ -142,15 +216,7 @@ function UserCell({
           <Pill square onClick={() => setEditing(false)}>
             Cancel
           </Pill>
-          <Pill
-            variant="primary"
-            square
-            onClick={() => {
-              if (draft.trim() === "") return;
-              setEditing(false);
-              onEdit?.(draft.trim());
-            }}
-          >
+          <Pill variant="primary" square onClick={resend}>
             Resend
           </Pill>
         </div>
@@ -174,11 +240,10 @@ function UserCell({
         </button>
       )}
       <div className="max-w-[78%] rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
-        {cell.text}
-        {cell.attachments !== undefined && (
-          <div className="mt-1.5 text-[11px] leading-none text-ink3">
-            {cell.attachments} image{cell.attachments === 1 ? "" : "s"} attached
-          </div>
+        {/* A turn that was only its attachments has no text to make room for. */}
+        {cell.text !== "" && <div>{cell.text}</div>}
+        {cell.attachments && cell.attachments.length > 0 && (
+          <AttachmentLine attachments={cell.attachments} />
         )}
       </div>
     </div>

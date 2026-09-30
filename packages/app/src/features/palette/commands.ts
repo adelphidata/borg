@@ -110,7 +110,9 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
       // Both the hint and the behaviour come from the keybind layer, so a row
       // can never advertise or perform a stale version of either.
       hint: ctx.hintFor("new-conversation"),
-      keywords: "chat start fresh",
+      // "clear" leads: it is what people type to wipe the slate, and it has to
+      // out-rank the same word further along another row's keywords.
+      keywords: "clear reset chat start fresh",
       run: () => ctx.dispatch("new-conversation"),
     },
   ];

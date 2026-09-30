@@ -65,6 +65,18 @@ describe("turnActivity", () => {
     // Marked tentative so the hold can keep it off screen when it is a blink.
     expect(turnActivity([user(), tool(true)])).toEqual({ label: "Working", tentative: true });
   });
+
+  it("names the provider outage while the retry notice is the live state", () => {
+    const retrying: Cell = { kind: "notice", text: "Retrying in 4s.", reconnecting: true };
+    expect(turnActivity([user(), assistant(), retrying])).toEqual({
+      label: "Provider unreachable, retrying…",
+    });
+  });
+
+  it("reads an ordinary notice as an ordinary gap", () => {
+    const notice: Cell = { kind: "notice", text: "Posture: reduced" };
+    expect(turnActivity([user(), notice])).toEqual({ label: "Working", tentative: true });
+  });
 });
 
 describe("createActivityHold", () => {

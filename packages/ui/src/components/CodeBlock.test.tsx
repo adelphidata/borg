@@ -3,11 +3,17 @@ import { act, render, screen } from "@testing-library/react";
 import { CodeBlock } from "./CodeBlock";
 
 const highlight = vi.hoisted(() => vi.fn());
-vi.mock("../lib/highlight", () => ({ highlight }));
+/** Markup the highlighter already holds, keyed by the code it belongs to. */
+const known = vi.hoisted(() => new Map<string, string>());
+vi.mock("../lib/highlight", () => ({
+  highlight,
+  peekHighlight: (code: string) => known.get(code),
+}));
 
 beforeEach(() => {
   vi.useFakeTimers();
   highlight.mockReset();
+  known.clear();
 });
 
 afterEach(() => {
@@ -65,6 +71,20 @@ describe("CodeBlock", () => {
     await settle();
     expect(highlight).toHaveBeenCalledTimes(1);
     expect(highlight).toHaveBeenLastCalledWith("abcd", "rust");
+  });
+
+  it("skips the wait when the streamed code is already highlighted", () => {
+    // No timer is advanced: the markup has to be on screen from the commit
+    // itself, and the highlighter must not be asked for what it already gave.
+    highlight.mockReturnValue(new Promise(() => {}));
+    known.set("ab", '<pre class="shiki">ab</pre>');
+    const { container, rerender } = render(<CodeBlock code="a" lang="rust" />);
+    expect(container.querySelector(".shiki")).toBeNull();
+
+    rerender(<CodeBlock code="ab" lang="rust" />);
+    expect(container.querySelector(".shiki")?.textContent).toBe("ab");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(highlight).not.toHaveBeenCalled();
   });
 
   it("ignores a highlight that lands after the code changed again", async () => {

@@ -9,6 +9,8 @@ import {
   stampTurnDuration,
   type Cell,
 } from "./useConversation";
+import { toolOutcome } from "./cells/toolOutcome";
+import { groupCells } from "./cells/toolRuns";
 
 /** Builds an AgentEvent with just the variant under test set. */
 function event(kind: Partial<sessionPb.AgentEvent>): sessionPb.AgentEvent {
@@ -33,6 +35,24 @@ describe("reduceEvent — text", () => {
       { textDelta: { text: "two" } },
     ]);
     expect(cells.filter((c) => c.kind === "assistant")).toHaveLength(2);
+  });
+
+  it("turns the marker a failed stream sends live into a notice, as a reload would", () => {
+    // `finish_text_only_turn` streams the marker as a delta of its own.
+    const cells = fold([
+      { textDelta: { text: "Here is the pl" } },
+      { textDelta: { text: "\n\n[stream interrupted: connection reset]" } },
+    ]);
+    expect(cells).toEqual([
+      { kind: "assistant", text: "Here is the pl", at: 0 },
+      { kind: "notice", text: "Reply cut short", at: 0 },
+    ]);
+  });
+
+  it("keeps a delta that only looks like a marker once it carries more text", () => {
+    const text = "\n\n[stream interrupted: eof]\nand then the model went on";
+    const cells = fold([{ textDelta: { text } }]);
+    expect(cells).toEqual([{ kind: "assistant", text, at: 0 }]);
   });
 });
 
@@ -136,6 +156,71 @@ describe("reduceEvent — tools", () => {
       { toolOutputDelta: { toolCallId: "ghost", name: "x", delta: "hi", isStderr: false } },
     ]);
     expect(cells).toEqual([]);
+  });
+
+  it("routes output to the newest open call when a provider reuses an id", () => {
+    const cells = fold([
+      { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "first done" } },
+      { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
+      {
+        toolOutputDelta: { toolCallId: "t1", name: "run_shell", delta: "second…", isStderr: false },
+      },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "second done" } },
+    ]);
+    expect(cells).toMatchObject([
+      { output: "first done", done: true },
+      { output: "second done", done: true },
+    ]);
+  });
+
+  it("drops a result for a call that already has one", () => {
+    const cells = fold([
+      { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "done" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "again" } },
+    ]);
+    expect(cells).toMatchObject([{ output: "done" }]);
+  });
+});
+
+describe("reduceEvent — provider retries", () => {
+  const retry = (n: number) => ({
+    systemNotice: { category: "reconnecting", text: `Retrying in ${n}s.` },
+  });
+
+  it("keeps one retry notice, the latest", () => {
+    const cells = fold([retry(2), retry(4)]);
+    expect(cells).toEqual([
+      { kind: "notice", text: "Retrying in 4s.", reconnecting: true, at: expect.any(Number) },
+    ]);
+  });
+
+  it.each([
+    ["a text delta", { textDelta: { text: "back" } }],
+    ["a reasoning delta", { thinkingDelta: { text: "hm" } }],
+    ["a tool call", { toolExecuting: { toolCallId: "t", name: "x", argsJson: "{}" } }],
+    ["the end of the turn", { turnComplete: {} }],
+    ["an error", { error: { message: "gave up" } }],
+  ])("takes the notice down on %s", (_, event) => {
+    const cells = fold([{ textDelta: { text: "start" } }, retry(2), event]);
+    expect(cells.some((c) => c.kind === "notice")).toBe(false);
+    expect(cells[0]).toMatchObject({ kind: "assistant" });
+  });
+
+  it("leaves an ordinary notice where it is", () => {
+    const cells = fold([
+      { systemNotice: { category: "posture", text: "Posture: reduced" } },
+      { textDelta: { text: "hi" } },
+    ]);
+    expect(cells.map((c) => c.kind)).toEqual(["notice", "assistant"]);
+    expect(cells[0]).not.toHaveProperty("reconnecting");
+  });
+
+  it("returns the same array when there is no notice to drop", () => {
+    const before = fold([{ textDelta: { text: "a" } }, { usage: {} as never }]);
+    const after = reduceEvent(before, event({ preparing: {} } as never));
+    expect(after).toBe(before);
   });
 });
 
@@ -358,6 +443,116 @@ describe("historyCells", () => {
   });
 });
 
+describe("historyCells — interrupted turns", () => {
+  // Every shape the agent persists (agent/mod.rs on cancel, stream_handler.rs
+  // on a failed stream or discarded tool calls). Only the bare marker is a stop.
+  it.each([
+    ["Here is the plan\n\n[response interrupted]", "Stopped"],
+    ["Here is the plan\n\n[stream interrupted: connection reset]", "Reply cut short"],
+    [
+      "Here is the plan\n\n[stream interrupted: eof; incomplete tool calls discarded]",
+      "Reply cut short",
+    ],
+    ["Here is the plan\n\n[incomplete tool calls discarded]", "Reply cut short"],
+  ])("turns the marker on %j into a notice", (stored, notice) => {
+    const cells = historyCells([{ role: "assistant", text: stored, unixTs: 5 }]);
+    expect(cells).toEqual([
+      { kind: "assistant", text: "Here is the plan", at: 5_000 },
+      { kind: "notice", text: notice, at: 5_000 },
+    ]);
+  });
+
+  it.each([
+    ["[stream interrupted: context_length_exceeded]", "Reply cut short"],
+    ["[response interrupted — [incomplete tool calls discarded]]", "Reply cut short"],
+    [
+      "[response interrupted — [stream interrupted: eof; incomplete tool calls discarded]]",
+      "Reply cut short",
+    ],
+  ])("shows only the notice when %j is all that was stored", (stored, notice) => {
+    const cells = historyCells([{ role: "assistant", text: stored }]);
+    expect(cells).toEqual([{ kind: "notice", text: notice, at: undefined }]);
+  });
+
+  it("leaves a reply that merely mentions the marker alone", () => {
+    const text = "The log said [response interrupted] and then carried on.";
+    expect(historyCells([{ role: "assistant", text }])).toEqual([
+      { kind: "assistant", text, at: undefined },
+    ]);
+  });
+
+  it("keeps a cancelled call's marker as its output for the row to read", () => {
+    const cells = historyCells([
+      {
+        role: "assistant",
+        text: "",
+        toolCallsJson: '[{"id":"c1","function":{"name":"run_shell"}}]',
+      },
+      { role: "tool", text: "[tool call cancelled by user]", toolCallId: "c1" },
+    ]);
+    expect(cells).toMatchObject([
+      { kind: "tool", name: "run_shell", output: "[tool call cancelled by user]", done: true },
+    ]);
+  });
+});
+
+describe("historyCells — stored tool results", () => {
+  /** What `finalize_tool_output` persists for a result. */
+  const stored = (name: string, body: string) =>
+    `<tool_output name="${name}" trust="external">\n${body}\n</tool_output>`;
+  const reload = (text: string) =>
+    historyCells([
+      {
+        role: "assistant",
+        text: "",
+        toolCallsJson: '[{"id":"c1","function":{"name":"run_shell"}}]',
+      },
+      { role: "tool", text, toolCallId: "c1" },
+    ])[0] as Cell & { kind: "tool" };
+
+  it("reads a reloaded failing command as failed, and keeps it out of a folded run", () => {
+    const failing = "Exit code: 1\n--- stdout ---\n--- stderr ---\nls: nope: No such file";
+    const passing = "Exit code: 0\n--- stdout ---\nok\n--- stderr ---\n";
+    const cells = historyCells([
+      {
+        role: "assistant",
+        text: "",
+        toolCallsJson: JSON.stringify(
+          ["c1", "c2", "c3"].map((id) => ({ id, function: { name: "run_shell" } })),
+        ),
+      },
+      { role: "tool", text: stored("run_shell", passing), toolCallId: "c1" },
+      { role: "tool", text: stored("run_shell", passing), toolCallId: "c2" },
+      { role: "tool", text: stored("run_shell", failing), toolCallId: "c3" },
+    ]);
+    const failed = cells[2] as Cell & { kind: "tool" };
+    expect(failed.output).toBe(failing);
+    expect(toolOutcome(failed)).toBe("failed");
+    // The two clean exits fold together; the failure stands on its own.
+    expect(groupCells(cells, false).map((item) => item.type)).toEqual(["run", "cell"]);
+  });
+
+  it("reads a reloaded handler error as failed", () => {
+    const cell = reload(stored("fs_read", "[TOOL_ERROR] file not found: /tmp/x.txt"));
+    expect(cell.output).toBe("[TOOL_ERROR] file not found: /tmp/x.txt");
+    expect(toolOutcome(cell)).toBe("failed");
+  });
+
+  it("gives back the closing tags the daemon escaped inside the output", () => {
+    const cell = reload(stored("fs_read", "a &lt;/tool_output&gt; b &lt;/Untrusted_Content&gt;"));
+    expect(cell.output).toBe("a </tool_output> b </Untrusted_Content>");
+  });
+
+  it("keeps the output's own blank lines", () => {
+    expect(reload(stored("fs_read", "\nline\n\n")).output).toBe("\nline\n\n");
+  });
+
+  it.each(["[tool call cancelled by user]", "[tool call failed — worker panicked]", "plain"])(
+    "leaves %j, which is stored bare, as it is",
+    (text) => expect(reload(text).output).toBe(text),
+  );
+});
+
 describe("contextUsed", () => {
   it("counts only the top-level components", () => {
     expect(
@@ -411,7 +606,14 @@ describe("retryTarget", () => {
   it("refuses to resend a message that carried attachments", () => {
     // The transcript keeps the count, never the bytes. A resend would carry no
     // files while the cell above went on claiming it sent two.
-    const cells: Cell[] = [{ kind: "user", text: "look at these", attachments: 2, at: 0 }];
+    const cells: Cell[] = [
+      {
+        kind: "user",
+        text: "look at these",
+        attachments: [{ kind: "image", filename: "a.png" }],
+        at: 0,
+      },
+    ];
     expect(retryTarget(cells)).toBeUndefined();
   });
 

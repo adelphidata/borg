@@ -7,6 +7,7 @@ import {
   PageChrome,
   Pill,
   SETTINGS_SCROLL_DESKTOP_PADDING,
+  isSubmitEnter,
   scrollCol,
   useIsMobile,
   useTheme,
@@ -128,7 +129,7 @@ function ValueEditor({
         value={draft}
         spellCheck={false}
         onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && !saving && onSave(draft)}
+        onKeyDown={(e) => isSubmitEnter(e) && !saving && onSave(draft)}
       />
       <div className="flex items-center gap-[9px]">
         <Pill variant="primary" onClick={() => !saving && onSave(draft)}>

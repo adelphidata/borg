@@ -42,8 +42,10 @@ export function ToolRunCell({ tools, live }: { tools: ToolCellData[]; live: bool
 
       {expanded && (
         <div className="flex flex-col gap-2 px-2 pb-2">
-          {tools.map((tool) => (
-            <ToolCell key={tool.id} cell={tool} />
+          {/* The position joins the key: a provider may hand out the same call
+              id twice, and a run only ever grows at its end. */}
+          {tools.map((tool, i) => (
+            <ToolCell key={`${tool.id}:${i}`} cell={tool} />
           ))}
         </div>
       )}

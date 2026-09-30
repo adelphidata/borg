@@ -1,17 +1,18 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { AgentsIcon, FindBar, PageChrome, useIsMobile } from "@borg/ui";
+import { AgentsIcon, FindBar, PageChrome, Pill, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
 import { DaemonState } from "../../components/DaemonState";
 import { formatElapsed } from "../../lib/format";
 import { useKeybind } from "../../lib/keybinds";
+import { usePlatform } from "../../lib/platform";
 import { useTick } from "../../lib/useTick";
 import { markSessionSeen } from "../sessions/unreadStore";
 import { Composer } from "./Composer";
 import { ContextBar } from "./ContextBar";
 import { draftKeyFor } from "./draftStore";
 import { useFindInTranscript } from "./useFindInTranscript";
-import { useFollowBottom } from "./followBottom";
+import { useFollowBottom, wheelReachesScroller } from "./followBottom";
 import { ChangedFilesCard } from "./cells/ChangedFilesCard";
 import { PlanPanel } from "./cells/PlanPanel";
 import { ToolRunCell } from "./cells/ToolRunCell";
@@ -21,8 +22,10 @@ import {
   INITIAL_BUDGET,
   budgetCutIndex,
   cutHidesEverything,
+  pageKeyDirection,
   revealEarlier,
   shouldRevealOnScroll,
+  shouldRevealOnWheel,
 } from "./renderBudget";
 import { FailureCard } from "./FailureCard";
 import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
@@ -34,10 +37,12 @@ export function ConversationPage() {
   const { sessionId: target } = useParams();
   const isMobile = useIsMobile();
   const navigate = useNavigate();
+  const { kind } = usePlatform();
   const [compacting, setCompacting] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const {
     opened,
+    ready,
     sessionId: liveSessionId,
     cells,
     plan,
@@ -159,11 +164,53 @@ export function ConversationPage() {
       }
       previousTop = top;
     };
+    // A view already at the top cannot move, so the wheel that asks for more
+    // sends no scroll event; the wheel itself is the only sign of it. A wheel
+    // turned inside a tool's output box scrolls that box, not the history.
+    const onWheel = (event: WheelEvent) => {
+      if (
+        shouldRevealOnWheel(event.deltaY, el.scrollTop, fromBottom.current !== undefined) &&
+        wheelReachesScroller(event, el)
+      ) {
+        showEarlierRef.current();
+      }
+    };
     el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
+    el.addEventListener("wheel", onWheel, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", onWheel);
+    };
   }, [hasHidden]);
 
-  useTurnNotifications(cells, busy, target);
+  // Page keys reach the transcript from the composer, where focus normally
+  // sits. Moving `scrollTop` fires the scroll the follow hook listens to, so
+  // paging down onto the newest message resumes following by itself.
+  const composerRef = useRef<HTMLDivElement>(null);
+  const hasHiddenRef = useRef(hasHidden);
+  hasHiddenRef.current = hasHidden;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const el = scrollRef.current;
+      const direction = pageKeyDirection(event, document.activeElement, composerRef.current, el);
+      if (!el || direction === undefined) return;
+      event.preventDefault();
+      if (direction < 0 && el.scrollTop === 0) {
+        if (hasHiddenRef.current && fromBottom.current === undefined) showEarlierRef.current();
+        return;
+      }
+      el.scrollTop += direction * el.clientHeight;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useTurnNotifications(
+    cells,
+    busy,
+    target,
+    opened.state === "ready" ? opened.data.title : undefined,
+  );
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
   // Search over the mounted transcript. The revision is what tells it to
@@ -178,6 +225,31 @@ export function ConversationPage() {
 
   // Follow the newest content, but only while the user is actually down there.
   const { pinned, missed, jumpToLatest } = useFollowBottom(scrollRef, contentRef, target);
+
+  // Ways out of a conversation that failed to open. Borg being down or the
+  // token being refused already get their own remedy from `DaemonState`, and
+  // a new conversation would fail the same way — only retrying is left, and
+  // only where `DaemonState` offers nothing to press (Borg down in a browser).
+  // A new conversation is also no way out of one that is already new.
+  const failure = opened.state === "error" ? opened.error : undefined;
+  const daemonDown = failure?.isUnavailable === true || failure?.isUnauthenticated === true;
+  const offerRetry = !daemonDown || (kind === "web" && failure?.isUnavailable === true);
+  const offerNew = !daemonDown && target !== "new";
+  const failureActions =
+    offerRetry || offerNew ? (
+      <>
+        {offerNew && (
+          <Pill variant="primary" onClick={() => navigate("/c/new")}>
+            Start a new conversation
+          </Pill>
+        )}
+        {offerRetry && (
+          <Pill variant={offerNew ? "default" : "primary"} onClick={opened.refetch}>
+            Try again
+          </Pill>
+        )}
+      </>
+    ) : undefined;
 
   const title = opened.state === "ready" && opened.data.title ? opened.data.title : "Conversation";
   const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
@@ -224,6 +296,22 @@ export function ConversationPage() {
       {/* `relative` so the find bar can float over the transcript: inside the
           scroller it would scroll away with the text it is searching. */}
       <div className="relative flex min-h-0 flex-1 flex-col">
+        {/* Always mounted, so a screen reader hears the work start and stop:
+            a live region that appears with its text is often not announced
+            at all. The visible lines below repeat it, so they are hidden from
+            the reader; the counter ticking every second would be noise. */}
+        <div className="sr-only">
+          <div role="status" aria-label="Borg activity">
+            {activity?.label ?? ""}
+          </div>
+          <div role="status" aria-label="Connection">
+            {streamError
+              ? streamOutageSustained
+                ? "Still cannot reach Borg. Check that the Borg app is running, then try again."
+                : "Lost the connection to Borg. Reconnecting…"
+              : ""}
+          </div>
+        </div>
         {find.open && (
           <div data-find-skip>
             <FindBar
@@ -234,6 +322,7 @@ export function ConversationPage() {
               onNext={find.next}
               onPrevious={find.previous}
               onClose={find.close}
+              focusRequest={find.focusRequest}
               // Only when history is genuinely out of reach. Revealing it is one
               // deliberate step, not the default — that budget is why a long
               // conversation opens at all.
@@ -251,7 +340,7 @@ export function ConversationPage() {
               isMobile ? "px-[22px]" : "px-[30px]"
             }`}
           >
-            <DaemonState query={opened} label="the conversation">
+            <DaemonState query={opened} label="the conversation" actions={failureActions}>
               {() => (
                 <>
                   {cells.length === 0 && (
@@ -288,7 +377,7 @@ export function ConversationPage() {
                     <ChangedFilesCard edits={edits} uncounted={uncounted} />
                   )}
                   {activity?.label !== undefined && (
-                    <div className="px-1 text-[12px] leading-none text-ink3">
+                    <div className="px-1 text-[12px] leading-none text-ink3" aria-hidden="true">
                       {activity.label}
                       {turnStartedAt !== undefined && (
                         <span className="text-ink3"> {formatElapsed(now - turnStartedAt)}</span>
@@ -310,21 +399,25 @@ export function ConversationPage() {
       >
         {/* Only once something has actually arrived unseen. Scrolling up on a
             settled transcript is reading, not falling behind, and does not
-            need a way back. */}
-        {!pinned && missed && (
+            need a way back — unless Borg is waiting on one, which is the one
+            thing worth interrupting reading for. */}
+        {!pinned && (missed || awaitingInput) && (
           <div className="mb-2 flex justify-center">
             <button
               type="button"
               onClick={jumpToLatest}
               className="cursor-pointer rounded-full border border-line bg-surface2 px-3.5 py-1.5 text-[11.5px] leading-none text-ink2 hover:text-ink"
             >
-              Jump to latest
+              {awaitingInput ? "Borg has a question" : "Jump to latest"}
             </button>
           </div>
         )}
         {/* A silent stall used to look identical to an idle agent. */}
         {streamError && (
-          <div className="mb-2 rounded-[10px] border border-alert bg-alert-soft px-3.5 py-2 text-[11.5px] leading-[1.5] text-ink2">
+          <div
+            className="mb-2 rounded-[10px] border border-alert bg-alert-soft px-3.5 py-2 text-[11.5px] leading-[1.5] text-ink2"
+            aria-hidden="true"
+          >
             {/* After a while "reconnecting" stops being news and starts
                 hiding the fact that nothing is coming back. */}
             {streamOutageSustained
@@ -349,16 +442,21 @@ export function ConversationPage() {
         <PlanPanel steps={plan} />
       </div>
 
-      <Composer
-        busy={busy}
-        awaitingInput={awaitingInput}
-        draftKey={draftKey}
-        conversationKey={target ?? "latest"}
-        sessionId={liveSessionId}
-        onSend={send}
-        onSteer={steer}
-        onCancel={cancel}
-      />
+      {/* `contents` keeps the wrapper out of layout; it only marks where the
+          composer's keys come from. */}
+      <div ref={composerRef} className="contents">
+        <Composer
+          busy={busy}
+          ready={ready}
+          awaitingInput={awaitingInput}
+          draftKey={draftKey}
+          conversationKey={target ?? "latest"}
+          sessionId={liveSessionId}
+          onSend={send}
+          onSteer={steer}
+          onCancel={cancel}
+        />
+      </div>
     </PageChrome>
   );
 }

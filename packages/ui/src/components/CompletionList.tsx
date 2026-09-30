@@ -10,6 +10,7 @@
  */
 
 import { useEffect, useRef } from "react";
+import { Truncated } from "./Truncated";
 
 export interface CompletionRow {
   id: string;
@@ -104,7 +105,7 @@ export function CompletionList({
             i === cursor ? "bg-surface3" : "bg-transparent"
           }`}
         >
-          <span className="min-w-0 truncate text-[13px] leading-[1.35] text-ink">{row.label}</span>
+          <Truncated className="min-w-0 text-[13px] leading-[1.35] text-ink">{row.label}</Truncated>
           {row.detail && (
             <span className="flex-none text-[11px] leading-none text-ink3">{row.detail}</span>
           )}

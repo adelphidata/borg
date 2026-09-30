@@ -93,6 +93,85 @@ function getHighlighter(): Promise<HighlighterCore> {
 }
 
 /**
+ * Finished markup, so a block that was highlighted once paints highlighted the
+ * next time it mounts. Reopening a conversation remounts every fence in it, and
+ * without this each one would show plain text first and recolour a beat later.
+ *
+ * Bounded by size, not by count. An entry holds the code and its two-theme
+ * markup, several times the code's length, and a block that is still streaming
+ * adds a new, slightly longer entry on every pass. A count bound lets a few
+ * long transcripts hold tens of megabytes.
+ *
+ * Least recently used out first: a `Map` iterates in insertion order, and a
+ * hit moves its key to the end, so the first key is the one used longest ago.
+ */
+export class HighlightCache {
+  private readonly entries = new Map<string, { html: string; size: number }>();
+  private total = 0;
+
+  /**
+   * `budget` is the most the cache holds, in characters of code plus markup.
+   * An entry larger than `entryMax` is never kept: it would push out many
+   * small blocks to hold one that is rarely shown twice.
+   */
+  constructor(
+    readonly budget: number,
+    readonly entryMax: number,
+  ) {}
+
+  /** Characters held now, code plus markup. */
+  get size(): number {
+    return this.total;
+  }
+
+  get(key: string): string | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.html;
+  }
+
+  set(key: string, code: string, html: string): void {
+    const size = code.length + html.length;
+    // Two callers can race on one key; the second replaces, not duplicates.
+    this.remove(key);
+    if (size > this.entryMax) return;
+    for (const oldest of this.entries.keys()) {
+      if (this.total + size <= this.budget) break;
+      this.remove(oldest);
+    }
+    this.entries.set(key, { html, size });
+    this.total += size;
+  }
+
+  private remove(key: string): void {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    this.total -= entry.size;
+  }
+}
+
+/** About 4 MB of code and markup across every block on screen and recently shown. */
+export const HIGHLIGHT_CACHE_BUDGET = 4_000_000;
+/** One block's share: a quarter of a megabyte of code and markup. */
+export const HIGHLIGHT_ENTRY_MAX = 256_000;
+const cache = new HighlightCache(HIGHLIGHT_CACHE_BUDGET, HIGHLIGHT_ENTRY_MAX);
+
+/** A language name holds no NUL, so no two pairs share a key. */
+const cacheKey = (lang: string, code: string) => `${lang}\0${code}`;
+
+/**
+ * The markup for `code` if it has been highlighted already, without waiting.
+ * `undefined` means "not known yet", not "cannot be highlighted".
+ */
+export function peekHighlight(code: string, tag: string | undefined): string | undefined {
+  const lang = resolveLanguage(tag);
+  return lang ? cache.get(cacheKey(lang, code)) : undefined;
+}
+
+/**
  * Highlights `code` and returns Shiki's HTML.
  *
  * Both themes are baked into the same markup as `--shiki-light` /
@@ -102,6 +181,9 @@ function getHighlighter(): Promise<HighlighterCore> {
 export async function highlight(code: string, tag: string | undefined): Promise<string | null> {
   const lang = resolveLanguage(tag);
   if (!lang) return null;
+  const key = cacheKey(lang, code);
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
 
   const shiki = await getHighlighter();
   if (!loaded.has(lang)) {
@@ -109,9 +191,11 @@ export async function highlight(code: string, tag: string | undefined): Promise<
     loaded.add(lang);
   }
 
-  return shiki.codeToHtml(code, {
+  const html = shiki.codeToHtml(code, {
     lang,
     themes: { light: "github-light", dark: "github-dark" },
     defaultColor: false,
   });
+  cache.set(key, code, html);
+  return html;
 }

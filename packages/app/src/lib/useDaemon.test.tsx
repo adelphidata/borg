@@ -160,6 +160,78 @@ describe("useRetryingServerStream", () => {
     expect(harness.subscriptions).toHaveLength(2);
   });
 
+  describe("redials at once when the user comes back", () => {
+    const visibility = (value: DocumentVisibilityState) =>
+      Object.defineProperty(document, "visibilityState", { configurable: true, value });
+    const fire = async (target: EventTarget, type: string) => {
+      await act(async () => {
+        target.dispatchEvent(new Event(type));
+      });
+    };
+
+    afterEach(() => {
+      visibility("visible");
+    });
+
+    // A pending retry can be up to thirty seconds out. The window coming to
+    // the front is when a frozen screen gets looked at, so the redial must
+    // not wait out the timer.
+    it.each([
+      ["the window becomes visible", () => fire(document, "visibilitychange")],
+      ["the network returns", () => fire(window, "online")],
+    ])("resubscribes before the timer fires when %s", async (_name, event) => {
+      vi.spyOn(Math, "random").mockReturnValue(0.99);
+      mount();
+      await drop();
+      await advance(100);
+      expect(harness.subscriptions).toHaveLength(1);
+
+      await event();
+      expect(harness.subscriptions).toHaveLength(2);
+    });
+
+    it("does not redial while the stream is open", async () => {
+      mount();
+      await fire(document, "visibilitychange");
+      await fire(window, "online");
+      expect(harness.subscriptions).toHaveLength(1);
+    });
+
+    it("does not redial when the window goes to the background", async () => {
+      mount();
+      await drop();
+      visibility("hidden");
+      await fire(document, "visibilitychange");
+      expect(harness.subscriptions).toHaveLength(1);
+    });
+
+    it("keeps the backoff it had built up", async () => {
+      // A tab switch is not proof the daemon is back. If it reset the count, a
+      // user flicking between windows would redial a dead daemon at full speed.
+      vi.spyOn(Math, "random").mockReturnValue(0.99);
+      mount();
+      await drop(); // failures: 1
+      await fire(window, "online");
+      expect(harness.subscriptions).toHaveLength(2);
+
+      // Second failure: the window is 2s, where a reset would have made it 1s.
+      await drop();
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+      await advance(1_000);
+      expect(harness.subscriptions).toHaveLength(3);
+    });
+
+    it("stops listening once it has unmounted", async () => {
+      const { unmount } = mount();
+      await drop();
+      unmount();
+      await fire(window, "online");
+      await fire(document, "visibilitychange");
+      expect(harness.subscriptions).toHaveLength(1);
+    });
+  });
+
   it("clears the escalation when the connection comes back", async () => {
     const { getByTestId } = mount();
     await act(async () => {

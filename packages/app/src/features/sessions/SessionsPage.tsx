@@ -11,6 +11,7 @@ import {
   SETTINGS_SCROLL_DESKTOP_PADDING,
   StatusDot,
   Truncated,
+  isSubmitEnter,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
@@ -81,7 +82,7 @@ function Row({
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
+            if (isSubmitEnter(e)) commit();
             if (e.key === "Escape") {
               setDraft(session.title);
               setEditing(false);
@@ -98,6 +99,9 @@ function Row({
       tabIndex={0}
       onClick={onOpen}
       onKeyDown={(e) => {
+        // A key pressed on the kebab or on a menu item bubbles up to here. It
+        // belongs to that control, not to the row.
+        if (e.target !== e.currentTarget) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onOpen();

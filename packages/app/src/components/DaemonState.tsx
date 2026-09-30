@@ -15,12 +15,18 @@ import type { Query } from "../lib/useDaemon";
 export function DaemonState<T>({
   query,
   label,
+  actions,
   children,
 }: {
   /** A `useQuery` result. `refetch` is optional so a bare `Query` still fits. */
   query: Query<T> & { refetch?: () => void };
   /** What was being fetched, used in the failure line: "Could not load {label}." */
   label: string;
+  /**
+   * Ways out of a failure that only the page knows about, shown after the
+   * remedies above. A page that fails to load is otherwise a dead end.
+   */
+  actions?: ReactNode;
   children: (data: T) => ReactNode;
 }) {
   const { kind } = usePlatform();
@@ -62,6 +68,7 @@ export function DaemonState<T>({
             Sign in again
           </Pill>
         )}
+        {actions !== undefined && <div className="flex flex-wrap gap-2">{actions}</div>}
       </div>
     );
   }

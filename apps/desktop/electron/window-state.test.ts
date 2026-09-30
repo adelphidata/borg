@@ -8,7 +8,12 @@ const { displays, makeWindow, resetElectron } = await import("./test/electron-st
 const { clampToDisplays, loadWindowState, trackWindowState } = await import("./window-state");
 
 const DEFAULTS = { width: 1240, height: 800 };
-const MAIN = { bounds: { x: 0, y: 0, width: 1920, height: 1080 } };
+const MAIN = { workArea: { x: 0, y: 0, width: 1920, height: 1080 } };
+/** A laptop panel: the menu bar takes the top 25px, the dock the bottom 70px. */
+const LAPTOP = {
+  bounds: { x: 0, y: 0, width: 1440, height: 900 },
+  workArea: { x: 0, y: 25, width: 1440, height: 805 },
+};
 
 beforeEach(() => {
   resetElectron();
@@ -23,9 +28,14 @@ afterEach(() => {
 
 const stored = (state: unknown) => fs.readFileSync.mockReturnValue(JSON.stringify(state));
 const written = () => JSON.parse(fs.writeFileSync.mock.calls.at(-1)?.[1] as string);
+/** Replace the connected displays with exactly these. */
+const connect = (...connected: (typeof LAPTOP)[]) => {
+  displays.length = 0;
+  displays.push(...connected);
+};
 
 describe("clampToDisplays", () => {
-  it("keeps a window that sits on a display", () => {
+  it("leaves a window that already fits unchanged", () => {
     const bounds = { x: 100, y: 100, width: 800, height: 600 };
     expect(clampToDisplays(bounds, [MAIN])).toEqual(bounds);
   });
@@ -37,12 +47,6 @@ describe("clampToDisplays", () => {
     expect(clampToDisplays(onSecondScreen, [MAIN])).toBeNull();
   });
 
-  it("accepts a window that still overlaps enough to be dragged back", () => {
-    // 200px of the window is on screen — enough title bar to grab.
-    const mostlyOff = { x: 1720, y: 100, width: 800, height: 600 };
-    expect(clampToDisplays(mostlyOff, [MAIN])).toEqual(mostlyOff);
-  });
-
   it("rejects a window with only a sliver on screen", () => {
     const sliver = { x: 1900, y: 100, width: 800, height: 600 };
     expect(clampToDisplays(sliver, [MAIN])).toBeNull();
@@ -50,19 +54,77 @@ describe("clampToDisplays", () => {
 
   it.each([
     // MIN_VISIBLE (80px) is the boundary: exactly that much still counts as
-    // "enough title bar to grab", one pixel less does not — on either axis.
-    ["exactly 80px left at the right edge", { x: 1840, y: 100, width: 800, height: 600 }, true],
-    ["exactly 80px left above the bottom edge", { x: 100, y: 1000, width: 800, height: 600 }, true],
-    ["a 60px sliver above the bottom edge", { x: 100, y: 1020, width: 800, height: 600 }, false],
-    ["hanging off the top with 50px visible", { x: 100, y: -550, width: 800, height: 600 }, false],
-  ])("applies the 80px rule to a window with %s", (_case, bounds, kept) => {
-    expect(clampToDisplays(bounds, [MAIN])).toEqual(kept ? bounds : null);
+    // the window being on this display, one pixel less does not — on either
+    // axis. A window that counts is pulled fully into the work area.
+    [
+      "200px left at the right edge",
+      { x: 1720, y: 100, width: 800, height: 600 },
+      { x: 1120, y: 100, width: 800, height: 600 },
+    ],
+    [
+      "exactly 80px left at the right edge",
+      { x: 1840, y: 100, width: 800, height: 600 },
+      { x: 1120, y: 100, width: 800, height: 600 },
+    ],
+    [
+      "exactly 80px left above the bottom edge",
+      { x: 100, y: 1000, width: 800, height: 600 },
+      { x: 100, y: 480, width: 800, height: 600 },
+    ],
+    [
+      "80px left below the top edge",
+      { x: 100, y: -520, width: 800, height: 600 },
+      { x: 100, y: 0, width: 800, height: 600 },
+    ],
+    ["a 60px sliver above the bottom edge", { x: 100, y: 1020, width: 800, height: 600 }, null],
+    ["hanging off the top with 50px visible", { x: 100, y: -550, width: 800, height: 600 }, null],
+  ])("applies the 80px rule to a window with %s", (_case, bounds, want) => {
+    expect(clampToDisplays(bounds, [MAIN])).toEqual(want);
+  });
+
+  it("shrinks a window saved on a large monitor to the laptop's work area", () => {
+    const fromBigMonitor = { x: 0, y: 0, width: 2560, height: 1400 };
+    expect(clampToDisplays(fromBigMonitor, [LAPTOP])).toEqual(LAPTOP.workArea);
+  });
+
+  it("moves a title bar out from under the menu bar", () => {
+    const underMenuBar = { x: 100, y: 0, width: 900, height: 700 };
+    expect(clampToDisplays(underMenuBar, [LAPTOP])).toEqual({ ...underMenuBar, y: 25 });
+  });
+
+  it("measures overlap against the work area, not the whole display", () => {
+    // 90px of the window is on the panel, but only 65px of that is below the
+    // menu bar: not enough to count.
+    const mostlyAbove = { x: 100, y: -610, width: 900, height: 700 };
+    expect(clampToDisplays(mostlyAbove, [LAPTOP])).toBeNull();
   });
 
   it("checks every display, not just the first", () => {
-    displays.push({ bounds: { x: 1920, y: 0, width: 1920, height: 1080 } });
+    const second = { workArea: { x: 1920, y: 0, width: 1920, height: 1080 } };
     const onSecond = { x: 2200, y: 100, width: 800, height: 600 };
-    expect(clampToDisplays(onSecond, displays)).toEqual(onSecond);
+    expect(clampToDisplays(onSecond, [MAIN, second])).toEqual(onSecond);
+  });
+
+  it.each([
+    ["the first", { x: 1300, y: 100, width: 800, height: 600 }, 1120],
+    ["the second", { x: 1700, y: 100, width: 800, height: 600 }, 1920],
+  ])("puts a window that straddles two displays on %s when it shows more", (_c, bounds, x) => {
+    const second = { workArea: { x: 1920, y: 0, width: 1920, height: 1080 } };
+    expect(clampToDisplays(bounds, [MAIN, second])).toEqual({ ...bounds, x });
+    // The order the displays are listed in must not decide it.
+    expect(clampToDisplays(bounds, [second, MAIN])).toEqual({ ...bounds, x });
+  });
+
+  it("never shrinks below the minimum window size", () => {
+    // The layout breaks below 360x600, and the top-left corner is what has to
+    // stay reachable when the window cannot fit.
+    const tiny = { workArea: { x: 10, y: 30, width: 320, height: 500 } };
+    expect(clampToDisplays({ x: 50, y: 60, width: 900, height: 700 }, [tiny])).toEqual({
+      x: 10,
+      y: 30,
+      width: 360,
+      height: 600,
+    });
   });
 });
 
@@ -127,6 +189,32 @@ describe("loadWindowState", () => {
     // Letting the OS place it is the recoverable outcome.
     stored({ x: 3000, y: 200, width: 900, height: 700, maximized: true });
     expect(loadWindowState()).toEqual({ width: 900, height: 700, maximized: true });
+  });
+
+  it("caps the size to the primary display when the monitor is gone", () => {
+    // Saved on a large external monitor, reopened on the laptop alone.
+    connect(LAPTOP);
+    stored({ x: 3000, y: 200, width: 2400, height: 1300, maximized: false });
+    expect(loadWindowState()).toEqual({ width: 1440, height: 805, maximized: false });
+  });
+
+  it("fits an oversized window onto the display it is still on", () => {
+    connect(LAPTOP);
+    stored({ x: 0, y: 0, width: 2560, height: 1400 });
+    expect(loadWindowState()).toEqual(LAPTOP.workArea);
+  });
+
+  it("caps the default size on a display smaller than the default", () => {
+    connect({
+      bounds: { x: 0, y: 0, width: 1024, height: 768 },
+      workArea: { x: 0, y: 25, width: 1024, height: 743 },
+    });
+    fs.readFileSync.mockImplementation(() => {
+      throw new Error("ENOENT");
+    });
+    expect(loadWindowState()).toEqual({ width: 1024, height: 743 });
+    stored({ width: "wide", maximized: true });
+    expect(loadWindowState()).toEqual({ width: 1024, height: 743, maximized: true });
   });
 
   it("fills in missing fields from the defaults", () => {

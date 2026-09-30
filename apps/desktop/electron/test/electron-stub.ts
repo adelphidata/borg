@@ -29,7 +29,7 @@ interface SharedState {
   focused: StubWindow | null;
   handlers: Map<string, (...args: unknown[]) => unknown>;
   notifications: StubNotification[];
-  displays: { bounds: { x: number; y: number; width: number; height: number } }[];
+  displays: StubDisplay[];
   notificationState: { supported: boolean };
   appState: {
     name: string;
@@ -53,6 +53,19 @@ interface SharedState {
     replies: Map<string, (...args: unknown[]) => unknown>;
   };
 }
+
+type StubRect = { x: number; y: number; width: number; height: number };
+
+/**
+ * `workArea` is the part of `bounds` left after the menu bar and dock. Left
+ * out, the display has neither and the work area is the whole of `bounds`.
+ */
+export interface StubDisplay {
+  bounds: StubRect;
+  workArea?: StubRect;
+}
+
+const withWorkArea = (d: StubDisplay) => ({ bounds: d.bounds, workArea: d.workArea ?? d.bounds });
 
 const shared: SharedState = ((globalThis as Record<string, unknown>).__borgElectronStub ??= {
   windows: [],
@@ -98,6 +111,8 @@ export interface StubWindow {
     setWindowOpenHandler(handler: (details: { url: string }) => { action: string }): void;
     listeners: Map<string, ((...args: unknown[]) => void)[]>;
     on(event: string, listener: (...args: unknown[]) => void): void;
+    once(event: string, listener: (...args: unknown[]) => void): void;
+    off(event: string, listener: (...args: unknown[]) => void): void;
     emit(event: string, ...args: unknown[]): void;
   };
   maximize(): void;
@@ -113,6 +128,7 @@ export interface StubWindow {
   hide(): void;
   /** Spies, so a test can assert the code focused or restored — or didn't. */
   focus: Mock<() => void>;
+  reload: Mock<() => void>;
   restore: Mock<() => void>;
   destroy(): void;
   /** Spies, so a test can read what the code under test loaded or set. */
@@ -146,8 +162,24 @@ export function makeWindow(overrides: Partial<StubWindow> = {}): StubWindow {
         const wc = win.webContents;
         wc.listeners.set(event, [...(wc.listeners.get(event) ?? []), listener]);
       },
+      once: (event, listener) => {
+        const wc = win.webContents;
+        const wrapped = (...args: unknown[]) => {
+          wc.off(event, wrapped);
+          listener(...args);
+        };
+        wc.on(event, wrapped);
+      },
+      off: (event, listener) => {
+        const wc = win.webContents;
+        wc.listeners.set(
+          event,
+          (wc.listeners.get(event) ?? []).filter((l) => l !== listener),
+        );
+      },
       emit: (event, ...args) => {
-        for (const listener of win.webContents.listeners.get(event) ?? []) listener(...args);
+        // A copy: a listener may remove itself while the event is dispatched.
+        for (const listener of [...(win.webContents.listeners.get(event) ?? [])]) listener(...args);
       },
     },
     maximize: () => {
@@ -170,6 +202,7 @@ export function makeWindow(overrides: Partial<StubWindow> = {}): StubWindow {
       win.visible = false;
     },
     focus: vi.fn(),
+    reload: vi.fn(),
     restore: vi.fn(() => {
       win.minimized = false;
     }),
@@ -328,7 +361,8 @@ export const displays = shared.displays;
 export const cursor = shared.cursor;
 
 export const screen = {
-  getAllDisplays: () => displays,
+  getAllDisplays: () => displays.map(withWorkArea),
+  getPrimaryDisplay: () => withWorkArea(displays[0]),
   getCursorScreenPoint: () => cursor.point,
   // Picks the display the point actually falls in, so a test can put the
   // cursor on a second monitor and get that monitor's work area back.

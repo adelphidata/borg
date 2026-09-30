@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CheckIcon, SearchIcon } from "@borg/ui";
+import { CheckIcon, SearchIcon, Truncated, isSubmitEnter } from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
 import { rank, type Command } from "./score";
 import { useCommands } from "./useCommands";
@@ -92,7 +92,7 @@ export function CommandPalette() {
               } else if (e.key === "ArrowUp") {
                 e.preventDefault();
                 setCursor((c) => Math.max(0, c - 1));
-              } else if (e.key === "Enter") {
+              } else if (isSubmitEnter(e)) {
                 e.preventDefault();
                 choose(results[cursor]);
               }
@@ -128,9 +128,9 @@ export function CommandPalette() {
                 i === cursor ? "bg-surface3" : "bg-transparent"
               }`}
             >
-              <span className="min-w-0 truncate text-[13.5px] leading-[1.35] text-ink">
+              <Truncated className="min-w-0 text-[13.5px] leading-[1.35] text-ink">
                 {command.label}
-              </span>
+              </Truncated>
               {command.detail && (
                 <span className="flex-none text-[11.5px] leading-none text-ink3">
                   {command.detail}

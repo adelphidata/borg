@@ -4,6 +4,7 @@ import { modelLabel, modelsOf, useSetupStatus } from "../onboarding/useSetupStat
 import { THINKING_OPTIONS } from "../settings/catalog";
 import { useKeybind } from "../../lib/keybinds";
 import { useSettings } from "../../lib/settings";
+import { focusComposer } from "./composerFocus";
 
 const ITEM =
   "flex w-full cursor-pointer items-center gap-2 border-0 bg-transparent px-3 py-[7px] text-left text-[12.5px] leading-none text-ink2 hover:bg-surface3 hover:text-ink";
@@ -30,6 +31,12 @@ export function ModelPill() {
   // id; only the short labels and the model list wait on it.
   const catalog = setup.state === "ready" ? setup.data.providers : [];
   const [open, setOpen] = useState(false);
+  // The menu was a detour from typing, so closing it goes back to the box —
+  // otherwise focus stays on the pill and the next keystroke goes nowhere.
+  const close = () => {
+    setOpen(false);
+    focusComposer();
+  };
   const root = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -43,7 +50,7 @@ export function ModelPill() {
 
   // Through the registry, not a raw listener: an open menu takes Escape and
   // hands it back on close, so closing the menu cannot also cancel the turn.
-  useKeybind("cancel-turn", () => setOpen(false), { enabled: open, inInputs: true });
+  useKeybind("cancel-turn", close, { enabled: open, inInputs: true });
 
   if (settings.state !== "ready") return null;
   const model = settings.data.get("model")?.value ?? "";
@@ -58,7 +65,7 @@ export function ModelPill() {
   // A rejected write would otherwise close the menu and leave the old model on
   // screen, so the pill would state a model the daemon is not using.
   const pick = (key: string, value: string) => {
-    setOpen(false);
+    close();
     void save(key, value);
   };
 

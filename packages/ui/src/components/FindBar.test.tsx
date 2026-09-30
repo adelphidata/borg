@@ -141,3 +141,57 @@ describe("FindBar", () => {
     expect(props.onClose).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("FindBar and an input method", () => {
+  it.each([
+    ["while a word is still being composed", { key: "Enter", isComposing: true }],
+    ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+    ["with Shift, mid-composition", { key: "Enter", shiftKey: true, isComposing: true }],
+  ])("does not step on an Enter %s", (_name, init) => {
+    const props = renderBar();
+    // Not cancelled either: the input method still needs the key.
+    expect(fireEvent.keyDown(box(), init)).toBe(true);
+    expect(props.onNext).not.toHaveBeenCalled();
+    expect(props.onPrevious).not.toHaveBeenCalled();
+  });
+});
+
+describe("FindBar focus requests", () => {
+  const bar = (focusRequest: number | undefined, count = 3) => (
+    <FindBar
+      query="borg"
+      onQueryChange={() => {}}
+      count={count}
+      position={1}
+      onNext={() => {}}
+      onPrevious={() => {}}
+      onClose={() => {}}
+      focusRequest={focusRequest}
+    />
+  );
+  const input = () => box() as HTMLInputElement;
+
+  it("takes focus back, with the query selected, when a new request arrives", () => {
+    const { rerender } = render(bar(1));
+    input().blur();
+    input().setSelectionRange(4, 4);
+    expect(document.activeElement).not.toBe(input());
+
+    rerender(bar(2));
+
+    expect(document.activeElement).toBe(input());
+    // Selected, so the next thing typed replaces the old search.
+    expect([input().selectionStart, input().selectionEnd]).toEqual([0, 4]);
+  });
+
+  it("leaves focus where the user put it when nothing was requested", () => {
+    // The match count changes on every streamed token; a bar that took focus
+    // on any re-render would pull the cursor out of the composer.
+    const { rerender } = render(bar(1, 3));
+    input().blur();
+
+    rerender(bar(1, 4));
+
+    expect(document.activeElement).not.toBe(input());
+  });
+});

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp, type UnaryTable } from "../../test/harness";
 import { SETUP_CATALOG, setupStatus } from "../../test/setupStatus";
@@ -225,5 +225,29 @@ describe("leadDetection", () => {
         detail: "OPENROUTER_API_KEY",
       }),
     ).toBe("Found your OpenRouter key in OPENROUTER_API_KEY.");
+  });
+});
+
+/** The two shapes an input method's Enter takes; neither one means "submit". */
+const IME_ENTERS: [string, { key: string; isComposing?: boolean; keyCode?: number }][] = [
+  ["while a word is still being composed", { key: "Enter", isComposing: true }],
+  ["that confirms a candidate after composition ended", { key: "Enter", keyCode: 229 }],
+];
+
+describe("OnboardingPage and an input method", () => {
+  it.each(IME_ENTERS)("does not start on an Enter %s", async (_name, init) => {
+    const { daemon, onDone } = mount({ GetSetupStatus: setupStatus() });
+    await waitFor(() => expect(screen.getByPlaceholderText("OpenRouter API key")).toBeTruthy());
+    const box = screen.getByPlaceholderText("OpenRouter API key");
+    fireEvent.change(box, { target: { value: "sk-live" } });
+
+    fireEvent.keyDown(box, init);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(methods(daemon)).not.toContain("SetApiKey");
+    expect(methods(daemon)).not.toContain("SetOnboardingComplete");
+    expect(onDone).not.toHaveBeenCalled();
   });
 });

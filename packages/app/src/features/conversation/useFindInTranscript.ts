@@ -12,8 +12,11 @@ export interface FindInTranscript {
   position: number;
   next: () => void;
   previous: () => void;
+  /** Opens the bar, or hands focus back to it when it is already open. */
   show: () => void;
   close: () => void;
+  /** Goes up on every `show`; the bar takes focus again when it changes. */
+  focusRequest: number;
 }
 
 /**
@@ -35,6 +38,7 @@ export function useFindInTranscript(
   const [query, setQuery] = useState("");
   const [count, setCount] = useState(0);
   const [at, setAt] = useState(0);
+  const [focusRequest, setFocusRequest] = useState(0);
   const matches = useRef<Range[]>([]);
 
   // One effect owns the painted state: it derives the ranges, paints them, and
@@ -95,7 +99,13 @@ export function useFindInTranscript(
     position: count === 0 ? 0 : wrapIndex(at, count) + 1,
     next: () => step(1),
     previous: () => step(-1),
-    show: () => setOpen(true),
+    show: () => {
+      setOpen(true);
+      // Opening is a no-op on a bar that is already open, so the second ⌘F
+      // needs its own signal to bring the cursor back.
+      setFocusRequest((n) => n + 1);
+    },
     close,
+    focusRequest,
   };
 }

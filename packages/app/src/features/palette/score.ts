@@ -40,6 +40,11 @@ export interface Command {
   run: () => void;
 }
 
+/** Lowercases, and spells every word separator the same way. */
+function fold(text: string): string {
+  return text.toLowerCase().replace(/[-_.]/g, " ");
+}
+
 /**
  * Subsequence match with a relevance score, or null when it does not match.
  *
@@ -47,11 +52,15 @@ export interface Command {
  * the whole reason to type into a palette instead of reading a menu. The score
  * rewards matches that start a word and that sit close together, so exact
  * prefixes still beat scattered letters.
+ *
+ * `-`, `_` and `.` read as a space on both sides, so "code review" finds
+ * `code-review`. One character folds to one character, which keeps every index
+ * into the folded text valid for the original.
  */
 export function score(text: string, query: string): number | null {
   if (query === "") return 0;
-  const haystack = text.toLowerCase();
-  const needle = query.toLowerCase();
+  const haystack = fold(text);
+  const needle = fold(query);
 
   let total = 0;
   let at = 0;
