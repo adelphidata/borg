@@ -35,7 +35,7 @@ const TITLE_SYSTEM_PROMPT: &str =
 
 /// The placeholder title set by [`Session::new`]. Used to decide whether the
 /// user has set a custom title that we must not clobber.
-const DEFAULT_PLACEHOLDER: &str = "New conversation";
+const DEFAULT_PLACEHOLDER: &str = crate::session::DEFAULT_TITLE;
 
 /// Truncate `s` to at most `n` chars (not bytes) — Unicode-safe.
 fn char_truncate(s: &str, n: usize) -> String {

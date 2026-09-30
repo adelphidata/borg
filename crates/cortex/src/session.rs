@@ -62,6 +62,9 @@ fn session_path(id: &str) -> Result<PathBuf> {
     Ok(sessions_dir()?.join(format!("{id}.json")))
 }
 
+/// The title a session carries until its first user message names it.
+pub const DEFAULT_TITLE: &str = "New conversation";
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -76,7 +79,7 @@ impl Session {
         Self {
             meta: SessionMeta {
                 id,
-                title: "New conversation".to_string(),
+                title: DEFAULT_TITLE.to_string(),
                 created_at: now.clone(),
                 updated_at: now,
                 message_count: 0,
@@ -126,23 +129,30 @@ impl Session {
         self.meta.message_count = history.len();
         self.meta.updated_at = Local::now().to_rfc3339();
 
-        // Auto-title from first user message
-        if self.meta.title == "New conversation" {
-            if let Some(msg) = history.iter().find(|m| m.role == Role::User) {
-                if let Some(content) = msg.text_content() {
-                    // Use first paragraph only — appended metadata blocks
-                    // (e.g. <proactive_nudges>) are separated by \n\n.
-                    let first_para = content.split("\n\n").next().unwrap_or(content);
-                    let title: String = first_para.chars().take(60).collect();
-                    self.meta.title = if first_para.chars().count() > 60 {
-                        format!("{title}...")
-                    } else {
-                        title
-                    };
-                }
+        if self.meta.title == DEFAULT_TITLE {
+            if let Some(title) = title_from_history(history) {
+                self.meta.title = title;
             }
         }
     }
+}
+
+/// The placeholder title a session takes from its first user message: the
+/// first paragraph, clipped to 60 characters. `None` before any user text.
+pub fn title_from_history(history: &[Message]) -> Option<String> {
+    let content = history
+        .iter()
+        .find(|m| m.role == Role::User)?
+        .text_content()?;
+    // Use first paragraph only — appended metadata blocks
+    // (e.g. <proactive_nudges>) are separated by \n\n.
+    let first_para = content.split("\n\n").next().unwrap_or(content);
+    let title: String = first_para.chars().take(60).collect();
+    Some(if first_para.chars().count() > 60 {
+        format!("{title}...")
+    } else {
+        title
+    })
 }
 
 /// Ensure a session with id `id` exists on disk, creating an empty one if it

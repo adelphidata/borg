@@ -1242,6 +1242,9 @@ impl Agent {
             .map(|reg| reg.begin_turn(&self.session.meta.id));
 
         let result = self.run_agent_loop_inner(event_tx, cancel.clone()).await;
+        // Before returning: the daemon announces the settle once this turn's
+        // event sender drops, and lists re-read the row on that announcement.
+        self.record_turn_on_session_row().await;
 
         if cancel.is_cancelled() {
             if let (Some(reg), Some(baseline)) = (

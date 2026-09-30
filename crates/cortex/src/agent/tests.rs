@@ -1657,6 +1657,37 @@ async fn empty_response_persists_neutral_marker_not_reasoning() {
     assert_eq!(content, crate::agent::EMPTY_RESPONSE_PERSISTED_MARKER);
 }
 
+/// Regression: the daemon writes the session row once, untitled, when the
+/// session opens. Listings read that row, so unless a turn updates it every
+/// conversation shows as "Untitled" and sorts by when it was opened. A turn
+/// stopped before any reply still counts — it is in the transcript.
+#[tokio::test]
+async fn a_turn_titles_the_session_row_and_marks_its_activity_even_when_stopped() {
+    let mut agent = minimal_test_agent(Config::default());
+    let id = agent.session.meta.id.clone();
+    let db = crate::db::Database::test_db().await;
+    db.upsert_session(&id, 100, 100, 0, "m", "").await.unwrap();
+    agent.db = Mutex::new(Some(db));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    let _ = agent
+        .send_message_with_cancel("Open the Wikipedia article on the Borg", tx, stopped)
+        .await;
+
+    let guard = agent.db_guard().await;
+    let row = guard
+        .as_ref()
+        .unwrap()
+        .session_by_id(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.title, "Open the Wikipedia article on the Borg");
+    assert!(row.updated_at > 100, "the turn must count as activity");
+}
+
 // NOTE: the `build_system_prompt_*_after_*` ordering tests above are the
 // prompt-cache guards (an explicitly-allowed source-grep exception). The
 // section *content* itself is verified by the tests below, which call the

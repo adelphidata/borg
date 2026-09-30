@@ -378,16 +378,14 @@ impl AgentBackend {
         // this, `messages` rows get written under `session_id` but the
         // `sessions` table stays empty until something else (handoff,
         // fork, export) materializes a row — and `/goal foo` from a
-        // fresh TUI fails with "no active session". Idempotent upsert,
-        // so resume paths re-touch the existing row without clobbering it.
+        // fresh TUI fails with "no active session". A resumed session's row
+        // is left exactly as it was: opening is not activity, and its title
+        // may be one the user or the titler gave it.
         if let Ok(db) = cortex::db::Database::open().await {
             let now = chrono::Utc::now().timestamp();
             let model = agent.config().llm.model.clone();
-            if let Err(e) = db
-                .upsert_session(&session_id, now, now, 0, &model, "")
-                .await
-            {
-                tracing::warn!(session_id = %session_id, error = %e, "upsert_session on open failed");
+            if let Err(e) = db.ensure_session_row(&session_id, now, &model).await {
+                tracing::warn!(session_id = %session_id, error = %e, "ensure_session_row on open failed");
             }
             // Stamp workspace identity so workspace-scoped resume
             // (`borg --continue`) can find this session again. Client-provided

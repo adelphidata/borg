@@ -149,6 +149,51 @@ impl Database {
         Ok(())
     }
 
+    /// Create an untitled session row unless one already exists.
+    ///
+    /// For opening a session: a new one needs its row at once, but a resumed
+    /// one keeps its title, its place in the list, and its archive state —
+    /// opening a conversation is not activity in it.
+    pub async fn ensure_session_row(&self, id: &str, created_at: i64, model: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, created_at, updated_at, total_tokens, model, title)
+             VALUES (?1, ?2, ?2, 0, ?3, '')
+             ON CONFLICT(id) DO NOTHING",
+                params!(id, created_at, model),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record a finished turn on the session row: last activity, the model
+    /// that answered, and a title when the row has none yet.
+    ///
+    /// The row is written once, empty-titled, when the session opens; without
+    /// this every conversation lists as untitled and sorts by when it was
+    /// opened rather than when it was last used. A title already on the row —
+    /// the user's own, or the aux titler's — always wins, and an empty
+    /// `title` leaves the row's alone. Activity un-archives, as in
+    /// [`Self::upsert_session`]. No-op when the row does not exist.
+    pub async fn record_session_turn(
+        &self,
+        id: &str,
+        updated_at: i64,
+        model: &str,
+        title: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET updated_at = ?2, model = ?3,
+                    title = CASE WHEN title = '' THEN ?4 ELSE title END,
+                    archived_at = NULL
+                 WHERE id = ?1",
+                params!(id, updated_at, model, title),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Fetch a single session row by exact id. Returns `None` if absent.
     pub async fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
         let mut rows = self
@@ -1862,6 +1907,64 @@ mod tests {
         // Token total + model must not be clobbered by a title-only update.
         assert_eq!(row.total_tokens, 500);
         assert_eq!(row.model, "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn record_session_turn_titles_an_untitled_row_and_moves_it_up() {
+        let db = test_db().await;
+        db.upsert_session("old", 100, 100, 0, "m", "")
+            .await
+            .unwrap();
+        db.upsert_session("new", 200, 200, 0, "m", "")
+            .await
+            .unwrap();
+
+        db.record_session_turn("old", 300, "deepseek", "Open the Borg article")
+            .await
+            .unwrap();
+
+        let rows = db.list_sessions(10).await.unwrap();
+        assert_eq!(rows[0].id, "old", "the conversation just used lists first");
+        assert_eq!(rows[0].title, "Open the Borg article");
+        assert_eq!(rows[0].model, "deepseek");
+    }
+
+    #[tokio::test]
+    async fn ensure_session_row_creates_once_and_never_touches_a_resumed_row() {
+        let db = test_db().await;
+        db.ensure_session_row("fresh", 100, "m").await.unwrap();
+        let fresh = db.session_by_id("fresh").await.unwrap().unwrap();
+        assert_eq!((fresh.title.as_str(), fresh.updated_at), ("", 100));
+
+        // Reopening a named, archived conversation must not rename it, move
+        // it to the top, or bring it back from the archive.
+        db.upsert_session("named", 100, 200, 0, "m", "Trip plans")
+            .await
+            .unwrap();
+        db.set_session_archived("named", Some(250)).await.unwrap();
+        db.ensure_session_row("named", 900, "other").await.unwrap();
+        let named = db.session_by_id("named").await.unwrap().unwrap();
+        assert_eq!(named.title, "Trip plans");
+        assert_eq!(named.updated_at, 200);
+        assert!(named.archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_session_turn_keeps_a_title_already_given() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "Named by the user")
+            .await
+            .unwrap();
+        db.record_session_turn("s1", 300, "m", "First message text")
+            .await
+            .unwrap();
+        db.upsert_session("s2", 100, 100, 0, "m", "").await.unwrap();
+        db.record_session_turn("s2", 300, "m", "").await.unwrap();
+
+        let s1 = db.session_by_id("s1").await.unwrap().unwrap();
+        assert_eq!(s1.title, "Named by the user");
+        assert_eq!(s1.updated_at, 300);
+        assert_eq!(db.session_by_id("s2").await.unwrap().unwrap().title, "");
     }
 
     #[tokio::test]

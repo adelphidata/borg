@@ -142,6 +142,32 @@ impl Agent {
         }
     }
 
+    /// Mirror a finished turn onto the session's DB row.
+    ///
+    /// Session listings read the row, not the JSON file `auto_save` writes,
+    /// so without this every conversation lists untitled and in the order it
+    /// was opened. Runs for every way a turn ends — a cancelled or cut-short
+    /// turn still happened. Best-effort: a listing detail must not fail the
+    /// turn.
+    pub(super) async fn record_turn_on_session_row(&self) {
+        let meta = &self.session.meta;
+        // A turn that ended before `auto_save` has not named the session yet.
+        let title = if meta.title == crate::session::DEFAULT_TITLE {
+            crate::session::title_from_history(&self.history).unwrap_or_default()
+        } else {
+            meta.title.clone()
+        };
+        let now = chrono::Utc::now().timestamp();
+        let guard = self.db_guard().await;
+        let Some(ref db) = *guard else { return };
+        if let Err(e) = db
+            .record_session_turn(&meta.id, now, &self.config.llm.model, &title)
+            .await
+        {
+            warn!(session_id = %meta.id, "recording the turn on the session row failed: {e}");
+        }
+    }
+
     /// Append a system-injected assistant message to the agent's history.
     ///
     /// Used to mirror text the user already saw on this client (e.g. a

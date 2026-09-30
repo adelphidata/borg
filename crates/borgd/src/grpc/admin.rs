@@ -485,8 +485,8 @@ impl Admin for AdminSvc {
         // stays on screen.
         //
         // The close MUST precede the stamp, never follow it: `close()` finalizes
-        // through the agent, and that path calls `upsert_session`, which clears
-        // `archived_at`. Stamping first would let the close silently unarchive
+        // through the agent, and a finished turn calls `record_session_turn`,
+        // which clears `archived_at`. Stamping first would let the close silently unarchive
         // the conversation the user just closed.
         if req.archived {
             if let Some(host) = self.registry.remove_host(&req.id) {
