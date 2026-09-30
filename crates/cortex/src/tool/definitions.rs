@@ -613,7 +613,7 @@ fn build_schedule_tool_def() -> ToolDefinition {
         "type": {"type":"string","enum":["prompt","command"],"description":"Job type: 'prompt' for AI tasks, 'command' for shell cron jobs (required for create, used as filter for list)"},
         "id": {"type":"string","description":"Job ID (required for get/update/pause/resume/cancel/delete/runs/run_now)"},
         "name": {"type":"string","description":"Job name (required for create, optional for update)"},
-        "prompt": {"type":"string","description":"Prompt to execute (for type=prompt, required for create). The model may return '[SILENT]' alone on its first or last line to suppress channel delivery for that run."},
+        "prompt": {"type":"string","description":"Prompt to execute (for type=prompt, required for create). It runs as one completion with NO tools: anything it must read, run, or fetch goes in pre_run_command. The model may return '[SILENT]' alone on its first or last line to suppress channel delivery for that run."},
         "command": {"type":"string","description":"Shell command to execute (for type=command, required for create)"},
         "schedule": {"type":"string","description":"5-field cron expression (e.g. '*/5 * * * *'). Required for type=command create."},
         "schedule_type": {"type":"string","enum":["cron","interval","once"],"description":"For type=prompt create: 'once' = fire one time at a specific future datetime (use for reminders). 'interval' = repeat every fixed duration. 'cron' = 5-field cron expression."},

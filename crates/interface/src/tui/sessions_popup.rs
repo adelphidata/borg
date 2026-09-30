@@ -38,6 +38,16 @@ const EXPORT_FORMATS: &[cortex::export::ExportFormat] = &[
     cortex::export::ExportFormat::Markdown,
 ];
 
+/// Every TUI start and every `/new` opens a session, so empty ones pile up;
+/// there is nothing in them to load or export. A pinned one stays: the user
+/// asked for it to be kept.
+fn listable(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    sessions
+        .into_iter()
+        .filter(|s| s.message_count > 0 || s.pinned)
+        .collect()
+}
+
 pub struct SessionsPopup {
     visible: bool,
     sessions: Vec<SessionSummary>,
@@ -72,7 +82,7 @@ impl SessionsPopup {
             tokio::runtime::Handle::current().block_on(async {
                 let mut c = client.lock().await;
                 match c.list_sessions().await {
-                    Ok(list) => list.sessions,
+                    Ok(list) => listable(list.sessions),
                     Err(e) => {
                         tracing::warn!("SessionsPopup: list_sessions failed: {e}");
                         Vec::new()

@@ -3,7 +3,6 @@ use chrono_tz::Tz;
 use cron::Schedule;
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -459,7 +458,8 @@ impl HeartbeatScheduler {
         tx: mpsc::Sender<HeartbeatEvent>,
         cancel: CancellationToken,
     ) {
-        let schedule = match Schedule::from_str(&cron_expr) {
+        // Same reading as scheduled tasks: crontab weekdays, 5 fields accepted.
+        let schedule = match cortex::tasks::parse_cron_schedule(&cron_expr) {
             Ok(s) => s,
             Err(e) => {
                 warn!("Invalid cron expression '{cron_expr}': {e}. Falling back to interval.");

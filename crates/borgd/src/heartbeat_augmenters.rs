@@ -206,10 +206,10 @@ boxed_check!(check_no_channels => check_no_channels_inner);
 
 const NO_CHANNELS_NUDGE: &str = "\
 No messaging channels are configured yet, so the user can only reach you \
-through the terminal. This tick, briefly and warmly suggest setting one \
-up so you can message them on the go. Tell them to run `/plugins` in the \
-TUI (or `borg plugins` from the command line) to browse and install \
-integrations. Native options: telegram, slack, discord, teams, \
+from this computer (the Borg app or the terminal). This tick, briefly and \
+warmly suggest setting one up so you can message them on the go. Tell them \
+to run `borg plugins` in a terminal (or `/plugins` in the TUI) to browse \
+and install integrations. Native options: telegram, slack, discord, teams, \
 google-chat, twilio. Keep it to 2-3 sentences — don't lecture, and don't \
 repeat yourself if you've already raised this recently.";
 
@@ -487,23 +487,35 @@ async fn check_identity_unpersonalized_inner(
     if cortex::identity::is_personalized() {
         return None;
     }
-    Some(IDENTITY_NUDGE.to_string())
+    let path = cortex::identity::identity_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "IDENTITY.md in Borg's data folder".to_string());
+    Some(identity_nudge(&path))
 }
 boxed_check!(check_identity_unpersonalized => check_identity_unpersonalized_inner);
 
-const IDENTITY_NUDGE: &str = "\
-Your IDENTITY.md is still the unfilled scaffold (~/.borg/IDENTITY.md), \
-so you have no personality, no owner name, and no sense of what \
-matters to this user. In your reply, briefly say why personalization \
-helps (one sentence), then call `request_user_input` with up to 3 \
-multiple-choice questions: communication style (Terse / Warm / \
-Professional / Playful), top priority area (Work / Personal / Both), \
-and preferred check-in window (Morning / Midday / Evening / Quiet). \
-After they answer, ask one open follow-up in chat for their name and \
-a one-line personality sketch, then call `write_memory` with \
-scope=`global` name=`IDENTITY` to persist a personalized identity \
-filled from the template structure. Don't re-raise this if you've \
-already asked recently.";
+/// The path is the resolved one, not `~/.borg`: under `BORG_HOME` a literal
+/// `~/.borg/IDENTITY.md` sent the agent to read some other install's file.
+///
+/// Plain-text questions, never `request_user_input`: this runs in a
+/// heartbeat, where nobody is there to answer a form, so the call makes the
+/// whole tick skip — and every other nudge in it (a security alert, say)
+/// goes undelivered with it.
+fn identity_nudge(path: &str) -> String {
+    format!(
+        "Your IDENTITY.md is still the unfilled scaffold ({path}), \
+         so you have no personality, no owner name, and no sense of what \
+         matters to this user. In your reply, briefly say why personalization \
+         helps (one sentence), then ask in plain text — this is a background \
+         check-in, so do NOT call `request_user_input` — three short \
+         questions: communication style (Terse / Warm / Professional / \
+         Playful), top priority area (Work / Personal / Both), and their name \
+         with a one-line personality sketch. When they answer, call \
+         `write_memory` with scope=`global` name=`IDENTITY` to persist a \
+         personalized identity filled from the template structure. Don't \
+         re-raise this if you've already asked recently."
+    )
+}
 
 /// Gateway has been abandoned by the orchestrator's respawn supervisor
 /// AND the daily self-healing recovery step also failed. Last-resort
@@ -706,6 +718,8 @@ mod tests {
         let snippet = check_no_channels(&cfg, None)
             .await
             .expect("nudge should fire");
+        // The apps are a route in too, so "only the terminal" was wrong.
+        assert!(!snippet.contains("only reach you through the terminal"));
         assert!(snippet.contains("/plugins"));
         assert!(snippet.contains("borg plugins"));
     }
@@ -1546,30 +1560,40 @@ mod tests {
 
     #[tokio::test]
     async fn identity_directive_mentions_required_tools() {
-        // Regression guard: the LLM follow-up depends on these exact tool
-        // names. If a future refactor renames or drops them from the
-        // directive the agent will silently stop completing the flow.
-        assert!(IDENTITY_NUDGE.contains("request_user_input"));
-        assert!(IDENTITY_NUDGE.contains("write_memory"));
-        assert!(IDENTITY_NUDGE.contains("IDENTITY"));
+        // Regression guard: the LLM follow-up depends on this exact tool
+        // name. If a future refactor renames or drops it from the directive
+        // the agent will silently stop completing the flow.
+        let nudge = identity_nudge("/data/IDENTITY.md");
+        assert!(nudge.contains("write_memory"));
+        assert!(nudge.contains("IDENTITY"));
     }
 
     #[tokio::test]
-    async fn identity_directive_offers_structured_questions() {
-        // The `request_user_input` tool is multiple-choice only. The
-        // directive must seed concrete option labels so the LLM produces
-        // a valid tool call instead of inventing free-form prompts.
-        assert!(IDENTITY_NUDGE.contains("Terse"));
-        assert!(IDENTITY_NUDGE.contains("Warm"));
-        assert!(IDENTITY_NUDGE.contains("Work"));
-    }
-
-    #[tokio::test]
-    async fn identity_nudge_size_stays_bounded() {
+    async fn identity_directive_never_asks_for_an_interactive_form() {
+        // A heartbeat has nobody to answer `request_user_input`; a directive
+        // that asks for it makes the tick skip and drops every other nudge
+        // collected with it. The words may appear only as a prohibition.
+        let nudge = identity_nudge("/data/IDENTITY.md");
         assert!(
-            IDENTITY_NUDGE.len() < 1024,
+            nudge.contains("do NOT call `request_user_input`"),
+            "{nudge}"
+        );
+        assert_eq!(nudge.matches("request_user_input").count(), 1, "{nudge}");
+        // Concrete choices keep the plain-text question answerable in a word.
+        for label in ["Terse", "Warm", "Work"] {
+            assert!(nudge.contains(label), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_nudge_names_the_resolved_path_and_stays_bounded() {
+        let nudge = identity_nudge("/tmp/scratch/home/IDENTITY.md");
+        assert!(nudge.contains("/tmp/scratch/home/IDENTITY.md"));
+        assert!(!nudge.contains("~/.borg"), "{nudge}");
+        assert!(
+            nudge.len() < 1024,
             "identity nudge should stay under 1KB; got {} bytes",
-            IDENTITY_NUDGE.len()
+            nudge.len()
         );
     }
 

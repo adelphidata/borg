@@ -467,43 +467,54 @@ impl Status for StatusSvc {
     }
 
     async fn get_heartbeat(&self, _req: Request<Empty>) -> Result<Response<Heartbeat>, TStatus> {
-        // The scheduler's exact next-fire timestamp lives inside the daemon
-        // task and isn't routed here yet. Return the configured interval —
-        // better than fabricating "next at +30s".
-        let cfg = Config::load_from_db()
+        // The heartbeat is the seeded scheduled-task row; the dispatcher fires
+        // it from that row's `next_run`, so that is when the next one really
+        // is. `heartbeat.interval` is not: the row keeps its own schedule.
+        let db = Database::open()
             .await
-            .map_err(|e| TStatus::internal(format!("config load failed: {e}")))?;
-        let next_in = parse_interval_seconds(&cfg.heartbeat.interval).unwrap_or(0);
-        Ok(Response::new(Heartbeat {
-            next_in_seconds: next_in,
-            last_unix_ts: 0,
-        }))
+            .map_err(|e| TStatus::internal(format!("heartbeat status failed: {e}")))?;
+        let id = cortex::task_ids::HEARTBEAT_TASK_ID;
+        let row = db
+            .get_task_by_id(id)
+            .await
+            .map_err(|e| TStatus::internal(format!("heartbeat status failed: {e}")))?;
+        let last = db
+            .last_task_run(id)
+            .await
+            .map_err(|e| TStatus::internal(format!("heartbeat status failed: {e}")))?;
+        let now = chrono::Utc::now().timestamp();
+        Ok(Response::new(heartbeat_status(
+            row.as_ref().map(|r| (r.status.as_str(), r.next_run)),
+            last.map(|r| r.started_at),
+            now,
+        )))
     }
 }
 
-/// Parse a heartbeat interval like `"30m"`, `"2h"`, `"45s"` to seconds.
-/// Returns `None` for malformed input (including unsupported sub-second units
-/// like `"30ms"`) so the caller can fall back to 0 explicitly rather than
-/// silently report "next heartbeat in 0 seconds."
-fn parse_interval_seconds(s: &str) -> Option<u64> {
-    let s = s.trim();
-    let split = s.find(|c: char| c.is_alphabetic())?;
-    let (num, unit) = s.split_at(split);
-    let n: u64 = num.trim().parse().ok()?;
-    // Match the EXACT unit string — `"ms"` falls through to `None` so callers
-    // see an unconfigured heartbeat instead of being told it'll fire instantly.
-    match unit {
-        "s" => Some(n),
-        "m" => Some(n * 60),
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86_400),
-        _ => None,
+/// `next_in_seconds` is 0 only when no check-in is coming (row missing, or
+/// paused); a due-but-not-yet-picked-up row reports 1, not 0, so it does not
+/// read as "off".
+///
+/// `row` is the heartbeat task's `(status, next_run)`; `last_started_at` is
+/// its latest run.
+fn heartbeat_status(
+    row: Option<(&str, Option<i64>)>,
+    last_started_at: Option<i64>,
+    now: i64,
+) -> Heartbeat {
+    let next_in_seconds = match row {
+        Some(("active", Some(next))) => u64::try_from(next - now).unwrap_or(0).max(1),
+        _ => 0,
+    };
+    Heartbeat {
+        next_in_seconds,
+        last_unix_ts: last_started_at.map_or(0, |t| u64::try_from(t).unwrap_or(0)),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{drift_notice_for_vitals, parse_interval_seconds};
+    use super::{drift_notice_for_vitals, heartbeat_status};
     use chrono::{Duration, Utc};
 
     #[test]
@@ -520,25 +531,33 @@ mod tests {
     }
 
     #[test]
-    fn interval_parses_common_suffixes() {
-        // Real failure mode: a regression to using `Duration::from_secs(s.parse()?)`
-        // would fail on "30m" silently — the heartbeat field would always
-        // report 0 and the popup would look dead.
-        assert_eq!(parse_interval_seconds("30s"), Some(30));
-        assert_eq!(parse_interval_seconds("30m"), Some(1800));
-        assert_eq!(parse_interval_seconds("2h"), Some(7200));
-        assert_eq!(parse_interval_seconds("1d"), Some(86_400));
-    }
-
-    #[test]
-    fn interval_returns_none_on_garbage_and_subsecond_units() {
-        // Real failure mode: a regression that took only the first alpha char
-        // would split "30ms" into ("30", "m") and report 30 minutes, then the
-        // popup would say "next heartbeat in 1800s" when the user asked for
-        // ms-precision. Asserting None forces the caller to surface "unknown".
-        assert_eq!(parse_interval_seconds(""), None);
-        assert_eq!(parse_interval_seconds("forever"), None);
-        assert_eq!(parse_interval_seconds("30x"), None);
-        assert_eq!(parse_interval_seconds("30ms"), None);
+    fn heartbeat_status_reports_the_rows_real_schedule() {
+        let now = 1_000_000;
+        // (row, last run, expected next_in, expected last)
+        let cases = [
+            // Next fire comes from the row, not the configured interval.
+            (
+                Some(("active", Some(now + 1234))),
+                Some(now - 60),
+                1234,
+                (now - 60) as u64,
+            ),
+            // Due but not yet picked up: still on, so never 0.
+            (Some(("active", Some(now - 30))), None, 1, 0),
+            // Paused or missing: no check-in is coming.
+            (
+                Some(("paused", Some(now + 1234))),
+                Some(now - 60),
+                0,
+                (now - 60) as u64,
+            ),
+            (Some(("active", None)), None, 0, 0),
+            (None, None, 0, 0),
+        ];
+        for (row, last, next_in, last_ts) in cases {
+            let hb = heartbeat_status(row, last, now);
+            assert_eq!(hb.next_in_seconds, next_in, "row {row:?}");
+            assert_eq!(hb.last_unix_ts, last_ts, "row {row:?}");
+        }
     }
 }

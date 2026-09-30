@@ -124,7 +124,7 @@ function buildChecks(d: HealthData): HealthCheck[] {
           state: posture === "reduced" ? "alert" : "ok",
           detail:
             posture === "reduced"
-              ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust."
+              ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust. Run `borg doctor` in a terminal to see which setting lowered it and how to raise it."
               : `Protections are at their normal level. XP multiplier ×${d.posture.xpMultiplier.toFixed(2)}.`,
         }
       : { id: "posture", name: "Security posture", ...UNCHECKED };
@@ -249,7 +249,19 @@ export function HealthPage() {
                     : "border-neon shadow-(--plateGlow)"
               }`}
             >
-              <CheckIcon size={22} />
+              {failing.length > 0 || unchecked.length > 0 ? (
+                // A check mark in an alert ring reads as "fine"; say what it is.
+                <span
+                  aria-hidden
+                  className={`text-[22px] leading-none font-medium ${
+                    failing.length > 0 ? "text-alert" : "text-ink3"
+                  }`}
+                >
+                  {failing.length > 0 ? "!" : "?"}
+                </span>
+              ) : (
+                <CheckIcon size={22} />
+              )}
             </span>
             <div className="flex-1 pt-0.5">
               <h1 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">

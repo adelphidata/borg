@@ -1343,6 +1343,174 @@ fn shift_tab_cycles_modes_and_manages_previous_collab_mode() {
     );
 }
 
+/// One way the mode can change, applied to an app.
+type ModeChange = Box<dyn Fn(&mut App<'static>)>;
+
+#[test]
+fn every_mode_change_is_queued_for_the_daemon() {
+    // The daemon's tool gate reads its own settings, not the TUI's config.
+    // A mode change that is not queued for the daemon leaves Plan mode
+    // read-write: the agent ran `touch` under a TUI that said [plan].
+    let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+    let cases: Vec<(&str, ModeChange, CollaborationMode)> = vec![
+        (
+            "/mode plan",
+            Box::new(|a| drop(a.try_handle_command("/mode plan"))),
+            CollaborationMode::Plan,
+        ),
+        (
+            "/plan",
+            Box::new(|a| drop(a.try_handle_command("/plan"))),
+            CollaborationMode::Plan,
+        ),
+        (
+            "shift+tab",
+            Box::new(move |a| drop(a.handle_key(back_tab).unwrap())),
+            CollaborationMode::Plan,
+        ),
+        (
+            "failed plan turn rolls back",
+            Box::new(|a| {
+                a.previous_collab_mode = Some(CollaborationMode::Execute);
+                a.config.conversation.collaboration_mode = CollaborationMode::Plan;
+                a.process_agent_event(AgentEvent::Error("boom".into()));
+            }),
+            CollaborationMode::Execute,
+        ),
+    ];
+    for (label, act, expected) in cases {
+        let mut app = make_app();
+        act(&mut app);
+        assert_eq!(
+            app.config.conversation.collaboration_mode, expected,
+            "{label}: wrong local mode"
+        );
+        assert!(
+            app.mode_sync_pending,
+            "{label}: mode not queued for the daemon"
+        );
+    }
+
+    // Asking for the mode already in force changes nothing and sends nothing.
+    let mut app = make_app();
+    drop(app.try_handle_command("/mode execute"));
+    assert!(
+        !app.mode_sync_pending,
+        "a no-op /mode must not write a setting"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_command_returns_at_once_and_reports_when_done() {
+    // `/heal` used to block the event loop for its whole RPC: keys and
+    // redraws stopped for tens of seconds with no sign of life.
+    let mut app = make_app();
+    let (release, gate) = tokio::sync::oneshot::channel::<()>();
+    app.run_in_background("Working on it.", |_c| async move {
+        gate.await.unwrap();
+        "Done.".to_string()
+    });
+    // Returned while the work is still waiting: the loop was not held.
+    let shown = |app: &App<'_>| {
+        app.cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::System { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shown(&app), ["Working on it."]);
+    let rx = app.notice_rx.as_mut().unwrap();
+    assert!(rx.try_recv().is_err(), "no result before the work ends");
+
+    release.send(()).unwrap();
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap();
+    assert_eq!(done.as_deref(), Some("Done."));
+}
+
+#[test]
+fn a_tool_call_after_new_or_resume_does_not_index_past_the_transcript() {
+    // `/new` cleared the cells but kept the scrollback watermark, so the
+    // next tool result sliced `cells[watermark..]` past the end and the TUI
+    // crashed ("watermark past end").
+    for cmd in ["/new", "/resume abc123"] {
+        let mut app = make_app();
+        for i in 0..5 {
+            app.push_system_message(format!("line {i}"));
+        }
+        app.flush_cell_range_to_scrollback(0, app.cells.len(), 80);
+        assert_eq!(app.cells_emitted, 5);
+
+        drop(app.try_handle_command(cmd));
+        app.enter_streaming();
+        app.process_agent_event(AgentEvent::ToolExecuting {
+            tool_call_id: "t1".into(),
+            name: "memory_search".into(),
+            args: "{}".into(),
+        });
+        app.process_agent_event(AgentEvent::ToolResult {
+            tool_call_id: "t1".into(),
+            name: "memory_search".into(),
+            result: "none".into(),
+        });
+        assert!(app.cells_emitted <= app.cells.len(), "{cmd}");
+    }
+}
+
+#[test]
+fn a_daemon_started_turn_opens_and_closes_like_an_own_one() {
+    // A `/heartbeat` fire used to run unseen: the reply only reached the
+    // TUI's history on the next launch.
+    let mut app = make_app();
+    app.process_external_event(AgentEvent::TextDelta("mango-fired".into()));
+    assert!(matches!(app.state, AppState::Streaming { .. }));
+    assert!(app.cells.iter().any(
+        |c| matches!(c, HistoryCell::System { text } if text.contains("started a turn on its own"))
+    ));
+    app.process_external_event(AgentEvent::TurnComplete);
+    assert!(matches!(app.state, AppState::Idle));
+    let notices = app
+        .cells
+        .iter()
+        .filter(|c| matches!(c, HistoryCell::System { text } if text.contains("on its own")))
+        .count();
+    assert_eq!(notices, 1, "one notice per turn, not per event");
+}
+
+#[test]
+fn channel_close_after_a_finished_plan_turn_keeps_plan_and_its_review() {
+    // The event channel closes after every turn. A finished Plan turn must
+    // stay in Plan with its review open; only a turn cut off mid-flight
+    // rolls the transient Plan flow back.
+    let mut app = make_app();
+    drop(app.try_handle_command("/plan"));
+    app.mode_sync_pending = false;
+    app.process_agent_event(AgentEvent::TurnComplete);
+    app.handle_agent_channel_closed();
+    assert!(matches!(app.state, AppState::PlanReview));
+    assert_eq!(
+        app.config.conversation.collaboration_mode,
+        CollaborationMode::Plan
+    );
+    assert!(!app.mode_sync_pending, "nothing changed, nothing to send");
+
+    let mut app = make_app();
+    drop(app.try_handle_command("/plan"));
+    app.state = AppState::Streaming {
+        start: std::time::Instant::now(),
+    };
+    app.handle_agent_channel_closed();
+    assert!(matches!(app.state, AppState::Idle));
+    assert_eq!(
+        app.config.conversation.collaboration_mode,
+        CollaborationMode::Execute
+    );
+    assert!(app.mode_sync_pending, "the rollback must reach the daemon");
+}
+
 #[test]
 fn turn_complete_in_plan_mode_opens_review_overlay() {
     let mut app = make_app();

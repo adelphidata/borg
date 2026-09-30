@@ -125,7 +125,12 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
     );
 
     if check {
-        let release = cortex::update::fetch_latest_release(prerelease).await?;
+        let release = cortex::update::fetch_latest_release(prerelease)
+            .await
+            .map_err(|e| {
+                tracing::warn!("update check failed: {e:#}");
+                anyhow::anyhow!(cortex::update::describe_update_error(&e))
+            })?;
         let latest = release
             .tag_name
             .strip_prefix('v')
@@ -138,7 +143,12 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
         return Ok(());
     }
 
-    match cortex::update::perform_update(prerelease).await? {
+    match cortex::update::perform_update(prerelease)
+        .await
+        .map_err(|e| {
+            tracing::warn!("update failed: {e:#}");
+            anyhow::anyhow!(cortex::update::describe_update_error(&e))
+        })? {
         cortex::update::UpdateResult {
             status: cortex::update::UpdateStatus::AlreadyUpToDate,
             current_version,

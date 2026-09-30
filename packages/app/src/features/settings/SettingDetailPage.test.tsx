@@ -258,6 +258,17 @@ describe("SettingDetailPage for provider and model", () => {
     expect(screen.queryByText("DeepSeek V4 Flash")).toBeNull();
   });
 
+  it("marks the provider default as selected when no model is set", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSettings: { entries: [entry("provider", "anthropic"), entry("model", "")] },
+    });
+    mount("/settings/model", daemon);
+    await waitFor(() => expect(screen.getByText("Opus 5")).toBeTruthy());
+    const selected = screen.getByRole("img", { name: "Selected" });
+    expect(selected.closest("button")?.textContent).toContain("Opus 5");
+  });
+
   it("keeps free text one step away, for an id the catalog does not carry", async () => {
     const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
     mount("/settings/model", daemon);

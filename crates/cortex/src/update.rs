@@ -130,6 +130,28 @@ async fn fetch_latest_release_with_base(base_url: &str, dev: bool) -> Result<Rel
     }
 }
 
+/// Say what went wrong with an update check or install in plain words, with
+/// the next action. The raw chain (GitHub JSON bodies, both endpoints' errors)
+/// belongs in the log, not in front of the user.
+pub fn describe_update_error(e: &anyhow::Error) -> String {
+    let chain = format!("{e:#}");
+    if chain.contains("HTTP 404") {
+        "No published Borg release was found to update from. Try again later, or rebuild from source."
+            .to_string()
+    } else if chain.contains("rate limit exceeded") {
+        "GitHub is limiting update checks right now. Try again in an hour.".to_string()
+    } else if e.downcast_ref::<reqwest::Error>().is_some() {
+        "Could not reach GitHub to check for updates. Check your network and try again.".to_string()
+    } else {
+        let (outer, root) = (e.to_string(), e.root_cause().to_string());
+        if outer == root {
+            root
+        } else {
+            format!("{outer}: {root}")
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReleaseKind {
     Stable,
@@ -726,6 +748,37 @@ fedcba987654  checksums.txt
         );
         assert!(msg.contains("HTTP 404"), "{msg}");
         assert!(msg.contains("Repository renamed"), "{msg}");
+    }
+
+    /// Spec: the user sees the next action, never GitHub's JSON body. A
+    /// private or release-less repo answers 404 on both endpoints.
+    #[test]
+    fn update_errors_are_described_without_raw_api_bodies() {
+        let body = r#"{"message":"Not Found","documentation_url":"https://docs.github.com"}"#;
+        let not_found = anyhow::anyhow!(
+            "{}",
+            format_github_api_error(reqwest::StatusCode::NOT_FOUND, &HeaderMap::new(), body)
+        )
+        .context("Failed to resolve latest stable release");
+        let mut limited_headers = HeaderMap::new();
+        limited_headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let limited = anyhow::anyhow!(
+            "{}",
+            format_github_api_error(reqwest::StatusCode::FORBIDDEN, &limited_headers, body)
+        );
+        let other =
+            anyhow::anyhow!("No stable releases found").context("Failed to resolve release");
+
+        let cases = [
+            (not_found, "No published Borg release"),
+            (limited, "limiting update checks"),
+            (other, "No stable releases found"),
+        ];
+        for (err, want) in cases {
+            let msg = describe_update_error(&err);
+            assert!(msg.contains(want), "{msg}");
+            assert!(!msg.contains("documentation_url"), "raw body leaked: {msg}");
+        }
     }
 
     #[test]

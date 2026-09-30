@@ -628,6 +628,10 @@ message ScheduledTask {
   string task_type = 10; // "prompt" or "command"
   string delivery_channel = 11;
   string delivery_target = 12;
+  // A row Borg seeded for itself (heartbeat, maintenance, consolidation…).
+  // Deleting one leaves that loop gone until the next migration, so the
+  // apps offer pause, not delete.
+  bool system = 13;
 }
 message ScheduledTaskList { repeated ScheduledTask tasks = 1; }
 message ScheduledTaskRef { string id = 1; }

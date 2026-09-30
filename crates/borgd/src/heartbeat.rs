@@ -713,6 +713,17 @@ pub(crate) fn scheduled_session_key() -> String {
     format!("heartbeat:{}", HeartbeatSource::Scheduled.as_wire())
 }
 
+/// What the conversation lists call a heartbeat session. Its first message is
+/// the tick prompt, which never titles it, so it otherwise lists as
+/// "Untitled" — a conversation the owner does not remember starting.
+pub(crate) const HEARTBEAT_SESSION_TITLE: &str = "Borg check-ins";
+
+/// The listing title for `id` when it is a heartbeat session.
+pub(crate) fn heartbeat_session_title(id: &str) -> Option<&'static str> {
+    id.starts_with("heartbeat:")
+        .then_some(HEARTBEAT_SESSION_TITLE)
+}
+
 /// Meta-table keys backing the max-ticks backstop. `TICKS` counts how many
 /// scheduled ticks the current goal has stayed `Active`; `GOAL_ID` records
 /// which goal the count belongs to so a fresh goal restarts the counter.

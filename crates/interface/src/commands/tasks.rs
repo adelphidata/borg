@@ -173,12 +173,12 @@ pub(crate) fn dispatch_tasks(action: Option<TasksAction>) -> Result<()> {
             delivery_channel.as_deref(),
             delivery_target.as_deref(),
         ),
-        Some(TasksAction::Delete { id }) => run_tasks_delete(&id),
-        Some(TasksAction::Pause { id }) => run_tasks_pause(&id),
-        Some(TasksAction::Resume { id }) => run_tasks_resume(&id),
-        Some(TasksAction::Run { id }) => run_tasks_run(&id),
-        Some(TasksAction::Runs { id, count }) => run_tasks_runs(&id, count),
-        Some(TasksAction::Status { id }) => run_tasks_status(&id),
+        Some(TasksAction::Delete { id }) => run_tasks_delete(&resolve_listed_id(&id)?),
+        Some(TasksAction::Pause { id }) => run_tasks_pause(&resolve_listed_id(&id)?),
+        Some(TasksAction::Resume { id }) => run_tasks_resume(&resolve_listed_id(&id)?),
+        Some(TasksAction::Run { id }) => run_tasks_run(&resolve_listed_id(&id)?),
+        Some(TasksAction::Runs { id, count }) => run_tasks_runs(&resolve_listed_id(&id)?, count),
+        Some(TasksAction::Status { id }) => run_tasks_status(&resolve_listed_id(&id)?),
         Some(TasksAction::Model {
             id,
             model,
@@ -250,6 +250,22 @@ async fn resolve_task_id_prefix(db: &cortex::db::Database, prefix: &str) -> Resu
     super::resolve_unique_prefix("tasks", prefix, ids)
 }
 
+/// Expand the short id that `borg tasks list` / `borg cron list` print into
+/// the full id the daemon keys on. An id that matches nothing passes through
+/// unchanged, so the daemon stays the one place that reports "not found".
+fn expand_listed_id(prefix: &str, ids: Vec<String>) -> Result<String> {
+    Ok(super::resolve_unique_prefix("tasks", prefix, ids)?.unwrap_or_else(|| prefix.to_string()))
+}
+
+fn resolve_listed_id(prefix: &str) -> Result<String> {
+    let ids = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        let resp = client.list_scheduled_tasks().await?;
+        Ok::<_, anyhow::Error>(resp.tasks.into_iter().map(|t| t.id).collect())
+    })?;
+    expand_listed_id(prefix, ids)
+}
+
 /// Dispatch for `borg cron ...`.
 pub(crate) fn dispatch_cron(action: Option<CronAction>) -> Result<()> {
     match action {
@@ -271,11 +287,11 @@ pub(crate) fn dispatch_cron(action: Option<CronAction>) -> Result<()> {
             delivery_channel.as_deref(),
             delivery_target.as_deref(),
         ),
-        Some(CronAction::Remove { id }) => run_cron_mutate(&id, "delete"),
-        Some(CronAction::Pause { id }) => run_cron_mutate(&id, "pause"),
-        Some(CronAction::Resume { id }) => run_cron_mutate(&id, "resume"),
-        Some(CronAction::Run { id }) => run_cron_mutate(&id, "run"),
-        Some(CronAction::Runs { id, count }) => run_tasks_runs(&id, count),
+        Some(CronAction::Remove { id }) => run_cron_mutate(&resolve_listed_id(&id)?, "delete"),
+        Some(CronAction::Pause { id }) => run_cron_mutate(&resolve_listed_id(&id)?, "pause"),
+        Some(CronAction::Resume { id }) => run_cron_mutate(&resolve_listed_id(&id)?, "resume"),
+        Some(CronAction::Run { id }) => run_cron_mutate(&resolve_listed_id(&id)?, "run"),
+        Some(CronAction::Runs { id, count }) => run_tasks_runs(&resolve_listed_id(&id)?, count),
     }
 }
 
@@ -327,14 +343,16 @@ pub(crate) fn run_tasks_create(
     // Validate locally so we can fail fast with a useful error before the
     // round-trip. The daemon revalidates on the way in.
     cortex::tasks::validate_schedule(schedule_type, schedule)?;
-    let tz = "local";
+    // Same zone as `borg cron add`: "local" is stored as UTC, which would run
+    // `0 8 * * *` at 08:00 UTC rather than 08:00 on the user's clock.
+    let tz = cron_job_timezone();
 
     let spec = ScheduledTaskCreate {
         name: name.to_string(),
         prompt: prompt.to_string(),
         schedule_type: schedule_type.to_string(),
         schedule_expr: schedule.to_string(),
-        timezone: tz.to_string(),
+        timezone: tz,
         task_type: "prompt".to_string(),
         delivery_channel: delivery_channel.unwrap_or("").to_string(),
         delivery_target: delivery_target.unwrap_or("").to_string(),
@@ -401,7 +419,13 @@ pub(crate) fn run_tasks_runs(id: &str, count: usize) -> Result<()> {
         } else {
             run.result.as_str()
         };
-        let details: String = details_src.chars().take(40).collect();
+        // Shell output ends in a newline, and a multi-line result would break
+        // the one-row-per-run table, so show only the first non-empty line.
+        let first_line = details_src
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        let details: String = first_line.chars().take(40).collect();
         println!("{when:<20} {status:<8} {duration:<10} {details}");
     }
     Ok(())
@@ -724,7 +748,40 @@ enum MutateOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{cron_job_timezone, cron_job_timezone_from, CRON_JOB_FALLBACK_TIMEZONE};
+    use super::{
+        cron_job_timezone, cron_job_timezone_from, expand_listed_id, CRON_JOB_FALLBACK_TIMEZONE,
+    };
+
+    /// `borg tasks list` prints 8-char ids; every subcommand must accept one.
+    #[test]
+    fn listed_short_id_expands_to_the_full_id() {
+        let ids = || {
+            vec![
+                "c50d65ff-ed1c-4950-b81a-02e951814896".to_string(),
+                "c50e0000-0000-4000-8000-000000000000".to_string(),
+            ]
+        };
+        let cases = [
+            ("c50d65ff", "c50d65ff-ed1c-4950-b81a-02e951814896"),
+            (
+                "c50d65ff-ed1c-4950-b81a-02e951814896",
+                "c50d65ff-ed1c-4950-b81a-02e951814896",
+            ),
+            // No match passes through so the daemon reports "not found".
+            ("deadbeef", "deadbeef"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                expand_listed_id(input, ids()).unwrap(),
+                want,
+                "input {input}"
+            );
+        }
+        assert!(
+            expand_listed_id("c50", ids()).is_err(),
+            "ambiguous prefix must refuse"
+        );
+    }
 
     /// The daemon validates the zone of every new task. A value that the
     /// validator refuses makes `borg cron add` fail for every user.

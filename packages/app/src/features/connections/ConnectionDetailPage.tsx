@@ -26,6 +26,24 @@ import {
 
 const STRATEGIES = ["fill_first", "round_robin", "least_used", "random"];
 
+/**
+ * A pool entry in words. A key from config is named by its slot
+ * (`llm.api_keys[0]`) — a setting path, not a name — so it reads "Key 1".
+ * Where it came from is worth saying only when that is something the user
+ * set up themselves, like an environment variable.
+ */
+export function describeKey(
+  e: Pick<admin.CredentialEntry, "label" | "sourceKind" | "sourceValue">,
+): {
+  name: string;
+  from: string | undefined;
+} {
+  const slot = /^llm\.api_keys\[(\d+)\]$/.exec(e.label);
+  const name = slot ? `Key ${Number(slot[1]) + 1}` : e.label;
+  if (e.sourceKind === "manual" || e.sourceKind === "config") return { name, from: undefined };
+  return { name, from: e.sourceValue || e.sourceKind };
+}
+
 function ErrorLine({ error }: { error: BorgError | undefined }) {
   if (!error) return null;
   return (
@@ -135,29 +153,34 @@ function ProviderDetail({
         <section>
           <div className={SECTION_LABEL}>Active key pool</div>
           <div className="flex flex-col">
-            {entries.map((e) => (
-              <div
-                key={e.id}
-                className="flex items-center gap-[13px] border-b border-line2 px-0.5 py-3"
-              >
-                <span
-                  className={`h-[7px] w-[7px] flex-none rounded-full ${
-                    e.status === "ok" ? "bg-neon" : "bg-alert"
-                  }`}
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="text-[13.5px] leading-[1.3] font-medium text-ink">{e.label}</div>
-                  <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
-                    {e.fingerprint} · used {e.useCount} time{e.useCount === 1 ? "" : "s"}
-                    {e.status !== "ok" && ` · ${e.status}`}
-                    {e.sourceKind !== "manual" && ` · from ${e.sourceValue || e.sourceKind}`}
+            {entries.map((e) => {
+              const key = describeKey(e);
+              return (
+                <div
+                  key={e.id}
+                  className="flex items-center gap-[13px] border-b border-line2 px-0.5 py-3"
+                >
+                  <span
+                    className={`h-[7px] w-[7px] flex-none rounded-full ${
+                      e.status === "ok" ? "bg-neon" : "bg-alert"
+                    }`}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] leading-[1.3] font-medium text-ink">
+                      {key.name}
+                    </div>
+                    <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
+                      {e.fingerprint} · used {e.useCount} time{e.useCount === 1 ? "" : "s"}
+                      {e.status !== "ok" && ` · ${e.status}`}
+                      {key.from && ` · from ${key.from}`}
+                    </div>
                   </div>
+                  <Pill variant="danger" onClick={() => !remove.pending && void remove.run(e.id)}>
+                    Remove
+                  </Pill>
                 </div>
-                <Pill variant="danger" onClick={() => !remove.pending && void remove.run(e.id)}>
-                  Remove
-                </Pill>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}

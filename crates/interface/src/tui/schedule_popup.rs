@@ -442,6 +442,7 @@ mod tests {
                 task_type: "prompt".into(),
                 delivery_channel: String::new(),
                 delivery_target: String::new(),
+                system: false,
             },
             original_status: status.into(),
             original_schedule_expr: "0 9 * * *".into(),

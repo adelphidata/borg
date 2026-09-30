@@ -247,3 +247,42 @@ async fn prompt_failure_with_a_token_is_stored_redacted() {
         "scheduled_tasks.last_error must not hold the token: {last_error}"
     );
 }
+
+/// A prompt task is one tool-less completion. The model must be told that,
+/// or "read this file" comes back with invented contents delivered as fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_task_tells_the_model_it_has_no_tools() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let h = Harness::setup("BORG_TEST_PROMPT_NO_TOOLS_KEY").await;
+    h.mount(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "status unknown"},
+            "finish_reason": "stop"
+        }]
+    })))
+    .await;
+    h.seed_due_prompt_task("prompt-no-tools").await;
+    h.run_to_finished_row("prompt-no-tools").await;
+
+    let requests = h.server.received_requests().await.expect("recorded");
+    let body: serde_json::Value = requests
+        .iter()
+        .find(|r| r.url.path() == "/v1/chat/completions")
+        .expect("the task reached the LLM")
+        .body_json()
+        .expect("json body");
+    assert!(body.get("tools").is_none(), "no tools are offered: {body}");
+    let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system.contains(task_runner::SCHEDULED_TASK_NO_TOOLS),
+        "system prompt must state the no-tools contract: {system}"
+    );
+}

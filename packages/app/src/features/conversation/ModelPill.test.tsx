@@ -122,6 +122,17 @@ describe("ModelPill", () => {
     expect(pill()).toBeNull();
   });
 
+  it("names the provider default the daemon runs when no model is set", () => {
+    // An empty `model` makes the daemon adopt the catalog default, so a fresh
+    // install still has a model to show and to switch away from.
+    stored.model = "";
+    render(<ModelPill />);
+    expect(pill()!.textContent).toContain("Opus 5");
+    openMenu();
+    const current = screen.getByRole("button", { name: /Opus 5/ });
+    expect(current.querySelector("svg")).not.toBeNull();
+  });
+
   it("stays hidden while the settings snapshot is still loading", () => {
     ready = false;
     render(<ModelPill />);

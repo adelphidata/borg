@@ -16,7 +16,9 @@ mod connect;
 mod event_stream;
 
 pub use connect::{connect, connect_default, default_socket_path, SOCKET_POLL_INTERVAL};
-pub use event_stream::{forward_event_stream, spawn_event_adapter};
+pub use event_stream::{
+    forward_event_stream, spawn_event_adapter, watch_external_turns, TurnWatch,
+};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -223,6 +225,25 @@ impl DaemonClient {
             admin: AdminClient::new(channel.clone()),
             status: StatusClient::new(channel.clone()),
             pki: PkiClient::new(channel),
+        }
+    }
+
+    /// The conversation a session host is showing right now (it changes on
+    /// `/new`, `/resume` and `/fork`). Goal, session-heartbeat and handoff
+    /// rows are keyed by it. Sent empty, the daemon falls back to the most
+    /// recently updated session, which may be another window's or a
+    /// `borg ask` run's — so empty is returned only when the host is unknown
+    /// or the lookup fails, and the failure is logged.
+    pub async fn live_session_id(&mut self, host_session_id: &str) -> String {
+        if host_session_id.is_empty() {
+            return String::new();
+        }
+        match self.get_state(host_session_id).await {
+            Ok(state) => state.agent_session_id,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not resolve the live session; daemon will pick the latest");
+                String::new()
+            }
         }
     }
 
@@ -1391,6 +1412,98 @@ rpc_wrappers! {
         pair_credential("Admin.PairCredential", protocols::admin::PairCredentialRequest {
             kind: kind.to_string(),
         }).entries;
+}
+
+#[cfg(test)]
+mod live_session_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use borgd::grpc::session::{SessionFactory, SessionSvc};
+    use borgd::session::backend::{InlineImage, SessionBackend, SessionStateSnapshot};
+    use borgd::session::{SessionHost, SessionRegistry};
+    use protocols::session::session_server::SessionServer;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use super::DaemonClient;
+
+    /// A host showing a conversation other than its own id — as after
+    /// `/new` or `/resume`, where the host stays and the conversation moves.
+    struct Host;
+    #[async_trait]
+    impl SessionBackend for Host {
+        async fn run_turn(
+            &self,
+            _text: String,
+            _images: Vec<InlineImage>,
+            _event_tx: mpsc::Sender<cortex::agent::AgentEvent>,
+            _cancel: CancellationToken,
+            _bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
+        ) {
+        }
+        fn session_id(&self) -> &str {
+            "host-1"
+        }
+        fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
+            Ok(SessionStateSnapshot {
+                agent_session_id: "conv-2".into(),
+                title: String::new(),
+                message_count: 0,
+                user_message_count: 0,
+                token_estimate: 0,
+                llm_provider: String::new(),
+                llm_model: String::new(),
+                collab_mode: String::new(),
+            })
+        }
+    }
+
+    struct NoOpen;
+    impl SessionFactory for NoOpen {
+        fn open<'a>(
+            &'a self,
+            _resume_id: Option<&'a str>,
+            _ctx: Option<cortex::execution_context::ExecutionContext>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SessionHost>> + Send + 'a>,
+        > {
+            Box::pin(async { anyhow::bail!("not used") })
+        }
+    }
+
+    /// `/goal`, `/heartbeat` and `/handoff` used to send an empty session
+    /// id, and the daemon then picked the most recently updated session —
+    /// another window's conversation, or a `borg ask` run's.
+    #[tokio::test]
+    async fn live_session_id_names_the_hosts_current_conversation() {
+        let registry = SessionRegistry::new();
+        registry.insert(SessionHost::new(Arc::new(Host)));
+        let svc = SessionSvc::new(registry, Arc::new(NoOpen));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(SessionServer::new(svc))
+                .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io))),
+        );
+        let mut client_io = Some(client_io);
+        let channel = tonic::transport::Endpoint::from_static("http://in-process")
+            .connect_with_connector(tower::service_fn(move |_| {
+                let io = client_io.take();
+                async move {
+                    io.map(hyper_util::rt::TokioIo::new)
+                        .ok_or_else(|| std::io::Error::other("one connection only"))
+                }
+            }))
+            .await
+            .unwrap();
+        let mut c = DaemonClient::from_channel(channel);
+
+        assert_eq!(c.live_session_id("host-1").await, "conv-2");
+        // Unknown host or no host: empty, so the daemon's own fallback applies.
+        assert_eq!(c.live_session_id("no-such-host").await, "");
+        assert_eq!(c.live_session_id("").await, "");
+    }
 }
 
 #[cfg(test)]

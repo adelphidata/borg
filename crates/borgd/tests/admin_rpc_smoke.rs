@@ -973,6 +973,61 @@ async fn list_sessions_previews_the_last_thing_said() {
     );
 }
 
+/// The heartbeat's own session opens on the tick prompt, which never titles
+/// it. It must list under a name the owner can place, not "Untitled", and the
+/// title backfill must not name it after "*heartbeat tick*".
+#[tokio::test]
+async fn heartbeat_session_lists_under_its_own_name() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        // Titled the way older builds' backfill left it.
+        db.upsert_session("heartbeat:scheduled", 1, 30, 0, "m", "*heartbeat tick*")
+            .await
+            .expect("seed");
+        db.insert_message(
+            "heartbeat:scheduled",
+            "user",
+            Some("*heartbeat tick*"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tick row");
+        db.upsert_session("plain-untitled", 1, 30, 0, "m", "")
+            .await
+            .expect("seed");
+    }
+
+    let list = admin
+        .list_sessions(ListSessionsRequest::default())
+        .await
+        .expect("list")
+        .into_inner();
+    let title = |id: &str| {
+        list.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} must be listed"))
+            .title
+            .clone()
+    };
+    assert_eq!(title("heartbeat:scheduled"), "Borg check-ins");
+    assert_eq!(
+        title("plain-untitled"),
+        "",
+        "other sessions keep their own title"
+    );
+}
+
 /// Minimal backend for the live-session case: it never runs a turn, it only
 /// records that the daemon finalized it.
 struct CloseCountingBackend {
@@ -1130,9 +1185,17 @@ async fn creating_a_scheduled_task_resolves_its_first_run_and_rejects_a_bad_expr
         "a created task must know when it next fires, or the scheduler skips it forever"
     );
 
-    // The five-field crontab dialect is not what the parser accepts.
+    // The five-field crontab form people and models write is accepted too,
+    // and fires at the same time as its six-field spelling.
+    let crontab = admin
+        .create_scheduled_task(create("crontab", "0 8 * * *"))
+        .await
+        .expect("five-field cron accepted")
+        .into_inner();
+    assert_eq!(crontab.next_run_unix, good.next_run_unix);
+
     let status = admin
-        .create_scheduled_task(create("bad", "0 8 * * *"))
+        .create_scheduled_task(create("bad", "every morning"))
         .await
         .expect_err("unparseable cron must be refused");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -1142,20 +1205,33 @@ async fn creating_a_scheduled_task_resolves_its_first_run_and_rejects_a_bad_expr
         status.message()
     );
 
-    let names = admin
+    let tasks = admin
         .list_scheduled_tasks(AdminEmpty {})
         .await
         .expect("list")
         .into_inner()
-        .tasks
-        .into_iter()
-        .map(|t| t.name)
-        .collect::<Vec<_>>();
+        .tasks;
+    let names = tasks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
     assert!(names.contains(&"good".to_string()));
     assert!(
         !names.contains(&"bad".to_string()),
         "a refused task must not be left behind in the table"
     );
+    // The apps hide delete on Borg's own rows; the flag must follow the id.
+    for t in &tasks {
+        assert_eq!(
+            t.system,
+            cortex::task_ids::is_system_task_id(&t.id),
+            "system flag for {} ({})",
+            t.name,
+            t.id
+        );
+    }
+    assert!(
+        tasks.iter().any(|t| t.system),
+        "seeded rows are listed as system"
+    );
+    assert!(tasks.iter().any(|t| t.name == "good" && !t.system));
 }
 
 /// A zone the scheduler cannot resolve must be refused on create and on

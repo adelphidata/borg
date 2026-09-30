@@ -345,7 +345,9 @@ message ContextBreakdown {
 }
 
 message CompactRequest { string session_id = 1; }
-message CompactResponse { uint64 dropped = 1; uint64 after_tokens = 2; }
+// Estimated history size before and after. Equal when there was nothing
+// worth summarising yet.
+message CompactResponse { uint64 before_tokens = 1; uint64 after_tokens = 2; }
 
 message ClearRequest { string session_id = 1; }
 

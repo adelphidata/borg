@@ -897,3 +897,39 @@ describe("useConversation session gone", () => {
     expect(daemon.calls.filter((c) => c.method === "Open")).toHaveLength(1);
   });
 });
+
+describe("useConversation commands", () => {
+  it("runs /goal on this conversation's agent session and answers in the transcript", async () => {
+    const daemon = fakeDaemon({
+      ...OPEN,
+      // The id the daemon reports now wins over the one captured at open.
+      GetState: { ...OPEN.GetState, agentSessionId: "agent-2" },
+      SetGoal: { present: true, objective: "Ship it", status: "active" },
+    });
+    const conv = mount(daemon);
+    await ready(conv);
+
+    let taken = false;
+    act(() => {
+      taken = conv.current.runCommand("/goal Ship it");
+    });
+    expect(taken).toBe(true);
+    await waitFor(() =>
+      expect(conv.current.cells.at(-1)).toMatchObject({
+        kind: "notice",
+        text: expect.stringContaining("Goal set"),
+      }),
+    );
+    expect(daemon.calls.find((c) => c.method === "SetGoal")?.request).toMatchObject({
+      sessionId: "agent-2",
+    });
+    // A command is not a turn: nothing went to the model.
+    expect(daemon.calls.some((c) => c.method === "Send")).toBe(false);
+  });
+
+  it("leaves ordinary text to be sent", async () => {
+    const conv = mount(fakeDaemon(OPEN));
+    await ready(conv);
+    expect(conv.current.runCommand("/goals are nice")).toBe(false);
+  });
+});

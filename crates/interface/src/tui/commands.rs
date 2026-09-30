@@ -199,7 +199,7 @@ impl App<'_> {
                 );
                 return Some(Ok(AppAction::Continue));
             }
-            self.cells.clear();
+            self.reset_transcript();
             self.queued_messages.clear();
             return Some(Ok(AppAction::LoadSession { id: id.to_string() }));
         }
@@ -403,17 +403,26 @@ impl App<'_> {
     }
 
     fn cmd_help(&mut self) -> Result<AppAction> {
-        self.push_system_message(
-            "Commands:\n  \
+        self.push_system_message(HELP_TEXT.to_string());
+        Ok(AppAction::Continue)
+    }
+}
+
+/// `/help`. Every command in the `/` popup is listed here (a test checks).
+pub(super) const HELP_TEXT: &str = "Commands:\n  \
              /help      - Show this help\n  \
              /settings  - Configure settings\n  \
              /usage [days] - Token spend, model + tool usage over a window (default 30 days)\n  \
-             /mode      - Switch collaboration mode (default/execute/plan)\n  \
+             /mode      - Switch collaboration mode (execute/plan)\n  \
              /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n  \
-             /think [lvl] - Show or set thinking level (off|minimal|low|medium|high|xhigh|adaptive|max)\n\
+             /think [lvl] - Show or set thinking level (off|minimal|low|medium|high|xhigh|adaptive|max)\n  \
+             /goal <text> - Give this session a goal to work toward (/goal for status, pause|resume|clear)\n  \
+             /heartbeat every <interval> <prompt> - Re-send a prompt here while idle (alias: /hb)\n  \
+             /theme     - Pick TUI theme (alias: /skin)\n\
              \n  \
              !<cmd>     - Run a shell command directly, no LLM turn (e.g. `!git status`)\n  \
              /btw <q>   - Ask a side question (ephemeral, not persisted)\n  \
+             /context   - Context-window usage breakdown\n  \
              /compact   - Compact conversation history\n  \
              /clear     - Clear conversation\n  \
              /cancel    - Stop the current in-progress turn\n  \
@@ -454,15 +463,21 @@ impl App<'_> {
              /model     - Switch LLM provider/model\n  \
              /schedule  - Manage scheduled tasks\n  \
              /migrate   - Import from another agent\n  \
+             /mcp       - Show configured MCP servers\n  \
+             /agents    - View and control sub-agents\n  \
+             /browser [connect|disconnect|status] - Manage the browser connection\n  \
+             /handoff <platform> - Continue this conversation on a messaging channel\n  \
              /restart   - Restart gateway server\n\
              \n  \
+             /xp        - Show XP summary and feed\n  \
+             /evolution - Show evolution overview\n  \
+             /card      - Print an ASCII share card\n  \
+             /stats     - Show agent vitals (alias of /status)\n\
+             \n  \
              /uninstall - Remove all borg data and binary\n  \
-             quit/exit  - Exit"
-                .to_string(),
-        );
-        Ok(AppAction::Continue)
-    }
+             /exit      - Exit (also: quit, exit)";
 
+impl App<'_> {
     /// Cancel the in-progress agent turn, if any. Equivalent to pressing Esc
     /// during streaming — provided as an explicit command so messaging-channel
     /// users (who can't press Esc) have a consistent verb across surfaces.
@@ -480,9 +495,11 @@ impl App<'_> {
             // The no-runtime branch (unit tests for `cmd_cancel`) is a no-op.
             if tokio::runtime::Handle::try_current().is_ok() {
                 let client = self.client.clone();
+                let host = self.host_session_id.clone();
                 tokio::spawn(async move {
                     let mut c = client.lock().await;
-                    if let Err(e) = c.pause_goal_on_interrupt("").await {
+                    let live = c.live_session_id(&host).await;
+                    if let Err(e) = c.pause_goal_on_interrupt(&live).await {
                         tracing::warn!("cmd_cancel: pause_goal_on_interrupt failed: {e}");
                     }
                 });
@@ -625,7 +642,7 @@ impl App<'_> {
     }
 
     fn cmd_new(&mut self) -> Result<AppAction> {
-        self.cells.clear();
+        self.reset_transcript();
         self.queued_messages.clear();
         self.session_prompt_tokens = 0;
         self.session_completion_tokens = 0;
@@ -703,7 +720,7 @@ impl App<'_> {
             // mode is stale and must be cleared.
             self.previous_collab_mode = None;
         }
-        self.config.conversation.collaboration_mode = next;
+        self.set_mode(next);
         self.push_system_message(format!("[collaboration mode: {next}]"));
     }
 
@@ -1016,20 +1033,15 @@ impl App<'_> {
                 return Ok(AppAction::Continue);
             }
         };
-        let client = self.client.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut c = client.lock().await;
-                c.reload(target).await
-            })
-        });
-        match result {
-            Ok(resp) => self.push_system_message(format_reload_response(target, &resp)),
-            Err(e) => {
-                tracing::warn!(error = %e, "on-demand /reload: daemon Reload RPC failed");
-                self.push_system_message(format!("Reload failed: {e}"));
+        self.run_in_background("Reloading…", move |mut c| async move {
+            match c.reload(target).await {
+                Ok(resp) => format_reload_response(target, &resp),
+                Err(e) => {
+                    tracing::warn!(error = %e, "on-demand /reload: daemon Reload RPC failed");
+                    format!("Reload failed: {e}")
+                }
             }
-        }
+        });
         Ok(AppAction::Continue)
     }
 
@@ -1037,22 +1049,18 @@ impl App<'_> {
     /// same routine the daemon fires nightly at 02:00, exposed for users who
     /// want to force a sweep without waiting.
     fn cmd_heal(&mut self) -> Result<AppAction> {
-        let client = self.client.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut c = client.lock().await;
-                c.heal().await
-            })
-        });
-        match result {
-            Ok(report) => {
-                self.push_system_message(format_heal_report(&report));
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "on-demand /heal: daemon heal RPC failed");
-                self.push_system_message(format!("Self-healing failed: {e}"));
-            }
-        }
+        self.run_in_background(
+            "Running the self-healing sweep. This can take a minute; you can keep working.",
+            |mut c| async move {
+                match c.heal().await {
+                    Ok(report) => format_heal_report(&report),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "on-demand /heal: daemon heal RPC failed");
+                        format!("Self-healing failed: {e}")
+                    }
+                }
+            },
+        );
         Ok(AppAction::Continue)
     }
 
@@ -1100,22 +1108,18 @@ impl App<'_> {
     }
 
     fn cmd_dream(&mut self) -> Result<AppAction> {
-        let client = self.client.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut c = client.lock().await;
-                c.dream().await
-            })
-        });
-        match result {
-            Ok(report) => {
-                self.push_system_message(crate::commands::misc::format_dream_report(&report))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "on-demand /dream: daemon dream RPC failed");
-                self.push_system_message(format!("Dream failed: {e}"));
-            }
-        }
+        self.run_in_background(
+            "Consolidating memory. This can take a minute; you can keep working.",
+            |mut c| async move {
+                match c.dream().await {
+                    Ok(report) => crate::commands::misc::format_dream_report(&report),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "on-demand /dream: daemon dream RPC failed");
+                        format!("Dream failed: {e}")
+                    }
+                }
+            },
+        );
         Ok(AppAction::Continue)
     }
 
@@ -1284,10 +1288,12 @@ impl App<'_> {
     /// the file is locked by a write transaction.
     fn fetch_goal_summary_via_rpc(&self) -> Result<String> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let detail = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.get_goal("").await
+                let live = c.live_session_id(&host).await;
+                c.get_goal(&live).await
             })
         })?;
         if !detail.present {
@@ -1446,21 +1452,25 @@ impl App<'_> {
 
     fn rpc_handoff_status(&self) -> Result<protocols::admin::HandoffStatusReply> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.get_handoff_status("").await
+                let live = c.live_session_id(&host).await;
+                c.get_handoff_status(&live).await
             })
         })
     }
 
     fn rpc_request_handoff(&self, platform: &str) -> Result<()> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let platform = platform.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.request_handoff("", &platform).await
+                let live = c.live_session_id(&host).await;
+                c.request_handoff(&live, &platform).await
             })
         })
     }
@@ -1499,11 +1509,13 @@ impl App<'_> {
         ordinal: i64,
     ) -> Result<protocols::admin::GoalGateList> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let command = command.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.mutate_goal_gates("", op, &command, ordinal).await
+                let live = c.live_session_id(&host).await;
+                c.mutate_goal_gates(&live, op, &command, ordinal).await
             })
         })
     }
@@ -1528,10 +1540,12 @@ impl App<'_> {
         };
 
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.mutate_session_heartbeat("", op as i32, &prompt, interval)
+                let live = c.live_session_id(&host).await;
+                c.mutate_session_heartbeat(&live, op as i32, &prompt, interval)
                     .await
             })
         });
@@ -1545,31 +1559,37 @@ impl App<'_> {
 
     fn rpc_clear_goal(&self) -> Result<()> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.clear_goal("").await
+                let live = c.live_session_id(&host).await;
+                c.clear_goal(&live).await
             })
         })
     }
 
     fn rpc_set_goal_status(&self, status: &str) -> Result<protocols::admin::GoalDetail> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let status = status.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.set_goal_status("", &status).await
+                let live = c.live_session_id(&host).await;
+                c.set_goal_status(&live, &status).await
             })
         })
     }
 
     fn rpc_set_goal_budget(&self, budget: Option<i64>) -> Result<protocols::admin::GoalDetail> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.set_goal_budget("", budget).await
+                let live = c.live_session_id(&host).await;
+                c.set_goal_budget(&live, budget).await
             })
         })
     }
@@ -1580,11 +1600,13 @@ impl App<'_> {
         budget: Option<i64>,
     ) -> Result<protocols::admin::GoalDetail> {
         let client = self.client.clone();
+        let host = self.host_session_id.clone();
         let objective = objective.to_string();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut c = client.lock().await;
-                c.set_goal_replace("", &objective, budget).await
+                let live = c.live_session_id(&host).await;
+                c.set_goal_replace(&live, &objective, budget).await
             })
         })
     }
@@ -2174,13 +2196,24 @@ fn format_session_heartbeat(d: &protocols::admin::SessionHeartbeatDetail) -> Str
     };
     out.push_str(&format!(
         "Heartbeat: every {} — {state}\n  \"{}\"",
-        format_secs(d.interval_secs),
+        format_interval(d.interval_secs),
         d.prompt
     ));
     out
 }
 
-/// Compact duration for display: `90s`, `15m`, `2h`, `1d`.
+/// An interval exactly as set: the largest unit that divides it, so
+/// `every 90s` reads back as `90s`, not a rounded `1m`.
+fn format_interval(secs: i64) -> String {
+    match secs {
+        s if s > 0 && s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s > 0 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s > 0 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// Approximate time left, for a countdown: `45s`, `15m`, `2h`, `1d`.
 fn format_secs(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
@@ -2792,6 +2825,23 @@ mod tests {
             !paused.contains("next fire"),
             "a paused heartbeat must not advertise a countdown: {paused}"
         );
+    }
+
+    #[test]
+    fn heartbeat_interval_reads_back_as_it_was_set() {
+        // `/hb every 90s …` read back as "every 1m": the display rounded the
+        // interval the user had just typed.
+        for (secs, shown) in [
+            (60, "1m"),
+            (90, "90s"),
+            (900, "15m"),
+            (5400, "90m"),
+            (7200, "2h"),
+            (86_400, "1d"),
+            (90_000, "25h"),
+        ] {
+            assert_eq!(format_interval(secs), shown, "{secs}s");
+        }
     }
 
     #[test]

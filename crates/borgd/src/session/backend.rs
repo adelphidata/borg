@@ -287,9 +287,40 @@ pub struct AgentBackend {
     /// Epoch of the lease this backend currently holds, or `-1` if none. Set on
     /// every successful claim; used to release precisely on close.
     lease_epoch: AtomicI64,
+    /// State as of the last moment the agent was free. A turn holds `agent`
+    /// for its whole length, so `GetState` answers from this while one runs
+    /// instead of waiting for the reply to finish.
+    last_snapshot: std::sync::Mutex<Option<SessionStateSnapshot>>,
+}
+
+/// The agent's user-facing state, read under its lock.
+fn snapshot_of(agent: &Agent) -> SessionStateSnapshot {
+    let session = agent.session();
+    let cfg = agent.next_turn_config();
+    let (msgs, users) = agent.conversation_stats();
+    SessionStateSnapshot {
+        agent_session_id: session.meta.id.clone(),
+        title: session.meta.title.clone(),
+        message_count: msgs as u64,
+        user_message_count: users as u64,
+        token_estimate: 0,
+        llm_provider: cfg.llm.provider.clone().unwrap_or_default(),
+        llm_model: cfg.llm.model.clone(),
+        collab_mode: format!("{}", cfg.conversation.collaboration_mode),
+    }
 }
 
 impl AgentBackend {
+    /// Record the state a turn starts from, for `GetState` to serve while
+    /// the turn holds the agent.
+    fn remember_snapshot(&self, agent: &Agent) {
+        let snap = snapshot_of(agent);
+        *self
+            .last_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap);
+    }
+
     /// Build a backend hosting a fresh agent. `resume_id` (if set) loads
     /// existing session history; otherwise a new session is started.
     ///
@@ -428,6 +459,7 @@ impl AgentBackend {
             }
         }
 
+        let first_snapshot = snapshot_of(&agent);
         Ok(Arc::new(Self {
             session_id,
             agent: Mutex::new(agent),
@@ -435,6 +467,7 @@ impl AgentBackend {
             steer_gate,
             worker_id,
             lease_epoch: AtomicI64::new(initial_epoch),
+            last_snapshot: std::sync::Mutex::new(Some(first_snapshot)),
         }))
     }
 
@@ -498,6 +531,7 @@ impl SessionBackend for AgentBackend {
                 return;
             }
         };
+        self.remember_snapshot(&agent);
 
         // Own the session before advancing it. The log is the source of truth,
         // so a worker may only act on a session it holds the lease for — if
@@ -586,6 +620,7 @@ impl SessionBackend for AgentBackend {
                 return;
             }
         };
+        self.remember_snapshot(&agent);
 
         if let LeaseStatus::Conflict = self.acquire_lease().await {
             let msg = "this session is owned by another worker; cannot run the turn here";
@@ -682,20 +717,23 @@ impl SessionBackend for AgentBackend {
     }
 
     fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
-        let agent = lock_agent(&self.agent);
-        let session = agent.session();
-        let cfg = agent.next_turn_config();
-        let (msgs, users) = agent.conversation_stats();
-        Ok(SessionStateSnapshot {
-            agent_session_id: session.meta.id.clone(),
-            title: session.meta.title.clone(),
-            message_count: msgs as u64,
-            user_message_count: users as u64,
-            token_estimate: 0,
-            llm_provider: cfg.llm.provider.clone().unwrap_or_default(),
-            llm_model: cfg.llm.model.clone(),
-            collab_mode: format!("{}", cfg.conversation.collaboration_mode),
-        })
+        // A turn holds the agent until its reply finishes. Waiting here would
+        // stall every client call that only needs the session id (a `/goal`
+        // typed mid-turn) for that long, so a busy agent answers from the
+        // state its turn started with.
+        if let Ok(agent) = self.agent.try_lock() {
+            self.remember_snapshot(&agent);
+            return Ok(snapshot_of(&agent));
+        }
+        let cached = self
+            .last_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match cached {
+            Some(snap) => Ok(snap),
+            None => Ok(snapshot_of(&lock_agent(&self.agent))),
+        }
     }
 
     fn steer(&self, text: &str) -> anyhow::Result<()> {

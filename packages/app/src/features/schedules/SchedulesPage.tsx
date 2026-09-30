@@ -24,11 +24,11 @@ import {
 
 /** Placeholder and helper text per schedule kind, so the field explains itself. */
 const EXPR_HELP: Record<ScheduleType, { placeholder: string; hint: string }> = {
-  // Six fields, seconds first — the daemon's cron parser is not the five-field
-  // crontab dialect, and a five-field expression is rejected outright.
+  // Crontab's five fields — the daemon widens them and reads weekdays the
+  // crontab way (0 or 7 is Sunday, 1-5 is Monday to Friday).
   cron: {
-    placeholder: "0 0 8 * * *",
-    hint: "second minute hour day month weekday — this example is 08:00 daily",
+    placeholder: "0 8 * * 1-5",
+    hint: "minute hour day month weekday — this example is 08:00 on weekdays",
   },
   interval: { placeholder: "30m", hint: "How long between runs, e.g. 90s, 30m, 6h" },
   once: { placeholder: "2026-08-10T09:00", hint: "When to run, once" },
@@ -154,6 +154,21 @@ const RUN_STATUS: Record<string, string> = {
 };
 
 /**
+ * Results the daemon stores for a run that sent nothing
+ * (`HEARTBEAT_SKIP_MARKERS` in `crates/borgd/src/task_runner.rs`). The code
+ * reads them back, so they stay codes on disk; people get the sentence.
+ */
+const SKIP_RESULT: Record<string, string> = {
+  quiet_hours: "Skipped — it fell in quiet hours.",
+  min_interval: "Skipped — it ran a short time ago.",
+  silent: "Nothing to report.",
+  zero_info: "Nothing to report.",
+  dedup_suppressed: "Same as last time, so it was not sent again.",
+  interactive_input_unavailable:
+    "Skipped — it needed an answer from you, and a scheduled run cannot ask.",
+};
+
+/**
  * What the task did last time.
  *
  * A task with no chat channel to deliver to keeps its results here, so this
@@ -170,7 +185,7 @@ function LastRun({ task }: { task: adminPb.ScheduledTask }) {
           if (!run) {
             return <div className="text-[12px] leading-[1.45] text-ink3">Not run yet.</div>;
           }
-          const text = run.error || run.result;
+          const text = run.error || (SKIP_RESULT[run.result] ?? run.result);
           return (
             <div className="flex flex-col gap-1.5">
               <div className="text-[11.5px] leading-[1.4] text-ink3">
@@ -192,6 +207,12 @@ function LastRun({ task }: { task: adminPb.ScheduledTask }) {
       </DaemonState>
     </div>
   );
+}
+
+/** "next in 4 min", but "due now" / "overdue" — "next due now" reads as a typo. */
+function nextRunLabel(unix: number): string {
+  const when = relativeTime(unix, Date.now());
+  return when.startsWith("in ") ? `next ${when}` : when;
 }
 
 function TaskRow({
@@ -227,9 +248,7 @@ function TaskRow({
           <div className="truncate text-[13.5px] leading-[1.35] text-ink">{task.name}</div>
           <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
             {describeSchedule(task.scheduleType, task.scheduleExpr)}
-            {!paused && !finished && (
-              <> · next {relativeTime(Number(task.nextRunUnix), Date.now())}</>
-            )}
+            {!paused && !finished && <> · {nextRunLabel(Number(task.nextRunUnix))}</>}
             {paused && <> · paused</>}
             {finished && <> · {task.status}</>}
           </div>
@@ -245,14 +264,18 @@ function TaskRow({
             {paused ? "Resume" : "Pause"}
           </Pill>
         )}
-        <button
-          type="button"
-          aria-label={`Delete ${task.name}`}
-          onClick={onDelete}
-          className="flex h-7 w-7 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-ink3 hover:text-alert"
-        >
-          <TrashIcon size={14} />
-        </button>
+        {/* Borg's own loops (heartbeat, maintenance…) can be paused, not
+            deleted: a deleted one stays gone until the next migration. */}
+        {!task.system && (
+          <button
+            type="button"
+            aria-label={`Delete ${task.name}`}
+            onClick={onDelete}
+            className="flex h-7 w-7 cursor-pointer items-center justify-center rounded border-0 bg-transparent text-ink3 hover:text-alert"
+          >
+            <TrashIcon size={14} />
+          </button>
+        )}
       </div>
     </div>
   );

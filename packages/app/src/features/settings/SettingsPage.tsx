@@ -14,7 +14,12 @@ import {
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings, type DaemonSetting } from "../../lib/settings";
 import { routes } from "../../routes";
-import { modelLabel, providerLabel, useSetupStatus } from "../onboarding/useSetupStatus";
+import {
+  effectiveModel,
+  modelLabel,
+  providerLabel,
+  useSetupStatus,
+} from "../onboarding/useSetupStatus";
 import { APPEARANCE_LABELS, advancedGroupOf, basicSettings, displayValue } from "./catalog";
 
 /**
@@ -107,7 +112,11 @@ export function SettingsPage() {
                         : s.catalog === "provider"
                           ? providerLabel(catalog, raw)
                           : s.catalog === "model"
-                            ? modelLabel(catalog, map.get("provider")?.value ?? "", raw)
+                            ? modelLabel(
+                                catalog,
+                                map.get("provider")?.value ?? "",
+                                effectiveModel(catalog, map.get("provider")?.value ?? "", raw),
+                              )
                             : displayValue(s, raw);
                   return (
                     <button

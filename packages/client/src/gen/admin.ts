@@ -558,6 +558,12 @@ export interface ScheduledTask {
   taskType: string;
   deliveryChannel: string;
   deliveryTarget: string;
+  /**
+   * A row Borg seeded for itself (heartbeat, maintenance, consolidation…).
+   * Deleting one leaves that loop gone until the next migration, so the
+   * apps offer pause, not delete.
+   */
+  system: boolean;
 }
 
 export interface ScheduledTaskList {
@@ -6821,6 +6827,7 @@ function createBaseScheduledTask(): ScheduledTask {
     taskType: "",
     deliveryChannel: "",
     deliveryTarget: "",
+    system: false,
   };
 }
 
@@ -6861,6 +6868,9 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     }
     if (message.deliveryTarget !== "") {
       writer.uint32(98).string(message.deliveryTarget);
+    }
+    if (message.system !== false) {
+      writer.uint32(104).bool(message.system);
     }
     return writer;
   },
@@ -6968,6 +6978,14 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
           message.deliveryTarget = reader.string();
           continue;
         }
+        case 13: {
+          if (tag !== 104) {
+            break;
+          }
+
+          message.system = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7019,6 +7037,7 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
         : isSet(object.delivery_target)
         ? globalThis.String(object.delivery_target)
         : "",
+      system: isSet(object.system) ? globalThis.Boolean(object.system) : false,
     };
   },
 
@@ -7060,6 +7079,9 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     if (message.deliveryTarget !== "") {
       obj.deliveryTarget = message.deliveryTarget;
     }
+    if (message.system !== false) {
+      obj.system = message.system;
+    }
     return obj;
   },
 
@@ -7080,6 +7102,7 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     message.taskType = object.taskType ?? "";
     message.deliveryChannel = object.deliveryChannel ?? "";
     message.deliveryTarget = object.deliveryTarget ?? "";
+    message.system = object.system ?? false;
     return message;
   },
 };

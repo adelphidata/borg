@@ -19,6 +19,57 @@ impl<'a> App<'a> {
         self.cells.push(HistoryCell::System { text });
     }
 
+    /// Start the view over for another conversation (`/new`, `/resume`,
+    /// `/fork`, a loaded session). What already reached terminal scrollback
+    /// stays there, but the watermark into `cells` must restart with them:
+    /// left behind, the next tool result indexed past the end and crashed.
+    pub fn reset_transcript(&mut self) {
+        self.truncate_cells(0);
+    }
+
+    /// Drop cells from `len` on, keeping the scrollback watermark in range.
+    pub fn truncate_cells(&mut self, len: usize) {
+        self.cells.truncate(len);
+        self.cells_emitted = self.cells_emitted.min(self.cells.len());
+    }
+
+    /// The one way to change the collaboration mode: it updates the copy the
+    /// footer reads and queues the write the daemon's tool gate depends on.
+    pub fn set_mode(&mut self, next: CollaborationMode) {
+        self.config.conversation.collaboration_mode = next;
+        self.mode_sync_pending = true;
+    }
+
+    /// Show an event from a turn this TUI did not start. The first one of
+    /// such a turn opens it in the view, as a submit would for the user's own.
+    pub fn process_external_event(&mut self, ev: AgentEvent) {
+        if matches!(self.state, AppState::Idle) {
+            self.push_system_message("[Borg started a turn on its own]".to_string());
+            self.enter_streaming();
+        }
+        self.process_agent_event(ev);
+    }
+
+    /// Run a slow daemon RPC off the event loop and show the text it returns
+    /// as a system message. Blocking on it instead freezes drawing and input
+    /// for as long as the RPC takes: `/heal`'s host audit alone runs for
+    /// tens of seconds. The task works on its own clone of the client, so
+    /// the shared one stays free for the popups and status refreshes.
+    pub fn run_in_background<F, Fut>(&mut self, started: &str, work: F)
+    where
+        F: FnOnce(crate::daemon_client::DaemonClient) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = String> + Send + 'static,
+    {
+        self.push_system_message(started.to_string());
+        let client = self.client.clone();
+        let tx = self.notice_tx.clone();
+        tokio::spawn(async move {
+            let c = client.lock().await.clone();
+            // The receiver only goes away with the App; nothing to tell then.
+            let _ = tx.send(work(c).await);
+        });
+    }
+
     /// Flush newly-stable cells to the pending scrollback buffer using the
     /// last-known viewport width (cached in `render_viewport`). Falls back to
     /// `DEFAULT_FLUSH_WIDTH` before the first frame has rendered.
@@ -501,7 +552,7 @@ impl<'a> App<'a> {
         // If a transient Plan flow failed, roll back to the prior mode so the
         // user isn't left trapped with mutations blocked.
         if let Some(prev) = self.previous_collab_mode.take() {
-            self.config.conversation.collaboration_mode = prev;
+            self.set_mode(prev);
         }
         self.state = AppState::Idle;
     }
@@ -681,11 +732,13 @@ impl<'a> App<'a> {
             }
         }
         self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
-        // If a transient Plan flow was in flight, roll back to the prior mode.
-        if let Some(prev) = self.previous_collab_mode.take() {
-            self.config.conversation.collaboration_mode = prev;
-        }
-        if !matches!(self.state, AppState::Idle) {
+        // The channel also closes after every finished turn. Only a turn cut
+        // off mid-flight is cleaned up here; a finished Plan turn sits in
+        // PlanReview, whose overlay decides the mode (Proceed restores it).
+        if !matches!(self.state, AppState::Idle | AppState::PlanReview) {
+            if let Some(prev) = self.previous_collab_mode.take() {
+                self.set_mode(prev);
+            }
             // If queued messages exist, treat unexpected close as an error so queue-pause
             // gives the user a chance to resume or clear instead of silently losing input.
             if !self.queued_messages.is_empty() {

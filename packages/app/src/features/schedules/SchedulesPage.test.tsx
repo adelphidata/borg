@@ -54,6 +54,27 @@ describe("SchedulesPage listing", () => {
     await waitFor(() => expect(screen.getByText(/next in 60 min/)).toBeTruthy());
   });
 
+  it("offers pause but not delete on a task Borg runs for itself", async () => {
+    const daemon = fakeDaemon(
+      listing([
+        task({ id: "sys", name: "Heartbeat", system: true }),
+        task({ id: "mine", name: "Morning briefing" }),
+      ]),
+    );
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Heartbeat")).toBeTruthy());
+    expect(screen.queryByLabelText("Delete Heartbeat")).toBeNull();
+    expect(screen.getByLabelText("Delete Morning briefing")).toBeTruthy();
+    expect(screen.getAllByText("Pause")).toHaveLength(2);
+  });
+
+  it("says due now, not 'next due now', for a task waiting on the next check", async () => {
+    const daemon = fakeDaemon(listing([task({ nextRunUnix: Math.floor(NOW / 1000) - 10 })]));
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText(/· due now/)).toBeTruthy());
+    expect(screen.queryByText(/next due/)).toBeNull();
+  });
+
   it("says a task is paused instead of counting down to a run that will not happen", async () => {
     const daemon = fakeDaemon(listing([task({ status: "paused" })]));
     mount(daemon);
@@ -131,6 +152,22 @@ describe("SchedulesPage last run", () => {
     click(screen.getByRole("button", { name: /^Morning briefing/ }));
     await waitFor(() => expect(screen.getByText("no delivery target")).toBeTruthy());
     expect(screen.getByText(/Could not be delivered/)).toBeTruthy();
+  });
+
+  it("says a skipped heartbeat run in words, never the stored reason code", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task()]),
+      GetScheduledTaskDetail: {
+        task: task(),
+        hasLastRun: true,
+        lastRun: run({ result: "interactive_input_unavailable" }),
+      },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
+    click(screen.getByRole("button", { name: /^Morning briefing/ }));
+    await waitFor(() => expect(screen.getByText(/a scheduled run cannot ask/)).toBeTruthy());
+    expect(screen.queryByText("interactive_input_unavailable")).toBeNull();
   });
 
   it("says a task has not run yet", async () => {
@@ -252,7 +289,7 @@ describe("SchedulesPage creation", () => {
     fireEvent.change(screen.getByPlaceholderText("What should Borg do?"), {
       target: { value: prompt },
     });
-    const exprBox = screen.getByPlaceholderText(/0 0 8|30m|2026-08/);
+    const exprBox = screen.getByPlaceholderText(/0 8 \* \* 1-5|30m|2026-08/);
     fireEvent.change(exprBox, { target: { value: expr } });
   };
 
@@ -264,11 +301,10 @@ describe("SchedulesPage creation", () => {
   });
 
   it("explains the expression field per schedule kind", async () => {
-    // The daemon's cron parser is six-field, seconds first; a crontab-shaped
-    // expression is rejected outright.
+    // The daemon reads crontab's five fields, weekdays numbered the crontab way.
     const daemon = fakeDaemon(listing([]));
     await openForm(daemon);
-    expect(screen.getByText(/second minute hour day month weekday/)).toBeTruthy();
+    expect(screen.getByText(/^minute hour day month weekday/)).toBeTruthy();
 
     click("interval");
     expect(screen.getByText(/How long between runs/)).toBeTruthy();

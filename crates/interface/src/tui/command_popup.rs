@@ -39,6 +39,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "Isolated git checkouts to code in (alias: /wt)",
     ),
     ("/mode", "Switch collaboration mode"),
+    ("/think", "Show or set the thinking level"),
     ("/model", "Switch LLM provider/model"),
     ("/theme", "Pick TUI theme (alias: /skin)"),
     // Conversation
@@ -61,6 +62,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/doctor", "Run diagnostics"),
     ("/dream", "Run memory consolidation now"),
     ("/heal", "Run self-healing maintenance sweep"),
+    (
+        "/reload",
+        "Hot-reload MCP servers and/or user skills (mcp|skills)",
+    ),
     (
         "/poke",
         "Trigger an immediate heartbeat (bypasses quiet hours)",
@@ -100,6 +105,16 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     (
         "/browser",
         "Manage browser CDP connection (connect|disconnect|status)",
+    ),
+    ("/mcp", "Show configured MCP servers"),
+    ("/agents", "View and control sub-agents"),
+    (
+        "/handoff",
+        "Continue this conversation on a messaging channel",
+    ),
+    (
+        "/terminal-setup",
+        "Install IDE terminal keybindings (auto|vscode|cursor|windsurf)",
     ),
     ("/restart", "Restart gateway server"),
     ("/xp", "Show XP summary and feed"),
@@ -393,6 +408,32 @@ impl CommandPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/help` left out `/goal`, `/heartbeat`, `/context` and more, and the
+    /// popup left out `/think`, `/reload` and `/mcp`: a command was only
+    /// discoverable from whichever list someone remembered to edit.
+    #[test]
+    fn help_and_popup_list_the_same_commands() {
+        let help = crate::tui::commands::HELP_TEXT;
+        let in_help: Vec<&str> = help
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.starts_with('/'))
+            .collect();
+        for (name, _) in BUILTIN_COMMANDS {
+            assert!(
+                in_help.contains(name),
+                "{name} is in the popup but not in /help"
+            );
+        }
+        // `/uninstall` deletes everything: listed in help, never one keypress away.
+        for name in in_help.iter().filter(|n| **n != "/uninstall") {
+            assert!(
+                BUILTIN_COMMANDS.iter().any(|(n, _)| n == name),
+                "{name} is in /help but not in the popup"
+            );
+        }
+    }
 
     #[test]
     fn empty_filter_returns_all() {

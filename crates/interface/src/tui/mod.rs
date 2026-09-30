@@ -91,7 +91,7 @@ use cortex::config::{CollaborationMode, Config};
 use cortex::telemetry::BorgMetrics;
 use heartbeat::scheduler::HeartbeatEvent;
 
-use crate::daemon_client::{forward_event_stream, DaemonClient};
+use crate::daemon_client::{forward_event_stream, watch_external_turns, DaemonClient, TurnWatch};
 
 use app::{App, AppAction};
 use history::HistoryCell;
@@ -330,7 +330,11 @@ pub async fn run(
                 return Ok(None);
             }
             Err(e) => {
-                eprintln!("Update failed: {e:#}");
+                tracing::warn!("update failed: {e:#}");
+                eprintln!(
+                    "Update failed. {}",
+                    cortex::update::describe_update_error(&e)
+                );
                 eprintln!("Continuing to TUI with current version.");
             }
         }
@@ -345,7 +349,7 @@ pub async fn run(
     // activity, bond, evolution, budget, script), and config watcher all live
     // inside `borgd` now — registered in `AgentBackend::new` rather than here.
     let mut client = crate::daemon_client::connect_or_spawn().await?;
-    let (session_id, _last_seq) = client
+    let (session_id, last_seq) = client
         .open_session_with_workspace(resume.as_deref(), workspace.as_deref(), None, false)
         .await?;
 
@@ -465,9 +469,11 @@ pub async fn run(
     {
         let seed_client = client.clone();
         let seed_tx = goal_ui_tx.clone();
+        let host = session_id.clone();
         tokio::spawn(async move {
             let mut c = seed_client;
-            match c.get_goal("").await {
+            let live = c.live_session_id(&host).await;
+            match c.get_goal(&live).await {
                 Ok(detail) if detail.present => {
                     let status = cortex::goals::GoalStatus::from_str(&detail.status);
                     let _ = seed_tx
@@ -571,6 +577,7 @@ pub async fn run(
         app_client,
         goal_event_rx,
     );
+    app.host_session_id = session_id.clone();
     if let Some((title, count)) = resumed_info {
         app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
     }
@@ -629,10 +636,25 @@ pub async fn run(
     // the loop often enough to matter when the agent is idle.
     let tick_rate = Duration::from_millis(100);
 
+    // Turns the daemon starts in this session (a `/heartbeat` fire, a
+    // message from another window) arrive only on `Session.Stream`.
+    let turn_watch = Arc::new(TurnWatch::starting_at(last_seq));
+    {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+        app.external_rx = Some(rx);
+        tokio::spawn(watch_external_turns(
+            client.clone(),
+            session_id.clone(),
+            turn_watch.clone(),
+            tx,
+        ));
+    }
+
     run_event_loop(
         &mut tui,
         &mut app,
         &mut client,
+        &turn_watch,
         &session_id,
         &mut event_stream,
         tick_rate,
@@ -645,6 +667,16 @@ pub async fn run(
 /// Convert the TUI's image attachments into the proto's `InlineImage` shape.
 /// The wire format takes raw bytes (NOT base64) — daemon side encodes when
 /// constructing the agent's multimodal message.
+/// `/compact`'s result. The daemon reports history size before and after;
+/// it used to be shown as "N messages dropped", with the token count as N.
+fn compact_report(before: u64, after: u64) -> String {
+    if after >= before {
+        format!("Nothing to compact yet (~{before} tokens of history).")
+    } else {
+        format!("Compacted: ~{before} → ~{after} tokens of history.")
+    }
+}
+
 /// What the TUI says when the daemon did not take a steer. The text is quoted
 /// back because the composer has already been cleared.
 fn steer_refused_notice(text: &str, error: &str) -> String {
@@ -961,11 +993,31 @@ where
     drained
 }
 
+/// Write a mode change queued by [`App::set_mode`] to the daemon, whose tool
+/// gate reads only its own settings. On failure the user is told the mode did
+/// not take, since believing Plan is on while tools still run is the harm.
+async fn sync_collaboration_mode(app: &mut App<'_>, client: &mut DaemonClient) {
+    if !std::mem::take(&mut app.mode_sync_pending) {
+        return;
+    }
+    let mode = app.config.conversation.collaboration_mode;
+    if let Err(e) = client
+        .set_setting("conversation.collaboration_mode", &mode.to_string())
+        .await
+    {
+        tracing::warn!(error = %e, "could not write collaboration mode to the daemon");
+        app.push_system_message(format!(
+            "Borg did not switch to {mode} mode ({e:#}). Its previous mode still applies. Try /mode {mode} again."
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     tui: &mut tui_lifecycle::Tui,
     app: &mut App<'_>,
     client: &mut DaemonClient,
+    turn_watch: &Arc<TurnWatch>,
     session_id: &str,
     event_stream: &mut EventStream,
     tick_rate: Duration,
@@ -1088,6 +1140,36 @@ async fn run_event_loop(
                 AppAction::Continue
             }
 
+            // Turns this TUI did not start (`/heartbeat`, another window)
+            ev = async {
+                if let Some(rx) = &mut app.external_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match ev {
+                    Some(ev) => app.process_external_event(ev),
+                    None => app.external_rx = None,
+                }
+                drain_queued_if_idle(app)?
+            }
+
+            // Results of slow slash commands run off the loop
+            notice = async {
+                if let Some(rx) = &mut app.notice_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match notice {
+                    Some(text) => app.push_system_message(text),
+                    None => app.notice_rx = None,
+                }
+                AppAction::Continue
+            }
+
             // `!cmd` shell-mode results
             event = async {
                 if let Some(rx) = &mut app.shell_result_rx {
@@ -1149,6 +1231,10 @@ async fn run_event_loop(
                 drain_queued_if_idle(app)?
             }
         };
+
+        // Before any action runs, so `/plan <msg>` reaches the daemon as a
+        // plan-mode turn rather than racing its own mode change.
+        sync_collaboration_mode(app, client).await;
 
         match action {
             AppAction::Quit => {
@@ -1223,18 +1309,22 @@ async fn run_event_loop(
                 let mut send_client = client.clone();
                 let sid = session_id.to_string();
                 let proto_images = images_to_proto(images);
+                let watch = turn_watch.clone();
+                watch.begin_own_turn();
                 tokio::spawn(async move {
                     match send_client
                         .send_message_with_images(&sid, &input, proto_images)
                         .await
                     {
                         Ok(stream) => {
-                            forward_event_stream(send_client, sid, stream, event_tx).await;
+                            forward_event_stream(send_client, sid, stream, event_tx, Some(&watch))
+                                .await;
                         }
                         Err(e) => {
                             let _ = event_tx.send(AgentEvent::Error(format!("{e:#}"))).await;
                         }
                     }
+                    watch.end_own_turn();
                 });
             }
             AppAction::ResumeInterruptedTurn { event_tx, cancel } => {
@@ -1255,10 +1345,13 @@ async fn run_event_loop(
 
                 let mut send_client = client.clone();
                 let sid = session_id.to_string();
+                let watch = turn_watch.clone();
+                watch.begin_own_turn();
                 tokio::spawn(async move {
                     match send_client.resume_interrupted_turn(&sid).await {
                         Ok(stream) => {
-                            forward_event_stream(send_client, sid, stream, event_tx).await;
+                            forward_event_stream(send_client, sid, stream, event_tx, Some(&watch))
+                                .await;
                         }
                         Err(e) => {
                             if let Err(send_err) =
@@ -1268,6 +1361,7 @@ async fn run_event_loop(
                             }
                         }
                     }
+                    watch.end_own_turn();
                 });
             }
             AppAction::ForkSession => {
@@ -1277,13 +1371,15 @@ async fn run_event_loop(
                     Ok(forked) => {
                         let id = forked.forked_agent_session_id;
                         let short: String = id.chars().take(8).collect();
+                        // Reuse the LoadSession path so daemon state, FTS, and
+                        // popups all converge on the new session id. The
+                        // notice goes in after the reset, or it is wiped
+                        // before it is ever drawn.
+                        app.reset_transcript();
                         app.push_system_message(format!(
                             "Forked {} messages → {} ({short})",
                             forked.message_count, forked.title
                         ));
-                        // Reuse the LoadSession path so daemon state, FTS, and
-                        // popups all converge on the new session id.
-                        app.cells.clear();
                         app.session_prompt_tokens = 0;
                         app.session_completion_tokens = 0;
                         app.last_prompt_tokens = 0;
@@ -1303,13 +1399,7 @@ async fn run_event_loop(
                 }
             }
             AppAction::CompactHistory => match client.compact(session_id).await {
-                Ok(r) => {
-                    let dropped = r.dropped as usize;
-                    let after = r.after_tokens as usize;
-                    app.push_system_message(format!(
-                        "Compacted: {dropped} messages dropped, ~{after} tokens remain"
-                    ));
-                }
+                Ok(r) => app.push_system_message(compact_report(r.before_tokens, r.after_tokens)),
                 Err(e) => app.push_system_message(format!("Compact failed: {e}")),
             },
             AppAction::ClearHistory => match client.clear_history(session_id).await {
@@ -1519,7 +1609,7 @@ async fn run_event_loop(
             }
             AppAction::LoadSession { id } => {
                 // Clear existing UI state before loading a new session.
-                app.cells.clear();
+                app.reset_transcript();
                 app.session_prompt_tokens = 0;
                 app.session_completion_tokens = 0;
                 app.last_prompt_tokens = 0;
@@ -1857,9 +1947,10 @@ async fn run_event_loop(
                     .take()
                     .unwrap_or(CollaborationMode::Execute);
                 if app.config.conversation.collaboration_mode != restored {
-                    app.config.conversation.collaboration_mode = restored;
+                    app.set_mode(restored);
                     app.push_system_message(format!("[mode: {restored}]"));
                 }
+                sync_collaboration_mode(app, client).await;
 
                 let proceed_msg = if clear_context {
                     // Extract plan text before clearing so the agent knows what to do
@@ -1880,7 +1971,7 @@ async fn run_event_loop(
                     if let Err(e) = client.clear_history(session_id).await {
                         tracing::warn!(error = %e, "PlanProceed clear_history failed");
                     }
-                    app.cells.clear();
+                    app.reset_transcript();
                     app.session_prompt_tokens = 0;
                     app.session_completion_tokens = 0;
                     app.last_prompt_tokens = 0;
@@ -2126,7 +2217,11 @@ async fn run_event_loop(
                             app.push_system_message(format_check_outcome(current, latest));
                         }
                         Err(e) => {
-                            app.push_system_message(format!("Update check failed: {e:#}"));
+                            tracing::warn!("update check failed: {e:#}");
+                            app.push_system_message(format!(
+                                "Update check failed. {}",
+                                cortex::update::describe_update_error(&e)
+                            ));
                         }
                     }
                 } else {
@@ -2139,7 +2234,11 @@ async fn run_event_loop(
                             app.push_system_message(format_install_outcome(&result));
                         }
                         Err(e) => {
-                            app.push_system_message(format!("Update failed: {e:#}"));
+                            tracing::warn!("update failed: {e:#}");
+                            app.push_system_message(format!(
+                                "Update failed. {}",
+                                cortex::update::describe_update_error(&e)
+                            ));
                         }
                     }
                 }
@@ -2371,6 +2470,19 @@ mod tests {
     /// Forbidden escape-sequence modes. Presence of ANY of these in the code
     /// paths that emit ANSI to the terminal will break native text selection.
     const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
+
+    /// `/compact` on a short chat printed "33 messages dropped, ~33 tokens
+    /// remain": the before-size was shown as a message count.
+    #[test]
+    fn compact_report_speaks_in_tokens_and_admits_a_no_op() {
+        assert_eq!(
+            compact_report(33, 33),
+            "Nothing to compact yet (~33 tokens of history)."
+        );
+        let done = compact_report(12_000, 3_000);
+        assert!(done.contains("~12000 → ~3000 tokens"), "{done}");
+        assert!(!done.contains("messages"), "{done}");
+    }
 
     /// Regression: a refused steer was only logged, while the screen still
     /// said it was queued and the composer had been cleared.

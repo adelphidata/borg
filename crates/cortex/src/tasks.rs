@@ -345,8 +345,7 @@ pub fn calculate_next_run(
 ) -> Result<Option<i64>> {
     match schedule_type {
         SCHEDULE_TYPE_CRON => {
-            let schedule = Schedule::from_str(schedule_expr)
-                .with_context(|| format!("Invalid cron expression: {schedule_expr}"))?;
+            let schedule = parse_cron_schedule(schedule_expr)?;
             let next = match resolve_cron_timezone(timezone) {
                 Some(tz) => schedule.upcoming(tz).next().map(|t| t.timestamp()),
                 None => schedule.upcoming(Utc).next().map(|t| t.timestamp()),
@@ -857,8 +856,7 @@ pub fn validate_timezone(timezone: &str) -> Result<()> {
 pub fn validate_schedule(schedule_type: &str, schedule_expr: &str) -> Result<()> {
     match schedule_type {
         SCHEDULE_TYPE_CRON => {
-            Schedule::from_str(schedule_expr)
-                .with_context(|| format!("Invalid cron expression: {schedule_expr}"))?;
+            parse_cron_schedule(schedule_expr)?;
             Ok(())
         }
         SCHEDULE_TYPE_INTERVAL => {
@@ -913,6 +911,79 @@ pub fn convert_5_to_7_field(expr: &str) -> String {
     format!("0 {} *", expr.trim())
 }
 
+/// Parse a cron expression the way crontab reads it.
+///
+/// The `cron` crate wants 6 or 7 fields (leading seconds), so a 5-field
+/// expression is widened with `convert_5_to_7_field` first. The crate also
+/// numbers weekdays 1=Sunday..7=Saturday, where crontab — and every prompt,
+/// doc and person — uses 0/7=Sunday, 1=Monday..6=Saturday. Read raw,
+/// `0 9 * * 1-5` ("weekdays") would fire Sunday to Thursday and `0` would be
+/// refused, so numeric weekdays are rewritten as day names before parsing.
+pub fn parse_cron_schedule(expr: &str) -> Result<Schedule> {
+    let widened = if expr.split_whitespace().count() == 5 {
+        convert_5_to_7_field(expr)
+    } else {
+        expr.to_string()
+    };
+    let mut fields: Vec<String> = widened.split_whitespace().map(str::to_string).collect();
+    if let Some(dow) = fields.get_mut(5) {
+        *dow = crontab_weekdays_as_names(dow)
+            .with_context(|| format!("Invalid cron expression: {expr}"))?;
+    }
+    Schedule::from_str(&fields.join(" "))
+        .with_context(|| format!("Invalid cron expression: {expr}"))
+}
+
+const WEEKDAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// Rewrite a crontab day-of-week field (`1-5`, `0,6`, `*/2`, `7`) as day
+/// names (`MON,TUE,WED,THU,FRI`). Parts that are already names, and a bare
+/// `*`/`?`, pass through unchanged.
+fn crontab_weekdays_as_names(field: &str) -> Result<String> {
+    if field == "*" || field == "?" {
+        return Ok(field.to_string());
+    }
+    let day = |s: &str| -> Result<usize> {
+        let n: usize = s.parse().with_context(|| format!("bad weekday '{s}'"))?;
+        anyhow::ensure!(n <= 7, "weekday {n} is out of range 0-7");
+        Ok(n % 7)
+    };
+    let mut parts = Vec::new();
+    for part in field.split(',') {
+        let (base, step) = match part.split_once('/') {
+            Some((b, s)) => (b, Some(s)),
+            None => (part, None),
+        };
+        if base.chars().any(|c| c.is_ascii_alphabetic()) {
+            parts.push(part.to_string());
+            continue;
+        }
+        let (lo, hi) = match base.split_once('-') {
+            Some((a, b)) => (day(a)?, if b.trim() == "7" { 7 } else { day(b)? }),
+            None if base == "*" => (0, 6),
+            // crontab: `n/step` runs from n to the end of the range.
+            None if step.is_some() => (day(base)?, 6),
+            None => (day(base)?, day(base)?),
+        };
+        anyhow::ensure!(lo <= hi, "weekday range '{base}' runs backwards");
+        let step: usize = match step {
+            Some(s) => s
+                .parse()
+                .with_context(|| format!("bad weekday step '{s}'"))?,
+            None => 1,
+        };
+        anyhow::ensure!(step > 0, "weekday step must be at least 1");
+        parts.extend(
+            (lo..=hi)
+                .step_by(step)
+                .map(|d| WEEKDAY_NAMES[d % 7].to_string()),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    parts.retain(|p| seen.insert(p.clone()));
+    Ok(parts.join(","))
+}
+
 /// Parse a combined cron line like "*/5 * * * * echo hello" (Linux crontab format).
 /// Returns (seven_field_cron_expr, command).
 /// The first 5 whitespace-separated tokens are the cron schedule, the rest is the command.
@@ -926,7 +997,7 @@ pub fn parse_cron_line(line: &str) -> Result<(String, String)> {
     let cron_5 = parts[..5].join(" ");
     let command = parts[5].trim().to_string();
     let cron_7 = convert_5_to_7_field(&cron_5);
-    Schedule::from_str(&cron_7).with_context(|| format!("Invalid cron expression: {cron_5}"))?;
+    parse_cron_schedule(&cron_7).with_context(|| format!("Invalid cron expression: {cron_5}"))?;
     Ok((cron_7, command))
 }
 
@@ -1369,6 +1440,63 @@ mod tests {
     #[test]
     fn convert_5_to_7_field_specific() {
         assert_eq!(convert_5_to_7_field("0 3 * * *"), "0 0 3 * * * *");
+    }
+
+    /// Weekdays follow crontab (0/7=Sun, 1=Mon..6=Sat), not the `cron`
+    /// crate's 1=Sun numbering — `1-5` must mean Monday to Friday.
+    #[test]
+    fn cron_weekdays_fire_on_the_crontab_days() {
+        use chrono::{Datelike, Weekday::*};
+        let fire_days = |expr: &str| {
+            let mut days: Vec<_> = parse_cron_schedule(expr)
+                .unwrap_or_else(|e| panic!("{expr}: {e:#}"))
+                .upcoming(Utc)
+                .take(14)
+                .map(|t| t.weekday())
+                .collect();
+            days.sort_by_key(|d| d.num_days_from_sunday());
+            days.dedup();
+            days
+        };
+        let cases: &[(&str, &[chrono::Weekday])] = &[
+            ("0 9 * * 1-5", &[Mon, Tue, Wed, Thu, Fri]),
+            ("0 0 9 * * 1-5", &[Mon, Tue, Wed, Thu, Fri]),
+            ("0 0 9 * * 1-5 *", &[Mon, Tue, Wed, Thu, Fri]),
+            ("0 9 * * 0", &[Sun]),
+            ("0 9 * * 7", &[Sun]),
+            ("0 9 * * 0,6", &[Sun, Sat]),
+            ("0 9 * * 5-7", &[Sun, Fri, Sat]),
+            ("0 9 * * */2", &[Sun, Tue, Thu, Sat]),
+            ("0 9 * * 1/3", &[Mon, Thu]),
+            ("0 9 * * MON-FRI", &[Mon, Tue, Wed, Thu, Fri]),
+        ];
+        for (expr, want) in cases {
+            assert_eq!(fire_days(expr), want.to_vec(), "{expr}");
+        }
+        for bad in ["0 9 * * 8", "0 9 * * 5-2", "0 9 * * */0"] {
+            assert!(parse_cron_schedule(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn five_field_cron_schedules_a_prompt_task_like_its_seven_field_form() {
+        validate_schedule("cron", "* * * * *").expect("5-field cron must validate");
+        let now = Utc::now().timestamp();
+        let next = calculate_next_run("cron", "*/5 * * * *", "UTC")
+            .unwrap()
+            .unwrap();
+        assert!(next > now && next <= now + 300, "next={next} now={now}");
+        assert_eq!(next % 300, 0, "*/5 fires on a 5-minute boundary");
+        assert_eq!(
+            next,
+            calculate_next_run("cron", "0 */5 * * * * *", "UTC")
+                .unwrap()
+                .unwrap()
+        );
+        assert!(
+            validate_schedule("cron", "* * * *").is_err(),
+            "4 fields stay invalid"
+        );
     }
 
     #[test]

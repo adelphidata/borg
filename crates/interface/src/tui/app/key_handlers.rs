@@ -74,7 +74,7 @@ impl<'a> App<'a> {
         } else {
             self.previous_collab_mode = None;
         }
-        self.config.conversation.collaboration_mode = next;
+        self.set_mode(next);
         self.push_system_message(format!("[mode: {next}]"));
         self.toast_info(format!("Mode → {next}"));
     }
@@ -366,7 +366,7 @@ impl<'a> App<'a> {
                     && matches!(self.cells[len - 1], HistoryCell::System { .. })
                     && matches!(self.cells[len - 2], HistoryCell::User { .. })
                 {
-                    self.cells.truncate(len - 2);
+                    self.truncate_cells(len - 2);
                 }
             }
         } else if key.code == KeyCode::Enter {
@@ -631,7 +631,7 @@ impl<'a> App<'a> {
                         .count()
                         - 1;
                     self.backtrack = BacktrackPhase::Inactive;
-                    self.cells.truncate(cell_idx);
+                    self.truncate_cells(cell_idx);
                     self.composer.set_text(&text);
                     return Ok(Some(AppAction::RewindTo {
                         nth_user_message: nth,

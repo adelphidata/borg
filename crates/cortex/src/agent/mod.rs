@@ -1053,6 +1053,12 @@ impl Agent {
             .last()
             .ok_or_else(|| anyhow!("This conversation is empty. Send a message to start it."))?;
 
+        // A turn stopped before its first token leaves the user's message last.
+        if last.role == Role::User {
+            return Err(anyhow!(
+                "The turn was stopped before any reply was written, so there is nothing to resume. Send the request again."
+            ));
+        }
         let partial = match (&last.role, last.text_content()) {
             (&Role::Assistant, Some(text)) => interrupted::strip_interruption_marker(text),
             _ => None,

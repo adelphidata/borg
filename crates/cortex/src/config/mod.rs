@@ -400,7 +400,26 @@ impl Config {
             }
         }
         config.adopt_stored_api_key(&stored_keys);
+        config.adopt_default_model();
         config
+    }
+
+    /// Fill an unset `model` with the provider's recommended catalog model.
+    ///
+    /// A provider picked without a model (`borg settings set provider …`, or a
+    /// Settings change that never reached the model picker) otherwise sends an
+    /// empty model id, and every turn and scheduled run fails upstream with a
+    /// 400. Providers with no recommended model (custom, local) stay empty.
+    pub fn adopt_default_model(&mut self) {
+        if !self.llm.model.is_empty() {
+            return;
+        }
+        let Some(provider) = self.llm.provider.as_deref() else {
+            return;
+        };
+        if let Some(model) = crate::llm::model_catalog::default_model(provider) {
+            self.llm.model = model;
+        }
     }
 
     /// Fold the `credentials.{provider}` row written by `Admin.SetApiKey`

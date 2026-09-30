@@ -156,8 +156,12 @@ describe("HealthPage", () => {
     await waitFor(() => expect(screen.getByText("Reduced")).toBeTruthy());
     expect(screen.getByText(/Needs you: Security posture/)).toBeTruthy();
 
+    // The hero must not show a check mark while something needs the user.
+    expect(screen.getByText("!")).toBeTruthy();
+
     click("Security posture");
-    expect(screen.getByText(/reduced protections/)).toBeTruthy();
+    // The detail names the next step, not only the problem.
+    expect(screen.getByText(/reduced protections.*Run `borg doctor`/)).toBeTruthy();
   });
 
   it("says check-ins are off rather than counting down to one that never comes", async () => {
@@ -310,6 +314,8 @@ describe("HealthPage", () => {
     expect(screen.queryByText("Borg is healthy.")).toBeNull();
     expect(screen.queryByText("Borg needs a look.")).toBeNull();
     expect(screen.getByText("Some checks did not answer.")).toBeTruthy();
+    expect(screen.getByText("?")).toBeTruthy();
+    expect(screen.queryByText("!")).toBeNull();
     expect(screen.getByText(new RegExp(`No answer from: ${row}\\. Try again`))).toBeTruthy();
     // Its dot is neutral grey, neither the healthy green nor the alert red.
     const dot = dotOf(row);

@@ -569,6 +569,13 @@ pub struct App<'a> {
     /// so the post-turn review overlay can restore it on "Proceed". `None` when the
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
+    /// Set by [`App::set_mode`] until the event loop has written the mode to
+    /// the daemon. The daemon gates every tool call on its own copy of the
+    /// mode, so a change the TUI kept to itself would leave Plan read-write.
+    pub mode_sync_pending: bool,
+    /// The daemon's session host for this TUI. Per-conversation RPCs resolve
+    /// the live conversation from it with `DaemonClient::live_session_id`.
+    pub host_session_id: String,
     pub pairing_popup: PairingPopup,
     pub sessions_popup: SessionsPopup,
     pub schedule_popup: SchedulePopup,
@@ -606,6 +613,13 @@ pub struct App<'a> {
     /// Ctrl+C the way an inline `.await` in the event loop would.
     pub shell_result_rx: Option<mpsc::UnboundedReceiver<ShellRunResult>>,
     pub shell_result_tx: Option<mpsc::UnboundedSender<ShellRunResult>>,
+    /// Results of slow slash commands (`/heal`, `/dream`, `/reload`), shown
+    /// as system messages. See [`App::run_in_background`].
+    pub notice_rx: Option<mpsc::UnboundedReceiver<String>>,
+    pub notice_tx: mpsc::UnboundedSender<String>,
+    /// Events of turns this TUI did not start (a `/heartbeat` fire, a
+    /// message sent from another window). See [`App::process_external_event`].
+    pub external_rx: Option<mpsc::Receiver<AgentEvent>>,
     /// Transient corner notifications; auto-expire.
     pub toasts: super::toast::ToastStack,
     /// Shared daemon client for admin RPCs from popups + commands.
@@ -653,6 +667,7 @@ impl<'a> App<'a> {
         let blocked_paths = config.security.blocked_paths.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let file_search = FileSearchService::spawn(cwd, blocked_paths);
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
         let mut app = Self {
             cells: Vec::new(),
             state: AppState::Idle,
@@ -699,6 +714,8 @@ impl<'a> App<'a> {
             plan_overlay: PlanOverlay::new(),
             transcript_pager: TranscriptPager::new(),
             previous_collab_mode: None,
+            mode_sync_pending: false,
+            host_session_id: String::new(),
             pairing_popup: PairingPopup::new(),
             sessions_popup: SessionsPopup::new(),
             schedule_popup: SchedulePopup::new(),
@@ -722,6 +739,9 @@ impl<'a> App<'a> {
             doctor_rx: None,
             shell_result_rx: None,
             shell_result_tx: None,
+            notice_rx: Some(notice_rx),
+            notice_tx,
+            external_rx: None,
             toasts: super::toast::ToastStack::new(),
             client,
             goal_status: None,

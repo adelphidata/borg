@@ -143,6 +143,57 @@ impl Database {
         Ok(())
     }
 
+    /// Recompute the upcoming `next_run` of every active cron task.
+    ///
+    /// Cron weekdays used to be read the `cron` crate's way (1 = Sunday), so
+    /// `1-5` meant Sunday–Thursday and `7` meant Saturday. They are now read
+    /// the crontab way, but a stored `next_run` was computed under the old
+    /// reading and would fire once on the wrong day before the scheduler
+    /// re-anchored it. Only future slots are touched: an overdue one is a
+    /// missed run the scheduler still owes. Safe to repeat — for a task whose
+    /// stored slot is already right, the next slot after now is that slot.
+    pub(super) async fn migrate_v5(&self) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, schedule_expr, timezone, next_run FROM scheduled_tasks \
+                 WHERE status = 'active' AND schedule_type = ?1 AND next_run > ?2",
+                params![crate::tasks::SCHEDULE_TYPE_CRON, now],
+            )
+            .await?;
+        let mut moved = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let (id, expr, tz, stored) = (
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+                row.get::<i64>(3)?,
+            );
+            match crate::tasks::calculate_next_run(crate::tasks::SCHEDULE_TYPE_CRON, &expr, &tz) {
+                Ok(Some(next)) if next != stored => moved.push((id, next)),
+                Ok(_) => {}
+                // The scheduler reports a bad expression on its own run.
+                Err(e) => tracing::warn!(task = %id, error = %e, "cron re-anchor skipped"),
+            }
+        }
+        for (id, next) in &moved {
+            self.conn
+                .execute(
+                    "UPDATE scheduled_tasks SET next_run = ?1 WHERE id = ?2",
+                    params![*next, id.as_str()],
+                )
+                .await?;
+        }
+        if !moved.is_empty() {
+            tracing::info!(
+                count = moved.len(),
+                "re-anchored cron tasks to crontab weekdays"
+            );
+        }
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -1454,6 +1505,67 @@ mod tests {
             rows.iter().all(|t| !t.run_now_requested),
             "the marker defaults to unset on upgraded rows"
         );
+    }
+
+    /// A "Sunday 04:00" task stored with next_run on a Saturday (the old
+    /// weekday reading) must move to the Sunday on upgrade, so it does not
+    /// fire once on the wrong day. An overdue slot is a missed run the
+    /// scheduler still owes, and a paused task is not scheduled at all:
+    /// neither may move.
+    #[tokio::test]
+    async fn upgrade_moves_future_cron_slots_to_crontab_weekdays() {
+        use chrono::{Datelike, TimeZone, Weekday};
+        let db = Database::test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        // Some Saturday 04:00 UTC at least a week out.
+        let mut sat = chrono::Utc::now().date_naive() + chrono::Duration::days(7);
+        while sat.weekday() != Weekday::Sat {
+            sat += chrono::Duration::days(1);
+        }
+        let wrong_sat = chrono::Utc
+            .from_utc_datetime(&sat.and_hms_opt(4, 0, 0).unwrap())
+            .timestamp();
+        let new = |id: &'static str, next_run: i64| crate::db::NewTask {
+            id,
+            name: id,
+            prompt: "p",
+            schedule_type: crate::tasks::SCHEDULE_TYPE_CRON,
+            schedule_expr: "0 0 4 * * 7",
+            timezone: "UTC",
+            next_run: Some(next_run),
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        };
+        db.create_task(&new("future", wrong_sat)).await.unwrap();
+        db.create_task(&new("overdue", now - 3600)).await.unwrap();
+        db.create_task(&new("paused", wrong_sat)).await.unwrap();
+        db.update_task_status("paused", "paused").await.unwrap();
+        db.set_meta("schema_version", "4").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let next = |row: Option<crate::db::ScheduledTaskRow>| row.unwrap().next_run.unwrap();
+        let moved = next(db.get_task_by_id("future").await.unwrap());
+        let moved_at = chrono::Utc.timestamp_opt(moved, 0).unwrap();
+        assert_eq!(moved_at.weekday(), Weekday::Sun, "slot at {moved_at}");
+        assert!(
+            moved > now && moved < wrong_sat,
+            "the next Sunday, not a later one"
+        );
+        assert_eq!(
+            next(db.get_task_by_id("overdue").await.unwrap()),
+            now - 3600
+        );
+        assert_eq!(next(db.get_task_by_id("paused").await.unwrap()), wrong_sat);
     }
 
     /// A row written by the old CLI carries `"include": []`, which the

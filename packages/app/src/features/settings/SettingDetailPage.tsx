@@ -16,6 +16,7 @@ import type { ThemePreference } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
 import {
+  effectiveModel,
   modelsOf,
   providerLabel,
   providerOf,
@@ -197,7 +198,12 @@ function CatalogDetail({
 
   const status = setup.state === "ready" ? setup.data : undefined;
   const options = status ? catalogOptions(basic.catalog, status, provider) : [];
-  const listed = options.some((o) => o.value === entry.value);
+  // An empty model runs as the provider default, so that row is the one on.
+  const current =
+    status && basic.catalog === "model"
+      ? effectiveModel(status.providers, provider, entry.value)
+      : entry.value;
+  const listed = options.some((o) => o.value === current);
   const editing = options.length === 0 || (freeText ?? (!listed && entry.value !== ""));
 
   const chosen =
@@ -227,11 +233,11 @@ function CatalogDetail({
       {!editing && (
         <OptionPicker
           options={[...options, { value: SOMETHING_ELSE, label: "Something else…" }]}
-          value={entry.value}
+          value={current}
           disabled={saving}
           onPick={(v) => {
             if (v === SOMETHING_ELSE) setFreeText(true);
-            else if (v !== entry.value) void pick(v);
+            else if (v !== current) void pick(v);
           }}
         />
       )}

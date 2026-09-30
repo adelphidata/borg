@@ -10,8 +10,33 @@ describe("describeSchedule", () => {
     expect(describeSchedule("interval", "45")).toBe("every 45s");
   });
 
-  it("passes a cron expression through — there is no honest short form", () => {
-    expect(describeSchedule("cron", "0 8 * * *")).toBe("0 8 * * *");
+  it("says the common cron shapes in words, in every field count the daemon stores", () => {
+    const cases: [string, string][] = [
+      ["* * * * *", "every minute"],
+      ["0 * * * * * *", "every minute"],
+      ["*/5 * * * *", "every 5 minutes"],
+      ["15 * * * *", "hourly at :15"],
+      ["0 8 * * *", "daily at 08:00"],
+      ["0 0 3 * * *", "daily at 03:00"],
+      ["0 0 9 * * 1-5", "weekdays at 09:00"],
+      ["30 9 * * MON-FRI", "weekdays at 09:30"],
+      ["0 10 * * 0,6", "weekends at 10:00"],
+      // Crontab numbering: 7 and 0 are both Sunday.
+      ["0 0 4 * * 7", "every Sunday at 04:00"],
+      ["0 4 * * 1", "every Monday at 04:00"],
+      ["0 0 9 1 * *", "monthly on day 1 at 09:00"],
+    ];
+    for (const [expr, want] of cases) {
+      expect(describeSchedule("cron", expr), expr).toBe(want);
+    }
+  });
+
+  it("shows anything it cannot say honestly as crontab fields", () => {
+    expect(describeSchedule("cron", "0 9 * * 1,3")).toBe("0 9 * * 1,3");
+    expect(describeSchedule("cron", "0 0 9 * 1 *")).toBe("0 9 * 1 *");
+    // A non-zero seconds field is kept rather than silently dropped.
+    expect(describeSchedule("cron", "30 0 9 * * *")).toBe("30 0 9 * * *");
+    expect(describeSchedule("cron", "garbage")).toBe("garbage");
   });
 
   it("labels a one-shot task", () => {
@@ -60,8 +85,14 @@ describe("relativeTime", () => {
     expect(relativeTime(nowSeconds + 5 * 86400, now)).toBe("in 5 d");
   });
 
-  it("says overdue rather than showing a negative countdown", () => {
-    expect(relativeTime(nowSeconds - 60, now)).toBe("overdue");
+  it("says due now while the once-a-minute check has not picked a task up yet", () => {
+    expect(relativeTime(nowSeconds, now)).toBe("due now");
+    expect(relativeTime(nowSeconds - 60, now)).toBe("due now");
+  });
+
+  it("says overdue only past that grace, rather than a negative countdown", () => {
+    expect(relativeTime(nowSeconds - 91, now)).toBe("overdue");
+    expect(relativeTime(nowSeconds - 3600, now)).toBe("overdue");
   });
 
   it("shows a dash when there is no next run at all", () => {

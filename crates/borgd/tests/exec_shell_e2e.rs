@@ -136,3 +136,28 @@ async fn exec_shell_is_refused_when_shell_mode_is_disabled() {
     );
     drop(tmp);
 }
+
+/// `GetState` reads the session id that clients address `/goal` and
+/// `/heartbeat` to. It must not wait for work that holds the agent, or a
+/// command typed mid-turn stalls until the reply has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_is_readable_while_the_agent_is_busy() {
+    let (backend, _tmp, _guard) = backend().await;
+    let idle = backend.snapshot_state().expect("idle snapshot");
+
+    let holder = backend.clone();
+    let busy = tokio::spawn(async move { holder.exec_shell("sleep 3", 10_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let started = std::time::Instant::now();
+    let during = backend.snapshot_state().expect("busy snapshot");
+    let waited = started.elapsed();
+    assert!(!busy.is_finished(), "the command must still hold the agent");
+    assert!(
+        waited < std::time::Duration::from_secs(1),
+        "GetState waited {waited:?}"
+    );
+    assert_eq!(during.agent_session_id, idle.agent_session_id);
+
+    busy.await.expect("join").expect("exec_shell");
+}

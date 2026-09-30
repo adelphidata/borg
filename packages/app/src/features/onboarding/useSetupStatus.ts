@@ -47,6 +47,19 @@ export function modelsOf(providers: ProviderChoice[], provider: string): ModelCh
   return providerOf(providers, provider)?.models ?? [];
 }
 
+/**
+ * The model the daemon actually runs. An empty `model` setting is not "no
+ * model": the daemon adopts the provider's catalog default at load, so the
+ * screens name that default too.
+ */
+export function effectiveModel(
+  providers: ProviderChoice[],
+  provider: string,
+  model: string,
+): string {
+  return model !== "" ? model : (providerOf(providers, provider)?.defaultModel ?? "");
+}
+
 /** Short display name for a model id; the id itself when it is not curated. */
 export function modelLabel(providers: ProviderChoice[], provider: string, model: string): string {
   return modelsOf(providers, provider).find((m) => m.id === model)?.label ?? model;

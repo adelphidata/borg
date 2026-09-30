@@ -53,6 +53,7 @@ export function ConversationPage() {
     streamError,
     streamOutageSustained,
     send,
+    runCommand,
     retryLast,
     steer,
     cancel,
@@ -288,8 +289,12 @@ export function ConversationPage() {
       }
       aside={
         activityOpen ? (
-          // Empty resolves to the daemon's active session, which is this one.
-          <AgentPanel sessionId="" onClose={() => setActivityOpen(false)} />
+          // This conversation's own id: an empty one makes the daemon pick its
+          // most recent session, which a check-in or another window can own.
+          <AgentPanel
+            sessionId={opened.state === "ready" ? opened.data.agentSessionId : ""}
+            onClose={() => setActivityOpen(false)}
+          />
         ) : undefined
       }
     >
@@ -455,6 +460,7 @@ export function ConversationPage() {
           onSend={send}
           onSteer={steer}
           onCancel={cancel}
+          onCommand={runCommand}
         />
       </div>
     </PageChrome>

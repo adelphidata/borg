@@ -77,6 +77,21 @@ describe("ConnectionDetailPage for a provider", () => {
     expect(screen.getByText(/used 2 times/)).toBeTruthy();
   });
 
+  it("names a config slot as a key, not as a setting path", async () => {
+    const daemon = fakeDaemon(
+      withPool([
+        credential({
+          label: "llm.api_keys[0]",
+          sourceKind: "config",
+          sourceValue: "llm.api_keys[0]",
+        }),
+      ]),
+    );
+    mount("/connections/provider/openrouter", daemon);
+    await waitFor(() => expect(screen.getByText("Key 1")).toBeTruthy());
+    expect(screen.queryByText(/llm\.api_keys/)).toBeNull();
+  });
+
   it("says why a key is not usable", async () => {
     const daemon = fakeDaemon(withPool([credential({ status: "exhausted" })]));
     mount("/connections/provider/openrouter", daemon);

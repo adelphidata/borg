@@ -2562,6 +2562,34 @@ async fn a_new_turn_clears_a_stale_storage_fault() {
     );
 }
 
+/// Spec: a turn stopped before its first token has no partial reply. The
+/// refusal must say that, not claim the previous reply finished normally.
+#[tokio::test]
+async fn resuming_a_turn_stopped_before_its_reply_says_so() {
+    let mut agent = Agent::new(Config::default(), BorgMetrics::default())
+        .await
+        .expect("Agent::new must succeed without credentials");
+    agent.inject_history_message(Message::user("hello"));
+    agent.inject_history_message(Message::assistant("All done."));
+    agent.inject_history_message(Message::user("write a long story"));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let err = agent
+        .resume_interrupted_turn(tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .expect_err("a turn with no reply text is not resumable");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("before any reply") && !msg.contains("finished normally"),
+        "the refusal must not claim the reply finished: {msg}"
+    );
+    assert_eq!(
+        agent.history().len(),
+        3,
+        "a refused resume must not mutate history"
+    );
+}
+
 /// Spec: a resume must refuse when the last reply finished normally, and must
 /// leave the history exactly as it found it. Without the refusal the model
 /// would be asked to continue a finished answer, and a mutation-then-refuse

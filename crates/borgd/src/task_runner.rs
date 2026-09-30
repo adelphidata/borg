@@ -20,6 +20,14 @@ const PRE_RUN_OUTPUT_CAP: usize = 64 * 1024;
 /// task prompt and pre-run preamble.
 const SCHEDULED_TURN_MEMORY_TOKENS: usize = 4000;
 
+/// A scheduled prompt task is one completion with no tools; its data comes
+/// from `pre_run_command`. Unless the model is told so, a prompt like "read
+/// this file" gets an invented answer delivered as if it were real.
+pub const SCHEDULED_TASK_NO_TOOLS: &str =
+    "You have no tools in this run: you cannot read files, run commands, or browse. \
+     Work only from this prompt and any preprocessed context. If the task needs data \
+     you were not given, say plainly that it is missing; never guess or invent it.";
+
 /// Sentinel string the LLM may return to suppress channel delivery for a
 /// scheduled-task run. Re-exported from the shared silence module so the
 /// prompt text below and the detection logic can never disagree.
@@ -1175,6 +1183,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
          # Scheduled Task\nYou are executing a scheduled task: \"{task_name}\"\n\
          Respond with the task result. Be concise. \
+         {SCHEDULED_TASK_NO_TOOLS} \
          If the preprocessed context shows nothing actionable changed, \
          respond with exactly `{SILENT_SENTINEL}` on its own line to suppress delivery."
     );
@@ -1497,14 +1506,10 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                         .into_iter()
                         .find(|r| {
                             r.status == cortex::tasks::RUN_STATUS_SUCCESS
-                                && !matches!(
-                                    r.result.as_deref(),
-                                    Some("quiet_hours")
-                                        | Some("min_interval")
-                                        | Some("silent")
-                                        | Some("zero_info")
-                                        | Some("dedup_suppressed")
-                                )
+                                && !r
+                                    .result
+                                    .as_deref()
+                                    .is_some_and(|m| HEARTBEAT_SKIP_MARKERS.contains(&m))
                         })
                         .map(|r| r.started_at),
                     Err(e) => {
@@ -1818,13 +1823,34 @@ async fn record_run_completion(
 }
 
 async fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
+    debug_assert!(
+        HEARTBEAT_SKIP_MARKERS.contains(&reason),
+        "unlisted marker {reason}"
+    );
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
     let what = format!("skip-record ({reason})");
     record_run_completion(run_id, duration_ms, Some(reason), None, task_name, &what).await;
     tracing::info!(task = %task_name, reason, "heartbeat: skipped tick");
 }
 
+/// Every `result` a heartbeat run stores when it delivered nothing. The
+/// min-interval gate skips these rows when it looks for the last delivered
+/// run; a marker missing here makes a skipped run count as a delivery.
+/// The apps show these same strings in words (`SchedulesPage.tsx`).
+pub const HEARTBEAT_SKIP_MARKERS: &[&str] = &[
+    "quiet_hours",
+    "min_interval",
+    "silent",
+    "zero_info",
+    "dedup_suppressed",
+    "interactive_input_unavailable",
+];
+
 async fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
+    debug_assert!(
+        HEARTBEAT_SKIP_MARKERS.contains(&marker),
+        "unlisted marker {marker}"
+    );
     record_run_completion(
         run_id,
         duration_ms,

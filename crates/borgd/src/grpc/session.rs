@@ -664,12 +664,12 @@ impl Session for SessionSvc {
         req: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, TStatus> {
         let host = self.host_or_err(&req.into_inner().session_id)?;
-        let (dropped, after) = host
+        let (before, after) = host
             .compact()
             .await
             .map_err(|e| TStatus::internal(format!("compact: {e}")))?;
         Ok(Response::new(CompactResponse {
-            dropped: dropped as u64,
+            before_tokens: before as u64,
             after_tokens: after as u64,
         }))
     }

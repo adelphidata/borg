@@ -59,6 +59,92 @@ pub fn spawn_event_adapter(
     rx
 }
 
+/// Which of a session host's events this client has already shown.
+///
+/// A client sees its own turns on their `Send` stream. Turns the daemon
+/// starts itself — a `/heartbeat` fire, a turn sent from another window —
+/// reach it only on `Session.Stream`, which also repeats every event of its
+/// own turns. An event on that stream is new only when no turn of this
+/// client's own is open and its sequence number is past every one shown.
+#[derive(Default)]
+pub struct TurnWatch {
+    own_turn: std::sync::atomic::AtomicBool,
+    seen: std::sync::atomic::AtomicU64,
+}
+
+impl TurnWatch {
+    /// A watch that has already shown everything up to `seq` (the host's
+    /// last sequence number when the client opened it).
+    pub fn starting_at(seq: u64) -> Self {
+        let watch = Self::default();
+        watch.saw(seq);
+        watch
+    }
+
+    /// Call before sending, so the turn's events never count as external.
+    pub fn begin_own_turn(&self) {
+        self.own_turn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Call once the turn's own stream has been drained.
+    pub fn end_own_turn(&self) {
+        self.own_turn
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn saw(&self, seq: u64) {
+        self.seen
+            .fetch_max(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a `Session.Stream` event is one to show, recording it if so.
+    pub fn take_external(&self, seq: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.own_turn.load(SeqCst) {
+            return false;
+        }
+        self.seen.fetch_max(seq, SeqCst) < seq
+    }
+}
+
+/// Forward the turns this client did not start, for as long as `tx` is
+/// open. Re-subscribes after a dropped stream (a daemon restart), resuming
+/// after the last event shown.
+pub async fn watch_external_turns(
+    mut client: DaemonClient,
+    session_id: String,
+    watch: std::sync::Arc<TurnWatch>,
+    tx: mpsc::Sender<CoreEvent>,
+) {
+    loop {
+        let since = watch.seen.load(std::sync::atomic::Ordering::SeqCst);
+        match client.stream_events(&session_id, since).await {
+            Ok(mut stream) => loop {
+                match stream.message().await {
+                    Ok(Some(pb)) => {
+                        if watch.take_external(pb.event_seq)
+                            && !forward_one(pb, &client, &session_id, &tx).await
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "session event stream dropped; re-subscribing");
+                        break;
+                    }
+                }
+            },
+            Err(e) => tracing::debug!(error = %e, "session event stream unavailable; retrying"),
+        }
+        if tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Drain a `Streaming<PbEvent>` into an existing `mpsc::Sender<CoreEvent>`.
 ///
 /// Variant of [`spawn_event_adapter`] for callers that already own the
@@ -75,10 +161,14 @@ pub async fn forward_event_stream(
     session_id: String,
     mut stream: Streaming<PbEvent>,
     tx: mpsc::Sender<CoreEvent>,
+    watch: Option<&TurnWatch>,
 ) {
     loop {
         match stream.message().await {
             Ok(Some(pb)) => {
+                if let Some(w) = watch {
+                    w.saw(pb.event_seq);
+                }
                 if !forward_one(pb, &client, &session_id, &tx).await {
                     return;
                 }
@@ -390,6 +480,25 @@ mod tests {
             _ => panic!("expected TurnComplete"),
         }
         assert!(rx.recv().await.is_none(), "stream should be closed");
+    }
+
+    /// `Session.Stream` repeats the TUI's own turns and replays from the
+    /// open point; only a turn nobody here started may be shown, once.
+    #[test]
+    fn turn_watch_shows_only_new_external_events() {
+        let w = TurnWatch::starting_at(10);
+        assert!(!w.take_external(10), "already there when the TUI opened");
+        assert!(w.take_external(11), "a daemon-started turn");
+        assert!(!w.take_external(11), "never twice");
+
+        w.begin_own_turn();
+        w.saw(12); // the own turn's Send stream
+        assert!(!w.take_external(12), "own turn, seen on Send");
+        assert!(!w.take_external(13), "own turn, Stream got it first");
+        w.saw(13);
+        w.end_own_turn();
+        assert!(!w.take_external(13), "own event arriving late on Stream");
+        assert!(w.take_external(14), "the next daemon-started turn");
     }
 
     #[tokio::test]

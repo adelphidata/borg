@@ -80,6 +80,17 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("medium")).toBeNull();
   });
 
+  it("names the provider default when no model is set", async () => {
+    // The daemon adopts the catalog default for an empty `model`; a blank row
+    // would say Borg has no model when it is answering with one.
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSettings: { entries: [entry("provider", "anthropic"), entry("model", "")] },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Opus 5")).toBeTruthy());
+  });
+
   it("shows a value the options do not list exactly as stored", async () => {
     const daemon = fakeDaemon({
       ...DAEMON,

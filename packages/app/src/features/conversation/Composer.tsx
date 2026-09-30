@@ -72,6 +72,11 @@ interface ComposerProps {
   /** Resolves to false when the running turn did not take the text. */
   onSteer: (text: string) => Promise<boolean> | boolean | void;
   onCancel: () => void;
+  /**
+   * Takes a command with words after it (`/goal …`) before it can be sent or
+   * steered as prose. Returns false for anything that is not one.
+   */
+  onCommand?: (text: string) => boolean;
 }
 
 /**
@@ -92,6 +97,7 @@ export function Composer({
   onSend,
   onSteer,
   onCancel,
+  onCommand,
 }: ComposerProps) {
   const isMobile = useIsMobile();
   const [draft, setDraft] = useState("");
@@ -433,6 +439,17 @@ export function Composer({
       choosePath(pathCursor);
       return;
     }
+    // A command Borg runs itself wins over the menu: a bare `/goal` asks for
+    // the goal, and must not run whichever row the query happens to rank
+    // first (a settings toggle). It runs even mid-turn, as an instruction to
+    // Borg rather than prose to steer in.
+    const typed = draft.trim();
+    if (attachments.length === 0 && typed !== "" && onCommand?.(typed)) {
+      history.current.push(typed);
+      historyAt.current = null;
+      setDraft("");
+      return;
+    }
     // While a row is on offer the token is a menu query, not prompt text: the
     // daemon has no slash handler, so sending it would look like it worked and
     // do nothing. With nothing on offer it is just text — otherwise `/tmp` and
@@ -441,7 +458,7 @@ export function Composer({
       runCommand(slashCursor);
       return;
     }
-    const text = draft.trim();
+    const text = typed;
     if (text === "" && attachments.length === 0) return;
     // Before the conversation is open there is nowhere to send to, so the
     // message waits for it rather than vanishing.

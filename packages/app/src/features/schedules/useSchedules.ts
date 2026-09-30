@@ -47,14 +47,75 @@ export function describeSchedule(type: string, expr: string): string {
     return `every ${seconds}s`;
   }
   if (type === "once") return expr === "" ? "once" : `once — ${expr}`;
-  return expr;
+  return describeCron(expr);
 }
 
-/** "in 4 min", "in 2 h", or "overdue" — a clock time alone is hard to read. */
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_ABBR = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/** Crontab day-of-week (0/7 = Sunday, or a name) to an index, else null. */
+function weekdayIndex(field: string): number | null {
+  if (/^[0-7]$/.test(field)) return Number(field) % 7;
+  const i = DAY_ABBR.indexOf(field.toUpperCase().slice(0, 3));
+  return i >= 0 && /^[a-z]+$/i.test(field) ? i : null;
+}
+
+/**
+ * The common cron shapes in words ("weekdays at 09:00", "every 5 minutes").
+ * Anything else is shown as its five crontab fields — a sentence that guessed
+ * would be worse than the expression. Weekdays read the way the daemon now
+ * parses them: crontab numbering, 1-5 is Monday to Friday.
+ */
+export function describeCron(expr: string): string {
+  let fields = expr.trim().split(/\s+/);
+  // The daemon stores 6 (seconds first) or 7 (plus year) fields; drop both
+  // when they are the defaults, so the rest reads as a crontab line.
+  if (fields.length === 7 && fields[6] === "*") fields = fields.slice(0, 6);
+  if (fields.length === 6 && fields[0] === "0") fields = fields.slice(1);
+  if (fields.length !== 5) return expr;
+  const [min, hour, dom, mon, dow] = fields as [string, string, string, string, string];
+  const crontab = fields.join(" ");
+  const isNum = (s: string) => /^\d+$/.test(s);
+
+  if (dom !== "*" || mon !== "*") {
+    if (isNum(min) && isNum(hour) && isNum(dom) && mon === "*" && dow === "*") {
+      return `monthly on day ${dom} at ${clock(hour, min)}`;
+    }
+    return crontab;
+  }
+  if (hour === "*" && dow === "*") {
+    if (min === "*") return "every minute";
+    const step = /^\*\/(\d+)$/.exec(min);
+    if (step) return `every ${plural(Number(step[1]), "minute")}`;
+    if (isNum(min)) return `hourly at :${min.padStart(2, "0")}`;
+    return crontab;
+  }
+  if (!isNum(min) || !isNum(hour)) return crontab;
+  const at = clock(hour, min);
+  if (dow === "*") return `daily at ${at}`;
+  if (dow === "1-5" || dow.toUpperCase() === "MON-FRI") return `weekdays at ${at}`;
+  if (dow === "0,6" || dow === "6,0" || dow.toUpperCase() === "SAT,SUN") return `weekends at ${at}`;
+  const day = weekdayIndex(dow);
+  return day === null ? crontab : `every ${DAY_NAMES[day]} at ${at}`;
+}
+
+function clock(hour: string, min: string): string {
+  return `${hour.padStart(2, "0")}:${min.padStart(2, "0")}`;
+}
+
+/**
+ * How far past its slot a task can be and still be on schedule: the daemon
+ * checks for due tasks once a minute, so a task can sit up to a minute past
+ * its time before it starts.
+ */
+const DUE_GRACE_SECONDS = 90;
+
+/** "in 4 min", "in 2 h", "due now" or "overdue" — a clock time alone is hard to read. */
 export function relativeTime(unix: number, now: number): string {
   if (unix <= 0) return "—";
   const deltaSeconds = Math.round(unix - now / 1000);
-  if (deltaSeconds < 0) return "overdue";
+  if (deltaSeconds < -DUE_GRACE_SECONDS) return "overdue";
+  if (deltaSeconds <= 0) return "due now";
   if (deltaSeconds < 90) return `in ${deltaSeconds}s`;
   const minutes = Math.round(deltaSeconds / 60);
   if (minutes < 90) return `in ${minutes} min`;

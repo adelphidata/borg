@@ -916,3 +916,28 @@ fn resolve_provider_treats_an_example_placeholder_as_no_key() {
     let (_, key) = real.expect("a real key resolves");
     assert_eq!(key, "sk-or-v1-9f3a5c7e1b2d4f6a");
 }
+
+/// A provider with no model must not send an empty model id upstream:
+/// OpenRouter answers that with `400 No models provided`.
+#[test]
+fn provider_without_model_adopts_the_catalog_default() {
+    let rows = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let recommended = crate::llm::model_catalog::default_model("openrouter")
+        .expect("openrouter declares a recommended model");
+
+    let cfg = Config::from_setting_rows(rows(&[("provider", "openrouter")]));
+    assert_eq!(cfg.llm.model, recommended);
+
+    // An explicit model always wins over the recommendation.
+    let cfg = Config::from_setting_rows(rows(&[("provider", "openrouter"), ("model", "x/y")]));
+    assert_eq!(cfg.llm.model, "x/y");
+
+    // No provider yet: nothing to recommend, onboarding still owns the pick.
+    let cfg = Config::from_setting_rows(rows(&[]));
+    assert_eq!(cfg.llm.model, "");
+}

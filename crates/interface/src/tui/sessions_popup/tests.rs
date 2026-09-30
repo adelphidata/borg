@@ -31,6 +31,26 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// Each TUI start leaves an empty session; listing them buried the real ones
+/// under rows of "0 messages". A pinned empty one is kept on purpose.
+#[test]
+fn empty_sessions_are_left_out_unless_pinned() {
+    let with = |id: &str, count: u64, pinned: bool| SessionSummary {
+        message_count: count,
+        pinned,
+        ..make_session(id, id)
+    };
+    let kept: Vec<String> = listable(vec![
+        with("empty", 0, false),
+        with("talked", 3, false),
+        with("pinned-empty", 0, true),
+    ])
+    .into_iter()
+    .map(|s| s.id)
+    .collect();
+    assert_eq!(kept, ["talked", "pinned-empty"]);
+}
+
 /// The `*` pin marker is the only TUI signal distinguishing a pinned session;
 /// it must render for pinned rows and stay absent (aligned padding) for
 /// unpinned ones.

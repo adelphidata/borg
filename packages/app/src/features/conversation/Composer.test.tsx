@@ -258,6 +258,55 @@ describe("the composer's slash menu", () => {
     expect(onSteer).not.toHaveBeenCalled();
   });
 
+  it("hands a command with words to Borg, even mid-turn, instead of steering it", () => {
+    const onSteer = vi.fn();
+    const onSend = vi.fn();
+    const onCommand = vi.fn((text: string) => text.startsWith("/goal "));
+    const props = {
+      draftKey: draftKeyFor("s"),
+      conversationKey: "s",
+      onSend,
+      onSteer,
+      onCancel: noop,
+      onCommand,
+    };
+    render(<Composer busy {...props} />);
+
+    type("/goal Ship the notes");
+    enter();
+    expect(onCommand).toHaveBeenCalledWith("/goal Ship the notes");
+    expect(onSteer).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toHaveProperty("value", "");
+
+    // Anything the command hook declines is still ordinary text.
+    type("keep going");
+    enter();
+    expect(onSteer).toHaveBeenCalledWith("keep going");
+  });
+
+  it("runs a bare /goal rather than the menu row it happens to match", () => {
+    const toggle = vi.fn();
+    registry.commands = [command("setting:goals.enabled", "Enable /goal", toggle)];
+    const onCommand = vi.fn((text: string) => text === "/goal");
+    render(
+      <Composer
+        busy={false}
+        draftKey={draftKeyFor("s")}
+        conversationKey="s"
+        onSend={noop}
+        onSteer={noop}
+        onCancel={noop}
+        onCommand={onCommand}
+      />,
+    );
+
+    type("/goal");
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    enter();
+    expect(onCommand).toHaveBeenCalledWith("/goal");
+    expect(toggle).not.toHaveBeenCalled();
+  });
+
   it("moves the highlight with the arrows rather than the caret", () => {
     const second = vi.fn();
     registry.commands = [

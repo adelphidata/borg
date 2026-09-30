@@ -8,6 +8,7 @@ import {
   useRetryingServerStream,
   type QueryResult,
 } from "../../lib/useDaemon";
+import { parseArgCommand, runArgCommand } from "./argCommands";
 import { splitAttachments } from "./attachments";
 import { draftKeyFor, moveDraft } from "./draftStore";
 import { awaitingInput as awaitingInputOf, retirePrompts } from "./queuedTurn";
@@ -615,6 +616,11 @@ export interface Conversation {
   streamOutageSustained: boolean;
   send: (text: string, attachments?: Attachment[]) => void;
   /**
+   * Runs `/goal …` or `/heartbeat …` here and answers in the transcript.
+   * False when the text is not such a command.
+   */
+  runCommand: (text: string) => boolean;
+  /**
    * Runs the last user message again, in place of the turn that failed on it.
    * A no-op mid-turn, and when nothing has been sent yet.
    */
@@ -1033,6 +1039,39 @@ export function useConversation(target: string | undefined): Conversation {
   );
 
   /**
+   * Runs `/goal …` or `/heartbeat …` against this conversation and answers
+   * with a notice. False when `text` is not one of them, so the caller sends
+   * it as an ordinary message.
+   */
+  const runCommand = useCallback(
+    (text: string): boolean => {
+      const cmd = parseArgCommand(text);
+      if (!cmd || !sessionId) return false;
+      const forGeneration = generation.current;
+      const answer = (reply: string) => {
+        if (forGeneration !== generation.current) return;
+        setCells((prev) => [...prev, { kind: "notice", text: reply, at: Date.now() }]);
+      };
+      void (async () => {
+        // Asked fresh rather than read from the ref: an empty id makes the
+        // daemon pick its most recent session, which can be another
+        // conversation entirely.
+        const agentId = await borg.session.getState({ sessionId }).then(
+          (s) => s.agentSessionId || agentSessionId.current,
+          () => agentSessionId.current,
+        );
+        if (!agentId) {
+          answer("Borg could not find this conversation. Try again in a moment.");
+          return;
+        }
+        answer(await runArgCommand(borg, agentId, cmd));
+      })();
+      return true;
+    },
+    [borg, sessionId],
+  );
+
+  /**
    * Sends the last message again, when nothing came back the first time.
    *
    * `retryTarget` decides whether there is anything safe to re-run; see it for
@@ -1224,6 +1263,7 @@ export function useConversation(target: string | undefined): Conversation {
     streamError,
     streamOutageSustained: state.sustained,
     send,
+    runCommand,
     retryLast,
     steer,
     cancel,

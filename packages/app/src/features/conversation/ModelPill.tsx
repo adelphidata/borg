@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { CheckIcon } from "@borg/ui";
-import { modelLabel, modelsOf, useSetupStatus } from "../onboarding/useSetupStatus";
+import { effectiveModel, modelLabel, modelsOf, useSetupStatus } from "../onboarding/useSetupStatus";
 import { THINKING_OPTIONS } from "../settings/catalog";
 import { useKeybind } from "../../lib/keybinds";
 import { useSettings } from "../../lib/settings";
@@ -53,11 +53,11 @@ export function ModelPill() {
   useKeybind("cancel-turn", close, { enabled: open, inInputs: true });
 
   if (settings.state !== "ready") return null;
-  const model = settings.data.get("model")?.value ?? "";
   const provider = settings.data.get("provider")?.value ?? "";
+  const model = effectiveModel(catalog, provider, settings.data.get("model")?.value ?? "");
   const thinking = settings.data.get("llm.thinking")?.value ?? "";
-  // Nothing configured yet means onboarding has not run; a pill naming no
-  // model, opening a menu offering none, is worse than no pill.
+  // No model and no provider default means onboarding has not run; a pill
+  // naming no model, opening a menu offering none, is worse than no pill.
   if (model === "") return null;
 
   const models = modelsOf(catalog, provider);

@@ -431,6 +431,7 @@ impl Admin for AdminSvc {
                 .filter(|(r, _)| {
                     r.title.is_empty()
                         && !live.contains(&r.id)
+                        && crate::heartbeat::heartbeat_session_title(&r.id).is_none()
                         && counts.get(&r.id).is_some_and(|&n| n > 0)
                 })
                 .map(|(r, _)| r.id.clone())
@@ -450,6 +451,11 @@ impl Admin for AdminSvc {
                     .map(|(role, content)| (role.clone(), preview_line(content)))
                     .unwrap_or_default();
                 let mut title = healed.get(&r.id).cloned().unwrap_or(r.title.clone());
+                // Always, not only when blank: builds before this named it
+                // after its first message, "*heartbeat tick*".
+                if let Some(named) = crate::heartbeat::heartbeat_session_title(&r.id) {
+                    title = named.to_string();
+                }
                 if live.contains(&r.id) && !title.contains("(live)") {
                     title = format!("{title} (live)");
                 }

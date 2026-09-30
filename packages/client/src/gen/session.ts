@@ -347,8 +347,12 @@ export interface CompactRequest {
   sessionId: string;
 }
 
+/**
+ * Estimated history size before and after. Equal when there was nothing
+ * worth summarising yet.
+ */
 export interface CompactResponse {
-  dropped: number;
+  beforeTokens: number;
   afterTokens: number;
 }
 
@@ -5029,13 +5033,13 @@ export const CompactRequest: MessageFns<CompactRequest> = {
 };
 
 function createBaseCompactResponse(): CompactResponse {
-  return { dropped: 0, afterTokens: 0 };
+  return { beforeTokens: 0, afterTokens: 0 };
 }
 
 export const CompactResponse: MessageFns<CompactResponse> = {
   encode(message: CompactResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.dropped !== 0) {
-      writer.uint32(8).uint64(message.dropped);
+    if (message.beforeTokens !== 0) {
+      writer.uint32(8).uint64(message.beforeTokens);
     }
     if (message.afterTokens !== 0) {
       writer.uint32(16).uint64(message.afterTokens);
@@ -5055,7 +5059,7 @@ export const CompactResponse: MessageFns<CompactResponse> = {
             break;
           }
 
-          message.dropped = longToNumber(reader.uint64());
+          message.beforeTokens = longToNumber(reader.uint64());
           continue;
         }
         case 2: {
@@ -5077,7 +5081,11 @@ export const CompactResponse: MessageFns<CompactResponse> = {
 
   fromJSON(object: any): CompactResponse {
     return {
-      dropped: isSet(object.dropped) ? globalThis.Number(object.dropped) : 0,
+      beforeTokens: isSet(object.beforeTokens)
+        ? globalThis.Number(object.beforeTokens)
+        : isSet(object.before_tokens)
+        ? globalThis.Number(object.before_tokens)
+        : 0,
       afterTokens: isSet(object.afterTokens)
         ? globalThis.Number(object.afterTokens)
         : isSet(object.after_tokens)
@@ -5088,8 +5096,8 @@ export const CompactResponse: MessageFns<CompactResponse> = {
 
   toJSON(message: CompactResponse): unknown {
     const obj: any = {};
-    if (message.dropped !== 0) {
-      obj.dropped = Math.round(message.dropped);
+    if (message.beforeTokens !== 0) {
+      obj.beforeTokens = Math.round(message.beforeTokens);
     }
     if (message.afterTokens !== 0) {
       obj.afterTokens = Math.round(message.afterTokens);
@@ -5102,7 +5110,7 @@ export const CompactResponse: MessageFns<CompactResponse> = {
   },
   fromPartial<I extends Exact<DeepPartial<CompactResponse>, I>>(object: I): CompactResponse {
     const message = createBaseCompactResponse();
-    message.dropped = object.dropped ?? 0;
+    message.beforeTokens = object.beforeTokens ?? 0;
     message.afterTokens = object.afterTokens ?? 0;
     return message;
   },
