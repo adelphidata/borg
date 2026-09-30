@@ -158,6 +158,44 @@ describe("OnboardingPage with something already here", () => {
     expect(screen.getByPlaceholderText("OpenRouter API key")).toBeTruthy();
   });
 
+  it("does not ask to paste a key it found for a provider picked from the list", async () => {
+    // The screen leads with one detection; the others are just as found.
+    const { daemon, onDone } = mount({
+      GetSetupStatus: setupStatus({
+        detected: [
+          { provider: "openrouter", source: "dotenv", detail: "/home/me/.borg/.env" },
+          { provider: "anthropic", source: "env", detail: "ANTHROPIC_API_KEY" },
+        ],
+      }),
+    });
+    await waitFor(() => expect(screen.getByText("Use something else")).toBeTruthy());
+    fireEvent.click(screen.getByText("Use something else"));
+    fireEvent.click(screen.getByText("Anthropic"));
+    expect(screen.queryByPlaceholderText(/API key/)).toBeNull();
+    expect(screen.getByText(/Found your Anthropic key in ANTHROPIC_API_KEY/)).toBeTruthy();
+    fireEvent.click(start());
+    await waitFor(() => expect(onDone).toHaveBeenCalled());
+    expect(methods(daemon)).not.toContain("SetApiKey");
+    expect(daemon.calls.map((c) => c.request)).toContainEqual({
+      key: "provider",
+      value: "anthropic",
+    });
+  });
+
+  it("still asks for a key when the only detection is a local runtime", async () => {
+    mount({
+      GetSetupStatus: setupStatus({
+        detected: [{ provider: "groq", source: "ollama", detail: "" }],
+      }),
+    });
+    await waitFor(() => expect(screen.getByText("Use something else")).toBeTruthy());
+    fireEvent.click(screen.getByText("Use something else"));
+    fireEvent.click(screen.getByText("More providers"));
+    fireEvent.click(screen.getByText("Groq"));
+    expect(screen.getByPlaceholderText("Groq API key")).toBeTruthy();
+    expect(start().disabled).toBe(true);
+  });
+
   it("finishes in one click when a provider is already configured", async () => {
     const { daemon, onDone } = mount({
       GetSetupStatus: setupStatus({ configured: true, provider: "openrouter", model: "x" }),

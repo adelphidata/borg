@@ -33,6 +33,8 @@ const BODY = "mt-3.5 mb-0 text-[14.5px] leading-[1.62] text-pretty text-ink2";
 const QUIET =
   "cursor-pointer border-0 bg-transparent p-0 text-[12.5px] leading-none text-ink3 hover:text-ink";
 const PRIMARY = "px-[22px] py-[11px] text-[13px]";
+/** Detection sources that are an API key the daemon can already use. */
+const KEY_SOURCES = new Set(["env", "dotenv", "stored", "keychain", "pool"]);
 
 function Card({ children }: { children: React.ReactNode }) {
   return (
@@ -212,7 +214,12 @@ function Picker({
   const featured = providers.filter((p) => p.featured || p.id === providerId);
   const rest = providers.filter((p) => !featured.includes(p));
   const models = modelsOf(providers, providerId);
-  const needsKey = selected?.needsApiKey ?? false;
+  // A key the daemon already found for this provider is one nobody should
+  // have to paste again, whichever provider the screen led with.
+  const found = status.detected.find(
+    (d) => d.provider.toLowerCase() === providerId.toLowerCase() && KEY_SOURCES.has(d.source),
+  );
+  const needsKey = (selected?.needsApiKey ?? false) && found === undefined;
   const ready = selected !== undefined && (!needsKey || apiKey.trim() !== "");
 
   // The daemon's catalog can arrive after a refetch; keep the model in step
@@ -286,7 +293,9 @@ function Picker({
       )}
       {selected && !needsKey && (
         <p className="mt-4 mb-0 text-[12.5px] leading-[1.5] text-ink3">
-          Nothing to paste. {selected.blurb}
+          {found
+            ? `${detectionNote(providers, found)} Nothing to paste.`
+            : `Nothing to paste. ${selected.blurb}`}
         </p>
       )}
 
