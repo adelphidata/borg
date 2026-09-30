@@ -914,6 +914,18 @@ impl Agent {
         &self.config
     }
 
+    /// The config the next turn will run with. Hot reload applies only at the
+    /// start of a turn, so between turns [`Agent::config`] can trail a
+    /// settings change; anything that reports the session's provider or model
+    /// to a user must read this instead, or it names a model that will not
+    /// answer.
+    pub fn next_turn_config(&self) -> Config {
+        match &self.config_rx {
+            Some(rx) => rx.borrow().clone(),
+            None => self.config.clone(),
+        }
+    }
+
     pub fn config_mut(&mut self) -> &mut Config {
         &mut self.config
     }

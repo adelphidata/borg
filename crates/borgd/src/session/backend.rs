@@ -673,7 +673,7 @@ impl SessionBackend for AgentBackend {
     fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
         let agent = lock_agent(&self.agent);
         let session = agent.session();
-        let cfg = agent.config();
+        let cfg = agent.next_turn_config();
         let (msgs, users) = agent.conversation_stats();
         Ok(SessionStateSnapshot {
             agent_session_id: session.meta.id.clone(),

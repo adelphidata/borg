@@ -2629,3 +2629,26 @@ async fn a_resume_strips_the_marker_and_adds_no_user_message() {
         "a resume is a turn and must be counted as one"
     );
 }
+
+/// A settings change lands in the watch channel between turns, but the agent
+/// only swaps its config when the next turn starts. What the session reports
+/// as its model must be the one that will actually answer.
+#[test]
+fn next_turn_config_reports_a_pending_reload_before_the_turn_applies_it() {
+    let mut old = Config::default();
+    old.llm.model = "deepseek/deepseek-v4-flash".into();
+    let mut agent = minimal_test_agent(old.clone());
+    assert_eq!(agent.next_turn_config().llm.model, old.llm.model);
+
+    let (tx, rx) = tokio::sync::watch::channel(old);
+    agent.set_config_watcher(rx);
+    let mut new = Config::default();
+    new.llm.provider = Some("anthropic".into());
+    new.llm.model = "claude-haiku-4-5".into();
+    tx.send(new).unwrap();
+
+    assert_eq!(agent.config().llm.model, "deepseek/deepseek-v4-flash");
+    let next = agent.next_turn_config();
+    assert_eq!(next.llm.model, "claude-haiku-4-5");
+    assert_eq!(next.llm.provider.as_deref(), Some("anthropic"));
+}
