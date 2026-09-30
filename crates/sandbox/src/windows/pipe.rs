@@ -28,7 +28,8 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, FALSE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, TRUE,
+    CloseHandle, GetLastError, BOOL, ERROR_BROKEN_PIPE, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, TRUE,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -256,9 +257,13 @@ fn read_exact(h: HANDLE, mut buf: &mut [u8]) -> io::Result<()> {
         };
         if ok == FALSE {
             let err = unsafe { GetLastError() };
-            return Err(io::Error::from_raw_os_error(err as i32));
+            // An anonymous pipe whose write-end is closed reports
+            // ERROR_BROKEN_PIPE, not a zero-byte read. Both mean EOF.
+            if err != ERROR_BROKEN_PIPE {
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
         }
-        if read == 0 {
+        if ok == FALSE || read == 0 {
             // EOF before we got the bytes we wanted.
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

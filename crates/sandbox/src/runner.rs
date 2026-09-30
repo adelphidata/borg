@@ -858,6 +858,7 @@ mod tests {
         assert_eq!(output.stdout.trim(), "injected_value");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_timeout_returns_error() {
         let dir = tempfile::tempdir().unwrap();

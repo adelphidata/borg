@@ -1946,6 +1946,9 @@ mod tests {
         run(&["init", "-q"]);
         run(&["config", "user.email", "t@borg.test"]);
         run(&["config", "user.name", "borg-test"]);
+        // `git commit` can start a detached `maintenance --auto` that writes
+        // under `.git/objects` after the commit returns, racing the tests.
+        run(&["config", "maintenance.auto", "false"]);
         std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
         run(&["add", "a.txt"]);
         run(&["commit", "-qm", "init"]);
@@ -2109,20 +2112,23 @@ mod tests {
     }
 
     fn object_file_count(repo: &Path) -> usize {
-        fn count(dir: &Path) -> usize {
-            std::fs::read_dir(dir)
+        fn count(path: &Path) -> usize {
+            if !path.is_dir() {
+                return 1;
+            }
+            std::fs::read_dir(path)
                 .unwrap()
                 .flatten()
-                .map(|e| {
-                    if e.path().is_dir() {
-                        count(&e.path())
-                    } else {
-                        1
-                    }
-                })
+                .map(|e| count(&e.path()))
                 .sum()
         }
-        count(&repo.join(".git/objects"))
+        // `info/` holds metadata such as the commit-graph, not objects.
+        std::fs::read_dir(repo.join(".git/objects"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != "info")
+            .map(|e| count(&e.path()))
+            .sum()
     }
 
     #[tokio::test]

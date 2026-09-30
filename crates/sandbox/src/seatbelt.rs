@@ -371,7 +371,9 @@ pub fn generate_profile(
     Ok(profile)
 }
 
-#[cfg(test)]
+// Seatbelt profiles only accept `/`-rooted paths, which Windows paths never
+// are. The Linux and macOS lanes run these tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
