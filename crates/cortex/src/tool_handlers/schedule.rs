@@ -148,8 +148,19 @@ fn reject_system_task(task_id: &str, action: &str) -> Option<String> {
     }
 }
 
+/// Told to the model when `origin` was asked for where there is no chat
+/// channel to send to, so it does not promise the user a delivery.
+const ORIGIN_KEPT_WITH_TASK: &str = "\n  Delivery: results are kept with the task \
+     (the Scheduled page shows them). This conversation is not on a chat channel, \
+     so nothing will be sent into it.";
+
 /// Resolve an "origin" sentinel on `delivery_channel` to the concrete
 /// `(channel, target)` of the current gateway conversation.
+///
+/// Outside a gateway turn — the app, the TUI — there is no channel to send
+/// to, so `origin` resolves to no delivery: results stay with the task. The
+/// sentinel used to be stored as-is, and every run then failed as
+/// "misconfigured" while the user waited for a reply that could never come.
 fn resolve_origin_delivery(
     delivery_channel: Option<String>,
     delivery_target: Option<String>,
@@ -161,14 +172,7 @@ fn resolve_origin_delivery(
         return (Some(ch), delivery_target);
     }
     let Some(origin) = crate::gateway_context::current() else {
-        tracing::warn!(
-            "schedule: delivery_channel='origin' requested outside a gateway turn; \
-             leaving unresolved"
-        );
-        return (
-            Some(crate::heartbeat_task::ORIGIN_DELIVERY.to_string()),
-            delivery_target,
-        );
+        return (None, None);
     };
     let target_json = serde_json::json!({
         "sender": origin.sender_id,
@@ -179,6 +183,17 @@ fn resolve_origin_delivery(
     })
     .to_string();
     (Some(origin.channel_name), Some(target_json))
+}
+
+/// The note a create reply carries when `origin` had nowhere to go.
+fn origin_note(args: &serde_json::Value, resolved: Option<&str>) -> &'static str {
+    let asked = optional_str_param(args, "delivery_channel")
+        == Some(crate::heartbeat_task::ORIGIN_DELIVERY);
+    if asked && resolved.is_none() {
+        ORIGIN_KEPT_WITH_TASK
+    } else {
+        ""
+    }
 }
 
 /// What the `failure_delivery_channel` / `failure_delivery_target` parameters
@@ -220,11 +235,12 @@ fn parse_failure_route(args: &serde_json::Value) -> std::result::Result<FailureR
     if channel == tasks::FAILURE_DELIVERY_NONE {
         return Ok(FailureRouteArg::Set(channel.to_string(), None));
     }
-    let (resolved, target) = resolve_origin_delivery(Some(channel.to_string()), target);
-    Ok(FailureRouteArg::Set(
-        resolved.unwrap_or_else(|| channel.to_string()),
-        target,
-    ))
+    match resolve_origin_delivery(Some(channel.to_string()), target) {
+        (Some(resolved), target) => Ok(FailureRouteArg::Set(resolved, target)),
+        // `origin` with no chat channel behind it: failures follow the
+        // success route, which keeps them with the task.
+        (None, _) => Ok(FailureRouteArg::Clear),
+    }
 }
 
 async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Result<String> {
@@ -259,6 +275,7 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
         optional_str_param(args, "delivery_channel").map(str::to_string),
         optional_str_param(args, "delivery_target").map(str::to_string),
     );
+    let delivery_note = origin_note(args, delivery_channel.as_deref());
     let pre_run_command = optional_str_param(args, "pre_run_command").map(str::to_string);
     // A `pre_run_command` is a shell command too, and the runner gates it at
     // fire time. Refusing here as well means the model finds out now instead
@@ -343,7 +360,7 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
                 }
                 let state = if paused { " (paused)" } else { "" };
                 Ok(format!(
-                    "Scheduled task created: {task_name} (id: {}){state}",
+                    "Scheduled task created: {task_name} (id: {}){state}{delivery_note}",
                     &id[..8]
                 ))
             }
@@ -780,6 +797,7 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
         optional_str_param(args, "delivery_channel").map(str::to_string),
         optional_str_param(args, "delivery_target").map(str::to_string),
     );
+    let delivery_note = origin_note(args, delivery_channel.as_deref());
     let timeout_ms = optional_i64_param(args, "timeout_ms");
     let paused = optional_bool_param(args, "paused", false);
     let (failure_channel, failure_target) = match parse_failure_route(args) {
@@ -821,7 +839,7 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
             .await
         {
             Ok(()) => Ok(format!(
-                "Cron job created: {name} (id: {}){}\n  Schedule: {schedule}\n  Command: {command}",
+                "Cron job created: {name} (id: {}){}\n  Schedule: {schedule}\n  Command: {command}{delivery_note}",
                 &id[..8],
                 if paused { " (paused)" } else { "" },
             )),
@@ -969,6 +987,29 @@ mod tests {
             out.starts_with("Error: monitor_mode requires a pre_run_command"),
             "monitor_mode without a pre_run_command must be refused, got: {out}"
         );
+    }
+
+    /// Regression: a task asked to reply "here" from the app stored the
+    /// `origin` sentinel, and every run then failed as misconfigured while the
+    /// agent had told the user the reply would come to this conversation.
+    #[test]
+    fn origin_outside_a_chat_channel_keeps_results_with_the_task_and_says_so() {
+        assert_eq!(
+            resolve_origin_delivery(Some("origin".into()), Some("12345".into())),
+            (None, None)
+        );
+        let args = serde_json::json!({"delivery_channel": "origin"});
+        assert!(origin_note(&args, None).contains("nothing will be sent into it"));
+        // Failures follow the success route rather than storing the sentinel.
+        let failure = serde_json::json!({"failure_delivery_channel": "origin"});
+        assert_eq!(parse_failure_route(&failure), Ok(FailureRouteArg::Clear));
+        // A concrete channel is untouched and needs no note.
+        assert_eq!(
+            resolve_origin_delivery(Some("slack".into()), Some("C1".into())),
+            (Some("slack".into()), Some("C1".into()))
+        );
+        let slack = serde_json::json!({"delivery_channel": "slack"});
+        assert_eq!(origin_note(&slack, Some("slack")), "");
     }
 
     #[tokio::test]
