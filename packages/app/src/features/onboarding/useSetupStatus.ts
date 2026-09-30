@@ -15,6 +15,15 @@ export type ProviderChoice = admin.ProviderChoice;
 export type ModelChoice = admin.ModelChoice;
 export type DetectedCredential = admin.DetectedCredential;
 
+/** Detection sources that are an API key the daemon can already use. */
+export const KEY_SOURCES: ReadonlySet<string> = new Set([
+  "env",
+  "dotenv",
+  "stored",
+  "keychain",
+  "pool",
+]);
+
 export function useSetupStatus(): QueryResult<SetupStatus> {
   return useQuery((borg) => borg.admin.getSetupStatus({}));
 }

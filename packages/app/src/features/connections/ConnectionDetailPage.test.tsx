@@ -53,6 +53,20 @@ describe("ConnectionDetailPage for a provider", () => {
     expect(screen.getByText("Add a key")).toBeTruthy();
   });
 
+  it("says a key found on this computer is already in use, and where", async () => {
+    const daemon = fakeDaemon({
+      ...EMPTY,
+      GetSetupStatus: setupStatus({
+        detected: [{ provider: "anthropic", source: "dotenv", detail: "~/.borg/.env" }],
+      }),
+    });
+    mount("/connections/provider/anthropic", daemon);
+    await waitFor(() => expect(screen.getByText("Connected")).toBeTruthy());
+    expect(screen.getByText("~/.borg/.env")).toBeTruthy();
+    expect(screen.getByText("Replace the key")).toBeTruthy();
+    expect(screen.queryByText("Add a key")).toBeNull();
+  });
+
   it("lists each pooled key with where it came from", async () => {
     const daemon = fakeDaemon(
       withPool([credential({ sourceKind: "env", sourceValue: "OPENROUTER_API_KEY" })]),

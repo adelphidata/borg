@@ -68,7 +68,8 @@ function ProviderDetail({
 
   const entries = (conn?.entries ?? []).filter((e) => e.status !== "removed");
   const saved = conn?.apiKeyBackend;
-  const isConnected = entries.length > 0 || saved !== undefined;
+  const foundAt = conn?.foundAt;
+  const isConnected = entries.length > 0 || saved !== undefined || foundAt !== undefined;
   const blurb = catalog.find((p) => p.id === name)?.blurb;
 
   const submitKey = () => {
@@ -116,6 +117,16 @@ function ProviderDetail({
             >
               Forget
             </Pill>
+          </div>
+        </section>
+      )}
+
+      {foundAt && !saved && entries.length === 0 && (
+        <section>
+          <div className={SECTION_LABEL}>Key in use</div>
+          <div className="text-[13px] leading-[1.55] text-pretty text-ink2">
+            Borg is using the key it found in <span className="break-all text-ink">{foundAt}</span>.
+            Nothing to add — save a key below only to use a different one.
           </div>
         </section>
       )}
@@ -171,7 +182,7 @@ function ProviderDetail({
       )}
 
       <section>
-        <div className={SECTION_LABEL}>{saved ? "Replace the key" : "Add a key"}</div>
+        <div className={SECTION_LABEL}>{saved || foundAt ? "Replace the key" : "Add a key"}</div>
         <div className="flex items-center gap-2.5">
           <input
             type="password"

@@ -1,5 +1,6 @@
 import type { BorgClient, admin } from "@borg/client";
 import { useQuery, type QueryResult } from "../../lib/useDaemon";
+import { KEY_SOURCES } from "../onboarding/useSetupStatus";
 
 /**
  * What the connections surface is really made of: LLM provider credentials
@@ -18,6 +19,12 @@ export interface ProviderConnection {
   entries: admin.CredentialEntry[];
   /** Persisted per-provider key backend: "literal" | "keychain" | undefined. */
   apiKeyBackend?: string;
+  /**
+   * Where the daemon found a key on this machine — a variable name or a
+   * `.env` path, never the secret. It already works, so the provider is
+   * connected; offering to "add" it asked for a key Borg was already using.
+   */
+  foundAt?: string;
 }
 
 export interface ChannelConnection {
@@ -69,7 +76,7 @@ export async function loadConnections(borg: BorgClient): Promise<Connections> {
     // The catalog only supplies display names and the "Add" grid. It is the
     // heaviest of the five calls, so a slow probe must not take the page
     // down; `providerLabel` passes an unknown id straight through.
-    borg.admin.getSetupStatus({}).catch(() => ({ providers: [] })),
+    borg.admin.getSetupStatus({}).catch(() => ({ providers: [], detected: [] })),
   ]);
 
   const providers = new Map<string, ProviderConnection>();
@@ -95,6 +102,12 @@ export async function loadConnections(borg: BorgClient): Promise<Connections> {
   // Persisted keys (SetApiKey) count as connected even before the pool sees them.
   for (const k of apiKeys.entries) {
     if (k.backend !== "unset") providerOf(k.provider).apiKeyBackend = k.backend;
+  }
+
+  for (const d of setup.detected ?? []) {
+    if (!KEY_SOURCES.has(d.source)) continue;
+    const conn = providerOf(d.provider.toLowerCase());
+    conn.foundAt ??= d.detail || "this computer";
   }
 
   const channels = new Map<string, ChannelConnection>();

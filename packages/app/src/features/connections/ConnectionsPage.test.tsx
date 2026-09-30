@@ -92,6 +92,8 @@ describe("ConnectionsPage", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
     expect(screen.getByText("2 keys · fill first")).toBeTruthy();
+    // The tile opens its detail page, so the keyboard has to reach it.
+    expect(screen.getByRole("button", { name: /OpenRouter/ })).toBeTruthy();
   });
 
   it("counts a persisted key as connected before the pool has seen it", async () => {
@@ -149,6 +151,26 @@ describe("ConnectionsPage", () => {
     expect(screen.getByText("Anthropic")).toBeTruthy();
     // OpenRouter appears once, as a connected card, not again as an offer.
     expect(screen.getAllByText("OpenRouter")).toHaveLength(1);
+  });
+
+  it("counts a key found on this computer as connected, not as one to add", async () => {
+    // The daemon was already answering with this key; offering "Add
+    // Anthropic" asked the user to paste something Borg was using.
+    const daemon = fakeDaemon({
+      ...EMPTY,
+      GetSetupStatus: setupStatus({
+        detected: [
+          { provider: "anthropic", source: "dotenv", detail: "~/.borg/.env" },
+          // A CLI sign-in is not a key; it stays an offer.
+          { provider: "groq", source: "claude_cli", detail: "/usr/local/bin/claude" },
+        ],
+      }),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("key found on this computer")).toBeTruthy());
+    expect(screen.getAllByText("Anthropic")).toHaveLength(1);
+    expect(screen.getByText("Groq")).toBeTruthy();
+    expect(screen.getAllByText("key found on this computer")).toHaveLength(1);
   });
 
   it("does not offer a provider that has no key to paste", async () => {
