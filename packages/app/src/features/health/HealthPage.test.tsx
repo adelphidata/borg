@@ -334,11 +334,22 @@ describe("HealthPage", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not answer"), expect.anything());
   });
 
-  it("paints answered rows green and a failing one red", async () => {
-    mount(fakeDaemon({ ...HEALTHY, GetPosture: { posture: "Reduced", xpMultiplier: 0.85 } }));
+  it("paints answered rows green and a warning yellow, not red", async () => {
+    // Red is for something broken. Reduced protections and doctor warnings
+    // still work, so they are worth a look, not an alarm.
+    mount(
+      fakeDaemon({
+        ...HEALTHY,
+        GetPosture: { posture: "Reduced", xpMultiplier: 0.85 },
+        GetPersistentWarnings: { warnings: ["Sandbox: profile missing"] },
+      }),
+    );
     await waitFor(() => expect(screen.getByText("Borg needs a look.")).toBeTruthy());
-    expect(dotOf("Security posture").className).toContain("bg-alert");
-    expect(dotOf("Warnings").className).toContain("bg-neon");
+    expect(dotOf("Security posture").className).toContain("bg-warn");
+    expect(dotOf("Warnings").className).toContain("bg-warn");
+    expect(dotOf("Borg is running").className).toContain("bg-neon");
+    expect(screen.getByText("!").className).toContain("text-warn");
+    expect(document.querySelector(".border-alert")).toBeNull();
   });
 
   it("puts an alert ahead of a check that did not answer", async () => {

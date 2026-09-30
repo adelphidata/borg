@@ -8,6 +8,7 @@ import { StatusDot, type DotTone } from "./StatusDot";
 const ALL_TONES = Object.keys({
   ok: true,
   alert: true,
+  warn: true,
   busy: true,
   working: true,
   unread: true,
