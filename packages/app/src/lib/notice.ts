@@ -67,6 +67,11 @@ export function archivedMessage(title: string | undefined): string {
   return `Archived “${title || "conversation"}”`;
 }
 
+/** What a conversation's new name says once it has taken. */
+export function renamedMessage(title: string): string {
+  return `Renamed to “${title}”`;
+}
+
 /** Offers to bring `sessionId` back, replacing whatever was on offer. */
 export function offerRestore(sessionId: string, title: string | undefined): void {
   publish(archivedMessage(title), { sessionId });

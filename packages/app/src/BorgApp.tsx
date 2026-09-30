@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArchiveIcon,
+  PencilIcon,
   Menu,
   PinIcon,
   Sidebar,
@@ -16,7 +17,14 @@ import {
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
-import { clearNotice, offerRestore, showNotice, takeNotice, useNotice } from "./lib/notice";
+import {
+  clearNotice,
+  offerRestore,
+  renamedMessage,
+  showNotice,
+  takeNotice,
+  useNotice,
+} from "./lib/notice";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { usePopCount } from "./features/conversation/conversationUrl";
 import {
@@ -209,6 +217,19 @@ function Shell({ platform }: { platform: Platform }) {
     },
   );
 
+  // Typed in place on the sidebar row a right-click picked "Rename" on.
+  const [renamingId, setRenamingId] = useState<string>();
+  const renameSession = useMutation(
+    (borg, vars: { id: string; title: string }) => borg.admin.setSessionTitle(vars),
+    {
+      onSuccess: (_data, { title }) => {
+        sessionsChanged();
+        showNotice(renamedMessage(title));
+      },
+      onError: (e) => showNotice(`Could not rename the conversation: ${e.message}`),
+    },
+  );
+
   const notice = useNotice();
   const pinSession = useMutation(
     (borg, { id, pinned }: { id: string; pinned: boolean }) =>
@@ -297,6 +318,11 @@ function Shell({ platform }: { platform: Platform }) {
             onArchiveRecent={(id) => void archiveSession.run(id)}
             onRecentContextMenu={(id, at) => setRecentMenu({ id, at })}
             onPinRecent={(id, pinned) => void pinSession.run({ id, pinned })}
+            renamingId={renamingId}
+            onRenameRecent={(id, title) => {
+              setRenamingId(undefined);
+              if (title !== undefined) void renameSession.run({ id, title });
+            }}
             archiveError={archiveSession.error?.message}
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
@@ -317,9 +343,9 @@ function Shell({ platform }: { platform: Platform }) {
           onClose={() => setRecentMenu(undefined)}
           label="Conversation actions"
           at={recentMenu?.at}
-          // The sidebar row offers pinning and archiving and nothing else, so
-          // the menu offers exactly those. Right-click should reach what the row
-          // can do, not advertise capability it does not have here.
+          // What the row itself can do: be pinned, have its title typed over in
+          // place, or be archived. Right-click should reach what the row can do,
+          // not advertise capability it does not have here.
           actions={[
             {
               id: "pin",
@@ -328,6 +354,12 @@ function Shell({ platform }: { platform: Platform }) {
               onSelect: () => {
                 if (recentMenu) void pinSession.run({ id: recentMenu.id, pinned: !menuPinned });
               },
+            },
+            {
+              id: "rename",
+              label: "Rename",
+              icon: <PencilIcon size={13} />,
+              onSelect: () => setRenamingId(recentMenu?.id),
             },
             {
               id: "archive",
