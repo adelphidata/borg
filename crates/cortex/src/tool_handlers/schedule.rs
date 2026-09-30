@@ -185,6 +185,25 @@ fn resolve_origin_delivery(
     (Some(origin.channel_name), Some(target_json))
 }
 
+/// The zone a new task's clock times are read in.
+///
+/// The tool promises "local", but the scheduler reads `local` as UTC, so
+/// "every day at 08:00" asked for in New York ran at 04:00. Absent or
+/// `local` now means the user's zone: the `user.timezone` setting, else the
+/// host's. An explicit zone is kept as given.
+fn task_timezone(requested: Option<&str>, config: &Config) -> String {
+    match requested.map(str::trim) {
+        Some(tz) if !tz.is_empty() && !tz.eq_ignore_ascii_case("local") => tz.to_string(),
+        _ => config
+            .user
+            .timezone
+            .clone()
+            .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
+            .or_else(Config::detect_host_timezone)
+            .unwrap_or_else(|| "local".to_string()),
+    }
+}
+
 /// The note a create reply carries when `origin` had nowhere to go.
 fn origin_note(args: &serde_json::Value, resolved: Option<&str>) -> &'static str {
     let asked = optional_str_param(args, "delivery_channel")
@@ -250,9 +269,7 @@ async fn manage_tasks_create(args: &serde_json::Value, config: &Config) -> Resul
         .unwrap_or("interval")
         .to_string();
     let schedule_expr = require_str_param(args, "schedule_expr")?.to_string();
-    let timezone = optional_str_param(args, "timezone")
-        .unwrap_or("local")
-        .to_string();
+    let timezone = task_timezone(optional_str_param(args, "timezone"), config);
     if let Err(e) = tasks::validate_schedule(&schedule_type, &schedule_expr) {
         return Ok(invalid_schedule(e));
     }
@@ -780,7 +797,8 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
         return Ok(invalid_schedule(e));
     }
 
-    let next_run = match tasks::calculate_next_run("cron", &cron_7, "local") {
+    let timezone = task_timezone(None, config);
+    let next_run = match tasks::calculate_next_run("cron", &cron_7, &timezone) {
         Ok(nr) => nr,
         Err(e) => return Ok(invalid_schedule(e)),
     };
@@ -814,7 +832,7 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
                     prompt: &command,
                     schedule_type: "cron",
                     schedule_expr: &cron_7,
-                    timezone: "local",
+                    timezone: &timezone,
                     next_run,
                     max_retries: Some(0),
                     timeout_ms,
@@ -1010,6 +1028,22 @@ mod tests {
         );
         let slack = serde_json::json!({"delivery_channel": "slack"});
         assert_eq!(origin_note(&slack, Some("slack")), "");
+    }
+
+    /// Regression: "local" is what the tool promises, but the scheduler reads
+    /// it as UTC, so a morning task ran hours early or late.
+    #[test]
+    fn a_task_with_no_zone_runs_on_the_users_clock() {
+        let mut config = Config::default();
+        config.user.timezone = Some("America/New_York".into());
+        assert_eq!(task_timezone(None, &config), "America/New_York");
+        assert_eq!(task_timezone(Some("local"), &config), "America/New_York");
+        assert_eq!(task_timezone(Some("Europe/Paris"), &config), "Europe/Paris");
+        // A broken setting falls through to the host rather than to a zone
+        // the scheduler would reject.
+        config.user.timezone = Some("Not/AZone".into());
+        let fallback = task_timezone(None, &config);
+        assert_ne!(fallback, "Not/AZone");
     }
 
     #[tokio::test]
