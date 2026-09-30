@@ -66,7 +66,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
           fetch-depth: 0
       - name: Resolve version, tag, and commit
         id: meta
@@ -74,8 +73,18 @@ jobs:
           EVENT: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_MODE: ${{ inputs.mode }}
+          INPUT_REF: ${{ inputs.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          # checkout only takes full names, so a short SHA is resolved here and
+          # every later job builds the full SHA.
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            sha=$(git rev-parse -q --verify "origin/$INPUT_REF^{commit}" || git rev-parse -q --verify "$INPUT_REF^{commit}") || {
+              echo "::error::No branch, tag, or commit named '$INPUT_REF'"
+              exit 1
+            }
+            git checkout -q "$sha"
+          fi
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
             version="${INPUT_VERSION#v}"
             mode="$INPUT_MODE"
