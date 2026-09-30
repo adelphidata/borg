@@ -1481,6 +1481,28 @@ fn a_daemon_started_turn_opens_and_closes_like_an_own_one() {
 }
 
 #[test]
+fn an_out_of_band_event_while_idle_opens_no_turn() {
+    // Posture and budget notices are broadcast between turns, and a finished
+    // turn can trail a TurnComplete after its Error. Neither may leave the
+    // view streaming with nothing coming to end it.
+    let mut app = make_app();
+    app.process_external_event(AgentEvent::SystemNotice {
+        category: "posture".into(),
+        text: "posture-kiwi".into(),
+    });
+    app.process_external_event(AgentEvent::TurnComplete);
+    assert!(matches!(app.state, AppState::Idle));
+    assert!(app
+        .cells
+        .iter()
+        .any(|c| matches!(c, HistoryCell::System { text } if text == "posture-kiwi")));
+    assert!(!app
+        .cells
+        .iter()
+        .any(|c| matches!(c, HistoryCell::System { text } if text.contains("on its own"))));
+}
+
+#[test]
 fn channel_close_after_a_finished_plan_turn_keeps_plan_and_its_review() {
     // The event channel closes after every turn. A finished Plan turn must
     // stay in Plan with its review open; only a turn cut off mid-flight

@@ -42,8 +42,21 @@ impl<'a> App<'a> {
 
     /// Show an event from a turn this TUI did not start. The first one of
     /// such a turn opens it in the view, as a submit would for the user's own.
+    ///
+    /// Not every event on `Session.Stream` is a turn: posture and budget
+    /// notices are broadcast between turns, and a finished turn can trail a
+    /// `TurnComplete` after its terminal `Error`. Opening a turn for those
+    /// would leave the view streaming with nothing left to end it.
     pub fn process_external_event(&mut self, ev: AgentEvent) {
         if matches!(self.state, AppState::Idle) {
+            match ev {
+                AgentEvent::SystemNotice { .. } | AgentEvent::Error(_) => {
+                    self.process_agent_event(ev);
+                    return;
+                }
+                AgentEvent::TurnComplete | AgentEvent::Usage(_) => return,
+                _ => {}
+            }
             self.push_system_message("[Borg started a turn on its own]".to_string());
             self.enter_streaming();
         }

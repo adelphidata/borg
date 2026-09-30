@@ -959,7 +959,11 @@ fn crontab_weekdays_as_names(field: &str) -> Result<String> {
             continue;
         }
         let (lo, hi) = match base.split_once('-') {
-            Some((a, b)) => (day(a)?, if b.trim() == "7" { 7 } else { day(b)? }),
+            // A range end of 7 stays 7 so `5-7` and `7-7` do not wrap to 0.
+            Some((a, b)) => {
+                let end = |s: &str| if s.trim() == "7" { Ok(7) } else { day(s) };
+                (end(a)?, end(b)?)
+            }
             None if base == "*" => (0, 6),
             // crontab: `n/step` runs from n to the end of the range.
             None if step.is_some() => (day(base)?, 6),
@@ -1466,6 +1470,7 @@ mod tests {
             ("0 9 * * 7", &[Sun]),
             ("0 9 * * 0,6", &[Sun, Sat]),
             ("0 9 * * 5-7", &[Sun, Fri, Sat]),
+            ("0 9 * * 7-7", &[Sun]),
             ("0 9 * * */2", &[Sun, Tue, Thu, Sat]),
             ("0 9 * * 1/3", &[Mon, Thu]),
             ("0 9 * * MON-FRI", &[Mon, Tue, Wed, Thu, Fri]),
