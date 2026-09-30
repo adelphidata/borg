@@ -21,12 +21,27 @@ export function defaultSocketPath(): string {
   return `${home}/borgd.sock`;
 }
 
+/**
+ * Reconnect quickly once the daemon's socket is back.
+ *
+ * grpc-js backs a failed connection off 1.6× per attempt up to two minutes, a
+ * policy meant for remote servers. While it waits, every call fails at once
+ * with the last error, so a daemon restarted after a minute's outage looked
+ * dead to the desktop app for another minute — and "Start Borg" appeared to
+ * do nothing. Here the peer is a local socket and an attempt is one cheap
+ * `connect(2)`.
+ */
+const SOCKET_CHANNEL_OPTIONS = {
+  "grpc.initial_reconnect_backoff_ms": 250,
+  "grpc.max_reconnect_backoff_ms": 2_000,
+};
+
 export function createNodeTransport(options: NodeTransportOptions = {}): BorgTransport & {
   channel: Channel;
   close(): void;
 } {
   const socketPath = options.socketPath ?? defaultSocketPath();
-  const channel = createChannel(`unix://${socketPath}`);
+  const channel = createChannel(`unix://${socketPath}`, undefined, SOCKET_CHANNEL_OPTIONS);
 
   // Every service is reachable over the socket, including bidi `capability`.
   const clients = indexClients(Object.keys(SERVICES) as ServiceName[], (definition) =>

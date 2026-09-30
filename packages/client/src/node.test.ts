@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, ServerError, Status } from "nice-grpc";
@@ -209,6 +210,38 @@ describe("defaultSocketPath", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it("retries a daemon that is not answering every couple of seconds, not minutes", async () => {
+    // A socket that accepts and drops every connection is a daemon that is not
+    // serving: each drop is one reconnect attempt, so the gaps between them
+    // are the channel's backoff. grpc-js's default grows it 1.6× per attempt
+    // toward two minutes — tuned for remote servers, and the reason a
+    // restarted daemon used to look dead to the desktop app for a minute or
+    // more. Over 16s the default already waits 5s+ between attempts.
+    const restartDir = mkdtempSync(join(tmpdir(), "borg-backoff-"));
+    const path = join(restartDir, "borgd.sock");
+    const attempts: number[] = [];
+    const t0 = Date.now();
+    const dropper = net.createServer((conn) => {
+      attempts.push(Date.now() - t0);
+      conn.destroy();
+    });
+    await new Promise<void>((r) => dropper.listen(path, r));
+    const t = createNodeTransport({ socketPath: path });
+    try {
+      while (Date.now() - t0 < 16_000) {
+        await t.unary("borg.status.v1.Status/GetVitals", {}).catch(() => {});
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      const gaps = attempts.slice(1).map((at, i) => at - attempts[i]!);
+      expect(attempts.length).toBeGreaterThan(5);
+      expect(Math.max(...gaps)).toBeLessThan(3_000);
+    } finally {
+      t.close();
+      await new Promise((r) => dropper.close(r));
+      rmSync(restartDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("is what the transport dials when no socketPath is given", () => {
     vi.stubEnv("BORG_HOME", dir);
