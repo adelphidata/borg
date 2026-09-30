@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { BorgError, GrpcStatus } from "@borg/client";
+import { clearNotice, pendingNotice } from "../../lib/notice";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { HealthPage, splitWarning } from "./HealthPage";
 
@@ -48,6 +49,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearNotice();
   vi.useRealTimers();
   warn.mockRestore();
 });
@@ -221,6 +223,9 @@ describe("HealthPage", () => {
     await waitFor(() =>
       expect(daemon.calls.filter((c) => c.method === "GetVitals").length).toBe(before + 1),
     );
+    // The rows usually come back the same, so the toast is the only sign the
+    // re-check happened at all.
+    await waitFor(() => expect(pendingNotice()?.message).toBe("Checked: Borg is healthy"));
   });
 
   it("reports what a tidy-up actually did", async () => {
@@ -242,9 +247,9 @@ describe("HealthPage", () => {
 
     click("Tidy up now");
     await waitFor(() =>
-      expect(
-        screen.getByText("Tidy-up done: 120 log entries pruned, 4 embeddings evicted."),
-      ).toBeTruthy(),
+      expect(pendingNotice()?.message).toBe(
+        "Tidy-up done: 120 log entries pruned, 4 embeddings evicted.",
+      ),
     );
   });
 
@@ -267,7 +272,7 @@ describe("HealthPage", () => {
 
     click("Tidy up now");
     await waitFor(() =>
-      expect(screen.getByText("Tidy-up done. Nothing needed cleaning.")).toBeTruthy(),
+      expect(pendingNotice()?.message).toBe("Tidy-up done. Nothing needed cleaning."),
     );
   });
 
@@ -278,9 +283,9 @@ describe("HealthPage", () => {
 
     click("Tidy up now");
     await waitFor(() =>
-      expect(
-        screen.getByText("Nothing to tidy — the last sweep already ran recently."),
-      ).toBeTruthy(),
+      expect(pendingNotice()?.message).toBe(
+        "Nothing to tidy — the last sweep already ran recently.",
+      ),
     );
   });
 
@@ -294,7 +299,7 @@ describe("HealthPage", () => {
 
     click("Tidy up now");
     await waitFor(() =>
-      expect(screen.getByText("Tidy-up failed: database is locked")).toBeTruthy(),
+      expect(pendingNotice()?.message).toBe("Tidy-up failed: database is locked"),
     );
   });
 

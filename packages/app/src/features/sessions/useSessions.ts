@@ -14,7 +14,7 @@ import {
   type SessionActivity,
 } from "./activityStore";
 import { formatElapsed } from "../../lib/format";
-import { offerRestore } from "../../lib/notice";
+import { offerRestore, showNotice } from "../../lib/notice";
 import { sessionsChanged, sessionsVersion, subscribeSessions } from "./sessionsVersion";
 import { observeSessions, subscribeUnread, unreadVersion } from "./unreadStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
@@ -234,25 +234,30 @@ export function useSessions(deps: unknown[] = []): Sessions {
     (borg, vars: { id: string; pinned: boolean }) => borg.admin.setSessionPinned(vars),
     { onSuccess: () => sessionsChanged() },
   );
-  const exportMutation = useMutation(async (borg, vars: { id: string; format: string }) => {
-    const result = await borg.admin.exportSession({
-      sessionId: vars.id,
-      format: vars.format,
-      noRedact: false,
-    });
-    // Hand the bytes to the browser as a download; both surfaces can do this,
-    // so there is no native-only path to maintain.
-    const blob = new Blob([result.content as BlobPart]);
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = result.suggestedFilename || `session.${vars.format}`;
-    link.click();
-    // `click()` only *schedules* the download; revoking in the same tick can
-    // pull the blob out from under it and produce a zero-byte or failed file.
-    setTimeout(() => URL.revokeObjectURL(url), 30_000);
-    return result;
-  });
+  const exportMutation = useMutation(
+    async (borg, vars: { id: string; format: string }) => {
+      const result = await borg.admin.exportSession({
+        sessionId: vars.id,
+        format: vars.format,
+        noRedact: false,
+      });
+      // Hand the bytes to the browser as a download; both surfaces can do this,
+      // so there is no native-only path to maintain.
+      const blob = new Blob([result.content as BlobPart]);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = result.suggestedFilename || `session.${vars.format}`;
+      link.click();
+      // `click()` only *schedules* the download; revoking in the same tick can
+      // pull the blob out from under it and produce a zero-byte or failed file.
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      return link.download;
+    },
+    // A download lands wherever the browser or the OS puts it, often with no
+    // sign in the window itself; the toast names what was written.
+    { onSuccess: (filename) => showNotice(`Exported ${filename}`) },
+  );
 
   const sessions = query.state === "ready" ? query.data : NO_SESSIONS;
   // Re-runs the naming pass whenever a composer publishes, so an unsent row is

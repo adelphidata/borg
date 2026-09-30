@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GrpcStatus, type admin as adminPb } from "@borg/client";
+import { showNotice } from "../../lib/notice";
 import { asBorgError, useBorg, useMutation, useServerStream } from "../../lib/useDaemon";
 
 /** What an agent's wire status means for the reader. */
@@ -203,12 +204,24 @@ export function useAgentTree(sessionId: string | undefined): AgentTree {
         ? "Borg's daemon cannot do this yet."
         : failure.message;
 
-  const pauseMutation = useMutation((borg, id: string) => borg.admin.pauseAgent({ agentId: id }));
-  const resumeMutation = useMutation((borg, id: string) => borg.admin.resumeAgent({ agentId: id }));
+  // The row's status changes only once the tree catches up, which can be a
+  // poll away; the toast says at once that the control was heard.
+  const nameOf = (id: string) => {
+    const agent = agents.find((a) => a.id === id);
+    return agent?.nickname || agent?.role || "the agent";
+  };
+  const pauseMutation = useMutation((borg, id: string) => borg.admin.pauseAgent({ agentId: id }), {
+    onSuccess: (_data, id) => showNotice(`Paused ${nameOf(id)}`),
+  });
+  const resumeMutation = useMutation(
+    (borg, id: string) => borg.admin.resumeAgent({ agentId: id }),
+    { onSuccess: (_data, id) => showNotice(`Resumed ${nameOf(id)}`) },
+  );
   // Kill the subtree, not the node: orphaned children keep burning tokens with
   // nothing left to report to.
-  const killMutation = useMutation((borg, id: string) =>
-    borg.admin.killAgentSubtree({ agentId: id }),
+  const killMutation = useMutation(
+    (borg, id: string) => borg.admin.killAgentSubtree({ agentId: id }),
+    { onSuccess: (_data, id) => showNotice(`Stopped ${nameOf(id)} and everything it started`) },
   );
 
   return {

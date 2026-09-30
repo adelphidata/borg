@@ -476,7 +476,10 @@ describe("ConversationPage", () => {
     const daemon = fakeDaemon({
       ...OPEN,
       GetContextBreakdown: { components: [{ tokens: 180_000 }], contextWindow: 200_000 },
-      Compact: () => new Promise((resolve) => (release = () => resolve({}))),
+      Compact: () =>
+        new Promise(
+          (resolve) => (release = () => resolve({ beforeTokens: 180_000, afterTokens: 40_000 })),
+        ),
     });
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Compact")).toBeTruthy());
@@ -486,6 +489,9 @@ describe("ConversationPage", () => {
 
     await act(async () => release());
     await waitFor(() => expect(screen.getByText("Compact")).toBeTruthy());
+    expect(
+      screen.getByText("Compacted the conversation from about 180,000 to 40,000 tokens."),
+    ).toBeTruthy();
   });
 
   it("reports a failed turn where it happened, with a retry", async () => {
