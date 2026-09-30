@@ -10,6 +10,7 @@ import {
   GitBranch,
   ListTree,
   MessageCircle,
+  Moon,
   MoreHorizontal,
   Paperclip,
   Pencil,
@@ -18,6 +19,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Sun,
   Trash2,
   Wallet,
   X,
@@ -72,6 +74,8 @@ export const ArchiveIcon = lucide(Archive, 14);
 export const ScheduleIcon = lucide(CalendarClock, 16);
 export const UsageIcon = lucide(Wallet, 16);
 export const AgentsIcon = lucide(ListTree, 16);
+export const SunIcon = lucide(Sun, 15);
+export const MoonIcon = lucide(Moon, 15);
 
 export function SendIcon({ size, ...props }: IconProps) {
   return (

@@ -9,6 +9,7 @@ import {
   Toast,
   useIsMobile,
   usePauseAnimationsWhenHidden,
+  useTheme,
 } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
 import { QUICK_ENTRY_HASH } from "./lib/chords";
@@ -81,6 +82,7 @@ function KeyboardLayer() {
 function Shell({ platform }: { platform: Platform }) {
   const isMobile = useIsMobile();
   usePauseAnimationsWhenHidden();
+  const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
@@ -252,6 +254,8 @@ function Shell({ platform }: { platform: Platform }) {
             collapsed={sidebarCollapsed}
             onToggleCollapsed={toggleSidebar}
             unreadCount={unreadCount}
+            theme={theme}
+            onToggleTheme={toggleTheme}
           />
         )}
         <Menu

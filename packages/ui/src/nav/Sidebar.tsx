@@ -1,6 +1,6 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
-import { ChevronIcon, LogoIcon } from "../components/icons";
+import { ChevronIcon, LogoIcon, MoonIcon, SunIcon } from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
 import { Truncated } from "../components/Truncated";
 import type { AppRoute, NavUser, RecentItem } from "../types";
@@ -41,6 +41,10 @@ export interface SidebarProps {
    * would be the same news twice.
    */
   unreadCount?: number;
+  /** The theme on screen; with `onToggleTheme`, shows a switch beside the user. */
+  theme?: "light" | "dark";
+  /** Flips between light and dark. Omit and the footer has no theme switch. */
+  onToggleTheme?: () => void;
 }
 
 function NavItem({ route }: { route: AppRoute }) {
@@ -170,6 +174,8 @@ export function Sidebar({
   collapsed = false,
   onToggleCollapsed,
   unreadCount = 0,
+  theme,
+  onToggleTheme,
 }: SidebarProps) {
   // A collapsed rail hides the rows that carry the unread dots, so a reply that
   // lands while it is narrow arrives in silence. The count rides the one control
@@ -277,6 +283,17 @@ export function Sidebar({
         <div className="min-w-0 flex-1">
           <div className="text-[12.5px] leading-[1.2] font-medium text-ink">{user.name}</div>
         </div>
+        {onToggleTheme && theme && (
+          // The icon shows where a click goes, and the label says it in words.
+          <button
+            type="button"
+            aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            onClick={onToggleTheme}
+            className="flex h-[26px] w-[26px] flex-none cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-ink3 hover:bg-surface3 hover:text-ink"
+          >
+            {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+          </button>
+        )}
       </div>
     </aside>
   );

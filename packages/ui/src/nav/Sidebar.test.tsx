@@ -224,3 +224,34 @@ describe("Sidebar collapse", () => {
     expect(screen.getByText("Chat")).toBeTruthy();
   });
 });
+
+describe("Sidebar theme switch", () => {
+  it("names the theme a click goes to, and flips it", () => {
+    const onToggleTheme = vi.fn();
+    const { rerender } = renderSidebar({ theme: "dark", onToggleTheme });
+    fireEvent.click(screen.getByLabelText("Switch to light mode"));
+    expect(onToggleTheme).toHaveBeenCalledTimes(1);
+    rerender(
+      <MemoryRouter>
+        <Sidebar
+          routes={[]}
+          recents={[]}
+          onOpenRecent={() => {}}
+          onArchiveRecent={() => {}}
+          onNewConversation={() => {}}
+          onSeeAllConversations={() => {}}
+          user={{ name: "Operator", initials: "OP" }}
+          theme="light"
+          onToggleTheme={onToggleTheme}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByLabelText("Switch to dark mode")).toBeTruthy();
+    expect(screen.queryByLabelText("Switch to light mode")).toBeNull();
+  });
+
+  it("has no switch when the app does not wire one", () => {
+    renderSidebar({ theme: "dark" });
+    expect(screen.queryByLabelText(/Switch to/)).toBeNull();
+  });
+});

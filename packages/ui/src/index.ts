@@ -43,6 +43,7 @@ export {
   CopyIcon,
   GearIcon,
   LogoIcon,
+  MoonIcon,
   MoreIcon,
   PencilIcon,
   PlugIcon,
@@ -51,6 +52,7 @@ export {
   SearchIcon,
   SendIcon,
   ShieldIcon,
+  SunIcon,
   TrashIcon,
   UsageIcon,
 } from "./components/icons";
