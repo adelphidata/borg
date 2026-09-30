@@ -94,6 +94,8 @@ export function subscribeDrafts(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+const LIVE_SUFFIX = /\s*\(live\)$/;
+
 /** Snapshot for `useSyncExternalStore`: bumped whenever any draft changes. */
 export function draftsVersion(): number {
   return version;
@@ -106,8 +108,13 @@ export function draftsVersion(): number {
  * to "Untitled"; both are placeholders standing in for a name the user has
  * effectively already written. Only a session with no messages can be renamed
  * this way — a titled conversation in use must never be relabelled by a draft.
+ *
+ * The listing marks resident sessions with a " (live)" suffix for the CLI's
+ * session picker; the app shows activity with its own dot, so the marker is
+ * dropped here rather than rendered as part of the name.
  */
-export function rowTitle(title: string, messageCount: number, sessionId: string): string {
+export function rowTitle(rawTitle: string, messageCount: number, sessionId: string): string {
+  const title = rawTitle.replace(LIVE_SUFFIX, "").trim();
   if (title !== "" && title !== "New conversation") return title;
   if (messageCount === 0) {
     const derived = draftTitle(readDraft(draftKeyFor(sessionId)));

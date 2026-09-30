@@ -118,6 +118,15 @@ describe("moveDraft", () => {
 });
 
 describe("rowTitle", () => {
+  it("drops the daemon's live marker, which the app shows as a dot instead", () => {
+    expect(rowTitle("Deploy notes (live)", 3, "s9")).toBe("Deploy notes");
+    // An untitled live session is a placeholder, not a conversation named "(live)".
+    expect(rowTitle(" (live)", 0, "s9")).toBe("Untitled");
+    expect(rowTitle("New conversation (live)", 2, "s9")).toBe("New conversation");
+    // Only a trailing marker is the daemon's; a title that mentions it keeps it.
+    expect(rowTitle("(live) demo prep", 1, "s9")).toBe("(live) demo prep");
+  });
+
   it("names an unsent session after what has been typed into it", () => {
     publishDraft(draftKeyFor("s1"), "Rewrite the scheduler");
     expect(rowTitle("New conversation", 0, "s1")).toBe("Rewrite the scheduler");
