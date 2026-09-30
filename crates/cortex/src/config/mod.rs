@@ -576,28 +576,28 @@ impl Config {
             return Ok((provider, String::new()));
         }
 
+        // `api_key_env` defaults to `OPENROUTER_API_KEY`, and every saved
+        // config carries that default whether anyone chose it or not. Treated
+        // as explicit, it outranks the chosen provider's own variable: pick
+        // Anthropic on a machine that has both keys and the OpenRouter key is
+        // sent, `correct_provider_from_key` reroutes the turn to OpenRouter,
+        // and the user is billed by a provider they just moved away from. So
+        // the default only counts after the provider's own variable.
+        let default_env = self.llm.api_key_env == crate::constants::DEFAULT_LLM_API_KEY_ENV;
         if let Some(key) = self
             .try_resolve_api_key_secret_ref("api_key_env")
-            .or_else(|| {
-                // For a Custom endpoint, the built-in `api_key_env` default
-                // (`OPENROUTER_API_KEY`) must not apply: it would send an
-                // unrelated provider's key as a Bearer credential to a
-                // user-supplied URL. Only an explicitly configured env var
-                // counts. (`Provider::Custom.default_env_var()` is already
-                // empty, so the third source is a no-op.) An operator who
-                // genuinely wants that env var as the endpoint's bearer
-                // credential can still express it via `llm.api_key =
-                // { source = "env", var = "OPENROUTER_API_KEY" }` — we can't
-                // distinguish "explicitly set to the default" here.
-                if provider == Provider::Custom
-                    && self.llm.api_key_env == crate::constants::DEFAULT_LLM_API_KEY_ENV
-                {
-                    None
-                } else {
-                    try_resolve_env(&self.llm.api_key_env)
-                }
-            })
+            .or_else(|| (!default_env).then(|| try_resolve_env(&self.llm.api_key_env))?)
             .or_else(|| try_resolve_env(provider.default_env_var()))
+            .or_else(|| {
+                // For a Custom endpoint, the built-in default must not apply
+                // at all: it would send an unrelated provider's key as a
+                // Bearer credential to a user-supplied URL. An operator who
+                // genuinely wants that env var there can still say so via
+                // `llm.api_key = { source = "env", var = "OPENROUTER_API_KEY" }`
+                // — we can't distinguish "explicitly set to the default" here.
+                (default_env && provider != Provider::Custom)
+                    .then(|| try_resolve_env(&self.llm.api_key_env))?
+            })
         {
             return Ok((provider, key));
         }

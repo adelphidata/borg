@@ -325,6 +325,51 @@ fn openrouter_env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn chosen_provider_key_beats_the_default_openrouter_env() {
+    // Regression: with both keys on the machine, switching the provider away
+    // from OpenRouter must send that provider's own key. The untouched
+    // `api_key_env` default used to win, and `correct_provider_from_key` then
+    // routed the turn back to OpenRouter.
+    let _env = openrouter_env_lock();
+    let old = std::env::var("OPENROUTER_API_KEY").ok();
+    let old_ds = std::env::var("DEEPSEEK_API_KEY").ok();
+    std::env::set_var("OPENROUTER_API_KEY", "sk-or-v1-host-key");
+    std::env::set_var("DEEPSEEK_API_KEY", "sk-deepseek-own-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("deepseek".to_string());
+    let own = cfg.resolve_api_keys();
+
+    // The default is still the last resort when the provider's own variable
+    // is absent — an OpenRouter key left under another provider keeps working.
+    std::env::remove_var("DEEPSEEK_API_KEY");
+    let fallback = cfg.resolve_api_keys();
+
+    // And an env var the operator named outright still outranks the provider's.
+    std::env::set_var("DEEPSEEK_API_KEY", "sk-deepseek-own-key");
+    std::env::set_var("BORG_TEST_EXPLICIT_LLM_KEY", "sk-explicit");
+    cfg.llm.api_key_env = "BORG_TEST_EXPLICIT_LLM_KEY".to_string();
+    let explicit = cfg.resolve_provider();
+
+    std::env::remove_var("BORG_TEST_EXPLICIT_LLM_KEY");
+    match old {
+        Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+        None => std::env::remove_var("OPENROUTER_API_KEY"),
+    }
+    match old_ds {
+        Some(v) => std::env::set_var("DEEPSEEK_API_KEY", v),
+        None => std::env::remove_var("DEEPSEEK_API_KEY"),
+    }
+
+    let (provider, keys) = own.expect("own key resolves");
+    assert_eq!(provider, Provider::DeepSeek);
+    assert_eq!(keys, vec!["sk-deepseek-own-key".to_string()]);
+    let (provider, keys) = fallback.expect("default env still a fallback");
+    assert_eq!(provider, Provider::OpenRouter);
+    assert_eq!(keys, vec!["sk-or-v1-host-key".to_string()]);
+    assert_eq!(explicit.expect("explicit env").1, "sk-explicit");
+}
+
+#[test]
 fn resolve_provider_custom_ignores_default_openrouter_env() {
     // Regression: a host with OPENROUTER_API_KEY exported (the built-in
     // `api_key_env` default) must not have that key resolved for a custom
