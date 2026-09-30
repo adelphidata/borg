@@ -13,6 +13,8 @@
  * Theme tokens. Light is the default; [data-theme="dark"] swaps the palette at
  * runtime (see src/lib/theme.tsx), so these stay plain CSS variables and the
  * @theme block below maps them into Tailwind utilities (bg-surface, text-ink…).
+ * A new theme is one more [data-theme="…"] block defining every token below,
+ * `color-scheme` included; the derived block after them needs no change.
  */
 :root {
   --canvas: #e9eae4;
@@ -44,6 +46,10 @@
   --plateGlow: none;
   --barTrack: rgba(12, 16, 13, 0.08);
   --frameShadow: 0 1px 2px rgba(12, 16, 13, 0.05), 0 18px 44px -18px rgba(12, 16, 13, 0.22);
+  /* What the scrollbar thumb is tinted with; its shades are derived below. */
+  --scrollTint: var(--ink);
+  /* Native controls, and anything left unstyled, follow the theme. */
+  color-scheme: light;
 }
 [data-theme="dark"] {
   --canvas: #050706;
@@ -69,6 +75,19 @@
   --plateGlow: 0 0 60px -14px rgba(180, 255, 0, 0.22);
   --barTrack: rgba(233, 239, 227, 0.1);
   --frameShadow: 0 0 0 1px rgba(180, 255, 0, 0.07), 0 30px 80px -30px rgba(0, 0, 0, 0.9);
+  --scrollTint: var(--neon);
+  color-scheme: dark;
+}
+
+/*
+ * Derived tokens. A theme sets only the inputs above; everything here follows
+ * from them. Custom properties resolve on the element that uses them, so these
+ * pick up whichever [data-theme] block is active without being repeated in it.
+ */
+:root {
+  --scrollTrack: color-mix(in srgb, var(--scrollTint) 8%, transparent);
+  --scrollThumb: color-mix(in srgb, var(--scrollTint) 55%, transparent);
+  --scrollThumbHover: color-mix(in srgb, var(--scrollTint) 85%, transparent);
 }
 
 @theme inline {
@@ -92,6 +111,8 @@
   --color-warn: var(--warn);
   --color-warn-soft: var(--warnSoft);
   --color-bar-track: var(--barTrack);
+  --color-scroll-track: var(--scrollTrack);
+  --color-scroll-thumb: var(--scrollThumb);
 }
 
 @theme {
@@ -147,6 +168,39 @@
    */
   html[data-hidden="true"] * {
     animation-play-state: paused !important;
+  }
+}
+
+/*
+ * Scrollbars. Chromium (Electron and the browser SPA) takes the pseudo-element
+ * rules: a tinted thumb on a faint track, inset by a transparent border so it
+ * floats inside the gutter. Setting `scrollbar-color` in Chromium would switch
+ * these rules off, so the standard properties are only for engines without
+ * them (Firefox).
+ */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scrollTrack);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollThumb);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollThumbHover);
+}
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollThumb) var(--scrollTrack);
   }
 }
 
