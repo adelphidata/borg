@@ -911,12 +911,19 @@ async fn serve_transports(
             let _ = tcp_rx.recv().await;
         });
 
-        let (uds_res, tcp_res) = tokio::join!(serve_uds, serve_tcp);
+        // Stop advertising as soon as the daemon starts to stop, not after
+        // the servers drain: `serve_until_drained` drops this whole future
+        // once the grace runs out, which would skip a goodbye queued behind
+        // the servers and leave LAN peers a stale record until it expires.
+        let mdns_goodbye = on_shutdown(shutdown_tx.subscribe(), move || {
+            if let Some(a) = mdns_announcer {
+                a.shutdown();
+            }
+        });
+
+        let (uds_res, tcp_res, ()) = tokio::join!(serve_uds, serve_tcp, mdns_goodbye);
         uds_res.context("UDS server")?;
         tcp_res.context("TCP server")?;
-        if let Some(a) = mdns_announcer {
-            a.shutdown();
-        }
     } else {
         let mut rx = shutdown_tx.subscribe();
         make_uds_router()
@@ -929,6 +936,12 @@ async fn serve_transports(
     Ok(())
 }
 
+/// Run `f` the moment the shutdown signal arrives (or its sender is gone).
+async fn on_shutdown(mut rx: broadcast::Receiver<()>, f: impl FnOnce()) {
+    let _ = rx.recv().await;
+    f();
+}
+
 /// How long open client streams may hold the listeners after a shutdown signal.
 const LISTENER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -939,8 +952,10 @@ const LISTENER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// connected app always holds one: the desktop and web surfaces keep a
 /// server-streaming activity subscription open for as long as they run. With
 /// either open, SIGTERM logged "draining" and the daemon never exited. Past
-/// the grace the servers are dropped, which closes those streams, and the
-/// caller's session drain runs as it would after a clean stop.
+/// the grace the server futures are dropped: the listeners stop accepting and
+/// the caller's session drain runs as it would after a clean stop. Streams
+/// already open run on tonic's own connection tasks and end when the runtime
+/// shuts down, not at this drop.
 async fn serve_until_drained<F>(
     serve: F,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -1140,6 +1155,44 @@ mod tests {
         assert!(!run.is_finished(), "open streams get the grace first");
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(run.is_finished(), "past the grace the daemon moves on");
+        run.await.unwrap().unwrap();
+    }
+
+    /// Regression: the LAN goodbye was queued behind the servers, and a held
+    /// stream meant the grace dropped them first, so peers kept a stale
+    /// record. It now goes out at the signal, before any drain.
+    #[tokio::test(start_paused = true)]
+    async fn the_lan_goodbye_goes_out_at_the_signal_not_after_the_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let said = Arc::new(AtomicBool::new(false));
+        let flag = said.clone();
+        let goodbye =
+            super::on_shutdown(tx.subscribe(), move || flag.store(true, Ordering::SeqCst));
+        let serve = async move {
+            // A server held open by a stream, alongside the goodbye.
+            let ((), ()) = tokio::join!(std::future::pending::<()>(), goodbye);
+            anyhow::Ok(())
+        };
+        let run = tokio::spawn(super::serve_until_drained(
+            serve,
+            rx,
+            Duration::from_secs(5),
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !said.load(Ordering::SeqCst),
+            "nothing is said before the signal"
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            said.load(Ordering::SeqCst),
+            "the goodbye must not wait for the drain"
+        );
+        tokio::time::sleep(Duration::from_secs(6)).await;
         run.await.unwrap().unwrap();
     }
 
