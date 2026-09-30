@@ -587,6 +587,11 @@ export interface ScheduledTask {
    * apps offer pause, not delete.
    */
   system: boolean;
+  /**
+   * The conversation each run of this task happens in, to watch or reply
+   * in. Empty for tasks that run no agent turn (commands, maintenance).
+   */
+  sessionId: string;
 }
 
 export interface ScheduledTaskList {
@@ -7853,6 +7858,7 @@ function createBaseScheduledTask(): ScheduledTask {
     deliveryChannel: "",
     deliveryTarget: "",
     system: false,
+    sessionId: "",
   };
 }
 
@@ -7896,6 +7902,9 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     }
     if (message.system !== false) {
       writer.uint32(104).bool(message.system);
+    }
+    if (message.sessionId !== "") {
+      writer.uint32(114).string(message.sessionId);
     }
     return writer;
   },
@@ -8017,6 +8026,14 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
             message.system = reader.bool();
             continue;
           }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.sessionId = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -8072,6 +8089,11 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
         ? globalThis.String(object.delivery_target)
         : "",
       system: isSet(object.system) ? globalThis.Boolean(object.system) : false,
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
     };
   },
 
@@ -8116,6 +8138,9 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     if (message.system !== false) {
       obj.system = message.system;
     }
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
     return obj;
   },
 
@@ -8137,6 +8162,7 @@ export const ScheduledTask: MessageFns<ScheduledTask> = {
     message.deliveryChannel = object.deliveryChannel ?? "";
     message.deliveryTarget = object.deliveryTarget ?? "";
     message.system = object.system ?? false;
+    message.sessionId = object.sessionId ?? "";
     return message;
   },
 };

@@ -496,6 +496,7 @@ pub(super) async fn update_task_status(
 pub(super) fn scheduled_task_row_to_proto(r: cortex::db::ScheduledTaskRow) -> ScheduledTask {
     ScheduledTask {
         system: cortex::task_ids::is_system_task_id(&r.id),
+        session_id: crate::task_runner::task_session_of(&r).unwrap_or_default(),
         id: r.id,
         name: r.name,
         prompt: r.prompt,

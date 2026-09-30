@@ -700,6 +700,9 @@ message ScheduledTask {
   // Deleting one leaves that loop gone until the next migration, so the
   // apps offer pause, not delete.
   bool system = 13;
+  // The conversation each run of this task happens in, to watch or reply
+  // in. Empty for tasks that run no agent turn (commands, maintenance).
+  string session_id = 14;
 }
 message ScheduledTaskList { repeated ScheduledTask tasks = 1; }
 message ScheduledTaskRef { string id = 1; }

@@ -521,6 +521,17 @@ pub enum RunNowOutcome {
     Queued,
 }
 
+/// Rung when a run is queued by hand, so the scheduler claims it now rather
+/// than on its next tick, up to a minute away — long enough that a manual
+/// run looks like it did nothing.
+static SCHEDULER_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Resolves when [`run_task_now`] has queued a run since the last call. A
+/// run queued while nobody waits is kept, so none is missed between ticks.
+pub async fn scheduler_woken() {
+    SCHEDULER_WAKE.notified().await;
+}
+
 /// Queue a task for immediate execution. Shared by the `manage_tasks` tool
 /// handler and the daemon admin RPC so the active-status gate cannot drift
 /// between the two lanes.
@@ -545,6 +556,7 @@ pub async fn run_task_now(db: &Database, task_id: &str) -> Result<RunNowOutcome>
     if let Err(e) = db.clear_task_retry(task_id).await {
         tracing::warn!("run_task_now: clear_task_retry({task_id}) failed: {e}");
     }
+    SCHEDULER_WAKE.notify_one();
     Ok(RunNowOutcome::Queued)
 }
 

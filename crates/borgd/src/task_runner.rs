@@ -19,9 +19,10 @@ const PRE_RUN_OUTPUT_CAP: usize = 64 * 1024;
 /// task prompt and pre-run preamble.
 const SCHEDULED_TURN_MEMORY_TOKENS: usize = 4000;
 
-/// A scheduled prompt task is one completion with no tools; its data comes
-/// from `pre_run_command`. Unless the model is told so, a prompt like "read
-/// this file" gets an invented answer delivered as if it were real.
+/// Without the daemon's executor, a scheduled prompt task is one completion
+/// with no tools; its data comes from `pre_run_command`. Unless the model is
+/// told so, a prompt like "read this file" gets an invented answer delivered
+/// as if it were real.
 pub const SCHEDULED_TASK_NO_TOOLS: &str =
     "You have no tools in this run: you cannot read files, run commands, or browse. \
      Work only from this prompt and any preprocessed context. If the task needs data \
@@ -87,6 +88,7 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
 /// unwinding the dispatcher and leaving the batch's rows `running`.
 struct RunSetup {
     config: Config,
+    model_pin: cortex::agent::ConfigPin,
     task_prompt: String,
     failure_delivery: Option<(String, String)>,
 }
@@ -96,6 +98,12 @@ async fn prepare_run(config: Config, task: &cortex::db::ScheduledTaskRow) -> Run
     // every downstream client (prompt, heartbeat, consolidation) builds from
     // this config, so overriding here covers all of them at one seam.
     let config = resolve_scheduled_model(config, task);
+    // A prompt task's turn rebuilds its agent from the live config, so the
+    // same resolution travels with the turn as a pin.
+    let model_pin = {
+        let task = task.clone();
+        cortex::agent::ConfigPin::new(move |config| resolve_scheduled_model(config, &task))
+    };
     let task_prompt = match task.id.as_str() {
         cortex::daily_summary::DAILY_SUMMARY_TASK_ID => {
             match cortex::daily_summary::build_daily_summary_prompt().await {
@@ -123,6 +131,7 @@ async fn prepare_run(config: Config, task: &cortex::db::ScheduledTaskRow) -> Run
     };
     RunSetup {
         config,
+        model_pin,
         task_prompt,
         failure_delivery,
     }
@@ -189,6 +198,7 @@ pub async fn spawn_task_execution(
         .await;
         let RunSetup {
             config,
+            model_pin,
             task_prompt,
             failure_delivery,
         } = match setup {
@@ -327,6 +337,7 @@ pub async fn spawn_task_execution(
             last_pre_run_hash,
             continuity,
             executor,
+            model_pin,
         };
 
         let result = std::panic::AssertUnwindSafe(async {
@@ -729,9 +740,12 @@ struct TaskExecContext {
     /// Carry what previous runs of this task produced into this run's turn.
     /// See `ScheduledTaskRow::continuity`.
     continuity: bool,
-    /// Session executor for agentic turns (heartbeat remediation). `None` on
-    /// paths that only run cheap tool-less tasks (tests, manual triggers).
+    /// Session executor for agentic turns: prompt tasks and heartbeat
+    /// remediation. `None` on paths that only run tool-less completions.
     executor: Option<Arc<DaemonSessionExecutor>>,
+    /// This task's model choice, re-applied over whatever the settings are
+    /// when its turn runs. See [`resolve_scheduled_model`].
+    model_pin: cortex::agent::ConfigPin,
 }
 
 fn maybe_attach_cost_event_sink(
@@ -849,6 +863,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         last_pre_run_hash: _,
         continuity: _,
         executor: _,
+        model_pin: _,
     } = ctx;
     let cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let mut cmd = match build_filtered_sh_command(command.as_str(), config, &cwd).await {
@@ -1239,9 +1254,6 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         timeout,
         run_id,
         started_at_ms,
-        retry_count,
-        max_retries,
-        schedule_type,
         delivery_channel,
         delivery_target,
         failure_delivery,
@@ -1253,23 +1265,10 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         monitor_mode,
         last_pre_run_hash,
         continuity,
-        executor: _,
+        executor,
+        model_pin,
+        ..
     } = ctx;
-    let identity = cortex::identity::load_identity_named(config.user.agent_name.as_deref())
-        .unwrap_or_default();
-    let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
-        .await
-        .unwrap_or_default();
-    let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
-
-    let system = format!(
-        "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
-         # Scheduled Task\nYou are executing a scheduled task: \"{task_name}\"\n\
-         Respond with the task result. Be concise. \
-         {SCHEDULED_TASK_NO_TOOLS} \
-         If the preprocessed context shows nothing actionable changed, \
-         respond with exactly `{SILENT_SENTINEL}` on its own line to suppress delivery."
-    );
 
     // Run the optional pre_run_command preamble. Its stdout (or failure
     // status + stderr) is injected as <preprocessed_context> ahead of the
@@ -1386,6 +1385,39 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         task_prompt.clone()
     };
 
+    // With the daemon's executor, the task runs as a full agent turn in a
+    // conversation of its own, which the app can open, watch, and reply in.
+    // Its history is the continuity: each run sees what the last ones said.
+    if let Some(executor) = executor {
+        let outcome = run_prompt_task_turn(
+            executor,
+            task_id,
+            task_name,
+            &user_msg,
+            delivery_channel.is_some() && delivery_target.is_some(),
+            model_pin,
+            *timeout,
+        )
+        .await;
+        finish_prompt_task(ctx, outcome, pending_pre_run_hash.as_deref()).await;
+        return;
+    }
+
+    let identity = cortex::identity::load_identity_named(config.user.agent_name.as_deref())
+        .unwrap_or_default();
+    let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
+        .await
+        .unwrap_or_default();
+    let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
+    let system = format!(
+        "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
+         # Scheduled Task\nYou are executing a scheduled task: \"{task_name}\"\n\
+         Respond with the task result. Be concise. \
+         {SCHEDULED_TASK_NO_TOOLS} \
+         If the preprocessed context shows nothing actionable changed, \
+         respond with exactly `{SILENT_SENTINEL}` on its own line to suppress delivery."
+    );
+
     let mut messages = vec![cortex::types::Message::system(system)];
     // Continuity: replay what previous runs of this same task produced, so
     // the model can report what changed rather than restating the same
@@ -1449,69 +1481,40 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
             return;
         }
     };
-    let result = tokio::time::timeout(*timeout, llm.chat(&messages, None)).await;
+    let outcome = match tokio::time::timeout(*timeout, llm.chat(&messages, None)).await {
+        Ok(Ok(response)) => Ok(response.text_content().unwrap_or("").to_string()),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err("Task timed out".to_string()),
+    };
+    finish_prompt_task(ctx, outcome, pending_pre_run_hash.as_deref()).await;
+}
 
-    match result {
-        Ok(Ok(response)) => {
-            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
-            // A prompt task reads untrusted content and can repeat a secret
-            // it saw. Redact once, before the text is stored or delivered.
-            let result_text = redact_for_run(
-                delivery_channel.as_deref().zip(delivery_target.as_deref()),
-                task_id,
-                response.text_content().unwrap_or(""),
-            );
-            let result_text = result_text.as_ref();
-            match cortex::db::Database::open().await {
-                Ok(db) => {
-                    if let Err(e) = db
-                        .complete_task_run(*run_id, duration_ms, Some(result_text), None)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Task '{task_name}': failed to finalize prompt-task run: {e}"
-                        );
-                    }
-                    if let Err(e) = db.clear_task_retry(task_id).await {
-                        tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
-                    }
-                    // Monitor mode: the turn succeeded on changed output —
-                    // this hash is now the baseline future runs dedup against.
-                    if let Some(h) = pending_pre_run_hash.as_deref() {
-                        if let Err(e) = db.update_task_pre_run_hash(task_id, Some(h)).await {
-                            tracing::warn!(
-                                "Task '{task_name}': failed to persist pre_run baseline hash: {e}"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Task '{task_name}': DB open failed at prompt-success: {e}")
-                }
-            }
-            if is_silent_response(result_text) {
-                tracing::info!(
-                    task_name = %task_name,
-                    "scheduled-task: [SILENT] sentinel — suppressing channel delivery"
-                );
-            } else if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
-                deliver_task_result(
-                    ch,
-                    tgt,
-                    task_name,
-                    result_text,
-                    config,
-                    ctx.executor.as_ref(),
-                    RunRef {
-                        task_id,
-                        run_id: *run_id,
-                    },
-                )
-                .await;
-            }
-        }
-        Ok(Err(e)) => {
-            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+/// Records a prompt task's run and hands its reply on: stored, then
+/// delivered unless the model asked for silence. A failure goes through the
+/// task's retry and failure-notice handling instead.
+async fn finish_prompt_task(
+    ctx: &TaskExecContext,
+    outcome: Result<String, String>,
+    pending_pre_run_hash: Option<&str>,
+) {
+    let TaskExecContext {
+        task_name,
+        task_id,
+        run_id,
+        started_at_ms,
+        retry_count,
+        max_retries,
+        schedule_type,
+        delivery_channel,
+        delivery_target,
+        failure_delivery,
+        config,
+        ..
+    } = ctx;
+    let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+    let reply = match outcome {
+        Ok(reply) => reply,
+        Err(error) => {
             handle_task_failure(
                 task_id,
                 task_name,
@@ -1522,26 +1525,242 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
                 schedule_type,
                 failure_delivery,
                 config,
-                &format!("{e}"),
+                &error,
             )
             .await;
+            return;
         }
-        Err(_) => {
-            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
-            handle_task_failure(
+    };
+    // A prompt task reads untrusted content and can repeat a secret it saw.
+    // Redact once, before the text is stored or delivered.
+    let result_text = redact_for_run(
+        delivery_channel.as_deref().zip(delivery_target.as_deref()),
+        task_id,
+        &reply,
+    );
+    let result_text = result_text.as_ref();
+    match cortex::db::Database::open().await {
+        Ok(db) => {
+            if let Err(e) = db
+                .complete_task_run(*run_id, duration_ms, Some(result_text), None)
+                .await
+            {
+                tracing::warn!("Task '{task_name}': failed to finalize prompt-task run: {e}");
+            }
+            if let Err(e) = db.clear_task_retry(task_id).await {
+                tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+            }
+            // Monitor mode: the turn succeeded on changed output — this hash
+            // is now the baseline future runs dedup against.
+            if let Some(h) = pending_pre_run_hash {
+                if let Err(e) = db.update_task_pre_run_hash(task_id, Some(h)).await {
+                    tracing::warn!(
+                        "Task '{task_name}': failed to persist pre_run baseline hash: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Task '{task_name}': DB open failed at prompt-success: {e}"),
+    }
+    if is_silent_response(result_text) {
+        tracing::info!(
+            task_name = %task_name,
+            "scheduled-task: [SILENT] sentinel — suppressing channel delivery"
+        );
+    } else if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
+        deliver_task_result(
+            ch,
+            tgt,
+            task_name,
+            result_text,
+            config,
+            ctx.executor.as_ref(),
+            RunRef {
                 task_id,
-                task_name,
-                *run_id,
-                duration_ms,
-                *retry_count,
-                *max_retries,
-                schedule_type,
-                failure_delivery,
-                config,
-                "Task timed out",
-            )
-            .await;
+                run_id: *run_id,
+            },
+        )
+        .await;
+    }
+}
+
+/// The conversation a prompt task runs in. One per task, so every run of it
+/// lands in the same place.
+pub(crate) fn task_session_key(task_id: &str) -> String {
+    format!("task:{task_id}")
+}
+
+/// The conversation `task`'s runs happen in, for the task types that run an
+/// agent turn at all. Mirrors the dispatch in [`spawn_task_execution`].
+///
+/// The heartbeat's is its check-ins conversation: a manual run, and any tick
+/// with something to act on, is a turn there. A quiet scheduled tick is a
+/// tool-less check-in that writes to no conversation.
+pub(crate) fn task_session_of(task: &cortex::db::ScheduledTaskRow) -> Option<String> {
+    if task.task_type == "heartbeat" {
+        return Some(crate::heartbeat::scheduled_session_key());
+    }
+    let turnless = matches!(task.task_type.as_str(), "command" | "maintenance")
+        || cortex::memory::consolidation::is_consolidation_task_id(&task.id);
+    (!turnless).then(|| task_session_key(&task.id))
+}
+
+/// Makes sure the conversation `task`'s runs happen in exists, so the app can
+/// open it before the run's first turn has started. `None` for a task that
+/// runs no turn.
+pub(crate) fn ensure_session_of(
+    task: &cortex::db::ScheduledTaskRow,
+) -> anyhow::Result<Option<String>> {
+    let Some(key) = task_session_of(task) else {
+        return Ok(None);
+    };
+    if task.task_type == "heartbeat" {
+        // Listed by its fixed title, so it needs no name of its own.
+        cortex::session::ensure_session_on_disk(&key)?;
+        Ok(Some(key))
+    } else {
+        ensure_task_session(&task.id, &task.name).map(Some)
+    }
+}
+
+/// Makes sure `task_id`'s conversation exists under its own id, named after
+/// the task. Without it on disk, opening the id mints a fresh session with a
+/// random one, and neither the run nor the app would find the other.
+pub(crate) fn ensure_task_session(task_id: &str, task_name: &str) -> anyhow::Result<String> {
+    let key = task_session_key(task_id);
+    if cortex::session::Session::load(&key).is_err() {
+        let mut session = cortex::session::Session::new_with_id(key.clone());
+        session.meta.title = task_name.to_string();
+        session.save()?;
+    }
+    Ok(key)
+}
+
+/// What a scheduled run says in the task's conversation.
+fn task_turn_message(task_name: &str, user_msg: &str, delivered: bool) -> String {
+    let silence = if delivered {
+        format!(
+            "\n\nYour reply is sent on to the owner. If this run found nothing worth \
+             reporting, reply with exactly `{SILENT_SENTINEL}` on its own line instead."
+        )
+    } else {
+        String::new()
+    };
+    format!("Scheduled task \"{task_name}\" is running.\n\n{user_msg}{silence}")
+}
+
+/// Runs one prompt-task fire as an agent turn in the task's conversation and
+/// returns its reply.
+async fn run_prompt_task_turn(
+    executor: &DaemonSessionExecutor,
+    task_id: &str,
+    task_name: &str,
+    user_msg: &str,
+    delivered: bool,
+    model_pin: &cortex::agent::ConfigPin,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let session_key = ensure_task_session(task_id, task_name)
+        .map_err(|e| format!("could not create the task's conversation: {e:#}"))?;
+    let turn = gateway::InboundTurn {
+        session_key: session_key.clone(),
+        text: task_turn_message(task_name, user_msg, delivered),
+        images: Vec::new(),
+        kind: gateway::TurnKind::Internal,
+    };
+    let (event_rx, cancel) = executor
+        .start_turn_pinned(turn, Some(model_pin.clone()))
+        .await
+        .map_err(|e| format!("could not start the task's turn: {e:#}"))?;
+    // An internal turn never interrupts one in flight; it comes back already
+    // cancelled instead, and the retry policy decides when to try again.
+    if cancel.is_cancelled() {
+        return Err("its conversation was busy with another turn".to_string());
+    }
+    name_task_session(&session_key, task_name).await;
+    collect_task_turn(event_rx, cancel, timeout, || {
+        // The turn's own event bridge is one of the watchers.
+        executor.watchers(&session_key) > 1
+    })
+    .await
+}
+
+/// Lists the task's conversation under the task's name. Only a blank title is
+/// filled, so a name the user gave it stays.
+async fn name_task_session(session_key: &str, task_name: &str) {
+    let db = match cortex::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("Task '{task_name}': DB open failed naming its conversation: {e}");
+            return;
         }
+    };
+    let blank = match db.session_by_id(session_key).await {
+        Ok(Some(row)) => row.title.is_empty(),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("Task '{task_name}': could not read its conversation's row: {e}");
+            false
+        }
+    };
+    if blank {
+        if let Err(e) = db.update_session_title(session_key, task_name).await {
+            tracing::warn!("Task '{task_name}': could not name its conversation: {e}");
+        }
+    }
+}
+
+/// Follows a task's turn to its end and returns the reply, or why there is
+/// none.
+///
+/// A turn that asks the user something waits for an answer only while
+/// someone has the conversation open (`watched`); otherwise nobody could
+/// answer, so it stops there. Either way `timeout` bounds the whole turn.
+async fn collect_task_turn(
+    mut event_rx: tokio::sync::mpsc::Receiver<cortex::agent::AgentEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+    timeout: std::time::Duration,
+    watched: impl Fn() -> bool,
+) -> Result<String, String> {
+    use crate::session::convert::{PROMPT_REQUEST_SHELL, PROMPT_REQUEST_USER_INPUT};
+    use cortex::agent::AgentEvent;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut reply = String::new();
+    let mut error: Option<String> = None;
+    loop {
+        let event = match tokio::time::timeout_at(deadline, event_rx.recv()).await {
+            Err(_) => {
+                cancel.cancel();
+                crate::heartbeat::drain_briefly(&mut event_rx).await;
+                return Err("Task timed out".to_string());
+            }
+            Ok(None) => break,
+            Ok(Some(event)) => event,
+        };
+        match event {
+            AgentEvent::TextDelta(delta) => reply.push_str(&delta),
+            // The attempt that sent this text failed; the full reply comes again.
+            AgentEvent::TextRetracted { bytes } => {
+                cortex::agent::retract_text_tail(&mut reply, bytes)
+            }
+            AgentEvent::SystemNotice { category, text }
+                if (category == PROMPT_REQUEST_USER_INPUT || category == PROMPT_REQUEST_SHELL)
+                    && !watched() =>
+            {
+                cancel.cancel();
+                crate::heartbeat::drain_briefly(&mut event_rx).await;
+                let snippet: String = text.chars().take(200).collect();
+                return Err(format!(
+                    "stopped to ask for input with nobody there to answer: {snippet}"
+                ));
+            }
+            AgentEvent::Error(message) => error = Some(message),
+            _ => {}
+        }
+    }
+    match error {
+        Some(message) => Err(message),
+        None => Ok(reply),
     }
 }
 
@@ -1577,7 +1796,11 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     } = ctx;
 
     let started_unix = *started_at_ms / 1000;
-    let bypass = task.bypass_quiet_hours_once;
+    // Someone pressed Run now and is watching for the result: no gate turns
+    // it into a silent skip, and it runs as a turn in the check-ins
+    // conversation the app offers to open.
+    let manual = task.run_now_requested;
+    let bypass = task.bypass_quiet_hours_once || manual;
     let now = chrono::Utc::now().timestamp();
 
     if !bypass && crate::heartbeat::is_quiet_hours(config) {
@@ -1642,12 +1865,13 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             false
         }
     };
-    let go_agentic = crate::heartbeat::remediation_gate_open(
-        config.heartbeat.remediation_enabled,
-        ctx.executor.is_some(),
-        !nudges.is_empty(),
-        active_goal,
-    );
+    let go_agentic = (manual && ctx.executor.is_some())
+        || crate::heartbeat::remediation_gate_open(
+            config.heartbeat.remediation_enabled,
+            ctx.executor.is_some(),
+            !nudges.is_empty(),
+            active_goal,
+        );
 
     let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(nudges);
     if let Some(cmd) = pre_run_command.as_deref() {
@@ -2518,7 +2742,10 @@ mod monitor_gate_tests {
 mod scheduled_model_tests {
     use super::*;
 
-    fn task_with_pin(model: Option<&str>, provider: Option<&str>) -> cortex::db::ScheduledTaskRow {
+    pub(super) fn task_with_pin(
+        model: Option<&str>,
+        provider: Option<&str>,
+    ) -> cortex::db::ScheduledTaskRow {
         cortex::db::ScheduledTaskRow {
             id: "task-1".to_string(),
             name: "nightly".to_string(),
@@ -3837,5 +4064,125 @@ mod unstarted_run_tests {
             Some(error.as_str()),
             "the task row must show the same failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod task_session_tests {
+    use super::*;
+    use cortex::agent::AgentEvent;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn task(id: &str, task_type: &str) -> cortex::db::ScheduledTaskRow {
+        let mut row = scheduled_model_tests::task_with_pin(None, None);
+        row.id = id.to_string();
+        row.task_type = task_type.to_string();
+        row
+    }
+
+    #[test]
+    fn prompt_tasks_have_a_conversation_and_the_rest_do_not() {
+        assert_eq!(
+            task_session_of(&task("t1", "prompt")).as_deref(),
+            Some("task:t1")
+        );
+        assert_eq!(
+            task_session_of(&task("t1", "heartbeat")),
+            Some(crate::heartbeat::scheduled_session_key())
+        );
+        for kind in ["command", "maintenance"] {
+            assert_eq!(task_session_of(&task("t1", kind)), None, "{kind}");
+        }
+        let consolidation = task(
+            cortex::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID,
+            "prompt",
+        );
+        assert_eq!(task_session_of(&consolidation), None);
+    }
+
+    #[test]
+    fn the_silence_marker_is_offered_only_when_the_reply_is_delivered() {
+        let delivered = task_turn_message("Digest", "summarise", true);
+        assert!(delivered.contains(SILENT_SENTINEL), "{delivered}");
+        let kept = task_turn_message("Digest", "summarise", false);
+        assert!(!kept.contains(SILENT_SENTINEL), "{kept}");
+        assert!(
+            kept.contains("\"Digest\"") && kept.ends_with("summarise"),
+            "{kept}"
+        );
+    }
+
+    async fn collect(
+        events: Vec<AgentEvent>,
+        watched: bool,
+    ) -> (Result<String, String>, CancellationToken) {
+        let (tx, rx) = mpsc::channel(16);
+        for event in events {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let cancel = CancellationToken::new();
+        let out = collect_task_turn(rx, cancel.clone(), Duration::from_secs(5), || watched).await;
+        (out, cancel)
+    }
+
+    fn prompt() -> AgentEvent {
+        AgentEvent::SystemNotice {
+            category: crate::session::convert::PROMPT_REQUEST_SHELL.to_string(),
+            text: "rm -rf build".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_returns_its_text() {
+        let (out, cancel) = collect(
+            vec![
+                AgentEvent::TextDelta("all ".into()),
+                AgentEvent::TextDelta("good".into()),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(out, Ok("all good".to_string()));
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn an_errored_turn_is_a_failure_not_an_empty_reply() {
+        let (out, _) = collect(
+            vec![
+                AgentEvent::TextDelta("half".into()),
+                AgentEvent::Error("provider down".into()),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(out, Err("provider down".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_question_nobody_can_see_stops_the_turn() {
+        let (out, cancel) = collect(vec![prompt()], false).await;
+        assert!(out.unwrap_err().contains("rm -rf build"));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_question_someone_is_watching_waits_for_them() {
+        let (out, cancel) =
+            collect(vec![prompt(), AgentEvent::TextDelta("done".into())], true).await;
+        assert_eq!(out, Ok("done".to_string()));
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_turn_past_its_timeout_is_cancelled() {
+        let (_tx, rx) = mpsc::channel::<AgentEvent>(1);
+        let cancel = CancellationToken::new();
+        let out = collect_task_turn(rx, cancel.clone(), Duration::from_millis(20), || false).await;
+        assert_eq!(out, Err("Task timed out".to_string()));
+        assert!(cancel.is_cancelled());
     }
 }

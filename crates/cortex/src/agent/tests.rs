@@ -304,6 +304,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         browser_session: None,
         tts_synthesizer: None,
         config_rx: None,
+        config_pin: None,
         db: Mutex::new(None),
         caches: SystemPromptCache::with_test_state(None, Some(HashMap::new()), None, None, None),
         ghost_commit: None,
@@ -3263,4 +3264,59 @@ fn next_turn_config_reports_a_pending_reload_before_the_turn_applies_it() {
     let next = agent.next_turn_config();
     assert_eq!(next.llm.model, "claude-haiku-4-5");
     assert_eq!(next.llm.provider.as_deref(), Some("anthropic"));
+}
+
+fn pin_model(model: &'static str) -> ConfigPin {
+    ConfigPin::new(move |mut config| {
+        config.llm.model = model.to_string();
+        config
+    })
+}
+
+#[test]
+fn a_config_pin_holds_for_its_turn_and_lifting_it_restores_the_setting() {
+    let mut config = Config::default();
+    config.llm.model = "chat-model".to_string();
+    let mut agent = minimal_test_agent(config);
+
+    agent.set_config_pin(Some(pin_model("task-model")));
+    assert_eq!(agent.config().llm.model, "task-model");
+    // A second pin replaces the first rather than stacking on it.
+    agent.set_config_pin(Some(pin_model("other-model")));
+    assert_eq!(agent.config().llm.model, "other-model");
+
+    agent.set_config_pin(None);
+    assert_eq!(agent.config().llm.model, "chat-model");
+}
+
+#[test]
+fn a_settings_change_mid_turn_lands_under_the_pin_and_survives_lifting_it() {
+    let mut config = Config::default();
+    config.llm.model = "chat-model".to_string();
+    let (tx, rx) = tokio::sync::watch::channel(config.clone());
+    let mut agent = minimal_test_agent(config.clone());
+    agent.config_rx = Some(rx);
+
+    agent.set_config_pin(Some(pin_model("task-model")));
+    let mut changed = config;
+    changed.llm.model = "new-chat-model".to_string();
+    changed.user.timezone = Some("Europe/Paris".to_string());
+    tx.send(changed).unwrap();
+    agent.maybe_reload_config();
+    assert_eq!(
+        agent.config().llm.model,
+        "task-model",
+        "the pin still holds"
+    );
+    assert_eq!(
+        agent.config().user.timezone.as_deref(),
+        Some("Europe/Paris")
+    );
+
+    agent.set_config_pin(None);
+    assert_eq!(
+        agent.config().llm.model,
+        "new-chat-model",
+        "not the stale setting"
+    );
 }

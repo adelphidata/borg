@@ -43,6 +43,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         browser_session: None,
         tts_synthesizer: None,
         config_rx: None,
+        config_pin: None,
         db: Mutex::new(db),
         caches: SystemPromptCache::default(),
         ghost_commit: None,

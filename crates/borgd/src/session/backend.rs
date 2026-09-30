@@ -171,6 +171,10 @@ pub trait SessionBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Lays `pin` over the config for the next turn only. Backends that hold
+    /// no agent have no config to pin, and run the turn as they would anyway.
+    fn pin_next_turn(&self, _pin: cortex::agent::ConfigPin) {}
+
     // ── Agent-control surface (default: not supported) ────────────────────
     //
     // These all return `Err(unsupported)` for stub backends; only `AgentBackend`
@@ -313,6 +317,8 @@ pub struct AgentBackend {
     /// for its whole length, so `GetState` answers from this while one runs
     /// instead of waiting for the reply to finish.
     last_snapshot: std::sync::Mutex<Option<SessionStateSnapshot>>,
+    /// Taken by the next turn, and lifted when it ends.
+    next_turn_pin: std::sync::Mutex<Option<cortex::agent::ConfigPin>>,
 }
 
 /// The agent's user-facing state, read under its lock.
@@ -478,6 +484,7 @@ impl AgentBackend {
             worker_id,
             lease_epoch: AtomicI64::new(initial_epoch),
             last_snapshot: std::sync::Mutex::new(Some(first_snapshot)),
+            next_turn_pin: std::sync::Mutex::new(None),
         }))
     }
 
@@ -525,6 +532,13 @@ impl SessionBackend for AgentBackend {
         cancel: CancellationToken,
         text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
     ) {
+        // Take the pin before any early return: a pinned turn that is refused
+        // must not leave its pin behind for whichever turn comes next.
+        let pin = self
+            .next_turn_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // Reject overlapping turns explicitly rather than silently queuing on
         // an async lock — a hung second `Send` is indistinguishable from a
         // crashed daemon for the user. SessionHost serializes turns at a
@@ -573,6 +587,10 @@ impl SessionBackend for AgentBackend {
             agent.set_text_file_bridge(text_file_bridge);
         }
         let max_image_bytes = agent.config().media.max_image_bytes;
+        let pinned = pin.is_some();
+        if pinned {
+            agent.set_config_pin(pin);
+        }
         let bridge_guard = TextFileBridgeAutoDetach::new(&mut agent, bridge_attached);
 
         let result = if images.is_empty() {
@@ -612,6 +630,10 @@ impl SessionBackend for AgentBackend {
         // bridge_guard's Drop runs here (or earlier on unwind) and detaches.
         drop(bridge_guard);
         self.steer_gate.close();
+        // The next turn is whoever sends it, on the session's own model.
+        if pinned {
+            agent.set_config_pin(None);
+        }
 
         if let Err(e) = result {
             // anyhow's `Display` only renders the topmost message; `{:#}` walks
@@ -665,6 +687,13 @@ impl SessionBackend for AgentBackend {
 
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    fn pin_next_turn(&self, pin: cortex::agent::ConfigPin) {
+        *self
+            .next_turn_pin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pin);
     }
 
     async fn close_session(&self) -> anyhow::Result<()> {

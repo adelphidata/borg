@@ -202,11 +202,13 @@ fn paused_turn_stream(
     (rx, cancelled)
 }
 
-#[async_trait]
-impl SessionExecutor for DaemonSessionExecutor {
-    async fn start_turn(
+impl DaemonSessionExecutor {
+    /// [`SessionExecutor::start_turn`], with `pin` laid over the config for
+    /// this turn only — a scheduled task running on its own model.
+    pub async fn start_turn_pinned(
         &self,
         turn: InboundTurn,
+        pin: Option<cortex::agent::ConfigPin>,
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
         // Emergency stop (`borg pause`): reject NEW turns before any host is
         // created or any in-flight turn is cancelled.
@@ -264,6 +266,9 @@ impl SessionExecutor for DaemonSessionExecutor {
             }
         }
 
+        if let Some(pin) = pin {
+            host.pin_next_turn(pin);
+        }
         // Subscribe BEFORE start_turn so we can't miss the first event.
         let mut sub = host.subscribe();
         let (cancel, baseline) = host.start_turn(turn.text, turn.images, None, None).await;
@@ -310,6 +315,24 @@ impl SessionExecutor for DaemonSessionExecutor {
         });
 
         Ok((rx, cancel))
+    }
+
+    /// How many event streams are attached to `session_key`'s live host; 0
+    /// when none is live. A turn this executor started holds one of them.
+    pub fn watchers(&self, session_key: &str) -> usize {
+        self.registry
+            .peek(session_key)
+            .map_or(0, |host| host.subscriber_count())
+    }
+}
+
+#[async_trait]
+impl SessionExecutor for DaemonSessionExecutor {
+    async fn start_turn(
+        &self,
+        turn: InboundTurn,
+    ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+        self.start_turn_pinned(turn, None).await
     }
 
     async fn cancel(&self, session_key: &str) -> bool {

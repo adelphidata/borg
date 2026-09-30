@@ -326,6 +326,28 @@ pub enum LlmRole {
     Auxiliary,
 }
 
+/// A rewrite laid over the live config for one turn, such as a scheduled
+/// task's own model. Settings changes that land mid-turn pass through it
+/// too, so the turn keeps its model and still picks up everything else.
+#[derive(Clone)]
+pub struct ConfigPin(Arc<dyn Fn(Config) -> Config + Send + Sync>);
+
+impl ConfigPin {
+    pub fn new(rewrite: impl Fn(Config) -> Config + Send + Sync + 'static) -> Self {
+        Self(Arc::new(rewrite))
+    }
+
+    pub fn apply(&self, config: Config) -> Config {
+        (self.0)(config)
+    }
+}
+
+impl std::fmt::Debug for ConfigPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConfigPin")
+    }
+}
+
 /// Core conversation agent: manages history, tools, and the LLM interaction loop.
 pub struct Agent {
     /// Primary config. Must be kept in sync with `config_arc` — update both in `reload_config`.
@@ -351,6 +373,9 @@ pub struct Agent {
     pub(super) browser_session: Option<crate::browser::BrowserSession>,
     pub(super) tts_synthesizer: Option<crate::media::tts::TtsSynthesizer>,
     pub(super) config_rx: Option<tokio::sync::watch::Receiver<Config>>,
+    /// The pin in force, and the config as it stood without it — what
+    /// lifting the pin goes back to.
+    pub(super) config_pin: Option<(ConfigPin, Config)>,
     pub(super) db: Mutex<Option<Database>>,
     /// System-prompt input caches (identity, credentials, project docs, skills).
     /// All invalidation goes through typed event methods on this struct —
@@ -598,6 +623,7 @@ impl Agent {
             metrics,
             browser_session: None,
             config_rx: None,
+            config_pin: None,
             db: Mutex::new(common.db),
             caches: SystemPromptCache::default(),
             ghost_commit: None,
@@ -2126,11 +2152,32 @@ impl Agent {
         }
     }
 
+    /// Lays `pin` over the config until it is replaced or lifted with `None`.
+    pub fn set_config_pin(&mut self, pin: Option<ConfigPin>) {
+        let base = match self.config_pin.take() {
+            Some((_, base)) => base,
+            None => self.config.clone(),
+        };
+        let next = match pin {
+            Some(pin) => {
+                let pinned = pin.apply(base.clone());
+                self.config_pin = Some((pin, base));
+                pinned
+            }
+            None => base,
+        };
+        self.reload_config(next);
+    }
+
     /// Hot-reload config if the watcher has detected changes.
     fn maybe_reload_config(&mut self) {
         if let Some(ref mut rx) = self.config_rx {
             if rx.has_changed().unwrap_or(false) {
-                let new_config = rx.borrow_and_update().clone();
+                let mut new_config = rx.borrow_and_update().clone();
+                if let Some((pin, base)) = self.config_pin.as_mut() {
+                    *base = new_config.clone();
+                    new_config = pin.apply(new_config);
+                }
                 info_span!("config_reload").in_scope(|| {
                     // Routine event, not an error condition — DEBUG is the
                     // right level. WARN here used to fire on the first turn of
