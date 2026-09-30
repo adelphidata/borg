@@ -702,9 +702,54 @@ pub(crate) fn try_take_eventstream_payload(
         });
     }
 
-    let payload = buffer[payload_start..payload_end].to_vec();
+    let name = eventstream_type(&buffer[12..payload_start]);
+    let payload = keyed_by_event_type(name, &buffer[payload_start..payload_end]);
     buffer.drain(..total_len);
     Ok(Some(payload))
+}
+
+/// The `:event-type` (or `:exception-type`) header of a frame.
+fn eventstream_type(mut headers: &[u8]) -> Option<String> {
+    let mut found = None;
+    while let Some((&name_len, rest)) = headers.split_first() {
+        let name_len = name_len as usize;
+        let name = rest.get(..name_len)?;
+        let (&kind, rest) = rest.get(name_len..)?.split_first()?;
+        let (value, rest) = match kind {
+            0 | 1 => (&[][..], rest),
+            2 => rest.split_at_checked(1)?,
+            3 => rest.split_at_checked(2)?,
+            4 => rest.split_at_checked(4)?,
+            5 | 8 => rest.split_at_checked(8)?,
+            9 => rest.split_at_checked(16)?,
+            6 | 7 => {
+                let len = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+                rest.get(2..)?.split_at_checked(len)?
+            }
+            _ => return found,
+        };
+        if kind == 7 && (name == b":event-type" || name == b":exception-type") {
+            found = std::str::from_utf8(value).ok().map(str::to_string);
+        }
+        headers = rest;
+    }
+    found
+}
+
+/// ConverseStream sends each event's body bare and names it in a header;
+/// the parser reads `{"<eventType>": body}`, so wrap it that way.
+fn keyed_by_event_type(name: Option<String>, payload: &[u8]) -> Vec<u8> {
+    let Some(name) = name else {
+        return payload.to_vec();
+    };
+    match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(serde_json::Value::Object(body)) if !body.contains_key(&name) => {
+            let mut wrapped = serde_json::Map::new();
+            wrapped.insert(name, serde_json::Value::Object(body));
+            serde_json::to_vec(&wrapped).unwrap_or_else(|_| payload.to_vec())
+        }
+        _ => payload.to_vec(),
+    }
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
@@ -992,6 +1037,52 @@ mod tests {
             .expect("payload present");
         assert_eq!(got, payload);
         assert!(frame.is_empty(), "frame bytes must be drained");
+    }
+
+    #[test]
+    fn eventstream_payload_is_keyed_by_its_event_type_header() {
+        fn frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+            let mut encoded = Vec::new();
+            for (name, value) in headers {
+                encoded.push(name.len() as u8);
+                encoded.extend_from_slice(name.as_bytes());
+                encoded.push(7);
+                encoded.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                encoded.extend_from_slice(value.as_bytes());
+            }
+            let total_len = 16 + encoded.len() + payload.len();
+            let mut out = Vec::new();
+            out.extend_from_slice(&(total_len as u32).to_be_bytes());
+            out.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            out.extend_from_slice(&0_u32.to_be_bytes());
+            out.extend_from_slice(&encoded);
+            out.extend_from_slice(payload);
+            out.extend_from_slice(&0_u32.to_be_bytes());
+            out
+        }
+
+        let mut buffer = frame(
+            &[
+                (":event-type", "contentBlockDelta"),
+                (":content-type", "application/json"),
+                (":message-type", "event"),
+            ],
+            br#"{"contentBlockIndex":1,"delta":{"text":"Hi"},"p":"ab"}"#,
+        );
+        buffer.extend(frame(
+            &[(":exception-type", "throttlingException"), (":message-type", "exception")],
+            br#"{"message":"slow down"}"#,
+        ));
+        buffer.extend(frame(&[(":event-type", "messageStop")], br#"{"stopReason":"end_turn"}"#));
+
+        let mut take = || {
+            let payload = try_take_eventstream_payload(&mut buffer).unwrap().unwrap();
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap()
+        };
+        assert_eq!(take()["contentBlockDelta"]["delta"]["text"], "Hi");
+        assert_eq!(take()["throttlingException"]["message"], "slow down");
+        assert_eq!(take()["messageStop"]["stopReason"], "end_turn");
+        assert!(buffer.is_empty());
     }
 
     #[test]
