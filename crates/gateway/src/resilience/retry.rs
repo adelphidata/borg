@@ -169,9 +169,13 @@ mod tests {
         policy(1, 2.0, 5, 0.0, max_retries)
     }
 
-    fn manifest_with_outbound(outbound: &str) -> ChannelManifest {
+    /// The script counts its calls in `state_dir`. The sandbox binds the
+    /// script's own directory read-only on Linux, so the manifest grants
+    /// write access to `state_dir` the way a real channel would.
+    fn manifest_with_outbound(outbound: &str, state_dir: &std::path::Path) -> ChannelManifest {
         toml::from_str(&format!(
-            "name = \"retry-test\"\ndescription = \"d\"\nruntime = \"bash\"\n\n[scripts]\ninbound = \"in.sh\"\noutbound = \"{outbound}\"\n"
+            "name = \"retry-test\"\ndescription = \"d\"\nruntime = \"bash\"\n\n[scripts]\ninbound = \"in.sh\"\noutbound = \"{outbound}\"\n\n[sandbox]\nfs_write = [\"{}\"]\n",
+            state_dir.display()
         ))
         .unwrap()
     }
@@ -187,7 +191,9 @@ mod tests {
     #[tokio::test]
     async fn send_with_retry_returns_success_on_first_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("calls");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let counter = state.join("calls");
         write_executable(
             &dir.path().join("out.sh"),
             &format!(
@@ -195,7 +201,7 @@ mod tests {
                 counter = counter.display()
             ),
         );
-        let manifest = manifest_with_outbound("out.sh");
+        let manifest = manifest_with_outbound("out.sh", &state);
         let executor = ChannelExecutor::new(&manifest, dir.path());
 
         let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(3)).await;
@@ -211,7 +217,9 @@ mod tests {
     #[tokio::test]
     async fn send_with_retry_returns_permanent_failure_on_exit_4_without_retrying() {
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("calls");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let counter = state.join("calls");
         write_executable(
             &dir.path().join("out.sh"),
             &format!(
@@ -219,7 +227,7 @@ mod tests {
                 counter = counter.display()
             ),
         );
-        let manifest = manifest_with_outbound("out.sh");
+        let manifest = manifest_with_outbound("out.sh", &state);
         let executor = ChannelExecutor::new(&manifest, dir.path());
 
         let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(5)).await;
@@ -241,7 +249,9 @@ mod tests {
     #[tokio::test]
     async fn send_with_retry_exhausts_after_max_retries_for_transient_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("calls");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let counter = state.join("calls");
         write_executable(
             &dir.path().join("out.sh"),
             &format!(
@@ -249,7 +259,7 @@ mod tests {
                 counter = counter.display()
             ),
         );
-        let manifest = manifest_with_outbound("out.sh");
+        let manifest = manifest_with_outbound("out.sh", &state);
         let executor = ChannelExecutor::new(&manifest, dir.path());
 
         let p = fast_policy(2);
@@ -270,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn send_with_retry_recovers_after_transient_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("calls");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let counter = state.join("calls");
         write_executable(
             &dir.path().join("out.sh"),
             &format!(
@@ -286,7 +298,7 @@ echo ok
                 counter = counter.display()
             ),
         );
-        let manifest = manifest_with_outbound("out.sh");
+        let manifest = manifest_with_outbound("out.sh", &state);
         let executor = ChannelExecutor::new(&manifest, dir.path());
 
         let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(3)).await;
