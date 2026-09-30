@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import {
@@ -14,6 +15,7 @@ import {
 } from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
 import { Truncated } from "../components/Truncated";
+import { isSubmitEnter } from "../lib/imeKey";
 import type { AppRoute, NavUser, RecentItem, SidebarUpdate } from "../types";
 
 export interface SidebarProps {
@@ -31,6 +33,13 @@ export interface SidebarProps {
    * menu itself; omit and right-click falls through to the browser's own.
    */
   onRecentContextMenu?: (id: string, at: { x: number; y: number }) => void;
+  /** The recent row whose title is being typed over, in place of its link. */
+  renamingId?: string;
+  /**
+   * Ends a rename: the typed title, or undefined when it was abandoned (Escape,
+   * or left blank or unchanged). Either way the row goes back to a link.
+   */
+  onRenameRecent?: (id: string, title: string | undefined) => void;
   /**
    * Why the last archive failed, if it did. Rendered under the list — an
    * archive button that silently does nothing reads as a broken button.
@@ -232,13 +241,18 @@ function RecentRow({
   onArchive,
   onPin,
   onContextMenu,
+  renaming = false,
+  onRename,
 }: {
   item: RecentItem;
   onOpen: () => void;
   onArchive: () => void;
   onPin?: (pinned: boolean) => void;
   onContextMenu?: (at: { x: number; y: number }) => void;
+  renaming?: boolean;
+  onRename?: (title: string | undefined) => void;
 }) {
+  if (renaming && onRename) return <RenameRow title={item.title} onDone={onRename} />;
   return (
     <div
       className="group relative flex items-center rounded-md pr-3 text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
@@ -342,6 +356,53 @@ function UserItem({ user, onEdit }: { user?: NavUser; onEdit?: () => void }) {
   );
 }
 
+/**
+ * A recent row's title as a text box, typed over in place. Enter or leaving
+ * the box keeps what was typed; Escape puts the old title back.
+ */
+function RenameRow({
+  title,
+  onDone,
+}: {
+  title: string;
+  onDone: (title: string | undefined) => void;
+}) {
+  const [draft, setDraft] = useState(title);
+  // Enter commits and unmounts the box, and the blur that follows must not
+  // report the rename a second time.
+  const [done, setDone] = useState(false);
+  const finish = (next: string | undefined) => {
+    if (done) return;
+    setDone(true);
+    const trimmed = next?.trim();
+    onDone(trimmed && trimmed !== title ? trimmed : undefined);
+  };
+  return (
+    <div className="px-1 py-[2px]">
+      <input
+        autoFocus
+        aria-label={`Rename ${title}`}
+        value={draft}
+        // Selected, so typing replaces the old title the way a file rename does.
+        onFocus={(e) => e.currentTarget.select()}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => finish(draft)}
+        onKeyDown={(e) => {
+          if (isSubmitEnter(e)) {
+            e.preventDefault();
+            finish(draft);
+          } else if (e.key === "Escape") {
+            // The row's own key: it must not also cancel a running turn.
+            e.stopPropagation();
+            finish(undefined);
+          }
+        }}
+        className="w-full rounded-[6px] border border-line bg-surface2 px-2 py-[5px] text-[12.5px] leading-[1.35] text-ink outline-none select-text [font-family:inherit]"
+      />
+    </div>
+  );
+}
+
 export function Sidebar({
   routes,
   recents,
@@ -349,6 +410,8 @@ export function Sidebar({
   onArchiveRecent,
   onPinRecent,
   onRecentContextMenu,
+  renamingId,
+  onRenameRecent,
   archiveError,
   onNewConversation,
   onSeeAllConversations,
@@ -464,6 +527,8 @@ export function Sidebar({
             onArchive={() => onArchiveRecent(r.id)}
             onPin={onPinRecent && ((pinned) => onPinRecent(r.id, pinned))}
             onContextMenu={onRecentContextMenu && ((at) => onRecentContextMenu(r.id, at))}
+            renaming={renamingId === r.id}
+            onRename={onRenameRecent && ((title) => onRenameRecent(r.id, title))}
           />
         ))}
       </div>

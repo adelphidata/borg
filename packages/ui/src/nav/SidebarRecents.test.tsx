@@ -218,4 +218,24 @@ describe("Sidebar recents", () => {
     expect(screen.getByText("Operator")).toBeTruthy();
     expect(screen.getByText("OP")).toBeTruthy();
   });
+
+  it("types over the title of the row being renamed, reporting it once", () => {
+    const onRenameRecent = vi.fn();
+    renderSidebar({ renamingId: "s1", onRenameRecent });
+    const box = screen.getByRole("textbox", { name: "Rename a past conversation" });
+    fireEvent.change(box, { target: { value: "the offsite plan" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.blur(box);
+    expect(onRenameRecent).toHaveBeenCalledTimes(1);
+    expect(onRenameRecent).toHaveBeenCalledWith("s1", "the offsite plan");
+  });
+
+  it("reports an unchanged or blank rename as abandoned", () => {
+    const onRenameRecent = vi.fn();
+    renderSidebar({ renamingId: "s1", onRenameRecent });
+    const box = screen.getByRole("textbox", { name: "Rename a past conversation" });
+    fireEvent.change(box, { target: { value: "   " } });
+    fireEvent.blur(box);
+    expect(onRenameRecent).toHaveBeenCalledWith("s1", undefined);
+  });
 });

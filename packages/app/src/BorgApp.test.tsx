@@ -207,6 +207,42 @@ describe("BorgApp shell", () => {
     );
   });
 
+  it("renames a sidebar row by right-click and typing", async () => {
+    const daemon = fakeDaemon({ ...BASE, SetSessionTitle: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    fireEvent.contextMenu(screen.getByText("Ship the daemon"), { clientX: 20, clientY: 30 });
+    await act(async () => screen.getByRole("menuitem", { name: /Rename/ }).click());
+    const box = screen.getByRole("textbox", { name: "Rename Ship the daemon" });
+    fireEvent.change(box, { target: { value: "  Ship borgd  " } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSessionTitle")?.request).toEqual({
+        id: "s1",
+        title: "Ship borgd",
+      }),
+    );
+    await waitFor(() => expect(toast().textContent).toContain("Renamed to “Ship borgd”"));
+    expect(screen.queryByRole("textbox", { name: "Rename Ship the daemon" })).toBeNull();
+  });
+
+  it("leaves the title alone when a sidebar rename is abandoned", async () => {
+    const daemon = fakeDaemon({ ...BASE, SetSessionTitle: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    fireEvent.contextMenu(screen.getByText("Ship the daemon"), { clientX: 20, clientY: 30 });
+    await act(async () => screen.getByRole("menuitem", { name: /Rename/ }).click());
+    const box = screen.getByRole("textbox", { name: "Rename Ship the daemon" });
+    fireEvent.change(box, { target: { value: "never mind" } });
+    fireEvent.keyDown(box, { key: "Escape" });
+
+    expect(screen.getByText("Ship the daemon")).toBeTruthy();
+    expect(daemon.calls.some((c) => c.method === "SetSessionTitle")).toBe(false);
+  });
+
   it("hands an archived conversation back without a confirmation dialog", async () => {
     // The archive goes through immediately — Borg does not put a dialog in
     // front of a reversible act — so the way back has to be on screen after it.

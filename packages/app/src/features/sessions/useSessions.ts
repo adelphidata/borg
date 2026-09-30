@@ -14,7 +14,7 @@ import {
   type SessionActivity,
 } from "./activityStore";
 import { formatElapsed } from "../../lib/format";
-import { offerRestore, showNotice } from "../../lib/notice";
+import { offerRestore, renamedMessage, showNotice } from "../../lib/notice";
 import { sessionsChanged, sessionsVersion, subscribeSessions } from "./sessionsVersion";
 import { observeSessions, subscribeUnread, unreadVersion } from "./unreadStore";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
@@ -212,7 +212,12 @@ export function useSessions(deps: unknown[] = []): Sessions {
     (borg, vars: { id: string; title: string }) => borg.admin.setSessionTitle(vars),
     // The sidebar lists the same titles from a query of its own, so the shared
     // counter is what renews both.
-    { onSuccess: () => sessionsChanged() },
+    {
+      onSuccess: (_: unknown, vars: { title: string }) => {
+        sessionsChanged();
+        showNotice(renamedMessage(vars.title));
+      },
+    },
   );
   const setArchivedMutation = useMutation(
     // `title` never reaches the daemon; it rides along so the undo offer can
