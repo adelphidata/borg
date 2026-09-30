@@ -795,6 +795,37 @@ async fn absorb_pending_steer_drains_into_history_and_signals_continue() {
     assert_eq!(agent.history.len(), 1, "no duplicate steer injected");
 }
 
+/// The last check of a turn: a steer that landed after the absorb check keeps
+/// the gate open so the turn can drain it, and only an empty channel closes
+/// it — after which a steer is refused rather than stranded.
+#[tokio::test]
+async fn last_steer_check_keeps_the_turn_open_for_a_waiting_steer() {
+    use crate::agent::steer::{SteerGate, SteerRefused};
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let gate = Arc::new(SteerGate::new());
+    agent.steer_rx = Some(steer_rx);
+    agent.steer_gate = Some(gate.clone());
+    gate.open();
+
+    gate.send(&steer_tx, "late redirect".into()).unwrap();
+    assert!(
+        !agent.close_steers_unless_pending(),
+        "a waiting steer must keep the turn going"
+    );
+    gate.send(&steer_tx, "still taken".into()).unwrap();
+
+    agent.drain_steers(&event_tx).await;
+    assert_eq!(agent.history.len(), 2, "both steers land in this turn");
+    assert!(agent.close_steers_unless_pending());
+    assert_eq!(
+        gate.send(&steer_tx, "too late".into()),
+        Err(SteerRefused::TurnEnded)
+    );
+}
+
 /// End-to-end accounting: after a turn baseline is captured, charging a token
 /// delta that crosses the budget flips the goal to BudgetLimited and queues the
 /// one-shot budget-limit steering message.

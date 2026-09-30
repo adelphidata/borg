@@ -513,6 +513,13 @@ impl SessionBackend for AgentBackend {
             return;
         }
 
+        // Take steers from here on, not only once the loop starts: a client
+        // shows a turn as running from the moment it sent it, and a steer
+        // typed while the user message is still being saved must not be
+        // refused. The loop's last check closes the gate; the close below
+        // covers a turn that never reached the loop.
+        self.steer_gate.open();
+
         // Attach the IDE-backed text-file bridge for the duration of the turn
         // and detach unconditionally — including on unwind. The async Mutex
         // serializes turns on this backend, so the next turn must not inherit
@@ -550,6 +557,7 @@ impl SessionBackend for AgentBackend {
         };
         // bridge_guard's Drop runs here (or earlier on unwind) and detaches.
         drop(bridge_guard);
+        self.steer_gate.close();
 
         if let Err(e) = result {
             // anyhow's `Display` only renders the topmost message; `{:#}` walks

@@ -645,6 +645,16 @@ pub async fn run(
 /// Convert the TUI's image attachments into the proto's `InlineImage` shape.
 /// The wire format takes raw bytes (NOT base64) — daemon side encodes when
 /// constructing the agent's multimodal message.
+/// What the TUI says when the daemon did not take a steer. The text is quoted
+/// back because the composer has already been cleared.
+fn steer_refused_notice(text: &str, error: &str) -> String {
+    if error.contains("FailedPrecondition") {
+        format!("The turn ended before this reached it; send it again: {text}")
+    } else {
+        format!("This did not reach the running turn ({error}): {text}")
+    }
+}
+
 fn images_to_proto(images: Vec<composer::ImageAttachment>) -> Vec<protocols::session::InlineImage> {
     images
         .into_iter()
@@ -1176,10 +1186,20 @@ async fn run_event_loop(
                 {
                     let mut steer_client = client.clone();
                     let sid = session_id.to_string();
+                    // Holds the turn's event channel open until the last steer
+                    // is answered, so a refusal still reaches the screen.
+                    let notices = event_tx.clone();
                     tokio::spawn(async move {
                         while let Some(text) = steer_rx.recv().await {
                             if let Err(e) = steer_client.steer(&sid, &text).await {
                                 tracing::warn!(error = %e, "Session.Steer failed");
+                                let notice = steer_refused_notice(&text, &format!("{e:#}"));
+                                let _ = notices
+                                    .send(AgentEvent::SystemNotice {
+                                        category: "steer".into(),
+                                        text: notice,
+                                    })
+                                    .await;
                             }
                         }
                     });
@@ -2351,6 +2371,25 @@ mod tests {
     /// Forbidden escape-sequence modes. Presence of ANY of these in the code
     /// paths that emit ANSI to the terminal will break native text selection.
     const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
+
+    /// Regression: a refused steer was only logged, while the screen still
+    /// said it was queued and the composer had been cleared.
+    #[test]
+    fn a_refused_steer_is_quoted_back_with_what_to_do() {
+        let ended = steer_refused_notice(
+            "check the sources",
+            "Session.Steer failed (FailedPrecondition): steer: no turn is running",
+        );
+        assert_eq!(
+            ended,
+            "The turn ended before this reached it; send it again: check the sources"
+        );
+        let other = steer_refused_notice("x", "Session.Steer failed (Unavailable)");
+        assert!(
+            other.contains("Unavailable") && other.ends_with(": x"),
+            "{other}"
+        );
+    }
 
     #[test]
     fn format_check_outcome_already_up_to_date() {

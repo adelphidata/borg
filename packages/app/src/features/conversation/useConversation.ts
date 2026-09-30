@@ -870,10 +870,12 @@ export function useConversation(target: string | undefined): Conversation {
       setStreamError(undefined);
       if (event.turnComplete || event.error) setBusy(false);
       // A turn the daemon started on its own — a resumed one, or a scheduled
-      // wake — has no submit to arm the clock, so the first event does it. A
-      // steer taken at a turn's last check keeps it going past the
-      // `turnComplete` already sent, so its echo marks the turn busy again.
-      if (event.preparing || event.steerReceived) {
+      // wake — has no submit to arm the clock, so the first event does it. So
+      // does a turn that a steer taken at its last check keeps going past the
+      // `turnComplete` already sent: its next model call starts with
+      // `preparing`. A bare steer echo is not enough — a stopped turn replays
+      // what it had queued after its `turnComplete`, and nothing follows it.
+      if (event.preparing) {
         setBusy(true);
         armTurnClock();
       }

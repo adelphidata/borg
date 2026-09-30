@@ -59,12 +59,12 @@ impl SteerGate {
     }
 
     /// A turn has started and will drain the channel.
-    pub(crate) fn open(&self) {
+    pub fn open(&self) {
         *self.lock() = true;
     }
 
     /// Stop taking steers.
-    pub(crate) fn close(&self) {
+    pub fn close(&self) {
         *self.lock() = false;
     }
 

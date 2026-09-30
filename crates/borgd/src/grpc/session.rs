@@ -744,8 +744,18 @@ impl Session for SessionSvc {
     async fn steer(&self, req: Request<SteerRequest>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
         let host = self.host_or_err(&req.session_id)?;
-        host.steer(&req.text)
-            .map_err(|e| TStatus::failed_precondition(format!("steer: {e}")))?;
+        // Only "the turn is over" is a precondition the client can act on by
+        // sending the text as a turn of its own; anything else is a failure
+        // it must report, not resend.
+        host.steer(&req.text).map_err(|e| {
+            use cortex::agent::steer::SteerRefused;
+            match e.downcast_ref::<SteerRefused>() {
+                Some(SteerRefused::TurnEnded) => {
+                    TStatus::failed_precondition(format!("steer: {e}"))
+                }
+                _ => TStatus::unavailable(format!("steer: {e}")),
+            }
+        })?;
         Ok(Response::new(Empty {}))
     }
 

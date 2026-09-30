@@ -331,7 +331,26 @@ describe("useConversation side channels", () => {
     expect(conv.current.busy).toBe(false);
 
     emit(daemon, { steerReceived: { text: "one more thing" } as never });
+    emit(daemon, { preparing: {} as never });
     expect(conv.current.busy).toBe(true);
+  });
+
+  it("stays idle when a stopped turn replays the steer it had queued", async () => {
+    // A stop keeps what was queued in the history, echoed after the
+    // `turnComplete`; no model call follows, so nothing would end a spinner.
+    const daemon = fakeDaemon({ ...OPEN, Steer: {} });
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    emit(daemon, { turnComplete: {} as never });
+    emit(daemon, { steerReceived: { text: "and the sources" } as never });
+
+    expect(conv.current.busy).toBe(false);
+    expect(conv.current.turnStartedAt).toBeUndefined();
+    expect(conv.current.cells.filter((c) => c.kind === "user").map((c) => c.text)).toEqual([
+      "go",
+      "and the sources",
+    ]);
   });
 
   it("refuses a steer before the session is open, without calling the daemon", async () => {
