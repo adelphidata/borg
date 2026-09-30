@@ -566,7 +566,7 @@ at `cost_usd_present = false` until a local-pricing policy exists.
     - `wfp` — operational `FwpmEngineOpen0` + transactional
       `FwpmProviderAdd0` / `FwpmSubLayerAdd0` / `FwpmFilterAdd0` ×2
       (V4+V6) with an `ALE_USER_ID` security-descriptor condition for
-      the offline SID, `PERSISTENT | BOOTTIME`, and delete-by-key
+      the offline SID, `PERSISTENT`, and delete-by-key
       teardown; filter _specs_ are cross-platform unit-tested.
     - `runtime::run_inner` Tier1↔Tier2 routing via `mode::detect()`
       with fail-safe fallback to the Tier 1 anonymous-pipe self-exec on

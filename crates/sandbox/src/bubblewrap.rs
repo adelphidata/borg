@@ -330,8 +330,6 @@ pub fn build_bwrap_args_probed(
 ) -> Vec<String> {
     let mut args = Vec::new();
 
-    push_bind_if_exists(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
-
     for path in SYSTEM_RO_BINDS {
         push_bind_if_exists(&mut args, "--ro-bind", path);
     }
@@ -350,6 +348,10 @@ pub fn build_bwrap_args_probed(
     // every `fs_write`/`deny_write` rule, plus read access to other processes'
     // shared-memory segments.
     args.extend(["--tmpfs".to_string(), "/dev/shm".to_string()]);
+
+    // After the system tmpfs mounts: a later mount covers an earlier one, so a
+    // tool dir under `/tmp` bound before `--tmpfs /tmp` would be hidden.
+    push_bind_if_exists(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
 
     for path in &policy.fs_read {
         push_bind_if_exists(&mut args, "--ro-bind", path);
@@ -669,6 +671,25 @@ mod tests {
                 .any(|w| w[0] == "--bind" && w[1] == missing_write_str),
             "an absent write grant must still be bound: {args:?}"
         );
+    }
+
+    /// A tool dir under `/tmp` must stay visible: its bind has to come after
+    /// the private `--tmpfs /tmp`, or that mount covers it.
+    #[test]
+    fn tool_dir_bind_comes_after_the_tmp_tmpfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool_dir_str = tmp.path().to_string_lossy().into_owned();
+        let args = build_bwrap_args(&default_policy(), tmp.path());
+
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("tmpfs /tmp");
+        let tool_bind = args
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == tool_dir_str)
+            .expect("tool dir bind");
+        assert!(tool_bind > tmpfs_tmp, "{args:?}");
     }
 
     /// A missing tool dir must not fail the spawn either. Tool dirs are created

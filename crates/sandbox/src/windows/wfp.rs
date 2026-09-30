@@ -22,14 +22,17 @@
 //! layer      = FWPM_LAYER_ALE_AUTH_CONNECT_V{4,6}
 //! action     = FWP_ACTION_BLOCK
 //! conditions = [ALE_USER_ID matches a security descriptor granting the offline SID]
-//! flags      = PERSISTENT | BOOTTIME
+//! flags      = PERSISTENT
 //! ```
 //!
-//! `BOOTTIME` plus `PERSISTENT` is the load-bearing pair: the filter
-//! survives reboot AND is active before any sandboxed process runs,
-//! even at first boot before borgd has started. A non-persistent or
-//! non-boottime filter could be raced by a child that starts in the
-//! window between boot and `borgd` reinstalling its filters.
+//! `PERSISTENT` is load-bearing: the filter survives reboot and is
+//! enforced from the moment the Base Filtering Engine starts, which is
+//! before `borgd` (the only thing that spawns sandboxed processes) can
+//! run. A non-persistent filter could be raced by a child that starts in
+//! the window between boot and `borgd` reinstalling its filters.
+//! `BOOTTIME` is not used: it covers only the window before BFE starts,
+//! when no sandboxed process can exist, and WFP rejects it combined with
+//! `PERSISTENT` (`FWP_E_INVALID_FLAGS`).
 //!
 //! # ALE_USER_ID matching
 //!
@@ -94,15 +97,11 @@ pub mod filter_specs {
         pub block: bool,
         /// `true` → `FWPM_FILTER_FLAG_PERSISTENT` (survives reboot).
         pub persistent: bool,
-        /// `true` → `FWPM_FILTER_FLAG_BOOTTIME` (active before borgd
-        /// runs at first boot).
-        pub boottime: bool,
     }
 
     /// The two filters that block all outbound network for the offline
     /// sandbox account: one at the IPv4 ALE connect layer, one at IPv6.
-    /// Both persistent + boottime so the block can't be raced across a
-    /// reboot.
+    /// Both persistent so the block can't be raced across a reboot.
     pub fn offline_outbound_block() -> Vec<FilterSpec> {
         vec![
             FilterSpec {
@@ -111,7 +110,6 @@ pub mod filter_specs {
                 ipv6: false,
                 block: true,
                 persistent: true,
-                boottime: true,
             },
             FilterSpec {
                 name: "Borg sandbox offline outbound block (IPv6)",
@@ -119,7 +117,6 @@ pub mod filter_specs {
                 ipv6: true,
                 block: true,
                 persistent: true,
-                boottime: true,
             },
         ]
     }
@@ -176,12 +173,12 @@ mod ffi {
         FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
         FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0, FWPM_ACTION0,
         FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
-        FWPM_FILTER0_0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_BOOTTIME,
-        FWPM_FILTER_FLAG_PERSISTENT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0, FWPM_PROVIDER_FLAG_PERSISTENT,
-        FWPM_SESSION0, FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK,
-        FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL,
-        FWP_SECURITY_DESCRIPTOR_TYPE, FWP_VALUE0, FWP_VALUE0_0,
+        FWPM_FILTER0_0, FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_PERSISTENT,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_PROVIDER0,
+        FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_SESSION0, FWPM_SUBLAYER0,
+        FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK, FWP_CONDITION_VALUE0,
+        FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_SECURITY_DESCRIPTOR_TYPE,
+        FWP_VALUE0, FWP_VALUE0_0,
     };
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
@@ -444,9 +441,6 @@ mod ffi {
             if spec.persistent {
                 flags |= FWPM_FILTER_FLAG_PERSISTENT;
             }
-            if spec.boottime {
-                flags |= FWPM_FILTER_FLAG_BOOTTIME;
-            }
             let mut filter_name = wide(spec.name);
             let filter_key = guid_from_str(spec.key)?;
             let mut filter: FWPM_FILTER0 = unsafe { std::mem::zeroed() };
@@ -537,15 +531,13 @@ mod tests {
     }
 
     #[test]
-    fn every_offline_filter_blocks_and_is_persistent_and_boottime() {
-        // Spec: an allow-by-accident or a non-persistent/non-boottime
-        // filter would defeat the network=false guarantee — silently
-        // (allow) or across a reboot window (persistence). Pin all three
-        // bits for every spec.
+    fn every_offline_filter_blocks_and_is_persistent() {
+        // Spec: an allow-by-accident or a non-persistent filter would
+        // defeat the network=false guarantee — silently (allow) or across
+        // a reboot window (persistence). Pin both bits for every spec.
         for spec in filter_specs::offline_outbound_block() {
             assert!(spec.block, "{} must BLOCK", spec.name);
             assert!(spec.persistent, "{} must be persistent", spec.name);
-            assert!(spec.boottime, "{} must be boottime", spec.name);
         }
     }
 
