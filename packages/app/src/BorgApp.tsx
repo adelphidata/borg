@@ -375,10 +375,11 @@ function Shell({ platform }: { platform: Platform }) {
         message={notice?.message}
         // The shell runs the restore rather than a closure from the page that
         // archived: that page is often unmounted by now.
-        actionLabel={notice?.sessionId ? "Undo" : undefined}
+        actionLabel={notice?.sessionId ? "Undo" : notice?.openPath ? "Open" : undefined}
         onAction={() => {
           const offer = takeNotice();
           if (offer?.sessionId) void restoreSession.run(offer.sessionId);
+          else if (offer?.openPath) navigate(offer.openPath);
         }}
         onDismiss={clearNotice}
         // Clear of the mobile tab bar, which is 72px plus the home indicator.

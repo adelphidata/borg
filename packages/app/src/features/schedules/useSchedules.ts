@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import type { admin as adminPb } from "@borg/client";
+import type { admin as adminPb, BorgClient } from "@borg/client";
 import { plural } from "../../lib/format";
+import { offerOpen, showNotice } from "../../lib/notice";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 /**
@@ -139,6 +140,60 @@ export function relativeTime(unix: number, now: number): string {
   return `in ${Math.round(hours / 24)} d`;
 }
 
+/** How often a run with no conversation to watch is checked on. */
+export const RUN_POLL_MS = 2_000;
+/** How long it is checked on before the page stops waiting to report it. */
+export const RUN_WATCH_MS = 15 * 60_000;
+
+/** What a finished run says, or null for a row that is not finished yet. */
+export function runOutcome(name: string, run: adminPb.ScheduledTaskRun): string | null {
+  switch (run.status) {
+    case "running":
+      return null;
+    case "success":
+      return `${name} finished`;
+    case "delivery_failed":
+      return `${name} finished, but its result could not be delivered`;
+    default:
+      return `${name} failed${run.error ? `: ${run.error}` : ""}`;
+  }
+}
+
+/**
+ * Reports how a manual run of a task with no conversation ends. Such a task
+ * (a maintenance job, a command) has nothing to open, so without this "Run
+ * now" answers with "Running…" and then nothing at all.
+ *
+ * Keyed on the newest run id from before the press, not on a clock: the run
+ * the press started is the first one after it. Module-level rather than in a
+ * component, because the toast outlives the page that was on screen.
+ */
+export async function reportWhenDone(
+  borg: BorgClient,
+  id: string,
+  name: string,
+  afterRunId: number,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<void> {
+  for (let waited = 0; waited < RUN_WATCH_MS; waited += RUN_POLL_MS) {
+    await sleep(RUN_POLL_MS);
+    let runs: adminPb.ScheduledTaskRun[];
+    try {
+      runs = (await borg.admin.getScheduledTaskRuns({ id, limit: 1 })).runs;
+    } catch {
+      // The daemon restarting mid-run is no news worth a toast; try again.
+      continue;
+    }
+    const run = runs[0];
+    if (!run || run.id <= afterRunId) continue;
+    const outcome = runOutcome(name, run);
+    if (outcome !== null) {
+      showNotice(outcome);
+      return;
+    }
+  }
+}
+
 export interface Schedules {
   query: QueryResult<adminPb.ScheduledTask[]>;
   create: (task: NewSchedule) => Promise<unknown>;
@@ -152,6 +207,7 @@ export interface Schedules {
   pause: (id: string) => Promise<unknown>;
   resume: (id: string) => Promise<unknown>;
   runNow: (id: string) => Promise<unknown>;
+  /** Why the last create or edit failed, shown beside the form that sent it. */
   error: string | undefined;
 }
 
@@ -173,7 +229,18 @@ export function useSchedules(deps: unknown[] = []): Schedules {
     return () => clearInterval(id);
   }, [refetch]);
 
-  const refresh = { onSuccess: () => query.refetch() };
+  // Every action here reports through the shell's toast: a row that pauses or
+  // runs changes little on screen, and a failure far from the button is one
+  // nobody reads. Named by the task, so two in a row are told apart.
+  const tasks = query.state === "ready" ? query.data : [];
+  const nameOf = (id: string) => `“${tasks.find((t) => t.id === id)?.name || "task"}”`;
+  const report = (done: (id: string) => string, failed: (id: string) => string) => ({
+    onSuccess: (_: unknown, id: string) => {
+      query.refetch();
+      showNotice(done(id));
+    },
+    onError: (e: { message: string }, id: string) => showNotice(`${failed(id)}: ${e.message}`),
+  });
 
   const createMutation = useMutation(
     (borg, task: NewSchedule) =>
@@ -196,7 +263,12 @@ export function useSchedules(deps: unknown[] = []): Schedules {
         preRunCwd: "",
         preRunTimeoutMs: 0,
       }),
-    refresh,
+    {
+      onSuccess: (_: unknown, task: NewSchedule) => {
+        query.refetch();
+        showNotice(`Scheduled “${task.name}”`);
+      },
+    },
   );
   const updateMutation = useMutation(
     (borg, vars: { id: string; task: NewSchedule; scheduleChanged: boolean }) =>
@@ -209,23 +281,56 @@ export function useSchedules(deps: unknown[] = []): Schedules {
         scheduleExpr: vars.scheduleChanged ? vars.task.scheduleExpr : "",
         timezone: "",
       }),
-    refresh,
+    {
+      onSuccess: (_: unknown, vars: { task: NewSchedule }) => {
+        query.refetch();
+        showNotice(`Saved “${vars.task.name}”`);
+      },
+    },
   );
   const deleteMutation = useMutation(
     (borg, id: string) => borg.admin.deleteScheduledTask({ id }),
-    refresh,
+    report(
+      (id) => `Deleted ${nameOf(id)}`,
+      (id) => `Could not delete ${nameOf(id)}`,
+    ),
   );
   const pauseMutation = useMutation(
     (borg, id: string) => borg.admin.pauseScheduledTask({ id }),
-    refresh,
+    report(
+      (id) => `Paused ${nameOf(id)}`,
+      (id) => `Could not pause ${nameOf(id)}`,
+    ),
   );
   const resumeMutation = useMutation(
     (borg, id: string) => borg.admin.resumeScheduledTask({ id }),
-    refresh,
+    report(
+      (id) => `Resumed ${nameOf(id)}`,
+      (id) => `Could not resume ${nameOf(id)}`,
+    ),
   );
   const runNowMutation = useMutation(
-    (borg, id: string) => borg.admin.runScheduledTaskNow({ id }),
-    refresh,
+    async (borg, id: string) => {
+      const watch = !tasks.find((t) => t.id === id)?.sessionId;
+      const afterRunId = watch
+        ? ((await borg.admin.getScheduledTaskRuns({ id, limit: 1 })).runs[0]?.id ?? 0)
+        : 0;
+      await borg.admin.runScheduledTaskNow({ id });
+      if (watch) void reportWhenDone(borg, id, nameOf(id), afterRunId);
+    },
+    {
+      onSuccess: (_: unknown, id: string) => {
+        query.refetch();
+        const session = tasks.find((t) => t.id === id)?.sessionId;
+        const message = `Running ${nameOf(id)}`;
+        // The run happens in the task's own conversation, so the toast offers
+        // the way to watch it — and to reply once it is done.
+        if (session) offerOpen(message, `/c/${encodeURIComponent(session)}`);
+        else showNotice(message);
+      },
+      onError: (e: { message: string }, id: string) =>
+        showNotice(`Could not run ${nameOf(id)}: ${e.message}`),
+    },
   );
 
   return {
@@ -236,13 +341,8 @@ export function useSchedules(deps: unknown[] = []): Schedules {
     pause: (id) => pauseMutation.run(id),
     resume: (id) => resumeMutation.run(id),
     runNow: (id) => runNowMutation.run(id),
-    error: (
-      createMutation.error ??
-      updateMutation.error ??
-      deleteMutation.error ??
-      pauseMutation.error ??
-      resumeMutation.error ??
-      runNowMutation.error
-    )?.message,
+    // Only the forms' own failures stay on the page, next to the form; a row
+    // action reports through the toast.
+    error: (createMutation.error ?? updateMutation.error)?.message,
   };
 }

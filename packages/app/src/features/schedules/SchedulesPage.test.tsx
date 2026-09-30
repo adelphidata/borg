@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { BorgError, GrpcStatus } from "@borg/client";
+import { clearNotice, pendingNotice } from "../../lib/notice";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
 import { SchedulesPage } from "./SchedulesPage";
-import { SCHEDULES_REFRESH_MS } from "./useSchedules";
+import { reportWhenDone, runOutcome, SCHEDULES_REFRESH_MS } from "./useSchedules";
 
 const NOW = Date.UTC(2026, 7, 22, 12, 0, 0);
 
@@ -38,6 +39,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  clearNotice();
 });
 
 describe("SchedulesPage listing", () => {
@@ -205,6 +207,7 @@ describe("SchedulesPage actions", () => {
       ResumeScheduledTask: {},
       RunScheduledTaskNow: {},
       DeleteScheduledTask: {},
+      GetScheduledTaskRuns: { runs: [] },
     });
 
   it("pauses a running task", async () => {
@@ -287,7 +290,34 @@ describe("SchedulesPage actions", () => {
     await waitFor(() => expect(screen.getByText("Pause")).toBeTruthy());
 
     click("Pause");
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("no such task"));
+    await waitFor(() =>
+      expect(pendingNotice()?.message).toBe("Could not pause “Morning briefing”: no such task"),
+    );
+  });
+
+  it("says a pause went through, naming the task", async () => {
+    mount(withActions());
+    await waitFor(() => expect(screen.getByText("Pause")).toBeTruthy());
+
+    click("Pause");
+    await waitFor(() => expect(pendingNotice()?.message).toBe("Paused “Morning briefing”"));
+  });
+
+  it("offers to open the conversation a run now happens in", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task({ sessionId: "task:t1" })]),
+      RunScheduledTaskNow: {},
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Run now")).toBeTruthy());
+
+    click("Run now");
+    await waitFor(() =>
+      expect(pendingNotice()).toMatchObject({
+        message: "Running “Morning briefing”",
+        openPath: "/c/task%3At1",
+      }),
+    );
   });
 });
 
@@ -464,5 +494,56 @@ describe("SchedulesPage editing", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Heartbeat")).toBeTruthy());
     expect(screen.queryByText("Edit")).toBeNull();
+  });
+});
+
+describe("a run with no conversation to open", () => {
+  const run = (over: Record<string, unknown> = {}) => ({
+    id: 8,
+    taskId: "t1",
+    startedAtUnix: 0,
+    durationMs: 0,
+    status: "success",
+    result: "",
+    error: "",
+    ...over,
+  });
+
+  it("says how it ended", () => {
+    expect(runOutcome("“Tidy”", run())).toBe("“Tidy” finished");
+    expect(runOutcome("“Tidy”", run({ status: "failed", error: "disk full" }))).toBe(
+      "“Tidy” failed: disk full",
+    );
+    expect(runOutcome("“Tidy”", run({ status: "running" }))).toBeNull();
+  });
+
+  it("waits for the run the press started, then reports it once", async () => {
+    // The run from before the press, then the new one running, then done.
+    const answers = [[run({ id: 7 })], [run({ status: "running" })], [run()]];
+    const getScheduledTaskRuns = vi.fn(async () => ({ runs: answers.shift() ?? [] }));
+    const borg = { admin: { getScheduledTaskRuns } } as never;
+
+    await reportWhenDone(borg, "t1", "“Tidy”", 7, async () => {});
+
+    expect(getScheduledTaskRuns).toHaveBeenCalledTimes(3);
+    expect(pendingNotice()?.message).toBe("“Tidy” finished");
+  });
+
+  it("asks where the runs stand before pressing, so it knows which one is new", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task({ taskType: "maintenance" })]),
+      RunScheduledTaskNow: {},
+      GetScheduledTaskRuns: { runs: [run({ id: 3 })] },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Run now")).toBeTruthy());
+
+    click("Run now");
+    await waitFor(() => expect(pendingNotice()?.message).toBe("Running “Morning briefing”"));
+    const methods = daemon.calls.map((c) => c.method);
+    expect(methods.indexOf("GetScheduledTaskRuns")).toBeLessThan(
+      methods.indexOf("RunScheduledTaskNow"),
+    );
+    expect(pendingNotice()?.openPath).toBeUndefined();
   });
 });

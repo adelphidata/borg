@@ -40,6 +40,12 @@ export interface Notice {
   message: string;
   /** The conversation to bring back. Absent on a notice with no way back. */
   sessionId?: string;
+  /**
+   * Where the notice's "Open" goes — the place the thing it reports can be
+   * watched, such as a scheduled run's conversation. A path, not a callback,
+   * for the same reason as `sessionId`.
+   */
+  openPath?: string;
 }
 
 let pending: Notice | undefined;
@@ -50,9 +56,9 @@ function notify() {
   for (const listener of listeners) listener();
 }
 
-function publish(message: string, sessionId?: string): void {
+function publish(message: string, extra: { sessionId?: string; openPath?: string } = {}): void {
   lastId += 1;
-  pending = { id: lastId, message, sessionId };
+  pending = { id: lastId, message, ...extra };
   notify();
 }
 
@@ -63,12 +69,20 @@ export function archivedMessage(title: string | undefined): string {
 
 /** Offers to bring `sessionId` back, replacing whatever was on offer. */
 export function offerRestore(sessionId: string, title: string | undefined): void {
-  publish(archivedMessage(title), sessionId);
+  publish(archivedMessage(title), { sessionId });
 }
 
-/** Says something happened, with no way back — a failure, usually. */
+/**
+ * Says something happened, with no way back: that an action with nothing else
+ * to show for it went through, or that one failed.
+ */
 export function showNotice(message: string): void {
   publish(message);
+}
+
+/** Says something started, and offers to go and watch it at `path`. */
+export function offerOpen(message: string, path: string): void {
+  publish(message, { openPath: path });
 }
 
 /** Takes the notice away, whether it was used, dismissed, or timed out. */
