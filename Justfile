@@ -64,26 +64,20 @@ install-hooks:
     git config core.hooksPath .githooks
     @echo "pre-commit hook active (.githooks/pre-commit). Bypass with --no-verify."
 
-# Install local CI helpers (cargo-audit, cargo-deny, cargo-nextest, cargo-watch)
+# Install local CI helpers (cargo-deny, cargo-nextest, cargo-watch)
 install-ci-tools:
-    RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
     RUSTUP_TOOLCHAIN=stable cargo install cargo-deny --locked
     RUSTUP_TOOLCHAIN=stable cargo install cargo-nextest --locked
     RUSTUP_TOOLCHAIN=stable cargo install cargo-watch --locked
 
-# Security advisory scan (mirrors CI's Security Audit job)
-audit:
-    RUSTUP_TOOLCHAIN=stable cargo audit
-
-# Dependency check (mirrors CI's Dependency Check job)
+# Dependency check: advisories, licenses, bans, sources (mirrors CI's Dependency Check job)
 deny:
     cargo deny --all-features check
 
-# Run everything CI runs (format, clippy, test, build, audit, deny)
+# Run everything CI runs (format, clippy, test, build, deny)
 ci: lint
     cargo test --workspace --features cortex/test-support
     cargo build
-    just audit
     just deny
 
 # Generate code coverage report (HTML)

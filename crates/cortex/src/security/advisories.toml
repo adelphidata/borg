@@ -2,7 +2,7 @@
 #
 # Curated subset of cargo dependencies known to be yanked, compromised, or
 # carrying an unfixed CVE that affects Borg. Refreshed manually; not a
-# replacement for `cargo audit` in CI.
+# replacement for `cargo deny` in CI.
 #
 # To add an entry:
 #   [[advisories]]

@@ -6,8 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# The Rust toolchain comes from rust-toolchain.toml: `rustup toolchain install`
+# with no argument installs exactly that pin, so CI and local builds agree.
 
 jobs:
   # Which surfaces did this change touch? Filtering here (rather than with
@@ -43,21 +51,8 @@ jobs:
               # committed TypeScript client must be regenerated to match.
               - 'crates/protocols/proto/**'
 
-  fmt:
-    name: Format
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-          components: rustfmt
-      - run: cargo fmt --check
-
-  clippy:
-    name: Clippy
+  lint:
+    name: Lint
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -65,91 +60,41 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-          components: clippy
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-clippy-
+      - run: rustup toolchain install
+      # rustfmt ignores `cfg`, so this also covers the Windows-only sandbox code.
+      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # One test run that also measures coverage: `cargo llvm-cov` runs the same
+  # `--lib --bins` suite a plain `cargo test` would, and links every lib and bin.
   test:
-    name: Test
+    name: Test + Coverage
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Coverage instrumentation needs no DWARF; without it the instrumented
+      # workspace fits on the runner disk.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-test-
-      - run: cargo test --workspace --lib --bins
-
-  build:
-    name: Build
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-build-
-      - run: cargo build
-
-  coverage:
-    name: Coverage
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-          components: llvm-tools-preview
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-coverage-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-      - name: Generate coverage
-        # Ratchet, not the target. The standard in AGENTS.md is 90%; this
-        # number tracks where the workspace actually is and only ever moves
-        # up, so coverage can never silently regress while we climb.
+        # bubblewrap lets the Linux sandbox tests wrap for real instead of
+        # falling back to an unsandboxed passthrough.
+        run: |
+          sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: rustup toolchain install && rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Test with coverage
+        # Ratchet, not the target. The standard is 90%; this number tracks
+        # where the workspace actually is and only ever moves up, so coverage
+        # can never silently regress while we climb.
         run: cargo llvm-cov --workspace --lib --bins --fail-under-lines 77 --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -159,25 +104,8 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  audit:
-    name: Security Audit
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-      - name: Install cargo-audit
-        env:
-          RUSTUP_TOOLCHAIN: stable
-        run: cargo install cargo-audit --locked
-      - name: Run cargo audit
-        env:
-          RUSTUP_TOOLCHAIN: stable
-        run: cargo audit
-
+  # Advisories, licenses, bans and sources in one pass. It reads deny.toml,
+  # which is the single list of accepted advisories.
   deny:
     name: Dependency Check
     needs: changes
@@ -196,8 +124,7 @@ jobs:
   #
   # Scoped to `-p sandbox` deliberately: the full workspace has C
   # dependencies (ring, etc.) that need a Windows VC++ toolchain we
-  # don't otherwise need. The Windows-only sandbox tests are the
-  # high-value lane; full-workspace Windows builds remain in
+  # don't otherwise need. Full-workspace Windows builds remain in
   # `release.yml`.
   windows-sandbox:
     name: Windows Sandbox
@@ -206,44 +133,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88.0"
-          components: clippy, rustfmt
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-windows-sandbox-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-windows-sandbox-
-      - name: cargo fmt --check (sandbox)
-        run: cargo fmt -p sandbox --check
-      - name: cargo clippy -p sandbox
-        run: cargo clippy -p sandbox --all-targets -- -D warnings
-      - name: cargo test -p sandbox (lib + bins)
-        run: cargo test -p sandbox --lib --bins
-      - name: cargo test -p sandbox (real-FFI smoke)
-        # Phase 12 partial-coverage lane: drives real CreatePipe /
-        # CreateDesktopW / CryptProtectData / CreatePseudoConsole on
-        # the runner. See `crates/sandbox/tests/windows_ffi_smoke.rs`
-        # for the carve-out vs full-VM validation.
-        run: cargo test -p sandbox --test windows_ffi_smoke
-
-  gen-drift:
-    name: Proto codegen drift
-    needs: changes
-    if: needs.changes.outputs.web == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-      # The committed TypeScript client must match crates/protocols/proto. If it
-      # does not, a proto change landed without regenerating — run `just gen`.
-      - run: bun x buf generate
-      - run: git diff --exit-code packages/client/src/gen
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p sandbox --all-targets -- -D warnings
+      - name: cargo test -p sandbox (lib + real-FFI smoke)
+        # The smoke test drives real CreatePipe / CreateDesktopW /
+        # CryptProtectData / CreatePseudoConsole on the runner. See
+        # `crates/sandbox/tests/windows_ffi_smoke.rs` for the carve-out vs
+        # full-VM validation.
+        run: cargo test -p sandbox --lib --bins --test windows_ffi_smoke
 
   web:
     name: Web surfaces
@@ -254,6 +152,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      - name: Proto codegen drift
+        # The committed TypeScript client must match crates/protocols/proto. If
+        # it does not, a proto change landed without regenerating — run `just gen`.
+        run: |
+          bun x buf generate
+          git diff --exit-code packages/client/src/gen
       - name: Format check
         run: bun x prettier --check "apps/**/*.{ts,tsx,css,html}" "packages/**/*.{ts,tsx}"
       - name: Typecheck every package

@@ -5,7 +5,7 @@
 //! At runtime, the `borg doctor` Supply Chain step scans the embedded lockfile
 //! against the advisory list and emits a warning or failure per match.
 //!
-//! This is intentionally lightweight — it does not replace `cargo audit` in
+//! This is intentionally lightweight — it does not replace `cargo deny` in
 //! CI. The goal is to give operators a loud signal when a dependency they
 //! shipped with is later flagged, so they update without waiting for the next
 //! release pipeline.
