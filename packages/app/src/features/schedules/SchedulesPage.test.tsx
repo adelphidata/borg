@@ -3,6 +3,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
 import { SchedulesPage } from "./SchedulesPage";
+import { SCHEDULES_REFRESH_MS } from "./useSchedules";
 
 const NOW = Date.UTC(2026, 7, 22, 12, 0, 0);
 
@@ -80,6 +81,82 @@ describe("SchedulesPage listing", () => {
     await waitFor(() =>
       expect(screen.getByText("Could not load your scheduled tasks.")).toBeTruthy(),
     );
+  });
+});
+
+describe("SchedulesPage last run", () => {
+  const run = (over: Record<string, unknown> = {}) => ({
+    id: 1,
+    taskId: "t1",
+    startedAtUnix: Math.floor(NOW / 1000) - 60,
+    durationMs: 900,
+    status: "success",
+    result: "The time is 12:00.",
+    error: "",
+    ...over,
+  });
+
+  it("shows what a task said last time, one click deep", async () => {
+    // A task with no chat channel keeps its results with the task; without
+    // this there was nowhere in the app to read them.
+    const daemon = fakeDaemon({
+      ...listing([task()]),
+      GetScheduledTaskDetail: { task: task(), hasLastRun: true, lastRun: run() },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
+    expect(screen.queryByText("The time is 12:00.")).toBeNull();
+
+    const row = screen.getByRole("button", { name: /^Morning briefing/ });
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    click(row);
+    await waitFor(() => expect(screen.getByText("The time is 12:00.")).toBeTruthy());
+    expect(screen.getByText(/Last run .* · Finished/)).toBeTruthy();
+
+    click(row);
+    expect(screen.queryByText("The time is 12:00.")).toBeNull();
+  });
+
+  it("shows a failed run's reason instead of its empty result", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task()]),
+      GetScheduledTaskDetail: {
+        task: task(),
+        hasLastRun: true,
+        lastRun: run({ status: "misconfigured", result: "", error: "no delivery target" }),
+      },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
+    click(screen.getByRole("button", { name: /^Morning briefing/ }));
+    await waitFor(() => expect(screen.getByText("no delivery target")).toBeTruthy());
+    expect(screen.getByText(/Could not be delivered/)).toBeTruthy();
+  });
+
+  it("says a task has not run yet", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task()]),
+      GetScheduledTaskDetail: { task: task(), hasLastRun: false },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
+    click(screen.getByRole("button", { name: /^Morning briefing/ }));
+    await waitFor(() => expect(screen.getByText("Not run yet.")).toBeTruthy());
+  });
+
+  it("re-reads the list on its own, so a countdown does not go stale", async () => {
+    vi.useFakeTimers({ now: NOW });
+    const daemon = fakeDaemon(listing([task()]));
+    mount(daemon);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const reads = () => daemon.calls.filter((c) => c.method === "ListScheduledTasks").length;
+    const before = reads();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SCHEDULES_REFRESH_MS);
+    });
+    expect(reads()).toBe(before + 1);
   });
 });
 

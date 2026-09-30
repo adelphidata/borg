@@ -1,6 +1,14 @@
+import { useEffect } from "react";
 import type { admin as adminPb } from "@borg/client";
 import { plural } from "../../lib/format";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
+
+/**
+ * How often the list is re-read while it is on screen. Runs happen without
+ * anyone touching the page, and a countdown that says "overdue" for a task
+ * that ran a minute ago reads as a broken scheduler.
+ */
+export const SCHEDULES_REFRESH_MS = 30_000;
 
 /** Schedule kinds the daemon understands (`crates/cortex/src/tasks.rs`). */
 export const SCHEDULE_TYPES = ["cron", "interval", "once"] as const;
@@ -76,6 +84,12 @@ export function useSchedules(deps: unknown[] = []): Schedules {
     const list = await borg.admin.listScheduledTasks({});
     return list.tasks;
   }, deps);
+
+  const { refetch } = query;
+  useEffect(() => {
+    const id = setInterval(refetch, SCHEDULES_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [refetch]);
 
   const refresh = { onSuccess: () => query.refetch() };
 

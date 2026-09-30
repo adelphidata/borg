@@ -12,6 +12,8 @@ import {
 } from "@borg/ui";
 import type { admin as adminPb } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
+import { formatClock } from "../../lib/format";
+import { useQuery } from "../../lib/useDaemon";
 import {
   SCHEDULE_TYPES,
   describeSchedule,
@@ -140,14 +142,69 @@ function draftOf(name: string, prompt: string, scheduleType: ScheduleType, sched
   };
 }
 
+/** Run outcomes in words; anything else shows as the daemon stored it. */
+const RUN_STATUS: Record<string, string> = {
+  success: "Finished",
+  failed: "Failed",
+  error: "Failed",
+  timeout: "Timed out",
+  misconfigured: "Could not be delivered",
+  quiet_hours: "Skipped for quiet hours",
+};
+
+/**
+ * What the task did last time.
+ *
+ * A task with no chat channel to deliver to keeps its results here, so this
+ * is where "what did it say?" gets answered. Re-read whenever the list is,
+ * so a run that lands while it is open shows up.
+ */
+function LastRun({ task }: { task: adminPb.ScheduledTask }) {
+  const detail = useQuery((borg) => borg.admin.getScheduledTaskDetail({ id: task.id }), [task]);
+  return (
+    <div className="mt-2.5">
+      <DaemonState query={detail} label="the last run">
+        {(d) => {
+          const run = d.hasLastRun ? d.lastRun : undefined;
+          if (!run) {
+            return <div className="text-[12px] leading-[1.45] text-ink3">Not run yet.</div>;
+          }
+          const text = run.error || run.result;
+          return (
+            <div className="flex flex-col gap-1.5">
+              <div className="text-[11.5px] leading-[1.4] text-ink3">
+                Last run {formatClock(Number(run.startedAtUnix) * 1000)} ·{" "}
+                {RUN_STATUS[run.status] ?? run.status}
+              </div>
+              {text && (
+                <div
+                  className={`max-h-[240px] overflow-y-auto rounded-[8px] bg-surface2 px-3 py-2 text-[12.5px] leading-[1.5] whitespace-pre-wrap select-text ${
+                    run.error ? "text-alert" : "text-ink2"
+                  }`}
+                >
+                  {text}
+                </div>
+              )}
+            </div>
+          );
+        }}
+      </DaemonState>
+    </div>
+  );
+}
+
 function TaskRow({
   task,
+  expanded,
+  onToggle,
   onPause,
   onResume,
   onRunNow,
   onDelete,
 }: {
   task: adminPb.ScheduledTask;
+  expanded: boolean;
+  onToggle: () => void;
   onPause: () => void;
   onResume: () => void;
   onRunNow: () => void;
@@ -160,15 +217,23 @@ function TaskRow({
     <div className="group flex items-start gap-3 rounded-[10px] border border-line2 px-4 py-3">
       <StatusDot tone={finished ? "idle" : paused ? "paused" : "ok"} className="mt-[6px]" />
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13.5px] leading-[1.35] text-ink">{task.name}</div>
-        <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
-          {describeSchedule(task.scheduleType, task.scheduleExpr)}
-          {!paused && !finished && (
-            <> · next {relativeTime(Number(task.nextRunUnix), Date.now())}</>
-          )}
-          {paused && <> · paused</>}
-          {finished && <> · {task.status}</>}
-        </div>
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={onToggle}
+          className="block w-full min-w-0 cursor-pointer border-0 bg-transparent p-0 text-left"
+        >
+          <div className="truncate text-[13.5px] leading-[1.35] text-ink">{task.name}</div>
+          <div className="mt-[3px] text-[11.5px] leading-[1.4] text-ink3">
+            {describeSchedule(task.scheduleType, task.scheduleExpr)}
+            {!paused && !finished && (
+              <> · next {relativeTime(Number(task.nextRunUnix), Date.now())}</>
+            )}
+            {paused && <> · paused</>}
+            {finished && <> · {task.status}</>}
+          </div>
+        </button>
+        {expanded && <LastRun task={task} />}
       </div>
       <div className="flex flex-none items-center gap-1.5 hover-reveal">
         <Pill square onClick={onRunNow}>
@@ -204,6 +269,7 @@ export function SchedulesPage() {
   const isMobile = useIsMobile();
   const location = useLocation();
   const schedules = useSchedules([location.key]);
+  const [open, setOpen] = useState<string>();
 
   return (
     <PageChrome title="Scheduled" mobileBrandHeader>
@@ -228,6 +294,8 @@ export function SchedulesPage() {
                 <TaskRow
                   key={task.id}
                   task={task}
+                  expanded={open === task.id}
+                  onToggle={() => setOpen((id) => (id === task.id ? undefined : task.id))}
                   onPause={() => void schedules.pause(task.id)}
                   onResume={() => void schedules.resume(task.id)}
                   onRunNow={() => void schedules.runNow(task.id)}
