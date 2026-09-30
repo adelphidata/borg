@@ -105,6 +105,20 @@ export const basicSettings: BasicSetting[] = [
   },
 ];
 
+/** How an option reads on screen: its label, else its stored value capitalized. */
+export function optionLabel(option: SettingOption): string {
+  return option.label ?? capitalize(option.value);
+}
+
+/**
+ * A curated setting's stored value as the user should read it. A value the
+ * options do not list (set from the CLI, say) is shown as stored.
+ */
+export function displayValue(setting: BasicSetting, raw: string): string {
+  const option = setting.options?.find((o) => o.value === raw);
+  return option ? optionLabel(option) : raw;
+}
+
 export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);
 }

@@ -74,7 +74,32 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(screen.getByText("Anthropic")).toBeTruthy());
     expect(screen.getByText("Opus 5")).toBeTruthy();
     expect(screen.queryByText("claude-opus-5")).toBeNull();
-    expect(screen.getByText("medium")).toBeTruthy();
+    // Stored option values read as words, not identifiers.
+    expect(screen.getByText("Medium")).toBeTruthy();
+    expect(screen.getByText("Execute")).toBeTruthy();
+    expect(screen.queryByText("medium")).toBeNull();
+  });
+
+  it("shows a value the options do not list exactly as stored", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      GetSettings: { entries: [entry("llm.thinking", "xhigh")] },
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("xhigh")).toBeTruthy());
+  });
+
+  it("makes every row a button, so the keyboard and screen readers reach it", async () => {
+    mount();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Provider/ })).toBeTruthy());
+    for (const name of [/^Model/, /^Thinking level/, /^Mode(?!l)/, /^Appearance/]) {
+      expect(screen.getByRole("button", { name })).toBeTruthy();
+    }
+    const fold = screen.getByRole("button", { name: /Advanced/ });
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    act(() => fold.click());
+    expect(fold.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("button", { name: /heartbeat\.enabled/ })).toBeTruthy();
   });
 
   it("falls back to the raw id when the catalog cannot answer", async () => {

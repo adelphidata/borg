@@ -52,15 +52,20 @@ describe("SettingDetailPage for a curated choice", () => {
     mount("/settings/thinking");
     await waitFor(() => expect(screen.getByText("Thinking level")).toBeTruthy());
     const selected = screen.getByRole("img", { name: "Selected" });
-    expect(selected.closest("div")?.textContent).toContain("medium");
+    const row = selected.closest("button");
+    expect(row?.textContent).toContain("Medium");
+    expect(row?.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: /^High/ }).getAttribute("aria-pressed")).toBe(
+      "false",
+    );
   });
 
   it("writes the picked option straight through", async () => {
     const daemon = fakeDaemon({ GetSettings: { entries: REGISTRY }, SetSetting: {} });
     mount("/settings/thinking", daemon);
-    await waitFor(() => expect(screen.getByText("high")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("High")).toBeTruthy());
 
-    click(screen.getByText("high"));
+    click(screen.getByText("High"));
     await waitFor(() =>
       expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
         key: "llm.thinking",
@@ -72,9 +77,9 @@ describe("SettingDetailPage for a curated choice", () => {
   it("does not write when the option picked is the one already set", async () => {
     const daemon = fakeDaemon({ GetSettings: { entries: REGISTRY }, SetSetting: {} });
     mount("/settings/thinking", daemon);
-    await waitFor(() => expect(screen.getByText("medium")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Medium")).toBeTruthy());
 
-    click(screen.getByText("medium"));
+    click(screen.getByText("Medium"));
     expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
   });
 
@@ -84,9 +89,9 @@ describe("SettingDetailPage for a curated choice", () => {
       SetSetting: new BorgError(INVALID_ARGUMENT, "unknown thinking level"),
     });
     mount("/settings/thinking", daemon);
-    await waitFor(() => expect(screen.getByText("high")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("High")).toBeTruthy());
 
-    click(screen.getByText("high"));
+    click(screen.getByText("High"));
     await waitFor(() => expect(screen.getByText("unknown thinking level")).toBeTruthy());
   });
 });

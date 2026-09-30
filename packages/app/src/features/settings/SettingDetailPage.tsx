@@ -22,7 +22,7 @@ import {
   useSetupStatus,
   type SetupStatus,
 } from "../onboarding/useSetupStatus";
-import { findBasicSetting, type BasicSetting, type SettingOption } from "./catalog";
+import { findBasicSetting, optionLabel, type BasicSetting, type SettingOption } from "./catalog";
 
 /** The row that opens the free-text editor under a catalog picker. */
 const SOMETHING_ELSE = "__something_else__";
@@ -81,9 +81,12 @@ function OptionPicker({
       {options.map((o) => {
         const on = o.value === value;
         return (
-          <div
+          <button
+            type="button"
             key={o.value}
-            className="flex cursor-pointer items-center gap-4 border-b border-line2 px-4 py-3.5 transition-[background] duration-150 last:border-b-0 hover:bg-surface3"
+            aria-pressed={on}
+            disabled={disabled}
+            className="flex w-full cursor-pointer items-center gap-4 border-0 border-b border-line2 bg-transparent px-4 py-3.5 text-left transition-[background] duration-150 last:border-b-0 hover:bg-surface3"
             onClick={() => onPick(o.value)}
           >
             <div className="min-w-0 flex-1">
@@ -92,14 +95,14 @@ function OptionPicker({
                   on ? "text-neon-ink" : "text-ink"
                 }`}
               >
-                {o.label ?? o.value}
+                {optionLabel(o)}
               </div>
               {o.desc && (
                 <div className="mt-[3px] text-[12px] leading-[1.45] text-ink3">{o.desc}</div>
               )}
             </div>
             {on && <CheckIcon size={15} role="img" aria-label="Selected" />}
-          </div>
+          </button>
         );
       })}
     </div>

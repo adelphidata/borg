@@ -15,7 +15,14 @@ import { DaemonState } from "../../components/DaemonState";
 import { useSettings, type DaemonSetting } from "../../lib/settings";
 import { routes } from "../../routes";
 import { modelLabel, providerLabel, useSetupStatus } from "../onboarding/useSetupStatus";
-import { APPEARANCE_LABELS, advancedGroupOf, basicSettings } from "./catalog";
+import { APPEARANCE_LABELS, advancedGroupOf, basicSettings, displayValue } from "./catalog";
+
+/**
+ * A full-width row that is a real button, so the keyboard and screen readers
+ * reach it; the resets strip the browser's button look.
+ */
+const ROW_BUTTON =
+  "flex w-full cursor-pointer items-center border-0 bg-transparent text-left font-[inherit]";
 
 /** Registry keys already surfaced by the curated list above the fold. */
 const CURATED_KEYS = new Set(basicSettings.flatMap((s) => (s.key ? [s.key] : [])));
@@ -101,11 +108,12 @@ export function SettingsPage() {
                           ? providerLabel(catalog, raw)
                           : s.catalog === "model"
                             ? modelLabel(catalog, map.get("provider")?.value ?? "", raw)
-                            : raw;
+                            : displayValue(s, raw);
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={s.id}
-                      className="flex cursor-pointer items-center gap-[18px] border-b border-line2 px-0.5 py-[18px]"
+                      className={`${ROW_BUTTON} gap-[18px] border-b border-line2 px-0.5 py-[18px]`}
                       onClick={() => navigate(`/settings/${s.id}`)}
                     >
                       <div className="min-w-0 flex-1">
@@ -122,12 +130,14 @@ export function SettingsPage() {
                         {value}
                       </div>
                       <ChevronIcon size={13} className="text-ink3" />
-                    </div>
+                    </button>
                   );
                 })}
 
-                <div
-                  className="flex cursor-pointer items-center gap-[11px] px-0.5 pt-[22px]"
+                <button
+                  type="button"
+                  aria-expanded={advOpen}
+                  className={`${ROW_BUTTON} gap-[11px] px-0.5 pt-[22px]`}
                   onClick={() => setAdvOpen((v) => !v)}
                 >
                   <span
@@ -139,7 +149,7 @@ export function SettingsPage() {
                     Advanced
                   </span>
                   <span className="h-px flex-1 bg-line2" />
-                </div>
+                </button>
 
                 {advOpen && (
                   <div className="flex flex-col gap-6 pt-2">
@@ -152,9 +162,10 @@ export function SettingsPage() {
                         <div className={`${SECTION_LABEL_TEXT} mb-[11px]`}>{g.name}</div>
                         <div className="overflow-hidden rounded-[10px] border border-line2 bg-surface2">
                           {g.rows.map((r) => (
-                            <div
+                            <button
+                              type="button"
                               key={r.key}
-                              className="flex cursor-pointer items-center justify-between gap-[18px] border-b border-line2 px-4 py-[13px] transition-[background] duration-150 last:border-b-0 hover:bg-surface3"
+                              className={`${ROW_BUTTON} justify-between gap-[18px] border-b border-line2 px-4 py-[13px] transition-[background] duration-150 last:border-b-0 hover:bg-surface3`}
                               onClick={() => navigate(`/settings/key/${encodeURIComponent(r.key)}`)}
                             >
                               <div className="min-w-0 text-[13px] leading-[1.3] font-medium text-ink">
@@ -167,7 +178,7 @@ export function SettingsPage() {
                               >
                                 {r.value === "" ? "—" : r.value}
                               </span>
-                            </div>
+                            </button>
                           ))}
                         </div>
                       </div>
