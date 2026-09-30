@@ -324,8 +324,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    #[test]
-    fn a_restart_reuses_the_published_name() {
+    // Creating a pipe registers it with the tokio reactor, so every pipe test
+    // runs on a runtime.
+    #[tokio::test]
+    async fn a_restart_reuses_the_published_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("borgd.sock");
         let first = PipeListener::bind(&path).expect("bind");
@@ -335,8 +337,8 @@ mod tests {
         assert_eq!(second.name(), name);
     }
 
-    #[test]
-    fn a_taken_name_is_replaced_not_shared() {
+    #[tokio::test]
+    async fn a_taken_name_is_replaced_not_shared() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("borgd.sock");
         let held = PipeListener::bind(&path).expect("bind");
