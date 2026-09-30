@@ -423,6 +423,20 @@ impl Admin for AdminSvc {
                 .await
                 .unwrap_or_default();
             let previews = db.last_message_previews(&ids).await.unwrap_or_default();
+            // Rows from before turns titled their session would otherwise list
+            // as "Untitled" until a next turn that may never come.
+            let untitled: Vec<String> = kept
+                .iter()
+                .filter(|(r, _)| r.title.is_empty() && counts.get(&r.id).is_some_and(|&n| n > 0))
+                .map(|(r, _)| r.id.clone())
+                .collect();
+            let healed = match db.backfill_session_titles(&untitled).await {
+                Ok(healed) => healed,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not title untitled sessions");
+                    Default::default()
+                }
+            };
             let mut sessions = Vec::with_capacity(kept.len());
             for (r, archived) in kept {
                 let count = counts.get(&r.id).copied().unwrap_or(0);
@@ -430,7 +444,7 @@ impl Admin for AdminSvc {
                     .get(&r.id)
                     .map(|(role, content)| (role.clone(), preview_line(content)))
                     .unwrap_or_default();
-                let mut title = r.title.clone();
+                let mut title = healed.get(&r.id).cloned().unwrap_or(r.title.clone());
                 if live.contains(&r.id) && !title.contains("(live)") {
                     title = format!("{title} (live)");
                 }

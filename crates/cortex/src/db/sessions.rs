@@ -194,6 +194,68 @@ impl Database {
         Ok(())
     }
 
+    /// Name the rows among `ids` that have a conversation but no title, from
+    /// their first user message, and return the titles written by id.
+    ///
+    /// A turn titles its own row, but rows from before that stayed untitled
+    /// until their next turn — which an old conversation may never get — and
+    /// listed as a column of identical "Untitled" rows. A title already on a
+    /// row is never touched.
+    pub async fn backfill_session_titles(&self, ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let args: Vec<libsql::Value> = ids
+            .iter()
+            .map(|id| libsql::Value::Text(id.clone()))
+            .collect();
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT m.session_id, m.content FROM messages m \
+                     JOIN sessions s ON s.id = m.session_id \
+                     WHERE s.title = '' AND m.session_id IN ({placeholders}) \
+                       AND m.id = (SELECT MIN(f.id) FROM messages f \
+                                   WHERE f.session_id = m.session_id AND f.role = 'user' \
+                                     AND f.event_kind IS NULL \
+                                     AND COALESCE(f.content, '') != '')"
+                ),
+                args,
+            )
+            .await?;
+        let mut firsts = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            firsts.push((id, content));
+        }
+        for (id, content) in firsts {
+            let Some(title) =
+                crate::session::title_from_history(&[crate::types::Message::user(&content)])
+            else {
+                continue;
+            };
+            let title = title.trim().to_string();
+            if title.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title = ''",
+                    params!(id.as_str(), title.as_str()),
+                )
+                .await?;
+            out.insert(id, title);
+        }
+        Ok(out)
+    }
+
     /// Fetch a single session row by exact id. Returns `None` if absent.
     pub async fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
         let mut rows = self
@@ -1947,6 +2009,59 @@ mod tests {
         assert_eq!(named.title, "Trip plans");
         assert_eq!(named.updated_at, 200);
         assert!(named.archived_at.is_some());
+    }
+
+    /// Regression: conversations from before turns titled their row listed
+    /// as a column of "Untitled" rows until a next turn that never came.
+    #[tokio::test]
+    async fn backfill_titles_an_old_conversation_from_its_first_user_message() {
+        let db = test_db().await;
+        for (id, title) in [("old", ""), ("named", "Trip plans"), ("empty", "")] {
+            db.upsert_session(id, 100, 100, 0, "m", title)
+                .await
+                .unwrap();
+        }
+        db.insert_message("old", "assistant", Some("Hello."), None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_message(
+            "old",
+            "user",
+            Some("Plan a week in Lisbon\n\n<meta/>"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_message("old", "user", Some("and Porto"), None, None, None, None)
+            .await
+            .unwrap();
+        db.insert_message(
+            "named",
+            "user",
+            Some("something else"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ids = ["old", "named", "empty"].map(String::from);
+        let healed = db.backfill_session_titles(&ids).await.unwrap();
+
+        assert_eq!(healed.len(), 1, "{healed:?}");
+        assert_eq!(healed["old"], "Plan a week in Lisbon");
+        for (id, title) in [
+            ("old", "Plan a week in Lisbon"),
+            ("named", "Trip plans"),
+            ("empty", ""),
+        ] {
+            assert_eq!(db.session_by_id(id).await.unwrap().unwrap().title, title);
+        }
     }
 
     #[tokio::test]
