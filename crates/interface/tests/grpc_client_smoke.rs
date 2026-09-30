@@ -4,7 +4,7 @@
 //! This file contains TWO tests:
 //!
 //!  1. `crates_cli_src_has_no_direct_db_access` — a source-grep regression
-//!     guard. Source-grep tests are normally a CLAUDE.md anti-pattern (the
+//!     guard. Source-grep tests are normally a AGENTS.md anti-pattern (the
 //!     compiler already enforces module structure), but this one is
 //!     intentionally listed as an exception under the "Source-grep tests"
 //!     rule for the same reason as the TUI mouse-capture guards: the
@@ -114,7 +114,7 @@ fn allowlist_is_shrink_only() {
 
 #[test]
 fn crates_cli_src_has_no_direct_db_access() {
-    // CLAUDE.md "Source-grep tests" exception:
+    // AGENTS.md "Source-grep tests" exception:
     // Invariant: the cli must not open the SQLite DB directly — the daemon
     // owns the DB and is the single writer. Motivating incident: prior
     // to the daemon migration the cli routinely raced the daemon's writer.

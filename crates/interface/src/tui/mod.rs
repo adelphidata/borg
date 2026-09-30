@@ -77,7 +77,7 @@ use crossterm::event::{Event, EventStream};
 //   - crossterm::event::EnableMouseCapture — it turns on ?1000h + ?1002h + ?1003h + ?1006h.
 //
 // Source-string guard tests below will fail the build if any forbidden mode
-// is reintroduced. See CLAUDE.md "Mouse Interaction" for the full rationale.
+// is reintroduced. See AGENTS.md "Mouse Interaction" for the full rationale.
 // ============================================================================
 
 use futures::StreamExt;
@@ -2362,7 +2362,7 @@ async fn run_event_loop(
 // text selection in the TUI is almost certainly broken in at least one
 // terminal. This has regressed multiple times; the belt-and-suspenders approach
 // (sequence tests + source-string guards + lifecycle test) is intentional.
-// See CLAUDE.md "Mouse Interaction" for the full rationale.
+// See AGENTS.md "Mouse Interaction" for the full rationale.
 // =============================================================================
 #[cfg(test)]
 mod tests {

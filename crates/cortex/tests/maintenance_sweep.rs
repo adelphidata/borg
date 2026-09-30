@@ -1,6 +1,6 @@
 //! Integration tests: daily self-healing maintenance sweep end-to-end.
 //!
-//! Spec invariants (CLAUDE.md → "Self-Healing"):
+//! Spec invariants (AGENTS.md → "Self-Healing"):
 //!   - Daily maintenance prunes stale embedding-cache rows, heals stalled
 //!     scheduled tasks, and head-truncates oversized append-only log files.
 //!   - The `maintenance.heal_action_budget` cap (default 1000) backstops

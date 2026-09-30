@@ -91,7 +91,7 @@ block at dispatch time.
 
 ## Why no approval prompts
 
-Borg's "agent just executes" invariant (`CLAUDE.md` → UX — No Approval
+Borg's "agent just executes" invariant (`AGENTS.md` → UX — No Approval
 Prompts) applies here. `computer_use` has no UI dialog — including for
 mutating actions. Safety comes from:
 

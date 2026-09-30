@@ -1,6 +1,6 @@
 //! Integration test: scheduled-task `pre_run_command` injection end-to-end.
 //!
-//! Spec invariants (CLAUDE.md → Tools, `schedule.create`):
+//! Spec invariants (AGENTS.md → Tools, `schedule.create`):
 //!   - For a `task_type=prompt` task with a `pre_run_command`, stdout is
 //!     injected into the LLM prompt as a
 //!     `<preprocessed_context source="pre_run" exit_code="N">` block ahead

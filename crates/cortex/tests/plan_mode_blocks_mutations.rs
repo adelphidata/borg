@@ -1,6 +1,6 @@
 //! Integration test: Plan-mode collaboration mode blocks mutating tool calls.
 //!
-//! Spec invariant (CLAUDE.md, "Collaboration Modes"):
+//! Spec invariant (AGENTS.md, "Collaboration Modes"):
 //!   When `config.conversation.collaboration_mode = Plan`, an LLM-emitted tool
 //!   call to a mutating tool is rejected by the agent loop with a result
 //!   containing "Plan mode:", and the tool dispatcher is never invoked.

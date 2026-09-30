@@ -122,7 +122,7 @@ fn apply_patch_rejects_malformed() {
             "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
         ),
         (
-            // Common-mistake case from CLAUDE.md: an UpdateFile body whose
+            // Common-mistake case from AGENTS.md: an UpdateFile body whose
             // lines all lack the ' '/'+'/'-' prefix and which is missing the
             // `@@` hunk header. The parser sees no hunks and rejects.
             "missing hunk prefix",

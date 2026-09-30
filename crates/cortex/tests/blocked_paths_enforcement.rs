@@ -1,6 +1,6 @@
 //! Integration tests for the `[security] blocked_paths` invariant.
 //!
-//! Spec (CLAUDE.md → "Security — Blocked Paths"):
+//! Spec (AGENTS.md → "Security — Blocked Paths"):
 //!   `[security] blocked_paths` defaults: `.ssh`, `.aws`, `.gnupg`,
 //!   `.config/gh`, `.env`, `credentials`, `private_key`. Filtered from
 //!   `fs_read`/`fs_write` and checked in `list_dir`.
@@ -64,7 +64,7 @@ fn assert_default_blocked_set(cfg: &Config) {
     for entry in expected {
         assert!(
             cfg.security.blocked_paths.iter().any(|p| p == entry),
-            "default blocked_paths missing `{entry}`; suite presumes CLAUDE.md spec defaults"
+            "default blocked_paths missing `{entry}`; suite presumes AGENTS.md spec defaults"
         );
     }
 }

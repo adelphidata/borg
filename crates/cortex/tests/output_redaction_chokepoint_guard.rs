@@ -4,7 +4,7 @@
 //! `output_redaction::current_policy()`), and MUST NOT call
 //! `redact_secrets` directly.
 //!
-//! This is a CLAUDE.md-sanctioned source-grep guard (the chokepoint
+//! This is a AGENTS.md-sanctioned source-grep guard (the chokepoint
 //! invariant can't be expressed in the type system because `&str` carries
 //! no provenance about which sink it's headed for). It pins four call
 //! sites:

@@ -1,7 +1,7 @@
 //! Integration test: a scheduled command's output is redacted before it is
 //! persisted or delivered.
 //!
-//! Spec invariant (CLAUDE.md → "Prompt Injection", layer 5 "secret
+//! Spec invariant (AGENTS.md → "Prompt Injection", layer 5 "secret
 //! redaction"): secrets must not survive into anything Borg stores or sends.
 //!
 //! The scheduled-task lane is the one place that had no coverage for this. Its

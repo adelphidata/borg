@@ -1249,7 +1249,7 @@ mod tests {
 
     /// The trigger runner is a daemon-lifetime loop and MUST be supervised.
     ///
-    /// Documented hard invariant (CLAUDE.md → "Subsystem Supervision",
+    /// Documented hard invariant (AGENTS.md → "Subsystem Supervision",
     /// `docs/daemon-supervision.md`): bare `tokio::spawn` for a long-running
     /// daemon subsystem is forbidden. Under a bare spawn a panic here is
     /// swallowed by tokio and the runner is silently dead — every later

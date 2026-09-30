@@ -43,7 +43,7 @@ cargo watch -x 'build --bin borg' -x 'build --bin borgd'
 
 ## Project Structure
 
-Borg is a Cargo workspace. See the Architecture table in [CLAUDE.md](CLAUDE.md#architecture) for the crate list and what each one owns.
+Borg is a Cargo workspace. See the Architecture table in [AGENTS.md](AGENTS.md#architecture) for the crate list and what each one owns.
 
 ## Running Tests
 

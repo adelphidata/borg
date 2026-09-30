@@ -13,7 +13,7 @@ fix crate="":
         cargo clippy --fix --all-features --tests --allow-dirty -p {{crate}}; \
     fi
 
-# Run lib + bin tests (fast feedback loop, mirrors CLAUDE.md). Uses nextest when available.
+# Run lib + bin tests (fast feedback loop, mirrors AGENTS.md). Uses nextest when available.
 test:
     @if command -v cargo-nextest >/dev/null 2>&1; then \
         cargo nextest run --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log; \

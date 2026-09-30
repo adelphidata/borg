@@ -919,7 +919,7 @@ mod tests {
     }
 
     /// Regression guard for the "Mouse Interaction — Hard Invariant" in
-    /// CLAUDE.md: the byte stream emitted by our terminal-init lifecycle
+    /// AGENTS.md: the byte stream emitted by our terminal-init lifecycle
     /// (set_modes + enter_alt_screen) must contain ZERO mouse-tracking mode
     /// switches. The existing `include_str!` source-grep guards in
     /// `tui/mod.rs` only catch literal occurrences in our own .rs files;

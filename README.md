@@ -20,13 +20,13 @@ Or download manually from [Releases](https://github.com/adelphidata/borg/release
 
 ## Desktop App
 
-A native window over the same Borg. Install the CLI first — the app talks to the daemon at `~/.borg/borgd.sock`.
+A native window over the same Borg. Install the CLI first. The app talks to the daemon at `~/.borg/borgd.sock`.
 
 ```sh
 borg service install     # keep the daemon running (launchd/systemd)
 ```
 
-Then grab the `desktop-v*` build for your OS from [Releases](https://github.com/adelphidata/borg/releases) — `.dmg` (macOS), `.exe` (Windows), `.AppImage` (Linux). Builds are not code-signed yet: on macOS right-click → Open the first time.
+Then grab the `desktop-v*` build for your OS from [Releases](https://github.com/adelphidata/borg/releases): `.dmg` (macOS), `.exe` (Windows), `.AppImage` (Linux). Builds are not code-signed yet: on macOS right-click → Open the first time.
 
 From source:
 
@@ -55,7 +55,7 @@ just desktop-dev         # or run it with hot reload
 | ------------ | ------------------------------------------------------- |
 | `/evolution` | See how your Borg has evolved over time                 |
 | `/xp`        | Show XP summary and recent feed                         |
-| `/stats`     | Borg vitals — stability, focus, sync, growth, happiness |
+| `/stats`     | Borg vitals: stability, focus, sync, growth, happiness  |
 | `/card`      | Print a shareable ASCII card of your Borg               |
 
 **Conversation**
@@ -78,11 +78,11 @@ just desktop-dev         # or run it with hot reload
 
 ## Plugins
 
-Connect Borg to the apps you already use — all managed in-app with `/plugins`:
+Connect Borg to the apps you already use, all managed in-app with `/plugins`:
 
 **Available:** Telegram, Slack, Discord, Teams, Google Chat, Twilio (WhatsApp + SMS), Gmail, Outlook, Google Calendar, Notion, Linear. iMessage works automatically on macOS.
 
-Any skill can be added as a plugin too — drop in a skill and Borg learns a new capability on the spot.
+Any skill can be added as a plugin too. Drop in a skill and Borg learns a new capability on the spot.
 
 ## Documentation
 

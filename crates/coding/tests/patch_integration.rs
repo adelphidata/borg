@@ -577,7 +577,7 @@ fn preflight_failure_prevents_partial_filesystem_writes() {
 
 // ── Test: missing diff-line prefix is a parse error ──
 //
-// The CLAUDE.md "common mistake" — Update body lines without `+`/`-`/space
+// The AGENTS.md "common mistake" — Update body lines without `+`/`-`/space
 // must be rejected at parse time, not silently dropped or treated as context.
 
 #[test]

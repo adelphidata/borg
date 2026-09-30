@@ -73,9 +73,9 @@ fn no_redesign_meta_in_source() {
     if docs.exists() {
         walk(&docs, &mut files);
     }
-    let claude_md = root.join("CLAUDE.md");
-    if claude_md.exists() {
-        files.push(claude_md);
+    let agents_md = root.join("AGENTS.md");
+    if agents_md.exists() {
+        files.push(agents_md);
     }
 
     let mut hits: Vec<String> = Vec::new();

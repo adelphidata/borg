@@ -1,8 +1,8 @@
 # packages/ui
 
-Local rules only. Workspace layout, the transport seam, build order, and `just` targets are in the root `CLAUDE.md`.
+Local rules only. Workspace layout, the transport seam, build order, and `just` targets are in the root `AGENTS.md`.
 
-**Read "UX — Progressive Disclosure" in the root `CLAUDE.md` before you add a component here.** It is the design thesis for every surface this package paints.
+**Read "UX — Progressive Disclosure" in the root `AGENTS.md` before you add a component here.** It is the design thesis for every surface this package paints.
 
 ## Invariants
 

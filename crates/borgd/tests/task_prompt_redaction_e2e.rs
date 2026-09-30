@@ -1,7 +1,7 @@
 //! Integration test: a scheduled prompt task's result and failure text are
 //! redacted before they are persisted.
 //!
-//! Spec invariant (CLAUDE.md → "Prompt Injection", layer 5 "secret
+//! Spec invariant (AGENTS.md → "Prompt Injection", layer 5 "secret
 //! redaction"): secrets must not survive into anything Borg stores or sends.
 //!
 //! A prompt task reads untrusted content and can repeat a secret it saw. The

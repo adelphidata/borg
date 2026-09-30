@@ -1,6 +1,6 @@
 //! Integration tests for `write_memory_db`'s 20k-token cap and 8k warn band.
 //!
-//! Spec (CLAUDE.md → Memory):
+//! Spec (AGENTS.md → Memory):
 //!   `write_memory` scans for prompt injection (override, exfil, invisible
 //!   Unicode) and enforces 20k-token cap (warn at 8k).
 //!

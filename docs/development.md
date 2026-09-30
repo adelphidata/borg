@@ -65,7 +65,7 @@ Source paths to know:
 - `crates/cortex/src/workflow/` — multi-step orchestration
 - `crates/cortex/src/hooks.rs` — lifecycle hook trait + registry
 - `crates/cortex/src/evolution/`, `crates/cortex/src/bond/`, `crates/cortex/src/vitals.rs` — XP / autonomy tier / vitals
-- `crates/interface/src/tui/` — TUI rendering (mouse/keyboard invariants live here — see CLAUDE.md)
+- `crates/interface/src/tui/` — TUI rendering (mouse/keyboard invariants live here — see AGENTS.md)
 - `crates/borgd/src/{daemon,scheduler,task_runner,heartbeat,orchestrator,channel_delivery}.rs` — daemon-side runtime
 
 ## Runtime requirements

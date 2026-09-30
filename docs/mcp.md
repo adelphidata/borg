@@ -215,7 +215,7 @@ borg settings set 'mcp.servers.<id>.tools.read_only=["search","read_resource"]'
 
 ## See also
 
-- `CLAUDE.md` → `### WASM Plugin Sandbox` for the analogous sandbox / kill-switch / rate-limit pattern that MCP mirrors.
+- `AGENTS.md` → `### WASM Plugin Sandbox` for the analogous sandbox / kill-switch / rate-limit pattern that MCP mirrors.
 - `crates/mcp/src/lib.rs` — crate-level docs and trust posture.
 - `crates/cortex/src/mcp_clients.rs` — cortex-side adapter (init, dispatch, trust wrapping).
 - `crates/cortex/src/config/mcp.rs` — config model and `${SECRET:NAME}` resolution.

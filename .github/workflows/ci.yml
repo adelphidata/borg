@@ -147,7 +147,7 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Generate coverage
-        # Ratchet, not the target. The standard in CLAUDE.md is 90%; this
+        # Ratchet, not the target. The standard in AGENTS.md is 90%; this
         # number tracks where the workspace actually is and only ever moves
         # up, so coverage can never silently regress while we climb.
         run: cargo llvm-cov --workspace --lib --bins --fail-under-lines 77 --lcov --output-path lcov.info

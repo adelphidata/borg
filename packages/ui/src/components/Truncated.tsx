@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
  * The tip is the legitimate kind: a clipped title is text the screen is
  * withholding, so reading it back is the only way to learn it. It appears only
  * when the text really is clipped — a title that fits gets no tip, because a
- * label repeated to itself teaches nothing (see this package's `CLAUDE.md`).
+ * label repeated to itself teaches nothing (see this package's `AGENTS.md`).
  *
  * Clipping is measured rather than guessed from length: the same 40 characters
  * fit or do not depending on the glyphs, the pane width, and the font the user

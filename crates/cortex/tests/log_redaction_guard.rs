@@ -2,7 +2,7 @@
 //! `api_key=`, `token=`, or `password=` followed by an interpolated value
 //! without going through `redact_secrets`.
 //!
-//! This is a CLAUDE.md-sanctioned source-grep test (the redaction invariant
+//! This is a AGENTS.md-sanctioned source-grep test (the redaction invariant
 //! cannot be expressed in the type system because tracing macros take
 //! arbitrary `&str`s). It scans every Rust source file in the workspace and
 //! flags two leak shapes:

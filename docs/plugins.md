@@ -44,7 +44,7 @@ Driven by `installer::install(def, data_dir, credentials, progress_tx)`. The cal
 - **Primary:** OS keychain via `keychain::store/read/check/remove`. macOS Keychain, Linux Secret Service / gnome-keyring.
 - **Fallback:** `~/.borg/.credentials.json`, mode `0600`. Used only when the keychain is unavailable or the user denies the prompt during install. Onboarding stays unblocked on headless Linux without Secret Service.
 
-The same keychain-first/file-fallback pattern is mirrored by `cortex::scripts::get_or_create_hmac_key` for the script HMAC signing key, and by `FileKekStore` for the KEK on headless deployments (see `CLAUDE.md` → "KEK Backend").
+The same keychain-first/file-fallback pattern is mirrored by `cortex::scripts::get_or_create_hmac_key` for the script HMAC signing key, and by `FileKekStore` for the KEK on headless deployments (see `AGENTS.md` → "KEK Backend").
 
 Account naming is `borg-<KEY>` under the service `borg-<plugin-id>`. The `service_name()` helper handles the slash-to-dash transform so `messaging/telegram` becomes service `borg-messaging-telegram`.
 

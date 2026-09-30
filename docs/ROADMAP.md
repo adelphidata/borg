@@ -108,7 +108,7 @@ deferred:
 - **TUI browser pane / screenshot overlay.** Today `/browser` only emits
   sys-messages into the transcript. A future pane that renders the live
   page would need to coexist with the mouse-interaction invariant in
-  `CLAUDE.md` (no `?1000h`/mouse-capture escapes in the inline viewport),
+  `AGENTS.md` (no `?1000h`/mouse-capture escapes in the inline viewport),
   so it's a non-trivial design problem rather than a drop-in. Deferred
   from the initial `/browser` CDP-attach pass.
 
