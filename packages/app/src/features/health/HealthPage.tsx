@@ -300,8 +300,10 @@ export function HealthPage() {
                   const open = openId === c.id;
                   return (
                     <div key={c.id}>
-                      <div
-                        className="flex cursor-pointer items-center gap-[15px] border-b border-line2 px-0.5 py-[15px]"
+                      <button
+                        type="button"
+                        aria-expanded={open}
+                        className="flex w-full cursor-pointer items-center gap-[15px] border-b border-line2 px-0.5 py-[15px] text-left"
                         onClick={() => setOpenId((id) => (id === c.id ? null : c.id))}
                       >
                         <StatusDot tone={DOT[c.state]} />
@@ -309,7 +311,7 @@ export function HealthPage() {
                         <span className="text-right text-[12.5px] leading-[1.35] text-ink3">
                           {c.value}
                         </span>
-                      </div>
+                      </button>
                       {open && (
                         <div className="flex flex-col items-start gap-3 border-b border-line2 pt-1 pr-0.5 pb-4 pl-[22px]">
                           <p className="mt-2.5 mb-0 text-[13px] leading-[1.6] text-pretty text-ink2">

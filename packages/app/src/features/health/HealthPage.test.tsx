@@ -103,6 +103,16 @@ describe("HealthPage", () => {
     expect(screen.getByText(/Thinking with claude-opus-5 on anthropic/)).toBeTruthy();
   });
 
+  it("makes each check a button that says whether it is open", async () => {
+    // A clickable div was unreachable by keyboard and silent to screen readers.
+    mount(fakeDaemon(HEALTHY));
+    await waitFor(() => expect(screen.getByText("Borg is running")).toBeTruthy());
+    const row = screen.getByRole("button", { name: /Borg is running/ });
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    click("Borg is running");
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("closes an expanded check again", async () => {
     mount(fakeDaemon(HEALTHY));
     await waitFor(() => expect(screen.getByText("Borg is running")).toBeTruthy());
