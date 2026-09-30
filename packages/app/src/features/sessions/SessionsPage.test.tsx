@@ -461,6 +461,7 @@ describe("SessionsPage export", () => {
 
       expect(clicks).toHaveLength(1);
       expect(clicks[0].download).toBe("ship-the-daemon.md");
+      expect(pendingNotice()?.message).toBe("Exported ship-the-daemon.md");
       expect(clicks[0].href).toContain("blob:transcript");
 
       // Revoking in the same tick can pull the blob out from under a download

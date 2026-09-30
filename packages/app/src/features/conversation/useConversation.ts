@@ -8,6 +8,7 @@ import {
   useRetryingServerStream,
   type QueryResult,
 } from "../../lib/useDaemon";
+import { showNotice } from "../../lib/notice";
 import { parseArgCommand, runArgCommand } from "./argCommands";
 import { splitAttachments } from "./attachments";
 import { adoptConversationUrl } from "./conversationUrl";
@@ -1278,8 +1279,11 @@ export function useConversation(target: string | undefined): Conversation {
       },
     },
   );
-  const forkMutation = useMutation((borg) =>
-    sessionId ? borg.session.fork({ sessionId }) : Promise.resolve(undefined),
+  const forkMutation = useMutation(
+    (borg) => (sessionId ? borg.session.fork({ sessionId }) : Promise.resolve(undefined)),
+    // The page swaps to the copy, which reads exactly like the original; the
+    // toast is what says the switch happened.
+    { onSuccess: (result) => result && showNotice("Forked — you are now in the copy") },
   );
   const rewindMutation = useMutation((borg, n: number) =>
     sessionId ? borg.session.rewindToNthUserMessage({ sessionId, n }) : Promise.resolve(undefined),

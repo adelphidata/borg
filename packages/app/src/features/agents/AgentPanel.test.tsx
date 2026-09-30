@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { BorgError, GrpcStatus } from "@borg/client";
+import { pendingNotice } from "../../lib/notice";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { AgentPanel } from "./AgentPanel";
 import { failureReason, statusLabel } from "./useAgentTree";
@@ -129,6 +130,7 @@ describe("AgentPanel", () => {
 
     await act(async () => screen.getByText("Pause").click());
     await waitFor(() => expect(daemon.calls.some((c) => c.method === "PauseAgent")).toBe(true));
+    await waitFor(() => expect(pendingNotice()?.message).toMatch(/^Paused /));
 
     await act(async () =>
       screen.getByRole("button", { name: "Stop this agent and its children" }).click(),

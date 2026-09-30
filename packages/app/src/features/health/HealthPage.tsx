@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CheckIcon,
   MobileTitle,
@@ -10,6 +10,7 @@ import {
   type DotTone,
 } from "@borg/ui";
 import type { BorgClient, admin } from "@borg/client";
+import { showNotice } from "../../lib/notice";
 import { useMutation, useQuery } from "../../lib/useDaemon";
 import { DaemonState } from "../../components/DaemonState";
 import { capitalize, formatDuration as fmtDuration, plural } from "../../lib/format";
@@ -217,7 +218,11 @@ export function HealthPage() {
   const vitals = useQuery((borg) => borg.status.getVitals({}));
   const health = useQuery(loadHealth);
   const heal = useMutation((borg) => borg.admin.heal({}), {
-    onSuccess: () => health.refetch(),
+    onSuccess: (report) => {
+      health.refetch();
+      showNotice(summariseHeal(report));
+    },
+    onError: (e) => showNotice(`Tidy-up failed: ${e.message}`),
   });
 
   const refreshing = vitals.refreshing || health.refreshing;
@@ -238,13 +243,33 @@ export function HealthPage() {
       : unchecked.length > 0
         ? "Some checks did not answer."
         : "Borg is healthy.";
-  const healReport = heal.error
-    ? `Tidy-up failed: ${heal.error.message}`
-    : heal.pending
-      ? "Tidying up…"
-      : heal.data
-        ? summariseHeal(heal.data)
-        : undefined;
+
+  // "Check again" re-reads rows that usually come back the same, so on its own
+  // it looks like the button did nothing. Once the re-check lands, the toast
+  // says what it found.
+  const [checkAsked, setCheckAsked] = useState(false);
+  // The click's render still reads `refreshing` as false: the queries only
+  // start their fetch in an effect. Wait until the re-check has visibly begun
+  // before reporting its end, or the toast describes the old rows.
+  const recheckStarted = useRef(false);
+  useEffect(() => {
+    if (!checkAsked) return;
+    if (refreshing) {
+      recheckStarted.current = true;
+      return;
+    }
+    if (!recheckStarted.current) return;
+    recheckStarted.current = false;
+    setCheckAsked(false);
+    if (health.state !== "ready") return;
+    showNotice(
+      failing.length > 0
+        ? `Checked: ${failing.length === 1 ? "1 thing needs" : `${failing.length} things need`} a look`
+        : unchecked.length > 0
+          ? "Checked: some checks did not answer"
+          : "Checked: Borg is healthy",
+    );
+  }, [checkAsked, refreshing, health.state, failing.length, unchecked.length]);
 
   return (
     <PageChrome title="Health" meta={`last checked ${lastChecked}`}>
@@ -378,19 +403,16 @@ export function HealthPage() {
             )}
           </DaemonState>
 
-          {healReport && (
-            <div className="text-[13px] leading-[1.6] text-pretty text-ink2">{healReport}</div>
-          )}
-
           <div className="flex gap-[9px]">
             <Pill
               variant="primary"
               onClick={() => {
                 vitals.refetch();
                 health.refetch();
+                setCheckAsked(true);
               }}
             >
-              Check again
+              {refreshing && checkAsked ? "Checking…" : "Check again"}
             </Pill>
             <Pill onClick={() => !heal.pending && void heal.run(undefined)}>
               {heal.pending ? "Tidying…" : "Tidy up now"}

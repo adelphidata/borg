@@ -12,6 +12,7 @@ import {
 } from "@borg/ui";
 import type { BorgError } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
+import { showNotice } from "../../lib/notice";
 import { useMutation } from "../../lib/useDaemon";
 import { badgeOf, useConnections, type ChannelConnection } from "./useConnections";
 
@@ -27,12 +28,26 @@ function ErrorLine({ error }: { error: BorgError | undefined }) {
 function ChannelDetail({ conn, refetch }: { conn: ChannelConnection; refetch: () => void }) {
   const approve = useMutation(
     (borg, code: string) => borg.admin.approvePairing({ channelName: conn.name, code }),
-    { onSuccess: refetch },
+    {
+      onSuccess: (_data, code) => {
+        refetch();
+        const request = conn.pending.find((r) => r.code === code);
+        showNotice(
+          `Approved ${request ? request.displayName || request.senderId : "the sender"} on ${conn.name}`,
+        );
+      },
+    },
   );
   const revoke = useMutation(
     (borg, senderId: string) =>
       borg.admin.revokeApprovedSender({ channelName: conn.name, senderId }),
-    { onSuccess: refetch },
+    {
+      onSuccess: (_data, senderId) => {
+        refetch();
+        const sender = conn.senders.find((s) => s.senderId === senderId);
+        showNotice(`Revoked ${sender?.displayName || senderId} on ${conn.name}`);
+      },
+    },
   );
 
   return (

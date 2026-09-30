@@ -125,7 +125,11 @@ export interface Mutation<Vars, T> {
  */
 export function useMutation<Vars, T>(
   mutate: (borg: BorgClient, vars: Vars) => Promise<T>,
-  options: { onSuccess?: (data: T, vars: Vars) => void } = {},
+  options: {
+    onSuccess?: (data: T, vars: Vars) => void;
+    /** Told why a call failed, as it fails — for a toast, say. */
+    onError?: (error: BorgError, vars: Vars) => void;
+  } = {},
 ): Mutation<Vars, T> {
   const borg = useBorg();
   const [pending, setPending] = useState(false);
@@ -135,6 +139,8 @@ export function useMutation<Vars, T>(
   mutateRef.current = mutate;
   const onSuccessRef = useRef(options.onSuccess);
   onSuccessRef.current = options.onSuccess;
+  const onErrorRef = useRef(options.onError);
+  onErrorRef.current = options.onError;
 
   const run = useCallback(
     async (vars: Vars): Promise<T | undefined> => {
@@ -146,7 +152,9 @@ export function useMutation<Vars, T>(
         onSuccessRef.current?.(result, vars);
         return result;
       } catch (e) {
-        setError(asBorgError(e));
+        const error = asBorgError(e);
+        setError(error);
+        onErrorRef.current?.(error, vars);
         return undefined;
       } finally {
         setPending(false);
