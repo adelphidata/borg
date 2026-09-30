@@ -644,11 +644,7 @@ pub(crate) fn signed_request(
         insert_header(&mut headers, "x-amz-security-token", token)?;
     }
 
-    let canonical_uri = if parsed_url.path().is_empty() {
-        "/"
-    } else {
-        parsed_url.path()
-    };
+    let canonical_uri = canonical_uri(parsed_url.path());
     let canonical_query = canonical_query_string(&parsed_url);
     let (canonical_headers, signed_headers) = canonical_headers(&headers)?;
     let canonical_request = format!(
@@ -776,6 +772,20 @@ fn hex_hmac(key: &[u8], data: &str) -> Result<String> {
 
 fn hex_sha256(data: &[u8]) -> String {
     hex_encode(&Sha256::digest(data))
+}
+
+/// SigV4 canonical URI for a non-S3 service: every segment of the path as
+/// sent, URI-encoded once more. Model ids carry a `:` (`…-v1:0`) that goes out
+/// raw in the path; AWS signs it as `%3A`, so signing the raw path fails every
+/// request for such a model with a signature mismatch.
+fn canonical_uri(path: &str) -> String {
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    path.split('/')
+        .map(aws_percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn aws_percent_encode(input: &str) -> String {
@@ -942,6 +952,19 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn canonical_uri_encodes_each_segment_as_sent() {
+        // What AWS itself answered with for a model id containing `:`.
+        assert_eq!(
+            canonical_uri("/model/anthropic.claude-3-7-sonnet-20250219-v1:0/converse"),
+            "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse"
+        );
+        // An already-escaped segment is escaped again, per non-S3 SigV4.
+        assert_eq!(canonical_uri("/model/a%3Ab/converse"), "/model/a%253Ab/converse");
+        assert_eq!(canonical_uri(""), "/");
+        assert_eq!(canonical_uri("/"), "/");
     }
 
     #[test]
