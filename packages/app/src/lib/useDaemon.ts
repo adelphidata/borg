@@ -62,11 +62,23 @@ export function useQuery<T>(
   // `deps` alone while still running the latest closure.
   const callRef = useRef(call);
   callRef.current = call;
+  // What the last run asked for. A retry of the same call keeps its failure on
+  // screen until the answer lands; a new target must not show the old error.
+  const lastTarget = useRef<unknown[]>(undefined);
 
   useEffect(() => {
     let live = true;
+    const target = [borg, ...deps];
+    const previous = lastTarget.current;
+    lastTarget.current = target;
+    const keepError =
+      previous !== undefined &&
+      previous.length === target.length &&
+      target.every((value, i) => Object.is(value, previous[i]));
     // Keep stale data on screen during a refetch; only a first load spins.
-    setResult((prev) => (prev.state === "ready" ? prev : { state: "loading" }));
+    setResult((prev) =>
+      prev.state === "ready" || (keepError && prev.state === "error") ? prev : { state: "loading" },
+    );
     setRefreshing(true);
 
     callRef

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { telemetry as telemetryPb } from "@borg/client";
-import { useQuery, useServerStream, type QueryResult } from "../../lib/useDaemon";
+import { useQuery, useRetryingServerStream, type QueryResult } from "../../lib/useDaemon";
 
 /** One model's share of the spend. */
 export interface ModelSpend {
@@ -96,7 +96,8 @@ export function useUsage(deps: unknown[] = []): Usage {
     };
   }, deps);
 
-  const stream = useServerStream<telemetryPb.CostEvent>(
+  // Retrying: the stream outlives a daemon restart only by being redialled.
+  const stream = useRetryingServerStream<telemetryPb.CostEvent>(
     (borg, handlers) => borg.telemetry.streamCostEvents({}, handlers),
     (event) => setEvents((prev) => [...prev, event].slice(-MAX_EVENTS)),
     [],

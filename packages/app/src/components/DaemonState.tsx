@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { Pill } from "@borg/ui";
 import { useNative, usePlatform } from "../lib/platform";
 import { signOut } from "../lib/session";
@@ -12,6 +12,9 @@ import type { Query } from "../lib/useDaemon";
  * borgd being down, and the browser's token being rejected. Everything else is
  * reported verbatim.
  */
+/** How often a page that lost the daemon asks again. */
+export const DAEMON_RETRY_MS = 2_000;
+
 export function DaemonState<T>({
   query,
   label,
@@ -19,7 +22,7 @@ export function DaemonState<T>({
   children,
 }: {
   /** A `useQuery` result. `refetch` is optional so a bare `Query` still fits. */
-  query: Query<T> & { refetch?: () => void };
+  query: Query<T> & { refetch?: () => void; refreshing?: boolean };
   /** What was being fetched, used in the failure line: "Could not load {label}." */
   label: string;
   /**
@@ -31,6 +34,19 @@ export function DaemonState<T>({
 }) {
   const { kind } = usePlatform();
   const native = useNative();
+
+  // A daemon that went away usually comes back — a restart, an update, the
+  // desktop shell starting it again. Ask again until it answers, so the page
+  // recovers by itself rather than keeping an outage on screen that is over.
+  // One attempt at a time: the next is scheduled when the last has failed,
+  // so a slow answer is waited for rather than cut off by the next tick.
+  const down = query.state === "error" && query.error.isUnavailable;
+  const { refetch, refreshing } = query;
+  useEffect(() => {
+    if (!down || refreshing || !refetch) return;
+    const id = setTimeout(refetch, DAEMON_RETRY_MS);
+    return () => clearTimeout(id);
+  }, [down, refreshing, refetch]);
 
   if (query.state === "loading") {
     return <div className="text-[13px] leading-none text-ink3">Loading {label}…</div>;

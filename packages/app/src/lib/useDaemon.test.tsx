@@ -9,7 +9,7 @@ import {
 } from "@borg/client";
 import { MAX_DELAY_MS, OUTAGE_ESCALATION_MS } from "./backoff";
 import { PlatformProvider } from "./platform";
-import { useRetryingServerStream } from "./useDaemon";
+import { useQuery, useRetryingServerStream } from "./useDaemon";
 
 /**
  * A transport whose only job is to hand each subscription's handlers back to
@@ -246,5 +246,55 @@ describe("useRetryingServerStream", () => {
       harness.subscriptions.at(-1)?.onMessage?.({});
     });
     expect(getByTestId("state").textContent).not.toBe("sustained");
+  });
+});
+
+describe("useQuery", () => {
+  afterEach(cleanup);
+
+  const probe: { refetch?: () => void } = {};
+
+  function QueryProbe({
+    target,
+    calls,
+  }: {
+    target: string;
+    calls: Map<string, () => Promise<string>>;
+  }) {
+    const query = useQuery(() => calls.get(target)!(), [target]);
+    probe.refetch = query.refetch;
+    return (
+      <div data-testid="query">{query.state === "error" ? query.error.message : query.state}</div>
+    );
+  }
+
+  it("does not carry one target's failure onto the next, even when a retry lands with it", async () => {
+    const calls = new Map<string, () => Promise<string>>([
+      ["old", () => Promise.reject(new BorgError(GrpcStatus.Unavailable, "old page failed"))],
+      ["new", () => new Promise<string>(() => {})],
+    ]);
+    const platform = {
+      kind: "web" as const,
+      transport: fakeTransport().transport,
+      titleBarDrag: false,
+    };
+    const view = render(
+      <PlatformProvider platform={platform}>
+        <QueryProbe target="old" calls={calls} />
+      </PlatformProvider>,
+    );
+    await act(async () => {});
+    expect(view.getByTestId("query").textContent).toBe("old page failed");
+
+    // A retry timer firing in the same batch as a navigation.
+    act(() => {
+      probe.refetch?.();
+      view.rerender(
+        <PlatformProvider platform={platform}>
+          <QueryProbe target="new" calls={calls} />
+        </PlatformProvider>,
+      );
+    });
+    expect(view.getByTestId("query").textContent).toBe("loading");
   });
 });

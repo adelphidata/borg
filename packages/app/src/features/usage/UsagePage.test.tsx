@@ -123,6 +123,23 @@ describe("UsagePage", () => {
     await waitFor(() => expect(screen.getByText("The cost stream is not connected.")).toBeTruthy());
   });
 
+  it("redials the cost stream after a drop, so a daemon restart does not leave it dead", async () => {
+    const daemon = fakeDaemon(MONTH);
+    renderApp(<UsagePage />, { daemon });
+    await waitFor(() => expect(screen.getByText("Waiting for the next model call.")).toBeTruthy());
+
+    const first = daemon.streams.find((s) => s.method === "StreamCostEvents")!;
+    act(() => first.handlers.onError?.(new BorgError(GrpcStatus.Unavailable, "gone")));
+    await waitFor(() => expect(screen.getByText("The cost stream is not connected.")).toBeTruthy());
+
+    // The first retry waits at most FIRST_DELAY_MS.
+    await waitFor(
+      () => expect(daemon.streams.filter((s) => s.method === "StreamCostEvents").length).toBe(2),
+      { timeout: 2_000 },
+    );
+    expect(screen.getByText("Waiting for the next model call.")).toBeTruthy();
+  });
+
   it("drops live events when the stream fails, rather than freezing a stale total", async () => {
     const daemon = fakeDaemon(MONTH);
     renderApp(<UsagePage />, { daemon });
