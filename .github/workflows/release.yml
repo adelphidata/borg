@@ -192,6 +192,17 @@ jobs:
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev libasound2-dev pkg-config
+      - name: Add swap
+        # A fat-LTO link of the workspace outgrows the Linux runners' memory
+        # and the job is killed mid-link.
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 16G /swapfile-release
+          sudo chmod 600 /swapfile-release
+          sudo mkswap /swapfile-release
+          sudo swapon /swapfile-release
+          free -h
       - uses: oven-sh/setup-bun@v2
       - name: Build web UI
         # ORDER MATTERS: borgd embeds apps/web/dist via rust-embed at compile
@@ -202,7 +213,10 @@ jobs:
           test -f apps/web/dist/index.html
       # No build cache: a release compiles from a clean tree.
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin borg --bin borgd
+        # One binary at a time, so two fat-LTO links never share the memory.
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} --bin borgd
+          cargo build --release --locked --target ${{ matrix.target }} --bin borg
       - name: Smoke test
         shell: bash
         run: |
@@ -233,6 +247,9 @@ jobs:
   desktop:
     name: Desktop (${{ matrix.name }})
     needs: [prepare, cli]
+    # Each leg needs only its own CLI archive, so one failed platform does not
+    # hide the others. Publish still requires every leg.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
