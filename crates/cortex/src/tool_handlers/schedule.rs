@@ -85,7 +85,7 @@ pub async fn handle_manage_tasks(args: &serde_json::Value, config: &Config) -> R
         "create" => manage_tasks_create(args, config).await,
         "list" => manage_tasks_list().await,
         "get" => manage_tasks_get(args).await,
-        "update" => manage_tasks_update(args).await,
+        "update" => manage_tasks_update(args, config).await,
         "pause" => {
             let task_id = require_str_param(args, "task_id")?.to_string();
             if let Some(msg) = reject_system_task(&task_id, "pause") {
@@ -190,18 +190,24 @@ fn resolve_origin_delivery(
 /// The tool promises "local", but the scheduler reads `local` as UTC, so
 /// "every day at 08:00" asked for in New York ran at 04:00. Absent or
 /// `local` now means the user's zone: the `user.timezone` setting, else the
-/// host's. An explicit zone is kept as given.
+/// host's. An explicit zone is kept as given; `tasks::validate_timezone`
+/// refuses one that does not parse.
 fn task_timezone(requested: Option<&str>, config: &Config) -> String {
     match requested.map(str::trim) {
         Some(tz) if !tz.is_empty() && !tz.eq_ignore_ascii_case("local") => tz.to_string(),
-        _ => config
-            .user
-            .timezone
-            .clone()
-            .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
-            .or_else(Config::detect_host_timezone)
-            .unwrap_or_else(|| "local".to_string()),
+        _ => user_timezone(config),
     }
+}
+
+/// The user's zone: the `user.timezone` setting, else the host's.
+fn user_timezone(config: &Config) -> String {
+    config
+        .user
+        .timezone
+        .clone()
+        .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
+        .or_else(Config::detect_host_timezone)
+        .unwrap_or_else(|| "local".to_string())
 }
 
 /// The note a create reply carries when `origin` had nowhere to go.
@@ -426,7 +432,7 @@ async fn manage_tasks_get(args: &serde_json::Value) -> Result<String> {
     .await
 }
 
-async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
+async fn manage_tasks_update(args: &serde_json::Value, config: &Config) -> Result<String> {
     let task_id = require_str_param(args, "task_id")?.to_string();
     if let Some(msg) = reject_system_task(&task_id, "update") {
         return Ok(msg);
@@ -442,7 +448,8 @@ async fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
     let prompt = optional_str_param(args, "prompt").map(str::to_string);
     let schedule_type = optional_str_param(args, "schedule_type").map(str::to_string);
     let schedule_expr = optional_str_param(args, "schedule_expr").map(str::to_string);
-    let timezone = optional_str_param(args, "timezone").map(str::to_string);
+    // "local" on an update means the user's zone too, never UTC.
+    let timezone = optional_str_param(args, "timezone").map(|tz| task_timezone(Some(tz), config));
     if let Some(tz) = timezone.as_deref() {
         if let Err(e) = tasks::validate_timezone(tz) {
             return Ok(invalid_schedule(e));
@@ -797,7 +804,7 @@ async fn manage_cron_create(args: &serde_json::Value, config: &Config) -> Result
         return Ok(invalid_schedule(e));
     }
 
-    let timezone = task_timezone(None, config);
+    let timezone = user_timezone(config);
     let next_run = match tasks::calculate_next_run("cron", &cron_7, &timezone) {
         Ok(nr) => nr,
         Err(e) => return Ok(invalid_schedule(e)),
@@ -930,7 +937,7 @@ mod tests {
             );
 
             let update = serde_json::json!({ "task_id": "any-task", "timezone": tz });
-            let out = manage_tasks_update(&update)
+            let out = manage_tasks_update(&update, &Config::default())
                 .await
                 .expect("handler returns Ok with an error string");
             assert!(

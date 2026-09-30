@@ -148,6 +148,7 @@ const RUN_STATUS: Record<string, string> = {
   failed: "Failed",
   error: "Failed",
   timeout: "Timed out",
+  cancelled: "Cancelled",
   misconfigured: "Could not be delivered",
   quiet_hours: "Skipped for quiet hours",
 };
