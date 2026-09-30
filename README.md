@@ -26,7 +26,7 @@ A native window over the same Borg. Install the CLI first. The app talks to the 
 borg service install     # keep the daemon running (launchd/systemd)
 ```
 
-Then grab the `desktop-v*` build for your OS from [Releases](https://github.com/adelphidata/borg/releases): `.dmg` (macOS), `.exe` (Windows), `.AppImage` (Linux). Builds are not code-signed yet: on macOS right-click → Open the first time.
+Then grab the installer for your OS from [Releases](https://github.com/adelphidata/borg/releases): `.dmg` (macOS), `.exe` (Windows), `.AppImage` or `.deb` (Linux). Builds are not code-signed yet: on macOS open the app once, then allow it under System Settings → Privacy & Security; on Windows choose More info → Run anyway.
 
 From source:
 

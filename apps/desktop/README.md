@@ -41,4 +41,4 @@ Beyond the workspace `just` targets:
 | `bun run dist`      | Installers via electron-builder into `release/`       |
 | `bun run pack`      | Unpacked build (`--dir`), for packaging smoke tests   |
 
-Installers come from `.github/workflows/release-desktop.yml`. Artifacts are currently **unsigned** — see the `TODO(signing)` note in `electron-builder.yml`.
+Installers come from `.github/workflows/release.yml`, in the same `v*` release as the CLI. Artifacts are currently **unsigned** (macOS builds are ad-hoc signed). Add the `MAC_CSC_LINK`/`MAC_CSC_KEY_PASSWORD`, `APPLE_ID`/`APPLE_APP_SPECIFIC_PASSWORD`/`APPLE_TEAM_ID`, and `WIN_CSC_LINK`/`WIN_CSC_KEY_PASSWORD` repository secrets and the same workflow signs and notarizes.

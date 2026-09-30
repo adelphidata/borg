@@ -1,5 +1,5 @@
-# Packaging for the Borg desktop app. Driven by .github/workflows/release-desktop.yml
-# on a `desktop-v*` tag.
+# Packaging for the Borg desktop app. Driven by .github/workflows/release.yml
+# on a `v*` release, next to the CLI archives.
 #
 # Signing is credential-gated, not code-gated. macOS signs and notarizes when
 # CSC_LINK / CSC_KEY_PASSWORD / APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
@@ -10,6 +10,10 @@
 appId: dev.borg.desktop
 productName: Borg
 copyright: Adelphi Data, Inc.
+
+# One name shape on every platform, with the arch always spelled out: both Mac
+# builds share a release, and electron-updater picks the arm64 file by name.
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 
 directories:
   output: release

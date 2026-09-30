@@ -90,7 +90,7 @@ just web-ci          # everything CI runs for the web side
 
 **Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 
-**Two release trains.** `borg-v*` tags build the Rust binaries (with the SPA embedded); `desktop-v*` tags build the Electron installers. Neither triggers the other.
+**One release train.** `.github/workflows/release.yml` builds a `vX.Y.Z` release with the `borg`/`borgd` archives (SPA embedded) and the desktop installers together. Run it from Actions → Release → Run workflow (`mode: artifacts` builds without publishing) or push a `v*` tag. Bump the `[workspace.package]` version in `Cargo.toml` and `apps/desktop/package.json` first; the workflow refuses a mismatch and a commit whose CI has not passed.
 
 ### Web surfaces
 
@@ -110,7 +110,7 @@ just web-ci          # everything CI runs for the web side
 
 **Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 
-**Two release trains.** `borg-v*` tags build the Rust binaries (with the SPA embedded); `desktop-v*` tags build the Electron installers. Neither triggers the other. The desktop train also builds `borgd` and packs it as `Contents/Resources/bin/borgd` (`extraResources`); locally `just desktop-bundle-borgd` does the same before `pack`/`dist`.
+**Desktop installers carry `borgd`.** The release packs the same `borgd` the CLI archive ships as `Contents/Resources/bin/borgd` (`extraResources`); locally `just desktop-bundle-borgd` does the same before `pack`/`dist`.
 
 **Provider and model lists come from the daemon.** `Admin.GetSetupStatus` serves `cortex::llm::provider_catalog::ONBOARDABLE` + the model catalog + what `credential_detect` found on the machine. The TUI wizard, `packages/app` onboarding, settings pickers, and the composer's model pill all read that one list — never add a provider or model constant in TypeScript. Keys saved by the GUI (`SetApiKey` literal → `credentials.{provider}` row) reach the LLM because `Config::load_from_db` folds that row into `llm.api_key`; `borgd` also loads `~/.borg/.env` at startup.
 
