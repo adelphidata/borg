@@ -178,11 +178,14 @@ function CatalogDetail({
   basic,
   entry,
   provider,
+  model,
 }: {
   basic: BasicSetting;
   entry: { key: string; value: string; overridden: boolean };
   /** The provider in force, which decides the model list. */
   provider: string;
+  /** The model in force, which a provider switch may have to replace. */
+  model: string;
 }) {
   const { save, clear, saving } = useSettings();
   const setup = useSetupStatus();
@@ -202,6 +205,16 @@ function CatalogDetail({
     chosen.needsApiKey &&
     !status!.detected.some((d) => d.provider.toLowerCase() === chosen.id.toLowerCase());
 
+  // A model belongs to its provider. Keeping `claude-haiku-4-5` across a
+  // switch to OpenAI sends OpenAI a model it has never heard of, so a switch
+  // to a provider that does not list the current model takes its default too.
+  const pick = async (value: string) => {
+    if (!(await save(entry.key, value)) || basic.catalog !== "provider" || !status) return;
+    const next = providerOf(status.providers, value);
+    const known = modelsOf(status.providers, value).some((m) => m.id === model);
+    if (next && next.defaultModel !== "" && !known) await save("model", next.defaultModel);
+  };
+
   return (
     <>
       {!editing && (
@@ -211,7 +224,7 @@ function CatalogDetail({
           disabled={saving}
           onPick={(v) => {
             if (v === SOMETHING_ELSE) setFreeText(true);
-            else if (v !== entry.value) void save(entry.key, v);
+            else if (v !== entry.value) void pick(v);
           }}
         />
       )}
@@ -219,7 +232,7 @@ function CatalogDetail({
         <ValueEditor
           initial={entry.value}
           saving={saving}
-          onSave={(v) => void save(entry.key, v)}
+          onSave={(v) => void pick(v)}
           onReset={entry.overridden ? () => void clear(entry.key) : undefined}
         />
       )}
@@ -320,6 +333,7 @@ export function SettingDetailPage() {
                   basic={basic}
                   entry={entry}
                   provider={map.get("provider")?.value ?? ""}
+                  model={map.get("model")?.value ?? ""}
                 />
               </>
             );

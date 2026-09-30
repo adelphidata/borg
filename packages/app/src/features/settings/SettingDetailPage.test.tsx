@@ -187,7 +187,7 @@ describe("SettingDetailPage for provider and model", () => {
     mount("/settings/provider", daemon);
     await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
     const selected = screen.getByRole("img", { name: "Selected" });
-    expect(selected.closest("div")?.textContent).toContain("Anthropic");
+    expect(selected.closest("button")?.textContent).toContain("Anthropic");
 
     click(screen.getByText("OpenRouter"));
     await waitFor(() =>
@@ -196,6 +196,35 @@ describe("SettingDetailPage for provider and model", () => {
         value: "openrouter",
       }),
     );
+  });
+
+  it("moves to the new provider's default model when it does not list the current one", async () => {
+    // claude-opus-5 is an Anthropic id; OpenRouter would be sent a model it
+    // does not carry under that name.
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+    click(screen.getByText("OpenRouter"));
+    await waitFor(() =>
+      expect(daemon.calls.filter((c) => c.method === "SetSetting").map((c) => c.request)).toEqual([
+        { key: "provider", value: "openrouter" },
+        { key: "model", value: "deepseek/deepseek-v4-flash" },
+      ]),
+    );
+  });
+
+  it("leaves the model alone when the provider write fails", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      SetSetting: new BorgError(GrpcStatus.Internal, "disk full"),
+    });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+    click(screen.getByText("OpenRouter"));
+    await waitFor(() => expect(screen.getByText(/disk full/)).toBeTruthy());
+    expect(daemon.calls.filter((c) => c.method === "SetSetting").map((c) => c.request)).toEqual([
+      { key: "provider", value: "openrouter" },
+    ]);
   });
 
   it("lists only the models of the provider in force", async () => {
