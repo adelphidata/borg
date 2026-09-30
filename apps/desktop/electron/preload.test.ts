@@ -159,7 +159,7 @@ describe("transport.serverStream", () => {
     vi.resetModules();
     await import("./preload");
     const reloaded = contextBridgeState.exposed.get("borg") as ExposedBorg;
-    const c = await open(reloaded);
+    const c = await open({ ...reloaded, transport: fromWire(reloaded.transport) });
     expect(load(c.id)).not.toBe(load(a.id));
   });
 
