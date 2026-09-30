@@ -227,6 +227,30 @@ describe("SettingDetailPage for provider and model", () => {
     ]);
   });
 
+  it("says so when the provider switched but its model could not follow", async () => {
+    // Two writes: the provider lands, the model does not. OpenRouter is now
+    // paired with an Anthropic model id, and the user has to know that.
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      SetSetting: (req: unknown) =>
+        (req as { key: string }).key === "model"
+          ? new BorgError(GrpcStatus.Internal, "disk full")
+          : {},
+    });
+    mount("/settings/provider", daemon);
+    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+    click(screen.getByText("OpenRouter"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Now using OpenRouter, but its model could not be switched/),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByRole("link", { name: "Pick a model" }).getAttribute("href")).toBe(
+      "/settings/model",
+    );
+  });
+
   it("lists only the models of the provider in force", async () => {
     mount("/settings/model");
     await waitFor(() => expect(screen.getByText("Opus 5")).toBeTruthy());

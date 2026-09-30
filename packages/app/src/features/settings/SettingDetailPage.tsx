@@ -192,6 +192,8 @@ function CatalogDetail({
   // Undecided until the user says; a value the catalog does not know starts
   // as text, and "Back to the list" is still honoured after that.
   const [freeText, setFreeText] = useState<boolean>();
+  // The provider a switch moved to when its model could not follow.
+  const [modelStranded, setModelStranded] = useState<string>();
 
   const status = setup.state === "ready" ? setup.data : undefined;
   const options = status ? catalogOptions(basic.catalog, status, provider) : [];
@@ -209,10 +211,15 @@ function CatalogDetail({
   // switch to OpenAI sends OpenAI a model it has never heard of, so a switch
   // to a provider that does not list the current model takes its default too.
   const pick = async (value: string) => {
+    setModelStranded(undefined);
     if (!(await save(entry.key, value)) || basic.catalog !== "provider" || !status) return;
     const next = providerOf(status.providers, value);
     const known = modelsOf(status.providers, value).some((m) => m.id === model);
-    if (next && next.defaultModel !== "" && !known) await save("model", next.defaultModel);
+    if (next && next.defaultModel !== "" && !known && !(await save("model", next.defaultModel))) {
+      // Two writes, and only the first landed: the new provider now has a
+      // model it does not carry. Say so, and where to fix it.
+      setModelStranded(next.label);
+    }
   };
 
   return (
@@ -244,6 +251,14 @@ function CatalogDetail({
         >
           Back to the list
         </button>
+      )}
+      {modelStranded && (
+        <div className="rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
+          Now using {modelStranded}, but its model could not be switched.{" "}
+          <Link to="/settings/model" className="text-neon-ink no-underline">
+            Pick a model
+          </Link>
+        </div>
       )}
       {keyMissing && (
         <div className="rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
