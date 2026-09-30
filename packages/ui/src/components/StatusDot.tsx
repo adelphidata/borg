@@ -2,15 +2,18 @@
  * The 6px dot that carries state in a list row.
  *
  * Every surface that shows liveness uses this one, so the vocabulary stays
- * fixed: neon means healthy, red means it wants you, grey means it is not
- * running. Callers pass a tone rather than a colour class — a page inventing
+ * fixed: neon means healthy, yellow means worth a look, red means it is
+ * broken, grey means it is not running. Callers pass a tone rather than a colour class — a page inventing
  * `bg-amber-400` is how a status vocabulary stops meaning anything.
  */
-export type DotTone = "ok" | "alert" | "busy" | "working" | "unread" | "draft" | "paused" | "idle";
+export type DotTone =
+  "ok" | "alert" | "warn" | "busy" | "working" | "unread" | "draft" | "paused" | "idle";
 
 const TONES: Record<DotTone, string> = {
   ok: "bg-neon shadow-(--glow)",
   alert: "bg-alert",
+  /** Worth a look, not broken — red is kept for what is. */
+  warn: "bg-warn",
   /** Working right now — the pulse is the difference from a settled `ok`. */
   busy: "animate-bpulse bg-neon",
   /**

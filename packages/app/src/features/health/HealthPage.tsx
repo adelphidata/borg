@@ -22,7 +22,7 @@ interface HealthCheck {
    * `unchecked` is its own state, not a pass: the call did not answer, so
    * the page knows nothing either way and must not paint it green.
    */
-  state: "ok" | "alert" | "unchecked";
+  state: "ok" | "warn" | "alert" | "unchecked";
   /** Plain-language explanation revealed when the row is expanded. */
   detail: string;
   /** Optional lines rendered as a bullet list under the detail. */
@@ -50,7 +50,13 @@ const UNCHECKED = {
 } as const;
 
 /** What each state looks like as a dot; a row that did not answer is grey. */
-const DOT: Record<HealthCheck["state"], DotTone> = { ok: "ok", alert: "alert", unchecked: "idle" };
+// Yellow is worth a look; red is reserved for something actually broken.
+const DOT: Record<HealthCheck["state"], DotTone> = {
+  ok: "ok",
+  warn: "warn",
+  alert: "alert",
+  unchecked: "idle",
+};
 
 /**
  * The value when the call succeeded, `undefined` when it did not. The row
@@ -106,7 +112,7 @@ function buildChecks(d: HealthData): HealthCheck[] {
         name: "Warnings",
         value:
           d.warnings.warnings.length === 0 ? "None" : plural(d.warnings.warnings.length, "warning"),
-        state: d.warnings.warnings.length === 0 ? "ok" : "alert",
+        state: d.warnings.warnings.length === 0 ? "ok" : "warn",
         detail:
           d.warnings.warnings.length === 0
             ? "The last check-up found nothing that needs you."
@@ -121,7 +127,7 @@ function buildChecks(d: HealthData): HealthCheck[] {
           id: "posture",
           name: "Security posture",
           value: capitalize(posture),
-          state: posture === "reduced" ? "alert" : "ok",
+          state: posture === "reduced" ? "warn" : "ok",
           detail:
             posture === "reduced"
               ? "Borg is running with reduced protections (for example, secrets in a file instead of the keychain). It still works, but earns less trust. Run `borg doctor` in a terminal to see which setting lowered it and how to raise it."
@@ -217,7 +223,8 @@ export function HealthPage() {
   const refreshing = vitals.refreshing || health.refreshing;
   const lastChecked = refreshing ? "checking…" : "just now";
   const checks = health.state === "ready" ? buildChecks(health.data) : [];
-  const failing = checks.filter((c) => c.state === "alert");
+  const failing = checks.filter((c) => c.state === "alert" || c.state === "warn");
+  const critical = failing.some((c) => c.state === "alert");
   const unchecked = checks.filter((c) => c.state === "unchecked");
   // Until the checks answer, nothing is known: no green tick, no verdict.
   const known = health.state === "ready";
@@ -248,11 +255,13 @@ export function HealthPage() {
           <div className="flex items-start gap-[22px]">
             <span
               className={`flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] ${
-                failing.length > 0
+                critical
                   ? "border-alert"
-                  : neutral
-                    ? "border-ink3"
-                    : "border-neon shadow-(--plateGlow)"
+                  : failing.length > 0
+                    ? "border-warn"
+                    : neutral
+                      ? "border-ink3"
+                      : "border-neon shadow-(--plateGlow)"
               }`}
             >
               {health.state === "loading" ? null : failing.length > 0 || neutral ? (
@@ -260,7 +269,7 @@ export function HealthPage() {
                 <span
                   aria-hidden
                   className={`text-[22px] leading-none font-medium ${
-                    failing.length > 0 ? "text-alert" : "text-ink3"
+                    critical ? "text-alert" : failing.length > 0 ? "text-warn" : "text-ink3"
                   }`}
                 >
                   {failing.length > 0 ? "!" : "?"}
