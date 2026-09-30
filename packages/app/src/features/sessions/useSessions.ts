@@ -1,6 +1,11 @@
 import { useMemo, useState, useSyncExternalStore } from "react";
 import type { admin as adminPb } from "@borg/client";
-import { draftsVersion, rowTitle, subscribeDrafts } from "../conversation/draftStore";
+import {
+  draftsVersion,
+  isBlankSession,
+  rowTitle,
+  subscribeDrafts,
+} from "../conversation/draftStore";
 import {
   activityVersion,
   sessionActivity,
@@ -23,6 +28,8 @@ export interface SessionRow {
   activity?: SessionActivity;
   /** True for a soft-hidden conversation, only ever set when they were asked for. */
   archived?: boolean;
+  /** Kept in every list, even with nothing in it yet. */
+  pinned?: boolean;
   /** One line of the newest message, capped and redacted by the daemon. */
   preview?: string;
   /** Who said it: "user" or "assistant". */
@@ -81,6 +88,7 @@ function toRow(s: adminPb.SessionSummary): SessionRow {
     messageCount: Number(s.messageCount),
     updatedAt: Number(s.updatedUnixTs),
     archived: s.archived || undefined,
+    pinned: s.pinned || undefined,
     preview: s.lastMessagePreview || undefined,
     previewRole: s.lastMessageRole || undefined,
   };
@@ -245,7 +253,13 @@ export function useSessions(deps: unknown[] = []): Sessions {
   // list beside it rather than on the next refetch.
   const read = useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
   const named = useMemo(
-    () => filterSessions(resolveTitles(sessions), search),
+    () =>
+      filterSessions(
+        resolveTitles(
+          sessions.filter((s) => s.pinned || !isBlankSession(s.title, s.messageCount, s.id)),
+        ),
+        search,
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the version
     // counters below name no value used here; they only say one changed.
     [sessions, search, drafts, activity, read],

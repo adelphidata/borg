@@ -83,6 +83,37 @@ describe("BorgApp shell", () => {
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
   });
 
+  it("keeps sessions that hold nothing out of the sidebar", async () => {
+    mount(
+      fakeDaemon({
+        ...BASE,
+        ListSessions: {
+          sessions: [session({ id: "blank", title: "", messageCount: 0 }), session()],
+        },
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(screen.queryByText("Untitled")).toBeNull();
+  });
+
+  it("renames a sidebar row as soon as its first turn settles", async () => {
+    // The daemon titles a session when a turn finishes; the sidebar used to
+    // keep saying "Untitled" until the next navigation.
+    let title = "";
+    const { daemon } = mount(
+      fakeDaemon({
+        ...BASE,
+        ListSessions: () => ({ sessions: [session({ title })] }),
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Untitled")).toBeTruthy());
+
+    title = "Plan the offsite";
+    const feed = daemon.streams.find((s) => s.method === "SubscribeSessionActivity")!;
+    act(() => feed.handlers.onMessage({ sessionId: "s1", turnActive: false } as never));
+    await waitFor(() => expect(screen.getByText("Plan the offsite")).toBeTruthy());
+  });
+
   it("lists recent conversations in the sidebar and opens one", async () => {
     mount();
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());

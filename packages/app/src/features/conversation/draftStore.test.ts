@@ -3,6 +3,7 @@ import {
   draftKeyFor,
   draftTitle,
   draftsVersion,
+  isBlankSession,
   moveDraft,
   publishDraft,
   readDraft,
@@ -154,5 +155,19 @@ describe("rowTitle", () => {
     publishDraft(draftKeyFor("s2"), "second");
     expect(rowTitle("", 0, "s1")).toBe("first");
     expect(rowTitle("", 0, "s2")).toBe("second");
+  });
+});
+
+describe("isBlankSession", () => {
+  it("is a session with no messages, no name and nothing typed", () => {
+    expect(isBlankSession("", 0, "s1")).toBe(true);
+    expect(isBlankSession("New conversation (live)", 0, "s1")).toBe(true);
+  });
+
+  it("is not blank once anything is in it", () => {
+    expect(isBlankSession("", 2, "s1"), "messages").toBe(false);
+    expect(isBlankSession("Deploy notes", 0, "s1"), "a name").toBe(false);
+    publishDraft(draftKeyFor("s2"), "half a question");
+    expect(isBlankSession("", 0, "s2"), "a draft").toBe(false);
   });
 });

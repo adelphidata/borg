@@ -4,6 +4,7 @@ import { Route, Routes, useLocation } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { clearNotice, pendingNotice } from "../../lib/notice";
+import { draftKeyFor, publishDraft } from "../conversation/draftStore";
 import { resetActivity } from "./activityStore";
 import { SessionsPage } from "./SessionsPage";
 import { sessionsVersion } from "./sessionsVersion";
@@ -80,6 +81,33 @@ describe("SessionsPage listing", () => {
     const daemon = fakeDaemon(listing([summary({ messageCount: 1 })]));
     mount(daemon);
     await waitFor(() => expect(screen.getByText("1 message")).toBeTruthy());
+  });
+
+  it("leaves out sessions that hold nothing, but keeps one with a draft", async () => {
+    // Every visit to New opens a session; listing the empty ones buried real
+    // conversations under a column of "Untitled".
+    publishDraft(draftKeyFor("drafted"), "Plan the offsite");
+    const daemon = fakeDaemon(
+      listing([
+        summary({ id: "empty", title: "", messageCount: 0 }),
+        summary({ id: "drafted", title: "", messageCount: 0 }),
+        summary(),
+      ]),
+    );
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(screen.getByText("Plan the offsite")).toBeTruthy();
+    expect(screen.queryByText("Untitled")).toBeNull();
+    publishDraft(draftKeyFor("drafted"), "");
+  });
+
+  it("keeps a pinned session even while it holds nothing", async () => {
+    const daemon = fakeDaemon(
+      listing([summary({ id: "kept", title: "", messageCount: 0, pinned: true }), summary()]),
+    );
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(screen.getByText("Untitled")).toBeTruthy();
   });
 
   it("says the list is empty rather than showing nothing at all", async () => {

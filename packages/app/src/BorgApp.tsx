@@ -16,7 +16,12 @@ import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
 import { clearNotice, offerRestore, showNotice, takeNotice, useNotice } from "./lib/notice";
 import { ConversationPage } from "./features/conversation/ConversationPage";
-import { draftsVersion, rowTitle, subscribeDrafts } from "./features/conversation/draftStore";
+import {
+  draftsVersion,
+  isBlankSession,
+  rowTitle,
+  subscribeDrafts,
+} from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
 import { BootGate } from "./features/boot/BootGate";
@@ -41,6 +46,7 @@ import {
 } from "./features/sessions/sessionsVersion";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
+import { PageErrorBoundary } from "./components/PageErrorBoundary";
 import { UpdatePill } from "./components/UpdatePill";
 import { SettingsProvider } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
@@ -142,11 +148,13 @@ function Shell({ platform }: { platform: Platform }) {
   // rather than on the next refetch. Lighting a dot still waits for one: the
   // mark is compared against the listing's own figures.
   useSyncExternalStore(subscribeUnread, unreadVersion, unreadVersion);
-  const listed = lastListed.current.map((s) => ({
-    id: s.id,
-    title: rowTitle(s.title, Number(s.messageCount), s.id),
-    activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
-  }));
+  const listed = lastListed.current
+    .filter((s) => s.pinned || !isBlankSession(s.title, Number(s.messageCount), s.id))
+    .map((s) => ({
+      id: s.id,
+      title: rowTitle(s.title, Number(s.messageCount), s.id),
+      activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
+    }));
   const recents = listed.slice(0, 8);
 
   // Counted over the whole listing rather than the eight rows above: the badge
@@ -277,16 +285,18 @@ function Shell({ platform }: { platform: Platform }) {
             },
           ]}
         />
-        <Routes>
-          {routes.map((r) => (
-            <Route key={r.id} path={r.path} element={<r.page />} />
-          ))}
-          <Route path="/c/:sessionId" element={<ConversationPage />} />
-          <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
-          <Route path="/settings/key/:key" element={<SettingDetailPage />} />
-          <Route path="/settings/:id" element={<SettingDetailPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <PageErrorBoundary resetKey={location.pathname}>
+          <Routes>
+            {routes.map((r) => (
+              <Route key={r.id} path={r.path} element={<r.page />} />
+            ))}
+            <Route path="/c/:sessionId" element={<ConversationPage />} />
+            <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
+            <Route path="/settings/key/:key" element={<SettingDetailPage />} />
+            <Route path="/settings/:id" element={<SettingDetailPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </PageErrorBoundary>
       </div>
       {isMobile && <TabBar routes={navRoutes} />}
       <CommandPalette />

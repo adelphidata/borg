@@ -122,3 +122,20 @@ export function rowTitle(rawTitle: string, messageCount: number, sessionId: stri
   }
   return title || "Untitled";
 }
+
+/**
+ * A session with nothing in it: no messages, no name, nothing typed.
+ *
+ * Opening a new conversation opens a daemon session straight away, so every
+ * visit to "New" leaves one behind. Listing them buries real conversations
+ * under a column of "Untitled" rows that hold nothing to go back to. A draft
+ * is something, so typing into one brings its row back.
+ */
+export function isBlankSession(rawTitle: string, messageCount: number, sessionId: string): boolean {
+  const title = rawTitle.replace(LIVE_SUFFIX, "").trim();
+  return (
+    messageCount === 0 &&
+    (title === "" || title === "New conversation") &&
+    draftTitle(readDraft(draftKeyFor(sessionId))) === ""
+  );
+}
