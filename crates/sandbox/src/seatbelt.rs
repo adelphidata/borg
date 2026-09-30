@@ -1559,7 +1559,14 @@ mod tests {
         let profile =
             generate_profile(&policy, Path::new(TEST_TOOL_DIR), TEST_RUNTIME_BIN).unwrap();
         let network = profile.find("(allow network*)").unwrap();
-        for form in ["/tmp/borg-home", "/private/tmp/borg-home"] {
+        // Only macOS links `/tmp` to `/private/tmp`; elsewhere there is no
+        // resolved form to emit.
+        let forms: &[&str] = if cfg!(target_os = "macos") {
+            &["/tmp/borg-home", "/private/tmp/borg-home"]
+        } else {
+            &["/tmp/borg-home"]
+        };
+        for form in forms {
             let rule = format!("(deny network-outbound (remote unix-socket (subpath \"{form}\")))");
             let at = profile
                 .find(&rule)
