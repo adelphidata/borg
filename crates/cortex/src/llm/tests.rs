@@ -1814,6 +1814,28 @@ async fn anthropic_request_thinking_off_includes_temperature() {
 }
 
 #[tokio::test]
+async fn anthropic_request_omits_temperature_for_models_that_reject_it() {
+    // Opus 4.7 onward answers `temperature` with a 400 even with thinking off.
+    for model in ["claude-opus-5", "claude-opus-4-7", "claude-sonnet-5-5"] {
+        let mut config = Config::default();
+        config.llm.provider = Some("anthropic".to_string());
+        config.llm.api_key_env = "ANTHROPIC_API_KEY".to_string();
+        config.llm.model = model.to_string();
+        config.llm.thinking = crate::config::ThinkingLevel::Off;
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        let client = LlmClient::new(&config).await.expect("should create client");
+
+        let body = client.build_anthropic_request(&[Message::user("hi")], None, false);
+
+        assert!(
+            body.get("temperature").is_none(),
+            "{model} rejects temperature, got: {body}"
+        );
+    }
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[tokio::test]
 async fn anthropic_request_thinking_enabled_omits_temperature() {
     let mut config = Config::default();
     config.llm.provider = Some("anthropic".to_string());
