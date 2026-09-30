@@ -75,8 +75,12 @@ export async function loadConnections(borg: BorgClient): Promise<Connections> {
     borg.admin.listPairingRequests({}),
     // The catalog only supplies display names and the "Add" grid. It is the
     // heaviest of the five calls, so a slow probe must not take the page
-    // down; `providerLabel` passes an unknown id straight through.
-    borg.admin.getSetupStatus({}).catch(() => ({ providers: [], detected: [] })),
+    // down; `providerLabel` passes an unknown id straight through. A key
+    // found on this computer then reads as not connected, so say why.
+    borg.admin.getSetupStatus({}).catch((err: unknown) => {
+      console.warn("connections: setup status unavailable", err);
+      return { providers: [], detected: [] };
+    }),
   ]);
 
   const providers = new Map<string, ProviderConnection>();

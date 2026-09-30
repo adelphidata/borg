@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { Route, Routes, useLocation } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
@@ -183,6 +183,7 @@ describe("ConnectionsPage", () => {
 
   it("still lists the connections when the catalog cannot be fetched", async () => {
     // The catalog is display metadata; a slow probe must not blank the page.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const daemon = fakeDaemon({
       ...EMPTY,
       GetSetupStatus: new BorgError(GrpcStatus.Unavailable, "probe timed out"),
@@ -193,6 +194,13 @@ describe("ConnectionsPage", () => {
     await waitFor(() => expect(screen.getByText("anthropic")).toBeTruthy());
     expect(screen.getByText("key saved")).toBeTruthy();
     expect(screen.queryByText("Add a model provider")).toBeNull();
+    // Keys found on this computer drop out with the catalog; the reason must
+    // not be silent.
+    expect(warn).toHaveBeenCalledWith(
+      "connections: setup status unavailable",
+      expect.objectContaining({ message: "probe timed out" }),
+    );
+    warn.mockRestore();
   });
 
   it("opens a provider's detail page", async () => {

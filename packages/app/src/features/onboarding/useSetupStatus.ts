@@ -15,7 +15,13 @@ export type ProviderChoice = admin.ProviderChoice;
 export type ModelChoice = admin.ModelChoice;
 export type DetectedCredential = admin.DetectedCredential;
 
-/** Detection sources that are an API key the daemon can already use. */
+/**
+ * Detection sources that are an API key the daemon can already use.
+ *
+ * The daemon's detector sends only `env` and `dotenv` today. The saved-key
+ * sources are listed too, as they are in `SOURCE_RANK` below, so a detector
+ * that starts reporting them needs no change here.
+ */
 export const KEY_SOURCES: ReadonlySet<string> = new Set([
   "env",
   "dotenv",
