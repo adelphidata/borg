@@ -278,6 +278,8 @@ pub struct AgentBackend {
     /// Steer channel sender — held here so `Session.Steer` can push text
     /// into the running turn even though the agent is locked.
     steer_tx: mpsc::UnboundedSender<String>,
+    /// Refuses a steer no turn will read, so the caller keeps the text.
+    steer_gate: Arc<cortex::agent::steer::SteerGate>,
     /// Identifies this daemon instance as the lease holder. Stable for the
     /// process lifetime, so re-claiming our own session is always re-entrant;
     /// a restarted daemon has a new id and looks like a (legitimate) takeover.
@@ -367,6 +369,8 @@ impl AgentBackend {
 
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
         agent.set_steer_channel(steer_rx);
+        let steer_gate = Arc::new(cortex::agent::steer::SteerGate::new());
+        agent.set_steer_gate(steer_gate.clone());
 
         let session_id = agent.session().meta.id.clone();
         let worker_id = format!("borgd-{}", std::process::id());
@@ -428,6 +432,7 @@ impl AgentBackend {
             session_id,
             agent: Mutex::new(agent),
             steer_tx,
+            steer_gate,
             worker_id,
             lease_epoch: AtomicI64::new(initial_epoch),
         }))
@@ -686,9 +691,7 @@ impl SessionBackend for AgentBackend {
     }
 
     fn steer(&self, text: &str) -> anyhow::Result<()> {
-        self.steer_tx
-            .send(text.to_string())
-            .map_err(|e| anyhow::anyhow!("steer channel closed: {e}"))
+        Ok(self.steer_gate.send(&self.steer_tx, text.to_string())?)
     }
 
     async fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {

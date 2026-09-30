@@ -39,6 +39,7 @@ pub mod media_markers;
 mod prompt_assembly;
 mod session_manager;
 pub mod silence;
+pub mod steer;
 mod stream_handler;
 mod system_prompt;
 pub(crate) mod system_prompt_cache;
@@ -351,6 +352,8 @@ pub struct Agent {
     pub(super) config_arc: Arc<Config>,
     /// Channel for receiving user steer messages mid-turn (injected at tool boundaries).
     pub(super) steer_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Refuses steers once the turn has made its last check (see `steer`).
+    pub(super) steer_gate: Option<Arc<steer::SteerGate>>,
     /// Tool names used in recent turns, for conditional tool loading.
     pub(super) recent_tool_names: std::collections::HashSet<String>,
     /// Optional best-effort sink for borgd cost events.
@@ -584,6 +587,7 @@ impl Agent {
             git_repo_root,
             config_arc,
             steer_rx: None,
+            steer_gate: None,
             recent_tool_names: std::collections::HashSet::new(),
             cost_event_sink: None,
             short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
@@ -699,6 +703,13 @@ impl Agent {
     /// Set a channel for receiving user steer messages mid-turn.
     pub fn set_steer_channel(&mut self, rx: mpsc::UnboundedReceiver<String>) {
         self.steer_rx = Some(rx);
+    }
+
+    /// Gate the steer channel on this agent's turns: open while one runs,
+    /// closed from its last steer check on. Senders go through
+    /// [`steer::SteerGate::send`].
+    pub fn set_steer_gate(&mut self, gate: Arc<steer::SteerGate>) {
+        self.steer_gate = Some(gate);
     }
 
     /// Set a config watch receiver for hot reload.
@@ -1241,7 +1252,19 @@ impl Agent {
             .process_registry()
             .map(|reg| reg.begin_turn(&self.session.meta.id));
 
+        if let Some(gate) = &self.steer_gate {
+            gate.open();
+        }
+        let leftover_tx = event_tx.clone();
         let result = self.run_agent_loop_inner(event_tx, cancel.clone()).await;
+        // A normal end already closed the gate at its last check. An error or
+        // a stop did not: close it, and keep what was queued in the history
+        // rather than leave it for some later turn to inject out of place.
+        if let Some(gate) = &self.steer_gate {
+            gate.close();
+        }
+        self.drain_steers(&leftover_tx).await;
+        drop(leftover_tx);
         // Before returning: the daemon announces the settle once this turn's
         // event sender drops, and lists re-read the row on that announcement.
         self.record_turn_on_session_row().await;
@@ -1706,6 +1729,10 @@ impl Agent {
                     .maybe_inject_goal_continuation(&turn_id, event_tx, cancel)
                     .await
                 {
+                    IterationOutcome::NudgeAndContinue
+                } else if !self.close_steers_unless_pending() {
+                    // A steer landed after the check above; answer it now.
+                    self.drain_steers(event_tx).await;
                     IterationOutcome::NudgeAndContinue
                 } else {
                     self.maybe_spawn_auto_title();

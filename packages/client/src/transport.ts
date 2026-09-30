@@ -67,6 +67,7 @@ export const GrpcStatus = {
   Cancelled: 1,
   NotFound: 5,
   PermissionDenied: 7,
+  FailedPrecondition: 9,
   Unimplemented: 12,
   Internal: 13,
   Unavailable: 14,

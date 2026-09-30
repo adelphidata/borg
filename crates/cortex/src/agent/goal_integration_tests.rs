@@ -52,6 +52,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         git_repo_root: None,
         config_arc: Arc::new(config),
         steer_rx: None,
+        steer_gate: None,
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),

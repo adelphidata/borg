@@ -117,6 +117,19 @@ impl Agent {
     /// re-enter the loop so the model responds to the redirect immediately;
     /// this is the correct resolution when a pending steer suppresses the goal
     /// continuation. Returns `false` (no-op) when nothing is buffered.
+    /// The turn's last steer check: close the gate unless a steer is waiting.
+    /// Returns whether it closed. The earlier `absorb_pending_steer_at_turn_end`
+    /// check leaves a gap before the turn really ends; closing under the gate's
+    /// lock means a steer in that gap is either seen here or refused to its
+    /// sender, never left in a channel no turn is reading. No gate (a sub-agent,
+    /// a test) closes trivially.
+    pub(super) fn close_steers_unless_pending(&self) -> bool {
+        match &self.steer_gate {
+            Some(gate) => gate.close_unless_pending(self.steer_rx.as_ref()),
+            None => true,
+        }
+    }
+
     pub(super) async fn absorb_pending_steer_at_turn_end(
         &mut self,
         event_tx: &tokio::sync::mpsc::Sender<crate::agent::AgentEvent>,

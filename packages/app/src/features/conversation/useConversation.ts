@@ -870,8 +870,10 @@ export function useConversation(target: string | undefined): Conversation {
       setStreamError(undefined);
       if (event.turnComplete || event.error) setBusy(false);
       // A turn the daemon started on its own — a resumed one, or a scheduled
-      // wake — has no submit to arm the clock, so the first event does it.
-      if (event.preparing) {
+      // wake — has no submit to arm the clock, so the first event does it. A
+      // steer taken at a turn's last check keeps it going past the
+      // `turnComplete` already sent, so its echo marks the turn busy again.
+      if (event.preparing || event.steerReceived) {
         setBusy(true);
         armTurnClock();
       }
@@ -1044,9 +1046,18 @@ export function useConversation(target: string | undefined): Conversation {
     send(text, [], Date.now(), false);
   }, [busy, cells, send, sessionId]);
 
-  const steerMutation = useMutation((borg, text: string) =>
-    sessionId ? borg.session.steer({ sessionId, text }) : Promise.resolve(undefined),
-  );
+  const steerMutation = useMutation(async (borg, text: string) => {
+    if (!sessionId) return undefined;
+    try {
+      await borg.session.steer({ sessionId, text });
+      return "steered" as const;
+    } catch (e) {
+      // The turn made its last check before this arrived. Not a failure: the
+      // text is simply a turn of its own now.
+      if (asBorgError(e).code === GrpcStatus.FailedPrecondition) return "turn-ended" as const;
+      throw e;
+    }
+  });
   const cancelMutation = useMutation((borg) =>
     sessionId ? borg.session.cancel({ sessionId }) : Promise.resolve(undefined),
   );
@@ -1062,15 +1073,18 @@ export function useConversation(target: string | undefined): Conversation {
       // a local echo renders the turn twice and — worse — shifts every later
       // user cell's ordinal away from the one `rewindToNthUserMessage` counts.
       //
-      // A steer that lands between turns starts one, which the daemon reports
-      // via `preparing` a moment later; arm now so that gap is counted. `arm`,
-      // not `start`: a mid-turn steer must not restart the turn's clock.
+      // `arm`, not `start`: a mid-turn steer must not restart the turn's clock.
       armTurnClock();
-      // `run` reports a refusal as undefined, and the error itself reaches the
-      // transcript through the effect below.
-      return (await steerMutation.run(text)) !== undefined;
+      const outcome = await steerMutation.run(text);
+      // The daemon refuses a steer that reached it after the turn's last
+      // check, rather than keep it where no turn reads it. Send it as the
+      // next turn, which is what the user meant by pressing Enter.
+      if (outcome === "turn-ended") send(text);
+      // `run` reports any other refusal as undefined, and the error itself
+      // reaches the transcript through the effect below.
+      return outcome !== undefined;
     },
-    [armTurnClock, sessionId, steerMutation.run],
+    [armTurnClock, send, sessionId, steerMutation.run],
   );
   const cancel = useCallback(() => {
     // A cancelled turn leaves nobody waiting on its prompts, so retire them —

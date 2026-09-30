@@ -302,6 +302,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         git_repo_root: None,
         config_arc: Arc::new(config),
         steer_rx: None,
+        steer_gate: None,
         recent_tool_names: std::collections::HashSet::new(),
         cost_event_sink: None,
         short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(session_id, 2000),
@@ -1686,6 +1687,51 @@ async fn a_turn_titles_the_session_row_and_marks_its_activity_even_when_stopped(
         .unwrap();
     assert_eq!(row.title, "Open the Wikipedia article on the Borg");
     assert!(row.updated_at > 100, "the turn must count as activity");
+}
+
+/// Regression: a steer queued after a turn's last check sat in the channel
+/// with the RPC already answered OK, and surfaced — out of place — in some
+/// later turn. Now a turn that ends closes the gate, what it had queued is
+/// kept in its own history, and a later steer is refused to its sender.
+#[tokio::test]
+async fn a_finished_turn_keeps_its_queued_steer_and_refuses_later_ones() {
+    use super::steer::{SteerGate, SteerRefused};
+
+    let mut agent = minimal_test_agent(Config::default());
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(SteerGate::new());
+    agent.set_steer_channel(steer_rx);
+    agent.set_steer_gate(gate.clone());
+    assert_eq!(
+        gate.send(&steer_tx, "before any turn".into()),
+        Err(SteerRefused::TurnEnded)
+    );
+
+    // Queued while the turn runs; the turn is stopped before any boundary
+    // could drain it.
+    gate.open();
+    gate.send(&steer_tx, "also check the sources".into())
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    let _ = agent
+        .send_message_with_cancel("Summarize the Borg article", tx, stopped)
+        .await;
+
+    assert!(
+        agent
+            .history
+            .iter()
+            .any(|m| m.role == crate::types::Role::User
+                && m.text_content()
+                    .is_some_and(|t| t.contains("also check the sources"))),
+        "the queued steer must land in this turn's history, not a later one"
+    );
+    assert_eq!(
+        gate.send(&steer_tx, "too late".into()),
+        Err(SteerRefused::TurnEnded)
+    );
 }
 
 // NOTE: the `build_system_prompt_*_after_*` ordering tests above are the

@@ -280,10 +280,10 @@ describe("useConversation side channels", () => {
     expect(conv.current.cells.filter((c) => c.kind === "user")).toHaveLength(1);
   });
 
-  it("reports a refused steer as false, so the caller can keep the text", async () => {
+  it("reports a failed steer as false, so the caller can keep the text", async () => {
     const daemon = fakeDaemon({
       ...OPEN,
-      Steer: new BorgError(FAILED_PRECONDITION, "no turn in flight"),
+      Steer: new BorgError(GrpcStatus.Unavailable, "daemon restarting"),
     });
     const conv = mount(daemon);
     await ready(conv);
@@ -292,6 +292,46 @@ describe("useConversation side channels", () => {
       accepted = await conv.current.steer("nudge");
     });
     expect(accepted).toBe(false);
+    expect(daemon.streams.some((s) => s.method === "Send")).toBe(false);
+  });
+
+  it("sends a steer the turn ended before taking as the next turn", async () => {
+    // Regression: the daemon answered OK to a steer that landed after the
+    // turn's last check, and the text was never seen again. It now refuses
+    // it, and what the user typed goes out as a turn of its own.
+    const daemon = fakeDaemon({
+      ...OPEN,
+      Steer: new BorgError(FAILED_PRECONDITION, "steer: no turn is running to take this message"),
+    });
+    const conv = mount(daemon);
+    await ready(conv);
+    let accepted: boolean | undefined;
+    await act(async () => {
+      accepted = await conv.current.steer("and the sources too");
+    });
+
+    expect(accepted).toBe(true);
+    expect(daemon.streams.find((s) => s.method === "Send")?.request).toMatchObject({
+      sessionId: "live-1",
+      text: "and the sources too",
+    });
+    expect(conv.current.busy).toBe(true);
+    expect(conv.current.cells.filter((c) => c.kind === "user")).toHaveLength(1);
+    expect(conv.current.sendError).toBeUndefined();
+  });
+
+  it("is busy again when a steer keeps a finished turn going", async () => {
+    // The last steer check runs after `turnComplete` is sent; a steer it
+    // finds keeps the turn going, and the composer must steer, not send.
+    const daemon = fakeDaemon({ ...OPEN, Steer: {} });
+    const conv = mount(daemon);
+    await ready(conv);
+    act(() => conv.current.send("go"));
+    emit(daemon, { turnComplete: {} as never });
+    expect(conv.current.busy).toBe(false);
+
+    emit(daemon, { steerReceived: { text: "one more thing" } as never });
+    expect(conv.current.busy).toBe(true);
   });
 
   it("refuses a steer before the session is open, without calling the daemon", async () => {
@@ -410,7 +450,7 @@ describe("useConversation side channels", () => {
   it("surfaces a failed side-channel call in the transcript's error slot", async () => {
     const daemon = fakeDaemon({
       ...OPEN,
-      Steer: new BorgError(FAILED_PRECONDITION, "no turn in flight"),
+      Steer: new BorgError(GrpcStatus.Internal, "steer channel broke"),
     });
     const conv = mount(daemon);
     await ready(conv);
@@ -418,7 +458,7 @@ describe("useConversation side channels", () => {
     await act(async () => {
       await conv.current.steer("nudge");
     });
-    await waitFor(() => expect(conv.current.sendError?.message).toBe("no turn in flight"));
+    await waitFor(() => expect(conv.current.sendError?.message).toBe("steer channel broke"));
   });
 });
 
