@@ -136,7 +136,7 @@ pub(crate) async fn collect_heartbeat_response(
     }
 }
 
-async fn drain_briefly(event_rx: &mut mpsc::Receiver<AgentEvent>) {
+pub(crate) async fn drain_briefly(event_rx: &mut mpsc::Receiver<AgentEvent>) {
     let drain_deadline = Instant::now() + HEARTBEAT_DRAIN_GRACE;
     loop {
         let now = Instant::now();

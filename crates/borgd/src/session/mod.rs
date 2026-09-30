@@ -224,6 +224,16 @@ impl SessionHost {
         self.inner.buffer.receiver_count() > 0
     }
 
+    /// How many event-stream subscribers are attached right now.
+    pub fn subscriber_count(&self) -> usize {
+        self.inner.buffer.receiver_count()
+    }
+
+    /// Lays `pin` over the config for this session's next turn only.
+    pub fn pin_next_turn(&self, pin: cortex::agent::ConfigPin) {
+        self.inner.backend.pin_next_turn(pin);
+    }
+
     /// Push an out-of-band [`SystemNotice`](protocols::session::SystemNotice)
     /// event into the session's buffer so live subscribers and replayers see
     /// it as a system cell. Used by daemon-level emitters (posture

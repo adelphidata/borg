@@ -656,12 +656,17 @@ impl Session for SessionSvc {
         let snap = host
             .snapshot_state()
             .map_err(|e| TStatus::internal(format!("snapshot_state: {e}")))?;
-        let title = match cortex::db::Database::open_readonly().await {
-            Ok(db) => stored_title(&db, &snap.agent_session_id, snap.title).await,
-            Err(e) => {
-                tracing::debug!("get_state: no database for the stored title: {e}");
-                snap.title
-            }
+        // A heartbeat conversation is named the way the conversation lists
+        // name it; its own title is its first message, the tick prompt.
+        let title = match crate::heartbeat::heartbeat_session_title(&req.session_id) {
+            Some(heartbeat) => heartbeat.to_string(),
+            None => match cortex::db::Database::open_readonly().await {
+                Ok(db) => stored_title(&db, &snap.agent_session_id, snap.title).await,
+                Err(e) => {
+                    tracing::debug!("get_state: no database for the stored title: {e}");
+                    snap.title
+                }
+            },
         };
         Ok(Response::new(SessionState {
             session_id: req.session_id,

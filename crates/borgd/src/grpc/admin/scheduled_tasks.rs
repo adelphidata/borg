@@ -154,7 +154,21 @@ pub(super) async fn run_scheduled_task_now(
         cortex::tasks::RunNowOutcome::Refused { status } => Err(TStatus::failed_precondition(
             format!("scheduled task `{id}` is {status}; resume it before running"),
         )),
-        cortex::tasks::RunNowOutcome::Queued => Ok(Response::new(Empty {})),
+        cortex::tasks::RunNowOutcome::Queued => {
+            // The app offers to open the run's conversation as soon as this
+            // answers. It has to exist by then: opening an id with nothing
+            // on disk starts an unrelated conversation instead.
+            let task = match Database::open().await {
+                Ok(db) => db.get_task_by_id(&id).await.ok().flatten(),
+                Err(_) => None,
+            };
+            if let Some(task) = task {
+                if let Err(e) = crate::task_runner::ensure_session_of(&task) {
+                    tracing::warn!(task = %task.name, "could not create its conversation: {e:#}");
+                }
+            }
+            Ok(Response::new(Empty {}))
+        }
     }
 }
 

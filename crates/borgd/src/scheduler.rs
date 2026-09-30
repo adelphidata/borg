@@ -515,6 +515,8 @@ pub async fn run(
                 return Ok(());
             }
             _ = interval.tick() => {}
+            // A run asked for by hand is claimed now, not up to a tick later.
+            _ = cortex::tasks::scheduler_woken() => {}
         }
 
         // NOTE: the liveness heartbeat is deliberately NOT bumped here.
