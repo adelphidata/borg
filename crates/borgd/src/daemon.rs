@@ -915,13 +915,16 @@ async fn serve_transports(
         // the servers drain: `serve_until_drained` drops this whole future
         // once the grace runs out, which would skip a goodbye queued behind
         // the servers and leave LAN peers a stale record until it expires.
-        let mdns_goodbye = on_shutdown(shutdown_tx.subscribe(), move || {
-            if let Some(a) = mdns_announcer {
-                a.shutdown();
-            }
-        });
-
-        let (uds_res, tcp_res, ()) = tokio::join!(serve_uds, serve_tcp, mdns_goodbye);
+        let (uds_res, tcp_res) = serve_with_goodbye(
+            async { tokio::join!(serve_uds, serve_tcp) },
+            shutdown_tx.subscribe(),
+            move || {
+                if let Some(a) = mdns_announcer {
+                    a.shutdown();
+                }
+            },
+        )
+        .await;
         uds_res.context("UDS server")?;
         tcp_res.context("TCP server")?;
     } else {
@@ -936,10 +939,28 @@ async fn serve_transports(
     Ok(())
 }
 
-/// Run `f` the moment the shutdown signal arrives (or its sender is gone).
-async fn on_shutdown(mut rx: broadcast::Receiver<()>, f: impl FnOnce()) {
-    let _ = rx.recv().await;
-    f();
+/// Run `servers` to the end, calling `goodbye` once: at the shutdown signal,
+/// or when the servers stop on their own first (a failed bind), so their
+/// result is never held up waiting for a signal.
+async fn serve_with_goodbye<F, T>(
+    servers: F,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    goodbye: impl FnOnce(),
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(servers);
+    tokio::select! {
+        out = &mut servers => {
+            goodbye();
+            out
+        }
+        _ = shutdown_rx.recv() => {
+            goodbye();
+            servers.await
+        }
+    }
 }
 
 /// How long open client streams may hold the listeners after a shutdown signal.
@@ -1168,13 +1189,12 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
         let said = Arc::new(AtomicBool::new(false));
         let flag = said.clone();
-        let goodbye =
-            super::on_shutdown(tx.subscribe(), move || flag.store(true, Ordering::SeqCst));
-        let serve = async move {
-            // A server held open by a stream, alongside the goodbye.
-            let ((), ()) = tokio::join!(std::future::pending::<()>(), goodbye);
-            anyhow::Ok(())
-        };
+        // Servers held open by a stream, as serve_transports runs them.
+        let serve = super::serve_with_goodbye(
+            std::future::pending::<anyhow::Result<()>>(),
+            tx.subscribe(),
+            move || flag.store(true, Ordering::SeqCst),
+        );
         let run = tokio::spawn(super::serve_until_drained(
             serve,
             rx,
@@ -1194,6 +1214,28 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(6)).await;
         run.await.unwrap().unwrap();
+    }
+
+    /// Listeners that fail to bind must report at once, not wait on a
+    /// shutdown signal that never comes; the goodbye still goes out.
+    #[tokio::test]
+    async fn a_failed_listener_is_reported_without_waiting_for_a_signal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        let said = Arc::new(AtomicBool::new(false));
+        let flag = said.clone();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::serve_with_goodbye(
+                async { Err::<(), _>(anyhow::anyhow!("bind failed")) },
+                rx,
+                move || flag.store(true, Ordering::SeqCst),
+            ),
+        )
+        .await
+        .expect("a failed bind must not wait for a signal");
+        assert_eq!(out.unwrap_err().to_string(), "bind failed");
+        assert!(said.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
