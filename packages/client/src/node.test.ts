@@ -217,7 +217,8 @@ describe("defaultSocketPath", () => {
     // are the channel's backoff. grpc-js's default grows it 1.6× per attempt
     // toward two minutes — tuned for remote servers, and the reason a
     // restarted daemon used to look dead to the desktop app for a minute or
-    // more. Over 16s the default already waits 5s+ between attempts.
+    // more. In 8s the default (1s, ×1.6) makes about four attempts; ours
+    // (250ms, capped at 2s) makes about eight.
     const restartDir = mkdtempSync(join(tmpdir(), "borg-backoff-"));
     const path = join(restartDir, "borgd.sock");
     const attempts: number[] = [];
@@ -229,7 +230,7 @@ describe("defaultSocketPath", () => {
     await new Promise<void>((r) => dropper.listen(path, r));
     const t = createNodeTransport({ socketPath: path });
     try {
-      while (Date.now() - t0 < 16_000) {
+      while (Date.now() - t0 < 8_000) {
         await t.unary("borg.status.v1.Status/GetVitals", {}).catch(() => {});
         await new Promise((r) => setTimeout(r, 300));
       }
@@ -241,7 +242,7 @@ describe("defaultSocketPath", () => {
       await new Promise((r) => dropper.close(r));
       rmSync(restartDir, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 20_000);
 
   it("is what the transport dials when no socketPath is given", () => {
     vi.stubEnv("BORG_HOME", dir);
