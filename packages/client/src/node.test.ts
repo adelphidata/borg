@@ -1,13 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, ServerError, Status } from "nice-grpc";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AdminDefinition } from "./gen/admin.js";
 import { StatusDefinition, Vitals } from "./gen/status.js";
 import { CostEvent, TelemetryDefinition } from "./gen/telemetry.js";
-import { createNodeTransport, defaultSocketPath } from "./node.js";
+import { createNodeTransport, defaultSocketPath, localAddress } from "./node.js";
 import { BorgError, GrpcStatus, type StreamHandlers } from "./transport.js";
 
 /**
@@ -195,12 +195,46 @@ describe("createNodeTransport", () => {
   });
 });
 
+describe("localAddress", () => {
+  const pipe = "\\\\.\\pipe\\borgd-0123abcd";
+
+  it("is the socket path itself off Windows", () => {
+    expect(localAddress("/h/.borg/borgd.sock", "darwin", () => pipe)).toBe("/h/.borg/borgd.sock");
+  });
+
+  it("is the pipe name borgd wrote into the socket file on Windows", () => {
+    expect(localAddress("C:\\h\\borgd.sock", "win32", () => `${pipe}\n`)).toBe(pipe);
+  });
+
+  it("refuses a file that names some other pipe", () => {
+    expect(localAddress("C:\\h\\borgd.sock", "win32", () => "\\\\.\\pipe\\evil")).toBeNull();
+  });
+
+  it("is null before the daemon has written the file", () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "borg-pipe-")), "borgd.sock");
+    expect(localAddress(missing, "win32")).toBeNull();
+  });
+
+  it("fails a Windows call as unavailable until a pipe name exists", async () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "borg-pipe-")), "borgd.sock");
+    const t = createNodeTransport({ socketPath: missing, platform: "win32" });
+    try {
+      await expect(t.unary("borg.status.v1.Status/GetVitals", {})).rejects.toMatchObject({
+        code: GrpcStatus.Unavailable,
+      });
+    } finally {
+      t.close();
+    }
+  });
+});
+
 describe("defaultSocketPath", () => {
   it.each([
     // [BORG_HOME, HOME, expected]
     ["/custom/borg-home", "/Users/someone", "/custom/borg-home/borgd.sock"],
     [undefined, "/Users/someone", "/Users/someone/.borg/borgd.sock"],
-    [undefined, undefined, "/.borg/borgd.sock"],
+    // Windows sets no HOME; the profile directory stands in, as for borgd.
+    [undefined, undefined, `${homedir()}/.borg/borgd.sock`],
   ])("BORG_HOME=%s HOME=%s → %s", (borgHome, home, expected) => {
     vi.stubEnv("BORG_HOME", borgHome as string);
     vi.stubEnv("HOME", home as string);

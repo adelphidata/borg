@@ -171,6 +171,23 @@ WantedBy=multi-user.target
 
 /// Locate the `borgd` binary using the resolution order documented at the
 /// module level.
+/// `borgd`'s file name next to `borg`: `borgd.exe` on Windows.
+pub(crate) const BORGD_FILE_NAME: &str = if cfg!(windows) { "borgd.exe" } else { "borgd" };
+
+/// Keep a spawned daemon off the caller's console on Windows, so closing
+/// the terminal that ran `borg` does not take the daemon down with it.
+pub(crate) fn detach_from_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 fn find_borgd_binary() -> Result<PathBuf> {
     if let Ok(env_path) = std::env::var("BORG_DAEMON_BIN") {
         let p = PathBuf::from(env_path);
@@ -184,7 +201,7 @@ fn find_borgd_binary() -> Result<PathBuf> {
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("borgd");
+        let sibling = exe.with_file_name(BORGD_FILE_NAME);
         if sibling.exists() {
             return Ok(sibling);
         }
@@ -251,6 +268,7 @@ pub async fn ensure_running() -> Result<()> {
     if let Some(dir) = daemon_spawn_dir() {
         cmd.current_dir(dir);
     }
+    detach_from_console(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 

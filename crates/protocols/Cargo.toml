@@ -17,6 +17,15 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+rand = { workspace = true }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

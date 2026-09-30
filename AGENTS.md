@@ -112,6 +112,8 @@ just web-ci          # everything CI runs for the web side
 
 **Desktop installers carry `borgd`.** The release packs the same `borgd` the CLI archive ships as `Contents/Resources/bin/borgd` (`extraResources`); locally `just desktop-bundle-borgd` does the same before `pack`/`dist`.
 
+**Windows has no daemon socket.** `borgd` serves an owner-only named pipe there and writes its name into `borgd.sock` (`protocols::pipe`). Clients connect through `protocols::connect_local` (Rust) or `localAddress` (`@borg/client/node`), never by treating the path as a socket. The Windows CI job runs the pipe tests and compiles `borg` + `borgd`.
+
 **Provider and model lists come from the daemon.** `Admin.GetSetupStatus` serves `cortex::llm::provider_catalog::ONBOARDABLE` + the model catalog + what `credential_detect` found on the machine. The TUI wizard, `packages/app` onboarding, settings pickers, and the composer's model pill all read that one list — never add a provider or model constant in TypeScript. Keys saved by the GUI (`SetApiKey` literal → `credentials.{provider}` row) reach the LLM because `Config::load_from_db` folds that row into `llm.api_key`; `borgd` also loads `~/.borg/.env` at startup.
 
 LLM credentials: one of OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude Code CLI.

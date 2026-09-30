@@ -122,10 +122,9 @@ jobs:
   # sandbox crate's tests on a Windows runner per-PR so a Windows-only
   # regression surfaces before merge, not on the release lane.
   #
-  # Scoped to `-p sandbox` deliberately: the full workspace has C
-  # dependencies (ring, etc.) that need a Windows VC++ toolchain we
-  # don't otherwise need. Full-workspace Windows builds remain in
-  # `release.yml`.
+  # Sandbox lint + FFI smoke, the named-pipe transport against real
+  # Windows pipes, and a compile of both shipped binaries so a unix-only
+  # API in borg or borgd fails here rather than at release time.
   windows-sandbox:
     name: Windows Sandbox
     needs: changes
@@ -142,6 +141,13 @@ jobs:
         # `crates/sandbox/tests/windows_ffi_smoke.rs` for the carve-out vs
         # full-VM validation.
         run: cargo test -p sandbox --lib --bins --test windows_ffi_smoke
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+      - name: cargo test -p protocols (named-pipe transport)
+        run: cargo test -p protocols
+      - name: cargo check borg + borgd
+        run: cargo check --bin borg --bin borgd
 
   web:
     name: Web surfaces

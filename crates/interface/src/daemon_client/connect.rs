@@ -111,7 +111,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
         .connect_with_connector(service_fn(move |_: Uri| {
             let p = path_owned.clone();
             async move {
-                let stream = protocols::uds::connect(&p).await?;
+                let stream = protocols::connect_local(&p).await?;
                 Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
             }
         }))
@@ -169,16 +169,17 @@ fn spawn_detached_daemon() -> Result<()> {
     // Find `borgd` next to the current binary so dev installs (cargo run -p
     // borg) and release installs both work without PATH gymnastics.
     let exe = std::env::current_exe().context("locating current exe")?;
-    let mut borgd = exe.with_file_name("borgd");
+    let mut borgd = exe.with_file_name(crate::borgd_launcher::BORGD_FILE_NAME);
     if !borgd.exists() {
         // Fallback: trust PATH.
         borgd = PathBuf::from("borgd");
     }
-    Command::new(&borgd)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(&borgd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    crate::borgd_launcher::detach_from_console(&mut cmd);
+    cmd.spawn()
         .with_context(|| format!("spawning {}", borgd.display()))?;
     Ok(())
 }
@@ -186,7 +187,7 @@ fn spawn_detached_daemon() -> Result<()> {
 async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if path.exists() && protocols::uds::connect(path).await.is_ok() {
+        if path.exists() && protocols::connect_local(path).await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(SOCKET_POLL_INTERVAL).await;

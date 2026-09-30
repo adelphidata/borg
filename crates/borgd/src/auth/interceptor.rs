@@ -41,10 +41,13 @@ pub fn auth_interceptor(
             .map(|sa| sa.ip());
 
         let tcp_certs = tcp_info.and_then(tonic::transport::server::TlsConnectInfo::peer_certs);
+        #[cfg(unix)]
         let uds_certs = req
             .extensions()
             .get::<TlsConnectInfo<tonic::transport::server::UdsConnectInfo>>()
             .and_then(tonic::transport::server::TlsConnectInfo::peer_certs);
+        #[cfg(not(unix))]
+        let uds_certs = None;
         let certs = tcp_certs.or(uds_certs);
 
         let leaf_der: Vec<u8> = certs

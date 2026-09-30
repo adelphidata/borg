@@ -31,8 +31,9 @@ use identity::{
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 /// Identity strings bound into SPAKE2 — must match between daemon and client.
 const ID_DAEMON: &[u8] = b"borg-pair-daemon";
@@ -80,37 +81,19 @@ impl BootstrapListener {
 
     /// Bind and serve. Drops the socket file when the future is dropped.
     pub async fn serve(self, state: BootstrapState) -> Result<()> {
-        // Best-effort cleanup of stale socket.
-        let _ = std::fs::remove_file(&self.socket_path);
-        // Tighten umask *around* the bind so the socket is created 0600
-        // atomically — mirroring `daemon::bind_uds`. A plain post-bind chmod
-        // leaves a window where a permissive process umask (Docker/systemd/root)
-        // exposes this always-on plaintext SPAKE2 socket as group/other-
-        // writable (finding L2).
+        #[cfg(windows)]
+        let mut listener = protocols::pipe::PipeListener::bind(&self.socket_path)
+            .with_context(|| format!("create bootstrap pipe named at {:?}", self.socket_path))?;
         #[cfg(unix)]
-        let prev_umask = unsafe { libc::umask(0o177) };
-        let bind_result = UnixListener::bind(&self.socket_path);
-        #[cfg(unix)]
-        unsafe {
-            libc::umask(prev_umask);
-        }
-        let listener =
-            bind_result.with_context(|| format!("bind bootstrap socket {:?}", self.socket_path))?;
-        // Re-assert owner-only perms and, unlike before, surface a failure
-        // rather than swallowing it — a socket we can't lock down must not go
-        // live silently.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| {
-                    format!("setting 0600 on bootstrap socket {:?}", self.socket_path)
-                })?;
-        }
+        let listener = self.bind_socket()?;
         tracing::info!(path = %self.socket_path.display(), "pairing bootstrap listener ready");
 
         loop {
-            let (stream, _addr) = match listener.accept().await {
+            #[cfg(unix)]
+            let accepted = listener.accept().await.map(|(stream, _addr)| stream);
+            #[cfg(windows)]
+            let accepted = listener.accept().await;
+            let stream = match accepted {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "bootstrap listener accept failed");
@@ -125,11 +108,44 @@ impl BootstrapListener {
             });
         }
     }
+
+    /// Bind the 0600 bootstrap socket, replacing a stale one.
+    #[cfg(unix)]
+    fn bind_socket(&self) -> Result<UnixListener> {
+        // Best-effort cleanup of stale socket.
+        let _ = std::fs::remove_file(&self.socket_path);
+        // Tighten umask *around* the bind so the socket is created 0600
+        // atomically — mirroring `daemon::bind_uds`. A plain post-bind chmod
+        // leaves a window where a permissive process umask (Docker/systemd/root)
+        // exposes this always-on plaintext SPAKE2 socket as group/other-
+        // writable (finding L2).
+        let prev_umask = unsafe { libc::umask(0o177) };
+        let bind_result = UnixListener::bind(&self.socket_path);
+        unsafe {
+            libc::umask(prev_umask);
+        }
+        let listener =
+            bind_result.with_context(|| format!("bind bootstrap socket {:?}", self.socket_path))?;
+        // Re-assert owner-only perms and, unlike before, surface a failure
+        // rather than swallowing it — a socket we can't lock down must not go
+        // live silently.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("setting 0600 on bootstrap socket {:?}", self.socket_path)
+                })?;
+        }
+        Ok(listener)
+    }
 }
 
 /// Drive a single pairing handshake on a connected stream. Public so tests
 /// can invoke it without binding a real socket.
-pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapState) -> Result<()> {
+pub async fn run_pairing_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    state: &BootstrapState,
+) -> Result<()> {
     // Frame 1: client sends plaintext code.
     let code_bytes = read_frame(&mut stream).await.context("read code frame")?;
     let code = String::from_utf8(code_bytes).context("code not utf-8")?;
@@ -277,7 +293,7 @@ fn random_nonce() -> [u8; 12] {
     n
 }
 
-async fn read_frame(s: &mut UnixStream) -> Result<Vec<u8>> {
+async fn read_frame<S: AsyncRead + Unpin>(s: &mut S) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     s.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
@@ -289,7 +305,7 @@ async fn read_frame(s: &mut UnixStream) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn write_frame(s: &mut UnixStream, data: &[u8]) -> Result<()> {
+async fn write_frame<S: AsyncWrite + Unpin>(s: &mut S, data: &[u8]) -> Result<()> {
     let len = (data.len() as u32).to_be_bytes();
     s.write_all(&len).await?;
     s.write_all(data).await?;
@@ -321,7 +337,7 @@ pub mod client {
         code: &str,
         device_label: &str,
     ) -> Result<PairResult> {
-        let mut stream = protocols::uds::connect(socket_path)
+        let mut stream = protocols::connect_local(socket_path)
             .await
             .with_context(|| format!("connect bootstrap socket {socket_path:?}"))?;
 

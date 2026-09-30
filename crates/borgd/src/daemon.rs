@@ -25,13 +25,26 @@ use cortex::paths;
 use cortex::telemetry::BorgMetrics;
 use protocols::pki::pki_server::PkiServer;
 use serde_json::json;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
+#[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
+
+/// The listener CLI and desktop clients reach on this machine: a 0600 unix
+/// socket, or on Windows an owner-only named pipe whose name sits at the
+/// socket path (see `protocols::pipe`).
+#[cfg(unix)]
+pub type LocalListener = UnixListener;
+/// See the unix definition.
+#[cfg(windows)]
+pub type LocalListener = protocols::pipe::PipeListener;
 
 /// Production session factory: builds an `AgentBackend` for each session.
 struct DaemonSessionFactory {
@@ -82,12 +95,26 @@ pub struct Config {
     pub core_config: CoreConfig,
 }
 
+/// Bind the local listener at `path`: see [`LocalListener`].
+#[cfg(windows)]
+pub fn bind_local(path: &Path) -> Result<LocalListener> {
+    protocols::pipe::PipeListener::bind(path)
+        .with_context(|| format!("creating borgd pipe named at {}", path.display()))
+}
+
+/// Bind the local listener at `path`: see [`LocalListener`].
+#[cfg(unix)]
+pub fn bind_local(path: &Path) -> Result<LocalListener> {
+    bind_uds(path)
+}
+
 /// Bind a Unix Domain Socket at `path` with owner-only (mode 0600) permissions.
 ///
 /// Closes the bind→chmod race by tightening the umask to 0o177 around the
 /// `bind()` call so the socket inode is created already-private; the explicit
 /// `chmod` afterwards is belt-and-braces against umask interactions on weird
 /// filesystems.
+#[cfg(unix)]
 pub fn bind_uds(path: &Path) -> Result<UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)
@@ -124,7 +151,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let socket_path = paths::socket_path(&cfg.borg_home);
-    let uds = bind_uds(&socket_path)?;
+    let uds = bind_local(&socket_path)?;
 
     tracing::info!(socket = %socket_path.display(), "borgd listening on UDS");
 
@@ -817,7 +844,7 @@ fn spawn_pairing_listener(
 /// exposes (or hides) it depending on which transport is active.
 #[allow(clippy::too_many_arguments)]
 async fn serve_transports(
-    uds: UnixListener,
+    uds: LocalListener,
     listen_tcp: Option<String>,
     shutdown_tx: &broadcast::Sender<()>,
     services: &grpc::Services,
@@ -828,7 +855,10 @@ async fn serve_transports(
     server_tls_material: &ServerCertMaterial,
     mdns_enabled: bool,
 ) -> Result<()> {
+    #[cfg(unix)]
     let uds_stream = UnixListenerStream::new(uds);
+    #[cfg(windows)]
+    let uds_stream = uds.incoming();
 
     let make_uds_router = || {
         tonic::transport::Server::builder()
@@ -1101,8 +1131,28 @@ pub(crate) fn format_posture_transition(
     )
 }
 
+/// Block until Ctrl+C or a console close/shutdown event; the Windows
+/// counterpart of SIGINT/SIGTERM.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+    let (Ok(mut c), Ok(mut b), Ok(mut close), Ok(mut shut)) =
+        (ctrl_c(), ctrl_break(), ctrl_close(), ctrl_shutdown())
+    else {
+        tracing::error!("no console handlers installed; daemon will only stop when killed");
+        return std::future::pending::<&'static str>().await;
+    };
+    tokio::select! {
+        _ = c.recv() => { tracing::info!("received Ctrl+C, draining"); "sigint" }
+        _ = b.recv() => { tracing::info!("received Ctrl+Break, draining"); "sigint" }
+        _ = close.recv() => { tracing::info!("console closed, draining"); "sigterm" }
+        _ = shut.recv() => { tracing::info!("system shutting down, draining"); "sigterm" }
+    }
+}
+
 /// Block until SIGTERM or SIGINT fires; return a stable string identifying
 /// which signal triggered the shutdown so it can be recorded in the audit log.
+#[cfg(unix)]
 async fn wait_for_shutdown_signal() -> &'static str {
     let term = signal(SignalKind::terminate())
         .map_err(|e| tracing::warn!(error = %e, "failed to install SIGTERM handler"))
@@ -1145,7 +1195,7 @@ pub(crate) async fn emit_daemon_stop(audit: &AuditWriter, reason: &str) {
         .await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{bind_uds, emit_daemon_stop, format_posture_transition};
     use cortex::db::{audit_events, AuditWriter, Database};

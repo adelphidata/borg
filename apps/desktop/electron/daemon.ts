@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { defaultSocketPath } from "@borg/client/node";
+import { defaultSocketPath, localAddress } from "@borg/client/node";
 import type { WireBootStatus } from "./channels";
 
 /**
@@ -116,8 +116,11 @@ export function socketReachable(
   timeoutMs = PROBE_TIMEOUT_MS,
 ): Promise<boolean> {
   if (!existsSync(socketPath)) return Promise.resolve(false);
+  // On Windows the file names the daemon's pipe rather than being the socket.
+  const address = localAddress(socketPath);
+  if (address === null) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const socket = net.connect(socketPath);
+    const socket = net.connect(address);
     const finish = (reachable: boolean) => {
       socket.removeAllListeners();
       socket.destroy();
@@ -190,7 +193,8 @@ function launchDetached(binary: string, cwd: string | undefined): Error | null {
 
 /** The daemon's own directory, which is where a daemon it spawns should start. */
 function borgHome(env: Record<string, string | undefined>): string | undefined {
-  const home = env.BORG_HOME ?? (env.HOME ? path.join(env.HOME, ".borg") : undefined);
+  const userHome = env.HOME ?? env.USERPROFILE;
+  const home = env.BORG_HOME ?? (userHome ? path.join(userHome, ".borg") : undefined);
   return home && existsSync(home) ? home : undefined;
 }
 

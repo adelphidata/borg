@@ -6478,10 +6478,12 @@ dependencies = [
  "futures-util",
  "prost 0.13.5",
  "prost-types 0.13.5",
+ "rand 0.9.5",
  "tempfile",
  "tokio",
  "tonic 0.13.1",
  "tonic-build",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

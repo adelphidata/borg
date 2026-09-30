@@ -7,8 +7,19 @@
 #![warn(missing_docs)]
 
 pub mod capabilities;
+#[cfg(windows)]
+pub mod pipe;
 #[cfg(unix)]
 pub mod uds;
+
+/// Connect to borgd's local listener at `path`: its unix socket, or on
+/// Windows the named pipe whose name borgd writes there.
+#[cfg(windows)]
+pub use pipe::connect as connect_local;
+/// Connect to borgd's local listener at `path`: its unix socket, or on
+/// Windows the named pipe whose name borgd writes there.
+#[cfg(unix)]
+pub use uds::connect as connect_local;
 
 /// Session service — agent interaction.
 pub mod session {
