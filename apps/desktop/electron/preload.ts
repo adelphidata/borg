@@ -1,6 +1,4 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { BorgTransport, MethodPath, StreamHandlers } from "@borg/client";
-import { BorgError } from "@borg/client";
 import type { NativeBridge } from "@borg/app";
 import {
   CHANNELS,
@@ -8,14 +6,16 @@ import {
   type UnaryReply,
   type WireBootStatus,
   type WireNotification,
+  type WireTransport,
   type WireUpdateStatus,
 } from "./channels";
 
 /**
- * The renderer's `BorgTransport`, implemented over IPC.
+ * The transport over IPC, with every failure kept as data.
  *
- * Satisfies exactly the same interface as the browser's gRPC-Web transport, so
- * `@borg/app` runs unchanged on both surfaces.
+ * Nothing here throws or builds an `Error`: the context bridge would strip it
+ * to a bare message. The renderer wraps this with `fromWire`, which is what
+ * gives `@borg/app` the same `BorgTransport` the browser's gRPC-Web one is.
  */
 let nextStreamId = 0;
 
@@ -26,32 +26,19 @@ let nextStreamId = 0;
  */
 const pageLoad = crypto.randomUUID();
 
-const transport: BorgTransport = {
-  async unary(method, request, signal) {
-    signal?.throwIfAborted();
-    const reply: UnaryReply = await ipcRenderer.invoke(CHANNELS.unary, method, request);
-    if (!reply.ok) throw new BorgError(reply.error.code, reply.error.message, method);
-    return reply.value as never;
+const transport: WireTransport = {
+  unary(method, request) {
+    return ipcRenderer.invoke(CHANNELS.unary, method, request) as Promise<UnaryReply>;
   },
 
-  serverStream(method: MethodPath, request, handlers: StreamHandlers<never>) {
+  serverStream(method, request, deliver) {
     const id = `${pageLoad}:s${nextStreamId++}`;
 
     const onEvent = (_e: unknown, streamId: string, payload: StreamEvent) => {
       if (streamId !== id) return;
-      switch (payload.kind) {
-        case "message":
-          handlers.onMessage(payload.message as never);
-          break;
-        case "error":
-          detach();
-          handlers.onError?.(new BorgError(payload.error.code, payload.error.message, method));
-          break;
-        case "complete":
-          detach();
-          handlers.onComplete?.();
-          break;
-      }
+      // An error or completion ends the stream; nothing after it is delivered.
+      if (payload.kind !== "message") detach();
+      deliver(payload);
     };
 
     const detach = () => ipcRenderer.off(CHANNELS.streamEvent, onEvent);

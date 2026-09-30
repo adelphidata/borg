@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BorgTransport } from "@borg/client";
 import type { NativeBridge } from "@borg/app";
-import { CHANNELS, type StreamEvent, type WireBootStatus } from "./channels";
+import { CHANNELS, type StreamEvent, type WireBootStatus, type WireTransport } from "./channels";
 
 vi.mock("electron", () => import("./test/electron-stub"));
 
@@ -9,9 +9,11 @@ const { contextBridgeState, pushToRenderer, rendererState, resetElectron } =
   await import("./test/electron-stub");
 const { BorgError } = await import("@borg/client");
 
+const { fromWire } = await import("./wire-transport");
+
 interface ExposedBorg {
   platform: string;
-  transport: BorgTransport;
+  transport: WireTransport;
   native: NativeBridge;
 }
 
@@ -20,7 +22,12 @@ interface ExposedBorg {
 // itself holds no per-window state beyond its stream counter.
 await import("./preload");
 const bridge = contextBridgeState.exposed.get("borg") as ExposedBorg;
-const loadPreload = async (): Promise<ExposedBorg> => bridge;
+/** The bridge as the renderer uses it: its transport wrapped by `fromWire`. */
+type RendererBorg = Omit<ExposedBorg, "transport"> & { transport: BorgTransport };
+const loadPreload = async (): Promise<RendererBorg> => ({
+  ...bridge,
+  transport: fromWire(bridge.transport),
+});
 
 beforeEach(() => {
   resetElectron();
@@ -36,6 +43,33 @@ describe("preload bridge", () => {
     const borg = await loadPreload();
     expect(Object.keys(borg).sort()).toEqual(["native", "platform", "transport"]);
     expect(borg.platform).toBe(process.platform);
+  });
+});
+
+describe("the exposed transport", () => {
+  // The context bridge strips an Error down to its message, so anything the
+  // preload threw or passed as an Error would reach the renderer codeless.
+  it("resolves a failed call with the failure as data, never rejecting", async () => {
+    rendererState.replies.set(CHANNELS.unary, () => ({
+      ok: false,
+      error: { code: 14, message: "connect ECONNREFUSED" },
+    }));
+    await expect(bridge.transport.unary("Sessions/Open", {})).resolves.toEqual({
+      ok: false,
+      error: { code: 14, message: "connect ECONNREFUSED" },
+    });
+  });
+
+  it("hands a stream error over as plain data", () => {
+    const events: StreamEvent[] = [];
+    bridge.transport.serverStream("Sessions/Watch", {}, (e) => events.push(e));
+    const id = invocations(CHANNELS.streamOpen).at(-1)?.args[0] as string;
+    pushToRenderer(CHANNELS.streamEvent, id, {
+      kind: "error",
+      error: { code: 16, message: "token rejected" },
+    });
+    expect(events).toEqual([{ kind: "error", error: { code: 16, message: "token rejected" } }]);
+    expect(events[0]).not.toBeInstanceOf(Error);
   });
 });
 
@@ -70,7 +104,7 @@ describe("transport.unary", () => {
 });
 
 describe("transport.serverStream", () => {
-  const open = async (borg: ExposedBorg, handlers: Record<string, unknown> = {}) => {
+  const open = async (borg: RendererBorg, handlers: Record<string, unknown> = {}) => {
     const onMessage = vi.fn();
     const cancel = borg.transport.serverStream("Sessions/Watch" as never, {}, {
       onMessage,

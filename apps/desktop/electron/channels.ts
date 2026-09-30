@@ -43,6 +43,21 @@ export type StreamEvent =
   | { kind: "error"; error: WireError }
   | { kind: "complete" };
 
+/**
+ * The transport as the preload exposes it: every failure arrives as data.
+ *
+ * The context bridge copies a thrown or passed `Error` as a bare `Error` with
+ * only its message — a `BorgError` built in the preload reaches the renderer
+ * with no status code, so "Borg is not running" and "token rejected" both
+ * read as internal errors. The renderer turns this into a `BorgTransport`
+ * with `fromWire`, where the `BorgError` class is its own.
+ */
+export interface WireTransport {
+  unary(method: string, request: unknown): Promise<UnaryReply>;
+  /** Delivers events until an error or completion; the return value cancels. */
+  serverStream(method: string, request: unknown, onEvent: (event: StreamEvent) => void): () => void;
+}
+
 /** Mirrors `NativeNotification` in `@borg/app` — kept structured-cloneable. */
 export interface WireNotification {
   title: string;

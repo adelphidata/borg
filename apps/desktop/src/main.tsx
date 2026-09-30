@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BorgApp, type Platform } from "@borg/app";
+import { fromWire } from "../electron/wire-transport";
 import "@borg/ui/styles/fonts.css";
 import "@borg/ui/styles/app.css";
 
@@ -13,7 +14,7 @@ import "@borg/ui/styles/app.css";
  */
 const platform: Platform = {
   kind: "desktop",
-  transport: window.borg.transport,
+  transport: fromWire(window.borg.transport),
   titleBarDrag: window.borg.platform === "darwin",
   native: window.borg.native,
 };
