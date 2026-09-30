@@ -300,17 +300,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     // See `grpc_web::build_grpc_web_router` for why Capability and Pki are out.
     grpc_web_slot.install(crate::grpc_web::build_grpc_web_router(&services));
 
-    serve_transports(
-        uds,
-        cfg.listen_tcp,
-        &shutdown_tx,
-        &services,
-        &pki_db,
-        &audit,
-        ca_cert_pem,
-        ca_key_pem,
-        &server_tls_material,
-        mdns_enabled,
+    serve_until_drained(
+        serve_transports(
+            uds,
+            cfg.listen_tcp,
+            &shutdown_tx,
+            &services,
+            &pki_db,
+            &audit,
+            ca_cert_pem,
+            ca_key_pem,
+            &server_tls_material,
+            mdns_enabled,
+        ),
+        shutdown_tx.subscribe(),
+        LISTENER_DRAIN_GRACE,
     )
     .await?;
 
@@ -925,6 +929,41 @@ async fn serve_transports(
     Ok(())
 }
 
+/// How long open client streams may hold the listeners after a shutdown signal.
+const LISTENER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run the listeners until they stop, but never longer than `grace` past the
+/// shutdown signal.
+///
+/// tonic's graceful shutdown waits for every open connection to finish, and a
+/// connected app always holds one: the desktop and web surfaces keep a
+/// server-streaming activity subscription open for as long as they run. With
+/// either open, SIGTERM logged "draining" and the daemon never exited. Past
+/// the grace the servers are dropped, which closes those streams, and the
+/// caller's session drain runs as it would after a clean stop.
+async fn serve_until_drained<F>(
+    serve: F,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    grace: std::time::Duration,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::select! {
+        res = serve => res,
+        () = async {
+            let _ = shutdown_rx.recv().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            tracing::warn!(
+                ?grace,
+                "clients still held open streams after shutdown; closing them"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// mDNS announce — only when enabled AND the bind is non-loopback
 /// (loopback peers can't reach a `.local` advertisement). The
 /// announcer holds an mdns-sd ServiceDaemon that drains on shutdown;
@@ -1078,6 +1117,44 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_does_not_wait_forever_on_a_held_stream() {
+        use super::serve_until_drained;
+        use std::time::Duration;
+        // A server whose graceful stop never completes stands in for tonic
+        // with the desktop app's activity stream still open.
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let run = tokio::spawn(serve_until_drained(
+            std::future::pending::<anyhow::Result<()>>(),
+            rx,
+            Duration::from_secs(5),
+        ));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            !run.is_finished(),
+            "no signal yet, so the listeners keep serving"
+        );
+        tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!run.is_finished(), "open streams get the grace first");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(run.is_finished(), "past the grace the daemon moves on");
+        run.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_listener_error_still_surfaces() {
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
+        let err = super::serve_until_drained(
+            async { Err(anyhow::anyhow!("bind failed")) },
+            rx,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "bind failed");
+    }
 
     #[tokio::test]
     async fn emit_daemon_stop_appends_event_with_reason_to_audit_chain() {
