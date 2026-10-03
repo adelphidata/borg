@@ -281,15 +281,17 @@ pub async fn spawn_task_execution(
         });
 
         if let Err(panic_err) = futures::FutureExt::catch_unwind(result).await {
-            let panic_msg = panic_err
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic_err.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
+            let panic_error = panic_error_text(
+                panic_err.as_ref(),
+                exec_ctx
+                    .failure_delivery
+                    .as_ref()
+                    .map(|(ch, tgt)| (ch.as_str(), tgt.as_str())),
+                &exec_ctx.task_id,
+            );
             // Supervisor restarts the task on next tick; downgrade ERROR→WARN
             // (recoverable) and surface task_name as a structured field.
-            tracing::warn!(task = %task_name, panic = %panic_msg, "task panicked");
-            let panic_error = format!("panic: {panic_msg}");
+            tracing::warn!(task = %task_name, panic = %panic_error, "task panicked");
             match cortex::db::Database::open().await {
                 Ok(db) => {
                     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
@@ -1069,6 +1071,22 @@ fn redact_for_run<'a>(
     cortex::output_redaction::current_policy().apply(sink, Some(task_id), text)
 }
 
+/// The `panic: …` text a panicked task run stores, logs and delivers,
+/// redacted like any other failure: a panic message can quote a key or a
+/// URL with a token from the value that tripped it.
+fn panic_error_text(
+    panic_err: &(dyn std::any::Any + Send),
+    delivery: Option<(&str, &str)>,
+    task_id: &str,
+) -> String {
+    let panic_msg = panic_err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic_err.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic");
+    redact_for_run(delivery, task_id, &format!("panic: {panic_msg}")).into_owned()
+}
+
 /// How many previous runs a continuity-enabled task sees.
 ///
 /// Enough to notice a trend, few enough that a daily task does not spend its
@@ -1339,11 +1357,21 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
             "auxiliary",
         ),
         Err(e) => {
-            tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
+            // The setup error can echo a misplaced key (e.g. one pasted
+            // into the provider field), so it is stored redacted.
+            let raw = format!("{e}");
+            let error = redact_for_run(
+                failure_delivery
+                    .as_ref()
+                    .map(|(ch, tgt)| (ch.as_str(), tgt.as_str())),
+                task_id,
+                &raw,
+            );
+            tracing::warn!("Failed to create LLM client for task '{task_name}': {error}");
             match cortex::db::Database::open().await {
                 Ok(db) => {
                     if let Err(e2) = db
-                        .complete_task_run(*run_id, 0, None, Some(&format!("{e}")))
+                        .complete_task_run(*run_id, 0, None, Some(error.as_ref()))
                         .await
                     {
                         tracing::warn!(
@@ -1622,7 +1650,10 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                     "auxiliary",
                 ),
                 Err(e) => {
-                    let err_str = format!("{e}");
+                    // Like the prompt lane: a setup error can echo a
+                    // misplaced key, so it is stored and published redacted.
+                    // Not sent to a channel here, hence the log sink.
+                    let err_str = redact_for_run(None, task_id, &format!("{e}")).into_owned();
                     record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
                     publish_failed_event(started_unix, &err_str);
                     return;
@@ -1632,7 +1663,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             let response = match result {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    let err_str = format!("{e}");
+                    let err_str = redact_for_run(None, task_id, &format!("{e}")).into_owned();
                     record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
                     publish_failed_event(started_unix, &err_str);
                     return;
@@ -3300,6 +3331,33 @@ mod run_redaction_tests {
             assert!(out.contains("[REDACTED"), "{delivery:?}: {out}");
             assert!(out.starts_with("Deploy ok. "), "{delivery:?}: {out}");
         }
+    }
+
+    #[test]
+    fn a_panic_message_with_a_secret_is_redacted() {
+        let msg = format!("called `Result::unwrap()` on token {TOKEN}");
+        let payloads: Vec<(&str, Box<dyn std::any::Any + Send>)> = vec![
+            ("String payload", Box::new(msg.clone())),
+            (
+                "&str payload",
+                Box::new(Box::leak(msg.into_boxed_str()) as &str),
+            ),
+        ];
+        for (label, payload) in payloads {
+            for delivery in [Some(("telegram", "12345")), None] {
+                let out = panic_error_text(payload.as_ref(), delivery, "task-1");
+                assert!(!out.contains(TOKEN), "{label} {delivery:?}: {out}");
+                assert!(
+                    out.starts_with("panic: called `Result::unwrap()` on token [REDACTED"),
+                    "{label} {delivery:?}: {out}"
+                );
+            }
+        }
+        let unknown: Box<dyn std::any::Any + Send> = Box::new(42u8);
+        assert_eq!(
+            panic_error_text(unknown.as_ref(), None, "task-1"),
+            "panic: unknown panic"
+        );
     }
 
     #[test]

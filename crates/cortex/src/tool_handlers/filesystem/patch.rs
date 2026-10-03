@@ -363,7 +363,8 @@ fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSna
     // otherwise run repo-configured `filter.<name>.clean`/`.process` drivers
     // against an untrusted tree.
     let mut index_env = vec![("GIT_INDEX_FILE".to_string(), tmp_path)];
-    index_env.extend(filter_neutralizing_env_sync(repo_root));
+    // Fails closed: without the overrides the snapshot is not taken at all.
+    index_env.extend(crate::git::filter_neutralizing_env_sync(repo_root)?);
     let untracked = run_git_sync(
         repo_root,
         &["ls-files", "--others", "--exclude-standard"],
@@ -398,7 +399,8 @@ fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSna
 
 fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
     // Worktree checkout runs `filter.<name>.smudge`/`.process` drivers.
-    let filter_env = filter_neutralizing_env_sync(&snapshot.repo_root);
+    let filter_env = crate::git::filter_neutralizing_env_sync(&snapshot.repo_root)
+        .context("ghost rollback not run; the working tree was left as the patch left it")?;
     // Not an early return: `git restore` is not transactional, and the
     // post-snapshot sweep below is the other half of the rollback. Skipping it
     // on a partial restore would leave every agent-created file behind too.
@@ -444,35 +446,6 @@ fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
          snapshot and post-patch content",
     )?;
     Ok(())
-}
-
-/// Discover repo-configured executable content filters and return the
-/// `GIT_CONFIG_*` env that neutralizes them. Best-effort: discovery failures
-/// yield no overrides (the hardening prelude still applies).
-fn filter_neutralizing_env_sync(repo_root: &std::path::Path) -> Vec<(String, String)> {
-    let mut discovery = std::process::Command::new("git");
-    discovery
-        .args(crate::git::filter_discovery_argv())
-        .current_dir(repo_root);
-    crate::git::harden_git_command_sync(&mut discovery);
-    let output = crate::git::run_sync_with_timeout(discovery);
-    match output {
-        // `--get-regexp` exits 1 when nothing matches — the common case.
-        Ok(o) if o.status.success() || o.status.code() == Some(1) => {
-            crate::git::neutralizing_env_from_stdout(&String::from_utf8_lossy(&o.stdout))
-        }
-        Ok(o) => {
-            tracing::warn!(
-                "git filter-driver discovery failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            Vec::new()
-        }
-        Err(e) => {
-            tracing::warn!("git filter-driver discovery failed to spawn: {e}");
-            Vec::new()
-        }
-    }
 }
 
 fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: &[(String, String)]) -> Result<String> {

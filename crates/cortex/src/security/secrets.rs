@@ -257,11 +257,14 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             true,
             None,
         ),
-        // `user:pass@` userinfo on a non-database scheme. Only the password is
-        // masked. `?` and `#` cannot occur raw in userinfo, and their
+        // `user:pass@` userinfo on a non-database scheme. The whole userinfo
+        // (user AND password) is masked: a token is often the username with
+        // an empty or dummy password (`https://<token>:@proxy`,
+        // `https://ghp_…:x-oauth-basic@github.com`). A colon-free `user@host`
+        // is left alone. `?` and `#` cannot occur raw in userinfo, and their
         // exclusion keeps `http://host:3000?email=a@b.example` untouched.
         (
-            r"(?:https?|wss?|ftp|ssh|git\+https?)://[^/\s:@?#]+:([^/\s@?#]{3,})@",
+            r"(?:https?|wss?|ftp|ssh|git\+https?)://([^/\s:@?#]*:[^/\s@?#]*)@",
             "URL Credential",
             true,
             None,
@@ -1119,13 +1122,13 @@ mod tests {
                 "clone https://alice:hunter2pw@git.example/repo now".to_string(),
                 "hunter2pw",
                 "URL Credential",
-                &["clone https://alice:", "@git.example/repo now"],
+                &["clone https://", "@git.example/repo now"],
             ),
             (
                 "wss://svc:s3cr3tvalue@stream.example/socket".to_string(),
                 "s3cr3tvalue",
                 "URL Credential",
-                &["wss://svc:", "@stream.example/socket"],
+                &["wss://", "@stream.example/socket"],
             ),
         ];
         for (input, secret, label, kept) in cases {
@@ -1167,6 +1170,39 @@ mod tests {
             let outcome = redact_with_audit(input);
             assert_eq!(outcome.text, input, "over-redacted: {input}");
             assert!(outcome.hits.is_empty(), "unexpected hits for {input}");
+        }
+    }
+
+    #[test]
+    fn url_userinfo_with_colon_masks_user_and_password() {
+        // A token is often sent as the URL *username* with an empty or dummy
+        // password; masking only the password leaked it. Any userinfo with a
+        // colon is masked whole; a colon-free `user@host` stays readable.
+        let cases: &[(&str, &str)] = &[
+            (
+                "https://Zq8vT3kP9wLm2xR7nB4cY6fH1dJ5sA0e:@llm-proxy.example/v1",
+                "https://[REDACTED URL Credential]@llm-proxy.example/v1",
+            ),
+            (
+                "git push https://ghp_abc123:x-oauth-basic@github.com/o/r",
+                "git push https://[REDACTED URL Credential]@github.com/o/r",
+            ),
+            (
+                "clone https://alice:hunter2pw@git.example/repo now",
+                "clone https://[REDACTED URL Credential]@git.example/repo now",
+            ),
+            (
+                "ftp://u:pw@files.example/x",
+                "ftp://[REDACTED URL Credential]@files.example/x",
+            ),
+            ("https://user@host/path", "https://user@host/path"),
+            (
+                "http://host:3000/?email=a@b.example",
+                "http://host:3000/?email=a@b.example",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), *expected, "input: {input}");
         }
     }
 

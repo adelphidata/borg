@@ -1170,6 +1170,49 @@ fn all_addrs_private(addrs: &[std::net::SocketAddr]) -> bool {
             .all(|a| crate::url_policy::is_private_class(&a.ip()))
 }
 
+/// `(scheme, lowercased host, effective port)` of `url`, with the scheme's
+/// default port (80/443) filled in. `None` when unparseable or hostless.
+fn url_origin(url: &str) -> Option<(String, String, u16)> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some((parsed.scheme().to_string(), host, port))
+}
+
+/// Whether two URLs share an origin. An unparseable side never matches, so a
+/// credential is only ever sent on to an origin that is provably the same.
+fn same_origin(a: &str, b: &str) -> bool {
+    matches!((url_origin(a), url_origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// A configured `base_url`, ignoring an empty/whitespace value.
+fn configured_base_url(base_url: Option<&str>) -> Option<&str> {
+    base_url.filter(|s| !s.trim().is_empty())
+}
+
+/// The endpoint `provider` talks to when no `base_url` is set, composed the
+/// same way [`LlmClient::new`] does from `cfg` (Azure resource, Vertex
+/// project/location, `OLLAMA_HOST`). `None` when it cannot be known: no
+/// static default, and the settings needed to compose one are missing.
+fn default_endpoint(provider: Provider, cfg: &LlmConfig) -> Option<String> {
+    match provider {
+        Provider::AzureOpenAi => compose_azure_openai_url(cfg).ok(),
+        Provider::VertexAi if vertex::is_anthropic_model(&cfg.model) => {
+            let model = provider.normalize_model(&cfg.model);
+            vertex::compose_anthropic_url(cfg, &model, true).ok()
+        }
+        Provider::VertexAi => vertex::compose_gemini_url(cfg).ok(),
+        Provider::Ollama => Some(
+            std::env::var("OLLAMA_HOST")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|host| compose_ollama_url(&host))
+                .unwrap_or_else(|| provider.base_url().to_string()),
+        ),
+        _ => Some(provider.base_url().to_string()).filter(|url| !url.is_empty()),
+    }
+}
+
 impl LlmClient {
     /// Effective API URL: config override → provider default, with provider-
     /// specific normalization (e.g. Gemini base-URL suffix correction).
@@ -1415,6 +1458,8 @@ impl LlmClient {
         // uses — no duplicated logic, and the aux client's
         // `provider_slots` vec is its own (cooldowns can't bleed into
         // the primary instance).
+        let aux_provider = Provider::from_str(&provider_str)?;
+        let same_provider = config.llm.provider.as_deref() == Some(provider_str.as_str());
         let mut synthetic = config.llm.clone();
         // A different aux provider must not inherit the primary's endpoint or
         // credentials. `Self::new` → `resolve_api_keys` → `correct_provider_from_key`
@@ -1422,13 +1467,11 @@ impl LlmClient {
         // so `[llm.aux] provider = "anthropic"` over an OpenAI primary routed
         // straight back to OpenAI — the aux pin looked applied and wasn't.
         // Same reasoning as `resolve_scheduled_model` in the task runner.
-        if config.llm.provider.as_deref() != Some(provider_str.as_str()) {
+        if !same_provider {
             synthetic.base_url = None;
             synthetic.api_key = None;
             synthetic.api_keys.clear();
-            if let Ok(p) = provider::Provider::from_str(&provider_str) {
-                synthetic.api_key_env = p.default_env_var().to_string();
-            }
+            synthetic.api_key_env = aux_provider.default_env_var().to_string();
         }
         synthetic.provider = Some(provider_str);
         synthetic.model = resolved_model;
@@ -1450,6 +1493,37 @@ impl LlmClient {
         }
         if aux.base_url.is_some() {
             synthetic.base_url = aux.base_url.clone();
+        }
+        // Same provider, own endpoint, no key of its own: the synthetic config
+        // still carries the primary's credentials, which would now be sent to
+        // the aux URL. Keep them only when that URL is the primary's own
+        // origin; otherwise drop them so the main key never reaches a host it
+        // was not configured for. The primary's URL is the one it really uses
+        // (an Azure resource URL is composed, not a static default); when that
+        // cannot be known the credentials are kept as before.
+        let aux_has_own_key =
+            aux.api_key.is_some() || !aux.api_keys.is_empty() || !aux.api_key_env.is_empty();
+        let aux_url = configured_base_url(aux.base_url.as_deref());
+        if let Some(aux_url) = aux_url.filter(|_| same_provider && !aux_has_own_key) {
+            let provider = aux_provider;
+            let main_url = configured_base_url(config.llm.base_url.as_deref())
+                .map(str::to_string)
+                .or_else(|| default_endpoint(provider, &config.llm));
+            if main_url.is_some_and(|main_url| !same_origin(&main_url, aux_url)) {
+                synthetic.api_key = None;
+                synthetic.api_keys.clear();
+                // The default name is the "unset" marker `resolve_provider`
+                // honors; any other inherited name would still be resolved.
+                synthetic.api_key_env = crate::constants::DEFAULT_LLM_API_KEY_ENV.to_string();
+                // `resolve_provider` still reads a keyed provider's own default
+                // env var (very likely the primary's key), so an empty slot
+                // cannot be expressed through config for those. Refuse instead.
+                if provider.requires_api_key() && provider != Provider::Custom {
+                    bail!(
+                        "llm.aux.base_url ({aux_url}) is a different endpoint than the main model's, so the main API key is not sent there. Set llm.aux.api_key or llm.aux.api_key_env for that endpoint."
+                    );
+                }
+            }
         }
         synthetic.fallback = aux.fallback.clone();
         // Aux work (consolidation, heartbeat, scheduled prompts) is
@@ -1572,7 +1646,20 @@ impl LlmClient {
             // and `fb.api_key_env` defaults to `None`, so this is a no-op — it
             // is here so the two paths state the same rule rather than one of
             // them depending on the other's constant staying empty.
-            let default_env_var = if provider == Provider::Custom {
+            //
+            // Likewise a slot pointed at its own `base_url` only gets the
+            // provider's default env key when that URL is the provider's
+            // default origin: `OPENAI_API_KEY` belongs to api.openai.com, not
+            // to whatever proxy the slot names. An explicit `api_key_env` is
+            // the operator's choice and is still honored. For Azure the default
+            // origin is the resource URL composed from `llm.azure_*`; a
+            // provider whose default origin cannot be known keeps the default
+            // env key.
+            let foreign_base_url = configured_base_url(fb.base_url.as_deref()).is_some_and(|url| {
+                default_endpoint(provider, &config.llm)
+                    .is_some_and(|default| !same_origin(url, &default))
+            });
+            let default_env_var = if provider == Provider::Custom || foreign_base_url {
                 ""
             } else {
                 provider.default_env_var()

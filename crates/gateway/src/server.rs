@@ -1661,6 +1661,12 @@ async fn webhook_handler_inner(
 
 type WebhookResponse = (StatusCode, axum::Json<serde_json::Value>);
 
+/// Ephemeral reply to a slash command from a channel off
+/// `gateway.slack_channel_allowlist`: says why nothing happened and what to do.
+const SLACK_CHANNEL_NOT_ALLOWED_TEXT: &str = "Borg is not turned on in this channel. \
+     Message Borg directly, or ask your Borg admin to add this channel to \
+     gateway.slack_channel_allowlist.";
+
 fn ok_response() -> WebhookResponse {
     (
         StatusCode::OK,
@@ -1728,6 +1734,25 @@ async fn slack_command_handler(
             axum::Json(serde_json::json!({ "error": "Slack not configured" })),
         );
     };
+
+    if !crate::slack::channel_allowed(
+        state.config.gateway.slack_channel_allowlist.as_deref(),
+        Some(&payload.channel_id),
+    ) {
+        info!(
+            "Slack slash command from channel {} dropped: not in gateway.slack_channel_allowlist",
+            payload.channel_id
+        );
+        // Slack shows an ephemeral reply only to the person who ran the
+        // command; an empty ack would leave them with no answer at all.
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "response_type": "ephemeral",
+                "text": SLACK_CHANNEL_NOT_ALLOWED_TEXT,
+            })),
+        );
+    }
 
     let command_text = payload.text.unwrap_or_default();
     let display_text = if command_text.is_empty() {
@@ -2979,6 +3004,70 @@ description = "Script fallback"
             resp_body.0
         );
         assert_eq!(resp_body.0, serde_json::json!({ "ok": true }));
+
+        // Let the spawned work finish against the temp BORG_HOME before the
+        // guard restores the real one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// `gateway.slack_channel_allowlist` gates slash commands: a channel off
+    /// the list gets an ephemeral reply that names the fix and starts no
+    /// turn; a listed channel and a DM (`D…`) both get the bare ack and start
+    /// one.
+    #[tokio::test]
+    async fn slack_command_respects_channel_allowlist() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let secret = "test-signing-secret";
+
+        for (channel, expect_turn) in [("C2", false), ("C1", true), ("D9", true)] {
+            let body = format!("command=%2Fborg&text=hi&user_id=U1&channel_id={channel}");
+            let ts = chrono::Utc::now().timestamp().to_string();
+            let sig = {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+                mac.update(format!("v0:{ts}:{body}").as_bytes());
+                format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("x-slack-request-timestamp", ts.parse().unwrap());
+            headers.insert("x-slack-signature", sig.parse().unwrap());
+
+            let mut config = Config::default();
+            config.gateway.slack_channel_allowlist = Some(vec!["C1".to_string()]);
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+            let slack_client = Arc::new(SlackClient::new("xoxb-test-token").unwrap());
+            let state = test_state(
+                config,
+                registry,
+                &[],
+                0,
+                None,
+                Some((slack_client, secret.to_string())),
+            );
+
+            let (status, resp_body) =
+                slack_command_handler(State(state.clone()), headers, body).await;
+            assert_eq!(status, StatusCode::OK, "channel {channel}");
+            if expect_turn {
+                assert_eq!(resp_body.0, serde_json::json!({ "ok": true }));
+            } else {
+                assert_eq!(resp_body.0["response_type"], "ephemeral");
+                let text = resp_body.0["text"].as_str().unwrap_or_default();
+                assert!(
+                    text.contains("gateway.slack_channel_allowlist")
+                        && text.contains("Message Borg directly"),
+                    "reply must name the next action: {text}"
+                );
+            }
+            assert_eq!(
+                state.session_queue.active_sessions().await > 0,
+                expect_turn,
+                "channel {channel}: turn started must be {expect_turn}"
+            );
+        }
 
         // Let the spawned work finish against the temp BORG_HOME before the
         // guard restores the real one.

@@ -165,13 +165,30 @@ mod unix {
             libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         }
 
-        // Spawn the real server in its own session so we can signal the whole
-        // tree (the server may fork its own children) and so a launcher shell's
-        // startup files cannot stop it on background terminal I/O. stdio is
-        // inherited — these fds are the parent's pipe ends, so JSON-RPC flows
-        // straight through us without a copy.
-        let mut command = Command::new(&cmd);
-        command.args(&args);
+        let child = match spawn_server(&cmd, &args) {
+            Ok(c) => c,
+            Err(e) => {
+                // 127 alone tells an operator nothing, and `pre_exec` failing is
+                // a second way to land here. This process has no tracing
+                // subscriber, but its stderr is the parent's pipe end, which the
+                // parent routes to the server's stderr log.
+                eprintln!("borg mcp watchdog: failed to spawn '{cmd}': {e}");
+                return 127;
+            }
+        };
+        supervise(child, || {
+            TERMINATE.load(Ordering::SeqCst) || parent_gone(parent_pid)
+        })
+    }
+
+    /// Spawn the real server in its own session so we can signal the whole
+    /// tree (the server may fork its own children) and so a launcher shell's
+    /// startup files cannot stop it on background terminal I/O. stdio is
+    /// inherited — these fds are the parent's pipe ends, so JSON-RPC flows
+    /// straight through us without a copy.
+    fn spawn_server(cmd: &str, args: &[String]) -> std::io::Result<Child> {
+        let mut command = Command::new(cmd);
+        command.args(args);
         // SAFETY: `detach_from_tty` only calls `setsid`/`setpgid` and
         // `close_nonstdio_fds` only `fcntl`/`getrlimit`/`close_range`, all
         // async-signal-safe, as `pre_exec` requires.
@@ -183,37 +200,86 @@ mod unix {
                 crate::process_group::close_nonstdio_fds()
             });
         }
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                // 127 alone tells an operator nothing, and `pre_exec` failing is
-                // a second way to land here. This process has no tracing
-                // subscriber, but its stderr is the parent's pipe end, which the
-                // parent routes to the server's stderr log.
-                eprintln!("borg mcp watchdog: failed to spawn '{cmd}': {e}");
-                return 127;
-            }
-        };
+        command.spawn()
+    }
+
+    /// Poll `child` (a process-group leader) until it exits or `should_stop`
+    /// fires, then tear its whole group down. Returns the exit code to use:
+    /// the server's own code on a natural exit, 0 on a requested teardown.
+    ///
+    /// The group is signalled on BOTH paths, before `child` is reaped. A
+    /// leader exiting does not end its group: a server that forked helpers
+    /// and then exited (say, because `close` dropped its stdin) leaves them
+    /// running in it.
+    fn supervise(mut child: Child, mut should_stop: impl FnMut() -> bool) -> i32 {
         let pgid = child.id() as i32; // group leader pid == pgid
 
         // 100ms trades a little orphan-reap latency for ~10 wakeups/sec on a
         // thread that lives as long as every stdio MCP server.
         let poll = Duration::from_millis(100);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return status.code().unwrap_or(0),
-                Ok(None) => {}
-                Err(_) => {
-                    reap_group(pgid, &mut child);
-                    return 0;
+        let requested = loop {
+            match leader_exited(pgid) {
+                Ok(true) => break false,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("borg mcp watchdog: waitid on server {pgid} failed: {e}");
+                    break true;
                 }
             }
-            if TERMINATE.load(Ordering::SeqCst) || parent_gone(parent_pid) {
-                reap_group(pgid, &mut child);
-                return 0;
+            if should_stop() {
+                break true;
             }
             std::thread::sleep(poll);
+        };
+        reap_group(pgid);
+        // Only now is the leader reaped, which frees its pid and so the pgid.
+        match child.wait() {
+            Ok(status) if !requested => status.code().unwrap_or(0),
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("borg mcp watchdog: reaping server {pgid} failed: {e}");
+                0
+            }
         }
+    }
+
+    /// True once `pid` has exited, WITHOUT reaping it (`WNOWAIT`). The zombie
+    /// leader keeps its pid, and with it the process-group id, reserved, so a
+    /// later `killpg(pgid, …)` cannot land on a recycled, unrelated group.
+    fn leader_exited(pid: i32) -> std::io::Result<bool> {
+        // SAFETY: an all-zero `siginfo_t` is a valid out-param. With `WNOHANG`
+        // the kernel leaves `si_pid` at 0 when the child has not exited.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: FFI call on our own child's pid with a valid out-pointer.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: reads the pid field of the `siginfo_t` filled in above.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    /// False only once no process reports `pgid` any more. `EPERM` means
+    /// members exist that we may not signal, so the group still counts.
+    ///
+    /// The leader is deliberately left an unreaped zombie here (see
+    /// [`leader_exited`]). On Linux a zombie still counts as a group member,
+    /// so `killpg(pgid, 0)` succeeds and this stays true until the caller
+    /// reaps it. Only a kernel that skips zombies in the probe reports
+    /// `ESRCH` while the leader is held.
+    fn group_alive(pgid: i32) -> bool {
+        // SAFETY: signal 0 only probes; `pgid` is our child's positive group.
+        if unsafe { libc::killpg(pgid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// True once the original parent is gone. Primary signal: our parent pid
@@ -230,8 +296,13 @@ mod unix {
     }
 
     /// SIGTERM the server's process group, allow a brief grace to exit, then
-    /// SIGKILL and reap the direct child so it isn't left a zombie.
-    fn reap_group(pgid: i32, child: &mut Child) {
+    /// SIGKILL whatever is left. The leader must still be unreaped (see
+    /// [`leader_exited`]) so `pgid` cannot have been recycled; the caller
+    /// reaps it afterwards.
+    ///
+    /// The SIGKILL pass runs even when the leader dies inside the grace: a
+    /// descendant that ignores SIGTERM is exactly what it exists for.
+    fn reap_group(pgid: i32) {
         // 15 x 20ms = 300ms of grace — enough for a node/python MCP server to
         // flush stdio and unwind, short enough that daemon shutdown doesn't stall.
         const SIGTERM_GRACE_POLLS: u32 = 15;
@@ -240,15 +311,28 @@ mod unix {
         // group call with EPERM, and dropping that result left the server's
         // descendants running after daemon shutdown.
         crate::process_group::signal_group_or_members(pgid, libc::SIGTERM);
+        // The early exit fires only where a zombie-only group probes as gone.
+        // On Linux the held zombie leader keeps [`group_alive`] true, so the
+        // full grace always runs and SIGKILL follows — at most 300ms of extra
+        // wait at shutdown, and SIGKILL to an exited group is harmless.
         for _ in 0..SIGTERM_GRACE_POLLS {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                let _ = child.wait();
+            if !group_alive(pgid) {
                 return;
             }
             std::thread::sleep(SIGTERM_GRACE_POLL);
         }
         crate::process_group::signal_group_or_members(pgid, libc::SIGKILL);
-        let _ = child.wait();
+        // The leader too, directly. It is unreaped, so its pid cannot be
+        // reused; if it ever left the group, the caller's blocking `wait`
+        // would otherwise hang on it. ESRCH just means it is already a zombie
+        // (some kernels refuse to signal one); anything else is reported.
+        // SAFETY: FFI call on our own unreaped child's pid.
+        if unsafe { libc::kill(pgid, libc::SIGKILL) } == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!("borg mcp watchdog: SIGKILL to server {pgid} failed: {err}");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -288,6 +372,93 @@ mod unix {
             let real_parent = unsafe { libc::getppid() };
             let code = run(real_parent, "false".to_string(), vec![]);
             assert_eq!(code, 1);
+        }
+
+        fn pid_exists(pid: i32) -> bool {
+            // SAFETY: signal 0 only probes.
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+
+        /// SIGKILLs a grandchild the test spawned if it is still alive on drop,
+        /// so a failing assertion cannot leave a stray `sleep 60` behind.
+        struct KillOnDrop(i32);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if self.0 > 0 && pid_exists(self.0) {
+                    // SAFETY: FFI call on the pid this test spawned.
+                    unsafe { libc::kill(self.0, libc::SIGKILL) };
+                }
+            }
+        }
+
+        /// The pid the server script wrote to `path`, once it is there.
+        fn read_pid(path: &std::path::Path) -> Option<i32> {
+            std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        }
+
+        /// The grandchild disappears within a few seconds (its reparented
+        /// zombie is reaped by init, not by us, so allow some slack).
+        fn assert_gone_soon(pid: i32, case: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pid_exists(pid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: grandchild {pid} that ignores SIGTERM outlived the watchdog"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Spec: the server's whole process group dies with the server, even
+        /// when its helpers ignore SIGTERM, on every way the leader can exit:
+        ///   - on its own (it forked a helper and exited, as a server does
+        ///     when `close` drops its stdin) — the group must still be reaped
+        ///     and the server's own exit code kept;
+        ///   - on the teardown SIGTERM, inside the grace period — the SIGKILL
+        ///     pass must still run for the helper that ignored it.
+        #[test]
+        fn server_group_is_reaped_however_the_leader_exits() {
+            // (case, script, teardown requested once the pidfile exists,
+            //  expected exit code). `$1` names where the helper's pid goes.
+            // The helper ignores TERM before its pid is published, so a
+            // teardown can never beat the `trap`.
+            let cases: &[(&str, &str, bool, i32)] = &[
+                (
+                    "leader exits on its own",
+                    r#"trap "" TERM; sleep 60 & echo $! > "$1"; exit 3"#,
+                    false,
+                    3,
+                ),
+                (
+                    "leader dies on the teardown SIGTERM",
+                    r#"sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 60' helper "$1" & wait"#,
+                    true,
+                    0,
+                ),
+            ];
+            for &(case, script, teardown, expected_code) in cases {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let pidfile = dir.path().join("helper.pid");
+                let args = [
+                    "-c".to_string(),
+                    script.to_string(),
+                    "sh".to_string(),
+                    pidfile.display().to_string(),
+                ];
+                let child = spawn_server("/bin/sh", &args).expect("spawn sh");
+                // Hard stop so a broken script fails the test instead of
+                // hanging it.
+                let give_up = Instant::now() + Duration::from_secs(10);
+                let code = supervise(child, || {
+                    (teardown && read_pid(&pidfile).is_some()) || Instant::now() > give_up
+                });
+                let helper = read_pid(&pidfile).expect("helper pid was never written");
+                let _guard = KillOnDrop(helper);
+
+                assert_eq!(code, expected_code, "{case}: exit code");
+                assert_gone_soon(helper, case);
+            }
         }
     }
 }

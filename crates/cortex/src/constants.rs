@@ -588,6 +588,16 @@ pub const TOOL_CALL_ENVELOPE_TOKEN_OVERHEAD: usize = 8;
 /// Token threshold below which tool results are not compacted.
 pub const TOOL_RESULT_COMPACT_THRESHOLD: usize = 20;
 
+/// Tool result stored when a call is refused because Plan mode blocks
+/// mutations. Compaction matches on it to keep the stub marked `denied`.
+pub const PLAN_MODE_MUTATION_DENIED: &str = "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.";
+
+/// Tool result stored when a `PreToolUse` hook blocks a call without a reason.
+pub const TOOL_SKIPPED_BY_HOOK: &str = "[tool call skipped by hook]";
+
+/// Tool result stored when the user cancels the turn before a call runs.
+pub const TOOL_CANCELLED_BY_USER: &str = "[tool call cancelled by user]";
+
 // ── Image generation ──────────────────────────────────────────────
 
 /// Timeout in seconds for image generation API requests.

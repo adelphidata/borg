@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::instrument;
 
-use crate::git::run_git;
+use crate::git::{run_git, run_git_neutralized, run_git_neutralized_with_env};
 use crate::paths::resolve_borg_home_readonly;
 
 /// Cap on a generated directory/branch component. Long enough for a real
@@ -313,7 +313,8 @@ pub async fn add(repo_root: &Path, root: &Path, opts: &AddOptions) -> Result<Wor
         }
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_git(&argv, repo_root)
+    // The checkout runs every smudge filter the repository configures.
+    run_git_neutralized(&argv, repo_root)
         .await
         .with_context(|| format!("creating worktree '{}'", opts.name))?;
 
@@ -448,10 +449,128 @@ pub async fn remove(
         args.push("--force");
     }
     args.push(&path_str);
-    run_git(&args, repo_root)
-        .await
-        .with_context(|| format!("removing worktree '{}'", wt.name()))?;
+    // Without `--force`, git checks the tree is clean with its own `status`,
+    // which runs clean filters. `LC_ALL=C` keeps git's refusal text in
+    // English so the submodule case below is recognized in any locale.
+    let c_locale = [("LC_ALL".to_string(), "C".to_string())];
+    match run_git_neutralized_with_env(&args, repo_root, &c_locale).await {
+        Ok(_) => {}
+        // Git refuses any worktree that holds an initialized submodule unless
+        // forced, however clean it is. Forcing is only safe once fresh checks
+        // still find nothing to lose — the earlier status check is stale by
+        // now, and it cannot see submodule commits or stashes that live only
+        // in this worktree's module store, which `--force` deletes. `wt` is
+        // not the main checkout (refused above), so this can never
+        // force-remove the operator's repository.
+        Err(e) if !force && format!("{e:#}").contains("containing submodules") => {
+            if has_uncommitted_changes(&wt.path).await? {
+                bail!(
+                    "worktree '{}' has uncommitted changes — commit them, or pass force to discard",
+                    wt.name()
+                );
+            }
+            submodule_work_is_saved(&wt.path, repo_root)
+                .await
+                .with_context(|| format!("worktree '{}' was not removed", wt.name()))?;
+            run_git_neutralized_with_env(
+                &["worktree", "remove", "--force", &path_str],
+                repo_root,
+                &c_locale,
+            )
+            .await
+            .with_context(|| format!("removing worktree '{}'", wt.name()))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("removing worktree '{}'", wt.name())),
+    }
     Ok(wt.path)
+}
+
+/// Refuse unless every initialized submodule in `worktree_path` (nested ones
+/// included) has nothing that removing the worktree would destroy.
+///
+/// A worktree's submodules keep their own object store under the worktree's
+/// admin dir, so a commit made there — even one the superproject already
+/// records, which leaves `status` clean — and any stash exist nowhere else.
+/// Each branch tip and HEAD must therefore be reachable from a remote-tracking
+/// ref or present in the main checkout's copy of the same submodule, and the
+/// stash must be empty. Any check that cannot run counts as a failure.
+async fn submodule_work_is_saved(worktree_path: &Path, repo_root: &Path) -> Result<()> {
+    let top = worktree_path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", worktree_path.display()))?;
+    // `$toplevel/$sm_path` is absolute, quoted, and NUL-terminated, so a
+    // repository-chosen submodule path cannot split or inject anything.
+    let listing = run_git(
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            r#"printf '%s/%s\0' "$toplevel" "$sm_path""#,
+        ],
+        &top,
+    )
+    .await
+    .context("listing the worktree's submodules")?;
+    for submodule in listing.split('\0').filter(|p| !p.is_empty()) {
+        let dir = PathBuf::from(submodule);
+        let rel = dir
+            .strip_prefix(&top)
+            .with_context(|| format!("submodule {submodule} lies outside the worktree"))?;
+        let next = format!(
+            "inspect it with `git -C {submodule} log --branches --not --remotes`, \
+             push what you need, or pass force to discard"
+        );
+        let stash = run_git(&["stash", "list"], &dir)
+            .await
+            .with_context(|| format!("checking stashes in submodule '{}'", rel.display()))?;
+        if !stash.is_empty() {
+            bail!(
+                "submodule '{}' has stashed changes that removal would delete — \
+                 apply or drop them, or pass force to discard",
+                rel.display()
+            );
+        }
+        let heads = run_git(
+            &["for-each-ref", "--format=%(objectname)", "refs/heads"],
+            &dir,
+        )
+        .await
+        .with_context(|| format!("listing branches in submodule '{}'", rel.display()))?;
+        let head = run_git(&["rev-parse", "HEAD"], &dir)
+            .await
+            .with_context(|| format!("reading HEAD of submodule '{}'", rel.display()))?;
+        for tip in heads.lines().chain([head.as_str()]) {
+            if !commit_is_saved(tip, &dir, &repo_root.join(rel)).await? {
+                bail!(
+                    "submodule '{}' has commit {} that exists only in this worktree — {next}",
+                    rel.display(),
+                    &tip[..tip.len().min(12)]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `commit` survives deleting the worktree submodule at `dir`: some
+/// remote-tracking ref contains it, or the main checkout's copy of the
+/// submodule (`main_copy`) already has it.
+async fn commit_is_saved(commit: &str, dir: &Path, main_copy: &Path) -> Result<bool> {
+    let remote = run_git(&["branch", "-r", "--contains", commit], dir)
+        .await
+        .with_context(|| format!("checking whether {commit} is pushed"))?;
+    if !remote.is_empty() {
+        return Ok(true);
+    }
+    if !main_copy.join(".git").exists() {
+        return Ok(false);
+    }
+    // `cat-file -e` reports "missing" only as a non-zero exit, so an error
+    // here means "not there"; that answer refuses the removal, so it fails
+    // closed.
+    let spec = format!("{commit}^{{commit}}");
+    Ok(run_git(&["cat-file", "-e", &spec], main_copy).await.is_ok())
 }
 
 /// The caller's current directory when it sits at or inside `worktree_path`.
@@ -480,9 +599,15 @@ async fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
         // administrative entry.
         return Ok(false);
     }
-    let status = run_git(&["status", "--porcelain"], worktree_path)
-        .await
-        .with_context(|| format!("checking status of {}", worktree_path.display()))?;
+    // `--ignore-submodules=none` so a repository's `submodule.<name>.ignore`
+    // cannot hide edits inside a submodule; it is also the check git itself
+    // makes before removing a worktree.
+    let status = run_git_neutralized(
+        &["status", "--porcelain", "--ignore-submodules=none"],
+        worktree_path,
+    )
+    .await
+    .with_context(|| format!("checking status of {}", worktree_path.display()))?;
     Ok(!status.trim().is_empty())
 }
 
@@ -1421,5 +1546,179 @@ branch refs/heads/side
             .await
             .expect("a missing checkout has no work to lose");
         assert_eq!(list(&repo).await.unwrap().len(), 1);
+    }
+
+    /// Creating and removing a worktree checks files out and compares them
+    /// with the index, which runs a repository's smudge and clean filters.
+    /// Neither may execute, and the checkout must still hold the real content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_and_remove_never_run_a_repo_content_filter() {
+        use crate::git::test_support::{arm_evil_content_filter, touch_forward};
+        let (tmp, repo, root) = fixture();
+        let sentinel = arm_evil_content_filter(&repo, tmp.path());
+
+        let wt = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "filtered".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("add must succeed with the filter neutralized");
+        assert!(
+            !sentinel.exists(),
+            "the smudge filter ran during worktree add"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+            "hello\n"
+        );
+
+        touch_forward(&wt.path.join("a.txt"));
+        remove(&repo, &root, "filtered", false)
+            .await
+            .expect("an unchanged checkout removes without force");
+        assert!(
+            !sentinel.exists(),
+            "the clean filter ran during worktree remove"
+        );
+        assert!(!wt.path.exists());
+    }
+
+    /// A repository's own `includeIf` can load a filter under the new
+    /// checkout's branch or directory that discovery never saw, so creating a
+    /// worktree there is refused — with a reason — and nothing is created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn add_refuses_a_repo_with_a_conditional_include() {
+        let (_tmp, repo, root) = fixture();
+        crate::git::test_support::git(
+            &repo,
+            &["config", "includeIf.onbranch:evil.path", "evil.cfg"],
+        );
+
+        let err = add(
+            &repo,
+            &root,
+            &AddOptions {
+                name: "inc".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("conditional includes"),
+            "{err:#}"
+        );
+        assert_eq!(list(&repo).await.unwrap().len(), 1, "nothing was created");
+    }
+
+    /// Git refuses to remove any worktree holding an initialized submodule
+    /// without `--force`, clean or not. A clean one must still remove without
+    /// the operator forcing it; one with work to lose — in the checkout or in
+    /// the submodule — must still be refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_handles_a_worktree_with_a_submodule() {
+        use crate::git::test_support::git;
+        // How the worktree is changed before removal.
+        #[derive(Clone, Copy)]
+        enum Change {
+            None,
+            /// Edit this file, relative to the worktree.
+            Dirty(&'static str),
+            /// Commit inside the submodule and record it in the worktree's
+            /// superproject: `status` is clean, yet the commit lives only in
+            /// the worktree's module store.
+            UnpushedSubmoduleCommit,
+            /// Edit a submodule file and stash it: `status` is clean.
+            SubmoduleStash,
+        }
+        // (case, change, expected error text; `None` = removed)
+        let cases: &[(&str, Change, Option<&str>)] = &[
+            ("clean", Change::None, None),
+            (
+                "dirty checkout",
+                Change::Dirty("a.txt"),
+                Some("uncommitted changes"),
+            ),
+            (
+                "dirty submodule",
+                Change::Dirty("sm/a.txt"),
+                Some("uncommitted changes"),
+            ),
+            (
+                "unpushed submodule commit",
+                Change::UnpushedSubmoduleCommit,
+                Some("exists only in this worktree"),
+            ),
+            (
+                "submodule stash",
+                Change::SubmoduleStash,
+                Some("stashed changes"),
+            ),
+        ];
+        for (case, change, refusal) in cases {
+            let (tmp, repo, root) = fixture();
+            let sub = tmp.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            init_repo(&sub);
+            let sub_url = sub.to_string_lossy().to_string();
+            let file_ok = ["-c", "protocol.file.allow=always"];
+            git(
+                &repo,
+                &[&file_ok[..], &["submodule", "add", "-q", &sub_url, "sm"]].concat(),
+            );
+            git(&repo, &["commit", "-qm", "add submodule"]);
+            let wt = add(
+                &repo,
+                &root,
+                &AddOptions {
+                    name: "withsub".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            git(
+                &wt.path,
+                &[&file_ok[..], &["submodule", "update", "--init", "-q"]].concat(),
+            );
+            let sm = wt.path.join("sm");
+            // The submodule clone has no identity of its own.
+            let who = ["-c", "user.email=t@borg.test", "-c", "user.name=borg-test"];
+            match change {
+                Change::None => {}
+                Change::Dirty(rel) => std::fs::write(wt.path.join(rel), "changed\n").unwrap(),
+                Change::UnpushedSubmoduleCommit => {
+                    std::fs::write(sm.join("a.txt"), "only here\n").unwrap();
+                    git(&sm, &[&who[..], &["commit", "-qam", "local only"]].concat());
+                    git(&wt.path, &["commit", "-qam", "bump submodule"]);
+                }
+                Change::SubmoduleStash => {
+                    std::fs::write(sm.join("a.txt"), "stashed\n").unwrap();
+                    git(&sm, &[&who[..], &["stash", "-q"]].concat());
+                }
+            }
+
+            let result = remove(&repo, &root, "withsub", false).await;
+            match refusal {
+                None => {
+                    result.unwrap_or_else(|e| panic!("{case}: {e:#}"));
+                    assert!(!wt.path.exists(), "{case}: the checkout must be gone");
+                }
+                Some(want) => {
+                    let err = result.expect_err(case);
+                    assert!(format!("{err:#}").contains(want), "{case}: {err:#}");
+                    assert!(sm.join("a.txt").exists(), "{case}: worktree kept");
+                    assert_eq!(list(&repo).await.unwrap().len(), 2, "{case}: still listed");
+                }
+            }
+            assert!(repo.join("a.txt").exists(), "{case}: main checkout intact");
+        }
     }
 }

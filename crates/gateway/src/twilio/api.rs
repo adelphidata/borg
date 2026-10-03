@@ -4,7 +4,12 @@ use reqwest::Client;
 use std::time::Duration;
 
 use crate::constants::{GATEWAY_HTTP_TIMEOUT, TWILIO_API_BASE};
+use crate::message_processing::chunker;
 use crate::twilio::types::WHATSAPP_PREFIX;
+
+/// Longest `Body` the Twilio Messages API accepts, in UTF-16 code units —
+/// an emoji outside the BMP counts as two.
+pub const TWILIO_MAX_BODY_UTF16: usize = 1600;
 
 fn with_whatsapp_prefix(number: &str) -> String {
     if number.starts_with(WHATSAPP_PREFIX) {
@@ -48,22 +53,50 @@ impl TwilioClient {
         })
     }
 
-    /// Send an SMS message.
-    pub async fn send_sms(&self, from: &str, to: &str, body: &str) -> Result<String> {
+    /// Send an SMS message, split into in-order parts that each fit
+    /// [`TWILIO_MAX_BODY_UTF16`]. Returns one message sid per part.
+    pub async fn send_sms(&self, from: &str, to: &str, body: &str) -> Result<Vec<String>> {
         // SMS is plain-text only — strip any outer markdown code fence so
         // preformatted command output (e.g. /xp, /card, /evolution) doesn't
         // arrive with literal backticks. WhatsApp supports ```monospace```
         // so `send_whatsapp` does NOT strip.
         let stripped = crate::message_processing::plain_text::strip_outer_code_fence(body);
-        self.send_message(from, to, &stripped).await
+        self.send_chunked(from, to, &stripped).await
     }
 
     /// Send a WhatsApp message, applying the `whatsapp:` address prefix
-    /// idempotently so a caller may pass either form.
-    pub async fn send_whatsapp(&self, from: &str, to: &str, body: &str) -> Result<String> {
+    /// idempotently so a caller may pass either form. Split like
+    /// [`Self::send_sms`]; returns one message sid per part.
+    pub async fn send_whatsapp(&self, from: &str, to: &str, body: &str) -> Result<Vec<String>> {
         let from = with_whatsapp_prefix(from);
         let to = with_whatsapp_prefix(to);
-        self.send_message(&from, &to, body).await
+        self.send_chunked(&from, &to, body).await
+    }
+
+    /// Post `body` as consecutive messages of at most
+    /// [`TWILIO_MAX_BODY_UTF16`] units each. Twilio rejects a longer Body
+    /// outright (error 21617), so one long reply would otherwise never arrive.
+    /// Stops at the first failed part and posts nothing after it. This call
+    /// never posts a part twice, but the error fails the whole message, so a
+    /// later delivery retry sends every part again — parts that arrived before
+    /// the failure can reach the recipient twice.
+    async fn send_chunked(&self, from: &str, to: &str, body: &str) -> Result<Vec<String>> {
+        let chunks = chunker::resplit_utf16(
+            chunker::chunks_for_delivery(body, TWILIO_MAX_BODY_UTF16)?,
+            TWILIO_MAX_BODY_UTF16,
+        );
+        let total = chunks.len();
+        let mut sids = Vec::with_capacity(total);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let sid = self
+                .send_message(from, to, chunk)
+                .await
+                // Keep the API's status and body in the top-level message:
+                // health records and delivery rows store only `to_string()`.
+                .map_err(|e| anyhow::anyhow!("part {} of {total}: {e:#}", i + 1))?;
+            sids.push(sid);
+        }
+        Ok(sids)
     }
 
     /// Send a message via the Twilio Messages API.
@@ -213,7 +246,53 @@ mod tests {
             .send_sms("+15550001111", "+15552223333", "hello from borg")
             .await
             .expect("2xx response with sid must succeed");
-        assert_eq!(sid, "SM_sms_1", "sid must come from the API response");
+        assert_eq!(sid, vec!["SM_sms_1"], "sid must come from the API response");
+    }
+
+    /// Twilio's 1600 cap is in UTF-16 code units, so astral emoji count
+    /// double. 1500 emoji fit a 1600-char budget but are 3000 units; every
+    /// posted part must fit the unit cap, and the parts must rejoin in order.
+    #[tokio::test]
+    async fn send_sms_budgets_parts_in_utf16_units() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sid": "SM_e"})),
+            )
+            .mount(&server)
+            .await;
+
+        // Cycle distinct emoji so a reordered or duplicated part breaks the rejoin.
+        let reply: String = (0..1500u32)
+            .map(|i| char::from_u32(0x1F600 + i % 40).unwrap())
+            .collect();
+        let client = TwilioClient::with_base("AC123", "tok", &server.uri()).unwrap();
+        let sids = client
+            .send_sms("+15550001111", "+15552223333", &reply)
+            .await
+            .expect("every part must be delivered");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let form: std::collections::HashMap<String, String> =
+                    serde_urlencoded::from_bytes(&r.body).unwrap();
+                form["Body"].clone()
+            })
+            .collect();
+        assert!(bodies.len() >= 2, "3000 units cannot fit one part");
+        assert_eq!(sids.len(), bodies.len(), "one sid per posted part");
+        for b in &bodies {
+            let units = chunker::utf16_len(b);
+            assert!(
+                units <= TWILIO_MAX_BODY_UTF16,
+                "part of {units} UTF-16 units exceeds Twilio's cap"
+            );
+        }
+        assert_eq!(bodies.concat(), reply, "parts must rejoin to the reply");
     }
 
     #[tokio::test]
@@ -265,7 +344,7 @@ mod tests {
             .send_whatsapp("+15550001111", "+15552223333", "hi there")
             .await
             .expect("2xx response with sid must succeed");
-        assert_eq!(sid, "SM_wa_1", "sid must come from the API response");
+        assert_eq!(sid, vec!["SM_wa_1"], "sid must come from the API response");
     }
 
     #[tokio::test]

@@ -18,6 +18,12 @@
 //!   `prompt_result_with_a_token_is_stored_redacted` fails.
 //! • In `handle_task_failure`, drop the `redact_for_run` rebinding of
 //!   `error`: `prompt_failure_with_a_token_is_stored_redacted` fails.
+//! • In `execute_prompt_task`, store the LLM-init error `format!("{e}")`
+//!   without `redact_for_run`:
+//!   `llm_setup_error_with_a_token_is_stored_redacted` fails.
+//! • In `execute_heartbeat_task`, store the LLM-init error `format!("{e}")`
+//!   without `redact_for_run`: the heartbeat row of
+//!   `llm_setup_error_with_a_token_is_stored_redacted` fails.
 
 #![allow(
     clippy::expect_used,
@@ -91,6 +97,10 @@ impl Harness {
     }
 
     async fn seed_due_prompt_task(&self, id: &str) {
+        self.seed_due_task(id, "prompt").await;
+    }
+
+    async fn seed_due_task(&self, id: &str, task_type: &str) {
         let db = Database::open().await.expect("open db");
         let now = chrono::Utc::now().timestamp();
         db.create_task(&NewTask {
@@ -106,7 +116,7 @@ impl Harness {
             delivery_channel: None,
             delivery_target: None,
             allowed_tools: None,
-            task_type: "prompt",
+            task_type,
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
@@ -246,6 +256,49 @@ async fn prompt_failure_with_a_token_is_stored_redacted() {
         !last_error.contains(TOKEN_BODY),
         "scheduled_tasks.last_error must not hold the token: {last_error}"
     );
+}
+
+/// LLM client setup fails before any request: a key pasted into the provider
+/// field comes back in the "Unknown provider" error, which must not be
+/// stored as-is — on the prompt lane and on the heartbeat lane alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_setup_error_with_a_token_is_stored_redacted() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    for task_type in ["prompt", "heartbeat"] {
+        let mut h = Harness::setup("BORG_TEST_PROMPT_REDACT_KEY_SETUP").await;
+        h.config.llm.provider = Some(FAKE_TOKEN.into());
+        // The default quiet hours would skip the heartbeat before setup.
+        h.config.heartbeat.quiet_hours_start = None;
+        h.config.heartbeat.quiet_hours_end = None;
+        let id = format!("{task_type}-setup-leak");
+        h.seed_due_task(&id, task_type).await;
+
+        let run = h.run_to_finished_row(&id).await;
+
+        let stored = run
+            .error
+            .unwrap_or_else(|| panic!("{task_type}: a failed setup stores its error"));
+        assert!(
+            stored.starts_with("Unknown provider: "),
+            "{task_type}: the setup error must be what was stored: {stored}"
+        );
+        assert!(
+            !stored.contains(TOKEN_BODY),
+            "{task_type}: task_runs.error must not hold the token: {stored}"
+        );
+        assert!(stored.contains("[REDACTED"), "{task_type}: {stored}");
+        assert!(
+            h.server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "{task_type}: setup must fail before any request"
+        );
+    }
 }
 
 /// A prompt task is one tool-less completion. The model must be told that,

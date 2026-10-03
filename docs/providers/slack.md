@@ -82,6 +82,8 @@ Restrict the bot to specific Slack channels:
 borg settings set gateway.slack_channel_allowlist '["C01234567","C89012345"]'
 ```
 
+Messages from other channels are ignored. A slash command from another channel starts nothing; only the person who ran it sees a short reply that says how to get access. Direct messages always pass the allowlist; `dm_policy` governs them. An empty list allows every channel.
+
 ### Group activation mode
 
 Control how the bot responds in channels (vs DMs):

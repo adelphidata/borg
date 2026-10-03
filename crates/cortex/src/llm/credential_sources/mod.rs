@@ -119,8 +119,17 @@ pub(crate) fn short_label_fingerprint(token: &str) -> String {
 
 /// Best-effort atomic write for credential-source write-back. Public to the
 /// crate so `codex.rs` and future sources can share it.
+///
+/// A symlinked `path` is written through to the link's final target, staged
+/// and renamed beside that target, so the link survives. Renaming over the
+/// link itself would replace it with a regular file: a credentials file kept
+/// in a dotfiles repo and linked into place would stop receiving rotated
+/// tokens, and the next login from that repo would restore a dead one.
 pub(crate) fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
     use anyhow::Context;
+    let resolved = coding::fs_atomic::resolve_write_target(path)
+        .with_context(|| format!("resolve symlink {}", path.display()))?;
+    let path = resolved.as_path();
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
@@ -182,6 +191,43 @@ pub(crate) fn warn_if_world_readable(path: &Path) {
     #[cfg(not(unix))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Credential write-back through a symlinked file must rotate the token in
+    /// the link's target and leave the link in place.
+    #[test]
+    fn write_back_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("other")).unwrap();
+        let real = home.path().join("other/real.json");
+        std::fs::write(&real, r#"{"token":"stale"}"#).unwrap();
+        let link = home.path().join("auth.json");
+        std::os::unix::fs::symlink("other/real.json", &link).unwrap();
+
+        write_atomically(&link, r#"{"token":"fresh"}"#).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the write-back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            r#"{"token":"fresh"}"#,
+            "the rotated token must land in the link's target"
+        );
+        let names: Vec<_> = std::fs::read_dir(home.path().join("other"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["real.json".to_string()], "no temp residue");
     }
 }
 

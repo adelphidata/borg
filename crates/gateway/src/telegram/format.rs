@@ -21,7 +21,9 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
                 let content: String = chars[i + 3..end].iter().collect();
                 // Strip optional language tag on first line
                 let code = if let Some(newline_pos) = content.find('\n') {
-                    let first_line = &content[..newline_pos];
+                    // A CRLF fence leaves `\r` on the tag line; drop it so
+                    // `rust\r` still reads as a bare language tag.
+                    let first_line = content[..newline_pos].trim_end_matches('\r');
                     if first_line.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         &content[newline_pos + 1..]
                     } else {
@@ -206,6 +208,9 @@ mod tests {
             // Language tags may contain underscores and must still be
             // stripped from the rendered block.
             ("```objective_c\nx\n```", "<pre>x\n</pre>"),
+            // A CRLF opener leaves `\r` on the tag line; the tag must
+            // still be stripped.
+            ("```rust\r\nfn x(){}\r\n```", "<pre>fn x(){}\r\n</pre>"),
             // A first line that is not a language tag (spaces) is content
             // and must survive verbatim.
             ("```not a lang\nx\n```", "<pre>not a lang\nx\n</pre>"),

@@ -342,6 +342,22 @@ fn matches_hardcoded_deny(normalized: &str) -> bool {
 /// refusal can name its cause. Folded matches report the original-cased
 /// pattern — the on-disk spelling an operator would recognize.
 fn matched_hardcoded_deny(normalized: &str) -> Option<&'static str> {
+    if let Some(pattern) = matched_hardcoded_deny_whole(normalized) {
+        return Some(pattern);
+    }
+    // The `rm -rf …` patterns are start-anchored, so on the rebuilt
+    // `rm -rf <op1> <op2> …` form only the first operand is ever tested:
+    // `rm -rf build ~` would walk straight past. `rm` deletes every operand,
+    // so test each one as its own `rm -rf <op>`.
+    let rest = normalized.strip_prefix("rm -rf ")?;
+    rest.split(' ')
+        .filter(|op| !op.is_empty() && !op.starts_with('-'))
+        .find_map(|op| matched_hardcoded_deny_whole(&format!("rm -rf {op}")))
+}
+
+/// [`matched_hardcoded_deny`] over the whole normalized string only, without
+/// the per-operand `rm` expansion.
+fn matched_hardcoded_deny_whole(normalized: &str) -> Option<&'static str> {
     for pattern in HARDCODED_DENY {
         if glob_match(pattern, normalized) {
             return Some(pattern);
@@ -3057,6 +3073,13 @@ mod tests {
             "rm -rf /",
             "echo x | tee /etc/sudoers",
             "history -c",
+            // `rm` deletes every operand, so a catastrophic target in any
+            // position must be flagged, not just the first.
+            "rm -rf build ~",
+            "rm -rf ~ /tmp/x",
+            "rm -rf /tmp/a /",
+            "rm -rf ./a /",
+            "rm -fr build -v ~/*",
         ] {
             assert!(is_catastrophic_command(bad), "{bad} must be flagged");
         }
@@ -3065,6 +3088,8 @@ mod tests {
             "rm -rf ./target",
             "see the postmortem: someone ran rm -rf / on prod",
             "sudo apt install ripgrep",
+            "rm -rf build dist",
+            "rm -rf build dist -v",
             "",
         ] {
             assert!(!is_catastrophic_command(ok), "{ok:?} must pass");

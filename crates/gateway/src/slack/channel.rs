@@ -74,6 +74,17 @@ impl NativeChannel for SlackChannel {
             SlackWebhookResult::Message(inbound) => *inbound,
         };
 
+        if !super::channel_allowed(
+            self.config.gateway.slack_channel_allowlist.as_deref(),
+            inbound.channel_id.as_deref(),
+        ) {
+            tracing::info!(
+                "Slack message from channel {:?} dropped: not in gateway.slack_channel_allowlist",
+                inbound.channel_id
+            );
+            return Ok(WebhookOutcome::Skip);
+        }
+
         // Ack reaction — immediate visual feedback
         if let (Some(ref ch), Some(ref ts)) = (&inbound.channel_id, &inbound.message_id) {
             self.client.add_reaction(ch, ts, "eyes").await;
@@ -726,6 +737,37 @@ mod tests {
                 ),
                 "a line that lands exactly on the budget must not be cut"
             );
+        }
+
+        /// `gateway.slack_channel_allowlist` gates the events path: a message
+        /// from an unlisted channel is dropped before it reaches the agent; a
+        /// listed channel and a DM (`D…`) both pass.
+        #[tokio::test]
+        async fn channel_allowlist_drops_unlisted_channels() {
+            let server = MockServer::start().await;
+            mount_history(&server, &[]).await;
+
+            for (channel_id, expect_message) in [("C2", false), ("C1", true), ("D9", true)] {
+                let mut channel = make_channel(&server.uri(), None);
+                channel.config.gateway.slack_channel_allowlist = Some(vec!["C1".to_string()]);
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&envelope("hello", None)).unwrap();
+                body["event"]["channel"] = serde_json::json!(channel_id);
+                let body = body.to_string();
+
+                let config = cortex::config::Config::default();
+                let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+                let ctx = WebhookContext {
+                    config: &config,
+                    health: &health,
+                };
+                let outcome = channel
+                    .handle_webhook(&signed_headers(&body), &body, &ctx)
+                    .await
+                    .expect("webhook must be accepted");
+                let got_message = matches!(outcome, WebhookOutcome::Message { .. });
+                assert_eq!(got_message, expect_message, "channel {channel_id}");
+            }
         }
 
         /// A threaded @mention already carries its own conversation context;

@@ -199,7 +199,7 @@ impl Agent {
                 // Emit cancellation markers for the remaining calls so the LLM
                 // sees a tool_result for every tool_call it issued.
                 for idx in group {
-                    self.skip_tool_call(&tc[idx].id, "[tool call cancelled by user]")
+                    self.skip_tool_call(&tc[idx].id, crate::constants::TOOL_CANCELLED_BY_USER)
                         .await;
                 }
                 continue;
@@ -225,7 +225,7 @@ impl Agent {
     ) {
         for tool_call in tool_calls {
             if cancel.is_cancelled() {
-                self.skip_tool_call(&tool_call.id, "[tool call cancelled by user]")
+                self.skip_tool_call(&tool_call.id, crate::constants::TOOL_CANCELLED_BY_USER)
                     .await;
                 continue;
             }
@@ -251,7 +251,7 @@ impl Agent {
                     // since hook scripts can echo anything.
                     let msg = match reason {
                         Some(r) => self.truncate_and_redact(&r),
-                        None => "[tool call skipped by hook]".to_string(),
+                        None => crate::constants::TOOL_SKIPPED_BY_HOOK.to_string(),
                     };
                     self.skip_tool_call(&tool_call.id, &msg).await;
                     continue;
@@ -272,11 +272,8 @@ impl Agent {
                 .blocks_mutations()
                 && is_mutating_tool_call(name, args)
             {
-                self.skip_tool_call(
-                    &tool_call.id,
-                    "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.",
-                )
-                .await;
+                self.skip_tool_call(&tool_call.id, crate::constants::PLAN_MODE_MUTATION_DENIED)
+                    .await;
                 continue;
             }
 
@@ -448,7 +445,7 @@ impl Agent {
         for tool_call in tool_calls {
             if cancel.is_cancelled() {
                 slots.push(Slot::Skipped {
-                    reason: "[tool call cancelled by user]".into(),
+                    reason: crate::constants::TOOL_CANCELLED_BY_USER.into(),
                 });
                 continue;
             }
@@ -472,7 +469,7 @@ impl Agent {
                     slots.push(Slot::Skipped {
                         reason: match reason {
                             Some(r) => self.truncate_and_redact(&r),
-                            None => "[tool call skipped by hook]".into(),
+                            None => crate::constants::TOOL_SKIPPED_BY_HOOK.into(),
                         },
                     });
                     continue;
@@ -492,7 +489,7 @@ impl Agent {
                 && is_mutating_tool_call(&name, &args)
             {
                 slots.push(Slot::Skipped {
-                    reason: "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.".into(),
+                    reason: crate::constants::PLAN_MODE_MUTATION_DENIED.into(),
                 });
                 continue;
             }

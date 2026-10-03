@@ -289,6 +289,101 @@ mod tests {
         assert_eq!(wa.outbound_count, 1, "outbound event must be recorded");
     }
 
+    fn sent_bodies(requests: &[wiremock::Request]) -> Vec<String> {
+        requests
+            .iter()
+            .map(|r| {
+                let form: std::collections::HashMap<String, String> =
+                    serde_urlencoded::from_bytes(&r.body).unwrap();
+                form["Body"].clone()
+            })
+            .collect()
+    }
+
+    /// Twilio rejects a Body over 1600 UTF-16 units (error 21617). A long reply must
+    /// go out as in-order parts that each fit and that rejoin to the reply,
+    /// on both the SMS and the WhatsApp path.
+    #[tokio::test]
+    async fn send_response_splits_long_reply_into_ordered_parts() {
+        // Digits cycle so a reordered or duplicated part breaks the rejoin.
+        let reply: String = (0..4000)
+            .map(|i| char::from(b'0' + (i % 10) as u8))
+            .collect();
+        for (channel_type, from) in [("sms", "+15550000000"), ("whatsapp", "+15551111111")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/Accounts/AC-sid/Messages.json"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"sid": "SM"})),
+                )
+                .expect(3)
+                .mount(&server)
+                .await;
+
+            let channel = wired_channel(&server.uri());
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+            let ctx = serde_json::json!({
+                "channel_type": channel_type,
+                "sender": "+15559990000",
+                "from_number": from,
+            });
+            channel
+                .send_response(&reply, &ctx, &health)
+                .await
+                .expect("every part delivered must be Ok");
+
+            let bodies = sent_bodies(&server.received_requests().await.unwrap());
+            assert_eq!(bodies.len(), 3, "{channel_type}: 4000 chars is 3 parts");
+            for b in &bodies {
+                assert!(
+                    b.chars().count() <= 1600,
+                    "{channel_type}: part of {} chars exceeds Twilio's cap",
+                    b.chars().count()
+                );
+            }
+            assert_eq!(bodies.concat(), reply, "{channel_type}: parts must rejoin");
+        }
+    }
+
+    /// A part that fails stops the send with an error, and the part already
+    /// delivered is not posted again.
+    #[tokio::test]
+    async fn send_response_failed_part_does_not_resend_delivered_parts() {
+        let reply = "x".repeat(4000);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sid": "SM"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream broke"))
+            .mount(&server)
+            .await;
+
+        let channel = wired_channel(&server.uri());
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::default()));
+        let ctx = serde_json::json!({
+            "channel_type": "sms",
+            "sender": "+15559990000",
+            "from_number": "+15550000000",
+        });
+        let err = channel
+            .send_response(&reply, &ctx, &health)
+            .await
+            .expect_err("a failed part must not be reported as sent");
+        assert!(format!("{err:#}").contains("part 2 of 3"), "got: {err:#}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one delivered part, one failed part, nothing re-sent or sent after"
+        );
+    }
+
     /// A failed send must surface the error AND record it against the
     /// channel's health — reporting success on failure is forbidden.
     #[tokio::test]

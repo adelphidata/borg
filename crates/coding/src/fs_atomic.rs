@@ -38,6 +38,57 @@ pub fn split_bom(s: &str) -> (bool, &str) {
     }
 }
 
+/// Hop limit for [`resolve_write_target`], matching Linux's `MAXSYMLINKS`.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// The path an atomic write to `path` must replace: `path` itself, or, when it
+/// is a symlink, the final target of its link chain.
+///
+/// An atomic write renames a sibling temp over the destination, and a rename
+/// replaces a symlink rather than following it — so a caller that wants to
+/// write *through* a link has to resolve the destination first. Resolved by hand rather than with `canonicalize`, because a
+/// *dangling* link must still resolve: it is written through and its target
+/// created, which is what a plain `std::fs::write` to the link would do.
+/// Refusing it instead would turn a credential refresh into a lost token.
+///
+/// A relative link target is joined onto the link's own directory without
+/// lexical normalization, so `..` is resolved by the kernel exactly as it
+/// would be when opening the link. A link loop fails with an error rather
+/// than counting as a new file.
+pub fn resolve_write_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&current)?;
+                current = match current.parent() {
+                    Some(dir) if link.is_relative() => dir.join(link),
+                    _ => link,
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
+}
+
+/// [`atomic_write`] to the final target of `path`'s link chain, so a
+/// symlinked `path` is updated in place and the link survives.
+///
+/// Renaming over the link itself would replace it with a regular file, and a
+/// config file symlinked from a dotfiles repo would silently stop updating.
+/// Only for callers that write files the operator owns and may have linked
+/// into place — never for agent-driven writes, where following a planted link
+/// is the attack (see [`atomic_write`]).
+pub fn atomic_write_through_symlink(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(&resolve_write_target(path)?, bytes)
+}
+
 /// Atomically write `bytes` to `full_path`.
 ///
 /// Writes to a temp file in the same directory, flushes it to the OS, then
@@ -47,7 +98,13 @@ pub fn split_bom(s: &str) -> (bool, &str) {
 /// no-silent-swallowing rule).
 ///
 /// The caller is responsible for any parent-directory creation and symlink
-/// checks on `full_path` before calling this.
+/// checks on `full_path` before calling this. A `full_path` that *is* a
+/// symlink is never followed: the rename replaces the link itself with a
+/// regular file and leaves its old target untouched. The patch applicator
+/// relies on that — a link planted at the leaf between its `reject_symlink`
+/// check and this write cannot redirect the write elsewhere. Callers that want
+/// a symlinked file updated in place opt in with
+/// [`atomic_write_through_symlink`].
 ///
 /// Permissions (Unix): the `rename` installs the temp file's mode, so the temp
 /// must end up with the right one. An existing target keeps its exact mode
@@ -319,6 +376,84 @@ mod tests {
             "the setuid bit must survive a same-owner rewrite"
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    /// The plain `atomic_write` never follows a symlinked leaf: the link is
+    /// replaced by a regular file and its target keeps its old content. The
+    /// patch applicator relies on this, so a link planted at the leaf after
+    /// its symlink check cannot redirect a write (e.g. into `~/.ssh`).
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_replaces_a_symlinked_leaf_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let link = dir.path().join("leaf.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        atomic_write(&link, b"payload").unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the link must be replaced by a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "payload");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "secret",
+            "the link's old target must stay untouched"
+        );
+    }
+
+    /// Writing to a symlinked path updates the link's target and keeps the
+    /// link — both for a live link (a dotfiles-managed credentials file) and a
+    /// chain of two, and for a dangling one, whose target is created. A
+    /// rename over the link would leave a regular file and a stale target.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_symlink_keeps_the_link_and_updates_the_target() {
+        // (case, link chain from `auth.json`, whether the target pre-exists)
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("relative link", &["other/real.json"], true),
+            ("chain of two links", &["hop.json", "other/real.json"], true),
+            ("dangling link", &["other/real.json"], false),
+        ];
+        for (case, chain, target_exists) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("other")).unwrap();
+            let real = dir.path().join("other/real.json");
+            if *target_exists {
+                std::fs::write(&real, "stale").unwrap();
+            }
+            let link = dir.path().join("auth.json");
+            let mut from = link.clone();
+            for hop in *chain {
+                std::os::unix::fs::symlink(hop, &from).unwrap();
+                from = dir.path().join(hop);
+            }
+
+            atomic_write_through_symlink(&link, b"fresh").unwrap();
+
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{case}: the link must survive the write"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&real).unwrap(),
+                "fresh",
+                "{case}: the link's target must hold the new content"
+            );
+            let residue: Vec<_> = std::fs::read_dir(dir.path().join("other"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("borg-tmp"))
+                .collect();
+            assert!(residue.is_empty(), "{case}: temp residue {residue:?}");
+        }
     }
 
     #[test]

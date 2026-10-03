@@ -31,20 +31,26 @@ pub fn compact_tool_results(history: &mut [Message], max_tokens: usize) {
     }
 
     let half = history.len() / 2;
-    let placeholder = "[compacted: output removed]";
 
     for msg in history[half..].iter_mut().rev() {
         if msg.role != Role::Tool {
             continue;
         }
         // Only compact if the message has substantial content
-        let msg_toks = match &msg.content {
-            Some(MessageContent::Text(s)) => estimate_tokens(s),
+        let placeholder = match &msg.content {
+            Some(MessageContent::Text(s))
+                if estimate_tokens(s) > constants::TOOL_RESULT_COMPACT_THRESHOLD =>
+            {
+                // Keep the outcome: a failed call must not read as a success
+                // once its output is gone.
+                match tool_outcome(s) {
+                    Some(outcome) => format!("[compacted: output removed — {outcome}]"),
+                    None => "[compacted: output removed]".to_string(),
+                }
+            }
             _ => continue,
         };
-        if msg_toks > constants::TOOL_RESULT_COMPACT_THRESHOLD {
-            msg.content = Some(MessageContent::Text(placeholder.to_string()));
-        }
+        msg.content = Some(MessageContent::Text(placeholder));
     }
 }
 
@@ -139,15 +145,7 @@ pub fn degrade_old_tool_results(history: &mut [Message], min_reclaim_tokens: usi
         } else {
             // Tier 3: one-liner
             if toks > AGE_TIER2_TOKEN_THRESHOLD {
-                let text_lower = text.to_lowercase();
-                let status = if text_lower.starts_with("error")
-                    || text_lower.starts_with("fail")
-                    || text_lower.contains("\"error\"")
-                {
-                    "error"
-                } else {
-                    "ok"
-                };
+                let status = tool_outcome(text).unwrap_or_else(|| "ok".to_string());
                 let tool_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
                 format!("[tool result {tool_id} — {status}]")
             } else {
@@ -169,6 +167,55 @@ pub fn degrade_old_tool_results(history: &mut [Message], min_reclaim_tokens: usi
         history[i].content = Some(MessageContent::Text(replacement));
     }
     reclaimed
+}
+
+/// Leading wording of the results Borg writes when a call is refused rather
+/// than run: shell policy, blocked paths, Plan mode, and a hook block that
+/// gave no reason.
+const DENIED_PREFIXES: &[&str] = &[
+    crate::tool_handlers::SHELL_DENIED_PREFIX,
+    "Access denied:",
+    constants::PLAN_MODE_MUTATION_DENIED,
+    constants::TOOL_SKIPPED_BY_HOOK,
+];
+
+/// Outcome of a tool result that went wrong, for the stubs that replace it:
+/// `failed (exit N)`, `failed`, `denied`, or `cancelled`. `None` means the
+/// call succeeded.
+///
+/// Executed results carry a `<tool_output …>` wrapper, so the body is read
+/// past it; skipped calls (Plan mode, hook blocks, rate limits) are stored
+/// unwrapped. A shell `Exit code:` line is authoritative when present, so a
+/// clean exit whose output quotes an error stays ok.
+pub(crate) fn tool_outcome(text: &str) -> Option<String> {
+    let body = match text.strip_prefix("<tool_output") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, b)| b),
+        None => text,
+    }
+    .trim_start();
+
+    if let Some(rest) = body.strip_prefix("Exit code:") {
+        return match rest.lines().next().unwrap_or("").trim().parse::<i64>() {
+            Ok(0) => None,
+            Ok(n) => Some(format!("failed (exit {n})")),
+            Err(_) => Some("failed".to_string()),
+        };
+    }
+    if DENIED_PREFIXES.iter().any(|p| body.starts_with(p)) {
+        return Some("denied".to_string());
+    }
+    if body.starts_with(constants::TOOL_CANCELLED_BY_USER) {
+        return Some("cancelled".to_string());
+    }
+    let head = body.get(..6).unwrap_or(body).to_ascii_lowercase();
+    // A JSON result reporting an `"error"` key counts as a failure too.
+    if head.starts_with("error")
+        || head.starts_with("failed")
+        || (body.starts_with('{') && body.contains("\"error\""))
+    {
+        return Some("failed".to_string());
+    }
+    None
 }
 
 /// Truncate text to first 3 lines + omission note + last 2 lines.
@@ -616,5 +663,177 @@ mod tests {
         assert!(result.contains("line 0"));
         assert!(result.contains("lines omitted"));
         assert!(result.contains("line 19"));
+    }
+
+    // -- tool_outcome --
+
+    /// Wrap a body the way `tool_execution` stores an executed tool result.
+    fn wrapped(name: &str, body: &str) -> String {
+        format!("<tool_output name=\"{name}\" trust=\"external\">\n{body}\n</tool_output>")
+    }
+
+    fn padded_output(lines: usize) -> String {
+        (0..lines)
+            .map(|j| format!("line {j} of output\n"))
+            .collect()
+    }
+
+    #[test]
+    fn tool_outcome_reads_real_result_shapes() {
+        let out = padded_output(5);
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            (
+                "shell exit 0",
+                wrapped(
+                    "run_shell",
+                    &format!("Exit code: 0\n--- stdout ---\n{out}--- stderr ---\n"),
+                ),
+                None,
+            ),
+            (
+                "shell exit 0 quoting an error",
+                wrapped(
+                    "run_shell",
+                    "Exit code: 0\n--- stdout ---\nError: none\n--- stderr ---\n",
+                ),
+                None,
+            ),
+            (
+                "shell exit 1",
+                wrapped(
+                    "run_shell",
+                    &format!("Exit code: 1\n--- stdout ---\n{out}--- stderr ---\n"),
+                ),
+                Some("failed (exit 1)"),
+            ),
+            (
+                "shell killed (-1)",
+                wrapped(
+                    "run_shell",
+                    "Exit code: -1\n--- stdout ---\n\n--- stderr ---\n",
+                ),
+                Some("failed (exit -1)"),
+            ),
+            (
+                "tty exit 2",
+                wrapped(
+                    "run_shell",
+                    &format!("Exit code: 2\n--- output (tty) ---\n{out}"),
+                ),
+                Some("failed (exit 2)"),
+            ),
+            (
+                "shell policy denial",
+                wrapped(
+                    "run_shell",
+                    &format!(
+                        "{} by policy: recursive delete of /",
+                        crate::tool_handlers::SHELL_DENIED_PREFIX
+                    ),
+                ),
+                Some("denied"),
+            ),
+            (
+                "blocked path",
+                wrapped(
+                    "read_file",
+                    "Access denied: /home/u/.ssh/id_rsa is in a blocked path.",
+                ),
+                Some("denied"),
+            ),
+            (
+                "plan mode (unwrapped skip)",
+                constants::PLAN_MODE_MUTATION_DENIED.into(),
+                Some("denied"),
+            ),
+            (
+                "hook block without reason",
+                constants::TOOL_SKIPPED_BY_HOOK.into(),
+                Some("denied"),
+            ),
+            (
+                "user cancel",
+                constants::TOOL_CANCELLED_BY_USER.into(),
+                Some("cancelled"),
+            ),
+            (
+                "handler error",
+                wrapped("web_fetch", "Error: connection refused"),
+                Some("failed"),
+            ),
+            (
+                "rate limit (unwrapped skip)",
+                "Error: rate limit exceeded for shell commands".into(),
+                Some("failed"),
+            ),
+            (
+                "json error result",
+                wrapped("schedule", "{\"error\": \"no such task\"}"),
+                Some("failed"),
+            ),
+            ("plain success", wrapped("read_file", &out), None),
+            (
+                "success mentioning failure mid-text",
+                wrapped("read_file", "fn main() {}\n// Failed attempts are logged\n"),
+                None,
+            ),
+        ];
+        for (label, text, want) in cases {
+            assert_eq!(tool_outcome(&text).as_deref(), want, "{label}: {text}");
+        }
+    }
+
+    #[test]
+    fn degraded_one_liner_keeps_the_failure() {
+        let mut history = make_history(12);
+        let body = format!(
+            "Exit code: 2\n--- stdout ---\n{}--- stderr ---\nboom\n",
+            padded_output(50)
+        );
+        history[2] = make_tool_result("call_0", &wrapped("run_shell", &body));
+        let ok_body = format!("Exit code: 0\n--- stdout ---\n{}", padded_output(50));
+        history[5] = make_tool_result("call_1", &wrapped("run_shell", &ok_body));
+
+        age_based_tool_result_degradation(&mut history);
+
+        assert_eq!(
+            history[2].text_content().unwrap(),
+            "[tool result call_0 — failed (exit 2)]"
+        );
+        assert_eq!(
+            history[5].text_content().unwrap(),
+            "[tool result call_1 — ok]"
+        );
+    }
+
+    #[test]
+    fn compacted_placeholder_keeps_the_failure() {
+        let failing = wrapped(
+            "run_shell",
+            &format!("Exit code: 1\n--- stdout ---\n{}", padded_output(40)),
+        );
+        let passing = wrapped(
+            "run_shell",
+            &format!("Exit code: 0\n--- stdout ---\n{}", padded_output(40)),
+        );
+        let mut history = vec![
+            make_user("a"),
+            make_assistant("b"),
+            make_tool_call_msg("", "c1", "run_shell"),
+            make_tool_result("c1", &failing),
+            make_tool_call_msg("", "c2", "run_shell"),
+            make_tool_result("c2", &passing),
+        ];
+
+        compact_tool_results(&mut history, 1);
+
+        assert_eq!(
+            history[3].text_content().unwrap(),
+            "[compacted: output removed — failed (exit 1)]"
+        );
+        assert_eq!(
+            history[5].text_content().unwrap(),
+            "[compacted: output removed]"
+        );
     }
 }

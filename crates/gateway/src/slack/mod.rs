@@ -48,6 +48,23 @@ pub enum SlackWebhookResult {
     Skip,
 }
 
+/// Whether `gateway.slack_channel_allowlist` admits traffic from `channel_id`.
+///
+/// A missing or empty allowlist admits everything. Direct messages (channel
+/// ids starting with `D`) always pass — DM access is gated by `dm_policy`, not
+/// this list. Anything else must be listed; a missing channel id fails closed
+/// once the allowlist is active. Shared by the events path and slash commands
+/// so the two entry points cannot drift.
+pub fn channel_allowed(allowlist: Option<&[String]>, channel_id: Option<&str>) -> bool {
+    let Some(allowlist) = allowlist.filter(|l| !l.is_empty()) else {
+        return true;
+    };
+    let Some(channel_id) = channel_id else {
+        return false;
+    };
+    channel_id.starts_with('D') || allowlist.iter().any(|c| c == channel_id)
+}
+
 /// Handle a Slack webhook request.
 ///
 /// If `signing_secret` is provided, the request signature is verified on all requests.
@@ -112,6 +129,32 @@ mod tests {
     use std::sync::Arc;
 
     type HmacSha256 = Hmac<Sha256>;
+
+    /// Allowlist semantics: unset/empty admits all; DMs always pass; an
+    /// active list admits only listed channels and fails closed on a
+    /// missing channel id.
+    #[test]
+    fn channel_allowed_table() {
+        let list: &[String] = &["C1".to_string()];
+        let empty: &[String] = &[];
+        let cases = [
+            (None, Some("C2"), true),
+            (Some(empty), Some("C2"), true),
+            (Some(empty), None, true),
+            (Some(list), Some("C1"), true),
+            (Some(list), Some("D9"), true),
+            (Some(list), Some("C2"), false),
+            (Some(list), Some("G7"), false),
+            (Some(list), None, false),
+        ];
+        for (allow, channel, want) in cases {
+            assert_eq!(
+                channel_allowed(allow, channel),
+                want,
+                "allowlist {allow:?}, channel {channel:?}"
+            );
+        }
+    }
 
     fn compute_signature(secret: &str, timestamp: &str, body: &str) -> String {
         let sig_basestring = format!("v0:{timestamp}:{body}");

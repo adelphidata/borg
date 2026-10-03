@@ -4491,6 +4491,238 @@ async fn custom_fallback_slot_never_borrows_the_default_provider_key() {
     }
 }
 
+#[test]
+fn same_origin_compares_scheme_host_and_effective_port() {
+    let cases = [
+        (
+            "https://api.openai.com/v1/x",
+            "https://API.openai.com:443/y",
+            true,
+        ),
+        ("http://h.example/a", "http://h.example:80/b", true),
+        (
+            "https://api.openai.com/v1",
+            "http://api.openai.com:8080/v1",
+            false,
+        ),
+        (
+            "https://api.openai.com/v1",
+            "https://api.openai.com:8443/v1",
+            false,
+        ),
+        (
+            "https://api.openai.com/v1",
+            "http://api.openai.com/v1",
+            false,
+        ),
+        (
+            "https://api.openai.com/v1",
+            "https://evil.example/v1",
+            false,
+        ),
+        ("https://api.openai.com/v1", "not a url", false),
+        ("", "", false),
+    ];
+    for (a, b, expected) in cases {
+        assert_eq!(super::same_origin(a, b), expected, "{a} vs {b}");
+    }
+}
+
+#[tokio::test]
+async fn for_auxiliary_same_provider_keeps_main_key_only_on_main_origin() {
+    // Regression: an aux block on the primary's provider that named its own
+    // `base_url` but no key inherited the primary's credentials and sent them
+    // to the new URL — a different port or host received the main API key.
+    let main_env = "BORG_TEST_AUX_ORIGIN_MAIN_KEY";
+    let aux_env = "BORG_TEST_AUX_ORIGIN_OWN_KEY";
+    std::env::set_var(main_env, "sk-main-origin-key");
+    std::env::set_var(aux_env, "sk-aux-own-key");
+
+    // (provider, main base_url, aux base_url, aux api_key_env, expected key;
+    //  None = the aux client must not build with any key)
+    type Case<'a> = (&'a str, Option<&'a str>, &'a str, &'a str, Option<&'a str>);
+    let cases: [Case; 7] = [
+        // Azure primary with no base_url talks to the resource URL composed
+        // from `llm.azure_*`; an aux on that resource keeps the key.
+        (
+            "azure-openai",
+            None,
+            "https://my-resource.openai.azure.com/openai/deployments/mini/chat/completions?api-version=2024-10-21",
+            "",
+            Some("sk-main-origin-key"),
+        ),
+        // Azure aux on another resource: the main key is not sent there.
+        (
+            "azure-openai",
+            None,
+            "https://other-resource.openai.azure.com/openai/deployments/mini/chat/completions",
+            "",
+            None,
+        ),
+        // Default primary origin, aux on another port: no key.
+        ("openai", None, "http://api.openai.com:8080/v1", "", None),
+        // Identical origin to the provider default: key kept.
+        (
+            "openai",
+            None,
+            "https://api.openai.com/v1/chat/completions",
+            "",
+            Some("sk-main-origin-key"),
+        ),
+        // Identical origin to a configured primary base_url: key kept.
+        (
+            "openai",
+            Some("https://proxy.example/v1"),
+            "https://PROXY.example:443/other",
+            "",
+            Some("sk-main-origin-key"),
+        ),
+        // Aux brings its own key for its own endpoint: that key is used.
+        (
+            "openai",
+            None,
+            "https://elsewhere.example/v1",
+            aux_env,
+            Some("sk-aux-own-key"),
+        ),
+        // Keyless-capable custom endpoint: builds, but with no inherited key.
+        (
+            "custom",
+            Some("https://a.example/v1"),
+            "https://b.example/v1",
+            "",
+            Some(""),
+        ),
+    ];
+    for (provider, main_url, aux_url, aux_key_env, expected) in cases {
+        let mut config = Config::default();
+        config.llm.provider = Some(provider.to_string());
+        config.llm.api_key_env = main_env.to_string();
+        config.llm.model = "gpt-5".to_string();
+        config.llm.base_url = main_url.map(str::to_string);
+        // Only read by the Azure rows.
+        config.llm.azure_resource = Some("my-resource".to_string());
+        config.llm.azure_deployment = Some("main".to_string());
+        config.llm.azure_api_version = Some("2024-10-21".to_string());
+        config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+            provider: Some(provider.to_string()),
+            model: "gpt-5-mini".to_string(),
+            api_key_env: aux_key_env.to_string(),
+            base_url: Some(aux_url.to_string()),
+            ..Default::default()
+        });
+        let built = LlmClient::for_auxiliary(&config).await;
+        let label = format!("provider={provider} main={main_url:?} aux={aux_url}");
+        match expected {
+            None => {
+                let err = built
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: must refuse"));
+                assert!(
+                    !err.to_string().contains("sk-main-origin-key"),
+                    "{label}: {err}"
+                );
+            }
+            Some(key) => {
+                let client = built.unwrap_or_else(|e| panic!("{label}: {e}"));
+                assert_eq!(client.api_key, key, "{label}");
+                assert_eq!(
+                    client.llm_config.base_url.as_deref(),
+                    Some(aux_url),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    std::env::remove_var(main_env);
+    std::env::remove_var(aux_env);
+}
+
+#[tokio::test]
+// Holds the default-env lock across the await; see the test above.
+#[allow(clippy::await_holding_lock)]
+async fn fallback_slot_default_env_key_only_reaches_the_provider_origin() {
+    // A fallback slot that points at its own `base_url` and names no key used
+    // to pick up the provider's default env key and send it to that URL.
+    let _env = crate::constants::default_llm_api_key_env_lock();
+    let key_var = crate::constants::DEFAULT_LLM_API_KEY_ENV;
+    let _restore = RestoreEnv::set(key_var, "sk-or-default-key");
+
+    let config = Config::default();
+    // (base_url, explicit api_key_env, expect the default key)
+    let cases: [(Option<&str>, Option<&str>, bool); 4] = [
+        (None, None, true),
+        (Some("https://openrouter.ai/api/v1/other"), None, true),
+        (Some("https://proxy.example/v1"), None, false),
+        // Naming the variable explicitly is the operator's choice.
+        (Some("https://proxy.example/v1"), Some(key_var), true),
+    ];
+    for (base_url, api_key_env, expect_key) in cases {
+        let fb = crate::config::LlmFallback {
+            provider: "openrouter".to_string(),
+            model: "some-model".to_string(),
+            api_key: None,
+            api_key_env: api_key_env.map(str::to_string),
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: base_url.map(str::to_string),
+        };
+        let got_key = LlmClient::resolve_fallback_slot(&fb, &config)
+            .await
+            .is_ok_and(|slot| slot.keys.iter().any(|k| k == "sk-or-default-key"));
+        assert_eq!(
+            got_key, expect_key,
+            "base_url={base_url:?} api_key_env={api_key_env:?}"
+        );
+    }
+
+    // Azure has no static default URL: its origin is the resource URL that
+    // `llm.azure_*` composes. The key is stored as a credential (not the
+    // shared `AZURE_OPENAI_API_KEY` env var) so no other test races on it.
+    let azure_key_env = "BORG_TEST_FB_AZURE_RESOURCE_KEY";
+    let _azure_key = RestoreEnv::set(azure_key_env, "azure-resource-key");
+    let mut config = Config::default();
+    config.llm.azure_resource = Some("my-resource".to_string());
+    config.llm.azure_deployment = Some("main".to_string());
+    config.llm.azure_api_version = Some("2024-10-21".to_string());
+    config.credentials.insert(
+        "AZURE_OPENAI_API_KEY".to_string(),
+        crate::config::CredentialValue::EnvVar(azure_key_env.to_string()),
+    );
+    let azure_cases = [
+        (
+            "https://my-resource.openai.azure.com/openai/deployments/fb/chat/completions",
+            true,
+        ),
+        (
+            "https://other-resource.openai.azure.com/openai/deployments/fb/chat/completions",
+            false,
+        ),
+    ];
+    for (base_url, expect_key) in azure_cases {
+        let fb = crate::config::LlmFallback {
+            provider: "azure-openai".to_string(),
+            model: "fb".to_string(),
+            api_key: None,
+            api_key_env: None,
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: Some(base_url.to_string()),
+        };
+        let slot = LlmClient::resolve_fallback_slot(&fb, &config)
+            .await
+            .unwrap_or_else(|e| panic!("{base_url}: {e}"));
+        assert_eq!(
+            slot.keys.iter().any(|k| k == "azure-resource-key"),
+            expect_key,
+            "{base_url}"
+        );
+    }
+}
+
 // ── stream_options compatibility resend ──
 
 /// An OpenAI-compatible endpoint that refuses unknown request keys: 400 on

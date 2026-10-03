@@ -330,33 +330,255 @@ pub(crate) fn git_config_env(overrides: &[(String, String)]) -> Vec<(String, Str
 }
 
 /// Discover the repository's configured executable filter drivers and return
-/// the `GIT_CONFIG_*` env entries that neutralize them. Best-effort: discovery
-/// failures log and yield no overrides (the hardening prelude still applies).
-async fn filter_neutralizing_env(cwd: &Path) -> Vec<(String, String)> {
-    let mut discovery = tokio::process::Command::new("git");
-    discovery.args(filter_discovery_argv()).current_dir(cwd);
-    harden_git_command(&mut discovery);
-    let result = run_with_timeout(discovery).await;
-    let stdout = match result {
-        // `--get-regexp` exits 1 when nothing matches — that's the common case.
-        Ok(Ok(o)) if o.status.success() || o.status.code() == Some(1) => o.stdout,
-        Ok(Ok(o)) => {
-            tracing::warn!(
-                "git filter-driver discovery failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return Vec::new();
+/// the `GIT_CONFIG_*` env entries that neutralize them.
+///
+/// Fails closed: when discovery cannot run, or the repository carries a
+/// conditional include (see [`neutralizing_env_from_probes`]), the caller gets
+/// an error and must not run the git command it was guarding. Running it
+/// without overrides is exactly the case the overrides exist to prevent.
+async fn filter_neutralizing_env(cwd: &Path) -> Result<Vec<(String, String)>> {
+    let (includes, filters) = tokio::join!(repo_conditional_include_probe(cwd), async {
+        config_probe_stdout(
+            "filter-driver",
+            run_config_probe(cwd, filter_discovery_argv()).await,
+        )
+    });
+    neutralizing_env_from_probes(includes, filters)
+}
+
+/// Run one `git config` probe under the timeout. A timeout comes back as an
+/// `ErrorKind::TimedOut` error, the same shape the blocking runner reports.
+async fn run_config_probe(
+    cwd: &Path,
+    argv: Vec<&'static str>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(argv).current_dir(cwd);
+    harden_git_command(&mut cmd);
+    run_with_timeout(cmd).await.unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ))
+    })
+}
+
+/// The repository's conditional includes, as `<scope>\0<key>\0` records (see
+/// [`repo_conditional_includes`]). Uses `--show-scope` (git 2.26+), and on an
+/// older git that rejects the option falls back to per-scope probes.
+async fn repo_conditional_include_probe(cwd: &Path) -> Result<String> {
+    let scoped = run_config_probe(cwd, conditional_include_probe_argv()).await;
+    if let Some(stdout) = scoped_include_probe_stdout(scoped)? {
+        return Ok(stdout);
+    }
+    let local = run_config_probe(cwd, legacy_include_probe_argv("--local")).await;
+    let worktree = run_config_probe(cwd, legacy_include_probe_argv("--worktree")).await;
+    legacy_include_probe_stdout(local, worktree)
+}
+
+/// [`filter_neutralizing_env`] for the blocking git runners in the patch
+/// applicator. Same fail-closed contract.
+pub(crate) fn filter_neutralizing_env_sync(cwd: &Path) -> Result<Vec<(String, String)>> {
+    let probe = |argv: Vec<&'static str>| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(argv).current_dir(cwd);
+        harden_git_command_sync(&mut cmd);
+        run_sync_with_timeout(cmd)
+    };
+    let includes = match scoped_include_probe_stdout(probe(conditional_include_probe_argv())) {
+        Ok(Some(stdout)) => Ok(stdout),
+        Ok(None) => legacy_include_probe_stdout(
+            probe(legacy_include_probe_argv("--local")),
+            probe(legacy_include_probe_argv("--worktree")),
+        ),
+        Err(e) => Err(e),
+    };
+    neutralizing_env_from_probes(
+        includes,
+        config_probe_stdout("filter-driver", probe(filter_discovery_argv())),
+    )
+}
+
+/// Outcome of the `--show-scope` conditional-include probe: its stdout, or
+/// `None` when this git predates the option (2.26) and the per-scope fallback
+/// must run instead. Any other failure is an error.
+///
+/// An unknown option is a usage error: git exits 129 and says "unknown
+/// option". Either signal counts, so a git that words it differently still
+/// takes the fallback rather than refusing every guarded command.
+fn scoped_include_probe_stdout(
+    output: std::io::Result<std::process::Output>,
+) -> Result<Option<String>> {
+    if let Ok(o) = &output {
+        let failed = !o.status.success() && o.status.code() != Some(1);
+        let unsupported = failed
+            && (o.status.code() == Some(129)
+                || String::from_utf8_lossy(&o.stderr).contains("unknown option"));
+        if unsupported {
+            tracing::debug!("git config lacks --show-scope; probing includes per scope");
+            return Ok(None);
         }
-        Ok(Err(e)) => {
-            tracing::warn!("git filter-driver discovery failed to spawn: {e}");
-            return Vec::new();
-        }
-        Err(_) => {
-            tracing::warn!("git filter-driver discovery timed out");
-            return Vec::new();
+    }
+    config_probe_stdout("conditional-include", output).map(Some)
+}
+
+/// Argv (hardening prelude included) for the pre-2.26 fallback: the
+/// conditional-include keys of one scope (`--local` or `--worktree`).
+/// `--includes` is stated because a scope flag turns include-following off by
+/// default, and an `includeIf` nested in a file the repository includes
+/// unconditionally must still show up.
+pub(crate) fn legacy_include_probe_argv(scope: &'static str) -> Vec<&'static str> {
+    let mut argv: Vec<&str> = hardened_prelude().to_vec();
+    argv.extend([
+        "config",
+        scope,
+        "--includes",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        CONDITIONAL_INCLUDE_PATTERN,
+    ]);
+    argv
+}
+
+/// Combine the pre-2.26 `--local` and `--worktree` probes into the
+/// `<scope>\0<key>\0` records the `--show-scope` probe produces.
+///
+/// The local probe must succeed: its failure is fail-closed, and the error
+/// asks for a newer git, the one change that removes this path. The worktree
+/// probe may fail and is skipped — git rejects `--worktree` when it predates
+/// 2.20 or when a repository with several worktrees has not enabled
+/// `extensions.worktreeConfig`, and in both cases git reads no worktree
+/// config file at all, so there is no include there to miss.
+fn legacy_include_probe_stdout(
+    local: std::io::Result<std::process::Output>,
+    worktree: std::io::Result<std::process::Output>,
+) -> Result<String> {
+    let local = config_probe_stdout("conditional-include", local).context(
+        "cannot check this repository's config for conditional includes; upgrade git to 2.26+",
+    )?;
+    let worktree = match config_probe_stdout("worktree conditional-include", worktree) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            tracing::debug!("skipping worktree-scope include probe: {e:#}");
+            String::new()
         }
     };
-    neutralizing_env_from_stdout(&String::from_utf8_lossy(&stdout))
+    // Without `extensions.worktreeConfig`, `--worktree` reads the local file
+    // again, so a key both probes report is listed once.
+    let mut seen = std::collections::HashSet::new();
+    let mut records = String::new();
+    for (scope, stdout) in [("local", &local), ("worktree", &worktree)] {
+        for key in stdout
+            .split('\0')
+            .filter(|k| !k.is_empty() && seen.insert(*k))
+        {
+            records.push_str(scope);
+            records.push('\0');
+            records.push_str(key);
+            records.push('\0');
+        }
+    }
+    Ok(records)
+}
+
+/// Stdout of a `git config --get-regexp` probe, or an error when the probe did
+/// not run to completion. `--get-regexp` exits 1 when nothing matches — the
+/// common case — so only other exit codes are failures.
+fn config_probe_stdout(
+    probe: &str,
+    output: std::io::Result<std::process::Output>,
+) -> Result<String> {
+    let output = output.with_context(|| format!("git {probe} discovery failed to run"))?;
+    if output.status.success() || output.status.code() == Some(1) {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    anyhow::bail!(
+        "git {probe} discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+/// Combine the two discovery probes into the neutralizing env, refusing a
+/// repository that carries its own conditional includes.
+///
+/// Discovery reads the configuration as it applies *now*, in this directory,
+/// on this branch. An `includeIf` in the repository's own config can load a
+/// different file under conditions the guarded command itself brings about —
+/// `onbranch:` once `worktree add` checks out a new branch, `gitdir:` in the
+/// new checkout's directory — and a filter defined there was never seen, so
+/// it cannot be blanked. The operator's own (global/system) includes are not
+/// repository-controlled and are left alone.
+pub(crate) fn neutralizing_env_from_probes(
+    includes: Result<String>,
+    filters: Result<String>,
+) -> Result<Vec<(String, String)>> {
+    let includes = repo_conditional_includes(&includes?);
+    if !includes.is_empty() {
+        anyhow::bail!(
+            "refusing to run git here: this repository's config has conditional \
+             includes ({}) that can load content filters Borg cannot neutralize. \
+             Remove the includeIf entries from the repository's .git/config, then retry",
+            includes.join(", ")
+        );
+    }
+    Ok(neutralizing_env_from_stdout(&filters?))
+}
+
+/// Pattern for `includeIf.<condition>.path` keys (git lowercases the section).
+const CONDITIONAL_INCLUDE_PATTERN: &str = r"^includeif\.";
+
+/// Argv (hardening prelude included) that lists every conditional include
+/// with the scope it came from. Includes are followed, so an `includeIf`
+/// nested in a file the repository includes unconditionally still shows up —
+/// attributed to the scope of the file that included it.
+pub(crate) fn conditional_include_probe_argv() -> Vec<&'static str> {
+    let mut argv: Vec<&str> = hardened_prelude().to_vec();
+    argv.extend([
+        "config",
+        "--show-scope",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        CONDITIONAL_INCLUDE_PATTERN,
+    ]);
+    argv
+}
+
+/// The conditional-include keys in `--show-scope --null --name-only` output
+/// (`<scope>\0<key>\0` records) that the repository itself controls: the
+/// `local` and `worktree` scopes.
+pub(crate) fn repo_conditional_includes(stdout: &str) -> Vec<String> {
+    let fields: Vec<&str> = stdout.split('\0').collect();
+    fields
+        .chunks(2)
+        .filter_map(|record| match record {
+            [scope, key] if matches!(*scope, "local" | "worktree") => Some((*key).to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run a git command that can execute content filters — anything that checks
+/// files out (`worktree add`, `restore`) or compares the worktree with the
+/// index (`status`, `worktree remove`) — with every discovered filter driver
+/// neutralized. Refuses, with an error, when discovery fails.
+pub(crate) async fn run_git_neutralized(args: &[&str], cwd: &Path) -> Result<String> {
+    run_git_neutralized_with_env(args, cwd, &[]).await
+}
+
+/// [`run_git_neutralized`] with extra environment entries, e.g. `LC_ALL=C`
+/// for a caller that matches git's error text.
+pub(crate) async fn run_git_neutralized_with_env(
+    args: &[&str],
+    cwd: &Path,
+    extra_env: &[(String, String)],
+) -> Result<String> {
+    let mut env = filter_neutralizing_env(cwd)
+        .await
+        .with_context(|| format!("git {} not run", args.join(" ")))?;
+    env.extend_from_slice(extra_env);
+    run_git_inner(args, cwd, &env).await
 }
 
 /// Argv (hardening prelude included) that lists a repository's configured
@@ -610,7 +832,9 @@ async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
                 // stale answer (or the same error) for the process lifetime,
                 // and `workspace_fingerprint` would stop noticing real edits.
                 let _entry = InFlightEntry(scan_key.clone());
-                run_git(&["status", "--porcelain"], &scan_key)
+                // `status` runs a repository's clean filter on any file whose
+                // stat data changed, so it is a filter-executing command.
+                run_git_neutralized(&["status", "--porcelain"], &scan_key)
                     .await
                     .map_err(|e| e.to_string())
             });
@@ -856,7 +1080,9 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
 
     // `add`/`read-tree` would otherwise run repo-configured content filters
     // (`filter.<name>.clean`/`.process`) against an untrusted tree.
-    let filter_env = filter_neutralizing_env(repo_root).await;
+    let filter_env = filter_neutralizing_env(repo_root)
+        .await
+        .context("ghost snapshot not taken")?;
 
     if has_head {
         run_git_with_index(&tmp_path, &["read-tree", "HEAD"], repo_root, &filter_env).await?;
@@ -914,7 +1140,10 @@ pub async fn restore_ghost_commit(repo_root: &Path, commit: &GhostCommit) -> Res
 
     // Restore all tracked files from the ghost commit. Worktree checkout runs
     // `filter.<name>.smudge`/`.process` drivers, so neutralize them too.
-    let filter_env = filter_neutralizing_env(repo_root).await;
+    // Nothing has been touched yet, so refusing here leaves the tree intact.
+    let filter_env = filter_neutralizing_env(repo_root)
+        .await
+        .context("ghost undo not run; nothing was changed")?;
     // `git restore` writes file by file with no transaction, so a mid-run
     // failure leaves the tree part-restored. Do not early-return on it: the
     // post-snapshot cleanup below is the other half of the undo, and skipping
@@ -1009,6 +1238,56 @@ async fn run_git_with_index(
     let mut env = vec![("GIT_INDEX_FILE".to_string(), index_path.to_string())];
     env.extend_from_slice(filter_env);
     run_git_inner(args, cwd, &env).await
+}
+
+/// Fixtures shared by the git and worktree tests.
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// Run a fixture `git` command in `dir`, isolated from the developer's
+    /// global and system config, and assert it succeeds.
+    pub fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("spawn git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// Arm the repository at `dir` (which must have a commit) with a hostile
+    /// content filter on every path: its smudge and clean commands create the
+    /// returned sentinel, and `required` turns a missing driver into an error.
+    /// The sentinel sits outside the repository so a filter run from any
+    /// checkout of it is caught.
+    pub fn arm_evil_content_filter(dir: &Path, sentinel_dir: &Path) -> PathBuf {
+        // Committed before the filter exists, so arming it runs nothing.
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        git(dir, &["add", ".gitattributes"]);
+        git(dir, &["commit", "-qm", "attributes"]);
+        let sentinel = sentinel_dir.join("PWNED");
+        let cmd = format!("touch '{}'; cat", sentinel.display());
+        git(dir, &["config", "filter.evil.smudge", &cmd]);
+        git(dir, &["config", "filter.evil.clean", &cmd]);
+        git(dir, &["config", "filter.evil.required", "true"]);
+        sentinel
+    }
+
+    /// Move `path`'s mtime forward so git can no longer trust its stat data
+    /// and has to run the clean filter to compare content.
+    pub fn touch_forward(path: &Path) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -2411,5 +2690,219 @@ mod tests {
             .await
             .expect("git must still run with a filtered environment");
         assert!(!head.is_empty(), "expected a branch name, got {head:?}");
+    }
+
+    /// Only the repository's own scopes are refused: an operator's global
+    /// `includeIf "gitdir:~/work/"` (the common work-email setup) must not
+    /// block every git call.
+    #[test]
+    fn only_repository_scoped_conditional_includes_are_reported() {
+        let cases: &[(&str, &[&str])] = &[
+            ("", &[]),
+            (
+                "local\0includeif.onbranch:x.path\0",
+                &["includeif.onbranch:x.path"],
+            ),
+            (
+                "worktree\0includeif.gitdir:/w/.path\0",
+                &["includeif.gitdir:/w/.path"],
+            ),
+            ("global\0includeif.gitdir:~/work/.path\0", &[]),
+            ("system\0includeif.a.path\0command\0includeif.b.path\0", &[]),
+            (
+                "global\0includeif.g.path\0local\0includeif.l.path\0",
+                &["includeif.l.path"],
+            ),
+        ];
+        for (stdout, want) in cases {
+            assert_eq!(repo_conditional_includes(stdout), *want, "for {stdout:?}");
+        }
+    }
+
+    /// Discovery fails closed: a probe that did not complete, or a repository
+    /// with its own conditional include, is an error — never an empty set of
+    /// overrides that lets the guarded command run unprotected.
+    #[cfg(unix)]
+    #[test]
+    fn filter_discovery_fails_closed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exited = |code: i32| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: b"fatal: bad config line 3".to_vec(),
+            })
+        };
+        assert_eq!(config_probe_stdout("p", exited(1)).unwrap(), "", "no match");
+        assert!(config_probe_stdout("p", exited(128)).is_err());
+        assert!(config_probe_stdout("p", Err(std::io::Error::other("no git"))).is_err());
+
+        let ok = |s: &str| Ok(s.to_string());
+        let failed = || Err(anyhow::anyhow!("probe failed"));
+        assert!(neutralizing_env_from_probes(ok(""), failed()).is_err());
+        assert!(neutralizing_env_from_probes(failed(), ok("")).is_err());
+        let refused =
+            neutralizing_env_from_probes(ok("local\0includeif.onbranch:x.path\0"), ok(""))
+                .unwrap_err();
+        assert!(
+            refused.to_string().contains("includeif.onbranch:x.path"),
+            "the refusal must name the include: {refused}"
+        );
+        let env = neutralizing_env_from_probes(ok(""), ok("filter.evil.clean\0")).unwrap();
+        assert!(
+            env.contains(&(
+                "GIT_CONFIG_KEY_0".to_string(),
+                "filter.evil.clean".to_string()
+            )),
+            "a clean repository still gets its filters neutralized: {env:?}"
+        );
+    }
+
+    /// A git older than 2.26 rejects `--show-scope`; that must take the
+    /// per-scope fallback, not fail closed for every guarded command. Only a
+    /// failure of the fallback's local probe refuses, and it names the fix.
+    #[cfg(unix)]
+    #[test]
+    fn include_probe_falls_back_when_show_scope_is_unknown() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let out = |code: i32, stdout: &str, stderr: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        let unknown = "error: unknown option `show-scope'\nusage: git config [<options>]";
+        // Expected: Some(Some(stdout)) / Some(None) = fall back / None = error.
+        type Want = Option<Option<&'static str>>;
+        // (case, probe output, expected)
+        let cases: Vec<(&str, std::io::Result<std::process::Output>, Want)> = vec![
+            (
+                "match",
+                out(0, "local\0includeif.a.path\0", ""),
+                Some(Some("local\0includeif.a.path\0")),
+            ),
+            ("no match", out(1, "", ""), Some(Some(""))),
+            ("usage exit", out(129, "", unknown), Some(None)),
+            (
+                "unknown option, other code",
+                out(128, "", unknown),
+                Some(None),
+            ),
+            ("bad config", out(128, "", "fatal: bad config line 3"), None),
+            ("spawn failure", Err(std::io::Error::other("no git")), None),
+        ];
+        for (case, output, want) in cases {
+            let got = scoped_include_probe_stdout(output);
+            match want {
+                Some(want) => assert_eq!(got.unwrap().as_deref(), want, "{case}"),
+                None => assert!(got.is_err(), "{case}: must fail closed"),
+            }
+        }
+
+        let both = legacy_include_probe_stdout(
+            out(0, "includeif.onbranch:x.path\0", ""),
+            out(0, "includeif.gitdir:/w/.path\0", ""),
+        )
+        .unwrap();
+        assert_eq!(
+            repo_conditional_includes(&both),
+            vec!["includeif.onbranch:x.path", "includeif.gitdir:/w/.path"]
+        );
+        let worktree_rejected = legacy_include_probe_stdout(
+            out(1, "", ""),
+            out(
+                128,
+                "",
+                "fatal: --worktree cannot be used with multiple working trees",
+            ),
+        )
+        .unwrap();
+        assert_eq!(worktree_rejected, "", "a rejected --worktree is skipped");
+        let local_failed =
+            legacy_include_probe_stdout(out(128, "", "fatal: bad config line 3"), out(1, "", ""))
+                .unwrap_err();
+        assert!(
+            format!("{local_failed:#}").contains("upgrade git to 2.26+"),
+            "{local_failed:#}"
+        );
+    }
+
+    /// The fallback argv, run against a real git, finds a repository's own
+    /// conditional include — including one nested in a file the repository
+    /// includes unconditionally, which a scoped probe skips by default.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_include_probe_finds_local_and_nested_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        std::fs::write(
+            dir.join(".git/nested.cfg"),
+            "[includeIf \"onbranch:evil\"]\n\tpath = evil.cfg\n",
+        )
+        .unwrap();
+        test_support::git(dir, &["config", "include.path", "nested.cfg"]);
+        let run = |argv: Vec<&'static str>| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(argv).current_dir(dir);
+            harden_git_command_sync(&mut cmd);
+            run_sync_with_timeout(cmd)
+        };
+        let records = legacy_include_probe_stdout(
+            run(legacy_include_probe_argv("--local")),
+            run(legacy_include_probe_argv("--worktree")),
+        )
+        .unwrap();
+        assert!(
+            repo_conditional_includes(&records)
+                .contains(&"includeif.onbranch:evil.path".to_string()),
+            "{records:?}"
+        );
+    }
+
+    /// `git status` runs the clean filter on a file whose stat data changed,
+    /// so the shared status scan must neutralize it like any other
+    /// filter-executing command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_scan_never_runs_a_repo_clean_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo_with_commit(&repo);
+        let sentinel = test_support::arm_evil_content_filter(&repo, tmp.path());
+        test_support::touch_forward(&repo.join("a.txt"));
+
+        let status = git_status_porcelain(&repo).await;
+        assert_eq!(status, Ok(String::new()), "content is unchanged");
+        assert!(
+            !sentinel.exists(),
+            "a repo-configured clean filter ran during git status"
+        );
+    }
+
+    /// A repository's own `includeIf` can load filters discovery never saw,
+    /// so every filter-guarded operation refuses it — and says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repo_conditional_include_refuses_filter_guarded_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        test_support::git(dir, &["config", "includeIf.onbranch:evil.path", "evil.cfg"]);
+
+        let status = run_git_neutralized(&["status", "--porcelain"], dir)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{status:#}").contains("conditional includes"),
+            "{status:#}"
+        );
+        let snapshot = create_ghost_commit(dir).await.unwrap_err();
+        assert!(
+            format!("{snapshot:#}").contains("conditional includes"),
+            "{snapshot:#}"
+        );
     }
 }

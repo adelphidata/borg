@@ -150,6 +150,13 @@ impl SessionQueue {
 
         true
     }
+
+    /// Number of live session consumers — lets handler tests observe whether
+    /// a request started a turn.
+    #[cfg(test)]
+    pub(crate) async fn active_sessions(&self) -> usize {
+        self.senders.lock().await.len()
+    }
 }
 
 /// Process work items for a single session sequentially.
