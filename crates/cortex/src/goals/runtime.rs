@@ -7,7 +7,8 @@
 //!
 //! * the per-turn baseline (token usage + wall-clock instant) used to compute
 //!   token/time deltas;
-//! * the one-shot steering message queue (budget-limit / objective-updated)
+//! * the one-shot steering message queue (budget-limit / objective-updated /
+//!   goal-cleared)
 //!   drained before the next LLM call;
 //! * the continuation reservation that prevents a single turn from spawning
 //!   more than one self-continuation.
@@ -35,6 +36,8 @@ pub enum SteeringReason {
     BudgetLimited,
     /// User replaced the objective on an existing Active goal.
     ObjectiveUpdated,
+    /// User cleared the goal the runtime was still tracking.
+    GoalCleared,
 }
 
 /// Volatile runtime state for the goal subsystem.

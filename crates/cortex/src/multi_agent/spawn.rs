@@ -396,10 +396,16 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         ),
     };
 
-    if let Ok(db) = crate::db::Database::open().await {
-        if let Err(e) = db.update_sub_agent_status(&agent_id, &status).await {
-            tracing::warn!(%agent_id, "failed to update sub-agent status: {e}");
+    match crate::db::Database::open().await {
+        Ok(db) => {
+            if let Err(e) = db.update_sub_agent_status(&agent_id, &status).await {
+                tracing::warn!(%agent_id, "failed to update sub-agent status: {e}");
+            }
         }
+        Err(e) => tracing::warn!(
+            %agent_id,
+            "failed to open database; sub-agent final status not persisted: {e:#}"
+        ),
     }
 
     if completion_tx
@@ -530,13 +536,19 @@ fn run_sub_agent(
             max_spawn_depth,
         );
 
-        if let Ok(db) = crate::db::Database::open().await {
-            if let Err(e) = db
-                .update_sub_agent_status(&agent_id, &SubAgentStatus::Running)
-                .await
-            {
-                tracing::warn!(%agent_id, "failed to update sub-agent running status: {e}");
+        match crate::db::Database::open().await {
+            Ok(db) => {
+                if let Err(e) = db
+                    .update_sub_agent_status(&agent_id, &SubAgentStatus::Running)
+                    .await
+                {
+                    tracing::warn!(%agent_id, "failed to update sub-agent running status: {e}");
+                }
             }
+            Err(e) => tracing::warn!(
+                %agent_id,
+                "failed to open database; sub-agent running status not persisted: {e:#}"
+            ),
         }
 
         let (event_tx, mut event_rx) =

@@ -178,6 +178,8 @@ fn spawn_detached_daemon() -> Result<()> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // The detached daemon outlives this client; never root it in our cwd.
+    crate::borgd_launcher::prepare_daemon_command(&mut cmd);
     crate::borgd_launcher::detach_from_console(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("spawning {}", borgd.display()))?;

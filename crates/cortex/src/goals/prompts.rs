@@ -1,4 +1,5 @@
-//! Goal steering prompt builders: continuation, budget-limit, objective-updated.
+//! Goal steering prompt builders: continuation, budget-limit, objective-updated,
+//! goal-cleared.
 //!
 //! Templates are embedded via `include_str!` and parsed once on first use.
 //! Each builder takes the live [`Goal`] state and produces the user-facing
@@ -20,6 +21,7 @@ use crate::template::Template;
 const CONTINUATION_SRC: &str = include_str!("templates/continuation.md");
 const BUDGET_LIMIT_SRC: &str = include_str!("templates/budget_limit.md");
 const OBJECTIVE_UPDATED_SRC: &str = include_str!("templates/objective_updated.md");
+const GOAL_CLEARED_SRC: &str = include_str!("templates/goal_cleared.md");
 
 static CONTINUATION: LazyLock<Template> =
     LazyLock::new(|| Template::parse(CONTINUATION_SRC).expect("continuation template parses"));
@@ -28,6 +30,9 @@ static BUDGET_LIMIT: LazyLock<Template> =
 static OBJECTIVE_UPDATED: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(OBJECTIVE_UPDATED_SRC).expect("objective_updated template parses")
 });
+
+static GOAL_CLEARED: LazyLock<Template> =
+    LazyLock::new(|| Template::parse(GOAL_CLEARED_SRC).expect("goal_cleared template parses"));
 
 /// XML-escape user-supplied text before embedding it inside an objective block.
 /// Prevents tag injection from a malicious objective.
@@ -103,6 +108,15 @@ pub fn objective_updated_prompt(goal: &Goal) -> String {
         .expect("objective_updated template renders")
 }
 
+/// Goal-cleared prompt: pushed once when the user removes the goal row while
+/// the runtime still tracks it. Tells the agent to stop pursuing it. Takes no
+/// goal data — the row is already gone.
+pub fn goal_cleared_prompt() -> String {
+    GOAL_CLEARED
+        .render(std::iter::empty::<(&str, String)>())
+        .expect("goal_cleared template renders")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +170,13 @@ mod tests {
         let out = objective_updated_prompt(&sample_goal());
         assert!(out.contains("supersedes"));
         assert!(out.contains("ship the feature"));
+    }
+
+    #[test]
+    fn goal_cleared_says_stop_pursuing() {
+        let out = goal_cleared_prompt();
+        assert!(out.contains("The user cleared the session goal"));
+        assert!(out.contains("Stop pursuing the previous goal objective"));
     }
 
     #[test]

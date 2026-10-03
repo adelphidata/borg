@@ -252,6 +252,55 @@ fn daemon_spawn_dir() -> Option<std::path::PathBuf> {
         .filter(|home| home.is_dir())
 }
 
+/// Point a `borgd` spawn command at the daemon's spawn dir. Every path that
+/// starts the daemon goes through here, so none of them leaves it rooted in
+/// the caller's directory.
+///
+/// Moving the cwd would change what a relative CA trust-store path names, so
+/// those variables are resolved against the caller's directory first.
+pub(crate) fn prepare_daemon_command(cmd: &mut std::process::Command) {
+    configure_daemon_command(
+        cmd,
+        daemon_spawn_dir(),
+        |key| std::env::var_os(key),
+        std::env::current_dir(),
+    );
+}
+
+/// [`prepare_daemon_command`] with its environment lookups injected.
+fn configure_daemon_command(
+    cmd: &mut std::process::Command,
+    spawn_dir: Option<PathBuf>,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    caller_dir: std::io::Result<PathBuf>,
+) {
+    for &key in mcp::transport::CA_PATH_ENV_VARS {
+        let Some(value) = lookup(key).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let path = std::path::Path::new(&value);
+        if path.is_absolute() {
+            continue;
+        }
+        match &caller_dir {
+            Ok(dir) => {
+                cmd.env(key, dir.join(path));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    key,
+                    error = %e,
+                    "cannot resolve a relative CA path for borgd; leaving it unset"
+                );
+                cmd.env_remove(key);
+            }
+        }
+    }
+    if let Some(dir) = spawn_dir {
+        cmd.current_dir(dir);
+    }
+}
+
 /// Spawn the `borgd` binary as a detached background process and wait briefly
 /// for its UDS to come up. Idempotent: if the daemon is already running, this
 /// is a no-op.
@@ -265,9 +314,7 @@ pub async fn ensure_running() -> Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    if let Some(dir) = daemon_spawn_dir() {
-        cmd.current_dir(dir);
-    }
+    prepare_daemon_command(&mut cmd);
     detach_from_console(&mut cmd);
     cmd.spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
@@ -1179,6 +1226,59 @@ mod tests {
             Some(elsewhere.as_path()),
             "the spawn dir must not track wherever the client happens to be"
         );
+    }
+
+    fn env_of(cmd: &std::process::Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .map(|(_, v)| v.map(|v| v.to_os_string()))
+    }
+
+    /// A relative CA path names a file relative to the caller. Moving the
+    /// daemon's cwd must not make it name a different file, so it is resolved
+    /// against the caller's dir; absolute and empty values pass untouched.
+    #[test]
+    fn daemon_command_resolves_relative_ca_paths_before_moving_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let caller = tmp.path().join("caller");
+        let spawn = tmp.path().join("home");
+        let abs = tmp.path().join("abs.pem");
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            match key {
+                "SSL_CERT_FILE" => Some("certs/ca.pem".into()),
+                "SSL_CERT_DIR" => Some(abs.clone().into_os_string()),
+                "NODE_EXTRA_CA_CERTS" => Some("".into()),
+                _ => None,
+            }
+        };
+        let mut cmd = std::process::Command::new("borgd");
+        configure_daemon_command(&mut cmd, Some(spawn.clone()), lookup, Ok(caller.clone()));
+
+        assert_eq!(cmd.get_current_dir(), Some(spawn.as_path()));
+        assert_eq!(
+            env_of(&cmd, "SSL_CERT_FILE"),
+            Some(Some(caller.join("certs/ca.pem").into_os_string()))
+        );
+        // Inherited as-is: absolute, empty, and unset values are not touched.
+        for key in ["SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"] {
+            assert_eq!(env_of(&cmd, key), None, "{key} must be inherited untouched");
+        }
+    }
+
+    /// With the caller's dir gone, a relative CA path cannot be resolved.
+    /// Passing it through would name a file under the new cwd, so it is
+    /// removed from the child's environment instead.
+    #[test]
+    fn daemon_command_drops_relative_ca_paths_when_caller_dir_is_gone() {
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            (key == "REQUESTS_CA_BUNDLE").then(|| "bundle.pem".into())
+        };
+        let gone = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let mut cmd = std::process::Command::new("borgd");
+        configure_daemon_command(&mut cmd, None, lookup, gone);
+
+        assert_eq!(env_of(&cmd, "REQUESTS_CA_BUNDLE"), Some(None));
+        assert_eq!(cmd.get_current_dir(), None, "no spawn dir means inherit");
     }
 
     /// The status string is the operator's only diagnostic surface for

@@ -178,22 +178,64 @@ pub const ENV_ALLOWLIST: &[&str] = &[
     "REQUESTS_CA_BUNDLE",
 ];
 
+/// Extra variables a Windows MCP child inherits on top of [`ENV_ALLOWLIST`].
+///
+/// A Windows process without `SYSTEMROOT` cannot load core DLLs, and node and
+/// python fail at start without the profile and program roots. None of these
+/// carry a credential. Only applied on Windows: a Unix child has no use for
+/// them, so forwarding them there would only widen the inherited surface.
+pub const WINDOWS_ENV_ALLOWLIST: &[&str] = &[
+    "SYSTEMROOT",
+    "WINDIR",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "TEMP",
+    "TMP",
+];
+
 /// Allowlisted variables whose value is a filesystem path.
 ///
 /// Borg does not set the child's working directory to its own, so a relative
 /// path inherited from the operator's shell would resolve against whatever
 /// directory the server happens to start in — silently pointing at the wrong
 /// file, or none.
-const CA_PATH_ENV_VARS: &[&str] = &[
+pub const CA_PATH_ENV_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
     "REQUESTS_CA_BUNDLE",
 ];
 
-/// True iff `key` is in the inherit allowlist.
+/// True iff `key` is in the inherit allowlist for the current platform.
 pub fn is_env_allowed(key: &str) -> bool {
-    ENV_ALLOWLIST.contains(&key)
+    env_allowed_for(key, cfg!(windows))
+}
+
+/// Allowlist check with the platform rules made explicit, so both rule sets
+/// are testable on every host.
+///
+/// Windows env names are case-insensitive and `PATH` is usually spelled
+/// `Path` there, so Windows rules match without regard to ASCII case and add
+/// [`WINDOWS_ENV_ALLOWLIST`]. Unix names are case-sensitive: `path` is a
+/// different variable from `PATH` and stays stripped.
+fn env_allowed_for(key: &str, windows: bool) -> bool {
+    name_in(ENV_ALLOWLIST, key, windows) || (windows && name_in(WINDOWS_ENV_ALLOWLIST, key, true))
+}
+
+/// True iff `key` is in `list`, matched without ASCII case when
+/// `ignore_case` is set.
+fn name_in(list: &[&str], key: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        list.iter().any(|name| name.eq_ignore_ascii_case(key))
+    } else {
+        list.contains(&key)
+    }
 }
 
 /// Resolve a CA trust-store variable to an absolute path.
@@ -203,7 +245,7 @@ pub fn is_env_allowed(key: &str) -> bool {
 /// spell "use the built-in store", and turning it into the current directory
 /// would change that meaning.
 pub fn absolutize_ca_path(key: &str, value: &str) -> String {
-    if !CA_PATH_ENV_VARS.contains(&key) || value.is_empty() {
+    if !name_in(CA_PATH_ENV_VARS, key, cfg!(windows)) || value.is_empty() {
         return value.to_string();
     }
     let path = std::path::Path::new(value);
@@ -239,6 +281,55 @@ mod tests {
         assert!(!is_env_allowed("BORG_KEK_PASSPHRASE"));
         assert!(!is_env_allowed("AWS_SECRET_ACCESS_KEY"));
         assert!(!is_env_allowed("GITHUB_TOKEN"));
+    }
+
+    /// Spec: on Windows the child needs `Path` (its usual spelling there) and
+    /// `SystemRoot` to start at all, and env names are case-insensitive. The
+    /// Windows rules still never admit a credential, in any case.
+    #[test]
+    fn windows_rules_admit_essentials_in_any_case_but_not_credentials() {
+        for key in [
+            "Path",
+            "PATH",
+            "SystemRoot",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "UserProfile",
+            "APPDATA",
+            "LocalAppData",
+            "ProgramData",
+            "ProgramFiles",
+            "Temp",
+        ] {
+            assert!(
+                env_allowed_for(key, true),
+                "{key} must reach a Windows child"
+            );
+        }
+        for key in [
+            "AWS_SECRET_ACCESS_KEY",
+            "aws_secret_access_key",
+            "Anthropic_Api_Key",
+            "BORG_KEK_PASSPHRASE",
+            "GITHUB_TOKEN",
+        ] {
+            assert!(
+                !env_allowed_for(key, true),
+                "{key} must be stripped on Windows"
+            );
+        }
+    }
+
+    /// Spec: Unix env names are case-sensitive and the Windows-only
+    /// essentials stay out of a Unix child.
+    #[test]
+    fn unix_rules_are_case_sensitive_and_skip_windows_essentials() {
+        assert!(env_allowed_for("PATH", false));
+        assert!(!env_allowed_for("Path", false));
+        assert!(!env_allowed_for("SYSTEMROOT", false));
+        assert!(!env_allowed_for("USERPROFILE", false));
+        assert!(!env_allowed_for("AWS_SECRET_ACCESS_KEY", false));
     }
 
     /// Spec: a CA bundle names which certificates to trust. It carries no

@@ -278,22 +278,27 @@ impl SecretRef {
                         &format!("Keychain lookup failed for service={service} account={account}"),
                     )
                 } else if cfg!(target_os = "linux") {
-                    let output = Command::new("secret-tool")
-                        .args(["lookup", "service", service, "key", account])
-                        .output()
-                        .with_context(|| {
-                            format!(
-                                "Failed to query secret-tool for service={service} key={account}"
-                            )
-                        })?;
-                    extract_secret(
-                        output,
-                        &format!(
-                            "secret-tool lookup failed for service={service} account={account}"
-                        ),
-                    )
+                    // Borg's keychain writer files the account under the
+                    // `account` attribute; older entries used `key`.
+                    let lookup = |attr: &str| {
+                        Command::new("secret-tool")
+                            .args(["lookup", "service", service, attr, account])
+                            .output()
+                            .with_context(|| {
+                                format!(
+                                    "Failed to query secret-tool for service={service} {attr}={account}"
+                                )
+                            })
+                    };
+                    let fail_context = format!(
+                        "secret-tool lookup failed for service={service} account={account}"
+                    );
+                    match extract_secret(lookup("account")?, &fail_context) {
+                        Ok(secret) if !secret.is_empty() => Ok(secret),
+                        _ => extract_secret(lookup("key")?, &fail_context),
+                    }
                 } else if cfg!(target_os = "windows") {
-                    let entry = keyring::Entry::new(service, account).with_context(|| {
+                    let entry = plugins::keychain::windows_entry(service, account).with_context(|| {
                         format!(
                             "Failed to open Windows Credential Manager entry for service={service} account={account}"
                         )

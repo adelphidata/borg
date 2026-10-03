@@ -1104,7 +1104,7 @@ fn cooldown_initially_inactive() {
 #[test]
 fn cooldown_active_after_failure() {
     let mut cd = ProviderCooldown::default();
-    cd.record_failure(FailoverReason::RateLimit);
+    cd.record_failure(FailoverReason::RateLimit, None);
     assert!(cd.is_active());
     assert_eq!(cd.error_count, 1);
     assert_eq!(cd.reason, Some(FailoverReason::RateLimit));
@@ -1113,7 +1113,7 @@ fn cooldown_active_after_failure() {
 #[test]
 fn cooldown_reset_on_success() {
     let mut cd = ProviderCooldown::default();
-    cd.record_failure(FailoverReason::Overloaded);
+    cd.record_failure(FailoverReason::Overloaded, None);
     assert!(cd.is_active());
 
     cd.record_success();
@@ -1127,13 +1127,13 @@ fn cooldown_backoff_escalates() {
     // Consecutive failures (without intervening success) must back off
     // longer each time — the whole point of the error_count counter.
     let mut cd = ProviderCooldown::default();
-    cd.record_failure(FailoverReason::RateLimit);
+    cd.record_failure(FailoverReason::RateLimit, None);
     let first = cd.cooldown_until.unwrap();
 
-    cd.record_failure(FailoverReason::RateLimit);
+    cd.record_failure(FailoverReason::RateLimit, None);
     let second = cd.cooldown_until.unwrap();
 
-    cd.record_failure(FailoverReason::RateLimit);
+    cd.record_failure(FailoverReason::RateLimit, None);
     let third = cd.cooldown_until.unwrap();
 
     assert!(
@@ -1147,14 +1147,52 @@ fn cooldown_backoff_escalates() {
     assert_eq!(cd.error_count, 3);
 }
 
+/// The cooldown is max(backoff, Retry-After), with the hint capped so one
+/// absurd header cannot park a provider for a day.
+#[test]
+fn cooldown_honors_retry_after_above_backoff_with_cap() {
+    let cap = Duration::from_secs(crate::constants::PROVIDER_COOLDOWN_RETRY_AFTER_MAX_SECS);
+    let backoff = Duration::from_secs_f64(crate::constants::PROVIDER_COOLDOWN_TRANSIENT_BASE_SECS);
+    let cases = [
+        (None, backoff, "no hint: plain backoff"),
+        (
+            Some(Duration::from_secs(5)),
+            backoff,
+            "short hint: backoff wins",
+        ),
+        (
+            Some(Duration::from_secs(600)),
+            Duration::from_secs(600),
+            "long hint wins",
+        ),
+        (
+            Some(Duration::from_secs(24 * 60 * 60)),
+            cap,
+            "huge hint is capped",
+        ),
+    ];
+    for (hint, expected, label) in cases {
+        let mut cd = ProviderCooldown::default();
+        let before = std::time::Instant::now();
+        cd.record_failure(FailoverReason::RateLimit, hint);
+        let after = std::time::Instant::now();
+        let until = cd.cooldown_until.expect("cooldown set");
+        assert!(
+            until >= before + expected && until <= after + expected,
+            "{label}: expected ~{expected:?}, got {:?}",
+            until - before
+        );
+    }
+}
+
 #[test]
 fn cooldown_auth_has_longer_base() {
     let mut cd1 = ProviderCooldown::default();
-    cd1.record_failure(FailoverReason::RateLimit);
+    cd1.record_failure(FailoverReason::RateLimit, None);
     let rl_until = cd1.cooldown_until.unwrap();
 
     let mut cd2 = ProviderCooldown::default();
-    cd2.record_failure(FailoverReason::Auth);
+    cd2.record_failure(FailoverReason::Auth, None);
     let auth_until = cd2.cooldown_until.unwrap();
 
     // Auth base is 300s, RateLimit base is 60s — auth should be further out
@@ -3891,7 +3929,7 @@ async fn make_failover_restore_client(env_var: &str) -> LlmClient {
 async fn rate_limited_primary_restores_after_cooldown_expires() {
     let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_RL").await;
 
-    client.record_provider_failure(FailoverReason::RateLimit);
+    client.record_provider_failure(FailoverReason::RateLimit, None);
     assert!(client.try_failover_provider(), "failover must switch slots");
     assert_eq!(client.active_slot_index, 0);
     assert_eq!(client.provider, Provider::Anthropic);
@@ -3923,11 +3961,41 @@ async fn rate_limited_primary_restores_after_cooldown_expires() {
     );
 }
 
+/// A primary that answered `Retry-After: 600` must stay parked until the
+/// server-advised deadline, not the 60s transient backoff.
+#[tokio::test]
+async fn primary_is_not_restored_before_server_retry_after() {
+    let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_RETRY_AFTER").await;
+
+    let before = std::time::Instant::now();
+    client.record_provider_failure(FailoverReason::RateLimit, Some(Duration::from_secs(600)));
+    assert!(client.try_failover_provider());
+
+    let until = client
+        .primary_cooldown
+        .cooldown_until
+        .expect("cooldown set");
+    assert!(
+        until >= before + Duration::from_secs(600),
+        "cooldown must reach the server deadline, got {:?}",
+        until - before
+    );
+
+    // The default 60s backoff alone would allow a probe once it lapses; the
+    // advised 600s deadline keeps the primary parked.
+    assert!(
+        !client.maybe_restore_primary(),
+        "primary must not be probed before its Retry-After deadline"
+    );
+    assert_eq!(client.active_slot_index, 0);
+    assert_eq!(client.provider, Provider::Anthropic);
+}
+
 #[tokio::test]
 async fn auth_failed_primary_is_never_restored() {
     let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_AUTH").await;
 
-    client.record_provider_failure(FailoverReason::AuthPermanent);
+    client.record_provider_failure(FailoverReason::AuthPermanent, None);
     assert!(client.try_failover_provider());
 
     // Even with the cooldown long expired, an auth-dead primary stays parked.
@@ -3944,14 +4012,14 @@ async fn auth_failed_primary_is_never_restored() {
 async fn restored_primary_refailure_reparks_with_fresh_cooldown() {
     let mut client = make_failover_restore_client("BORG_TEST_PRIMARY_RESTORE_REFAIL").await;
 
-    client.record_provider_failure(FailoverReason::RateLimit);
+    client.record_provider_failure(FailoverReason::RateLimit, None);
     assert!(client.try_failover_provider());
     client.primary_cooldown.cooldown_until = Some(std::time::Instant::now());
     assert!(client.maybe_restore_primary());
 
     // The probe fails again: the primary re-parks and the snapshot is
     // re-captured for the next restore cycle.
-    client.record_provider_failure(FailoverReason::RateLimit);
+    client.record_provider_failure(FailoverReason::RateLimit, None);
     assert!(client.try_failover_provider());
     assert_eq!(client.active_slot_index, 0);
     assert!(client.primary_snapshot.is_some());
@@ -4005,7 +4073,7 @@ async fn primary_restore_defers_while_the_pool_reports_a_future_reset() {
     let (pool, _dir) = one_key_system_clock_pool().await;
     client.primary_pool = Some(pool.clone());
 
-    client.record_provider_failure(FailoverReason::RateLimit);
+    client.record_provider_failure(FailoverReason::RateLimit, None);
     assert!(client.try_failover_provider(), "failover must switch slots");
 
     // The provider said "come back in an hour" — bench the only key that long.
@@ -4047,7 +4115,7 @@ async fn primary_restore_falls_open_when_the_pool_cannot_name_a_recovery_time() 
     let (pool, _dir) = one_key_system_clock_pool().await;
     client.primary_pool = Some(pool.clone());
 
-    client.record_provider_failure(FailoverReason::RateLimit);
+    client.record_provider_failure(FailoverReason::RateLimit, None);
     assert!(client.try_failover_provider(), "failover must switch slots");
 
     // Tombstone the only key: nothing is available, yet there is no reset

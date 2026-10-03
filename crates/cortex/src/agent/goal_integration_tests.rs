@@ -925,3 +925,88 @@ async fn account_at_turn_end_noop_in_plan_mode() {
         "a dropped Plan baseline must not double-charge the next Execute turn"
     );
 }
+
+/// Clearing the goal mid-loop must reach the model: the next sync sees the
+/// row gone while the runtime still tracks it, queues exactly one
+/// `GoalCleared` steering message, and resets the runtime. The drain puts it
+/// into history as a tagged synthetic user message.
+#[tokio::test]
+async fn cleared_goal_queues_one_steering_message_and_resets_runtime() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    let session_id = agent.session.meta.id.clone();
+    let goal_id = seed_active_goal(&agent, "refactor the parser", None).await;
+    agent.sync_goal_runtime_for_turn().await;
+    assert_eq!(agent.goal_runtime.current_goal_id(), Some(goal_id));
+
+    // The user clears the goal between iterations.
+    {
+        let guard = agent.db_guard().await;
+        assert!(guard
+            .as_ref()
+            .expect("db")
+            .delete_goal(&session_id)
+            .await
+            .expect("delete goal"));
+    }
+
+    assert!(agent.sync_goal_runtime_for_turn().await.is_none());
+    assert_eq!(
+        agent.goal_runtime.current_goal_id(),
+        None,
+        "runtime must stop tracking the cleared goal"
+    );
+
+    let before = agent.history.len();
+    agent.drain_pending_goal_steering().await;
+    assert_eq!(agent.history.len(), before + 1, "steering reaches history");
+    let text = agent
+        .history
+        .last()
+        .and_then(Message::text_content)
+        .expect("steering text")
+        .to_string();
+    assert!(
+        text.starts_with("<goal_steering reason=\"goal_cleared\">"),
+        "tagged as goal_cleared: {text}"
+    );
+    assert!(
+        text.contains("Stop pursuing the previous goal objective"),
+        "tells the model to stop: {text}"
+    );
+
+    // One-shot: the next iteration has nothing more to say.
+    assert!(agent.sync_goal_runtime_for_turn().await.is_none());
+    assert!(
+        agent.goal_runtime.take_pending_steering().is_none(),
+        "the cleared notice must fire only once"
+    );
+}
+
+/// Negative: starting a new session is not a user clear of the old session's
+/// goal, so the fresh conversation must not be told to stop pursuing it.
+#[tokio::test]
+async fn new_session_does_not_report_prior_goal_as_cleared() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "refactor the parser", None).await;
+    agent.sync_goal_runtime_for_turn().await;
+    assert!(agent.goal_runtime.current_goal_id().is_some());
+
+    agent.new_session().await;
+
+    assert!(agent.sync_goal_runtime_for_turn().await.is_none());
+    assert!(
+        agent.goal_runtime.take_pending_steering().is_none(),
+        "a session switch must not queue a goal-cleared notice"
+    );
+}
+
+/// Negative: a session that never had a goal must not get a cleared notice.
+#[tokio::test]
+async fn no_goal_ever_tracked_queues_no_cleared_steering() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    assert!(agent.sync_goal_runtime_for_turn().await.is_none());
+    assert!(agent.goal_runtime.take_pending_steering().is_none());
+}

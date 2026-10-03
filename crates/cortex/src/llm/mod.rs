@@ -558,7 +558,12 @@ impl ProviderCooldown {
     }
 
     /// Record a failure and compute the next cooldown duration.
-    fn record_failure(&mut self, reason: FailoverReason) {
+    ///
+    /// `retry_after` is the server's advised wait. The cooldown is the longer
+    /// of the exponential backoff and that hint (capped at
+    /// [`crate::constants::PROVIDER_COOLDOWN_RETRY_AFTER_MAX_SECS`]), so a
+    /// primary that said `Retry-After: 600` is not re-probed after 60s.
+    fn record_failure(&mut self, reason: FailoverReason, retry_after: Option<Duration>) {
         // If cooldown expired, reset counter (half-open circuit breaker).
         if !self.is_active() {
             self.error_count = 0;
@@ -579,9 +584,11 @@ impl ProviderCooldown {
             _ => crate::constants::PROVIDER_COOLDOWN_TRANSIENT_MAX_EXP,
         };
         let exp = self.error_count.saturating_sub(1).min(max_exp);
-        let backoff_secs = base_secs * 2.0_f64.powi(exp as i32);
-        self.cooldown_until =
-            Some(std::time::Instant::now() + Duration::from_secs_f64(backoff_secs));
+        let backoff = Duration::from_secs_f64(base_secs * 2.0_f64.powi(exp as i32));
+        let advised = retry_after.unwrap_or_default().min(Duration::from_secs(
+            crate::constants::PROVIDER_COOLDOWN_RETRY_AFTER_MAX_SECS,
+        ));
+        self.cooldown_until = Some(std::time::Instant::now() + backoff.max(advised));
     }
 
     /// Reset cooldown on success.
@@ -1677,16 +1684,18 @@ impl LlmClient {
         false
     }
 
-    /// Record a failure on the currently active provider slot.
-    fn record_provider_failure(&mut self, reason: FailoverReason) {
+    /// Record a failure on the currently active provider slot. `retry_after`
+    /// is the server's advised wait, when the error carried one; it extends
+    /// the cooldown past the default backoff.
+    fn record_provider_failure(&mut self, reason: FailoverReason, retry_after: Option<Duration>) {
         if self.active_slot_index < self.provider_slots.len() {
             self.provider_slots[self.active_slot_index]
                 .cooldown
-                .record_failure(reason);
+                .record_failure(reason, retry_after);
         } else {
             // Primary head. Its cooldown gates when a failed-over client
             // probes it again (see `maybe_restore_primary`).
-            self.primary_cooldown.record_failure(reason);
+            self.primary_cooldown.record_failure(reason, retry_after);
         }
     }
 
@@ -2391,7 +2400,7 @@ impl LlmClient {
                         } else {
                             FailoverReason::AuthPermanent
                         };
-                        self.record_provider_failure(reason);
+                        self.record_provider_failure(reason, None);
                         if self.failover_and_notify(&tx).await {
                             should_failover = true;
                             break;
@@ -2527,7 +2536,7 @@ impl LlmClient {
                             // and burning the fallback chain just delays the
                             // real error. ModelNotFound cools this slot and
                             // moves on: a sibling slot's model may serve.
-                            self.record_provider_failure(e.reason());
+                            self.record_provider_failure(e.reason(), e.retry_after());
                             // Defer fallback when the primary pool will
                             // recover soon — jumping providers while a
                             // sibling key is about to cool off burns budget
@@ -3328,7 +3337,7 @@ impl LlmClient {
                             } else {
                                 FailoverReason::AuthPermanent
                             };
-                            self.record_provider_failure(reason);
+                            self.record_provider_failure(reason, None);
                             last_error = Some(msg);
                             if self.try_failover_provider() {
                                 should_failover = true;
@@ -3409,7 +3418,7 @@ impl LlmClient {
                         // than the turn can hold ends the attempts here.
                         let long_wait = is_long_provider_wait(&e);
                         if !e.is_retryable() || attempt == max_retries || long_wait {
-                            self.record_provider_failure(reason);
+                            self.record_provider_failure(reason, e.retry_after());
                             if let Some(wait) = e.retry_after().filter(|_| long_wait) {
                                 warn!(
                                     target: "cortex::llm",

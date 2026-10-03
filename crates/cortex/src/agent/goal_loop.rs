@@ -39,6 +39,9 @@ impl Agent {
     /// - Detect a `goal_id` swap vs. the previously-adopted id and queue an
     ///   `ObjectiveUpdated` steering message (so the next LLM call gets a
     ///   visible "the user replaced the objective" nudge).
+    /// - Detect a goal row that vanished while the runtime still tracks its
+    ///   id (the user cleared it) and queue a one-shot `GoalCleared`
+    ///   steering message, then reset the runtime.
     /// - Call [`GoalRuntimeState::adopt`] to refresh the cached id and clear
     ///   stale baselines tied to a different goal_id.
     /// - When the goal is Active and we're not in Plan mode, capture the
@@ -65,7 +68,20 @@ impl Agent {
                 }
             }
         };
-        let goal = goal?;
+        let Some(goal) = goal else {
+            // The row is gone but the runtime still tracks it: the user
+            // cleared the goal (completion forgets the runtime itself). Tell
+            // the model once, or it keeps pursuing the old objective.
+            if self.goal_runtime.current_goal_id().is_some() {
+                // forget() drops any queued steering, so queue after it.
+                self.goal_runtime.forget();
+                self.goal_runtime.queue_steering(PendingSteering {
+                    reason: SteeringReason::GoalCleared,
+                    body: prompts::goal_cleared_prompt(),
+                });
+            }
+            return None;
+        };
         // Detect objective replacement BEFORE adopt() clobbers the cached id.
         let prior = self.goal_runtime.current_goal_id();
         let id_changed = prior
@@ -639,6 +655,7 @@ impl Agent {
             match steering.reason {
                 SteeringReason::BudgetLimited => "budget_limited",
                 SteeringReason::ObjectiveUpdated => "objective_updated",
+                SteeringReason::GoalCleared => "goal_cleared",
             },
             steering.body
         );

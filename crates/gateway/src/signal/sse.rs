@@ -22,6 +22,17 @@ const JITTER_FRACTION: f64 = constants::SIGNAL_SSE_JITTER_FRACTION;
 const STALL_TIMEOUT: Duration = constants::SIGNAL_SSE_STALL_TIMEOUT;
 const MAX_ATTACHMENT_BYTES: u64 = constants::SIGNAL_MAX_ATTACHMENT_BYTES;
 
+/// How long a stream must stay up before its drop counts as a fresh failure.
+///
+/// A server that accepts the connection and then drops it at once is failing
+/// just as much as one that refuses it. Without this bar, every accept reset
+/// the backoff and such a server was retried at the minimum delay forever.
+///
+/// A server that accepts and then sends nothing is cut off by the longer
+/// stall timeout and so counts as stable; each such cycle still takes the
+/// full stall window, which bounds the reconnect rate.
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
+
 /// Maximum SSE buffer size before we drop and reconnect (1 MB).
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -100,7 +111,7 @@ pub async fn run_sse_loop(
         };
 
         info!("Signal SSE stream connected");
-        consecutive_errors = 0;
+        let connected_at = std::time::Instant::now();
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
@@ -117,17 +128,14 @@ pub async fn run_sse_loop(
                         Ok(Some(Ok(bytes))) => bytes,
                         Ok(Some(Err(e))) => {
                             warn!("Signal SSE stream error: {e}");
-                            consecutive_errors += 1;
                             break;
                         }
                         Ok(None) => {
                             info!("Signal SSE stream ended");
-                            consecutive_errors += 1;
                             break;
                         }
                         Err(_) => {
                             warn!("Signal SSE stalled (no data in {STALL_TIMEOUT:?}), reconnecting");
-                            consecutive_errors += 1;
                             break;
                         }
                     }
@@ -143,7 +151,6 @@ pub async fn run_sse_loop(
                     "Signal SSE buffer exceeded {} bytes, dropping and reconnecting",
                     MAX_BUFFER_SIZE
                 );
-                consecutive_errors += 1;
                 break;
             }
 
@@ -227,6 +234,22 @@ pub async fn run_sse_loop(
                 // Ignore other SSE fields (event:, id:, retry:, comments)
             }
         }
+
+        consecutive_errors = errors_after_disconnect(consecutive_errors, connected_at.elapsed());
+    }
+}
+
+/// Error count to carry into the next reconnect after a stream ends.
+///
+/// A stream that stayed up for [`STABLE_CONNECTION`] proved the server
+/// healthy, so the count restarts at one (the minimum backoff). A shorter
+/// stream is one more failure on top of the ones before it, so the backoff
+/// keeps growing for a server that accepts and then drops at once.
+fn errors_after_disconnect(previous: u32, uptime: Duration) -> u32 {
+    if uptime >= STABLE_CONNECTION {
+        1
+    } else {
+        previous.saturating_add(1)
     }
 }
 
@@ -316,6 +339,33 @@ mod tests {
             saturated.as_secs_f64() <= max_with_jitter,
             "any attempt count must cap at MAX_BACKOFF + jitter, got {saturated:?}"
         );
+    }
+
+    /// Spec: a server that accepts and then drops at once must back off like
+    /// one that refuses outright, while a drop after a long healthy stream
+    /// restarts at the minimum delay.
+    #[test]
+    fn short_lived_streams_escalate_backoff_and_stable_streams_reset_it() {
+        let short = Duration::from_millis(50);
+        let mut errors = 0;
+        for expected in 1..=4 {
+            errors = errors_after_disconnect(errors, short);
+            assert_eq!(errors, expected, "short-lived stream must escalate");
+        }
+        assert!(
+            calculate_backoff(errors) > calculate_backoff(1),
+            "escalated count must give a longer delay"
+        );
+
+        let just_under = STABLE_CONNECTION - Duration::from_millis(1);
+        assert_eq!(errors_after_disconnect(7, just_under), 8);
+        assert_eq!(errors_after_disconnect(7, STABLE_CONNECTION), 1);
+        assert_eq!(
+            errors_after_disconnect(7, STABLE_CONNECTION * 10),
+            1,
+            "a long-lived stream resets the count"
+        );
+        assert_eq!(errors_after_disconnect(u32::MAX, short), u32::MAX);
     }
 
     /// `url_encode` builds the SSE subscription URL — `+` MUST become

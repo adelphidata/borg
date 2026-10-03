@@ -187,19 +187,94 @@ fn detected_keyboard_transport() -> (TerminalKind, Option<String>) {
     (terminal, tmux_format)
 }
 
+/// How long the tmux probe may run before startup gives up on it.
+const TMUX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound on how much probe output is read back.
+const TMUX_PROBE_MAX_OUTPUT: u64 = 4 * 1024;
+
 /// Read tmux's `extended-keys` option value (`on`/`off`/`always` in newer tmux,
 /// `xterm`/`csi-u` for the key *format*). Best-effort: any failure yields `None`,
 /// which keeps the default (event types requested).
 fn read_tmux_extended_keys_format() -> Option<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["show-option", "-gqv", "extended-keys-format"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.args(["show-option", "-gqv", "extended-keys-format"]);
+    run_bounded_probe(cmd, TMUX_PROBE_TIMEOUT)
+}
+
+/// Run `cmd` and return its trimmed stdout when it exits 0 with output inside
+/// `timeout`. A hung tmux server must not freeze startup, so the child is
+/// killed at the deadline. Stdout goes to a temp file, not a pipe: a
+/// grandchild that inherits a pipe could keep the read open past the child.
+fn run_bounded_probe(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::process::Stdio;
+
+    let mut out = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(error = %e, "terminal probe: temp file unavailable; skipping");
+            return None;
+        }
+    };
+    let child_out = match out.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(error = %e, "terminal probe: temp file clone failed; skipping");
+            return None;
+        }
+    };
+    let mut child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_out))
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::debug!(error = %e, "terminal probe: spawn failed");
+            return None;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "terminal probe timed out; killing it and using default keyboard flags"
+                );
+                // Best-effort: the child may exit between the check and kill.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal probe: wait failed");
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let mut buf = Vec::new();
+    if let Err(e) = out
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| (&mut out).take(TMUX_PROBE_MAX_OUTPUT).read_to_end(&mut buf))
+    {
+        tracing::warn!(error = %e, "terminal probe: reading output failed");
+        return None;
+    }
+    let value = String::from_utf8_lossy(&buf).trim().to_string();
     (!value.is_empty()).then_some(value)
 }
 
@@ -705,6 +780,66 @@ impl Tui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    /// A hung tmux server must not freeze startup: the probe gives up at the
+    /// deadline instead of waiting for the child.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_gives_up_on_a_hung_command() {
+        let start = std::time::Instant::now();
+        let got = run_bounded_probe(sh("sleep 5"), TMUX_PROBE_TIMEOUT);
+        assert_eq!(got, None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(3000),
+            "probe took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_reads_trimmed_output_and_rejects_failures() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("printf 'csi-u\\n'", Some("csi-u")),
+            ("printf '  xterm  '", Some("xterm")),
+            ("printf ''", None),
+            ("printf xterm; exit 1", None),
+        ];
+        for (script, want) in cases.iter().copied() {
+            assert_eq!(
+                run_bounded_probe(sh(script), TMUX_PROBE_TIMEOUT).as_deref(),
+                want,
+                "script {script:?}"
+            );
+        }
+    }
+
+    /// A grandchild that inherits stdout and outlives the child must not hold
+    /// the probe open: the child's exit ends the wait.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_ignores_a_lingering_grandchild() {
+        let start = std::time::Instant::now();
+        let got = run_bounded_probe(sh("sleep 5 & printf csi-u"), TMUX_PROBE_TIMEOUT);
+        assert_eq!(got.as_deref(), Some("csi-u"));
+        assert!(start.elapsed() < std::time::Duration::from_millis(3000));
+    }
+
+    /// Output past the 4 KiB cap is not read: the value placed after 5000
+    /// bytes of padding never reaches the result.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_probe_reads_at_most_the_output_cap() {
+        let got = run_bounded_probe(sh("printf '%5000s' xterm"), TMUX_PROBE_TIMEOUT);
+        assert_eq!(got, None);
+    }
 
     #[test]
     fn keyboard_enhancement_env_flag_parses_common_values() {

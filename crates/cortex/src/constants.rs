@@ -526,6 +526,12 @@ pub const PROVIDER_COOLDOWN_AUTH_MAX_EXP: u32 = 3;
 /// Max exponent applied to the transient cooldown (2^N multiplier cap).
 pub const PROVIDER_COOLDOWN_TRANSIENT_MAX_EXP: u32 = 4;
 
+/// Upper bound (seconds) on how far a server `Retry-After` may push a
+/// provider's failover cooldown. The header parser accepts up to a day; a
+/// failed-over client still re-probes the primary within the hour so one
+/// absurd header cannot strand it on a fallback.
+pub const PROVIDER_COOLDOWN_RETRY_AFTER_MAX_SECS: u64 = 60 * 60;
+
 /// Default token budget for active memory injection into the system prompt.
 pub const ACTIVE_INJECTION_DEFAULT_MAX_TOKENS: usize = 1500;
 

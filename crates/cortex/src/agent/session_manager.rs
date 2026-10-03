@@ -29,6 +29,9 @@ impl Agent {
         let session = Session::load(id)?;
         self.history = session.messages.clone();
         self.session = session;
+        // Goal tracking belongs to the session it was armed in; carrying it
+        // over would read the new session's missing goal row as a user clear.
+        self.goal_runtime.forget();
         Ok(())
     }
 
@@ -58,6 +61,9 @@ impl Agent {
         // Don't carry a prior session's failover identity into a new session —
         // its first turn runs on the configured primary until proven otherwise.
         self.active_failover_identity = None;
+        // Goal tracking belongs to the prior session; carrying it over would
+        // read the new session's missing goal row as a user clear.
+        self.goal_runtime.forget();
         // Drop the system-prompt input caches (identity, resolved credentials,
         // project docs, skills). Otherwise a long-lived `Agent` reused across a
         // reset would assemble the new session's prompt from the prior session's

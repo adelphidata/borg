@@ -363,7 +363,11 @@ impl<'a> Composer<'a> {
 
     pub fn handle_paste(&mut self, text: &str) {
         self.history.reset();
-        self.paste_burst.flush_immediate();
+        // Chars typed just before the paste may sit in the burst buffer;
+        // insert them first so they are not lost and keep their order.
+        if let Some(text) = self.paste_burst.flush_immediate() {
+            self.insert_burst_text(&text);
+        }
         // Fold `\r\n` and bare `\r` into `\n` before sanitizing, which drops
         // `\r` and would otherwise join two pasted lines into one.
         let text = super::history::normalize_pasted_newlines(text);
@@ -375,10 +379,21 @@ impl<'a> Composer<'a> {
 
     /// Called on each tick to flush any paste-burst buffer.
     pub fn tick(&mut self) {
-        if let Some(text) = self.paste_burst.flush_if_due(Instant::now()) {
-            self.textarea
-                .insert_str(&*super::history::sanitize_user_text(&text));
+        self.flush_due_burst(Instant::now());
+    }
+
+    /// Insert a burst whose idle timeout has passed at `now`. The tick does
+    /// this too, but ticks are skipped while a popup is open, so key
+    /// handling must not trust that an idle burst is still a live paste.
+    fn flush_due_burst(&mut self, now: Instant) {
+        if let Some(text) = self.paste_burst.flush_if_due(now) {
+            self.insert_burst_text(&text);
         }
+    }
+
+    fn insert_burst_text(&mut self, text: &str) {
+        self.textarea
+            .insert_str(&*super::history::sanitize_user_text(text));
     }
 
     /// Capture an unmodified Tab into an active paste burst. Without
@@ -387,15 +402,25 @@ impl<'a> Composer<'a> {
     /// Callers that bind Tab must ask here first; returns `true` when the
     /// Tab was consumed as pasted text.
     pub fn capture_burst_tab(&mut self, key: &KeyEvent) -> bool {
+        self.capture_burst_tab_at(key, Instant::now())
+    }
+
+    fn capture_burst_tab_at(&mut self, key: &KeyEvent, now: Instant) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
-        key.code == KeyCode::Tab
-            && key.modifiers == KeyModifiers::NONE
-            && self
-                .paste_burst
-                .append_control_char_if_active('\t', Instant::now())
+        if key.code != KeyCode::Tab || key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        self.flush_due_burst(now);
+        self.paste_burst.append_control_char_if_active('\t', now)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    /// `handle_key` with an explicit clock, so tests can step past the
+    /// paste-burst idle timeout without sleeping.
+    fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> Option<String> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         // While an incremental search is active, intercept keys before any
@@ -406,8 +431,12 @@ impl<'a> Composer<'a> {
             return self.handle_search_key(key);
         }
 
+        // A burst that went idle is finished text, not a live paste: insert
+        // it before this key so Enter submits and Tab completes as usual.
+        self.flush_due_burst(now);
+
         // Tab mid-burst is pasted whitespace, not a completion/focus key.
-        if self.capture_burst_tab(&key) {
+        if self.capture_burst_tab_at(&key, now) {
             return None;
         }
 
@@ -420,7 +449,6 @@ impl<'a> Composer<'a> {
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 // During a paste burst, treat Enter as newline instead of submit
-                let now = Instant::now();
                 if self.paste_burst.append_control_char_if_active('\n', now) {
                     return None;
                 }
@@ -515,7 +543,7 @@ impl<'a> Composer<'a> {
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 use super::paste_burst::CharAction;
                 self.history.reset();
-                match self.paste_burst.on_char(ch, Instant::now()) {
+                match self.paste_burst.on_char(ch, now) {
                     CharAction::Buffer => None,
                     CharAction::Insert => {
                         self.textarea.input(key);
@@ -1083,6 +1111,66 @@ mod tests {
         let mut c = Composer::new();
         c.handle_paste("line 1\nline 2\nline 3");
         assert_eq!(c.text(), "line 1\nline 2\nline 3");
+    }
+
+    /// Spec: a burst that went idle is finished text. Ticks are skipped while
+    /// a popup is open, so a burst can expire unflushed; the Enter that
+    /// follows must submit the whole text, not land as a pasted newline.
+    #[test]
+    fn enter_after_expired_unflushed_burst_submits_burst_text() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut c = Composer::new();
+        c.feed_paste_burst_for_test("hello world");
+        let later = Instant::now() + std::time::Duration::from_secs(1);
+        let submitted = c.handle_key_at(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), later);
+        assert_eq!(submitted.as_deref(), Some("hello world"));
+        assert_eq!(c.text(), "", "composer clears after submit");
+    }
+
+    /// The same expired burst must not swallow a Tab as pasted whitespace,
+    /// and a plain char typed after it must follow the burst text.
+    #[test]
+    fn keys_after_expired_burst_are_not_captured_into_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let later = Instant::now() + std::time::Duration::from_secs(1);
+
+        let mut c = Composer::new();
+        c.feed_paste_burst_for_test("abcd");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(
+            !c.capture_burst_tab_at(&tab, later),
+            "an expired burst must not capture Tab"
+        );
+        assert_eq!(c.text(), "abcd");
+
+        let mut c = Composer::new();
+        c.feed_paste_burst_for_test("abcd");
+        c.handle_key_at(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE), later);
+        assert_eq!(c.text(), "abcd!");
+    }
+
+    /// A live (not yet idle) burst still treats Enter as a pasted newline.
+    #[test]
+    fn enter_during_live_burst_stays_in_paste() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut c = Composer::new();
+        // Captured before the feed, so it is never past the burst clock.
+        let before = Instant::now();
+        c.feed_paste_burst_for_test("abcd");
+        let submitted = c.handle_key_at(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), before);
+        assert_eq!(submitted, None);
+        c.flush_due_burst(Instant::now() + std::time::Duration::from_secs(1));
+        assert_eq!(c.text(), "abcd\n");
+    }
+
+    /// Chars buffered by the burst detector just before a bracketed paste
+    /// must land ahead of the pasted text, not vanish.
+    #[test]
+    fn bracketed_paste_keeps_chars_buffered_before_it() {
+        let mut c = Composer::new();
+        c.feed_paste_burst_for_test("abcd");
+        c.handle_paste("XYZ");
+        assert_eq!(c.text(), "abcdXYZ");
     }
 
     /// Spec: every line ending a terminal can send in a bracketed paste must

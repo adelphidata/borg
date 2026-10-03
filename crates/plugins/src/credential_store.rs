@@ -50,8 +50,18 @@ fn load_file() -> Result<CredentialsFile> {
     if bytes.is_empty() {
         return Ok(CredentialsFile::default());
     }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("Failed to parse {} as JSON", path.display()))
+    // serde's message can quote the offending value ("invalid type: string
+    // \"sk-...\""), and that value may be a secret. Report only where and what
+    // kind of error it is.
+    serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse {} as JSON ({:?} error at line {} column {})",
+            path.display(),
+            e.classify(),
+            e.line(),
+            e.column()
+        )
+    })
 }
 
 fn save_file(file: &CredentialsFile) -> Result<()> {
@@ -81,6 +91,9 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
         tracing::warn!(
             "Keychain store failed for service={service} account={account}, falling back to file: {e}"
         );
+        // `read()` consults the keychain first, so a stale entry left from an
+        // earlier store would shadow the value written to the file below.
+        keychain::remove(service, account);
         let mut file = load_file()?;
         file.services
             .entry(service.to_string())
@@ -96,36 +109,106 @@ pub fn read(service: &str, account: &str) -> Option<String> {
     if let Some(v) = read_keychain(service, account) {
         return Some(v);
     }
-    let file = load_file().ok()?;
-    file.services.get(service)?.get(account).cloned()
+    match read_fallback(service, account) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                service,
+                account,
+                "credentials fallback file is unreadable, so it is ignored: {e:#}"
+            );
+            None
+        }
+    }
+}
+
+/// Look up a credential in the fallback file. A missing file is `Ok(None)`;
+/// an unreadable or corrupt one is an error, so the caller can say so.
+fn read_fallback(service: &str, account: &str) -> Result<Option<String>> {
+    let file = load_file()?;
+    Ok(file
+        .services
+        .get(service)
+        .and_then(|accounts| accounts.get(account))
+        .cloned())
 }
 
 fn read_keychain(service: &str, account: &str) -> Option<String> {
-    if cfg!(target_os = "macos") {
-        let output = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            return String::from_utf8(output.stdout)
-                .ok()
-                .map(|s| s.trim().to_string());
-        }
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        (
+            "security",
+            vec!["find-generic-password", "-s", service, "-a", account, "-w"],
+        )
     } else if cfg!(target_os = "linux") {
-        let output = std::process::Command::new("secret-tool")
-            .args(["lookup", "service", service, "account", account])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            return String::from_utf8(output.stdout)
-                .ok()
-                .map(|s| s.trim().to_string());
-        }
+        (
+            "secret-tool",
+            vec!["lookup", "service", service, "account", account],
+        )
     } else if cfg!(target_os = "windows") {
-        let entry = keyring::Entry::new(service, account).ok()?;
-        return entry.get_password().ok();
+        return match keychain::windows_entry(service, account).and_then(|e| e.get_password()) {
+            Ok(value) => Some(value),
+            Err(keyring::Error::NoEntry) => None,
+            Err(e) => {
+                tracing::warn!(
+                    service,
+                    account,
+                    "Windows Credential Manager read failed: {e}"
+                );
+                None
+            }
+        };
+    } else {
+        return None;
+    };
+    let output = match std::process::Command::new(program).args(&args).output() {
+        Ok(output) => output,
+        // No helper installed means no keychain on this host, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                service,
+                account,
+                "keychain helper `{program}` failed to start: {e}"
+            );
+            return None;
+        }
+    };
+    if output.status.success() {
+        return match String::from_utf8(output.stdout) {
+            Ok(value) => Some(value.trim().to_string()),
+            Err(_) => {
+                tracing::warn!(service, account, "keychain value is not valid UTF-8");
+                None
+            }
+        };
+    }
+    if keychain_lookup_failed(program, output.status.code(), &output.stderr) {
+        // stderr only: stdout is where the helper would print the secret.
+        tracing::warn!(
+            service,
+            account,
+            status = %output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "keychain read failed"
+        );
     }
     None
+}
+
+/// `security` exit code for `errSecItemNotFound`.
+const SECURITY_ITEM_NOT_FOUND: i32 = 44;
+
+/// True when a non-zero keychain lookup is a real failure rather than the
+/// item being absent. Absence is the normal path for an optional credential
+/// and must stay quiet.
+///
+/// `security` reports absence as exit 44. `secret-tool` exits 1 for absence
+/// and for errors alike, but prints a message only for an error.
+fn keychain_lookup_failed(program: &str, code: Option<i32>, stderr: &[u8]) -> bool {
+    match program {
+        "security" => code != Some(SECURITY_ITEM_NOT_FOUND),
+        _ => !String::from_utf8_lossy(stderr).trim().is_empty(),
+    }
 }
 
 /// Check whether a credential exists in either backend.
@@ -379,6 +462,62 @@ mod tests {
             load_file().is_err(),
             "corrupt JSON must not silently succeed"
         );
+    }
+
+    /// Spec: a missing fallback file is the normal "not stored" case, while a
+    /// corrupt one is an error the caller can log. The error must never echo
+    /// file content, because that content is secrets.
+    #[test]
+    fn read_fallback_tells_missing_from_corrupt_without_leaking_values() {
+        let _env = TestEnv::new();
+        assert_eq!(read_fallback("svc", "acct").unwrap(), None);
+
+        let path = credentials_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Valid JSON of the wrong shape: serde's own message would quote it.
+        std::fs::write(&path, br#"{"svc": "leaked-secret-value"}"#).unwrap();
+        let err = read_fallback("svc", "acct").expect_err("corrupt file must be an error");
+        assert!(
+            !format!("{err:#}").contains("leaked-secret-value"),
+            "error must not quote file content: {err:#}"
+        );
+        assert_eq!(read("borg-test-credstore-8f3a-corrupt", "acct"), None);
+    }
+
+    /// Spec: an absent item stays quiet, any other helper failure is logged.
+    #[test]
+    fn keychain_lookup_failure_is_told_apart_from_absence() {
+        let cases: &[(&str, Option<i32>, &[u8], bool)] = &[
+            (
+                "security",
+                Some(44),
+                b"security: The specified item could not be found",
+                false,
+            ),
+            ("security", Some(51), b"", true),
+            (
+                "security",
+                Some(36),
+                b"User interaction is not allowed.",
+                true,
+            ),
+            ("security", None, b"", true),
+            ("secret-tool", Some(1), b"", false),
+            (
+                "secret-tool",
+                Some(1),
+                b"secret-tool: Cannot autolaunch D-Bus",
+                true,
+            ),
+        ];
+        for (program, code, stderr, failed) in cases {
+            assert_eq!(
+                keychain_lookup_failed(program, *code, stderr),
+                *failed,
+                "{program} exit {code:?} stderr {:?}",
+                String::from_utf8_lossy(stderr)
+            );
+        }
     }
 
     #[test]

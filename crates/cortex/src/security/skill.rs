@@ -58,9 +58,31 @@ pub fn validate_skill_env(
     manifest: &SkillManifest,
     skill_config: Option<&SkillEntryConfig>,
 ) -> Vec<String> {
+    denied_skill_env(manifest, skill_config, cfg!(windows))
+}
+
+/// [`validate_skill_env`] with the platform rule made explicit, so both rules
+/// are testable on every host.
+///
+/// Windows env names are case-insensitive (`Path` and `PATH` are one
+/// variable), so Windows matches without regard to ASCII case. Unix names are
+/// case-sensitive, so `path` there is a different variable and is denied.
+fn denied_skill_env(
+    manifest: &SkillManifest,
+    skill_config: Option<&SkillEntryConfig>,
+    windows: bool,
+) -> Vec<String> {
     let allowed_env: Vec<&str> = skill_config
         .map(|c| c.allowed_env.iter().map(String::as_str).collect())
         .unwrap_or_default();
+    let matches = |list: &[&str], name: &str| {
+        if windows {
+            list.iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        } else {
+            list.contains(&name)
+        }
+    };
 
     manifest
         .requires
@@ -68,7 +90,7 @@ pub fn validate_skill_env(
         .iter()
         .filter(|var| {
             let name = var.as_str();
-            !SAFE_ENV_VARS.contains(&name) && !allowed_env.contains(&name)
+            !matches(SAFE_ENV_VARS, name) && !matches(&allowed_env, name)
         })
         .cloned()
         .collect()
@@ -449,6 +471,38 @@ mod tests {
         };
         let denied = validate_skill_env(&manifest, Some(&config));
         assert_eq!(denied, vec!["SECRET_TOKEN".to_string()]);
+    }
+
+    /// Spec: Windows env names are case-insensitive, so `Path` is the safe
+    /// `PATH` and a configured name matches in any case; a credential that is
+    /// not configured stays denied in any case. Unix keeps exact case.
+    #[test]
+    fn env_matching_ignores_case_on_windows_only() {
+        let manifest = make_manifest(
+            "test",
+            vec![
+                "Path".to_string(),
+                "my_custom_key".to_string(),
+                "Anthropic_Api_Key".to_string(),
+            ],
+        );
+        let config = SkillEntryConfig {
+            enabled: true,
+            env: std::collections::HashMap::new(),
+            allowed_env: vec!["MY_CUSTOM_KEY".to_string()],
+        };
+        assert_eq!(
+            denied_skill_env(&manifest, Some(&config), true),
+            vec!["Anthropic_Api_Key".to_string()]
+        );
+        assert_eq!(
+            denied_skill_env(&manifest, Some(&config), false),
+            vec![
+                "Path".to_string(),
+                "my_custom_key".to_string(),
+                "Anthropic_Api_Key".to_string(),
+            ]
+        );
     }
 
     #[test]

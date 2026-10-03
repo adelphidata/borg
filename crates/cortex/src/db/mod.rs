@@ -69,8 +69,13 @@ mod sqlite_code {
     pub const LOCKED: i32 = 6;
     /// `SQLITE_IOERR` — a disk I/O error occurred.
     pub const IOERR: i32 = 10;
+    /// `SQLITE_CORRUPT` — the database disk image is malformed.
+    pub const CORRUPT: i32 = 11;
     /// `SQLITE_FULL` — database or disk is full.
     pub const FULL: i32 = 13;
+    /// `SQLITE_NOTADB` — the file is not a database (or the SQLCipher key
+    /// does not decrypt it).
+    pub const NOTADB: i32 = 26;
 }
 
 /// True only for the durable-storage-exhausted error class: the write cannot
@@ -131,6 +136,32 @@ pub fn is_lock_contention(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+/// True only when an open failure proves the database image itself is
+/// unusable: `SQLITE_CORRUPT` / `SQLITE_NOTADB` (and their extended codes)
+/// anywhere in the error chain. A wrong SQLCipher key surfaces as
+/// `SQLITE_NOTADB` too, which is why that case is still quarantined.
+///
+/// The recovery path uses this to decide whether moving the file aside is
+/// justified. Everything else — `SQLITE_BUSY`, a migration bug, a refused WAL
+/// switch, an un-creatable data dir — leaves healthy data behind a transient
+/// or operator-fixable fault, and quarantining it would boot an empty DB.
+///
+/// Walks the whole chain because the open path layers `.context()` over the
+/// libsql error. The message fallbacks catch wrapping that loses the code.
+pub fn is_corruption(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let Some(libsql::Error::SqliteFailure(code, msg)) = cause.downcast_ref::<libsql::Error>()
+        else {
+            return false;
+        };
+        if matches!(code & 0xff, sqlite_code::CORRUPT | sqlite_code::NOTADB) {
+            return true;
+        }
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("file is not a database") || lower.contains("disk image is malformed")
+    })
 }
 
 /// True for the *possibly transient* I/O error class: `SQLITE_IOERR` (and its
@@ -550,11 +581,14 @@ impl Database {
 
     /// Open the primary database, recovering from an unreadable file or a
     /// non-regular path. A clean open (including first-boot, where the file
-    /// doesn't exist yet) returns `(db, None)`. When the existing file can't be
-    /// opened — corrupt image, or the SQLCipher key no longer matches — or the
-    /// path is a directory, the original is **preserved** (never deleted) under
+    /// doesn't exist yet) returns `(db, None)`. When the existing file is
+    /// proven unusable — corrupt image, or the SQLCipher key no longer matches
+    /// (both classified by [`is_corruption`]) — or the path is a directory, the
+    /// original is **preserved** (never deleted) under
     /// `borg.db.corrupt-<now_unix>` and a fresh migrated DB is created in its
-    /// place, returning the [`RecoveryNotice`].
+    /// place, returning the [`RecoveryNotice`]. Any other open failure (lock
+    /// contention, a failed migration, a refused WAL switch) returns the error
+    /// and leaves the file in place.
     ///
     /// `now_unix` is injected so the backup name is deterministic under test.
     async fn open_at_recovering(
@@ -611,14 +645,14 @@ impl Database {
         if regular_or_absent {
             match Self::open_at_inner(path, busy_timeout_ms, key, false).await {
                 Ok(db) => return Ok((db, None)),
-                Err(first_err) => {
+                Err(mut first_err) => {
                     let _guard = RECOVERY_LOCK.lock().await;
                     // Another task may have recovered the file while we waited
                     // on the lock; re-try before quarantining anything.
                     if path.is_file() {
-                        if let Ok(db) = Self::open_at_inner(path, busy_timeout_ms, key, false).await
-                        {
-                            return Ok((db, None));
+                        match Self::open_at_inner(path, busy_timeout_ms, key, false).await {
+                            Ok(db) => return Ok((db, None)),
+                            Err(e) => first_err = e,
                         }
                     } else if !path.exists() {
                         // A concurrent recoverer already moved the bad file
@@ -649,11 +683,15 @@ impl Database {
                                         );
                                         return Ok((db, None));
                                     }
-                                    Err(e) => tracing::warn!(
-                                        "database at {} still unreadable after permission repair ({e:#}); \
-                                         treating as corrupt",
-                                        path.display()
-                                    ),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "database at {} still unreadable after permission repair ({e:#})",
+                                            path.display()
+                                        );
+                                        // The post-repair error is the
+                                        // current truth; classify it below.
+                                        first_err = e;
+                                    }
                                 }
                             }
                         }
@@ -667,8 +705,19 @@ impl Database {
                             )));
                         }
                     }
+                    // Only a proven-corrupt image (or a key that no longer
+                    // decrypts it) justifies moving the file aside. BUSY, a
+                    // failed migration, a refused WAL switch, or a
+                    // create_dir_all failure all leave healthy data that a
+                    // quarantine would hide behind an empty DB.
+                    if !is_corruption(&first_err) {
+                        return Err(first_err.context(format!(
+                            "database at {} failed to open; left in place",
+                            path.display()
+                        )));
+                    }
                     tracing::warn!(
-                        "database at {} is unreadable ({first_err:#}); preserving it and starting fresh",
+                        "database at {} is corrupt ({first_err:#}); preserving it and starting fresh",
                         path.display()
                     );
                     let notice = Self::quarantine_corrupt_db(path, now_unix)?;
@@ -1574,6 +1623,117 @@ mod recovery_tests {
             backups.is_empty(),
             "no backup file should exist: {backups:?}"
         );
+    }
+
+    fn corrupt_siblings(dir: &Path) -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect()
+    }
+
+    /// A healthy database that merely cannot be opened right now — another
+    /// connection holds an exclusive lock, so init fails with `SQLITE_BUSY` —
+    /// must be left in place. Quarantining it would boot an empty DB and hide
+    /// the user's history over a lock wait.
+    #[tokio::test]
+    async fn busy_database_is_left_in_place_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+
+        // A valid rollback-journal database with a marker row, held under an
+        // exclusive write lock. The recovering open must switch it to WAL,
+        // which needs the lock, so it fails with SQLITE_BUSY.
+        let holder_db = libsql::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let holder = holder_db.connect().unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE marker (v TEXT); INSERT INTO marker VALUES ('survived'); \
+                 BEGIN EXCLUSIVE; INSERT INTO marker VALUES ('pending');",
+            )
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = match Database::open_at_recovering(&path, 50, None, 31337).await {
+            Ok(_) => panic!("open must fail while another connection holds the lock"),
+            Err(e) => e,
+        };
+
+        assert!(
+            corrupt_siblings(dir.path()).is_empty(),
+            "a busy database must never be quarantined"
+        );
+        assert!(!is_corruption(&err), "BUSY is not corruption: {err:#}");
+        assert!(
+            format!("{err:#}").contains("left in place"),
+            "error must say the file was kept: {err:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "file untouched");
+
+        // Release the lock: the original data is still there.
+        holder.execute_batch("ROLLBACK;").await.unwrap();
+        let mut rows = holder
+            .query("SELECT v FROM marker", libsql::params![])
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("marker row survives");
+        assert_eq!(row.get::<String>(0).unwrap(), "survived");
+    }
+
+    /// Only the corrupt-image class (including extended codes, and through
+    /// `.context()` layers) is classified as corruption; contention, I/O,
+    /// full-disk, and non-libsql failures such as a migration error are not.
+    #[test]
+    fn is_corruption_classifies_only_corrupt_and_notadb() {
+        let sqlite = |code: i32, msg: &str| {
+            anyhow::Error::from(libsql::Error::SqliteFailure(code, msg.to_string()))
+        };
+        let cases: Vec<(anyhow::Error, bool, &str)> = vec![
+            (
+                sqlite(11, "database disk image is malformed"),
+                true,
+                "CORRUPT",
+            ),
+            (sqlite(11 | (1 << 8), "corrupt vtab"), true, "CORRUPT_VTAB"),
+            (sqlite(26, "file is not a database"), true, "NOTADB"),
+            (
+                sqlite(26, "file is not a database").context("libsql build at x"),
+                true,
+                "NOTADB under context",
+            ),
+            (
+                sqlite(1, "file is not a database"),
+                true,
+                "message fallback",
+            ),
+            (sqlite(5, "database is locked"), false, "BUSY"),
+            (sqlite(6, "database table is locked"), false, "LOCKED"),
+            (
+                sqlite(10 | (3 << 8), "disk I/O error"),
+                false,
+                "IOERR_WRITE",
+            ),
+            (sqlite(13, "database or disk is full"), false, "FULL"),
+            (
+                anyhow::anyhow!("migration v42 failed: no such column"),
+                false,
+                "migration error",
+            ),
+            (
+                anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    .context("create_dir_all(/x)"),
+                false,
+                "create_dir_all failure",
+            ),
+        ];
+        for (err, expected, label) in cases {
+            assert_eq!(is_corruption(&err), expected, "{label}: {err:#}");
+        }
     }
 
     /// Quarantine moves the main file and any WAL/SHM siblings aside together,

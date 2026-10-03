@@ -53,33 +53,84 @@ pub fn available() -> bool {
     }
 }
 
-/// Build the `security add-generic-password` argv for macOS.
+/// Argv for the macOS store helper. `security -i` reads its command from
+/// stdin, so the secret never appears on the command line, where any local
+/// user can read it with `ps` while the helper runs.
+const MACOS_STORE_ARGV: [&str; 1] = ["-i"];
+
+/// Longest command line `security -i` takes in one read. A longer line is
+/// split, and the remainder runs as further commands; refusing it here keeps
+/// a long value from turning into a truncated write.
+const MACOS_INTERACTIVE_LINE_MAX: usize = 3584;
+
+/// Quote one argument for the `security -i` command parser: wrap it in
+/// double quotes and escape `\` and `"` with a backslash.
+fn quote_interactive_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        if c == '\\' || c == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Build the `security add-generic-password` command line that
+/// `security -i` reads from stdin on macOS.
 ///
 /// When `exe_path` is `Some`, includes `-T <path>` so the stored item's ACL
 /// grants read access to that binary. Without `-T`, macOS restricts reads to
 /// the exact process that created the item — which breaks the daemon, since
 /// the TUI writes the keychain entry and the launchd-spawned daemon reads it.
-pub(crate) fn build_macos_store_args(
+///
+/// Fails for a value with a line break (it would end the command early) or a
+/// line too long for one read; the caller then uses the fallback file.
+pub(crate) fn build_macos_store_command(
     service: &str,
     account: &str,
     value: &str,
     exe_path: Option<&Path>,
-) -> Vec<String> {
-    let mut args = vec![
-        "add-generic-password".to_string(),
-        "-s".to_string(),
-        service.to_string(),
-        "-a".to_string(),
-        account.to_string(),
-        "-w".to_string(),
-        value.to_string(),
-        "-U".to_string(),
-    ];
-    if let Some(path) = exe_path {
-        args.push("-T".to_string());
-        args.push(path.to_string_lossy().into_owned());
+) -> Result<String> {
+    let exe = exe_path.map(|p| p.to_string_lossy().into_owned());
+    let fields = [service, account, value, exe.as_deref().unwrap_or("")];
+    if fields.iter().any(|f| f.contains(['\n', '\r', '\0'])) {
+        anyhow::bail!(
+            "Cannot store a credential with a line break in macOS Keychain (service={service}, account={account})"
+        );
     }
-    args
+    let mut line = format!(
+        "add-generic-password -s {} -a {} -w {} -U",
+        quote_interactive_arg(service),
+        quote_interactive_arg(account),
+        quote_interactive_arg(value),
+    );
+    if let Some(path) = &exe {
+        line.push_str(" -T ");
+        line.push_str(&quote_interactive_arg(path));
+    }
+    line.push('\n');
+    if line.len() > MACOS_INTERACTIVE_LINE_MAX {
+        anyhow::bail!(
+            "Credential too long for macOS Keychain helper (service={service}, account={account})"
+        );
+    }
+    Ok(line)
+}
+
+/// Windows Credential Manager entry for `service`/`account`.
+///
+/// The target name is `{service}/{account}`, the name every earlier Borg
+/// release wrote through `cmdkey`, so entries already on disk read back and
+/// `cmdkey /list` and `/delete` still find what this writes.
+pub fn windows_entry(service: &str, account: &str) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new_with_target(&windows_target(service, account), service, account)
+}
+
+fn windows_target(service: &str, account: &str) -> String {
+    format!("{service}/{account}")
 }
 
 /// Store a credential in the OS keychain.
@@ -100,11 +151,12 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
                 None
             }
         };
-        let args = build_macos_store_args(service, account, value, exe.as_deref());
-        let output = run_captured("security", &args, None)?;
+        let command = build_macos_store_command(service, account, value, exe.as_deref())?;
+        let output = run_captured("security", MACOS_STORE_ARGV, Some(command.as_bytes()))?;
         if !output.status.success() {
             anyhow::bail!(
-                "Failed to store in macOS Keychain (service={service}, account={account})"
+                "Failed to store in macOS Keychain (service={service}, account={account}, status={})",
+                output.status
             );
         }
     } else if cfg!(target_os = "linux") {
@@ -120,19 +172,16 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
             anyhow::bail!("Failed to store via secret-tool (service={service}, account={account})");
         }
     } else if cfg!(target_os = "windows") {
-        let target = format!("{service}/{account}");
-        let output = run_captured(
-            "cmdkey",
-            [
-                format!("/generic:{target}"),
-                format!("/user:{account}"),
-                format!("/pass:{value}"),
-            ],
-            None,
-        )?;
-        if !output.status.success() {
-            anyhow::bail!("Failed to store in Windows Credential Manager (target={target})");
-        }
+        // Written through the Credential Manager API, not `cmdkey /pass:`,
+        // so the secret is never on a command line.
+        windows_entry(service, account)
+            .and_then(|entry| entry.set_password(value))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to store in Windows Credential Manager (target={}): {e}",
+                    windows_target(service, account)
+                )
+            })?;
     } else {
         anyhow::bail!("No keychain available on this platform");
     }
@@ -161,7 +210,7 @@ pub fn remove(service: &str, account: &str) {
             None,
         );
     } else if cfg!(target_os = "windows") {
-        let target = format!("{service}/{account}");
+        let target = windows_target(service, account);
         let _ = run_captured("cmdkey", [format!("/delete:{target}")], None);
     }
 }
@@ -179,7 +228,7 @@ pub fn check(service: &str, account: &str) -> bool {
             .output()
             .is_ok_and(|o| o.status.success())
     } else if cfg!(target_os = "windows") {
-        let target = format!("{service}/{account}");
+        let target = windows_target(service, account);
         std::process::Command::new("cmdkey")
             .arg(format!("/list:{target}"))
             .output()
@@ -224,7 +273,7 @@ mod tests {
             // `secret-tool store` path which pipes the secret in.
             let _shim = crate::test_support::KeychainShim::fake_helper(concat!(
                 "cat >/dev/null 2>/dev/null\n",
-                "case \"$1\" in add-generic-password|delete-generic-password|store|clear) exit 0 ;; esac\n",
+                "case \"$1\" in -i|delete-generic-password|store|clear) exit 0 ;; esac\n",
                 "exit 1",
             ));
             store("borg-shim-store", "acct", "v").expect("helper success must map to Ok");
@@ -416,30 +465,98 @@ mod tests {
     }
 
     #[test]
-    fn build_macos_store_args_includes_dash_t_when_exe_provided() {
+    fn build_macos_store_command_includes_dash_t_when_exe_provided() {
         let exe = std::path::PathBuf::from("/usr/local/bin/borg");
-        let args = build_macos_store_args("svc", "acct", "val", Some(&exe));
+        let line = build_macos_store_command("svc", "acct", "val", Some(&exe)).unwrap();
 
         // -T is the ACL flag that lets the borg binary (daemon + TUI + CLI)
         // read the stored item. Dropping it re-introduces the bug.
-        let t_idx = args
-            .iter()
-            .position(|a| a == "-T")
-            .expect("-T flag must be present");
         assert_eq!(
-            args.get(t_idx + 1).map(String::as_str),
-            Some("/usr/local/bin/borg"),
-            "-T must be followed by the exe path"
+            line,
+            "add-generic-password -s \"svc\" -a \"acct\" -w \"val\" -U -T \"/usr/local/bin/borg\"\n"
         );
-        assert!(args.contains(&"-U".to_string()), "-U still required");
     }
 
     #[test]
-    fn build_macos_store_args_omits_dash_t_when_exe_missing() {
-        let args = build_macos_store_args("svc", "acct", "val", None);
+    fn build_macos_store_command_omits_dash_t_when_exe_missing() {
+        let line = build_macos_store_command("svc", "acct", "val", None).unwrap();
+        assert!(!line.contains("-T"), "no -T when exe path unavailable");
+        assert!(line.contains(" -U"), "-U still required");
+    }
+
+    /// Spec: `security -i` splits its line on whitespace outside double
+    /// quotes and takes `\\` and `\"` as escapes. A value with spaces, quotes
+    /// or backslashes must stay one argument, or the stored secret is wrong
+    /// and the rest of the value runs as extra options.
+    #[test]
+    fn interactive_quoting_keeps_each_value_one_argument() {
+        let cases = [
+            ("plain", r#""plain""#),
+            ("a b", r#""a b""#),
+            (r#"x"y"#, r#""x\"y""#),
+            (r"c:\d\", r#""c:\\d\\""#),
+            ("$HOME 'q'", r#""$HOME 'q'""#),
+        ];
+        for (raw, quoted) in cases {
+            assert_eq!(quote_interactive_arg(raw), quoted, "quoting {raw:?}");
+        }
+    }
+
+    /// Spec: a line break would end the command early and run the rest as a
+    /// second command, and an over-long line is split the same way. Both
+    /// must fail so the caller falls back to the file instead of writing a
+    /// truncated secret.
+    #[test]
+    fn build_macos_store_command_rejects_line_breaks_and_overlong_values() {
+        for bad in ["a\nb", "a\rb"] {
+            assert!(build_macos_store_command("svc", "acct", bad, None).is_err());
+            assert!(build_macos_store_command(bad, "acct", "v", None).is_err());
+        }
+        let long = "A".repeat(MACOS_INTERACTIVE_LINE_MAX);
+        let err = build_macos_store_command("svc", "acct", &long, None).unwrap_err();
         assert!(
-            !args.iter().any(|a| a == "-T"),
-            "no -T when exe path unavailable"
+            !err.to_string().contains(&long),
+            "error must not echo the secret"
+        );
+        let fits = "A".repeat(2048);
+        assert!(build_macos_store_command("svc", "acct", &fits, None).is_ok());
+    }
+
+    /// Regression: the store helper got the secret as an argument, so any
+    /// local user could read it with `ps` while the helper ran. The secret
+    /// must reach the helper on stdin only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_passes_secret_on_stdin_not_argv() {
+        let _lock = crate::test_support::env_lock();
+        let shim = crate::test_support::KeychainShim::fake_helper(concat!(
+            "printf 'ARGV %s\\n' \"$*\" >> \"{{LOG}}\"\n",
+            "if [ \"$1\" = -i ]; then printf 'STDIN ' >> \"{{LOG}}\"; cat >> \"{{LOG}}\"; fi\n",
+            "exit 0",
+        ));
+        let secret = "sk-argv-leak-check-9d2f";
+
+        store("borg-shim-argv-svc", "acct", secret).expect("shimmed store succeeds");
+
+        let log = std::fs::read_to_string(shim.log_path()).expect("helper ran");
+        for line in log.lines().filter(|l| l.starts_with("ARGV ")) {
+            assert!(!line.contains(secret), "secret on argv: {line}");
+        }
+        assert!(
+            log.lines()
+                .any(|l| l.starts_with("STDIN add-generic-password") && l.contains(secret)),
+            "secret must reach the helper on stdin: {log}"
+        );
+    }
+
+    /// Spec: the Windows target name stays `{service}/{account}` so entries
+    /// written by earlier releases (through `cmdkey`) read back, and
+    /// `cmdkey /list` and `/delete` find new ones.
+    #[test]
+    fn windows_target_matches_the_cmdkey_layout() {
+        assert_eq!(
+            windows_target("borg-slack", "bot_token"),
+            "borg-slack/bot_token"
         );
     }
 
