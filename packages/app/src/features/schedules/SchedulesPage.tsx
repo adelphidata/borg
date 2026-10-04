@@ -62,7 +62,7 @@ function NewSchedule({
   }
 
   const field =
-    "w-full rounded-[9px] border border-line bg-surface2 px-3 py-2 text-[13px] text-ink outline-none select-text placeholder:text-ink3";
+    "w-full rounded-[9px] border border-field bg-surface2 px-3 py-2 text-[13px] text-ink outline-none select-text placeholder:text-ink3 focus:border-focus";
 
   return (
     <div className="mb-5 flex flex-col gap-3 rounded-[10px] border border-line bg-surface2 p-4">

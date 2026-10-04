@@ -738,12 +738,11 @@ export function Composer({
           }}
           className={`flex items-end gap-3 border bg-surface2 py-2 pr-2 pl-[19px] ${
             isMobile ? "rounded-[22px]" : "rounded-[13px]"
-          } ${dragging ? "border-neon" : "border-line"}`}
+          } ${dragging ? "border-focus" : "border-field focus-within:border-focus"}`}
         >
-          <label
-            aria-label="Attach a file"
-            className="flex h-[29px] flex-none cursor-pointer items-center text-ink3 hover:text-ink2"
-          >
+          {/* The input is visually hidden but still focusable, so the paperclip
+              is reachable by Tab; the label draws the focus ring for it. */}
+          <label className="flex h-[29px] flex-none cursor-pointer items-center rounded-[6px] text-ink3 hover:text-ink2 has-focus-visible:text-ink has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-focus">
             <AttachIcon size={15} />
             <input
               type="file"
@@ -752,7 +751,8 @@ export function Composer({
               // browser labels `application/…` despite being text.
               accept="text/*,.md,.json,.yaml,.yml,.toml,.csv,.log,.rs,.ts,.tsx,.js,.jsx,.py,.go,.sh,.sql,image/png,image/jpeg,image/gif,image/webp"
               multiple
-              className="hidden"
+              aria-label="Attach a file"
+              className="sr-only"
               onChange={(e) => {
                 void addFiles(Array.from(e.target.files ?? []));
                 e.target.value = "";
@@ -770,8 +770,9 @@ export function Composer({
             }
             // Focus never leaves the box, so the row Enter would take is only
             // announced if the box names it. No `role="combobox"`: that would
-            // replace the textarea's own role, and it is a text box first.
-            aria-expanded={slashOpen || (pathOpen && pathRows.length > 0)}
+            // replace the textarea's own role, and it is a text box first —
+            // which is also why there is no `aria-expanded`, a state a text box
+            // does not support.
             aria-controls={
               pathOpen && pathRows.length > 0 ? PATH_LIST_ID : slashOpen ? SLASH_LIST_ID : undefined
             }

@@ -38,9 +38,9 @@ export function PageChrome({
     <main className="flex min-w-0 flex-1 flex-col bg-surface">
       {!isMobile && (
         <header className="flex h-14 flex-none items-center gap-3 border-b border-line2 px-[30px]">
-          <span className="text-[14px] leading-none font-medium tracking-[-0.01em] text-ink">
+          <h1 className="m-0 text-[14px] leading-none font-medium tracking-[-0.01em] text-ink">
             {title}
-          </span>
+          </h1>
           <span className="flex-1" />
           {meta && <span className="text-[11.5px] leading-none text-ink3">{meta}</span>}
           {headerActions}
@@ -56,6 +56,10 @@ export function PageChrome({
           <span className="h-1.5 w-1.5 animate-bpulse rounded-full bg-neon shadow-(--glow)" />
         </header>
       )}
+      {/* At phone width there is no title bar, so the page keeps its name as
+          a heading for assistive tech only. A visible <MobileTitle> repeats
+          it for the eye and is hidden from assistive tech. */}
+      {isMobile && <h1 className="sr-only">{title}</h1>}
       {children}
     </main>
   );

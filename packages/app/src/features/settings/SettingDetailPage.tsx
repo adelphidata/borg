@@ -47,9 +47,9 @@ function DetailShell({ title, children }: { title: string; children: ReactNode }
 function Heading({ name, desc }: { name: string; desc?: string }) {
   return (
     <div>
-      <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] break-all text-ink">
+      <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] break-all text-ink">
         {name}
-      </div>
+      </h2>
       {desc && <div className="mt-2 text-[13.5px] leading-[1.55] text-ink2">{desc}</div>}
     </div>
   );
@@ -113,11 +113,14 @@ function OptionPicker({
 }
 
 function ValueEditor({
+  label,
   initial,
   saving,
   onSave,
   onReset,
 }: {
+  /** The field's accessible name: the page heading names it only by sight. */
+  label: string;
   initial: string;
   saving: boolean;
   onSave: (value: string) => void;
@@ -131,8 +134,9 @@ function ValueEditor({
   return (
     <div className="flex flex-col gap-3.5">
       <input
-        className="w-full rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon"
+        className="w-full rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus"
         value={draft}
+        aria-label={label}
         spellCheck={false}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => isSubmitEnter(e) && !saving && onSave(draft)}
@@ -245,6 +249,7 @@ function CatalogDetail({
       )}
       {editing && (
         <ValueEditor
+          label={basic.name}
           initial={entry.value}
           saving={saving}
           onSave={(v) => void pick(v)}
@@ -305,7 +310,7 @@ function NameDetail({ entry }: { entry: { key: string; value: string; overridden
   return (
     <>
       <div className="flex flex-col gap-3.5">
-        <div className="flex items-center gap-1 rounded-[10px] border border-line2 bg-surface2 py-1 pr-1.5 pl-4 focus-within:border-neon">
+        <div className="flex items-center gap-1 rounded-[10px] border border-field bg-surface2 py-1 pr-1.5 pl-4 focus-within:border-focus">
           <input
             aria-label="Agent name"
             className="min-w-0 flex-1 bg-transparent py-2 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3"
@@ -437,6 +442,7 @@ export function SettingDetailPage() {
                 />
               ) : (
                 <ValueEditor
+                  label={title}
                   initial={entry.value}
                   saving={saving}
                   onSave={(v) => void save(entry.key, v)}

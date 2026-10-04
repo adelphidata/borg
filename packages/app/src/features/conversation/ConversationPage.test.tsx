@@ -181,6 +181,22 @@ describe("ConversationPage", () => {
     await waitFor(() => expect(screen.getByText("ask 40")).toBeTruthy());
   });
 
+  it("lets the keyboard reach and page the transcript itself", async () => {
+    // A transcript of plain text holds nothing focusable, so the scroller
+    // must take focus itself or a keyboard user cannot scroll it.
+    mount(fakeDaemon({ ...OPEN, GetSession: { messages: LONG } }));
+    const button = await screen.findByText("Show earlier messages", {}, { timeout: 5_000 });
+    const scroller = scrollerOf(button);
+    expect(screen.getByRole("region", { name: "Transcript" })).toBe(scroller);
+    expect(scroller.tabIndex).toBe(0);
+
+    measure(scroller, 3000, 500);
+    scroller.scrollTop = 1200;
+    scroller.focus();
+    pageKey("PageUp", scroller);
+    expect(scroller.scrollTop).toBe(700);
+  });
+
   it("leaves the page keys to the find input", async () => {
     mount(fakeDaemon(OPEN));
     await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());

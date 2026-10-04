@@ -177,7 +177,8 @@ function EditBox({
       autoFocus
       ref={box}
       rows={1}
-      className="w-full resize-none rounded-[13px] border border-line bg-surface2 px-4 py-[11px] text-[13.5px] leading-[1.45] text-ink outline-none select-text"
+      aria-label="Edit message"
+      className="w-full resize-none rounded-[13px] border border-field bg-surface2 px-4 py-[11px] text-[13.5px] leading-[1.45] text-ink outline-none select-text focus:border-focus"
       value={draft}
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={(e) => {

@@ -17,7 +17,7 @@ import { useVoiceCatalog, type VoiceCatalog, type VoiceProvider } from "../../li
 import { primaryRow, withPrimaryFields, withPrimaryProvider, type ChainRow } from "./voiceChain";
 
 const FIELD =
-  "w-full rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon";
+  "w-full rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus";
 
 const CARD = "flex flex-col gap-4 rounded-[12px] border border-line2 bg-surface2 p-4";
 
@@ -115,13 +115,16 @@ function Switch({
         <div className="text-[13.5px] leading-[1.3] font-medium text-ink">{label}</div>
         <div className="mt-[3px] text-[12px] leading-[1.45] text-ink3">{desc}</div>
       </div>
+      {/* Track and knob hold 3:1 against the card and each other in both
+          themes (WCAG 1.4.11): the field/focus tokens, and a knob in the
+          surface colour, which a white knob on dark-theme neon is not. */}
       <span
         className={`flex h-[22px] w-[38px] flex-none items-center rounded-full p-[3px] transition-colors ${
-          on ? "bg-neon" : "bg-line2"
+          on ? "bg-focus" : "bg-field"
         }`}
       >
         <span
-          className={`h-4 w-4 rounded-full bg-white transition-transform ${on ? "translate-x-4" : ""}`}
+          className={`h-4 w-4 rounded-full bg-surface transition-transform ${on ? "translate-x-4" : ""}`}
         />
       </span>
     </button>
@@ -437,9 +440,9 @@ export function VoiceSettingsPage() {
         <div className={DETAIL_COL}>
           <BackLink to="/settings" label="Settings" />
           <div>
-            <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
+            <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
               Voice & phone
-            </div>
+            </h2>
             <div className="mt-2 text-[13.5px] leading-[1.55] text-ink2">
               Talk to Borg, hear it answer, and let it make calls. Pick any provider for each;
               switch whenever you like.

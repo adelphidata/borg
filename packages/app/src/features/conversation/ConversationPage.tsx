@@ -335,9 +335,15 @@ export function ConversationPage() {
             />
           </div>
         )}
+        {/* Focusable so a keyboard can scroll it when nothing inside takes
+            focus (a transcript of plain text); the page keys above already
+            treat the transcript itself as a place they may page from. */}
         <div
           ref={scrollRef}
-          className={`flex-1 overflow-y-auto pb-2 ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
+          tabIndex={0}
+          role="region"
+          aria-label="Transcript"
+          className={`flex-1 overflow-y-auto pb-2 focus-visible:outline-offset-[-2px] ${isMobile ? "pt-[22px]" : "pt-[38px]"}`}
         >
           <div
             ref={contentRef}

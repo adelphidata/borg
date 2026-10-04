@@ -103,9 +103,9 @@ function ProviderDetail({
           {badgeOf(name)}
         </Badge>
         <div className="min-w-0 flex-1">
-          <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
+          <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
             {providerLabel(catalog, name)}
-          </div>
+          </h2>
           <div className="mt-1 text-[12.5px] leading-[1.4] text-ink3">
             {isConnected ? "Connected" : (blurb ?? "Not connected yet.")}
           </div>
@@ -209,7 +209,7 @@ function ProviderDetail({
         <div className="flex items-center gap-2.5">
           <input
             type="password"
-            className="min-w-0 flex-1 rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon"
+            className="min-w-0 flex-1 rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus"
             placeholder="API key"
             value={draftKey}
             onChange={(e) => setDraftKey(e.target.value)}
@@ -245,9 +245,9 @@ function ChannelDetail({ conn, refetch }: { conn: ChannelConnection; refetch: ()
           {badgeOf(conn.name)}
         </Badge>
         <div className="min-w-0 flex-1">
-          <div className="text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
+          <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
             {conn.name}
-          </div>
+          </h2>
           <div className="mt-1 text-[12.5px] leading-[1.4] text-ink3">
             {conn.senders.length} approved sender{conn.senders.length === 1 ? "" : "s"}
           </div>

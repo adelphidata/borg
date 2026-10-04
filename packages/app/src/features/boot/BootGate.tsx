@@ -52,7 +52,7 @@ export function BootGate({ children }: { children: ReactNode }) {
   const failed = status.state === "failed";
 
   return (
-    <div className="flex h-full items-center justify-center bg-surface [-webkit-app-region:drag]">
+    <main className="flex h-full items-center justify-center bg-surface [-webkit-app-region:drag]">
       <div className="flex w-[420px] max-w-[calc(100vw-48px)] flex-col px-[38px] [-webkit-app-region:no-drag]">
         <h1 className={TITLE}>{failed ? "Borg could not start." : "Starting Borg…"}</h1>
         <p className={BODY}>
@@ -80,6 +80,6 @@ export function BootGate({ children }: { children: ReactNode }) {
           </div>
         )}
       </div>
-    </div>
+    </main>
   );
 }

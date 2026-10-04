@@ -74,6 +74,27 @@ export function resolveLanguage(tag: string | undefined): keyof typeof LANGUAGES
   return Object.hasOwn(ALIASES, key) ? ALIASES[key] : null;
 }
 
+/**
+ * github-dark paints comments #6a737d on #24292e, 3.05:1 — under the 4.5:1
+ * text contrast floor. Swap in the theme's own lighter grey (#959da5, 5.3:1);
+ * every other token in both themes already clears it.
+ */
+const DARK_COMMENT = "#6a737d";
+const DARK_COMMENT_LEGIBLE = "#959da5";
+
+export function legibleComments<
+  T extends { tokenColors?: { settings?: { foreground?: string } }[] },
+>(theme: T): T {
+  return {
+    ...theme,
+    tokenColors: theme.tokenColors?.map((t) =>
+      t.settings?.foreground?.toLowerCase() === DARK_COMMENT
+        ? { ...t, settings: { ...t.settings, foreground: DARK_COMMENT_LEGIBLE } }
+        : t,
+    ),
+  };
+}
+
 let highlighter: Promise<HighlighterCore> | undefined;
 const loaded = new Set<string>();
 
@@ -84,7 +105,10 @@ function getHighlighter(): Promise<HighlighterCore> {
       import("shiki/engine/javascript"),
     ]);
     return createHighlighterCore({
-      themes: [import("@shikijs/themes/github-light"), import("@shikijs/themes/github-dark")],
+      themes: [
+        import("@shikijs/themes/github-light"),
+        import("@shikijs/themes/github-dark").then((m) => legibleComments(m.default)),
+      ],
       langs: [],
       engine: createJavaScriptRegexEngine(),
     });

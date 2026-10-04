@@ -43,17 +43,31 @@ describe("PageChrome", () => {
     expect(bare.container.querySelector(".text-ink3")).toBeNull();
   });
 
-  it("drops the desktop header at phone width", () => {
-    // Pages render their own heading through MobileTitle instead.
+  it("drops the desktop header at phone width but keeps the page's heading", () => {
+    // Pages show their title through MobileTitle; the h1 stays for assistive
+    // tech only, so every screen still has exactly one.
     breakpoint.set(true);
     render(
       <PageChrome title="Usage" meta="last 7 days">
         <p>body</p>
       </PageChrome>,
     );
-    expect(screen.queryByText("Usage")).toBeNull();
+    expect(screen.queryByRole("banner")).toBeNull();
+    expect(screen.getByRole("heading", { level: 1, name: "Usage" }).className).toContain("sr-only");
     expect(screen.queryByText("last 7 days")).toBeNull();
     expect(screen.getByText("body")).toBeTruthy();
+  });
+
+  it("names the page with an h1 in the desktop header", () => {
+    breakpoint.set(false);
+    render(
+      <PageChrome title="Usage">
+        <p>body</p>
+      </PageChrome>,
+    );
+    expect(screen.getByRole("heading", { level: 1, name: "Usage" }).className).not.toContain(
+      "sr-only",
+    );
   });
 
   it("shows the brand header on mobile only where the page asked for it", () => {

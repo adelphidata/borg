@@ -43,11 +43,11 @@ const PRIMARY = "px-[22px] py-[11px] text-[13px]";
 
 function Card({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex h-full items-center justify-center bg-surface [-webkit-app-region:drag]">
+    <main className="flex h-full items-center justify-center bg-surface [-webkit-app-region:drag]">
       <div className="flex min-h-[400px] w-[520px] max-w-[calc(100vw-48px)] flex-col justify-end px-[38px] pt-[34px] pb-[30px] [-webkit-app-region:no-drag]">
         {children}
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -279,13 +279,12 @@ function Picker({
         key={p.id}
         square
         variant={providerId === p.id ? "primary" : undefined}
+        aria-pressed={providerId === p.id}
         onClick={() => pick(p)}
       >
         {p.label}
         {p.recommended && (
-          <span className="ml-1.5 text-[10px] tracking-[0.08em] uppercase opacity-70">
-            Recommended
-          </span>
+          <span className="ml-1.5 text-[10px] tracking-[0.08em] uppercase">Recommended</span>
         )}
       </Pill>
     ));
@@ -297,7 +296,12 @@ function Picker({
       <div className="mt-5 flex flex-wrap gap-2">
         {pills(featured)}
         {rest.length > 0 && (
-          <button type="button" className={QUIET} onClick={() => setShowAll((v) => !v)}>
+          <button
+            type="button"
+            className={QUIET}
+            aria-expanded={showAll}
+            onClick={() => setShowAll((v) => !v)}
+          >
             {showAll ? "Fewer providers" : "More providers"}
           </button>
         )}
@@ -309,8 +313,9 @@ function Picker({
           <input
             autoFocus
             type="password"
-            className="mt-4 w-full rounded-[9px] border border-line bg-surface2 px-3 py-2.5 text-[13px] text-ink outline-none select-text placeholder:text-ink3"
+            className="mt-4 w-full rounded-[9px] border border-field bg-surface2 px-3 py-2.5 text-[13px] text-ink outline-none select-text placeholder:text-ink3 focus:border-focus"
             placeholder={`${selected.label} API key`}
+            aria-label={`${selected.label} API key`}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             onKeyDown={(e) => isSubmitEnter(e) && start()}
@@ -344,7 +349,12 @@ function Picker({
           {models.length > 1 && (
             <>
               {" · "}
-              <button type="button" className={QUIET} onClick={() => setChangingModel((v) => !v)}>
+              <button
+                type="button"
+                className={QUIET}
+                aria-expanded={changingModel}
+                onClick={() => setChangingModel((v) => !v)}
+              >
                 {changingModel ? "Keep" : "Change"}
               </button>
             </>
@@ -357,6 +367,7 @@ function Picker({
             <button
               key={choice.id}
               type="button"
+              aria-pressed={model === choice.id}
               onClick={() => {
                 setModel(choice.id);
                 setChangingModel(false);

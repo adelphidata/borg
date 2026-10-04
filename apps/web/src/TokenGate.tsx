@@ -55,7 +55,7 @@ export function TokenGate({ children }: { children: ReactNode }) {
   };
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-6 bg-surface px-6">
+    <main className="flex h-full flex-col items-center justify-center gap-6 bg-surface px-6">
       <div className="flex w-full max-w-[420px] flex-col gap-5">
         <div>
           <h1 className="text-[26px] leading-tight font-semibold tracking-[-0.02em] text-ink">
@@ -72,15 +72,16 @@ export function TokenGate({ children }: { children: ReactNode }) {
           value={draft}
           autoFocus
           placeholder="Client token"
+          aria-label="Client token"
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => isSubmitEnter(e) && save()}
-          className="w-full rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-neon"
+          className="w-full rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus"
         />
 
         <Pill variant="primary" className="self-start" onClick={save}>
           Continue
         </Pill>
       </div>
-    </div>
+    </main>
   );
 }

@@ -84,7 +84,7 @@ export function FindBar({
   return (
     <div
       role="search"
-      className="absolute top-3 right-4 z-10 flex items-center gap-1.5 rounded-[10px] border border-line bg-surface2 py-1.5 pr-1.5 pl-3 shadow-(--plateGlow)"
+      className="absolute top-3 right-4 z-10 flex items-center gap-1.5 rounded-[10px] border border-field bg-surface2 py-1.5 pr-1.5 pl-3 shadow-(--plateGlow) focus-within:border-focus"
     >
       <SearchIcon size={13} />
       <input

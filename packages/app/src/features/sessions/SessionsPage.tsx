@@ -77,7 +77,7 @@ function Row({
       <div className="flex items-center gap-2 rounded-[9px] px-3 py-2.5">
         <input
           autoFocus
-          className="min-w-0 flex-1 rounded-[7px] border border-line bg-surface2 px-2.5 py-1.5 text-[13px] text-ink outline-none select-text"
+          className="min-w-0 flex-1 rounded-[7px] border border-field bg-surface2 px-2.5 py-1.5 text-[13px] text-ink outline-none select-text focus:border-focus"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
@@ -95,42 +95,41 @@ function Row({
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={(e) => {
-        // A key pressed on the kebab or on a menu item bubbles up to here. It
-        // belongs to that control, not to the row.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
       // The gesture most people reach for on a list row. Same actions as the
       // kebab — a second door, not a second set of choices.
       onContextMenu={(e) => {
         e.preventDefault();
         setMenuAt({ x: e.clientX, y: e.clientY });
       }}
-      className={`group flex cursor-pointer items-center gap-2 rounded-[9px] px-3 py-2.5 hover:bg-surface3 ${
-        session.archived ? "opacity-60" : ""
-      }`}
+      className="group flex items-center gap-2 rounded-[9px] pr-3 hover:bg-surface3"
     >
-      {/* "Working" is already spelled out in the line below, so labelling the
-          dot too would make a screen reader say it twice. The other two are
-          not written anywhere, so those keep their labels. */}
-      {session.activity && (
-        <StatusDot tone={session.activity} label={DOT_LABELS[session.activity]} />
-      )}
-      <div className="min-w-0 flex-1">
-        <Truncated className="block text-[13.5px] leading-[1.35] text-ink">
-          {session.title}
-        </Truncated>
-        <Truncated className="mt-[3px] block text-[11px] leading-[1.35] text-ink3">
-          {rowSubtitle(session, now)}
-        </Truncated>
-      </div>
+      {/* The row's open action is its own button beside the kebab rather than
+          the whole row being one: a control inside a control is announced as
+          one and leaves the inner one unreachable to assistive tech. */}
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-[9px] border-0 bg-transparent py-2.5 pl-3 text-left"
+      >
+        {/* "Working" is already spelled out in the line below, so labelling the
+            dot too would make a screen reader say it twice. The other two are
+            not written anywhere, so those keep their labels. */}
+        {session.activity && (
+          <StatusDot tone={session.activity} label={DOT_LABELS[session.activity]} />
+        )}
+        <div className="min-w-0 flex-1">
+          {/* Archived rows recede by colour, not opacity: opacity would take
+              the grey subtitle below the 4.5:1 text contrast floor. */}
+          <Truncated
+            className={`block text-[13.5px] leading-[1.35] ${session.archived ? "text-ink2" : "text-ink"}`}
+          >
+            {session.title}
+          </Truncated>
+          <Truncated className="mt-[3px] block text-[11px] leading-[1.35] text-ink3">
+            {rowSubtitle(session, now)}
+          </Truncated>
+        </div>
+      </button>
       <SessionRowMenu
         onRename={rename}
         onArchive={onArchive}
@@ -186,12 +185,13 @@ export function SessionsPage() {
     <PageChrome title="Conversations" mobileBrandHeader>
       <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
         <div className="mb-4 flex items-center gap-2">
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-[10px] border border-line bg-surface2 px-3 py-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-[10px] border border-field bg-surface2 px-3 py-2 focus-within:border-focus">
             <SearchIcon size={14} />
             <input
               ref={searchBox}
               className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-ink outline-none select-text placeholder:text-ink3"
               placeholder="Search conversations"
+              aria-label="Search conversations"
               value={sessions.search}
               onChange={(e) => sessions.setSearch(e.target.value)}
             />

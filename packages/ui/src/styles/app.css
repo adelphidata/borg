@@ -21,9 +21,14 @@
   --surface3: #edefe8;
   --line: rgba(12, 16, 13, 0.12);
   --line2: rgba(12, 16, 13, 0.06);
+  /* Form-field borders and focus indicators carry meaning, so they hold the
+     3:1 non-text contrast floor (WCAG 1.4.11) that hairline dividers do not.
+     Text tokens (ink2/ink3) hold 4.5:1 on every surface, canvas included. */
+  --field: rgba(12, 16, 13, 0.46);
+  --focus: #3e6b00;
   --ink: #0c100d;
-  --ink2: rgba(12, 16, 13, 0.56);
-  --ink3: rgba(12, 16, 13, 0.54);
+  --ink2: rgba(12, 16, 13, 0.66);
+  --ink3: rgba(12, 16, 13, 0.62);
   --neon: #8fd400;
   --neonInk: #3e6b00;
   --navOnBg: rgba(143, 212, 0, 0.2);
@@ -42,6 +47,8 @@
   --surface3: #161b13;
   --line: rgba(180, 255, 0, 0.13);
   --line2: rgba(255, 255, 255, 0.055);
+  --field: rgba(233, 239, 227, 0.4);
+  --focus: #b4ff00;
   --ink: #e9efe3;
   --ink2: rgba(233, 239, 227, 0.55);
   --ink3: rgba(233, 239, 227, 0.54);
@@ -64,6 +71,8 @@
   --color-surface3: var(--surface3);
   --color-line: var(--line);
   --color-line2: var(--line2);
+  --color-field: var(--field);
+  --color-focus: var(--focus);
   --color-ink: var(--ink);
   --color-ink2: var(--ink2);
   --color-ink3: var(--ink3);
@@ -115,6 +124,12 @@
   }
   a:hover {
     color: var(--ink);
+  }
+  /* One keyboard focus ring for every control, at 3:1 in both themes. Fields
+     that draw their own focus border opt out with `outline-none`. */
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
   }
   /*
    * A page nobody can see should not be animating. The attribute is set by

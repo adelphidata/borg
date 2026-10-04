@@ -1017,10 +1017,10 @@ describe("dropping onto the composer", () => {
     const { frame } = mount();
 
     fireEvent.dragOver(frame, transfer({ "text/plain": "some words" }));
-    expect(frame.className).not.toContain("border-neon");
+    expect(frame.className.split(" ")).not.toContain("border-focus");
 
     expect(fireEvent.dragOver(frame, transfer({}, [image]))).toBe(false);
-    expect(frame.className).toContain("border-neon");
+    expect(frame.className.split(" ")).toContain("border-focus");
   });
 
   it("leaves text dragged onto the box for the browser to place", () => {
@@ -1059,7 +1059,7 @@ describe("dropping onto the composer", () => {
 
     expect(box).toHaveProperty("value", "https://example.com/");
     expect(collectAttachments).not.toHaveBeenCalled();
-    expect(frame.className).not.toContain("border-neon");
+    expect(frame.className.split(" ")).not.toContain("border-focus");
   });
 
   it("still says why a shortcut file dropped alone cannot be attached", async () => {

@@ -50,7 +50,7 @@ export function InlineNameField({
           size={1}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => onSubmit && isSubmitEnter(e) && onSubmit()}
-          className="col-start-1 row-start-1 w-full min-w-0 border-0 border-b border-dashed border-line bg-transparent p-0 text-inherit outline-none select-text placeholder:text-ink3 focus:border-neon"
+          className="col-start-1 row-start-1 w-full min-w-0 border-0 border-b border-dashed border-field bg-transparent p-0 text-inherit outline-none select-text placeholder:text-ink3 focus:border-focus"
         />
       </span>
       <ShuffleButton onClick={onShuffle} />

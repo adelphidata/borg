@@ -135,15 +135,13 @@ describe("SessionsPage listing", () => {
     expect(screen.getByTestId("path").textContent).toBe("/c/s1");
   });
 
-  it("opens a row from the keyboard", async () => {
-    // The row is a div; without the key handler it is unreachable without a
-    // mouse.
+  it("opens a row from a real button, so the keyboard reaches it", async () => {
     const daemon = fakeDaemon(listing([summary()]));
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]')!;
-    fireEvent.keyDown(row, { key: "Enter" });
+    const row = screen.getByRole("button", { name: /Ship the daemon/ });
+    act(() => row.click());
     expect(screen.getByTestId("path").textContent).toBe("/c/s1");
   });
 
@@ -267,7 +265,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Rename").click());
 
@@ -287,7 +285,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Rename").click());
     fireEvent.keyDown(screen.getByDisplayValue("Ship the daemon"), { key: "Enter" });
@@ -300,7 +298,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Rename").click());
 
@@ -316,7 +314,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Archive").click());
     await waitFor(() =>
@@ -332,7 +330,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Archive").click());
 
@@ -372,7 +370,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Archive").click());
     await waitFor(() =>
@@ -385,7 +383,7 @@ describe("SessionsPage row actions", () => {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
     fireEvent(row, event);
     expect(event.defaultPrevented).toBe(true);
@@ -414,7 +412,7 @@ describe("SessionsPage export", () => {
       mount(daemon);
       await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-      const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+      const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
       fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
       // Fake timers only from here: the export's deferred revoke is the point,
       // and everything before this needs the real clock to settle.
@@ -461,7 +459,7 @@ describe("SessionsPage export", () => {
       mount(daemon);
       await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
 
-      const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+      const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
       fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
       act(() =>
         within(screen.getByRole("menu"))
@@ -488,7 +486,7 @@ describe("SessionsPage rename", () => {
   async function startRename(daemon: ReturnType<typeof fakeDaemon>) {
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
-    const row = screen.getByText("Ship the daemon").closest('[role="button"]') as HTMLElement;
+    const row = screen.getByText("Ship the daemon").closest("button") as HTMLElement;
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     act(() => within(screen.getByRole("menu")).getByText("Rename").click());
     return screen.getByDisplayValue("Ship the daemon");

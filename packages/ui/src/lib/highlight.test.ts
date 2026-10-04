@@ -3,6 +3,7 @@ import {
   HIGHLIGHT_ENTRY_MAX,
   HighlightCache,
   highlight,
+  legibleComments,
   peekHighlight,
   resolveLanguage,
 } from "./highlight";
@@ -263,4 +264,24 @@ describe("registered grammars", () => {
     },
     30000,
   );
+});
+
+describe("legibleComments", () => {
+  it("lifts github-dark's comment grey over the text contrast floor and leaves the rest", () => {
+    const theme = {
+      name: "t",
+      tokenColors: [
+        { scope: "comment", settings: { foreground: "#6A737D" } },
+        { scope: "keyword", settings: { foreground: "#F97583" } },
+        { scope: "plain", settings: {} },
+      ],
+    };
+    const out = legibleComments(theme);
+    expect(out.tokenColors.map((t) => t.settings.foreground)).toEqual([
+      "#959da5",
+      "#F97583",
+      undefined,
+    ]);
+    expect(theme.tokenColors[0]!.settings.foreground).toBe("#6A737D");
+  });
 });
