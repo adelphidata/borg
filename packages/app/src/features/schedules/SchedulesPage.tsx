@@ -70,6 +70,7 @@ function NewSchedule({
         autoFocus
         className={field}
         placeholder="Name"
+        aria-label="Name"
         value={name}
         onChange={(e) => setName(e.target.value)}
       />
@@ -77,6 +78,7 @@ function NewSchedule({
         rows={3}
         className={`${field} resize-none`}
         placeholder="What should Borg do?"
+        aria-label="What should Borg do?"
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
       />
@@ -86,6 +88,7 @@ function NewSchedule({
             key={type}
             square
             variant={type === scheduleType ? "primary" : undefined}
+            aria-pressed={type === scheduleType}
             onClick={() => setScheduleType(type)}
           >
             {type}
@@ -96,6 +99,7 @@ function NewSchedule({
         <input
           className={field}
           placeholder={EXPR_HELP[scheduleType].placeholder}
+          aria-label="Schedule"
           value={scheduleExpr}
           onChange={(e) => setScheduleExpr(e.target.value)}
         />

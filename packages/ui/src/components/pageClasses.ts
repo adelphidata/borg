@@ -15,6 +15,14 @@ export const SECTION_LABEL_TEXT =
 /** The common case: a section label with the standard gap under it. */
 export const SECTION_LABEL = `${SECTION_LABEL_TEXT} mb-3.5`;
 
+/**
+ * The standard single-line text field, without its width. The border and the
+ * focus border use the field and focus tokens, which hold 3:1 against the
+ * surface in both themes. Callers add `w-full` or `min-w-0 flex-1`.
+ */
+export const TEXT_FIELD =
+  "rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus";
+
 /** Narrow column used by the connection + setting detail pages. */
 export const DETAIL_COL = "flex max-w-[620px] flex-col gap-7";
 

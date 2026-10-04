@@ -6,6 +6,7 @@ import {
   Pill,
   SECTION_LABEL,
   SETTINGS_SCROLL_DESKTOP_PADDING,
+  TEXT_FIELD,
   isSubmitEnter,
   scrollCol,
   useIsMobile,
@@ -16,8 +17,7 @@ import { useMutation } from "../../lib/useDaemon";
 import { useVoiceCatalog, type VoiceCatalog, type VoiceProvider } from "../../lib/voice";
 import { primaryRow, withPrimaryFields, withPrimaryProvider, type ChainRow } from "./voiceChain";
 
-const FIELD =
-  "w-full rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus";
+const FIELD = `w-full ${TEXT_FIELD}`;
 
 const CARD = "flex flex-col gap-4 rounded-[12px] border border-line2 bg-surface2 p-4";
 

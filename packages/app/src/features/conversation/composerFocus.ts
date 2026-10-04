@@ -18,7 +18,9 @@ export function registerComposer(get: () => HTMLTextAreaElement | null): () => v
 
 function isEditable(el: Element | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
-  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
+  // A file input takes focus (the composer's paperclip) but no typing.
+  if (el instanceof HTMLInputElement) return el.type !== "file";
+  return el.tagName === "TEXTAREA" || el.isContentEditable;
 }
 
 /**

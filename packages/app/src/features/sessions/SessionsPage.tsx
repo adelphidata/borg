@@ -78,6 +78,7 @@ function Row({
         <input
           autoFocus
           className="min-w-0 flex-1 rounded-[7px] border border-field bg-surface2 px-2.5 py-1.5 text-[13px] text-ink outline-none select-text focus:border-focus"
+          aria-label="Conversation title"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
@@ -101,7 +102,7 @@ function Row({
         e.preventDefault();
         setMenuAt({ x: e.clientX, y: e.clientY });
       }}
-      className="group flex items-center gap-2 rounded-[9px] pr-3 hover:bg-surface3"
+      className="group flex items-center rounded-[9px] pr-3 hover:bg-surface3"
     >
       {/* The row's open action is its own button beside the kebab rather than
           the whole row being one: a control inside a control is announced as
@@ -109,7 +110,7 @@ function Row({
       <button
         type="button"
         onClick={onOpen}
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-[9px] border-0 bg-transparent py-2.5 pl-3 text-left"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-[9px] border-0 bg-transparent py-2.5 pr-2 pl-3 text-left"
       >
         {/* "Working" is already spelled out in the line below, so labelling the
             dot too would make a screen reader say it twice. The other two are
@@ -117,7 +118,7 @@ function Row({
         {session.activity && (
           <StatusDot tone={session.activity} label={DOT_LABELS[session.activity]} />
         )}
-        <div className="min-w-0 flex-1">
+        <span className="block min-w-0 flex-1">
           {/* Archived rows recede by colour, not opacity: opacity would take
               the grey subtitle below the 4.5:1 text contrast floor. */}
           <Truncated
@@ -128,7 +129,7 @@ function Row({
           <Truncated className="mt-[3px] block text-[11px] leading-[1.35] text-ink3">
             {rowSubtitle(session, now)}
           </Truncated>
-        </div>
+        </span>
       </button>
       <SessionRowMenu
         onRename={rename}

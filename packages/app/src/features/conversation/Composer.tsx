@@ -736,9 +736,15 @@ export function Composer({
             e.preventDefault();
             dropText(text);
           }}
-          className={`flex items-end gap-3 border bg-surface2 py-2 pr-2 pl-[19px] ${
+          // Focus rests in the box, so the focus border is nearly always on; a
+          // drag also tints the frame, or it would look like nothing changed.
+          className={`flex items-end gap-3 border py-2 pr-2 pl-[19px] ${
             isMobile ? "rounded-[22px]" : "rounded-[13px]"
-          } ${dragging ? "border-focus" : "border-field focus-within:border-focus"}`}
+          } ${
+            dragging
+              ? "border-focus bg-nav-on-bg"
+              : "border-field bg-surface2 focus-within:border-focus"
+          }`}
         >
           {/* The input is visually hidden but still focusable, so the paperclip
               is reachable by Tab; the label draws the focus ring for it. */}
@@ -756,6 +762,9 @@ export function Composer({
               onChange={(e) => {
                 void addFiles(Array.from(e.target.files ?? []));
                 e.target.value = "";
+                // Back to the box, or focus stays on the paperclip, where
+                // typing and the page keys go nowhere.
+                if (!isMobileRef.current) focusComposer();
               }}
             />
           </label>

@@ -37,6 +37,18 @@ describe("focusComposer", () => {
     },
   );
 
+  it("takes focus back from a file input, which holds no caret", () => {
+    const box = mount("textarea");
+    const file = mount("input");
+    file.type = "file";
+    file.focus();
+    const unregister = registerComposer(() => box);
+
+    expect(focusComposer()).toBe(true);
+    expect(document.activeElement).toBe(box);
+    unregister();
+  });
+
   it("does nothing once the composer is gone", () => {
     const box = mount("textarea");
     registerComposer(() => box)();

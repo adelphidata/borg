@@ -8,6 +8,7 @@ import {
   Pill,
   SECTION_LABEL,
   StatusDot,
+  TEXT_FIELD,
   isSubmitEnter,
   scrollCol,
   useIsMobile,
@@ -209,8 +210,9 @@ function ProviderDetail({
         <div className="flex items-center gap-2.5">
           <input
             type="password"
-            className="min-w-0 flex-1 rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus"
+            className={`min-w-0 flex-1 ${TEXT_FIELD}`}
             placeholder="API key"
+            aria-label="API key"
             value={draftKey}
             onChange={(e) => setDraftKey(e.target.value)}
             onKeyDown={(e) => isSubmitEnter(e) && submitKey()}

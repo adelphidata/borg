@@ -7,6 +7,7 @@ import {
   PageChrome,
   Pill,
   SETTINGS_SCROLL_DESKTOP_PADDING,
+  TEXT_FIELD,
   isSubmitEnter,
   scrollCol,
   useIsMobile,
@@ -134,7 +135,7 @@ function ValueEditor({
   return (
     <div className="flex flex-col gap-3.5">
       <input
-        className="w-full rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus"
+        className={`w-full ${TEXT_FIELD}`}
         value={draft}
         aria-label={label}
         spellCheck={false}
