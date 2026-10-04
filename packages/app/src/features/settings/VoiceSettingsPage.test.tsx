@@ -195,4 +195,34 @@ describe("VoiceSettingsPage", () => {
     fireEvent.change(pickers[pickers.length - 1]!, { target: { value: "" } });
     await waitFor(() => expect(saved(daemon, "telephony.provider")).toEqual([""]));
   });
+  it("saves once when Enter is followed by leaving the field", async () => {
+    const { daemon } = mount([
+      entry("tts.enabled", "true"),
+      entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }])),
+    ]);
+    const voice = await screen.findByLabelText("Voice");
+    fireEvent.change(voice, { target: { value: "rachel" } });
+    fireEvent.keyDown(voice, { key: "Enter" });
+    fireEvent.blur(voice);
+    await waitFor(() => expect(saved(daemon, "tts.models")).toHaveLength(1));
+  });
+
+  it("keeps both edits when two fields save before the settings refresh", async () => {
+    const { daemon } = mount([
+      entry("tts.enabled", "true"),
+      entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }, { provider: "edge" }])),
+    ]);
+    const voice = await screen.findByLabelText("Voice");
+    const model = screen.getByLabelText("Model");
+    fireEvent.change(voice, { target: { value: "rachel" } });
+    fireEvent.blur(voice);
+    fireEvent.change(model, { target: { value: "eleven_v3" } });
+    fireEvent.blur(model);
+    await waitFor(() => expect(saved(daemon, "tts.models")).toHaveLength(2));
+    // The second write builds on the first, not on the stale snapshot.
+    expect(JSON.parse(saved(daemon, "tts.models")[1]!)).toEqual([
+      { provider: "elevenlabs", voice: "rachel", model: "eleven_v3" },
+      { provider: "edge" },
+    ]);
+  });
 });

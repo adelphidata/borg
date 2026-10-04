@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import {
   BackLink,
   DETAIL_COL,
@@ -58,9 +58,19 @@ function TextSetting({
   onCommit: (value: string) => void;
 }) {
   const [draft, setDraft] = useState(value);
+  // The last value handed to `onCommit`, so Enter then blur saves once.
+  const sent = useRef(value);
   // A save refreshes the snapshot; follow the stored value.
-  useEffect(() => setDraft(value), [value]);
-  const commit = () => draft.trim() !== value && onCommit(draft.trim());
+  useEffect(() => {
+    setDraft(value);
+    sent.current = value;
+  }, [value]);
+  const commit = () => {
+    const next = draft.trim();
+    if (next === sent.current) return;
+    sent.current = next;
+    onCommit(next);
+  };
   return (
     <Field label={label} hint={hint}>
       {(id) => (
@@ -235,13 +245,24 @@ function ChainSection({
   refetch: () => void;
 }) {
   const { settings, save } = useSettings();
+  const chain = settings.state === "ready" ? settings.data.get(chainKey)?.value : undefined;
+  // Each write builds on the last one sent, not on this render's snapshot: a
+  // blur save and a provider pick in the same moment would otherwise each
+  // drop the other's edit.
+  const latest = useRef(chain);
+  useEffect(() => {
+    latest.current = chain;
+  }, [chain]);
   if (settings.state !== "ready") return null;
+  const writeChain = (edit: (json: string | undefined) => string) => {
+    latest.current = edit(latest.current);
+    void save(chainKey, latest.current);
+  };
   const enabled = settings.data.get(toggleKey)?.value === "true";
-  const chain = settings.data.get(chainKey)?.value;
   const row: ChainRow | undefined = primaryRow(chain);
   const provider = providers.find((p) => p.id === row?.provider);
   const setField = (field: keyof ChainRow, value: string) =>
-    void save(chainKey, withPrimaryFields(chain, { [field]: value }));
+    writeChain((json) => withPrimaryFields(json, { [field]: value }));
 
   return (
     <section>
@@ -259,7 +280,7 @@ function ChainSection({
               label="Provider"
               providers={providers}
               value={row?.provider ?? ""}
-              onPick={(id) => void save(chainKey, withPrimaryProvider(chain, id))}
+              onPick={(id) => writeChain((json) => withPrimaryProvider(json, id))}
             />
             {provider && <KeyField key={provider.id} provider={provider} onSaved={refetch} />}
             {provider && showVoice && !provider.requiresCommand && (

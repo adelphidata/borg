@@ -36,23 +36,44 @@ export function VoiceInputButton({
   const catalog = useVoiceCatalog();
   const [phase, setPhase] = useState<Phase>("idle");
   const recorder = useRef<MediaRecorder | null>(null);
-  // Read by the recorder's stop handler, which outlives the render it was made in.
+  // Set from the click until the recorder runs, so a second click during the
+  // permission prompt cannot open a second stream.
+  const starting = useRef(false);
+  // Read by async work that outlives the render it was made in.
   const live = useRef(true);
   const handlers = useRef({ onText, onError });
   handlers.current = { onText, onError };
+
+  const visible = canRecord() && catalog.state === "ready" && catalog.data.transcriptionReady;
+
+  /** End a recording without sending it: the microphone goes off, the audio is dropped. */
+  const discard = () => {
+    const r = recorder.current;
+    recorder.current = null;
+    if (!r) return;
+    r.onstop = null;
+    if (r.state !== "inactive") r.stop();
+    r.stream.getTracks().forEach((t) => t.stop());
+  };
 
   useEffect(() => {
     live.current = true;
     return () => {
       live.current = false;
-      // Leaving the page must not leave the microphone on.
-      const r = recorder.current;
-      if (r && r.state !== "inactive") r.stop();
-      r?.stream.getTracks().forEach((t) => t.stop());
+      // Leaving the page must not leave the microphone on, nor send what it heard.
+      discard();
     };
   }, []);
 
-  if (!canRecord() || catalog.state !== "ready" || !catalog.data.transcriptionReady) return null;
+  // Voice input turned off mid-recording: no button is left to stop it, so stop it here.
+  useEffect(() => {
+    if (!visible) {
+      discard();
+      setPhase("idle");
+    }
+  }, [visible]);
+
+  if (!visible) return null;
 
   const transcribe = async (blob: Blob) => {
     setPhase("transcribing");
@@ -75,14 +96,24 @@ export function VoiceInputButton({
   };
 
   const start = async () => {
+    if (starting.current || recorder.current) return;
+    starting.current = true;
     handlers.current.onError(undefined);
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch {
-      handlers.current.onError(
-        "Borg can't use the microphone. Allow it for this app and try again.",
-      );
+      starting.current = false;
+      if (live.current)
+        handlers.current.onError(
+          "Borg can't use the microphone. Allow it for this app and try again.",
+        );
+      return;
+    }
+    starting.current = false;
+    // The composer went away while the permission prompt was open.
+    if (!live.current) {
+      stream.getTracks().forEach((t) => t.stop());
       return;
     }
     const r = new MediaRecorder(stream);
@@ -100,7 +131,7 @@ export function VoiceInputButton({
     setPhase("recording");
   };
 
-  const label =
+  const hint =
     phase === "recording"
       ? "Stop recording"
       : phase === "transcribing"
@@ -110,9 +141,11 @@ export function VoiceInputButton({
   return (
     <button
       type="button"
-      aria-label={label}
-      title={label}
+      // One stable name; the state rides on pressed/busy, as screen readers expect.
+      aria-label="Voice input"
+      title={hint}
       aria-pressed={phase === "recording"}
+      aria-busy={phase === "transcribing"}
       disabled={phase === "transcribing"}
       onClick={() => (phase === "recording" ? recorder.current?.stop() : void start())}
       className={`flex h-[29px] w-[29px] flex-none cursor-pointer items-center justify-center rounded-[9px] border-0 disabled:cursor-wait ${
