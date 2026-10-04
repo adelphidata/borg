@@ -164,6 +164,8 @@ Borg's STT/TTS/LLM layers all support a local-first stack. The pieces below
 require no API keys — point each subsystem at the right local endpoint and
 everything stays on-device.
 
+For the provider lists, key lookup and phone calls, see [Voice & phone](./voice.md).
+
 **LLM (Ollama or any OpenAI-compatible local server — e.g. llama.cpp's `server`).**
 
 ```sh

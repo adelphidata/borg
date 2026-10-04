@@ -690,7 +690,9 @@ roughly by ROI — each is independent.
 
 - **Voice Call channel.** `[I]` Twilio/Telnyx/Plivo realtime voice
   with streaming STT/TTS (Deepgram, ElevenLabs, OpenAI/xAI realtime).
-  Borg has Twilio SMS but no voice path.
+  Borg places outbound calls through the `phone_call` tool (Twilio, Vapi,
+  Bland, ElevenLabs agents; see [voice.md](./voice.md)) but has no inbound
+  or realtime streaming voice channel.
 - **TTS/STT provider matrix.** `[I]` Borg has a shared
   `audio.models`/`tts.models` provider matrix for local voice, gateway
   voice, `text_to_speech`, and `transcribe_audio`: Edge, OpenAI,
