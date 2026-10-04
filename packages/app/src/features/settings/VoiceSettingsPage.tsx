@@ -55,7 +55,8 @@ function TextSetting({
   hint?: ReactNode;
   value: string;
   placeholder?: string;
-  onCommit: (value: string) => void;
+  /** Resolves to false when the save did not take, so the same value can be retried. */
+  onCommit: (value: string) => Promise<boolean> | void;
 }) {
   const [draft, setDraft] = useState(value);
   // The last value handed to `onCommit`, so Enter then blur saves once.
@@ -69,7 +70,9 @@ function TextSetting({
     const next = draft.trim();
     if (next === sent.current) return;
     sent.current = next;
-    onCommit(next);
+    void Promise.resolve(onCommit(next)).then((ok) => {
+      if (ok === false && sent.current === next) sent.current = value;
+    });
   };
   return (
     <Field label={label} hint={hint}>
@@ -249,14 +252,27 @@ function ChainSection({
   // Each write builds on the last one sent, not on this render's snapshot: a
   // blur save and a provider pick in the same moment would otherwise each
   // drop the other's edit.
+  // Writes go out one at a time, in order, and a refresh only resyncs
+  // `latest` once none is in flight, so a refresh between two writes
+  // cannot roll the second back.
   const latest = useRef(chain);
+  const inFlight = useRef(0);
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   useEffect(() => {
-    latest.current = chain;
+    if (inFlight.current === 0) latest.current = chain;
   }, [chain]);
   if (settings.state !== "ready") return null;
-  const writeChain = (edit: (json: string | undefined) => string) => {
-    latest.current = edit(latest.current);
-    void save(chainKey, latest.current);
+  const writeChain = (edit: (json: string | undefined) => string): Promise<boolean> => {
+    const next = edit(latest.current);
+    latest.current = next;
+    inFlight.current += 1;
+    const done = queue.current
+      .then(() => save(chainKey, next))
+      .finally(() => {
+        inFlight.current -= 1;
+      });
+    queue.current = done.catch(() => undefined);
+    return done;
   };
   const enabled = settings.data.get(toggleKey)?.value === "true";
   const row: ChainRow | undefined = primaryRow(chain);
@@ -280,7 +296,7 @@ function ChainSection({
               label="Provider"
               providers={providers}
               value={row?.provider ?? ""}
-              onPick={(id) => writeChain((json) => withPrimaryProvider(json, id))}
+              onPick={(id) => void writeChain((json) => withPrimaryProvider(json, id))}
             />
             {provider && <KeyField key={provider.id} provider={provider} onSaved={refetch} />}
             {provider && showVoice && !provider.requiresCommand && (
@@ -363,13 +379,13 @@ function PhoneSection({ catalog, refetch }: { catalog: VoiceCatalog; refetch: ()
                 label="Account SID"
                 value={value("telephony.account_id")}
                 placeholder="AC…"
-                onCommit={(v) => void save("telephony.account_id", v)}
+                onCommit={(v) => save("telephony.account_id", v)}
               />
             )}
             <TextSetting
               label={phone.callerIdLabel}
               value={value("telephony.caller_id")}
-              onCommit={(v) => void save("telephony.caller_id", v)}
+              onCommit={(v) => save("telephony.caller_id", v)}
             />
             {phone.usesAgentId && (
               <TextSetting
@@ -380,7 +396,7 @@ function PhoneSection({ catalog, refetch }: { catalog: VoiceCatalog; refetch: ()
                     : "Leave empty to give each call's task to a fresh agent. A saved agent gets it as {{task}}."
                 }
                 value={value("telephony.agent_id")}
-                onCommit={(v) => void save("telephony.agent_id", v)}
+                onCommit={(v) => save("telephony.agent_id", v)}
               />
             )}
             <TextSetting
@@ -388,7 +404,7 @@ function PhoneSection({ catalog, refetch }: { catalog: VoiceCatalog; refetch: ()
               hint="Comma-separated numbers or prefixes with country code, like +1415. Empty allows any number."
               value={value("telephony.allowed_numbers")}
               placeholder="Any number"
-              onCommit={(v) => void save("telephony.allowed_numbers", v)}
+              onCommit={(v) => save("telephony.allowed_numbers", v)}
             />
             <Status
               ok={catalog.phoneProblem === ""}

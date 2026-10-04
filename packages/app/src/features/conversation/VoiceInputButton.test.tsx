@@ -228,4 +228,33 @@ describe("VoiceInputButton", () => {
     expect(track.stop).toHaveBeenCalled();
     expect(daemon.calls.some((c) => c.method === "Transcribe")).toBe(false);
   });
+  it("releases a stream granted after voice input was turned off during the prompt", async () => {
+    let grant: (s: unknown) => void = () => {};
+    getUserMedia.mockImplementation(() => new Promise((resolve) => (grant = resolve)));
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [] },
+      GetVoiceCatalog: catalog(true),
+      SetSetting: {},
+    });
+    let save: (key: string, value: string) => Promise<unknown> = async () => undefined;
+    function SaveProbe() {
+      save = useSettings().save;
+      return null;
+    }
+    renderApp(
+      <>
+        <VoiceInputButton onText={vi.fn()} onError={vi.fn()} />
+        <SaveProbe />
+      </>,
+      { daemon, wrapper: (children) => <SettingsProvider>{children}</SettingsProvider> },
+    );
+    fireEvent.click(await findMic());
+    daemon.answer("GetSettings", { entries: [setting("audio.enabled", "false")] });
+    daemon.answer("GetVoiceCatalog", catalog(false));
+    await act(async () => void (await save("audio.enabled", "false")));
+    await waitFor(() => expect(queryMic()).toBeNull());
+    await act(async () => grant({ getTracks: () => [track] }));
+    expect(track.stop).toHaveBeenCalled();
+    expect(FakeRecorder.last).toBeUndefined();
+  });
 });

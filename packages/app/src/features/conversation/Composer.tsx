@@ -804,8 +804,10 @@ export function Composer({
             }}
           />
           <VoiceInputButton
-            // A new conversation gets a new microphone; a recording never lands in another draft.
-            key={draftKey}
+            // Another conversation gets a new microphone, so a recording never
+            // lands in another draft. Not `draftKey`: it changes when a new
+            // conversation is issued its id, which would drop the recording.
+            key={conversationKey}
             onText={(spoken) => {
               setDraft((prev) => (prev.trim() === "" ? spoken : `${prev.trimEnd()} ${spoken}`));
               focusComposer();

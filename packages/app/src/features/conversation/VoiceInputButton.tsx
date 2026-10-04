@@ -44,16 +44,26 @@ export function VoiceInputButton({
   const handlers = useRef({ onText, onError });
   handlers.current = { onText, onError };
 
-  const visible = canRecord() && catalog.state === "ready" && catalog.data.transcriptionReady;
+  // A failed refresh keeps the last answer: a network blip must not cut off a recording.
+  const lastReady = useRef(false);
+  if (catalog.state === "ready") lastReady.current = catalog.data.transcriptionReady;
+  const visible = canRecord() && lastReady.current;
+  // Read after the permission prompt, which can outlast the button.
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
-  /** End a recording without sending it: the microphone goes off, the audio is dropped. */
+  /**
+   * End a recording without sending it: the microphone goes off, the audio is
+   * dropped. True when there was a recording to drop.
+   */
   const discard = () => {
     const r = recorder.current;
     recorder.current = null;
-    if (!r) return;
+    if (!r) return false;
     r.onstop = null;
     if (r.state !== "inactive") r.stop();
     r.stream.getTracks().forEach((t) => t.stop());
+    return true;
   };
 
   useEffect(() => {
@@ -68,7 +78,8 @@ export function VoiceInputButton({
   // Voice input turned off mid-recording: no button is left to stop it, so stop it here.
   useEffect(() => {
     if (!visible) {
-      discard();
+      if (discard())
+        handlers.current.onError("Voice input was turned off, so the recording was dropped.");
       setPhase("idle");
     }
   }, [visible]);
@@ -111,8 +122,9 @@ export function VoiceInputButton({
       return;
     }
     starting.current = false;
-    // The composer went away while the permission prompt was open.
-    if (!live.current) {
+    // The composer went away, or voice input was turned off, while the
+    // permission prompt was open.
+    if (!live.current || !visibleRef.current) {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }

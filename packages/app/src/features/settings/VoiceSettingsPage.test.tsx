@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { ThemeProvider } from "@borg/ui";
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { fakeDaemon, renderApp } from "../../test/harness";
+import { BorgError, GrpcStatus } from "@borg/client";
 import { SettingsProvider } from "../../lib/settings";
 import { VoiceSettingsPage } from "./VoiceSettingsPage";
 
@@ -223,6 +224,43 @@ describe("VoiceSettingsPage", () => {
     expect(JSON.parse(saved(daemon, "tts.models")[1]!)).toEqual([
       { provider: "elevenlabs", voice: "rachel", model: "eleven_v3" },
       { provider: "edge" },
+    ]);
+  });
+  it("lets the same value be saved again after a save failed", async () => {
+    const { daemon } = mount([entry("telephony.provider", "twilio")]);
+    daemon.answer("SetSetting", new BorgError(GrpcStatus.Unavailable, "daemon down"));
+    const sid = await screen.findByLabelText("Account SID");
+    fireEvent.change(sid, { target: { value: "AC123" } });
+    fireEvent.keyDown(sid, { key: "Enter" });
+    await waitFor(() => expect(saved(daemon, "telephony.account_id")).toHaveLength(1));
+    daemon.answer("SetSetting", {});
+    await act(async () => {});
+    fireEvent.keyDown(sid, { key: "Enter" });
+    await waitFor(() => expect(saved(daemon, "telephony.account_id")).toEqual(["AC123", "AC123"]));
+  });
+
+  it("sends chain writes one at a time, each on top of the last", async () => {
+    const { daemon } = mount([
+      entry("tts.enabled", "true"),
+      entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }])),
+    ]);
+    let release: () => void = () => {};
+    daemon.answer("SetSetting", () => new Promise((resolve) => (release = () => resolve({}))));
+    const voice = await screen.findByLabelText("Voice");
+    const model = screen.getByLabelText("Model");
+    fireEvent.change(voice, { target: { value: "rachel" } });
+    fireEvent.blur(voice);
+    fireEvent.change(model, { target: { value: "eleven_v3" } });
+    fireEvent.blur(model);
+    await waitFor(() => expect(saved(daemon, "tts.models")).toHaveLength(1));
+    // The second write waits for the first.
+    await act(async () => {});
+    expect(saved(daemon, "tts.models")).toHaveLength(1);
+    await act(async () => release());
+    await waitFor(() => expect(saved(daemon, "tts.models")).toHaveLength(2));
+    await act(async () => release());
+    expect(JSON.parse(saved(daemon, "tts.models")[1]!)).toEqual([
+      { provider: "elevenlabs", voice: "rachel", model: "eleven_v3" },
     ]);
   });
 });

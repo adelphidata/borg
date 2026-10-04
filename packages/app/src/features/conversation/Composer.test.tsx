@@ -46,22 +46,34 @@ vi.mock("./ModelPill", () => ({ ModelPill: () => null }));
  * The microphone talks to the daemon too. Its stand-in hands the composer
  * words or an error on click, which is all the composer sees of it.
  */
-const spoken = vi.hoisted(() => ({ text: "hello there", error: undefined as string | undefined }));
-vi.mock("./VoiceInputButton", () => ({
-  VoiceInputButton: ({
-    onText,
-    onError,
-  }: {
-    onText: (t: string) => void;
-    onError: (m: string | undefined) => void;
-  }) => (
-    <button
-      type="button"
-      aria-label="Speak instead of typing"
-      onClick={() => (spoken.error ? onError(spoken.error) : onText(spoken.text))}
-    />
-  ),
+const spoken = vi.hoisted(() => ({
+  text: "hello there",
+  error: undefined as string | undefined,
+  mounts: 0,
 }));
+vi.mock("./VoiceInputButton", async () => {
+  const { useEffect } = await import("react");
+  return {
+    VoiceInputButton: ({
+      onText,
+      onError,
+    }: {
+      onText: (t: string) => void;
+      onError: (m: string | undefined) => void;
+    }) => {
+      useEffect(() => {
+        spoken.mounts += 1;
+      }, []);
+      return (
+        <button
+          type="button"
+          aria-label="Speak instead of typing"
+          onClick={() => (spoken.error ? onError(spoken.error) : onText(spoken.text))}
+        />
+      );
+    },
+  };
+});
 
 /**
  * Path completions come from the daemon, scoped and filtered there. This file
@@ -1150,6 +1162,16 @@ describe("Composer voice input", () => {
   beforeEach(() => {
     spoken.text = "hello there";
     spoken.error = undefined;
+    spoken.mounts = 0;
+  });
+
+  it("keeps the same microphone when a new conversation is issued its id", () => {
+    const props = { busy: false, onSend: noop, onSteer: noop, onCancel: noop };
+    const { rerender } = render(<Composer {...props} draftKey="new" conversationKey="c1" />);
+    rerender(<Composer {...props} draftKey="session-123" conversationKey="c1" />);
+    expect(spoken.mounts).toBe(1);
+    rerender(<Composer {...props} draftKey="session-456" conversationKey="c2" />);
+    expect(spoken.mounts).toBe(2);
   });
 
   it("puts spoken words into an empty box without sending them", () => {
