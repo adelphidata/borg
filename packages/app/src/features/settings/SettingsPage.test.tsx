@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
+import { useLocation } from "react-router-dom";
 import { ThemeProvider } from "@borg/ui";
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { BorgError, GrpcStatus } from "@borg/client";
@@ -37,15 +38,25 @@ const REGISTRY = [
 
 const DAEMON = { GetSettings: { entries: REGISTRY }, GetSetupStatus: setupStatus() };
 
+function Path() {
+  return <span data-testid="path">{useLocation().pathname}</span>;
+}
+
 function mount(daemon = fakeDaemon(DAEMON)) {
-  return renderApp(<SettingsPage />, {
-    daemon,
-    wrapper: (children) => (
-      <ThemeProvider>
-        <SettingsProvider>{children}</SettingsProvider>
-      </ThemeProvider>
-    ),
-  });
+  return renderApp(
+    <>
+      <SettingsPage />
+      <Path />
+    </>,
+    {
+      daemon,
+      wrapper: (children) => (
+        <ThemeProvider>
+          <SettingsProvider>{children}</SettingsProvider>
+        </ThemeProvider>
+      ),
+    },
+  );
 }
 
 describe("advancedCategoryOf", () => {
@@ -218,6 +229,22 @@ describe("SettingsPage", () => {
       "Other",
     ]);
     expect(screen.getByText("1 changed")).toBeTruthy();
+  });
+
+  it("opens the guided voice page from its category, above the raw keys", async () => {
+    mount(
+      fakeDaemon({
+        ...DAEMON,
+        GetSettings: { entries: [...REGISTRY, entry("tts.enabled", "false")] },
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
+    act(() => screen.getByText("Advanced").click());
+    act(() => screen.getByText("Voice & Media").click());
+    expect(screen.getByTitle("tts.enabled")).toBeTruthy();
+    expect(advancedCategoryOf("telephony.provider").name).toBe("Voice & Media");
+    act(() => screen.getByRole("button", { name: /Voice & phone/ }).click());
+    expect(screen.getByTestId("path").textContent).toBe("/settings/voice");
   });
 
   it("remembers open folds for the tab across a remount", async () => {

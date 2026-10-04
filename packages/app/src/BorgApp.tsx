@@ -46,6 +46,7 @@ import {
 } from "./features/sessions/sessionsVersion";
 import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
+import { VoiceSettingsPage } from "./features/settings/VoiceSettingsPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
 import { UpdatePill } from "./components/UpdatePill";
 import { useAgentName } from "./lib/agentName";
@@ -295,6 +296,7 @@ function Shell({ platform }: { platform: Platform }) {
             ))}
             <Route path="/c/:sessionId" element={<ConversationPage />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
+            <Route path="/settings/voice" element={<VoiceSettingsPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
             <Route path="/settings/:id" element={<SettingDetailPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

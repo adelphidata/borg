@@ -19,6 +19,7 @@ import { appendPastedText, composerOwnsPaste, pastedTextFile } from "./documentP
 import { draftTitle, publishDraft, readDraft } from "./draftStore";
 import { carriesFiles, carriesText, insertAt, readDrop } from "./dropContent";
 import { ModelPill } from "./ModelPill";
+import { VoiceInputButton } from "./VoiceInputButton";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
 import { mergeQueued } from "./queuedTurn";
 import { slashQuery } from "./slashToken";
@@ -801,6 +802,13 @@ export function Composer({
               if (files.length > 0) void addFiles(files);
               if (asFile) pasteText(text);
             }}
+          />
+          <VoiceInputButton
+            onText={(spoken) => {
+              setDraft((prev) => (prev.trim() === "" ? spoken : `${prev.trimEnd()} ${spoken}`));
+              focusComposer();
+            }}
+            onError={setError}
           />
           {busy && draft.trim() === "" ? (
             <Pill variant="danger" square onClick={stop}>

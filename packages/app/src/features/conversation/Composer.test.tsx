@@ -43,6 +43,27 @@ vi.mock("./attachments", () => ({
 vi.mock("./ModelPill", () => ({ ModelPill: () => null }));
 
 /**
+ * The microphone talks to the daemon too. Its stand-in hands the composer
+ * words or an error on click, which is all the composer sees of it.
+ */
+const spoken = vi.hoisted(() => ({ text: "hello there", error: undefined as string | undefined }));
+vi.mock("./VoiceInputButton", () => ({
+  VoiceInputButton: ({
+    onText,
+    onError,
+  }: {
+    onText: (t: string) => void;
+    onError: (m: string | undefined) => void;
+  }) => (
+    <button
+      type="button"
+      aria-label="Speak instead of typing"
+      onClick={() => (spoken.error ? onError(spoken.error) : onText(spoken.text))}
+    />
+  ),
+}));
+
+/**
  * Path completions come from the daemon, scoped and filtered there. This file
  * is about what the composer does with the rows it is handed.
  */
@@ -1122,5 +1143,44 @@ describe("Enter while an input method is composing", () => {
 
     fireEvent.keyDown(box, { key: "Enter", keyCode: 13 });
     expect(onSend).toHaveBeenCalledWith("こんにちは", []);
+  });
+});
+
+describe("Composer voice input", () => {
+  beforeEach(() => {
+    spoken.text = "hello there";
+    spoken.error = undefined;
+  });
+
+  it("puts spoken words into an empty box without sending them", () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        busy={false}
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+        draftKey="v1"
+        conversationKey="v1"
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Speak instead of typing"));
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("hello there");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("appends spoken words after what was already typed, one space apart", () => {
+    setup({ draftKey: "v2", conversationKey: "v2" });
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "Remind me  " } });
+    fireEvent.click(screen.getByLabelText("Speak instead of typing"));
+    expect(box.value).toBe("Remind me hello there");
+  });
+
+  it("shows the microphone's failure under the box", () => {
+    spoken.error = "Didn't catch that. Try again a bit closer.";
+    setup({ draftKey: "v3", conversationKey: "v3" });
+    fireEvent.click(screen.getByLabelText("Speak instead of typing"));
+    expect(screen.getByText("Didn't catch that. Try again a bit closer.")).toBeTruthy();
   });
 });

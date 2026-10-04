@@ -153,6 +153,23 @@ function CategoryFold({
       </button>
       {open && (
         <div id={bodyId} className="border-t border-line2 bg-surface px-1.5 pt-1 pb-1.5">
+          {category.page && (
+            <button
+              type="button"
+              className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
+              onClick={() => navigate(category.page!.path)}
+            >
+              <span className="min-w-0">
+                <span className="block text-[12.5px] leading-[1.3] font-medium text-ink">
+                  {category.page.name}
+                </span>
+                <span className="mt-[3px] block text-[11.5px] leading-[1.4] text-ink3">
+                  {category.page.desc}
+                </span>
+              </span>
+              <ChevronIcon size={12} className="flex-none text-ink3" />
+            </button>
+          )}
           {sections.map((section) => (
             <div key={section.prefix || "_"}>
               {labelled && section.prefix !== "" && (

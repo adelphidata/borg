@@ -43,6 +43,7 @@ export {
   CopyIcon,
   GearIcon,
   LogoIcon,
+  MicIcon,
   MoonIcon,
   MoreIcon,
   PencilIcon,

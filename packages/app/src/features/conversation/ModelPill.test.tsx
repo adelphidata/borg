@@ -10,6 +10,7 @@ vi.mock("../palette/useCommands", () => ({
   useCommands: () => ({ commands: [], saveError: undefined, clearSaveError: () => {} }),
 }));
 vi.mock("./usePathCompletions", () => ({ usePathCompletions: () => [] }));
+vi.mock("./VoiceInputButton", () => ({ VoiceInputButton: () => null }));
 
 const save = vi.fn(() => Promise.resolve(true));
 

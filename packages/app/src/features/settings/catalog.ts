@@ -138,6 +138,8 @@ export interface AdvancedCategory {
   desc: string;
   /** First key segments that land here (`voice` for `voice.enabled`). */
   prefixes: readonly string[];
+  /** A guided page for this fold's settings, listed above the raw keys. */
+  page?: { path: string; name: string; desc: string };
 }
 
 /**
@@ -176,8 +178,13 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
   {
     id: "voice",
     name: "Voice & Media",
-    desc: "Speech, transcription, images and video",
-    prefixes: ["voice", "tts", "audio", "media", "image_gen"],
+    desc: "Speech, transcription, phone calls, images and video",
+    prefixes: ["voice", "tts", "audio", "telephony", "media", "image_gen"],
+    page: {
+      path: "/settings/voice",
+      name: "Voice & phone",
+      desc: "Pick who listens, who speaks, and who places calls",
+    },
   },
   {
     id: "tools",
