@@ -40,9 +40,10 @@ export interface BasicSetting {
   /**
    * Choices come from the daemon's catalog (`Admin.GetSetupStatus`) rather
    * than a list here: the providers, or the models of the current provider.
-   * Free text stays reachable behind "Something else…".
+   * Free text stays reachable behind "Something else…". `name` is the
+   * agent's name: free text with a reroll from the daemon's name pool.
    */
-  catalog?: "provider" | "model";
+  catalog?: "provider" | "model" | "name";
 }
 
 /**
@@ -61,6 +62,13 @@ export const THINKING_OPTIONS: SettingOption[] = [
 ];
 
 export const basicSettings: BasicSetting[] = [
+  {
+    id: "name",
+    key: "user.agent_name",
+    name: "Name",
+    desc: "What Borg answers to",
+    catalog: "name",
+  },
   {
     id: "provider",
     key: "provider",
@@ -123,10 +131,125 @@ export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);
 }
 
-/** `llm.thinking` → "Llm" bucket; keys with no dot land in "General". */
-export function advancedGroupOf(key: string): string {
+/** One fold under Advanced: a plain-words bucket over several key prefixes. */
+export interface AdvancedCategory {
+  id: string;
+  name: string;
+  desc: string;
+  /** First key segments that land here (`voice` for `voice.enabled`). */
+  prefixes: readonly string[];
+}
+
+/**
+ * Advanced, sorted by what the settings are for rather than how the config
+ * file nests them. Order is the order on screen: the knobs people reach for
+ * first sit at the top. A prefix nobody listed falls into "Other", so a new
+ * daemon section shows up without a change here.
+ */
+export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
+  {
+    id: "model",
+    name: "Model",
+    desc: "Providers, fallbacks, caching and spend",
+    prefixes: [
+      "llm",
+      "temperature",
+      "max_tokens",
+      "compaction",
+      "credentials",
+      "providers",
+      "budget",
+    ],
+  },
+  {
+    id: "conversation",
+    name: "Conversation",
+    desc: "Context, history and how each turn runs",
+    prefixes: ["conversation", "loop_guard", "ui"],
+  },
+  {
+    id: "memory",
+    name: "Memory",
+    desc: "What Borg remembers and how it recalls it",
+    prefixes: ["memory", "consolidation", "data"],
+  },
+  {
+    id: "voice",
+    name: "Voice & Media",
+    desc: "Speech, transcription, images and video",
+    prefixes: ["voice", "tts", "audio", "media", "image_gen"],
+  },
+  {
+    id: "tools",
+    name: "Tools & Skills",
+    desc: "Skills, scripts, MCP servers and plugins",
+    prefixes: ["tools", "skills", "scripts", "mcp", "plugins", "hooks", "computer_use"],
+  },
+  {
+    id: "browser",
+    name: "Browser & Web",
+    desc: "Browsing, search and page fetching",
+    prefixes: ["browser", "web"],
+  },
+  {
+    id: "agents",
+    name: "Agents & Goals",
+    desc: "Sub-agents, long-running goals and background tasks",
+    prefixes: ["agents", "goals", "tasks", "evolution"],
+  },
+  {
+    id: "heartbeat",
+    name: "Heartbeat",
+    desc: "Proactive check-ins and quiet hours",
+    prefixes: ["heartbeat"],
+  },
+  {
+    id: "channels",
+    name: "Channels & Network",
+    desc: "Messaging gateways, webhooks, tunnels and discovery",
+    prefixes: ["gateway", "webhooks", "apns", "tunnel", "discovery"],
+  },
+  {
+    id: "security",
+    name: "Security",
+    desc: "Sandboxing, secrets and what Borg may touch",
+    prefixes: ["security", "sandbox"],
+  },
+  {
+    id: "system",
+    name: "System",
+    desc: "Maintenance, processes, telemetry and updates",
+    prefixes: [
+      "maintenance",
+      "process_registry",
+      "telemetry",
+      "debug",
+      "update",
+      "user",
+      "onboarded",
+    ],
+  },
+];
+
+/** Where a key no category claims ends up. */
+export const OTHER_CATEGORY: AdvancedCategory = {
+  id: "other",
+  name: "Other",
+  desc: "Everything else",
+  prefixes: [],
+};
+
+const CATEGORY_BY_PREFIX = new Map(
+  ADVANCED_CATEGORIES.flatMap((c) => c.prefixes.map((p) => [p, c] as const)),
+);
+
+/** A key's first segment: `voice` for `voice.enabled`, the key itself when undotted. */
+export function keyPrefix(key: string): string {
   const dot = key.indexOf(".");
-  if (dot === -1) return "General";
-  const head = key.slice(0, dot);
-  return capitalize(head);
+  return dot === -1 ? key : key.slice(0, dot);
+}
+
+/** The Advanced fold a registry key belongs in. */
+export function advancedCategoryOf(key: string): AdvancedCategory {
+  return CATEGORY_BY_PREFIX.get(keyPrefix(key)) ?? OTHER_CATEGORY;
 }

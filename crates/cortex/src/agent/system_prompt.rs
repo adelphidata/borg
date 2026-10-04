@@ -17,7 +17,7 @@ use tracing::instrument;
 use crate::types::ToolDefinition;
 
 use crate::constants;
-use crate::identity::load_identity;
+use crate::identity::load_identity_named;
 use crate::skills::load_skills_context;
 use crate::template::Template;
 
@@ -182,7 +182,10 @@ impl Agent {
         tools: &[ToolDefinition],
     ) -> Result<BuiltSystemPrompt> {
         let mut withhold_tools = false;
-        let identity = self.caches.identity_or_load(load_identity)?;
+        let agent_name = self.config.user.agent_name.clone();
+        let identity = self
+            .caches
+            .identity_or_load(|| load_identity_named(agent_name.as_deref()))?;
         let memory = self.load_memory_with_ranking().await?;
         let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);

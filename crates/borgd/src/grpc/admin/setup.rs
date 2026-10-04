@@ -51,11 +51,35 @@ pub(super) async fn get_setup_status(
             model: config.llm.model.clone(),
             providers: provider_choices(),
             detected,
+            agent_name: agent_name(&config),
+            agent_names: cortex::agent_name::BORG_NAMES
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         })
     }
     .await
     .map_err(map_internal("get_setup_status"))?;
     Ok(Response::new(status))
+}
+
+/// `user.agent_name`, else the name a hand-written `IDENTITY.md` already
+/// gives itself, so the first-run screen shows (and keeps) that name rather
+/// than suggesting a random one over it. "" when neither has one.
+fn agent_name(config: &cortex::config::Config) -> String {
+    if let Some(name) = config
+        .user
+        .agent_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+    {
+        return name.to_string();
+    }
+    cortex::identity::identity_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| cortex::agent_name::name_in_identity(&c).map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// How long a runtime probe result is reused. Every page that names a

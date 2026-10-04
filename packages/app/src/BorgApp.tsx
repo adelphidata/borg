@@ -48,7 +48,8 @@ import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
 import { UpdatePill } from "./components/UpdatePill";
-import { SettingsProvider } from "./lib/settings";
+import { useAgentName } from "./lib/agentName";
+import { SettingsProvider, useSettings } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useBorg, useMutation, useQuery } from "./lib/useDaemon";
 import type { admin } from "@borg/client";
@@ -89,6 +90,7 @@ function Shell({ platform }: { platform: Platform }) {
   const isMobile = useIsMobile();
   usePauseAnimationsWhenHidden();
   const { theme, toggleTheme } = useTheme();
+  const agentName = useAgentName();
   const navigate = useNavigate();
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
@@ -259,6 +261,7 @@ function Shell({ platform }: { platform: Platform }) {
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
             user={user}
+            agentName={agentName}
             collapsed={sidebarCollapsed}
             onToggleCollapsed={toggleSidebar}
             unreadCount={unreadCount}
@@ -328,11 +331,20 @@ function Shell({ platform }: { platform: Platform }) {
  */
 function OnboardingGate({ platform }: { platform: Platform }) {
   const onboarding = useQuery((borg) => borg.admin.getOnboardingState({}));
+  const { settings } = useSettings();
   const [justFinished, setJustFinished] = useState(false);
 
   if (onboarding.state === "loading") return null;
   if (onboarding.state === "ready" && !onboarding.data.onboarded && !justFinished) {
-    return <OnboardingPage onDone={() => setJustFinished(true)} />;
+    // The snapshot predates the first run's writes; the sidebar needs the name.
+    return (
+      <OnboardingPage
+        onDone={() => {
+          settings.refetch();
+          setJustFinished(true);
+        }}
+      />
+    );
   }
   return (
     <HashRouter>

@@ -42,7 +42,9 @@ describe("OnboardingPage with nothing on the machine", () => {
   });
 
   it("holds back until a key has been pasted, then writes key, provider, model, done", async () => {
-    const { daemon, onDone } = mount({ GetSetupStatus: setupStatus() });
+    const { daemon, onDone } = mount({
+      GetSetupStatus: setupStatus({ agentNames: ["Borgzilla"] }),
+    });
     await waitFor(() => expect(start().disabled).toBe(true));
     fireEvent.change(screen.getByPlaceholderText("OpenRouter API key"), {
       target: { value: "  sk-or-test  " },
@@ -55,6 +57,7 @@ describe("OnboardingPage with nothing on the machine", () => {
       "SetApiKey",
       "SetSetting",
       "SetSetting",
+      "SetSetting",
       "SetOnboardingComplete",
     ]);
     expect(daemon.calls.find((c) => c.method === "SetApiKey")?.request).toEqual({
@@ -64,6 +67,7 @@ describe("OnboardingPage with nothing on the machine", () => {
     expect(daemon.calls.filter((c) => c.method === "SetSetting").map((c) => c.request)).toEqual([
       { key: "provider", value: "openrouter" },
       { key: "model", value: "deepseek/deepseek-v4-flash" },
+      { key: "user.agent_name", value: "Borgzilla" },
     ]);
   });
 
@@ -127,11 +131,62 @@ describe("OnboardingPage with nothing on the machine", () => {
   });
 });
 
+describe("OnboardingPage naming the agent", () => {
+  const nameInput = () => screen.getByLabelText("Agent name") as HTMLInputElement;
+  const configured = { configured: true, provider: "openrouter", model: "x" };
+  const savedName = (daemon: ReturnType<typeof fakeDaemon>) =>
+    daemon.calls.find(
+      (c) => c.method === "SetSetting" && (c.request as { key: string }).key === "user.agent_name",
+    )?.request;
+
+  it("greets with a name already picked from the daemon's pool", async () => {
+    mount({ GetSetupStatus: setupStatus() });
+    await waitFor(() => expect(["Borgzilla", "Borg Vader"]).toContain(nameInput().value));
+  });
+
+  it("keeps the name the daemon already has", async () => {
+    mount({ GetSetupStatus: setupStatus({ agentName: "Clint Eastborg" }) });
+    await waitFor(() => expect(nameInput().value).toBe("Clint Eastborg"));
+  });
+
+  it("rerolls to a different name from the pool", async () => {
+    const { daemon, onDone } = mount({ GetSetupStatus: setupStatus(configured) });
+    await waitFor(() => expect(nameInput()).toBeTruthy());
+    const first = nameInput().value;
+    fireEvent.click(screen.getByLabelText("Pick another name"));
+    const second = nameInput().value;
+    expect(second).not.toBe(first);
+    expect(["Borgzilla", "Borg Vader"]).toContain(second);
+    fireEvent.click(start());
+    await waitFor(() => expect(onDone).toHaveBeenCalled());
+    expect(savedName(daemon)).toEqual({ key: "user.agent_name", value: second });
+  });
+
+  it("saves a typed name, trimmed, and Enter in the name starts", async () => {
+    const { daemon, onDone } = mount({ GetSetupStatus: setupStatus(configured) });
+    await waitFor(() => expect(nameInput()).toBeTruthy());
+    fireEvent.change(nameInput(), { target: { value: "  Ada  " } });
+    fireEvent.keyDown(nameInput(), { key: "Enter" });
+    await waitFor(() => expect(onDone).toHaveBeenCalled());
+    expect(savedName(daemon)).toEqual({ key: "user.agent_name", value: "Ada" });
+  });
+
+  it("writes no name when the field is cleared", async () => {
+    const { daemon, onDone } = mount({ GetSetupStatus: setupStatus(configured) });
+    await waitFor(() => expect(nameInput()).toBeTruthy());
+    fireEvent.change(nameInput(), { target: { value: "   " } });
+    fireEvent.click(start());
+    await waitFor(() => expect(onDone).toHaveBeenCalled());
+    expect(savedName(daemon)).toBeUndefined();
+  });
+});
+
 describe("OnboardingPage with something already here", () => {
   it("offers a found key with one click and never asks to paste it", async () => {
     const { daemon, onDone } = mount({
       GetSetupStatus: setupStatus({
         detected: [{ provider: "anthropic", source: "dotenv", detail: "/home/me/.borg/.env" }],
+        agentName: "Borg Vader",
       }),
     });
     await waitFor(() =>
@@ -144,6 +199,7 @@ describe("OnboardingPage with something already here", () => {
     expect(daemon.calls.filter((c) => c.method === "SetSetting").map((c) => c.request)).toEqual([
       { key: "provider", value: "anthropic" },
       { key: "model", value: "claude-opus-5" },
+      { key: "user.agent_name", value: "Borg Vader" },
     ]);
   });
 
@@ -203,7 +259,9 @@ describe("OnboardingPage with something already here", () => {
     await waitFor(() => expect(screen.getByText(/already set up with OpenRouter/)).toBeTruthy());
     fireEvent.click(start());
     await waitFor(() => expect(onDone).toHaveBeenCalled());
+    // The name rides along; nothing about the provider is rewritten.
     expect(methods(daemon).filter((m) => m !== "GetSetupStatus")).toEqual([
+      "SetSetting",
       "SetOnboardingComplete",
     ]);
   });

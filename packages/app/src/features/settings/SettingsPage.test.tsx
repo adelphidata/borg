@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { ThemeProvider } from "@borg/ui";
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
@@ -7,9 +7,13 @@ import { fakeDaemon, renderApp } from "../../test/harness";
 import { setupStatus } from "../../test/setupStatus";
 import { SettingsProvider } from "../../lib/settings";
 import { SettingsPage } from "./SettingsPage";
-import { advancedGroupOf, findBasicSetting } from "./catalog";
+import { groupAdvanced } from "./AdvancedSettings";
+import { advancedCategoryOf, findBasicSetting } from "./catalog";
 
 const media = installMatchMedia(() => false);
+
+// Open folds are kept for the tab; each test starts from a closed page.
+beforeEach(() => sessionStorage.clear());
 const mobile = media.controller("(max-width: 700px)");
 
 const entry = (key: string, value: string, category = "default") => ({
@@ -44,14 +48,51 @@ function mount(daemon = fakeDaemon(DAEMON)) {
   });
 }
 
-describe("advancedGroupOf", () => {
-  it("buckets a dotted key under its section", () => {
-    expect(advancedGroupOf("llm.thinking")).toBe("Llm");
-    expect(advancedGroupOf("heartbeat.min_interval_secs")).toBe("Heartbeat");
+describe("advancedCategoryOf", () => {
+  it("files a key by what it is for, not by its prefix", () => {
+    expect(advancedCategoryOf("llm.thinking").name).toBe("Model");
+    expect(advancedCategoryOf("tts.default_voice").name).toBe("Voice & Media");
+    expect(advancedCategoryOf("audio.language").name).toBe("Voice & Media");
+    expect(advancedCategoryOf("heartbeat.min_interval_secs").name).toBe("Heartbeat");
+    expect(advancedCategoryOf("temperature").name).toBe("Model");
   });
 
-  it("puts an undotted key in General rather than inventing a group", () => {
-    expect(advancedGroupOf("provider")).toBe("General");
+  it("puts a prefix nobody listed in Other rather than dropping it", () => {
+    expect(advancedCategoryOf("brand_new.knob").name).toBe("Other");
+    expect(advancedCategoryOf("standalone").name).toBe("Other");
+  });
+});
+
+describe("groupAdvanced", () => {
+  const row = (key: string, overridden = false) => ({
+    key,
+    value: "",
+    overridden,
+    label: "",
+    kind: "",
+    group: "",
+  });
+
+  it("orders categories as listed and runs inside them by prefix, then name", () => {
+    const groups = groupAdvanced(
+      [
+        row("tts.enabled"),
+        row("voice.enabled", true),
+        row("voice.auto_tts"),
+        row("llm.max_retries", true),
+        row("temperature"),
+        row("provider"),
+      ],
+      new Set(["provider"]),
+    );
+    expect(groups.map((g) => g.category.name)).toEqual(["Model", "Voice & Media"]);
+    const [model, voice] = groups;
+    expect(model!.sections.map((s) => s.prefix)).toEqual(["", "llm"]);
+    expect(voice!.sections.map((s) => [s.prefix, s.rows.map((r) => r.key)])).toEqual([
+      ["voice", ["voice.auto_tts", "voice.enabled"]],
+      ["tts", ["tts.enabled"]],
+    ]);
+    expect([voice!.total, voice!.changed]).toEqual([3, 1]);
   });
 });
 
@@ -110,6 +151,10 @@ describe("SettingsPage", () => {
     expect(fold.getAttribute("aria-expanded")).toBe("false");
     act(() => fold.click());
     expect(fold.getAttribute("aria-expanded")).toBe("true");
+    const category = screen.getByRole("button", { name: /^Heartbeat/ });
+    expect(category.getAttribute("aria-expanded")).toBe("false");
+    act(() => category.click());
+    expect(category.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByRole("button", { name: /heartbeat\.enabled/ })).toBeTruthy();
   });
 
@@ -139,34 +184,61 @@ describe("SettingsPage", () => {
     // finishes the job.
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
-    expect(screen.queryByText("heartbeat.enabled")).toBeNull();
+    expect(screen.queryByText("Heartbeat")).toBeNull();
 
     act(() => screen.getByText("Advanced").click());
-    expect(screen.getByText("heartbeat.enabled")).toBeTruthy();
+    // Opening Advanced shows categories, not keys; a category shows its keys.
+    expect(screen.queryByTitle("heartbeat.enabled")).toBeNull();
+    act(() => screen.getByText("Heartbeat").click());
+    expect(screen.getByTitle("heartbeat.enabled")).toBeTruthy();
   });
 
   it("does not repeat a curated key inside Advanced", async () => {
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
     act(() => screen.getByText("Advanced").click());
-    expect(screen.queryByText("llm.thinking")).toBeNull();
-    expect(screen.getByText("agents.max_depth")).toBeTruthy();
+    // Thinking level is curated, so Model has nothing left to show.
+    expect(screen.queryByText("Providers, fallbacks, caching and spend")).toBeNull();
+    act(() => screen.getByText("Agents & Goals").click());
+    expect(screen.getByTitle("agents.max_depth")).toBeTruthy();
+    expect(screen.queryByTitle("llm.thinking")).toBeNull();
   });
 
-  it("groups advanced keys by section, alphabetically", async () => {
+  it("lists categories in screen order with counts and what changed", async () => {
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
     act(() => screen.getByText("Advanced").click());
-    const groups = ["Agents", "General", "Heartbeat"].map((name) => screen.getByText(name));
-    expect(groups.map((g) => g.textContent)).toEqual(["Agents", "General", "Heartbeat"]);
+    const folds = screen
+      .getAllByRole("button", { expanded: false })
+      .map((b) => b.textContent ?? "")
+      .filter((t) => /Agents & Goals|Heartbeat|Other/.test(t));
+    expect(folds.map((t) => t.match(/Agents & Goals|Heartbeat|Other/)?.[0])).toEqual([
+      "Agents & Goals",
+      "Heartbeat",
+      "Other",
+    ]);
+    expect(screen.getByText("1 changed")).toBeTruthy();
+  });
+
+  it("remembers open folds for the tab across a remount", async () => {
+    const first = mount();
+    await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
+    act(() => screen.getByText("Advanced").click());
+    act(() => screen.getByText("Heartbeat").click());
+    first.unmount();
+    mount();
+    await waitFor(() => expect(screen.getByTitle("heartbeat.enabled")).toBeTruthy());
   });
 
   it("closes the fold again", async () => {
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
     act(() => screen.getByText("Advanced").click());
+    act(() => screen.getByText("Heartbeat").click());
+    act(() => screen.getByText("Heartbeat").click());
+    expect(screen.queryByTitle("heartbeat.enabled")).toBeNull();
     act(() => screen.getByText("Advanced").click());
-    expect(screen.queryByText("heartbeat.enabled")).toBeNull();
+    expect(screen.queryByText("Heartbeat")).toBeNull();
   });
 
   it("reports a failed registry load instead of an empty settings list", async () => {

@@ -431,6 +431,11 @@ message SetupStatus {
   string model = 3;
   repeated ProviderChoice providers = 4;
   repeated DetectedCredential detected = 5;
+  // `user.agent_name`; "" when unset (the agent is then "Borg").
+  string agent_name = 6;
+  // The curated pool onboarding and settings reroll from
+  // (`cortex::agent_name::BORG_NAMES`).
+  repeated string agent_names = 7;
 }
 
 message LogActivityRequest {

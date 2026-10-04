@@ -52,6 +52,7 @@ export {
   SearchIcon,
   SendIcon,
   ShieldIcon,
+  ShuffleIcon,
   SunIcon,
   TrashIcon,
   UsageIcon,

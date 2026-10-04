@@ -28,6 +28,8 @@ export interface SidebarProps {
   /** Opens the full, searchable conversation list. */
   onSeeAllConversations: () => void;
   user: NavUser;
+  /** What the agent is called, shown beside the logo. Defaults to "Borg". */
+  agentName?: string;
   /**
    * Narrows the sidebar to its rail. The nav is chrome, and on a small window
    * it is a third of the screen spent on something the user is not reading.
@@ -171,6 +173,7 @@ export function Sidebar({
   onNewConversation,
   onSeeAllConversations,
   user,
+  agentName = "Borg",
   collapsed = false,
   onToggleCollapsed,
   unreadCount = 0,
@@ -225,8 +228,11 @@ export function Sidebar({
     <aside className="flex w-[236px] flex-none flex-col border-r border-line2 bg-surface2 px-[14px] pt-[18px] pb-4">
       <div className="flex items-center gap-[11px] px-2 pt-0.5 pb-5">
         <LogoIcon size={20} />
-        <span className="flex-1 text-[13px] leading-none font-semibold tracking-[0.2em] text-ink">
-          BORG
+        <span
+          title={agentName}
+          className="min-w-0 flex-1 truncate text-[13.5px] leading-[1.2] font-semibold tracking-[-0.01em] text-ink"
+        >
+          {agentName}
         </span>
         {toggle}
       </div>

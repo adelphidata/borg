@@ -1191,7 +1191,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         continuity,
         executor: _,
     } = ctx;
-    let identity = cortex::identity::load_identity().unwrap_or_default();
+    let identity = cortex::identity::load_identity_named(config.user.agent_name.as_deref())
+        .unwrap_or_default();
     let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
         .await
         .unwrap_or_default();
@@ -1625,7 +1626,8 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         }
         _ => {
             // Cheap tool-less check-in — the steady-state path for quiet ticks.
-            let identity = cortex::identity::load_identity().unwrap_or_default();
+            let identity = cortex::identity::load_identity_named(config.user.agent_name.as_deref())
+                .unwrap_or_default();
             let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
                 .await
                 .unwrap_or_default();

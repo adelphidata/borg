@@ -789,6 +789,11 @@ impl Agent {
             .update_limits(new_config.security.action_limits.clone());
         let resolved_creds = new_config.resolve_credentials();
         self.caches.on_config_reloaded(resolved_creds);
+        // A rename rewrites IDENTITY.md (or the default it falls back to).
+        if new_config.user.agent_name != self.config.user.agent_name {
+            self.caches
+                .on_memory_written("global", crate::constants::IDENTITY_FILE);
+        }
         self.config_arc = Arc::new(new_config.clone());
         self.config = new_config;
         // skills caches were just cleared by `on_config_reloaded`;

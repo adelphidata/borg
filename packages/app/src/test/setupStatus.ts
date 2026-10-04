@@ -65,6 +65,8 @@ export function setupStatus(over: Partial<admin.SetupStatus> = {}): admin.SetupS
     model: "",
     providers: SETUP_CATALOG,
     detected: [],
+    agentName: "",
+    agentNames: ["Borgzilla", "Borg Vader"],
     ...over,
   };
 }

@@ -14,6 +14,8 @@ import {
 } from "@borg/ui";
 import type { ThemePreference } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
+import { ShuffleButton } from "../../components/NameField";
+import { DEFAULT_AGENT_NAME, rerollName } from "../../lib/agentName";
 import { useSettings } from "../../lib/settings";
 import {
   effectiveModel,
@@ -283,6 +285,58 @@ function CatalogDetail({
   );
 }
 
+/**
+ * The agent's name: typed, or rerolled from the pool the first run drew
+ * from. A reroll only fills the field; Save is the commitment. The daemon
+ * carries the new name into the memory files.
+ */
+function NameDetail({ entry }: { entry: { key: string; value: string; overridden: boolean } }) {
+  const { save, clear, saving } = useSettings();
+  const setup = useSetupStatus();
+  const pool = setup.state === "ready" ? setup.data.agentNames : [];
+  const current = entry.value.trim() || DEFAULT_AGENT_NAME;
+  const [draft, setDraft] = useState(current);
+  // A save refreshes the snapshot; follow the new name.
+  useEffect(() => setDraft(current), [current]);
+  const next = draft.trim();
+  const dirty = next !== "" && next !== current;
+  const commit = () => dirty && !saving && void save(entry.key, next);
+
+  return (
+    <>
+      <div className="flex flex-col gap-3.5">
+        <div className="flex items-center gap-1 rounded-[10px] border border-line2 bg-surface2 py-1 pr-1.5 pl-4 focus-within:border-neon">
+          <input
+            aria-label="Agent name"
+            className="min-w-0 flex-1 bg-transparent py-2 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3"
+            value={draft}
+            placeholder={DEFAULT_AGENT_NAME}
+            maxLength={40}
+            spellCheck={false}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => isSubmitEnter(e) && commit()}
+          />
+          <ShuffleButton
+            disabled={pool.length === 0}
+            onClick={() => setDraft(rerollName(pool, draft))}
+          />
+        </div>
+        <div className="flex items-center gap-[9px]">
+          <Pill variant="primary" disabled={!dirty || saving} onClick={commit}>
+            {saving ? "Saving…" : "Save"}
+          </Pill>
+          {entry.overridden && (
+            <Pill onClick={() => !saving && void clear(entry.key)}>Reset to default</Pill>
+          )}
+        </div>
+      </div>
+      <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
+        Shown in the sidebar and written into Borg’s memory files.
+      </div>
+    </>
+  );
+}
+
 /** The local-only theme setting — applies before paint, so it never touches borgd. */
 function AppearanceDetail() {
   const { preference, setPreference } = useTheme();
@@ -342,6 +396,16 @@ export function SettingDetailPage() {
               <div className="text-[14.5px] leading-[1.62] text-pretty text-ink2">
                 That setting doesn’t exist.
               </div>
+            );
+          }
+
+          if (basic?.catalog === "name") {
+            return (
+              <>
+                <Heading name={title} desc={basic.desc} />
+                <SaveError message={saveError?.message} />
+                <NameDetail entry={entry} />
+              </>
             );
           }
 

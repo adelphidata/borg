@@ -316,6 +316,13 @@ export interface SetupStatus {
   model: string;
   providers: ProviderChoice[];
   detected: DetectedCredential[];
+  /** `user.agent_name`; "" when unset (the agent is then "Borg"). */
+  agentName: string;
+  /**
+   * The curated pool onboarding and settings reroll from
+   * (`cortex::agent_name::BORG_NAMES`).
+   */
+  agentNames: string[];
 }
 
 export interface LogActivityRequest {
@@ -4186,7 +4193,7 @@ export const DetectedCredential: MessageFns<DetectedCredential> = {
 };
 
 function createBaseSetupStatus(): SetupStatus {
-  return { configured: false, provider: "", model: "", providers: [], detected: [] };
+  return { configured: false, provider: "", model: "", providers: [], detected: [], agentName: "", agentNames: [] };
 }
 
 export const SetupStatus: MessageFns<SetupStatus> = {
@@ -4205,6 +4212,12 @@ export const SetupStatus: MessageFns<SetupStatus> = {
     }
     for (const v of message.detected) {
       DetectedCredential.encode(v!, writer.uint32(42).fork()).join();
+    }
+    if (message.agentName !== "") {
+      writer.uint32(50).string(message.agentName);
+    }
+    for (const v of message.agentNames) {
+      writer.uint32(58).string(v!);
     }
     return writer;
   },
@@ -4256,6 +4269,22 @@ export const SetupStatus: MessageFns<SetupStatus> = {
           message.detected.push(DetectedCredential.decode(reader, reader.uint32()));
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.agentName = reader.string();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.agentNames.push(reader.string());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4275,6 +4304,16 @@ export const SetupStatus: MessageFns<SetupStatus> = {
         : [],
       detected: globalThis.Array.isArray(object?.detected)
         ? object.detected.map((e: any) => DetectedCredential.fromJSON(e))
+        : [],
+      agentName: isSet(object.agentName)
+        ? globalThis.String(object.agentName)
+        : isSet(object.agent_name)
+        ? globalThis.String(object.agent_name)
+        : "",
+      agentNames: globalThis.Array.isArray(object?.agentNames)
+        ? object.agentNames.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.agent_names)
+        ? object.agent_names.map((e: any) => globalThis.String(e))
         : [],
     };
   },
@@ -4296,6 +4335,12 @@ export const SetupStatus: MessageFns<SetupStatus> = {
     if (message.detected?.length) {
       obj.detected = message.detected.map((e) => DetectedCredential.toJSON(e));
     }
+    if (message.agentName !== "") {
+      obj.agentName = message.agentName;
+    }
+    if (message.agentNames?.length) {
+      obj.agentNames = message.agentNames;
+    }
     return obj;
   },
 
@@ -4309,6 +4354,8 @@ export const SetupStatus: MessageFns<SetupStatus> = {
     message.model = object.model ?? "";
     message.providers = object.providers?.map((e) => ProviderChoice.fromPartial(e)) || [];
     message.detected = object.detected?.map((e) => DetectedCredential.fromPartial(e)) || [];
+    message.agentName = object.agentName ?? "";
+    message.agentNames = object.agentNames?.map((e) => e) || [];
     return message;
   },
 };

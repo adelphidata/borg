@@ -18,6 +18,7 @@ const entry = (key: string, value: string, category = "default") => ({
 });
 
 const REGISTRY = [
+  entry("user.agent_name", ""),
   entry("llm.thinking", "medium"),
   entry("provider", "anthropic"),
   entry("model", "claude-opus-5"),
@@ -46,6 +47,56 @@ function mount(route: string, daemon = fakeDaemon(DAEMON)) {
 }
 
 const click = (element: HTMLElement) => act(() => element.click());
+
+describe("SettingDetailPage for the agent's name", () => {
+  const nameInput = () => screen.getByLabelText("Agent name") as HTMLInputElement;
+  const save = () => screen.getByText("Save").closest("button") as HTMLButtonElement;
+
+  it("shows Borg while unset, and saves only a real change", async () => {
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(nameInput().value).toBe("Borg"));
+    expect(save().disabled).toBe(true);
+    fireEvent.change(nameInput(), { target: { value: " Ada " } });
+    fireEvent.keyDown(nameInput(), { key: "Enter" });
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "user.agent_name",
+        value: "Ada",
+      }),
+    );
+  });
+
+  it("rerolls from the daemon's pool into the field, then Save writes it", async () => {
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [entry("user.agent_name", "Borgzilla", "db")] },
+      GetSetupStatus: setupStatus(),
+      SetSetting: {},
+      UnsetSetting: {},
+    });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(nameInput().value).toBe("Borgzilla"));
+    // The pool arrives with setup status; until then there is nothing to reroll to.
+    const shuffle = screen.getByLabelText("Pick another name") as HTMLButtonElement;
+    await waitFor(() => expect(shuffle.disabled).toBe(false));
+    click(shuffle);
+    await waitFor(() => expect(nameInput().value).toBe("Borg Vader"));
+    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
+    click(save());
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "user.agent_name",
+        value: "Borg Vader",
+      }),
+    );
+    click(screen.getByText("Reset to default"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UnsetSetting")?.request).toEqual({
+        key: "user.agent_name",
+      }),
+    );
+  });
+});
 
 describe("SettingDetailPage for a curated choice", () => {
   it("marks the option that is currently in force", async () => {

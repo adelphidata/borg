@@ -34,6 +34,8 @@
 pub mod activity_log;
 /// Agent conversation loop and tool dispatch.
 pub mod agent;
+/// The agent's name: suggestion pool and memory-file rename.
+pub mod agent_name;
 /// Authentication primitives for non-mTLS ingress surfaces — bearer
 /// tokens for OpenAI-compat HTTP and MCP HTTP.
 pub mod auth;

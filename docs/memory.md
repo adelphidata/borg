@@ -299,6 +299,8 @@ not canned response data.
 
 `IDENTITY.md` is not part of the general memory stores. It is loaded at the front of the system prompt and defines the assistant’s persistent personality and behavior.
 
+The agent's name lives in the `user.agent_name` setting (first-run screen, Settings → Name, or `borg settings set user.agent_name …`). Changing it rewrites the name in `IDENTITY.md` (heading and `You are …,`), the `- Agent:` line of `$BORG_HOME/MEMORY.md`, and `SETUP.md` while it still exists. With no `IDENTITY.md`, the default identity uses the setting.
+
 ## HEARTBEAT.md
 
 `HEARTBEAT.md` is an optional checklist used only during heartbeat turns.

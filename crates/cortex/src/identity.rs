@@ -108,6 +108,23 @@ pub fn load_identity_with_override(override_path: Option<&std::path::Path>) -> R
     }
 }
 
+/// [`load_identity`], with the no-file default answering to `agent_name`
+/// (the `user.agent_name` setting). The web onboarding names the agent
+/// without seeding `IDENTITY.md`, and the name must still reach the prompt.
+pub fn load_identity_named(agent_name: Option<&str>) -> Result<String> {
+    let identity = load_identity()?;
+    Ok(match agent_name.map(str::trim) {
+        Some(name) if !name.is_empty() && identity == DEFAULT_IDENTITY => {
+            default_identity_for(name)
+        }
+        _ => identity,
+    })
+}
+
+fn default_identity_for(name: &str) -> String {
+    format!("You are {name}, a personal AI assistant built on Borg.\n")
+}
+
 /// True when IDENTITY.md exists, isn't the bare default, and has no
 /// remaining template scaffold markers. Used by the heartbeat
 /// `identity_unpersonalized` augmenter to decide whether to nudge the
@@ -146,6 +163,10 @@ pub fn is_personalized_content(content: &str) -> bool {
 /// The atomic write makes the file either the old persona or the new one.
 pub fn save_identity(content: &str) -> Result<()> {
     let path = identity_path()?;
+    // Serialized with renames, which read-modify-write the same file.
+    let _guard = crate::agent_name::MEMORY_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -157,6 +178,14 @@ pub fn save_identity(content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_identity_for_names_the_agent() {
+        assert_eq!(
+            default_identity_for("Borgzilla"),
+            "You are Borgzilla, a personal AI assistant built on Borg.\n"
+        );
+    }
 
     #[test]
     fn load_identity_returns_non_empty_content() {

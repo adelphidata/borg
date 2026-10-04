@@ -16,142 +16,10 @@ use crate::logo::LOGO;
 use crate::onboarding::{models_for_provider, OnboardingResult, PROVIDERS};
 use crate::terminal_guard::TerminalGuard;
 use crate::tui::theme;
+use cortex::agent_name::random_borg_name;
 use cortex::config::Config;
 use cortex::llm::provider::Provider;
-use rand::Rng;
 use std::str::FromStr;
-
-const BORG_NAMES: &[&str] = &[
-    "Borgan Freeman",
-    "Borgan Wallen",
-    "Borgbacue",
-    "Mark Zuckerborg",
-    "Ruth Bader Ginsborg",
-    "Borg Washington",
-    "Goldborg",
-    "Bloomborg",
-    "Heidegborg",
-    "Gutenborg",
-    "Borgman",
-    "Max Borg",
-    "Bjorn Borg",
-    "Piers Borgan",
-    "Steven Spielborg",
-    "Smorgasborg",
-    "J.P. Borgan",
-    "Tracy Borgan",
-    "Borgan Fairchild",
-    "Victor Borge",
-    "Cyborg Jones",
-    "Rube Goldborg",
-    "Blomborg",
-    "Harrisonborg",
-    "Stromborg",
-    "Borgström",
-    "Weinborg",
-    "Feinborg",
-    "Borgenstein",
-    "Borgward",
-    "Borgson",
-    "Borgy",
-    "Borgie",
-    "B0rg",
-    "Pittsborg",
-    "Luxemborg",
-    "Salzborg",
-    "Harrisborg",
-    "Gettysborg",
-    "Williamsborg",
-    "Pittsborg Steelers",
-    "Pittsborg Pirates",
-    "Pittsborg Penguins",
-    "Johannesborg",
-    "Nuremborg",
-    "Borgholm",
-    "Saint Petersborg",
-    "Borgtown",
-    "Spongeborg Squarepants",
-    "Borger King",
-    "Borgcraft",
-    "Borg Lightyear",
-    "Borginator",
-    "The Borg Identity",
-    "Borg of the Rings",
-    "Borgzilla",
-    "Cyborg",
-    "Iceborger",
-    "Cheeseborger",
-    "Hamborg",
-    "Borgify",
-    "Newborg Baby",
-    "Borganic",
-    "Borgana",
-    "The Battle of The Borg",
-    "Borga Borga",
-    "LeBorg James",
-    "The Good, The Borg, and The Ugly",
-    "Borgs Bunny",
-    "Borges",
-    "Schoenberg",
-    "Borgkovich",
-    "Heisenborg",
-    "Borgdorf",
-    "Wittgenborg",
-    "Schrödingborg",
-    "Humphrey Borgart",
-    "Borggart",
-    "Schwarzenegborg",
-    "Clint Eastborg",
-    "Borgothy",
-    "Borgatron",
-    "Borgatti",
-    "Borgleone",
-    "Amelia Borghart",
-    "Oppenborger",
-    "Borgdwin",
-    "Borgsworth",
-    "Van Borghen",
-    "Strasborg",
-    "Borgdeaux",
-    "Borgona",
-    "Borggundy",
-    "Borgcelona",
-    "Borgamo",
-    "Borgpool",
-    "Borg Vader",
-    "Frodo Borggins",
-    "Borglock Holmes",
-    "James Borgd",
-    "Indiana Borgs",
-    "Captain Borgmerica",
-    "The Incredible Borg",
-    "Borg to the Future",
-    "Jurassic Borg",
-    "The Borgfather",
-    "Borgbusters",
-    "Borg Wars",
-    "The Borgrix",
-    "Doctor Borgenstein",
-    "Frankenborg",
-    "Borgalicious",
-    "Borgmeister",
-    "Borgnado",
-    "Borgtastic",
-    "Borgberry",
-    "Borgasaurus",
-    "Borgnarok",
-    "El Borgo",
-    "Borgchamp",
-    "Borgsmith",
-    "Borganaut",
-    "Borgopolis",
-    "Ingrid Borgman",
-];
-
-fn random_borg_name() -> String {
-    let idx = rand::rng().random_range(0..BORG_NAMES.len());
-    BORG_NAMES[idx].to_string()
-}
 
 const LOGO_HEIGHT: u16 = 8; // includes leading blank line
 
@@ -1656,39 +1524,12 @@ mod tests {
         );
     }
 
-    /// `BORG_NAMES` is the random-name pool. The "≥100" floor exists so the
-    /// onboarding default isn't trivially predictable; the dedup guard
-    /// catches a copy-paste mistake in the list (a duplicate would silently
-    /// double that name's pick rate).
+    /// `OnboardingState::new()` seeds the name from the shared pool.
     #[test]
-    fn borg_names_pool_is_large_and_deduplicated() {
-        assert!(
-            BORG_NAMES.len() >= 100,
-            "Expected at least 100 Borg names, got: {}",
-            BORG_NAMES.len()
-        );
-        let mut seen = std::collections::HashSet::new();
-        for name in BORG_NAMES {
-            assert!(seen.insert(name), "Duplicate Borg name: {name}");
-        }
-    }
-
-    /// `random_borg_name` must only return values from the curated
-    /// `BORG_NAMES` pool — a regression where the RNG indexes off-by-one
-    /// would surface here as an empty / out-of-bounds-clipped string.
-    /// Also covers `OnboardingState::new()` seeding the same way.
-    #[test]
-    fn random_borg_name_only_returns_pool_entries() {
-        for _ in 0..20 {
-            let name = random_borg_name();
-            assert!(
-                BORG_NAMES.contains(&name.as_str()),
-                "random_borg_name() returned unknown name: {name}"
-            );
-        }
+    fn initial_agent_name_comes_from_the_pool() {
         let state = OnboardingState::new();
         assert!(
-            BORG_NAMES.contains(&state.agent_name.as_str()),
+            cortex::agent_name::BORG_NAMES.contains(&state.agent_name.as_str()),
             "Initial agent_name not in BORG_NAMES: {}",
             state.agent_name
         );

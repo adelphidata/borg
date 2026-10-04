@@ -119,6 +119,16 @@ describe("Sidebar nav", () => {
   });
 });
 
+describe("Sidebar header", () => {
+  it("names the agent beside the logo, Borg by default", () => {
+    renderSidebar();
+    expect(screen.getByTitle("Borg").textContent).toBe("Borg");
+    cleanup();
+    renderSidebar({ agentName: "Frodo Borggins" });
+    expect(screen.getByTitle("Frodo Borggins").textContent).toBe("Frodo Borggins");
+  });
+});
+
 describe("Sidebar collapse", () => {
   it("keeps the way back on screen once collapsed", () => {
     const onToggleCollapsed = vi.fn();

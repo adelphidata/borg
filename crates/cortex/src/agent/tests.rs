@@ -993,6 +993,27 @@ fn skill_tool_write_refreshes_cached_skill_state() {
     );
 }
 
+/// A rename reaches the prompt on the next turn: the identity cache drops
+/// when `user.agent_name` changes, and only then.
+#[test]
+fn reload_config_drops_identity_on_rename() {
+    let mut agent = minimal_test_agent(Config::default());
+    agent.caches = SystemPromptCache::with_test_state(
+        Some("identity-snapshot".into()),
+        None,
+        None,
+        None,
+        None,
+    );
+    agent.reload_config(Config::default());
+    assert_eq!(agent.caches.identity_for_test(), Some("identity-snapshot"));
+
+    let mut renamed = Config::default();
+    renamed.user.agent_name = Some("Borgzilla".into());
+    agent.reload_config(renamed);
+    assert_eq!(agent.caches.identity_for_test(), None);
+}
+
 /// `reload_config` must clear the skills caches (the env-allowlist they
 /// were rendered against is stale) and replace the credentials wholesale,
 /// while preserving identity (config does not affect IDENTITY.md). This

@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { Pill, isSubmitEnter } from "@borg/ui";
+import { InlineNameField } from "../../components/NameField";
+import { AGENT_NAME_KEY, DEFAULT_AGENT_NAME, rerollName } from "../../lib/agentName";
 import { useMutation } from "../../lib/useDaemon";
 import {
   KEY_SOURCES,
@@ -23,6 +25,10 @@ import {
  * the provider preselected and the model chosen. Everything else sits behind
  * "More providers" and "Change", so the default path is paste, click, talk.
  *
+ * The greeting carries the agent's name, already picked from the daemon's
+ * pool: typing over it renames, the shuffle button rerolls, and leaving it
+ * alone is a choice too. No extra step.
+ *
  * Every provider and model shown comes from the daemon; this file carries no
  * list of its own, which is what keeps it in step with the TUI wizard and the
  * settings pickers.
@@ -45,41 +51,65 @@ function Card({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Hello() {
-  return <h1 className={TITLE}>Hello. I’m Borg.</h1>;
+/** The agent's name in the greeting; editable once the daemon has answered. */
+interface NameProps {
+  value: string;
+  onChange: (value: string) => void;
+  onShuffle: () => void;
+  onSubmit?: () => void;
 }
+
+function Hello({ name }: { name?: NameProps }) {
+  if (!name) return <h1 className={TITLE}>Hello. I’m {DEFAULT_AGENT_NAME}.</h1>;
+  return (
+    <h1 className={TITLE}>
+      Hello. I’m <InlineNameField {...name} />
+    </h1>
+  );
+}
+
+type SaveVars = { provider?: string; apiKey?: string; model?: string; agentName: string };
 
 export function OnboardingPage({ onDone }: { onDone: () => void }) {
   const status = useSetupStatus();
   // "Use something else" leaves the found-it path for the picker.
   const [pickerForced, setPickerForced] = useState(false);
+  // Undefined until the user types or rerolls; the suggestion stands till then.
+  const [typedName, setTypedName] = useState<string>();
+  // Fixed per mount so the suggested name holds still across re-renders.
+  const [seed] = useState(Math.random);
 
   const complete = useMutation((borg) => borg.admin.setOnboardingComplete({}), {
     onSuccess: onDone,
   });
-  const save = useMutation(
-    async (borg, vars: { provider: string; apiKey: string; model: string }) => {
-      // The key first: a provider selected with no credential behind it is the
-      // state this whole screen exists to avoid.
-      if (vars.apiKey.trim() !== "") {
-        await borg.admin.setApiKey({ provider: vars.provider, literal: vars.apiKey.trim() });
-      }
+  const save = useMutation(async (borg, vars: SaveVars) => {
+    // The key first: a provider selected with no credential behind it is the
+    // state this whole screen exists to avoid.
+    const apiKey = vars.apiKey?.trim() ?? "";
+    if (vars.provider !== undefined && apiKey !== "") {
+      await borg.admin.setApiKey({ provider: vars.provider, literal: apiKey });
+    }
+    if (vars.provider !== undefined) {
       await borg.admin.setSetting({ key: "provider", value: vars.provider });
-      if (vars.model !== "") {
-        await borg.admin.setSetting({ key: "model", value: vars.model });
-      }
-      // `useMutation.run` reports failure as `undefined`, so a void return
-      // would be indistinguishable from an error and the flow would never
-      // advance. Return something.
-      return true as const;
-    },
-  );
+    }
+    if (vars.model) {
+      await borg.admin.setSetting({ key: "model", value: vars.model });
+    }
+    // Cleared means "keep the default", not "name me nothing".
+    if (vars.agentName.trim() !== "") {
+      await borg.admin.setSetting({ key: AGENT_NAME_KEY, value: vars.agentName.trim() });
+    }
+    // `useMutation.run` reports failure as `undefined`, so a void return
+    // would be indistinguishable from an error and the flow would never
+    // advance. Return something.
+    return true as const;
+  });
 
   const busy = save.pending || complete.pending;
   const finish = () => {
     if (!complete.pending) void complete.run(undefined);
   };
-  const saveAndFinish = async (vars: { provider: string; apiKey: string; model: string }) => {
+  const saveAndFinish = async (vars: SaveVars) => {
     if (busy) return;
     // A failed write must not be papered over by marking onboarding done.
     if ((await save.run(vars)) === true) finish();
@@ -124,20 +154,30 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
   }
 
   const data = status.data;
+  const pool = data.agentNames;
+  const agentName =
+    typedName ?? (data.agentName || pool[Math.floor(seed * pool.length)] || DEFAULT_AGENT_NAME);
+  const nameProps = (onSubmit?: () => void): NameProps => ({
+    value: agentName,
+    onChange: setTypedName,
+    onShuffle: () => setTypedName(rerollName(pool, agentName)),
+    onSubmit,
+  });
   const lead = leadDetection(data);
   const showPicker = pickerForced || (!data.configured && lead === undefined);
 
   if (!showPicker && data.configured) {
+    const start = () => void saveAndFinish({ agentName });
     return (
       <Card>
-        <Hello />
+        <Hello name={nameProps(start)} />
         <p className={BODY}>
           You’re already set up with {providerLabel(data.providers, data.provider)}. Ask me
           anything.
         </p>
         {errors}
         <div className="mt-[26px] flex items-center gap-3">
-          <Pill variant="primary" sizeClasses={PRIMARY} disabled={busy} onClick={finish}>
+          <Pill variant="primary" sizeClasses={PRIMARY} disabled={busy} onClick={start}>
             {busy ? "Saving…" : "Start talking"}
           </Pill>
           <button type="button" className={QUIET} onClick={() => setPickerForced(true)}>
@@ -151,18 +191,14 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
   if (!showPicker && lead) {
     const choice = providerOf(data.providers, lead.provider);
     const model = choice?.defaultModel ?? "";
+    const use = () => void saveAndFinish({ provider: lead.provider, model, agentName });
     return (
       <Card>
-        <Hello />
+        <Hello name={nameProps(use)} />
         <p className={BODY}>{detectionNote(data.providers, lead)} Nothing to paste.</p>
         {errors}
         <div className="mt-[26px] flex items-center gap-3">
-          <Pill
-            variant="primary"
-            sizeClasses={PRIMARY}
-            disabled={busy}
-            onClick={() => void saveAndFinish({ provider: lead.provider, apiKey: "", model })}
-          >
+          <Pill variant="primary" sizeClasses={PRIMARY} disabled={busy} onClick={use}>
             {busy ? "Saving…" : `Use ${providerLabel(data.providers, lead.provider)}`}
           </Pill>
           <button type="button" className={QUIET} onClick={() => setPickerForced(true)}>
@@ -179,7 +215,8 @@ export function OnboardingPage({ onDone }: { onDone: () => void }) {
         status={data}
         busy={busy}
         errors={errors}
-        onStart={(vars) => void saveAndFinish(vars)}
+        name={nameProps()}
+        onStart={(vars) => void saveAndFinish({ ...vars, agentName })}
         onLater={finish}
       />
     </Card>
@@ -190,12 +227,14 @@ function Picker({
   status,
   busy,
   errors,
+  name,
   onStart,
   onLater,
 }: {
   status: SetupStatus;
   busy: boolean;
   errors: React.ReactNode;
+  name: NameProps;
   onStart: (vars: { provider: string; apiKey: string; model: string }) => void;
   onLater: () => void;
 }) {
@@ -253,7 +292,7 @@ function Picker({
 
   return (
     <>
-      <Hello />
+      <Hello name={{ ...name, onSubmit: start }} />
       <p className={BODY}>Pick where I think. One key and we’re talking.</p>
       <div className="mt-5 flex flex-wrap gap-2">
         {pills(featured)}

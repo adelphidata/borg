@@ -19,6 +19,38 @@
 
 use std::sync::Mutex;
 
+/// The setting that names the agent. Writing it also renames the agent in
+/// its seeded memory files.
+pub(super) const AGENT_NAME_KEY: &str = "user.agent_name";
+
+/// The agent's name before a write, for the memory-file rename to replace.
+/// Read before the row changes; "" when unset.
+pub(super) async fn current_agent_name() -> Result<String, tonic::Status> {
+    cortex::config::Config::load_from_db()
+        .await
+        .map(|c| c.user.agent_name.unwrap_or_default())
+        .map_err(|e| tonic::Status::internal(format!("read current agent name: {e}")))
+}
+
+/// Carry a `user.agent_name` write from `old` to `new` into `IDENTITY.md`,
+/// `MEMORY.md` and `SETUP.md`. The setting has already landed, so the error
+/// says the files lag rather than that the rename failed. The file work runs
+/// on the blocking pool, off the RPC worker.
+pub(super) async fn rename_agent_in_memory(old: String, new: &str) -> Result<(), tonic::Status> {
+    let new = new.to_string();
+    tokio::task::spawn_blocking(move || {
+        cortex::config::Config::data_dir()
+            .and_then(|dir| cortex::agent_name::rename_in_memory_files(&dir, &old, &new))
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("rename task failed: {e}")))
+    .map_err(|e| {
+        tonic::Status::internal(format!(
+            "name saved, but the memory files could not be updated: {e}"
+        ))
+    })
+}
+
 /// A daemon dependency wired into [`super::AdminSvc`] after construction via a
 /// `with_*` builder. Centralizes the poison-tolerant lock dance that every
 /// wired slot would otherwise repeat for its setter and getter.

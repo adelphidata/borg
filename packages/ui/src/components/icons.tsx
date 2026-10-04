@@ -19,6 +19,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Shuffle,
   Sun,
   Trash2,
   Wallet,
@@ -76,6 +77,7 @@ export const UsageIcon = lucide(Wallet, 16);
 export const AgentsIcon = lucide(ListTree, 16);
 export const SunIcon = lucide(Sun, 15);
 export const MoonIcon = lucide(Moon, 15);
+export const ShuffleIcon = lucide(Shuffle, 15);
 
 export function SendIcon({ size, ...props }: IconProps) {
   return (
