@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package borg.voice.v1;
+
+// Voice and phone: the swappable providers for speech, transcription and
+// calls, plus the transcription the UI's microphone needs. Configuration
+// itself stays in Admin settings (`tts.*`, `audio.*`, `telephony.*`) and
+// Admin.SetApiKey; this service only describes what can be chosen and what
+// is ready.
+service Voice {
+  // Every built-in provider per capability, and which can run right now.
+  rpc GetVoiceCatalog(Empty) returns (VoiceCatalog);
+  // Turn a short recording into text with the configured transcription chain.
+  rpc Transcribe(TranscribeRequest) returns (TranscribeResponse);
+}
+
+message Empty {}
+
+// One provider as a picker shows it.
+message VoiceProvider {
+  string id = 1;
+  string label = 2;
+  // Whether it takes an API key at all.
+  bool needs_key = 3;
+  // Where to get a key; empty when there is none.
+  string key_url = 4;
+  string default_model = 5;
+  string default_voice = 6;
+  // Runs an operator-supplied local command instead of an API.
+  bool requires_command = 7;
+  // A key reaches this provider now (saved in Settings, environment, or the
+  // credential store). Always true for keyless providers.
+  bool has_key = 8;
+}
+
+// A phone provider, plus which shared phone settings it reads.
+message PhoneProvider {
+  VoiceProvider provider = 1;
+  // What `telephony.caller_id` means for this provider.
+  string caller_id_label = 2;
+  bool uses_agent_id = 3;
+  bool agent_required = 4;
+  bool uses_account_id = 5;
+}
+
+message VoiceCatalog {
+  repeated VoiceProvider speech = 1;
+  repeated VoiceProvider transcription = 2;
+  repeated PhoneProvider phone = 3;
+  // At least one configured speech provider can run.
+  bool speech_ready = 4;
+  // At least one configured transcription provider can run; the UI shows its
+  // microphone only when this is true.
+  bool transcription_ready = 5;
+  // Empty when calls can be placed; otherwise what to fix, in plain words.
+  string phone_problem = 6;
+}
+
+message TranscribeRequest {
+  bytes audio = 1;
+  // e.g. "audio/webm", "audio/wav".
+  string mime_type = 2;
+  // Optional BCP-47 hint; empty uses the configured language.
+  string language = 3;
+}
+
+message TranscribeResponse {
+  string text = 1;
+}

@@ -5,6 +5,7 @@ pub mod capability;
 pub mod session;
 pub mod status;
 pub mod telemetry;
+pub mod voice;
 
 use crate::cost_events::CostEventBus;
 use crate::goal_bus::GoalEventBus;
@@ -17,6 +18,7 @@ use protocols::capability::capability_server::CapabilityServer;
 use protocols::session::session_server::SessionServer;
 use protocols::status::status_server::StatusServer;
 use protocols::telemetry::telemetry_server::TelemetryServer;
+use protocols::voice::voice_server::VoiceServer;
 use std::sync::Arc;
 
 /// Bundle of all service servers exposed by borgd.
@@ -31,6 +33,12 @@ pub struct Services {
     pub capability: CapabilityServer<capability::CapabilitySvc>,
     /// Daemon-wide telemetry streams.
     pub telemetry: TelemetryServer<telemetry::TelemetrySvc>,
+    /// Voice and phone provider catalog plus transcription.
+    pub voice: VoiceServer<voice::VoiceSvc>,
+}
+
+fn voice_server() -> VoiceServer<voice::VoiceSvc> {
+    VoiceServer::new(voice::VoiceSvc).max_decoding_message_size(voice::MAX_RECORDING_BYTES)
 }
 
 /// Construct the service bundle. The session factory governs how new
@@ -48,6 +56,7 @@ pub fn build_services(
             .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
+        voice: voice_server(),
     }
 }
 
@@ -117,5 +126,6 @@ pub fn build_services_with_extras(
             .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
+        voice: voice_server(),
     }
 }

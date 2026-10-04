@@ -867,6 +867,7 @@ async fn serve_transports(
             .add_service(services.session.clone())
             .add_service(services.capability.clone())
             .add_service(services.telemetry.clone())
+            .add_service(services.voice.clone())
             .add_service(PkiServer::new(PkiSvc::new(
                 pki_db.clone(),
                 audit.clone(),
@@ -924,6 +925,10 @@ async fn serve_transports(
             ))
             .add_service(InterceptedService::new(
                 services.telemetry.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.voice.clone(),
                 interceptor.clone(),
             ))
             .add_service(InterceptedService::new(tcp_pki, interceptor));

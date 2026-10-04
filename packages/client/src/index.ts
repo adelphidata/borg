@@ -23,3 +23,4 @@ export * as pki from "./gen/pki.js";
 export * as session from "./gen/session.js";
 export * as status from "./gen/status.js";
 export * as telemetry from "./gen/telemetry.js";
+export * as voice from "./gen/voice.js";

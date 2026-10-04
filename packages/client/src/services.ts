@@ -3,6 +3,7 @@ import { PkiDefinition } from "./gen/pki.js";
 import { SessionDefinition } from "./gen/session.js";
 import { StatusDefinition } from "./gen/status.js";
 import { TelemetryDefinition } from "./gen/telemetry.js";
+import { VoiceDefinition } from "./gen/voice.js";
 
 /**
  * The borgd services a UI may call, keyed by the name used everywhere else.
@@ -17,6 +18,7 @@ export const SERVICES = {
   session: SessionDefinition,
   status: StatusDefinition,
   telemetry: TelemetryDefinition,
+  voice: VoiceDefinition,
 } as const;
 
 export type ServiceName = keyof typeof SERVICES;
@@ -27,4 +29,5 @@ export const WEB_SERVICES = [
   "session",
   "status",
   "telemetry",
+  "voice",
 ] as const satisfies readonly ServiceName[];

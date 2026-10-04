@@ -57,6 +57,12 @@ pub mod pki {
     tonic::include_proto!("borg.pki.v1");
 }
 
+/// Voice and phone provider catalog plus transcription.
+pub mod voice {
+    #![allow(missing_docs, clippy::all)]
+    tonic::include_proto!("borg.voice.v1");
+}
+
 /// Re-export tonic for downstream crates so they don't have to pin a version.
 pub use tonic;
 
