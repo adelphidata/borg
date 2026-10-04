@@ -443,8 +443,8 @@ impl TelephonyProviderDef {
     pub(super) fn build(&'static self, config: &Config) -> Result<Box<dyn TelephonyProvider>> {
         let Some(api_key) = self.info.api_key(config, None) else {
             bail!(
-                "{} needs an API key. Add it under Settings → Advanced → Voice & phone.",
-                self.info.label
+                "Phone calls need the {}. Add it under Settings → Advanced → Voice & phone.",
+                self.info.key_name()
             );
         };
         (self.build)(BuildContext {
@@ -460,6 +460,7 @@ static PROVIDERS: &[TelephonyProviderDef] = &[
     TelephonyProviderDef {
         info: ProviderInfo {
             key_env: &["TWILIO_AUTH_TOKEN"],
+            key_label: "Twilio Auth Token",
             key_url: "https://console.twilio.com",
             base_url: "https://api.twilio.com",
             default_voice: "Polly.Joanna",
@@ -595,7 +596,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("needs an API key"), "{err}");
+        assert!(err.contains("need the Bland voice agent API key"), "{err}");
     }
 
     #[test]

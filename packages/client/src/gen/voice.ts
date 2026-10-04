@@ -29,6 +29,8 @@ export interface VoiceProvider {
    * credential store). Always true for keyless providers.
    */
   hasKey: boolean;
+  /** The settings label for its secret, like "Twilio Auth Token". */
+  keyLabel: string;
 }
 
 /** A phone provider, plus which shared phone settings it reads. */
@@ -123,6 +125,7 @@ function createBaseVoiceProvider(): VoiceProvider {
     defaultVoice: "",
     requiresCommand: false,
     hasKey: false,
+    keyLabel: "",
   };
 }
 
@@ -151,6 +154,9 @@ export const VoiceProvider: MessageFns<VoiceProvider> = {
     }
     if (message.hasKey !== false) {
       writer.uint32(64).bool(message.hasKey);
+    }
+    if (message.keyLabel !== "") {
+      writer.uint32(74).string(message.keyLabel);
     }
     return writer;
   },
@@ -226,6 +232,14 @@ export const VoiceProvider: MessageFns<VoiceProvider> = {
           message.hasKey = reader.bool();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.keyLabel = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -269,6 +283,11 @@ export const VoiceProvider: MessageFns<VoiceProvider> = {
         : isSet(object.has_key)
         ? globalThis.Boolean(object.has_key)
         : false,
+      keyLabel: isSet(object.keyLabel)
+        ? globalThis.String(object.keyLabel)
+        : isSet(object.key_label)
+        ? globalThis.String(object.key_label)
+        : "",
     };
   },
 
@@ -298,6 +317,9 @@ export const VoiceProvider: MessageFns<VoiceProvider> = {
     if (message.hasKey !== false) {
       obj.hasKey = message.hasKey;
     }
+    if (message.keyLabel !== "") {
+      obj.keyLabel = message.keyLabel;
+    }
     return obj;
   },
 
@@ -314,6 +336,7 @@ export const VoiceProvider: MessageFns<VoiceProvider> = {
     message.defaultVoice = object.defaultVoice ?? "";
     message.requiresCommand = object.requiresCommand ?? false;
     message.hasKey = object.hasKey ?? false;
+    message.keyLabel = object.keyLabel ?? "";
     return message;
   },
 };

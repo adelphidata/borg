@@ -31,6 +31,8 @@ message VoiceProvider {
   // A key reaches this provider now (saved in Settings, environment, or the
   // credential store). Always true for keyless providers.
   bool has_key = 8;
+  // The settings label for its secret, like "Twilio Auth Token".
+  string key_label = 9;
 }
 
 // A phone provider, plus which shared phone settings it reads.

@@ -167,7 +167,7 @@ function KeyField({ provider, onSaved }: { provider: VoiceProvider; onSaved: () 
   };
   return (
     <Field
-      label={`${provider.label} API key`}
+      label={provider.keyLabel}
       hint={
         <>
           {provider.hasKey ? "A key is set. Paste a new one to replace it." : "No key yet."}
@@ -219,6 +219,7 @@ function ChainSection({
   providers,
   ready,
   showVoice,
+  commandHint,
   refetch,
 }: {
   title: string;
@@ -229,6 +230,8 @@ function ChainSection({
   providers: VoiceProvider[];
   ready: boolean;
   showVoice: boolean;
+  /** How a custom command gets its input and hands back its result. */
+  commandHint: string;
   refetch: () => void;
 }) {
   const { settings, save } = useSettings();
@@ -278,7 +281,7 @@ function ChainSection({
             {provider?.requiresCommand && (
               <TextSetting
                 label="Command"
-                hint="Runs on this machine. See the docs for the placeholders it can use."
+                hint={commandHint}
                 value={row?.command ?? ""}
                 onCommit={(v) => setField("command", v)}
               />
@@ -422,6 +425,7 @@ export function VoiceSettingsPage() {
                   providers={data.transcription}
                   ready={data.transcriptionReady}
                   showVoice={false}
+                  commandHint="Runs on this machine. Put {audio_file} where the recording's path goes; the command prints the text."
                   refetch={catalog.refetch}
                 />
                 <ChainSection
@@ -433,6 +437,7 @@ export function VoiceSettingsPage() {
                   providers={data.speech}
                   ready={data.speechReady}
                   showVoice
+                  commandHint="Runs on this machine. It reads the reply from {text_file} and writes the audio to {output_path}."
                   refetch={catalog.refetch}
                 />
                 <PhoneSection catalog={data} refetch={catalog.refetch} />

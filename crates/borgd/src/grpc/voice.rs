@@ -34,6 +34,7 @@ fn provider(info: &ProviderInfo, config: &Config) -> VoiceProvider {
         default_voice: info.default_voice.to_string(),
         requires_command: info.requires_command,
         has_key: info.api_key(config, None).is_some(),
+        key_label: info.key_name(),
     }
 }
 

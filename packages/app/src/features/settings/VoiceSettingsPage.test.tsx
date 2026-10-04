@@ -26,6 +26,7 @@ const provider = (id: string, label: string, extra: Record<string, unknown> = {}
   defaultVoice: "",
   requiresCommand: false,
   hasKey: false,
+  keyLabel: `${label} API key`,
   ...extra,
 });
 
@@ -40,7 +41,7 @@ const CATALOG = {
   ],
   phone: [
     {
-      provider: provider("twilio", "Twilio (speak a message)"),
+      provider: provider("twilio", "Twilio (speak a message)", { keyLabel: "Twilio Auth Token" }),
       callerIdLabel: "Twilio phone number",
       usesAgentId: false,
       agentRequired: false,
@@ -171,6 +172,7 @@ describe("VoiceSettingsPage", () => {
       { ...CATALOG, phoneProblem: "Twilio needs your Account SID." },
     );
     expect(await screen.findByLabelText("Account SID")).toBeTruthy();
+    expect(screen.getByLabelText("Twilio Auth Token")).toBeTruthy();
     expect(screen.queryByLabelText(/Agent id/)).toBeNull();
     expect(screen.getByText("Twilio needs your Account SID.")).toBeTruthy();
 

@@ -29,6 +29,9 @@ pub struct ProviderInfo {
     pub default_voice: &'static str,
     /// True for providers that shell out to an operator-supplied `command`.
     pub requires_command: bool,
+    /// What the provider calls its secret, when that is not "API key"
+    /// (Twilio's is an Auth Token). Empty means "<label> API key".
+    pub key_label: &'static str,
 }
 
 impl ProviderInfo {
@@ -44,6 +47,16 @@ impl ProviderInfo {
             default_model: "",
             default_voice: "",
             requires_command: false,
+            key_label: "",
+        }
+    }
+
+    /// The name a settings field shows for this provider's secret.
+    pub fn key_name(&self) -> String {
+        if self.key_label.is_empty() {
+            format!("{} API key", self.label)
+        } else {
+            self.key_label.to_string()
         }
     }
 
@@ -135,6 +148,16 @@ mod tests {
         ApiKeyRouting::Literal {
             value: value.to_string(),
         }
+    }
+
+    #[test]
+    fn key_name_defaults_to_an_api_key_and_honors_an_override() {
+        assert_eq!(KEYED.key_name(), format!("{} API key", KEYED.label));
+        let twilio = ProviderInfo {
+            key_label: "Twilio Auth Token",
+            ..ProviderInfo::new("twilio", "Twilio")
+        };
+        assert_eq!(twilio.key_name(), "Twilio Auth Token");
     }
 
     #[test]
