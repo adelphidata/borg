@@ -71,6 +71,7 @@ pub fn mutating_tool_names() -> &'static [&'static str] {
         "manage_cron",
         "manage_roles",
         "manage_tasks",
+        "phone_call",
         "projects",
         "run_shell",
         "schedule",
@@ -92,7 +93,7 @@ pub(crate) fn classify_action(tool_name: &str) -> ActionType {
         "write_memory" => ActionType::MemoryWrite,
         "memory_search" | "read_memory" => ActionType::ToolCall,
         "web_fetch" | "web_search" | "browser" | "text_to_speech" | "transcribe_audio"
-        | "generate_image" | "vision_analyze" => ActionType::WebRequest,
+        | "generate_image" | "vision_analyze" | "phone_call" => ActionType::WebRequest,
         _ => ActionType::ToolCall,
     }
 }
@@ -122,6 +123,7 @@ mod tests {
             ("transcribe_audio", ActionType::WebRequest),
             ("generate_image", ActionType::WebRequest),
             ("vision_analyze", ActionType::WebRequest),
+            ("phone_call", ActionType::WebRequest),
         ];
         for (tool, expected) in cases {
             assert_eq!(
@@ -173,6 +175,8 @@ mod tests {
             "text_to_speech",
             "transcribe_audio",
             "generate_image",
+            // Places real, billed calls to real people.
+            "phone_call",
         ] {
             assert!(
                 names.contains(&required),

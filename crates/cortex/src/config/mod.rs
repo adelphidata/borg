@@ -16,6 +16,7 @@ pub mod security;
 #[macro_use]
 mod settings_macro;
 pub mod settings_table;
+pub mod telephony;
 pub mod tunnel;
 pub mod ui;
 pub mod update;
@@ -39,6 +40,7 @@ pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
 pub use process_registry::*;
 pub use security::*;
+pub use telephony::TelephonyConfig;
 pub use tunnel::{
     CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
     TunnelConfig, TunnelProvider,
@@ -59,6 +61,7 @@ use tracing::warn;
 
 use crate::llm::provider::Provider;
 use crate::paths::{self, BorgSubdir};
+use crate::security::secrets_resolve::{ApiKeyRouting, SecretRef};
 
 /// Settings-table prefix of the per-provider API key routing rows that
 /// `Admin.SetApiKey` writes (`credentials.openrouter`, …).
@@ -143,6 +146,9 @@ pub struct Config {
     /// Voice-mode loop (mic capture VAD + TTS-pause guard + auto-submit).
     #[serde(default)]
     pub voice: VoiceConfig,
+    /// Outbound phone calls (`phone_call` tool); off until a provider is set.
+    #[serde(default)]
+    pub telephony: TelephonyConfig,
     /// Media understanding settings.
     #[serde(default)]
     pub media: MediaConfig,
@@ -205,6 +211,11 @@ pub struct Config {
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,
+    /// Keys saved per provider by `Admin.SetApiKey` (`credentials.{provider}`
+    /// rows), keyed by lowercase provider id. Kept beside the LLM fold so a
+    /// voice or phone provider finds the key Settings saved for it.
+    #[serde(skip)]
+    pub stored_api_keys: HashMap<String, ApiKeyRouting>,
     /// Transient identity override (not serialized). Set by gateway routing.
     #[serde(skip)]
     pub identity_override: Option<std::path::PathBuf>,
@@ -400,8 +411,53 @@ impl Config {
             }
         }
         config.adopt_stored_api_key(&stored_keys);
+        config.keep_stored_api_keys(&stored_keys);
         config.adopt_default_model();
         config
+    }
+
+    /// Remember every parseable `credentials.{provider}` row for
+    /// [`Config::resolve_provider_key`]. A malformed row is already reported
+    /// by [`Config::adopt_stored_api_key`] when it is the LLM's, so it is only
+    /// logged at debug here.
+    fn keep_stored_api_keys(&mut self, rows: &[(String, String)]) {
+        for (provider, json) in rows {
+            match serde_json::from_str::<ApiKeyRouting>(json) {
+                Ok(routing) => {
+                    self.stored_api_keys
+                        .insert(provider.to_ascii_lowercase(), routing);
+                }
+                Err(e) => tracing::debug!("{STORED_API_KEY_PREFIX}{provider} skipped: {e}"),
+            }
+        }
+    }
+
+    /// Resolve the API key of a non-LLM provider (speech, transcription,
+    /// telephony).
+    ///
+    /// Each of `env_names` (the provider's conventional variables, or a
+    /// per-row override) is tried in order through
+    /// [`Config::resolve_credential_or_env`], so an operator's explicit
+    /// routing is never overridden; the key Settings saved for `provider` is
+    /// the fallback. Because chat and voice read the same
+    /// `credentials.{provider}` row, an OpenAI key saved for chat also serves
+    /// OpenAI speech.
+    pub fn resolve_provider_key(&self, provider: &str, env_names: &[&str]) -> Option<String> {
+        if let Some(key) = env_names
+            .iter()
+            .find_map(|name| self.resolve_credential_or_env(name))
+        {
+            return Some(key);
+        }
+        let routing = self.stored_api_keys.get(&provider.to_ascii_lowercase())?;
+        match SecretRef::from(routing.clone()).resolve() {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Saved key for {provider} could not be read: {e}");
+                None
+            }
+        }
     }
 
     /// Fill an unset `model` with the provider's recommended catalog model.
@@ -441,7 +497,7 @@ impl Config {
         let Some((_, json)) = rows.iter().find(|(p, _)| p.eq_ignore_ascii_case(provider)) else {
             return;
         };
-        match serde_json::from_str::<crate::security::secrets_resolve::ApiKeyRouting>(json) {
+        match serde_json::from_str::<ApiKeyRouting>(json) {
             Ok(routing) => self.llm.api_key = Some(routing.into()),
             Err(e) => warn!("{STORED_API_KEY_PREFIX}{provider} is not valid key routing JSON: {e}"),
         }
@@ -806,7 +862,7 @@ impl Config {
         let service = format!("borg-{}", plugin_id.replace('/', "-"));
         let account = format!("borg-{key}");
 
-        let sr = crate::security::secrets_resolve::SecretRef::Keychain {
+        let sr = SecretRef::Keychain {
             service: service.clone(),
             account: account.clone(),
         };

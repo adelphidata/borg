@@ -43,6 +43,7 @@ pub(crate) mod list;
 pub(crate) mod list_dir;
 pub(crate) mod memory_search;
 pub(crate) mod multi_agent;
+pub(crate) mod phone_call;
 pub(crate) mod read_file;
 pub(crate) mod read_memory;
 pub(crate) mod request_user_input;
@@ -69,6 +70,7 @@ pub(crate) use list::ListArgs;
 pub(crate) use list_dir::ListDirArgs;
 pub(crate) use memory_search::MemorySearchArgs;
 pub(crate) use multi_agent::MultiAgentArgs;
+pub(crate) use phone_call::PhoneCallArgs;
 pub(crate) use read_file::ReadFileArgs;
 pub(crate) use read_memory::ReadMemoryArgs;
 pub(crate) use request_user_input::RequestUserInputArgs;
@@ -129,6 +131,7 @@ pub(crate) enum Tool {
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
     TranscribeAudio(TranscribeAudioArgs),
+    PhoneCall(PhoneCallArgs),
     VisionAnalyze(VisionAnalyzeArgs),
     VideoAnalyze(VideoAnalyzeArgs),
     ComputerUse(ComputerUseArgs),
@@ -219,6 +222,7 @@ impl Tool {
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
             tn::TRANSCRIBE_AUDIO => Tool::TranscribeAudio(from(tn::TRANSCRIBE_AUDIO, args)?),
+            tn::PHONE_CALL => Tool::PhoneCall(from(tn::PHONE_CALL, args)?),
             tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
             tn::VIDEO_ANALYZE => Tool::VideoAnalyze(from(tn::VIDEO_ANALYZE, args)?),
             tn::COMPUTER_USE => Tool::ComputerUse(from(tn::COMPUTER_USE, args)?),
@@ -268,6 +272,7 @@ impl Tool {
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
             Tool::TranscribeAudio(_) => tn::TRANSCRIBE_AUDIO,
+            Tool::PhoneCall(_) => tn::PHONE_CALL,
             Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
             Tool::VideoAnalyze(_) => tn::VIDEO_ANALYZE,
             Tool::ComputerUse(_) => tn::COMPUTER_USE,
@@ -316,6 +321,7 @@ impl Tool {
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::TranscribeAudio(_)
+            | Tool::PhoneCall(_)
             | Tool::ComputerUse(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
@@ -370,6 +376,7 @@ impl Tool {
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::TranscribeAudio(_)
+            | Tool::PhoneCall(_)
             | Tool::CreateGoal(_)
             | Tool::UpdateGoal(_)
             | Tool::SpawnAgent(_)
@@ -407,6 +414,7 @@ impl Tool {
             Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::TranscribeAudio(_)
+            | Tool::PhoneCall(_)
             | Tool::VisionAnalyze(_)
             | Tool::VideoAnalyze(_)
             | Tool::ComputerUse(_) => ToolGroup::Media,
@@ -565,6 +573,7 @@ mod tests {
             (tn::GENERATE_IMAGE, json!({"prompt":"a cat"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
             (tn::TRANSCRIBE_AUDIO, json!({"path":"clip.wav"})),
+            (tn::PHONE_CALL, json!({"action":"status","call_id":"c1"})),
             (
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
@@ -666,6 +675,7 @@ mod tests {
             (tn::GENERATE_IMAGE, json!({"prompt":"x"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
             (tn::TRANSCRIBE_AUDIO, json!({"path":"clip.wav"})),
+            (tn::PHONE_CALL, json!({"action":"status","call_id":"c1"})),
             (
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),

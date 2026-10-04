@@ -193,6 +193,15 @@ define_settings! {
         "voice.sample_rate_hz" => voice.sample_rate_hz, parsed(u32);
         "voice.record_key" => voice.record_key, string;
 
+        // ── Telephony ──
+        "telephony.provider" => telephony.provider, string;
+        "telephony.caller_id" => telephony.caller_id, string;
+        "telephony.agent_id" => telephony.agent_id, string;
+        "telephony.account_id" => telephony.account_id, string;
+        "telephony.voice" => telephony.voice, string;
+        "telephony.allowed_numbers" => telephony.allowed_numbers, string;
+        "telephony.max_call_secs" => telephony.max_call_secs, parsed(u32);
+
         // ── Evolution ──
         "evolution.enabled" => evolution.enabled, parsed(bool);
         "evolution.ambient_header_enabled" => evolution.ambient_header_enabled, parsed(bool);

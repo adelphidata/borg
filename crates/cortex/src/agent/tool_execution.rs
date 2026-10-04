@@ -858,6 +858,9 @@ impl Agent {
             crate::tool::Tool::GenerateImage(args) => {
                 crate::tool::generate_image::handle(args, &self.config).await
             }
+            crate::tool::Tool::PhoneCall(args) => {
+                crate::tool::phone_call::handle(args, &self.config).await
+            }
             crate::tool::Tool::TranscribeAudio(args) => {
                 crate::tool::transcribe_audio::handle(
                     args,

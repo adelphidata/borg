@@ -315,10 +315,10 @@ impl Default for BrowserConfig {
 }
 
 /// Single transcription provider entry (cloud API or local CLI).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioModelConfig {
-    /// Provider name: "openai", "groq", "deepgram", "mistral", "xai",
-    /// "local", or "custom".
+    /// Provider id from `media::understanding::providers()` (e.g. "openai",
+    /// "elevenlabs", "local", "custom").
     pub provider: String,
     /// Model name (e.g. "whisper-1", "nova-3").
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,15 +395,16 @@ impl Default for AudioConfig {
 }
 
 /// Single TTS provider entry in the fallback chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TtsModelConfig {
-    /// Provider name: "edge", "openai", "elevenlabs", "gemini", "minimax",
-    /// "xai", "mistral", "piper", "kittentts", "neutts", or "custom".
+    /// Provider id from `media::tts::providers()` (e.g. "elevenlabs",
+    /// "openai", "edge", "custom").
     pub provider: String,
     /// Model name (e.g. "gpt-4o-mini-tts", "eleven_multilingual_v2").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Voice identifier (e.g. "alloy", "nova", or ElevenLabs voice ID).
+    /// Voice identifier (e.g. "alloy", or an ElevenLabs voice ID). Unset
+    /// falls back to `tts.default_voice`, then the provider's own default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
     /// Override API key env var for this provider.
@@ -459,7 +460,9 @@ pub struct TtsConfig {
     /// Ordered fallback chain of TTS providers.
     #[serde(default)]
     pub models: Vec<TtsModelConfig>,
-    /// Default voice name/ID.
+    /// Voice used by every provider row that names none. Empty (the
+    /// default) lets each provider use its own default voice, since voice
+    /// ids rarely carry across providers.
     pub default_voice: String,
     /// Default output format (mp3, opus, aac, flac, wav).
     pub default_format: String,
@@ -476,7 +479,7 @@ impl Default for TtsConfig {
         Self {
             enabled: false,
             models: Vec::new(),
-            default_voice: "alloy".into(),
+            default_voice: String::new(),
             default_format: "mp3".into(),
             max_text_length: 4096,
             timeout_ms: constants::TTS_DEFAULT_TIMEOUT_MS,

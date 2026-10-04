@@ -174,6 +174,8 @@ pub mod task_ids;
 pub mod tasks;
 /// Anonymous telemetry collection.
 pub mod telemetry;
+/// Outbound phone calls behind a swappable provider registry.
+pub mod telephony;
 /// System prompt template assembly.
 pub mod template;
 /// Typed tool dispatch: closed `enum Tool` + per-variant `Args`. Also hosts

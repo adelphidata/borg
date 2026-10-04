@@ -62,6 +62,7 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
         tool_names::TRANSCRIBE_AUDIO,
         "Transcribe a local audio file to text",
     ),
+    (tool_names::PHONE_CALL, "Place and follow outbound phone calls"),
     (
         tool_names::VISION_ANALYZE,
         "Describe or answer questions about a remote image",
@@ -217,6 +218,23 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["text"]
+            }),
+        ));
+    }
+
+    if config.telephony.enabled() {
+        defs.push(ToolDefinition::new(
+            tool_names::PHONE_CALL,
+            "Place an outbound phone call and follow it. `call` dials `to` (E.164, e.g. +14155550123): plain-call providers speak `message` verbatim; voice-agent providers hold a conversation with `message` as their task. Calls cost money and reach real people — only call numbers the user asked for. `status` returns progress, transcript and summary; `hang_up` ends a live call.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["call", "status", "hang_up"] },
+                    "to": { "type": "string", "description": "Callee in E.164 (for call)" },
+                    "message": { "type": "string", "description": "What to say, or the voice agent's task (for call)" },
+                    "call_id": { "type": "string", "description": "Id returned by call (for status, hang_up)" }
+                },
+                "required": ["action"]
             }),
         ));
     }
@@ -753,6 +771,7 @@ mod tests {
         config.web.enabled = true;
         config.tts.enabled = true;
         config.audio.enabled = true;
+        config.telephony.provider = "twilio".into();
         config.image_gen.enabled = true;
         config.goals.enabled = true;
         // Defaults on only on macOS; its summary must still match on Linux.

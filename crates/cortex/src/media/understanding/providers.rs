@@ -1,3 +1,11 @@
+//! Built-in transcription providers and the registry that names them.
+//!
+//! Same shape as the speech registry: a [`TranscriptionProvider`] impl plus
+//! one [`SttProviderDef`] row in [`PROVIDERS`] holding the defaults, so the
+//! engine and the Settings UI read one table. Any OpenAI-compatible server
+//! plugs in through the `openai` row's `base_url`, any local engine through
+//! `custom`.
+
 use std::time::Duration;
 
 use anyhow::Context;
@@ -7,49 +15,32 @@ use tracing::{debug, warn};
 
 use crate::config::{AudioModelConfig, Config};
 use crate::media::core::ensure_success;
-
-// ── Audio Transcription ──
-
-/// Outcome of a single provider attempt.
-#[derive(Debug, Clone)]
-pub enum AttemptOutcome {
-    Success,
-    Skipped(String),
-    Failed(String),
-}
-
-/// Tracks each provider attempt in the fallback chain.
-#[derive(Debug, Clone)]
-pub struct TranscriptionAttempt {
-    pub provider: String,
-    pub model: Option<String>,
-    pub outcome: AttemptOutcome,
-}
+use crate::media::provider_info::ProviderInfo;
 
 /// Request data for transcription providers.
-struct TranscriptionRequest<'a> {
-    audio_bytes: &'a [u8],
-    mime_type: String,
-    filename: String,
-    model: Option<String>,
-    language: Option<String>,
-    timeout: Duration,
+pub(super) struct TranscriptionRequest<'a> {
+    pub audio_bytes: &'a [u8],
+    pub mime_type: String,
+    pub filename: String,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub timeout: Duration,
 }
 
 /// Provider-agnostic transcription trait.
 #[async_trait::async_trait]
-trait TranscriptionProvider: Send + Sync {
+pub(super) trait TranscriptionProvider: Send + Sync {
     async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String>;
     fn name(&self) -> &str;
 }
 
 /// OpenAI-compatible Whisper provider (works for OpenAI and Groq).
-struct WhisperProvider {
-    client: Client,
-    api_key: String,
-    base_url: String,
-    default_model: String,
-    provider_name: String,
+pub(super) struct WhisperProvider {
+    pub(super) client: Client,
+    pub(super) api_key: String,
+    pub(super) base_url: String,
+    pub(super) default_model: String,
+    pub(super) provider_name: String,
 }
 
 #[async_trait::async_trait]
@@ -128,6 +119,51 @@ impl TranscriptionProvider for DeepgramProvider {
 
     fn name(&self) -> &str {
         "deepgram"
+    }
+}
+
+/// ElevenLabs Scribe — `POST {base}/v1/speech-to-text` (multipart
+/// `file` + `model_id`, optional `language_code`); answers `{ "text": … }`.
+struct ElevenLabsSttProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    default_model: String,
+}
+
+#[async_trait::async_trait]
+impl TranscriptionProvider for ElevenLabsSttProvider {
+    async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let file_part = reqwest::multipart::Part::bytes(req.audio_bytes.to_vec())
+            .file_name(req.filename.clone())
+            .mime_str(&req.mime_type)?;
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model_id", model.to_string());
+        if let Some(ref lang) = req.language {
+            form = form.text("language_code", lang.clone());
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}/v1/speech-to-text", self.base_url))
+            .header("xi-api-key", &self.api_key)
+            .multipart(form)
+            .timeout(req.timeout)
+            .send()
+            .await?;
+        let resp = ensure_success(resp, "ElevenLabs STT").await?;
+
+        let json: serde_json::Value = resp.json().await?;
+        json["text"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Missing 'text' in ElevenLabs STT response"))
+    }
+
+    fn name(&self) -> &str {
+        "elevenlabs"
     }
 }
 
@@ -458,326 +494,230 @@ pub fn parse_deepgram_response(json: &serde_json::Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Missing transcript in Deepgram response"))
 }
 
-/// A provider with its per-model configuration.
-struct ProviderEntry {
-    provider: Box<dyn TranscriptionProvider>,
-    model: Option<String>,
-    language: Option<String>,
-    timeout: Option<Duration>,
+// ── Registry ──
+
+/// What a registry row's constructor receives: the config row plus the
+/// key and endpoint already resolved from the provider's [`ProviderInfo`].
+struct BuildContext<'a> {
+    client: &'a Client,
+    row: &'a AudioModelConfig,
+    info: &'static ProviderInfo,
+    /// Empty for keyless providers.
+    api_key: String,
+    base_url: String,
 }
 
-/// Main transcription engine with multi-provider fallback.
-pub struct AudioTranscriber {
-    entries: Vec<ProviderEntry>,
-    max_file_size: u64,
-    min_file_size: u64,
-    default_language: Option<String>,
-    default_timeout: Duration,
+/// OpenAI-shaped multipart transcription, shared by every provider that
+/// speaks `/v1/audio/transcriptions`.
+fn build_whisper(cx: BuildContext<'_>) -> Option<Box<dyn TranscriptionProvider>> {
+    Some(Box::new(WhisperProvider {
+        client: cx.client.clone(),
+        api_key: cx.api_key,
+        base_url: cx.base_url,
+        default_model: cx.info.default_model.to_string(),
+        provider_name: cx.info.id.to_string(),
+    }))
 }
 
-impl AudioTranscriber {
-    /// Build transcription engine from config. Returns None if disabled or no providers available.
-    pub fn from_config(config: &Config) -> Option<Self> {
-        if !config.audio.enabled {
-            return None;
-        }
+/// One built-in transcription provider.
+pub(super) struct SttProviderDef {
+    pub(super) info: ProviderInfo,
+    /// `None` when the row is unusable; the engine logs and skips it.
+    build: fn(BuildContext<'_>) -> Option<Box<dyn TranscriptionProvider>>,
+}
 
-        let audio = &config.audio;
-        // Cloned, not built: every provider entry below shares the one
-        // connection pool, and per-request budgets are applied on the request.
-        let client = crate::http::shared().clone();
-        let mut entries: Vec<ProviderEntry> = Vec::new();
-
-        for model_cfg in &audio.models {
-            match Self::build_provider(&client, model_cfg, config) {
-                Some(p) => entries.push(ProviderEntry {
-                    provider: p,
-                    model: model_cfg.model.clone(),
-                    language: model_cfg.language.clone(),
-                    timeout: model_cfg.timeout_ms.map(Duration::from_millis),
-                }),
-                None => {
-                    debug!(
-                        "Skipping audio provider '{}': no API key",
-                        model_cfg.provider
-                    );
-                }
-            }
-        }
-
-        if entries.is_empty() {
-            debug!("No audio transcription providers available");
-            return None;
-        }
-
-        Some(Self {
-            entries,
-            max_file_size: audio.max_file_size,
-            min_file_size: audio.min_file_size,
-            default_language: audio.language.clone(),
-            default_timeout: Duration::from_millis(audio.timeout_ms),
-        })
-    }
-
-    fn build_provider(
+impl SttProviderDef {
+    /// Build this provider for `row`, or `None` when its key is missing or
+    /// the row is incomplete.
+    pub(super) fn build(
+        &'static self,
         client: &Client,
-        model_cfg: &AudioModelConfig,
+        row: &AudioModelConfig,
         config: &Config,
     ) -> Option<Box<dyn TranscriptionProvider>> {
-        let resolve_key = |env_var: &str| -> Option<String> {
-            config
-                .resolve_credential_or_env(env_var)
-                .or_else(|| std::env::var(env_var).ok())
-                .filter(|k| !k.is_empty())
-        };
-
-        match model_cfg.provider.as_str() {
-            "openai" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-                let api_key = resolve_key(env_var)?;
-                Some(Box::new(WhisperProvider {
-                    client: client.clone(),
-                    api_key,
-                    base_url: model_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.openai.com".to_string()),
-                    default_model: "whisper-1".to_string(),
-                    provider_name: "openai".to_string(),
-                }))
-            }
-            "groq" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("GROQ_API_KEY");
-                let api_key = resolve_key(env_var)?;
-                Some(Box::new(WhisperProvider {
-                    client: client.clone(),
-                    api_key,
-                    base_url: model_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.groq.com/openai".to_string()),
-                    default_model: "whisper-large-v3-turbo".to_string(),
-                    provider_name: "groq".to_string(),
-                }))
-            }
-            "deepgram" => {
-                let env_var = model_cfg
-                    .api_key_env
-                    .as_deref()
-                    .unwrap_or("DEEPGRAM_API_KEY");
-                let api_key = resolve_key(env_var)?;
-                Some(Box::new(DeepgramProvider {
-                    client: client.clone(),
-                    api_key,
-                    base_url: model_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.deepgram.com".to_string()),
-                    default_model: "nova-3".to_string(),
-                }))
-            }
-            // Mistral's `/v1/audio/transcriptions` is OpenAI-compatible
-            // (multipart `file`+`model`), so the existing WhisperProvider
-            // works as-is. Default model voxtral-mini-latest matches
-            // (DEFAULT_MISTRAL_STT_MODEL in
-            "mistral" => {
-                let env_var = model_cfg
-                    .api_key_env
-                    .as_deref()
-                    .unwrap_or("MISTRAL_API_KEY");
-                let api_key = resolve_key(env_var)?;
-                Some(Box::new(WhisperProvider {
-                    client: client.clone(),
-                    api_key,
-                    base_url: model_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
-                    default_model: "voxtral-mini-latest".to_string(),
-                    provider_name: "mistral".to_string(),
-                }))
-            }
-            // Local whisper.cpp via the optional `local-stt` cargo feature.
-            // When the feature is off, log + skip so a config row referencing
-            // "local" doesn't break the fallback chain.
-            #[cfg(feature = "local-stt")]
-            "local" => {
-                let path_str = model_cfg
-                    .api_key_env
-                    .clone()
-                    .unwrap_or_else(|| "~/.borg/models/whisper-base.en.bin".to_string());
-                let expanded = shellexpand_home(&path_str);
-                let model_path = std::path::PathBuf::from(expanded);
-                let cpus = std::thread::available_parallelism()
-                    .map(std::num::NonZeroUsize::get)
-                    .unwrap_or(2);
-                let threads = (cpus / 2).max(1) as i32;
-                Some(Box::new(LocalWhisperProvider {
-                    model_path,
-                    threads,
-                }))
-            }
-            #[cfg(not(feature = "local-stt"))]
-            "local" => {
-                debug!(
-                    "STT provider 'local' configured but cortex was built without \
-                     --features local-stt; skipping"
-                );
-                None
-            }
-            // xAI Grok STT — `/v1/stt` multipart (not OpenAI-compatible).
-            // Matches `_transcribe_xai` at
-            "xai" => {
-                let env_var = model_cfg.api_key_env.as_deref().unwrap_or("XAI_API_KEY");
-                let api_key = resolve_key(env_var)?;
-                Some(Box::new(XaiSttProvider {
-                    client: client.clone(),
-                    api_key,
-                    base_url: model_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
-                    // `None` preserves the historical default (format on,
-                    // diarize off). The Option fields exist so operators
-                    // can flip either behavior per-model row.
-                    format: model_cfg.xai_stt_format.unwrap_or(true),
-                    diarize: model_cfg.xai_stt_diarize.unwrap_or(false),
-                }))
-            }
-            // Local CLI shell-template. Unblocks Parakeet, faster-whisper,
-            // MLX-whisper, and any other ASR binary without forcing the
-            // operator to wrap it in an HTTP server first. No API key —
-            // skip only when the template is missing (operator error).
-            "custom" => {
-                let template = model_cfg
-                    .command
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())?;
-                if !template.contains("{audio_file}") && !template.contains("{input_path}") {
-                    warn!(
-                        "STT provider 'custom' is missing `{{audio_file}}` or `{{input_path}}` in its command \
-                         template; skipping"
-                    );
-                    return None;
-                }
-                let ext = match model_cfg
-                    .model
-                    .as_deref()
-                    .map(str::to_ascii_lowercase)
-                    .as_deref()
-                {
-                    Some("mp3") => "mp3".to_string(),
-                    Some("flac") => "flac".to_string(),
-                    Some("ogg") => "ogg".to_string(),
-                    _ => "wav".to_string(),
-                };
-                Some(Box::new(CustomSttProvider {
-                    name: "custom".to_string(),
-                    command_template: template.to_string(),
-                    model: model_cfg.model.clone().unwrap_or_default(),
-                    audio_extension: ext,
-                }))
-            }
-            other => {
-                warn!("Unknown audio transcription provider: {other}");
-                None
-            }
-        }
+        let api_key = self.info.api_key(config, row.api_key_env.as_deref())?;
+        (self.build)(BuildContext {
+            client,
+            row,
+            info: &self.info,
+            api_key,
+            base_url: self.info.base_url_or(row.base_url.as_deref()),
+        })
     }
+}
 
-    /// Transcribe audio bytes using the multi-provider fallback chain.
-    /// Returns the transcript text and a log of all attempts.
-    pub async fn transcribe(
-        &self,
-        bytes: &[u8],
-        mime_type: &str,
-        filename: &str,
-        language: Option<&str>,
-    ) -> Result<(String, Vec<TranscriptionAttempt>)> {
-        let size = bytes.len() as u64;
+/// whisper.cpp in-process, behind the `local-stt` cargo feature. The model
+/// path is the row's `model`; `api_key_env` is still read as a path for
+/// rows written before `model` carried it.
+#[cfg(feature = "local-stt")]
+fn build_local(cx: BuildContext<'_>) -> Option<Box<dyn TranscriptionProvider>> {
+    let path_str = cx
+        .row
+        .model
+        .clone()
+        .or_else(|| cx.row.api_key_env.clone())
+        .unwrap_or_else(|| "~/.borg/models/whisper-base.en.bin".to_string());
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2);
+    Some(Box::new(LocalWhisperProvider {
+        model_path: std::path::PathBuf::from(shellexpand_home(&path_str)),
+        threads: (cpus / 2).max(1) as i32,
+    }))
+}
 
-        if size < self.min_file_size {
-            bail!(
-                "Audio file too small: {size} bytes (minimum: {})",
-                self.min_file_size
-            );
-        }
-        if size > self.max_file_size {
-            bail!(
-                "Audio file too large: {size} bytes (maximum: {})",
-                self.max_file_size
-            );
-        }
+#[cfg(not(feature = "local-stt"))]
+fn build_local(_: BuildContext<'_>) -> Option<Box<dyn TranscriptionProvider>> {
+    debug!("STT provider 'local' needs a build with --features local-stt; skipping");
+    None
+}
 
-        let mut attempts = Vec::new();
-
-        for entry in &self.entries {
-            // Per-model overrides: language, timeout, model
-            let lang = language
-                .map(String::from)
-                .or_else(|| entry.language.clone())
-                .or_else(|| self.default_language.clone());
-            let timeout = entry.timeout.unwrap_or(self.default_timeout);
-
-            let req = TranscriptionRequest {
-                audio_bytes: bytes,
-                mime_type: mime_type.to_string(),
-                filename: filename.to_string(),
-                model: entry.model.clone(),
-                language: lang,
-                timeout,
-            };
-
-            match entry.provider.transcribe(&req).await {
-                Ok(text) => {
-                    attempts.push(TranscriptionAttempt {
-                        provider: entry.provider.name().to_string(),
-                        model: entry.model.clone(),
-                        outcome: AttemptOutcome::Success,
-                    });
-                    return Ok((text, attempts));
-                }
-                Err(e) => {
-                    let reason = format!("{e}");
-                    warn!(
-                        "Audio transcription failed with {}: {reason}",
-                        entry.provider.name()
-                    );
-                    attempts.push(TranscriptionAttempt {
-                        provider: entry.provider.name().to_string(),
-                        model: entry.model.clone(),
-                        outcome: AttemptOutcome::Failed(reason),
-                    });
-                }
-            }
-        }
-
-        bail!(
-            "All transcription providers failed ({} attempted)",
-            attempts.len()
-        )
+/// Local CLI shell template: Parakeet, faster-whisper, MLX-whisper, or any
+/// other ASR binary, without wrapping it in an HTTP server first.
+fn build_custom(cx: BuildContext<'_>) -> Option<Box<dyn TranscriptionProvider>> {
+    let template = cx.row.command.as_deref().filter(|s| !s.trim().is_empty())?;
+    if !template.contains("{audio_file}") && !template.contains("{input_path}") {
+        warn!(
+            "STT provider 'custom' is missing `{{audio_file}}` or `{{input_path}}` in its command \
+             template; skipping"
+        );
+        return None;
     }
+    let ext = match cx
+        .row
+        .model
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp3") => "mp3",
+        Some("flac") => "flac",
+        Some("ogg") => "ogg",
+        _ => "wav",
+    };
+    Some(Box::new(CustomSttProvider {
+        name: "custom".to_string(),
+        command_template: template.to_string(),
+        model: cx.row.model.clone().unwrap_or_default(),
+        audio_extension: ext.to_string(),
+    }))
+}
+
+/// Every built-in transcription provider, in picker order.
+pub(super) static PROVIDERS: &[SttProviderDef] = &[
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["OPENAI_API_KEY"],
+            key_url: "https://platform.openai.com/api-keys",
+            base_url: "https://api.openai.com",
+            default_model: "whisper-1",
+            ..ProviderInfo::new("openai", "OpenAI")
+        },
+        build: build_whisper,
+    },
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["ELEVENLABS_API_KEY"],
+            key_url: "https://elevenlabs.io/app/settings/api-keys",
+            base_url: "https://api.elevenlabs.io",
+            default_model: "scribe_v1",
+            ..ProviderInfo::new("elevenlabs", "ElevenLabs Scribe")
+        },
+        build: |cx| {
+            Some(Box::new(ElevenLabsSttProvider {
+                client: cx.client.clone(),
+                default_model: cx.info.default_model.to_string(),
+                api_key: cx.api_key,
+                base_url: cx.base_url,
+            }))
+        },
+    },
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["GROQ_API_KEY"],
+            key_url: "https://console.groq.com/keys",
+            base_url: "https://api.groq.com/openai",
+            default_model: "whisper-large-v3-turbo",
+            ..ProviderInfo::new("groq", "Groq")
+        },
+        build: build_whisper,
+    },
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["DEEPGRAM_API_KEY"],
+            key_url: "https://console.deepgram.com",
+            base_url: "https://api.deepgram.com",
+            default_model: "nova-3",
+            ..ProviderInfo::new("deepgram", "Deepgram")
+        },
+        build: |cx| {
+            Some(Box::new(DeepgramProvider {
+                client: cx.client.clone(),
+                default_model: cx.info.default_model.to_string(),
+                api_key: cx.api_key,
+                base_url: cx.base_url,
+            }))
+        },
+    },
+    // Mistral's transcription endpoint is OpenAI-compatible.
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["MISTRAL_API_KEY"],
+            key_url: "https://console.mistral.ai/api-keys",
+            base_url: "https://api.mistral.ai",
+            default_model: "voxtral-mini-latest",
+            ..ProviderInfo::new("mistral", "Mistral Voxtral")
+        },
+        build: build_whisper,
+    },
+    // `/v1/stt` multipart, not OpenAI-compatible.
+    SttProviderDef {
+        info: ProviderInfo {
+            key_env: &["XAI_API_KEY"],
+            key_url: "https://console.x.ai",
+            base_url: "https://api.x.ai/v1",
+            ..ProviderInfo::new("xai", "xAI Grok")
+        },
+        build: |cx| {
+            Some(Box::new(XaiSttProvider {
+                client: cx.client.clone(),
+                // `None` keeps the historical default: format on, diarize off.
+                format: cx.row.xai_stt_format.unwrap_or(true),
+                diarize: cx.row.xai_stt_diarize.unwrap_or(false),
+                api_key: cx.api_key,
+                base_url: cx.base_url,
+            }))
+        },
+    },
+    SttProviderDef {
+        info: ProviderInfo::new("local", "Whisper (on this device)"),
+        build: build_local,
+    },
+    SttProviderDef {
+        info: ProviderInfo {
+            requires_command: true,
+            ..ProviderInfo::new("custom", "Custom command")
+        },
+        build: build_custom,
+    },
+];
+
+/// Look up a built-in transcription provider by id.
+pub(super) fn find(id: &str) -> Option<&'static SttProviderDef> {
+    crate::media::provider_info::find(PROVIDERS, id, |d| &d.info)
+}
+
+/// Every built-in transcription provider, for pickers.
+pub fn providers() -> impl Iterator<Item = &'static ProviderInfo> {
+    PROVIDERS.iter().map(|d| &d.info)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn from_config_returns_none_when_disabled() {
-        let config = Config::default();
-        assert!(!config.audio.enabled);
-        assert!(AudioTranscriber::from_config(&config).is_none());
-    }
-
-    #[test]
-    fn from_config_returns_none_when_no_providers() {
-        let mut config = Config::default();
-        config.audio.enabled = true;
-        // No models configured, no API keys → None
-        assert!(AudioTranscriber::from_config(&config).is_none());
-    }
-
+    use crate::media::understanding::{AttemptOutcome, AudioTranscriber};
+    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     #[test]
     fn parse_deepgram_response_valid() {
         let json = serde_json::json!({
@@ -793,140 +733,14 @@ mod tests {
     }
 
     #[test]
+    fn registry_is_well_formed() {
+        crate::media::provider_info::assert_registry_well_formed(providers());
+    }
+
+    #[test]
     fn parse_deepgram_response_missing_transcript() {
         let json = serde_json::json!({"results": {"channels": []}});
         assert!(parse_deepgram_response(&json).is_err());
-    }
-
-    /// Spec: every documented STT provider arm in
-    /// `AudioTranscriber::build_provider` must successfully construct when
-    /// its credentials are present. Mirrors `tts.rs::from_config_builds_every_provider_arm`.
-    /// `local` is gated behind the `local-stt` cargo feature and exercised
-    /// in a separate test below.
-    #[tokio::test]
-    async fn from_config_builds_every_cloud_provider_arm() {
-        use crate::config::AudioModelConfig;
-        let arms: &[(&str, &str)] = &[
-            ("openai", "BORG_STT_ARM_OPENAI"),
-            ("groq", "BORG_STT_ARM_GROQ"),
-            ("deepgram", "BORG_STT_ARM_DEEPGRAM"),
-            ("mistral", "BORG_STT_ARM_MISTRAL"),
-            ("xai", "BORG_STT_ARM_XAI"),
-        ];
-        for (_, var) in arms {
-            unsafe { std::env::set_var(var, "test-key") };
-        }
-
-        let mut config = crate::config::Config::default();
-        config.audio.enabled = true;
-        config.audio.models = arms
-            .iter()
-            .map(|(provider, var)| AudioModelConfig {
-                provider: (*provider).to_string(),
-                model: None,
-                api_key_env: Some((*var).to_string()),
-                language: None,
-                timeout_ms: None,
-                base_url: None,
-                xai_stt_format: None,
-                xai_stt_diarize: None,
-                command: None,
-            })
-            .collect();
-
-        let transcriber = AudioTranscriber::from_config(&config)
-            .expect("transcriber must build with every cloud arm");
-        assert_eq!(
-            transcriber.entries.len(),
-            arms.len(),
-            "every arm row must produce an entry"
-        );
-        let names: Vec<&str> = transcriber
-            .entries
-            .iter()
-            .map(|e| e.provider.name())
-            .collect();
-        for (expected, _) in arms {
-            assert!(
-                names.contains(expected),
-                "expected provider {expected} in entries, got {names:?}"
-            );
-        }
-
-        for (_, var) in arms {
-            unsafe { std::env::remove_var(var) };
-        }
-    }
-
-    /// Spec: the xAI STT row's `xai_stt_format` and `xai_stt_diarize`
-    /// options must round-trip through serde so an operator's choice
-    /// survives DB persistence. Default-on (None) maps to format=true,
-    /// diarize=false — the historical hardcoded values.
-    #[test]
-    fn audio_model_config_xai_options_serde_round_trip() {
-        use crate::config::AudioModelConfig;
-        // Explicit Some(true)/Some(false) must round-trip.
-        let cfg = AudioModelConfig {
-            provider: "xai".to_string(),
-            model: None,
-            api_key_env: None,
-            language: None,
-            timeout_ms: None,
-            base_url: None,
-            xai_stt_format: Some(false),
-            xai_stt_diarize: Some(true),
-            command: None,
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.xai_stt_format, Some(false));
-        assert_eq!(parsed.xai_stt_diarize, Some(true));
-
-        // Default (None) round-trips as None — historical hardcoded
-        // values apply only via `unwrap_or` at the provider build site,
-        // never at the config layer.
-        let none_cfg = AudioModelConfig {
-            provider: "xai".to_string(),
-            model: None,
-            api_key_env: None,
-            language: None,
-            timeout_ms: None,
-            base_url: None,
-            xai_stt_format: None,
-            xai_stt_diarize: None,
-            command: None,
-        };
-        let json = serde_json::to_string(&none_cfg).unwrap();
-        let parsed: AudioModelConfig = serde_json::from_str(&json).unwrap();
-        assert!(parsed.xai_stt_format.is_none());
-        assert!(parsed.xai_stt_diarize.is_none());
-    }
-
-    /// Spec: a config row for a provider whose API key isn't set must be
-    /// skipped silently rather than poisoning the whole chain. Drops the
-    /// matching env var to simulate a misconfigured operator setup.
-    #[tokio::test]
-    async fn from_config_skips_provider_without_api_key() {
-        use crate::config::AudioModelConfig;
-        // Pick a var name unused elsewhere so a stale value can't fake
-        // success.
-        let var = "BORG_STT_ARM_NEVER_SET";
-        unsafe { std::env::remove_var(var) };
-        let mut config = crate::config::Config::default();
-        config.audio.enabled = true;
-        config.audio.models = vec![AudioModelConfig {
-            provider: "openai".to_string(),
-            model: None,
-            api_key_env: Some(var.to_string()),
-            language: None,
-            timeout_ms: None,
-            base_url: None,
-            xai_stt_format: None,
-            xai_stt_diarize: None,
-            command: None,
-        }];
-        // No usable providers → from_config returns None.
-        assert!(AudioTranscriber::from_config(&config).is_none());
     }
 
     /// Spec: `custom` STT provider executes the operator's shell template
@@ -1040,97 +854,14 @@ mod tests {
         );
     }
 
-    /// Spec: a config row with `provider = "custom"` but missing `command`
-    /// must be skipped (operator misconfiguration) rather than panicking
-    /// or substituting a default that runs arbitrary user state.
-    #[test]
-    fn custom_stt_without_command_template_is_skipped() {
-        use crate::config::AudioModelConfig;
-        let mut config = crate::config::Config::default();
-        config.audio.enabled = true;
-        config.audio.models = vec![AudioModelConfig {
-            provider: "custom".to_string(),
-            model: None,
-            api_key_env: None,
-            language: None,
-            timeout_ms: None,
-            base_url: None,
-            xai_stt_format: None,
-            xai_stt_diarize: None,
-            command: None,
-        }];
-        // No other providers in the chain → from_config returns None.
-        assert!(AudioTranscriber::from_config(&config).is_none());
-    }
-
-    /// Spec: a `command` template missing the `{audio_file}` placeholder
-    /// is operator error — the CLI would have nothing to transcribe.
-    /// Surface as "skip" so the fallback chain can recover, not as a
-    /// hard panic at build time.
-    #[test]
-    fn custom_stt_command_without_audio_file_token_is_skipped() {
-        use crate::config::AudioModelConfig;
-        let mut config = crate::config::Config::default();
-        config.audio.enabled = true;
-        config.audio.models = vec![AudioModelConfig {
-            provider: "custom".to_string(),
-            model: None,
-            api_key_env: None,
-            language: None,
-            timeout_ms: None,
-            base_url: None,
-            xai_stt_format: None,
-            xai_stt_diarize: None,
-            command: Some("echo hello".to_string()),
-        }];
-        assert!(AudioTranscriber::from_config(&config).is_none());
-    }
-
-    #[tokio::test]
-    async fn transcribe_rejects_undersized_files() {
-        let transcriber = AudioTranscriber {
-            entries: Vec::new(),
-            max_file_size: 20 * 1024 * 1024,
-            min_file_size: 1024,
-            default_language: None,
-            default_timeout: Duration::from_secs(60),
-        };
-        let bytes = vec![0u8; 100]; // < 1024
-        let result = transcriber
-            .transcribe(&bytes, "audio/ogg", "test.ogg", None)
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too small"));
-    }
-
-    #[tokio::test]
-    async fn transcribe_rejects_oversized_files() {
-        let transcriber = AudioTranscriber {
-            entries: Vec::new(),
-            max_file_size: 1000,
-            min_file_size: 10,
-            default_language: None,
-            default_timeout: Duration::from_secs(60),
-        };
-        let bytes = vec![0u8; 2000]; // > 1000
-        let result = transcriber
-            .transcribe(&bytes, "audio/ogg", "test.ogg", None)
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("too large"));
-    }
-
     // ── Wiremock-backed provider HTTP tests ──
     //
     // These exercise the actual `reqwest` request shape (method, path,
     // auth header, multipart form fields) against a `MockServer`. Until
     // they existed, every cloud STT provider could regress its wire
-    // protocol without a single test failing. We bypass `from_config`
-    // and instantiate providers directly so we can pin `base_url` at
+    // protocol without a single test failing. Providers are built
+    // directly so we can pin `base_url` at
     // the mock URL — production callers still go through `from_config`.
-
-    use wiremock::matchers::{header, method, path as wm_path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_request<'a>(audio: &'a [u8]) -> TranscriptionRequest<'a> {
         TranscriptionRequest {
@@ -1141,6 +872,36 @@ mod tests {
             language: None,
             timeout: Duration::from_secs(5),
         }
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_stt_provider_sends_scribe_form_and_reads_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/speech-to-text"))
+            .and(header("xi-api-key", "xi-mock"))
+            .and(wiremock::matchers::body_string_contains("scribe_v1"))
+            .and(wiremock::matchers::body_string_contains("language_code"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "hello from scribe"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = ElevenLabsSttProvider {
+            client: Client::new(),
+            api_key: "xi-mock".into(),
+            base_url: server.uri(),
+            default_model: "scribe_v1".into(),
+        };
+        let mut req = make_request(b"RIFF....WAVEfmt ");
+        req.language = Some("en".into());
+        assert_eq!(
+            provider.transcribe(&req).await.unwrap(),
+            "hello from scribe"
+        );
     }
 
     #[tokio::test]
@@ -1335,79 +1096,5 @@ mod tests {
             .expect_err("401 must surface");
         let msg = format!("{err}");
         assert!(msg.contains("401"), "missing status: {msg}");
-    }
-
-    /// Spec: the fallback chain in `AudioTranscriber::transcribe` must move
-    /// on to the next provider when the first one fails, and the
-    /// `TranscriptionAttempt` log must record both attempts in order so
-    /// downstream observability can show what was tried.
-    #[tokio::test]
-    async fn fallback_chain_advances_past_failing_provider() {
-        // Server returns 503 on the first endpoint, 200 on the second.
-        let server_a = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(wm_path("/v1/audio/transcriptions"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("primary down"))
-            .expect(1)
-            .mount(&server_a)
-            .await;
-
-        let server_b = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(wm_path("/v1/audio/transcriptions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"text": "secondary served it"})),
-            )
-            .expect(1)
-            .mount(&server_b)
-            .await;
-
-        let transcriber = AudioTranscriber {
-            entries: vec![
-                ProviderEntry {
-                    provider: Box::new(WhisperProvider {
-                        client: Client::new(),
-                        api_key: "k1".to_string(),
-                        base_url: server_a.uri(),
-                        default_model: "whisper-1".to_string(),
-                        provider_name: "primary".to_string(),
-                    }),
-                    model: None,
-                    language: None,
-                    timeout: Some(Duration::from_secs(5)),
-                },
-                ProviderEntry {
-                    provider: Box::new(WhisperProvider {
-                        client: Client::new(),
-                        api_key: "k2".to_string(),
-                        base_url: server_b.uri(),
-                        default_model: "whisper-1".to_string(),
-                        provider_name: "secondary".to_string(),
-                    }),
-                    model: None,
-                    language: None,
-                    timeout: Some(Duration::from_secs(5)),
-                },
-            ],
-            max_file_size: 20 * 1024 * 1024,
-            min_file_size: 1,
-            default_language: None,
-            default_timeout: Duration::from_secs(5),
-        };
-
-        let (text, attempts) = transcriber
-            .transcribe(b"audio-bytes", "audio/wav", "x.wav", None)
-            .await
-            .expect("fallback must succeed once secondary returns 200");
-        assert_eq!(text, "secondary served it");
-        assert_eq!(attempts.len(), 2, "both attempts must be recorded");
-        assert_eq!(attempts[0].provider, "primary");
-        assert!(
-            matches!(attempts[0].outcome, AttemptOutcome::Failed(_)),
-            "primary attempt must be marked failed"
-        );
-        assert_eq!(attempts[1].provider, "secondary");
-        assert!(matches!(attempts[1].outcome, AttemptOutcome::Success));
     }
 }
