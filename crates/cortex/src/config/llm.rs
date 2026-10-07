@@ -463,6 +463,26 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// Re-point this route at `provider`'s own credentials: the previous
+    /// provider's `base_url`, `api_key` and `api_keys` are dropped and
+    /// `api_key_env` becomes the provider's default variable. The caller sets
+    /// `provider` itself. Every lane that switches provider (config overrides,
+    /// the aux client) goes through here so none can carry a stale key to a
+    /// host it was never meant for.
+    pub fn route_to_provider(&mut self, provider: crate::llm::provider::Provider) {
+        self.reset_route_credentials(provider.default_env_var());
+    }
+
+    /// The reset body behind [`Self::route_to_provider`]; `api_key_env` is
+    /// set to `api_key_env`. The default name is the "unset" marker
+    /// `resolve_provider` honors, for a route whose provider is unknown.
+    pub(crate) fn reset_route_credentials(&mut self, api_key_env: &str) {
+        self.base_url = None;
+        self.api_key = None;
+        self.api_keys.clear();
+        self.api_key_env = api_key_env.to_string();
+    }
+
     /// True when no *primary* provider is named at all.
     ///
     /// Only "nothing named" counts. Credentials resolve from the keychain, the

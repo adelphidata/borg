@@ -2,10 +2,24 @@
 //!
 //! Each function resolves credentials, creates a client, runs a probe/auth check,
 //! and returns the client (if successful) plus any metadata fields.
+//!
+//! The probe is the only network call at startup, and the registry is built
+//! once from its result — so a transient failure (DNS not up yet, a 5xx, a
+//! rate limit) used to disable the channel until the daemon restarted.
+//! [`probe_with_retry`] retries such failures with bounded exponential
+//! backoff and gives up at once on a rejected token.
+//!
+//! The probes run before the gateway binds its TCP port, so the schedule is
+//! also a startup budget: a stopped local daemon (connection refused on
+//! every attempt) may hold every webhook back for the summed waits, and the
+//! default keeps that under [`STARTUP_PROBE_BUDGET`].
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cortex::config::Config;
+use cortex::util::retry::{backoff_with_config, BackoffConfig};
 use tracing::{info, warn};
 
 use crate::discord::api::DiscordClient;
@@ -49,6 +63,95 @@ async fn log_gateway_activity(message: &str) {
     crate::activity::log_gateway_activity("info", message).await;
 }
 
+/// The most the default probe schedule may delay the gateway bind when a
+/// probe fails on every attempt (jitter excluded).
+#[allow(dead_code)] // asserted in tests; documents the contract
+pub(crate) const STARTUP_PROBE_BUDGET: Duration = Duration::from_secs(6);
+
+/// Retry schedule for a channel's startup probe.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeRetry {
+    /// Total attempts including the first; the default schedule (2s, 4s)
+    /// waits six seconds in all, so a channel that is down delays the bind
+    /// by at most that.
+    pub(crate) max_attempts: u32,
+    pub(crate) backoff: BackoffConfig,
+}
+
+impl Default for ProbeRetry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            backoff: BackoffConfig {
+                initial: Duration::from_secs(2),
+                factor: 2.0,
+                max_delay: Duration::from_secs(4),
+                jitter_fraction: 0.1,
+            },
+        }
+    }
+}
+
+/// Error tokens that mean the credential itself was rejected: retrying
+/// cannot help, and hammering the API with a bad token can get it revoked.
+/// Matched on whole tokens so a port or trace id containing `401` does not
+/// misfire.
+const PERMANENT_PROBE_TOKENS: &[&str] = &[
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "invalid_auth",
+    "not_authed",
+    "token_revoked",
+    "account_inactive",
+    "invalid_token",
+];
+
+/// Whether a probe error is a rejected credential rather than a transient
+/// network, timeout, 5xx or rate-limit failure.
+pub(crate) fn probe_error_is_permanent(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| PERMANENT_PROBE_TOKENS.contains(&token))
+}
+
+/// Run a channel's startup probe, retrying transient failures on the
+/// [`ProbeRetry`] schedule and stopping at once on a permanent one.
+/// `None` means the channel stays unregistered.
+pub(crate) async fn probe_with_retry<T, F, Fut>(
+    label: &str,
+    retry: &ProbeRetry,
+    mut probe: F,
+) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let attempts = retry.max_attempts.max(1);
+    for attempt in 0..attempts {
+        let err = match probe().await {
+            Ok(value) => return Some(value),
+            Err(err) => err,
+        };
+        if probe_error_is_permanent(&err) {
+            warn!("{label} failed: {err:#} — credential rejected, not retrying");
+            return None;
+        }
+        if attempt + 1 >= attempts {
+            warn!("{label} failed after {attempts} attempts, giving up: {err:#}");
+            return None;
+        }
+        let delay = backoff_with_config(attempt, &retry.backoff);
+        warn!(
+            "{label} failed (attempt {}/{attempts}), retrying in {delay:?}: {err:#}",
+            attempt + 1
+        );
+        tokio::time::sleep(delay).await;
+    }
+    None
+}
+
 /// Initialize Telegram client. Returns (client, bot_username).
 pub(crate) async fn init_telegram(
     config: &Config,
@@ -65,8 +168,11 @@ pub(crate) async fn init_telegram(
                     return (None, None, telegram_secret);
                 }
             };
-            match client.get_me().await {
-                Ok(me) => {
+            let probed =
+                probe_with_retry("Telegram getMe", &ProbeRetry::default(), || client.get_me())
+                    .await;
+            match probed {
+                Some(me) => {
                     info!(
                         "Telegram native integration active (bot: @{})",
                         me.username.as_deref().unwrap_or(&me.first_name)
@@ -97,8 +203,8 @@ pub(crate) async fn init_telegram(
 
                     (Some(Arc::new(client)), bot_username)
                 }
-                Err(e) => {
-                    warn!("TELEGRAM_BOT_TOKEN set but getMe failed: {e}");
+                None => {
+                    warn!("TELEGRAM_BOT_TOKEN set but getMe failed; Telegram not registered");
                     (None, None)
                 }
             }
@@ -123,9 +229,25 @@ pub(crate) async fn init_slack(
         resolve_credential(config, "messaging/slack", "SLACK_SIGNING_SECRET");
 
     let (client, bot_user_id) = match slack_token {
-        Some(token) => match SlackClient::new(&token) {
-            Ok(mut client) => match client.auth_test().await {
-                Ok(resp) => {
+        Some(token) => {
+            // Surface a local construction failure once, before the probe.
+            if let Err(e) = SlackClient::new(&token) {
+                warn!("Failed to create Slack HTTP client: {e}");
+                return (None, slack_signing_secret, None);
+            }
+            // `auth_test` needs `&mut self` to record the bot user id, so
+            // each attempt builds its own client and the passing one wins.
+            let probed = probe_with_retry("Slack auth.test", &ProbeRetry::default(), || {
+                let token = token.clone();
+                async move {
+                    let mut client = SlackClient::new(&token)?;
+                    let resp = client.auth_test().await?;
+                    Ok((client, resp))
+                }
+            })
+            .await;
+            match probed {
+                Some((client, resp)) => {
                     info!(
                         "Slack native integration active (bot: {}, team: {})",
                         resp.user.as_deref().unwrap_or("unknown"),
@@ -135,16 +257,12 @@ pub(crate) async fn init_slack(
                     let bot_uid = client.bot_user_id().map(String::from);
                     (Some(Arc::new(client)), bot_uid)
                 }
-                Err(e) => {
-                    warn!("SLACK_BOT_TOKEN set but auth.test failed: {e}");
+                None => {
+                    warn!("SLACK_BOT_TOKEN set but auth.test failed; Slack not registered");
                     (None, None)
                 }
-            },
-            Err(e) => {
-                warn!("Failed to create Slack HTTP client: {e}");
-                (None, None)
             }
-        },
+        }
         None => (None, None),
     };
 
@@ -206,8 +324,12 @@ pub(crate) async fn init_discord(config: &Config) -> (Option<Arc<DiscordClient>>
                     return (None, discord_public_key);
                 }
             };
-            match client.get_current_user().await {
-                Ok(user) => {
+            let probed = probe_with_retry("Discord /users/@me", &ProbeRetry::default(), || {
+                client.get_current_user()
+            })
+            .await;
+            match probed {
+                Some(user) => {
                     info!("Discord native integration active (bot: {})", user.username);
                     client.set_application_id(user.id.clone());
 
@@ -222,8 +344,8 @@ pub(crate) async fn init_discord(config: &Config) -> (Option<Arc<DiscordClient>>
 
                     Some(Arc::new(client))
                 }
-                Err(e) => {
-                    warn!("DISCORD_BOT_TOKEN set but /users/@me failed: {e}");
+                None => {
+                    warn!("DISCORD_BOT_TOKEN set but /users/@me failed; Discord not registered");
                     None
                 }
             }
@@ -291,19 +413,28 @@ pub(crate) async fn init_signal(config: &Config) -> Option<Arc<SignalClient>> {
                 .unwrap_or(crate::constants::SIGNAL_CLI_PORT_DEFAULT);
             let base_url = format!("http://{host}:{port}");
             match SignalClient::new(&base_url, account) {
-                Ok(client) => match client.probe().await {
-                    Ok(version) => {
-                        info!(
-                            "Signal native integration active (account: {}, daemon: v{})",
-                            account, version
-                        );
-                        Some(Arc::new(client))
+                Ok(client) => {
+                    let probed =
+                        probe_with_retry("Signal daemon probe", &ProbeRetry::default(), || {
+                            client.probe()
+                        })
+                        .await;
+                    match probed {
+                        Some(version) => {
+                            info!(
+                                "Signal native integration active (account: {}, daemon: v{})",
+                                account, version
+                            );
+                            Some(Arc::new(client))
+                        }
+                        None => {
+                            warn!(
+                                "SIGNAL_ACCOUNT set but signal-cli daemon not reachable; Signal not registered"
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        warn!("SIGNAL_ACCOUNT set but signal-cli daemon not reachable: {e}");
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     warn!("Failed to create Signal client: {e}");
                     None
@@ -542,6 +673,155 @@ mod tests {
                 .iter()
                 .any(|e| e.message == "channel wiring probe 4711"),
             "expected the wrapper to write an info/gateway activity row"
+        );
+    }
+
+    fn fast_retry(max_attempts: u32) -> ProbeRetry {
+        ProbeRetry {
+            max_attempts,
+            backoff: BackoffConfig {
+                initial: Duration::from_millis(1),
+                factor: 2.0,
+                max_delay: Duration::from_millis(4),
+                jitter_fraction: 0.0,
+            },
+        }
+    }
+
+    /// Spec: a probe that fails with a transient error (network, 5xx,
+    /// 429) and then succeeds still yields the channel, with one attempt
+    /// per failure plus the success.
+    #[tokio::test]
+    async fn probe_with_retry_recovers_from_transient_failures() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = probe_with_retry("probe", &fast_retry(8), || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                match n {
+                    1 => Err(anyhow::anyhow!("Failed to call getMe: connection refused")),
+                    2 => Err(anyhow::anyhow!(
+                        "GET /users/@me failed (503 Service Unavailable): down"
+                    )),
+                    _ => Ok(format!("bot-{n}")),
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.as_deref(), Some("bot-3"));
+        assert_eq!(calls.get(), 3, "two failures then one success");
+    }
+
+    /// Spec: a rejected credential is permanent — one attempt, no retry,
+    /// no channel. Covers each channel's real error shape.
+    #[tokio::test]
+    async fn probe_with_retry_gives_up_at_once_on_rejected_credential() {
+        let permanent = [
+            "GET /users/@me failed (401 Unauthorized): {\"message\": \"401: Unauthorized\"}",
+            "getMe failed: Unauthorized",
+            "auth.test failed: invalid_auth — check the bot token",
+            "auth.test failed: token_revoked",
+            "GET /users/@me failed (403 Forbidden): missing access",
+        ];
+        for msg in permanent {
+            let calls = std::cell::Cell::new(0u32);
+            let out: Option<()> = probe_with_retry("probe", &fast_retry(8), || {
+                calls.set(calls.get() + 1);
+                let msg = msg.to_string();
+                async move { Err(anyhow::anyhow!("{msg}")) }
+            })
+            .await;
+            assert!(out.is_none(), "{msg}: must not yield a channel");
+            assert_eq!(calls.get(), 1, "{msg}: must not be retried");
+        }
+    }
+
+    /// Spec: transient failures are bounded — after `max_attempts` the
+    /// probe gives up so the daemon still finishes startup.
+    #[tokio::test]
+    async fn probe_with_retry_is_bounded_by_max_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Option<()> = probe_with_retry("probe", &fast_retry(3), || {
+            calls.set(calls.get() + 1);
+            async { Err(anyhow::anyhow!("Signal daemon probe failed: timed out")) }
+        })
+        .await;
+        assert!(out.is_none());
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// Token matching must not misfire on a port or id that merely
+    /// contains the digits of an auth status.
+    #[test]
+    fn probe_error_classification_matches_whole_tokens() {
+        assert!(!probe_error_is_permanent(&anyhow::anyhow!(
+            "Failed to call getMe: connect to 127.0.0.1:4010 refused"
+        )));
+        assert!(!probe_error_is_permanent(&anyhow::anyhow!(
+            "auth.test failed: ratelimited (429)"
+        )));
+        assert!(probe_error_is_permanent(&anyhow::anyhow!(
+            "auth.test failed: account_inactive"
+        )));
+        // The classifier reads the whole context chain, not only the
+        // outermost message.
+        let chained = anyhow::anyhow!("401 Unauthorized").context("Signal daemon probe failed");
+        assert!(probe_error_is_permanent(&chained));
+    }
+
+    /// Spec: the probes run before the TCP bind, so the default schedule is
+    /// a startup budget. A channel whose daemon is stopped (connection
+    /// refused on every attempt) may delay every webhook by the summed
+    /// waits, which must stay within [`STARTUP_PROBE_BUDGET`] — while still
+    /// retrying at least once, with a real pause, so a DNS blip at boot
+    /// does not lose the channel.
+    #[test]
+    fn default_probe_schedule_fits_startup_budget() {
+        let retry = ProbeRetry::default();
+        assert!(
+            (2..=3).contains(&retry.max_attempts),
+            "default must retry, but not more than twice: {}",
+            retry.max_attempts
+        );
+        let mut no_jitter = retry.backoff.clone();
+        no_jitter.jitter_fraction = 0.0;
+        let total: Duration = (0..retry.max_attempts.saturating_sub(1))
+            .map(|a| backoff_with_config(a, &no_jitter))
+            .sum();
+        assert!(
+            total <= STARTUP_PROBE_BUDGET,
+            "summed backoff {total:?} exceeds the startup budget {STARTUP_PROBE_BUDGET:?}"
+        );
+        assert!(
+            backoff_with_config(0, &no_jitter) >= Duration::from_secs(1),
+            "first retry must wait, not spin"
+        );
+    }
+
+    /// Spec: a probe that is refused on every attempt (a stopped local
+    /// daemon) finishes within the startup budget in wall-clock time, not
+    /// only on paper — the schedule's delays are what the bind waits on.
+    #[tokio::test(start_paused = true)]
+    async fn refused_probe_gives_up_within_startup_budget() {
+        let calls = std::cell::Cell::new(0u32);
+        let started = tokio::time::Instant::now();
+        let out: Option<()> = probe_with_retry("probe", &ProbeRetry::default(), || {
+            calls.set(calls.get() + 1);
+            async {
+                Err(anyhow::anyhow!(
+                    "Signal daemon probe failed: connection refused"
+                ))
+            }
+        })
+        .await;
+        let elapsed = started.elapsed();
+        assert!(out.is_none());
+        assert_eq!(calls.get(), ProbeRetry::default().max_attempts);
+        // Jitter may stretch each wait by at most 10%.
+        let ceiling = STARTUP_PROBE_BUDGET + STARTUP_PROBE_BUDGET / 10;
+        assert!(
+            elapsed <= ceiling,
+            "refused probe held startup for {elapsed:?}, budget {ceiling:?}"
         );
     }
 

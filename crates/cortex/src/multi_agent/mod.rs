@@ -616,7 +616,7 @@ impl AgentControl {
             child_config.llm.model = m.clone();
         }
         if let Some(ref p) = parent_config.agents.delegation_provider {
-            child_config.llm.provider = Some(p.clone());
+            child_config.route_llm_to_provider(p);
         }
 
         // Layer 2: role overrides win over delegation defaults.
@@ -625,7 +625,7 @@ impl AgentControl {
                 child_config.llm.model = model.clone();
             }
             if let Some(ref provider) = role.provider {
-                child_config.llm.provider = Some(provider.to_string());
+                child_config.route_llm_to_provider(provider);
             }
             if let Some(temp) = role.temperature {
                 child_config.llm.temperature = temp;
@@ -2462,6 +2462,67 @@ mod sub_agent_surface_tests {
         parent_no_delegation.agents.delegation_model = None;
         let c4 = ctrl.build_sub_agent_config(None, None, None, &parent_no_delegation);
         assert_eq!(c4.llm.model, "parent-model");
+    }
+
+    /// A delegation or role provider that differs from the parent's must take
+    /// the route as a unit: the parent's `base_url` and keys must not ride
+    /// along, or the child's calls go to the wrong host with the wrong key —
+    /// or get silently routed back to the parent's provider by key shape.
+    /// A same-provider role keeps them: that is the common cheaper-model case.
+    #[test]
+    fn build_sub_agent_config_provider_switch_drops_parent_route_same_provider_keeps_it() {
+        use crate::security::secrets_resolve::SecretRef;
+        let mut parent = Config::default();
+        parent.llm.provider = Some("anthropic".into());
+        parent.llm.base_url = Some("https://proxy.example/anthropic".into());
+        parent.llm.api_key_env = "BORG_TEST_PARENT_KEY".into();
+        parent.llm.api_key = Some(SecretRef::Env {
+            var: "BORG_TEST_PARENT_KEY".into(),
+        });
+        parent.llm.api_keys = vec![SecretRef::Env {
+            var: "BORG_TEST_PARENT_KEY".into(),
+        }];
+        let ctrl = AgentControl::new(&MultiAgentConfig::default(), "p", 0);
+
+        // Layer 3: delegation provider differs from the parent's.
+        let mut delegating = parent.clone();
+        delegating.agents.delegation_provider = Some("openrouter".into());
+        let child = ctrl.build_sub_agent_config(None, None, None, &delegating);
+        assert_eq!(child.llm.provider.as_deref(), Some("openrouter"));
+        assert_eq!(child.llm.base_url, None, "parent endpoint must not follow");
+        assert!(
+            child.llm.api_key.is_none() && child.llm.api_keys.is_empty(),
+            "parent keys must not be sent to the delegation provider"
+        );
+        assert_eq!(child.llm.api_key_env, "OPENROUTER_API_KEY");
+
+        // Layer 2: a role on a different provider.
+        let role_elsewhere = AgentRole {
+            provider: Some("openai".into()),
+            ..mk_role("r", None)
+        };
+        let child = ctrl.build_sub_agent_config(Some(&role_elsewhere), None, None, &parent);
+        assert_eq!(child.llm.provider.as_deref(), Some("openai"));
+        assert_eq!(child.llm.base_url, None);
+        assert!(child.llm.api_key.is_none() && child.llm.api_keys.is_empty());
+        assert_eq!(child.llm.api_key_env, "OPENAI_API_KEY");
+
+        // Same provider: the operator's route stays intact.
+        let role_same = AgentRole {
+            provider: Some("anthropic".into()),
+            model: Some("claude-cheap".into()),
+            ..mk_role("r", None)
+        };
+        let child = ctrl.build_sub_agent_config(Some(&role_same), None, None, &parent);
+        assert_eq!(child.llm.model, "claude-cheap");
+        assert_eq!(child.llm.base_url, parent.llm.base_url);
+        assert!(
+            matches!(child.llm.api_key, Some(SecretRef::Env { ref var }) if var == "BORG_TEST_PARENT_KEY"),
+            "same-provider role must keep the parent's key: {:?}",
+            child.llm.api_key
+        );
+        assert_eq!(child.llm.api_keys.len(), 1);
+        assert_eq!(child.llm.api_key_env, parent.llm.api_key_env);
     }
 
     /// The per-spawn thinking override must decide the child's *effective*

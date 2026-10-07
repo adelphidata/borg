@@ -205,10 +205,18 @@ pub struct AutoReapReport {
     /// Entries whose PID was recycled to a different process before the sweep
     /// could signal it — skipped to avoid killing an unrelated bystander.
     pub recycled_skipped: usize,
+    /// Entries whose PID was already gone when the sweep reached them —
+    /// recorded `Dead`, nothing was signaled.
+    pub already_gone: usize,
+    /// Entries the sweep could not signal (EPERM, an odd PID) while the
+    /// process is still alive. They stay `Running` so the next sweep retries;
+    /// they are never counted as killed.
+    pub signal_failed: Vec<ProcessEntry>,
 }
 
 impl AutoReapReport {
     /// Count of entries the sweep actually killed (SIGTERM or SIGKILL).
+    /// A failed signal is not a kill and is excluded.
     pub fn killed_count(&self) -> usize {
         self.terminated.len() + self.killed.len()
     }
@@ -238,9 +246,12 @@ pub struct TurnBaseline {
 /// Report returned by [`ProcessRegistry::reap_abandoned_turn`].
 #[derive(Clone, Debug, Default)]
 pub struct AbandonedTurnReport {
-    /// Entries killed (SIGTERM or SIGKILL; includes signal-failed entries
-    /// recorded as `Dead`, mirroring `auto_reap`).
+    /// Entries killed (SIGTERM or SIGKILL). A process the reap could not
+    /// signal is in `signal_failed`, never here.
     pub killed: Vec<ProcessEntry>,
+    /// Entries still alive that the reap could not signal (EPERM, an odd
+    /// PID). They stay `Running` so the maintenance sweep retries them.
+    pub signal_failed: Vec<ProcessEntry>,
     /// Turn-spawned entries spared by an explicit user pin.
     pub exempted_by_pin: usize,
     /// Turn-spawned entries spared by a `never_kill_patterns` match.
@@ -324,11 +335,42 @@ pub fn default_never_kill_patterns() -> Vec<String> {
     ]
 }
 
+/// Sends `signal` to `pid`. The registry's one seam onto the kernel, so a test
+/// can make a kill fail (EPERM) without owning a process it cannot signal.
+pub type SignalFn = fn(pid: u32, signal: i32) -> std::io::Result<()>;
+
+#[cfg(unix)]
+fn libc_signal(pid: u32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn libc_signal(_pid: u32, _signal: i32) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "signals are unsupported on this platform",
+    ))
+}
+
 /// Central registry. Cheap to clone — the inner state is shared via
 /// `Arc<Mutex<_>>`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProcessRegistry {
     inner: Arc<Mutex<Inner>>,
+    signal: SignalFn,
+}
+
+impl Default for ProcessRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            signal: libc_signal,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -356,6 +398,34 @@ impl ProcessRegistry {
     /// and hands clones to every spawn site.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose kills go through `signal` instead of `libc::kill`.
+    #[cfg(test)]
+    fn with_signal_fn(signal: SignalFn) -> Self {
+        Self {
+            signal,
+            ..Self::default()
+        }
+    }
+
+    /// Settle a reap whose signal could not be delivered. A PID that is no
+    /// longer running is simply gone: finalize it `Dead` and return `None`.
+    /// A PID that is still alive (EPERM, an odd PID) stays `Running` so the
+    /// next sweep retries it, and its entry is returned for the report.
+    fn settle_signal_failure(&self, entry: &ProcessEntry, reason: &str) -> Option<ProcessEntry> {
+        if pid_alive(entry.pid) {
+            tracing::warn!(
+                pid = entry.pid,
+                id = entry.id,
+                command = %command_head(&entry.command),
+                reason,
+                "process_registry: could not signal process; it is still running and will be retried"
+            );
+            return Some(entry.clone());
+        }
+        self.finalize(entry.id, ProcessStatus::Dead, None);
+        None
     }
 
     /// Register a freshly-spawned process. The returned guard must be
@@ -501,29 +571,36 @@ impl ProcessRegistry {
 
         let mut reaped_norm: Vec<String> = Vec::with_capacity(to_kill.len());
         for entry in to_kill {
-            reaped_norm.push(normalize_command(&entry.command));
             let outcome = send_term_then_kill(
                 entry.pid,
                 policy.sigterm_grace_secs,
                 entry.start_fingerprint,
+                self.signal,
             );
+            if outcome == KillOutcome::SignalFailed {
+                // Nothing was delivered, so this is not a kill: a live process
+                // stays `Running` (and out of the repeat-offender list) so the
+                // next sweep retries it; a vanished one is simply `Dead`.
+                match self.settle_signal_failure(&entry, "auto-reap") {
+                    Some(e) => report.signal_failed.push(e),
+                    None => report.already_gone += 1,
+                }
+                continue;
+            }
             let finished = finalize_killed(self, entry.id, now);
             if let Some(mut f) = finished {
                 match outcome {
                     KillOutcome::TermSufficed => {
+                        reaped_norm.push(normalize_command(&entry.command));
                         f.status = ProcessStatus::Killed;
                         report.terminated.push(f);
                     }
                     KillOutcome::NeededKill => {
+                        reaped_norm.push(normalize_command(&entry.command));
                         f.status = ProcessStatus::Killed;
                         report.killed.push(f);
                     }
-                    KillOutcome::SignalFailed => {
-                        // Couldn't even send SIGTERM (no permission, weird
-                        // PID); mark Dead so the sweep still cleans it up.
-                        f.status = ProcessStatus::Dead;
-                        report.killed.push(f);
-                    }
+                    KillOutcome::SignalFailed => unreachable!("handled above"),
                     KillOutcome::Recycled => {
                         // PID belonged to a different process — we signaled
                         // nothing. Drop our stale entry as Dead and count it so
@@ -645,9 +722,22 @@ impl ProcessRegistry {
                 report.already_gone += 1;
                 continue;
             }
-            let outcome =
-                send_term_then_kill(entry.pid, sigterm_grace_secs, entry.start_fingerprint);
-            let Some(mut finished) = finalize_killed(self, entry.id, now) else {
+            let outcome = send_term_then_kill(
+                entry.pid,
+                sigterm_grace_secs,
+                entry.start_fingerprint,
+                self.signal,
+            );
+            if outcome == KillOutcome::SignalFailed {
+                // Not a kill: a live process stays `Running` for the
+                // maintenance sweep to retry; a vanished one is `Dead`.
+                match self.settle_signal_failure(&entry, "abandoned turn") {
+                    Some(e) => report.signal_failed.push(e),
+                    None => report.already_gone += 1,
+                }
+                continue;
+            }
+            let Some(finished) = finalize_killed(self, entry.id, now) else {
                 // Entry finalized concurrently (guard drop, reap_dead) —
                 // nothing further to record.
                 continue;
@@ -662,12 +752,7 @@ impl ProcessRegistry {
                     );
                     report.killed.push(finished);
                 }
-                KillOutcome::SignalFailed => {
-                    // Couldn't signal at all — mirror auto_reap and record
-                    // Dead so the entry doesn't linger as Running.
-                    finished.status = ProcessStatus::Dead;
-                    report.killed.push(finished);
-                }
+                KillOutcome::SignalFailed => unreachable!("handled above"),
                 KillOutcome::Recycled => {
                     tracing::warn!(
                         pid = entry.pid,
@@ -935,7 +1020,12 @@ fn pid_alive(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn send_term_then_kill(pid: u32, grace_secs: u64, fingerprint: Option<u64>) -> KillOutcome {
+fn send_term_then_kill(
+    pid: u32,
+    grace_secs: u64,
+    fingerprint: Option<u64>,
+    signal: SignalFn,
+) -> KillOutcome {
     if pid == 0 {
         return KillOutcome::SignalFailed;
     }
@@ -945,9 +1035,8 @@ fn send_term_then_kill(pid: u32, grace_secs: u64, fingerprint: Option<u64>) -> K
     if !pid_identity_matches(pid, fingerprint) {
         return KillOutcome::Recycled;
     }
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let term = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    if term != 0 {
+    if let Err(e) = signal(pid, libc::SIGTERM) {
+        tracing::debug!(pid, error = %e, "process_registry: SIGTERM not delivered");
         return KillOutcome::SignalFailed;
     }
     // Poll up to `grace_secs` for the process to exit. 100ms granularity
@@ -968,16 +1057,22 @@ fn send_term_then_kill(pid: u32, grace_secs: u64, fingerprint: Option<u64>) -> K
     if !pid_identity_matches(pid, fingerprint) {
         return KillOutcome::Recycled;
     }
-    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
-    let kill = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if kill != 0 && pid_alive(pid) {
-        return KillOutcome::SignalFailed;
+    if let Err(e) = signal(pid, libc::SIGKILL) {
+        if pid_alive(pid) {
+            tracing::debug!(pid, error = %e, "process_registry: SIGKILL not delivered");
+            return KillOutcome::SignalFailed;
+        }
     }
     KillOutcome::NeededKill
 }
 
 #[cfg(not(unix))]
-fn send_term_then_kill(_pid: u32, _grace_secs: u64, _fingerprint: Option<u64>) -> KillOutcome {
+fn send_term_then_kill(
+    _pid: u32,
+    _grace_secs: u64,
+    _fingerprint: Option<u64>,
+    _signal: SignalFn,
+) -> KillOutcome {
     KillOutcome::SignalFailed
 }
 
@@ -1194,6 +1289,110 @@ mod tests {
         g_pinned.complete(Some(0));
     }
 
+    /// A pid no kernel hands out, so liveness probes report it gone.
+    const NONEXISTENT_PID: u32 = 3_999_990;
+
+    #[cfg(unix)]
+    fn eperm_signal(_pid: u32, _signal: i32) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_reap_keeps_an_unsignalable_live_process_running_and_does_not_count_it_killed() {
+        // The kernel refused the signal (EPERM) and the process is still
+        // alive. Reporting that as a kill would log "auto-reaped" for a
+        // process that is running, and dropping the entry would mean no
+        // later sweep ever retries it.
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let reg = ProcessRegistry::with_signal_fn(eperm_signal);
+        let g = reg.register(pid, ProcessKind::RunShell, "sleep 99", None);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
+        let policy = AutoReapPolicy {
+            max_age_secs: 60,
+            never_kill_patterns: vec![],
+            sigterm_grace_secs: 1,
+        };
+
+        let rep = reg.auto_reap(now_unix(), &policy);
+
+        assert_eq!(rep.killed_count(), 0, "a failed signal is not a kill");
+        assert_eq!(rep.signal_failed.len(), 1);
+        assert_eq!(rep.signal_failed[0].id, g.id());
+        let snap = reg.snapshot();
+        assert!(
+            snap.running.iter().any(|e| e.id == g.id()),
+            "the entry must stay running so a later sweep retries it"
+        );
+        assert!(
+            snap.finished.is_empty(),
+            "nothing may be recorded as finished: {:?}",
+            snap.finished
+        );
+        assert!(
+            reg.previous_auto_reaped_commands().is_empty(),
+            "an unkilled workload must not feed the repeat-offender check"
+        );
+        assert!(pid_alive(pid), "the real process is untouched");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        g.complete(Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_turn_reap_keeps_an_unsignalable_live_process_running() {
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let reg = ProcessRegistry::with_signal_fn(eperm_signal);
+        let baseline = reg.begin_turn("s1");
+        let g = reg.register(pid, ProcessKind::RunShell, "sleep 99", Some("s1".into()));
+
+        let report = reg.reap_abandoned_turn(&baseline, &[], 1);
+
+        assert!(report.killed.is_empty(), "a failed signal is not a kill");
+        assert_eq!(report.signal_failed.len(), 1);
+        assert_eq!(report.signal_failed[0].id, g.id());
+        assert!(
+            reg.snapshot().running.iter().any(|e| e.id == g.id()),
+            "the entry must stay running for the maintenance sweep to retry"
+        );
+        assert!(pid_alive(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        g.complete(Some(0));
+    }
+
+    #[test]
+    fn auto_reap_records_a_vanished_unsignalable_pid_as_gone_not_killed() {
+        // ESRCH: the process is not there. That is not a kill either — the
+        // entry is finalized `Dead` and counted as already gone.
+        let reg = ProcessRegistry::with_signal_fn(|_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+        });
+        let g = reg.register(NONEXISTENT_PID, ProcessKind::RunShell, "ghost", None);
+        force_started_at(&reg, g.id(), now_unix() - 999_999);
+        let policy = AutoReapPolicy {
+            max_age_secs: 60,
+            never_kill_patterns: vec![],
+            sigterm_grace_secs: 1,
+        };
+
+        let rep = reg.auto_reap(now_unix(), &policy);
+
+        assert_eq!(rep.killed_count(), 0);
+        assert!(rep.signal_failed.is_empty());
+        assert_eq!(rep.already_gone, 1);
+        let snap = reg.snapshot();
+        assert!(snap.running.is_empty());
+        assert_eq!(snap.finished.len(), 1);
+        assert_eq!(snap.finished[0].status, ProcessStatus::Dead);
+        drop(g);
+    }
+
     #[test]
     fn auto_reap_disabled_when_max_age_zero() {
         let reg = ProcessRegistry::new();
@@ -1249,9 +1448,19 @@ mod tests {
     fn auto_reap_exempts_pattern_match_but_not_close_cousin() {
         // `cargo build*` matches `cargo build --release` but must NOT
         // match `cargo-incompatible-tool` — the glob is anchored.
-        let reg = ProcessRegistry::new();
-        let g_match = reg.register(11, ProcessKind::RunShell, "cargo build --release", None);
-        let g_cousin = reg.register(12, ProcessKind::RunShell, "cargo-incompatible-tool", None);
+        let reg = ProcessRegistry::with_signal_fn(|_, _| Ok(()));
+        let g_match = reg.register(
+            NONEXISTENT_PID,
+            ProcessKind::RunShell,
+            "cargo build --release",
+            None,
+        );
+        let g_cousin = reg.register(
+            NONEXISTENT_PID + 1,
+            ProcessKind::RunShell,
+            "cargo-incompatible-tool",
+            None,
+        );
         force_started_at(&reg, g_match.id(), now_unix() - 999_999);
         force_started_at(&reg, g_cousin.id(), now_unix() - 999_999);
         let policy = AutoReapPolicy {
@@ -1261,9 +1470,8 @@ mod tests {
         };
         let rep = reg.auto_reap(now_unix(), &policy);
         assert_eq!(rep.exempted_by_pattern, 1);
-        // The cousin should have been a kill candidate. We don't have a
-        // real PID to TERM, so `send_term_then_kill` returns SignalFailed
-        // → cousin moves to finished as Dead.
+        // The cousin is the one kill candidate: the fake signal lands and
+        // the (nonexistent) pid reads as gone, so SIGTERM sufficed.
         assert_eq!(rep.killed_count(), 1);
         let snap = reg.snapshot();
         assert!(snap.running.iter().any(|e| e.id == g_match.id()));
@@ -1376,10 +1584,11 @@ mod tests {
     #[test]
     fn auto_reap_records_normalized_commands_for_next_sweep() {
         // The maintenance sweep diffs `previous_auto_reaped_commands`
-        // across sweeps; auto_reap is responsible for stashing them.
-        let reg = ProcessRegistry::new();
+        // across sweeps; auto_reap is responsible for stashing them. The
+        // fake signal lands, so the kill counts.
+        let reg = ProcessRegistry::with_signal_fn(|_, _| Ok(()));
         let g = reg.register(
-            0xFEED,
+            NONEXISTENT_PID,
             ProcessKind::RunShell,
             "rustc --emit=link foo.rs",
             None,

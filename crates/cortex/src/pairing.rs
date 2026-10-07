@@ -323,22 +323,7 @@ async fn send_approval_notification_inner(
             let chat_id: i64 = sender_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let client = crate::http::shared();
-            let resp = client
-                .post(&url)
-                .json(&serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": message,
-                }))
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Telegram API error {status}: {body}");
-            }
-            Ok(())
+            send_telegram_message(TELEGRAM_API_BASE, &token, chat_id, &message).await
         }
         _ => {
             tracing::debug!(
@@ -350,11 +335,62 @@ async fn send_approval_notification_inner(
     }
 }
 
+const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
+
+/// POST a Telegram `sendMessage`. The bot token is part of the request URL,
+/// so a transport error is scrubbed of its URL (`without_url`) before it
+/// propagates: the caller logs the error text, and `daemon.log` must never
+/// carry the token.
+async fn send_telegram_message(
+    api_base: &str,
+    token: &str,
+    chat_id: i64,
+    message: &str,
+) -> Result<()> {
+    let url = format!("{api_base}/bot{token}/sendMessage");
+    let client = crate::http::shared();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": message,
+        }))
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Telegram API error {status}: {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn telegram_send_failure_does_not_leak_bot_token() {
+        // Bind-then-drop a listener so the port is closed: the connect fails
+        // locally and the resulting reqwest error normally carries the URL,
+        // which embeds the token.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let token = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+        let err = send_telegram_message(&format!("http://127.0.0.1:{port}"), token, 42, "hi")
+            .await
+            .expect_err("closed port must fail");
+        let text = format!("{err:#}");
+        assert!(!text.is_empty());
+        assert!(
+            !text.contains(token) && !text.contains("AAHdqTcvCH1v"),
+            "bot token leaked into error text: {text}"
+        );
+    }
 
     #[test]
     fn test_generate_phrase_is_six_bip39_words() {

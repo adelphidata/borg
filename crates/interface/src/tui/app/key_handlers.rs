@@ -22,6 +22,18 @@ use super::{
     QueuedMessage,
 };
 
+/// The command name of a composer line that is a slash command (`/x …`),
+/// or `None` for ordinary text. A lone `/` and a `/` followed by
+/// whitespace are not commands.
+fn slash_command_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let name = rest.split_whitespace().next()?;
+    if !rest.starts_with(name) {
+        return None;
+    }
+    Some(name)
+}
+
 /// True for a bare Ctrl+Z (the conventional shell suspend chord). Other
 /// modifier combinations (Ctrl+Shift+Z, Ctrl+Alt+Z) are deliberately excluded
 /// so a future binding can claim them without colliding with suspend.
@@ -393,6 +405,16 @@ impl<'a> App<'a> {
                 });
                 self.previous_collab_mode = None;
                 self.state = AppState::Idle;
+                return Ok(AppAction::Continue);
+            }
+            // Any other slash command is a client-side instruction, not
+            // something to inject into the model's context as a steer.
+            // Keep the composer intact so the user can resend it once
+            // the turn ends.
+            if let Some(command) = slash_command_name(&text) {
+                self.cells.push(HistoryCell::System {
+                    text: format!("[busy — run /{command} when the turn finishes]"),
+                });
                 return Ok(AppAction::Continue);
             }
             if !text.is_empty() {
@@ -824,6 +846,74 @@ mod voice_key_tests {
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn slash_command_name_recognises_only_real_commands() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("/model gpt-5", Some("model")),
+            ("/settings", Some("settings")),
+            ("/", None),
+            ("/ x", None),
+            ("plain text", None),
+            ("a /b", None),
+            ("", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(slash_command_name(input), *expected, "input {input:?}");
+        }
+    }
+
+    /// Spec: a slash command typed while a turn is streaming is a client
+    /// instruction, never a steer into the model context. The TUI tells
+    /// the user to retry after the turn and leaves the composer intact.
+    #[test]
+    fn slash_command_mid_turn_is_not_steered() {
+        use crate::daemon_client::DaemonClient;
+        use cortex::config::Config;
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, Mutex};
+
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(Config::default(), None, None, None, client, None);
+        app.state = AppState::Streaming {
+            start: std::time::Instant::now(),
+        };
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<String>();
+        app.steer_tx = Some(steer_tx);
+        app.composer.set_text("/model gpt-5");
+
+        app.handle_key(ev(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(
+            steer_rx.try_recv().is_err(),
+            "slash command must not be sent as a steer"
+        );
+        assert!(app.pending_steers.is_empty());
+        assert!(app.queued_messages.is_empty(), "must not be queued either");
+        assert_eq!(
+            app.composer.text(),
+            "/model gpt-5",
+            "composer must keep the command for a later resend"
+        );
+        let notice = app
+            .cells
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                HistoryCell::System { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a notice must be shown");
+        assert_eq!(notice, "[busy — run /model when the turn finishes]");
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+
+        // Ordinary text still steers.
+        app.composer.set_text("keep going");
+        app.handle_key(ev(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(steer_rx.try_recv().as_deref(), Ok("keep going"));
     }
 
     #[test]

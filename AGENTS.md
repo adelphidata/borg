@@ -186,7 +186,7 @@ Server cert SAN is `localhost` — exposing beyond loopback needs operator's hos
 
 ### Security — Blocked Paths
 
-`[security] blocked_paths` defaults: `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.env`, `.envrc`, `credentials`, `private_key`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`. Filtered from `fs_read`/`fs_write` and checked in `list_dir`. Matching is per path-component with **dotted-family** coverage on the final component: a `.env`/`private_key`/`credentials` entry also blocks `.env.local`, `private_key.pem`, `credentials.json` (component-suffix `entry.` — not substring, so `.environment`/`.sshrc` are not over-blocked).
+`[security] blocked_paths` defaults: directories `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.config/gcloud`, `.azure`, `.kube`, `.docker` (`sandbox::constants::CREDENTIAL_HOME_PATHS`, also audited by `host_audit`; the sandbox backends deny only the `SENSITIVE_HOME_PATHS` subset `.ssh`, `.aws`, `.gnupg`, `.config/gh` so `kubectl`/`docker`/`gcloud`/`az` still run) plus files `.env`, `.envrc`, `credentials`, `private_key`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`. Filtered from `fs_read`/`fs_write` and checked in `list_dir`. Matching is per path-component with **dotted-family** coverage on the final component: a `.env`/`private_key`/`credentials` entry also blocks `.env.local`, `private_key.pem`, `credentials.json` (component-suffix `entry.` — not substring, so `.environment`/`.sshrc` are not over-blocked).
 
 ### KEK Backend — Headless VPS Default
 

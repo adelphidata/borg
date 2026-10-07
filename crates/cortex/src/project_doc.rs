@@ -36,6 +36,10 @@ pub fn discover_project_docs(
 
     let mut combined = String::new();
     let mut remaining_bytes = MAX_PROJECT_DOC_BYTES;
+    // Docs that did not fit at all. They are named at the end so the agent
+    // knows a more specific doc exists and can read it, instead of the
+    // nested rules silently vanishing whenever the root doc is oversized.
+    let mut skipped: Vec<PathBuf> = Vec::new();
 
     for group in &doc_groups {
         // One directory contributes at most one doc, but a refused `AGENTS.md`
@@ -44,31 +48,51 @@ pub fn discover_project_docs(
         let Some((path, content)) = first_readable(group, &root, security) else {
             continue;
         };
+        if remaining_bytes == 0 {
+            skipped.push(path);
+            continue;
+        }
         // Scan for prompt injection before including in system prompt
         let safe_content = scan_doc_content(&path, &content);
 
+        if !combined.is_empty() {
+            combined.push_str("\n\n---\n\n");
+        }
         if safe_content.len() > remaining_bytes {
             // Truncate to fit byte budget (find a valid UTF-8 boundary)
-            let truncated = &safe_content[..floor_char_boundary(&safe_content, remaining_bytes)];
-            if !combined.is_empty() {
-                combined.push_str("\n\n---\n\n");
-            }
-            // Name the file and tell the agent it can read the rest, so a
-            // partial doc isn't mistaken for the whole file. The marker is
-            // an HTML comment so it stays inert in the rendered prompt.
+            let cut = floor_char_boundary(&safe_content, remaining_bytes);
+            let truncated = &safe_content[..cut];
+            // Name the file, say which sections were cut, and tell the agent
+            // it can read the rest, so a partial doc isn't mistaken for the
+            // whole file and the agent can judge whether what it lost
+            // matters. The marker is an HTML comment so it stays inert in
+            // the rendered prompt.
+            let omitted = omitted_headings(&safe_content, cut);
+            let sections = if omitted.is_empty() {
+                String::new()
+            } else {
+                format!(" omitted sections: {};", omitted.join("; "))
+            };
             combined.push_str(&format!(
-                "<!-- {path} (TRUNCATED: exceeded the project-doc budget; \
+                "<!-- {path} (TRUNCATED: exceeded the project-doc budget;{sections} \
                  read the full file with read_file(\"{path}\") if you need \
                  the omitted content) -->\n{truncated}",
                 path = path.display(),
             ));
-            break;
-        }
-        if !combined.is_empty() {
-            combined.push_str("\n\n---\n\n");
+            remaining_bytes = 0;
+            continue;
         }
         combined.push_str(&format!("<!-- {} -->\n{}", path.display(), safe_content));
         remaining_bytes -= safe_content.len();
+    }
+
+    if !skipped.is_empty() {
+        let names: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        combined.push_str(&format!(
+            "\n\n---\n\n<!-- SKIPPED for the project-doc budget (more specific to your \
+             working directory; read with read_file if you need them): {} -->",
+            names.join(", ")
+        ));
     }
 
     if combined.is_empty() {
@@ -76,6 +100,51 @@ pub fn discover_project_docs(
     } else {
         Ok(Some(combined))
     }
+}
+
+/// Upper bound on the bytes a truncation marker spends naming cut sections.
+const OMITTED_HEADINGS_BUDGET: usize = 400;
+
+/// Markdown headings whose line starts at or after byte offset `from` — the
+/// sections a truncation at `from` drops. `#` lines inside fenced code
+/// blocks are comments, not headings, and are ignored. The list is bounded
+/// by [`OMITTED_HEADINGS_BUDGET`] so a heading-dense doc cannot buy back the
+/// budget the truncation just enforced; an overflow ends in `…`.
+fn omitted_headings(content: &str, from: usize) -> Vec<String> {
+    let mut headings = Vec::new();
+    let mut spent = 0usize;
+    let mut offset = 0usize;
+    let mut fenced = false;
+    for line in content.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || start < from {
+            continue;
+        }
+        let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+        if !(1..=6).contains(&hashes) || !trimmed[hashes..].starts_with(' ') {
+            continue;
+        }
+        let title = trimmed[hashes..].trim();
+        if title.is_empty() {
+            continue;
+        }
+        // Budget the rendered list: each entry costs its title plus the
+        // "; " separator that joins it to the previous one.
+        let cost = title.len() + if headings.is_empty() { 0 } else { 2 };
+        if spent + cost > OMITTED_HEADINGS_BUDGET {
+            headings.push("…".to_string());
+            break;
+        }
+        spent += cost;
+        headings.push(title.to_string());
+    }
+    headings
 }
 
 /// Read a project doc, refusing any file that resolves outside `root`.
@@ -660,6 +729,86 @@ mod tests {
         let result = discover_project_docs(tmp.path(), &sec()).unwrap();
         // Whitespace-only content still gets included with the path comment
         assert!(result.is_some());
+    }
+
+    /// The truncation marker must say which sections were cut, so the agent
+    /// can tell whether what it lost matters — a `#` inside a fenced code
+    /// block is a shell comment, not a heading, and kept sections are not
+    /// "omitted".
+    #[test]
+    fn truncation_marker_names_the_dropped_headings() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let pad = "word ".repeat(MAX_PROJECT_DOC_BYTES / 10);
+        let doc = format!(
+            "# Kept head\n{pad}\n## Lost section\n{pad}\n```bash\n# a shell comment\n```\n\
+             ### Lost subsection\n{pad}\n"
+        );
+        // The head alone fills the budget, so everything after it is cut.
+        let doc = format!("{}{doc}", "x".repeat(MAX_PROJECT_DOC_BYTES));
+        std::fs::write(tmp.path().join("AGENTS.md"), &doc).unwrap();
+
+        let content = discover_project_docs(tmp.path(), &sec()).unwrap().unwrap();
+        let marker_end = content.find("-->").expect("truncation marker present");
+        let marker = &content[..marker_end];
+        assert!(marker.contains("TRUNCATED"), "{marker}");
+        assert!(
+            marker.contains("Lost section; Lost subsection"),
+            "marker must list the cut headings in order: {marker}"
+        );
+        assert!(
+            !marker.contains("Kept head") && !marker.contains("shell comment"),
+            "kept sections and fenced comments are not omitted sections: {marker}"
+        );
+    }
+
+    /// `omitted_headings` is bounded so a heading-dense doc cannot buy back the
+    /// budget the truncation enforced; the overflow is signalled, not dropped.
+    #[test]
+    fn omitted_headings_are_bounded_and_signal_overflow() {
+        let doc: String = (0..200)
+            .map(|i| format!("## Section number {i} with a long name\n"))
+            .collect();
+        let omitted = omitted_headings(&doc, 0);
+        let joined = omitted.join("; ");
+        assert!(
+            joined.len() <= OMITTED_HEADINGS_BUDGET + "; …".len(),
+            "list must stay within the budget: {} bytes",
+            joined.len()
+        );
+        assert_eq!(omitted.last().map(String::as_str), Some("…"));
+        assert!(omitted.len() > 1, "the budget must still fit some headings");
+    }
+
+    /// An oversized root doc must not make the nested, more specific docs
+    /// vanish without a trace: they are named so the agent can read them.
+    #[test]
+    fn docs_dropped_after_the_budget_is_spent_are_named() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "x".repeat(MAX_PROJECT_DOC_BYTES + 1000),
+        )
+        .unwrap();
+        let sub = tmp.path().join("packages").join("web");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "web rules body").unwrap();
+
+        let content = discover_project_docs(&sub, &sec()).unwrap().unwrap();
+        assert!(
+            !content.contains("web rules body"),
+            "the budget was spent, so the nested doc's body must not be included"
+        );
+        let skipped_at = content
+            .find("SKIPPED")
+            .expect("skipped docs must be announced");
+        let skipped = &content[skipped_at..];
+        assert!(
+            skipped.contains(&sub.join("CLAUDE.md").display().to_string()),
+            "the skipped marker must name the dropped doc: {skipped}"
+        );
+        assert!(skipped.contains("read_file"), "{skipped}");
     }
 
     #[test]

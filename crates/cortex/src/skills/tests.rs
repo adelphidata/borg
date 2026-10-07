@@ -3099,3 +3099,119 @@ fn project_skill_dirs_are_ordered_and_only_existing_ones_are_returned() {
         "Borg's own directory must be searched first"
     );
 }
+
+/// Write a user-tier skill at `~/.borg/skills/<dir>/SKILL.md` declaring `name`.
+fn write_user_skill(env: &SkillsDataDirEnv, dir: &str, name: &str) {
+    let d = env.skills_path().join(dir);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: A user skill\n---\n\nBody of {dir}.\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn skills_in_one_directory_load_in_path_order() {
+    // `read_dir` order is filesystem-dependent; the catalog must not be.
+    let env = SkillsDataDirEnv::new();
+    for dir in ["zeta-order", "alpha-order", "mid-order"] {
+        write_user_skill(&env, dir, dir);
+    }
+
+    let skills = load_all_skills(
+        &std::collections::HashMap::new(),
+        &SkillsConfig::default(),
+        None,
+    )
+    .unwrap();
+
+    let user: Vec<&str> = skills
+        .iter()
+        .filter(|s| s.source == SkillSource::User)
+        .map(|s| s.manifest.name.as_str())
+        .collect();
+    assert_eq!(user, ["alpha-order", "mid-order", "zeta-order"]);
+}
+
+#[test]
+fn same_directory_duplicate_names_are_refused_not_picked_by_directory_order() {
+    // Two directories in ~/.borg/skills declaring one name: there is no
+    // sensible winner, so neither loads. Other skills are unaffected.
+    let env = SkillsDataDirEnv::new();
+    write_user_skill(&env, "alpha-twin", "twin");
+    write_user_skill(&env, "beta-twin", "twin");
+    write_user_skill(&env, "solo", "solo");
+
+    let skills = load_all_skills(
+        &std::collections::HashMap::new(),
+        &SkillsConfig::default(),
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !skills.iter().any(|s| s.manifest.name == "twin"),
+        "a same-tier name collision must refuse both, not pick one"
+    );
+    assert!(
+        skills.iter().any(|s| s.manifest.name == "solo"),
+        "an unrelated skill in the same directory still loads"
+    );
+}
+
+#[test]
+fn a_shadowed_skill_is_reported_with_both_paths_and_the_winning_tier() {
+    use super::loader::{dedup_by_name, Candidate, ShadowedSkill};
+
+    let candidate = |source: SkillSource, origin: Option<&str>| {
+        let (manifest, body) = parse_skill_md(MINIMAL_SKILL).unwrap();
+        Candidate {
+            skill: Skill {
+                manifest,
+                body,
+                source,
+                available: true,
+                disabled: false,
+                references: Vec::new(),
+                scripts: Vec::new(),
+            },
+            origin: origin.map(std::path::PathBuf::from),
+        }
+    };
+
+    // Project outranks user, whatever the order they were found in.
+    let (skills, shadowed) = dedup_by_name(vec![
+        candidate(SkillSource::Project, Some("/ws/.borg/skills/minimal")),
+        candidate(SkillSource::User, Some("/home/u/.borg/skills/minimal")),
+    ]);
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].source, SkillSource::Project);
+    assert_eq!(
+        shadowed,
+        vec![ShadowedSkill {
+            name: "minimal".into(),
+            dropped: Some("/home/u/.borg/skills/minimal".into()),
+            winner: Some("/ws/.borg/skills/minimal".into()),
+            winning_tier: SkillSource::Project,
+        }]
+    );
+
+    // A built-in has no path, and the report says so rather than inventing one.
+    let (skills, shadowed) = dedup_by_name(vec![
+        candidate(SkillSource::BuiltIn, None),
+        candidate(SkillSource::User, Some("/home/u/.borg/skills/renamed-dir")),
+    ]);
+    assert_eq!(skills[0].source, SkillSource::BuiltIn);
+    assert_eq!(shadowed.len(), 1);
+    assert_eq!(shadowed[0].winner, None);
+    assert_eq!(shadowed[0].winning_tier, SkillSource::BuiltIn);
+
+    // No collision, no report.
+    let (skills, shadowed) = dedup_by_name(vec![candidate(
+        SkillSource::User,
+        Some("/home/u/.borg/skills/minimal"),
+    )]);
+    assert_eq!(skills.len(), 1);
+    assert!(shadowed.is_empty());
+}

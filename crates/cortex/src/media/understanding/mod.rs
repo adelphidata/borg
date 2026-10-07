@@ -128,11 +128,15 @@ impl AudioTranscriber {
         }
 
         let mut attempts = Vec::new();
+        // The caller's hint is model-controlled (the `transcribe_audio` tool
+        // passes it straight from the LLM), so it is normalised once here
+        // before any provider splices it into a URL or form field.
+        let language = language.and_then(normalize_language_hint);
 
         for entry in &self.entries {
             // Per-model overrides: language, timeout, model
             let lang = language
-                .map(String::from)
+                .clone()
                 .or_else(|| entry.language.clone())
                 .or_else(|| self.default_language.clone());
             let timeout = entry.timeout.unwrap_or(self.default_timeout);
@@ -177,10 +181,76 @@ impl AudioTranscriber {
     }
 }
 
+/// Reduce a language hint to a BCP-47-shaped tag or drop it.
+///
+/// Accepts a 2-3 letter ASCII base (lowercased) optionally followed by
+/// `-`/`_` and a 2-4 character alphanumeric subtag (`en`, `en-US`,
+/// `zh-Hant`). Anything else — including a hint carrying `&`, `=`, `/`
+/// or whitespace — is rejected with a warning so a hostile value can
+/// never add query parameters or form fields on a provider request.
+pub fn normalize_language_hint(hint: &str) -> Option<String> {
+    let hint = hint.trim();
+    let (base, region) = match hint.find(['-', '_']) {
+        Some(idx) => (
+            &hint[..idx],
+            Some((hint.as_bytes()[idx] as char, &hint[idx + 1..])),
+        ),
+        None => (hint, None),
+    };
+    let base_ok = (2..=3).contains(&base.len()) && base.bytes().all(|b| b.is_ascii_alphabetic());
+    let region_ok = match region {
+        None => true,
+        Some((_, sub)) => {
+            (2..=4).contains(&sub.len()) && sub.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+    };
+    if !base_ok || !region_ok {
+        warn!("Ignoring malformed audio language hint {hint:?}");
+        return None;
+    }
+    let mut out = base.to_ascii_lowercase();
+    if let Some((sep, sub)) = region {
+        out.push(sep);
+        out.push_str(sub);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use providers::WhisperProvider;
+
+    /// Spec: the hint reaching a provider must be a plain language tag.
+    /// A value that smuggles query syntax is dropped, not forwarded.
+    #[test]
+    fn normalize_language_hint_accepts_tags_and_drops_injection() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("en", Some("en")),
+            ("EN", Some("en")),
+            (" en-US ", Some("en-US")),
+            ("zh-Hant", Some("zh-Hant")),
+            ("pt_BR", Some("pt_BR")),
+            ("ast", Some("ast")),
+            ("en&callback=https://evil/x", None),
+            ("en-US&model=x", None),
+            ("e", None),
+            ("english", None),
+            ("en-", None),
+            ("en-U", None),
+            ("en-USABC", None),
+            ("en US", None),
+            ("", None),
+            ("en/..", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_language_hint(input).as_deref(),
+                *expected,
+                "hint {input:?}"
+            );
+        }
+    }
     #[test]
     fn from_config_returns_none_when_disabled() {
         let config = Config::default();
@@ -483,5 +553,70 @@ mod tests {
         );
         assert_eq!(attempts[1].provider, "secondary");
         assert!(matches!(attempts[1].outcome, AttemptOutcome::Success));
+    }
+
+    /// Spec: the engine normalises the caller's hint before any provider
+    /// sees it. An injected hint is dropped (no `language`, no `callback`
+    /// on the wire); a well-formed one reaches the provider intact.
+    #[tokio::test]
+    async fn transcribe_drops_injected_language_hint_before_provider() {
+        use providers::DeepgramProvider;
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let server = MockServer::start().await;
+        let ok = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {"channels": [{"alternatives": [{"transcript": "ok"}]}]}
+        }));
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/listen"))
+            .and(query_param("model", "nova-3"))
+            .and(query_param_is_missing("language"))
+            .and(query_param_is_missing("callback"))
+            .respond_with(ok.clone())
+            .expect(1)
+            .named("injected hint dropped")
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/listen"))
+            .and(query_param("language", "en-US"))
+            .respond_with(ok)
+            .expect(1)
+            .named("valid hint forwarded")
+            .mount(&server)
+            .await;
+
+        let transcriber = AudioTranscriber {
+            entries: vec![ProviderEntry {
+                provider: Box::new(DeepgramProvider {
+                    client: Client::new(),
+                    api_key: "k".to_string(),
+                    base_url: server.uri(),
+                    default_model: "nova-3".to_string(),
+                }),
+                model: None,
+                language: None,
+                timeout: Some(Duration::from_secs(5)),
+            }],
+            max_file_size: 1024,
+            min_file_size: 1,
+            default_language: None,
+            default_timeout: Duration::from_secs(5),
+        };
+
+        transcriber
+            .transcribe(
+                b"audio",
+                "audio/wav",
+                "x.wav",
+                Some("en&callback=https://evil/x"),
+            )
+            .await
+            .expect("injected hint must be dropped, not sent");
+        transcriber
+            .transcribe(b"audio", "audio/wav", "x.wav", Some(" EN-US"))
+            .await
+            .expect("valid hint must be forwarded");
+        server.verify().await;
     }
 }

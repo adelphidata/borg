@@ -85,25 +85,28 @@ impl TranscriptionProvider for WhisperProvider {
 }
 
 /// Deepgram transcription provider.
-struct DeepgramProvider {
-    client: Client,
-    api_key: String,
-    base_url: String,
-    default_model: String,
+pub(super) struct DeepgramProvider {
+    pub(super) client: Client,
+    pub(super) api_key: String,
+    pub(super) base_url: String,
+    pub(super) default_model: String,
 }
 
 #[async_trait::async_trait]
 impl TranscriptionProvider for DeepgramProvider {
     async fn transcribe(&self, req: &TranscriptionRequest<'_>) -> Result<String> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
-        let mut url = format!("{}/v1/listen?model={model}", self.base_url);
+        // Query values go through reqwest's encoder, never string
+        // concatenation: a language hint can only ever be one parameter.
+        let mut query: Vec<(&str, &str)> = vec![("model", model)];
         if let Some(ref lang) = req.language {
-            url.push_str(&format!("&language={lang}"));
+            query.push(("language", lang));
         }
 
         let resp = self
             .client
-            .post(&url)
+            .post(format!("{}/v1/listen", self.base_url))
+            .query(&query)
             .header("Authorization", format!("Token {}", self.api_key))
             .header("Content-Type", &req.mime_type)
             .body(req.audio_bytes.to_vec())
@@ -294,8 +297,12 @@ struct XaiSttProvider {
     client: Client,
     api_key: String,
     base_url: String,
+    /// Sent on every request: the server-side default has moved between
+    /// model generations, so leaving it out makes the wire nondeterministic.
+    default_model: String,
     /// Inverse text normalization — emits punctuation/casing/digits. On
-    /// by default.
+    /// by default, but only sent alongside a language: the endpoint
+    /// answers HTTP 400 to `format=true` without one.
     format: bool,
     /// Speaker diarization. Off by default (paid feature).
     diarize: bool,
@@ -310,13 +317,17 @@ impl TranscriptionProvider for XaiSttProvider {
             .file_name(req.filename.clone())
             .mime_str(&req.mime_type)?;
 
-        let mut form = reqwest::multipart::Form::new().part("file", file_part);
-        if self.format {
-            let lang = req.language.clone().unwrap_or_else(|| "en".to_string());
-            form = form.text("language", lang);
-            form = form.text("format", "true");
-        } else if let Some(ref lang) = req.language {
+        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", model.to_string());
+        // No language means auto-detect; forcing `en` here would silently
+        // mistranscribe every other language.
+        if let Some(ref lang) = req.language {
             form = form.text("language", lang.clone());
+            if self.format {
+                form = form.text("format", "true");
+            }
         }
         if self.diarize {
             form = form.text("diarize", "true");
@@ -676,11 +687,13 @@ pub(super) static PROVIDERS: &[SttProviderDef] = &[
             key_env: &["XAI_API_KEY"],
             key_url: "https://console.x.ai",
             base_url: "https://api.x.ai/v1",
+            default_model: "grok-voice-transcribe-2.0",
             ..ProviderInfo::new("xai", "xAI Grok")
         },
         build: |cx| {
             Some(Box::new(XaiSttProvider {
                 client: cx.client.clone(),
+                default_model: cx.info.default_model.to_string(),
                 // `None` keeps the historical default: format on, diarize off.
                 format: cx.row.xai_stt_format.unwrap_or(true),
                 diarize: cx.row.xai_stt_diarize.unwrap_or(false),
@@ -1062,6 +1075,7 @@ mod tests {
             api_key: "xai-mock-key".to_string(),
             // xAI's base is `…/v1`, the provider appends `/stt`.
             base_url: format!("{}/v1", server.uri()),
+            default_model: "grok-voice-transcribe-2.0".to_string(),
             format: true,
             diarize: false,
         };
@@ -1087,6 +1101,7 @@ mod tests {
             api_key: "xai-mock-key".to_string(),
             // xAI's base is `…/v1`, the provider appends `/stt`.
             base_url: format!("{}/v1", server.uri()),
+            default_model: "grok-voice-transcribe-2.0".to_string(),
             format: true,
             diarize: false,
         };
@@ -1096,5 +1111,112 @@ mod tests {
             .expect_err("401 must surface");
         let msg = format!("{err}");
         assert!(msg.contains("401"), "missing status: {msg}");
+    }
+
+    /// Matcher asserting a substring is absent from the request body —
+    /// wiremock ships only the positive `body_string_contains`.
+    struct BodyLacks(&'static str);
+
+    impl wiremock::Match for BodyLacks {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            !String::from_utf8_lossy(&request.body).contains(self.0)
+        }
+    }
+
+    /// Spec: the language hint is one encoded query value. A hint that
+    /// carries `&callback=…` must arrive as a single `language` parameter,
+    /// never as a second parameter the model controls.
+    #[tokio::test]
+    async fn deepgram_provider_encodes_language_as_single_query_param() {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/listen"))
+            .and(query_param("model", "nova-3"))
+            .and(query_param("language", "en&callback=https://evil/x"))
+            .and(query_param_is_missing("callback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": {"channels": [{"alternatives": [{"transcript": "safe"}]}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            client: Client::new(),
+            api_key: "k".to_string(),
+            base_url: server.uri(),
+            default_model: "nova-3".to_string(),
+        };
+        let mut req = make_request(b"audio");
+        req.language = Some("en&callback=https://evil/x".to_string());
+        assert_eq!(provider.transcribe(&req).await.unwrap(), "safe");
+    }
+
+    /// Spec: without a language the request is auto-detect — no forced
+    /// `en`, and no `format` flag (the endpoint rejects it without a
+    /// language). The model is always named.
+    #[tokio::test]
+    async fn xai_stt_without_language_sends_model_and_no_forced_english() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/stt"))
+            .and(body_string_contains("name=\"model\""))
+            .and(body_string_contains("grok-voice-transcribe-2.0"))
+            .and(BodyLacks("name=\"language\""))
+            .and(BodyLacks("name=\"format\""))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "auto"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = XaiSttProvider {
+            client: Client::new(),
+            api_key: "xai".to_string(),
+            base_url: format!("{}/v1", server.uri()),
+            default_model: "grok-voice-transcribe-2.0".to_string(),
+            format: true,
+            diarize: false,
+        };
+        assert_eq!(
+            provider.transcribe(&make_request(b"audio")).await.unwrap(),
+            "auto"
+        );
+    }
+
+    /// Spec: with a language resolved, `language` and `format=true` are
+    /// sent, and the row's configured model wins over the default.
+    #[tokio::test]
+    async fn xai_stt_with_language_sends_format_and_configured_model() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/stt"))
+            .and(body_string_contains("name=\"language\""))
+            .and(body_string_contains("name=\"format\""))
+            .and(body_string_contains("grok-voice-transcribe-1.0"))
+            .and(BodyLacks("grok-voice-transcribe-2.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "pinned"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = XaiSttProvider {
+            client: Client::new(),
+            api_key: "xai".to_string(),
+            base_url: format!("{}/v1", server.uri()),
+            default_model: "grok-voice-transcribe-2.0".to_string(),
+            format: true,
+            diarize: false,
+        };
+        let mut req = make_request(b"audio");
+        req.model = Some("grok-voice-transcribe-1.0".to_string());
+        req.language = Some("de".to_string());
+        assert_eq!(provider.transcribe(&req).await.unwrap(), "pinned");
     }
 }

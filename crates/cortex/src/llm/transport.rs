@@ -215,28 +215,36 @@ const LEGACY_MANUAL_THINKING_CLAUDE: &[&str] = &[
 ];
 
 /// Claude families where thinking is mandatory: `thinking: {"type":"disabled"}`
-/// answers HTTP 400. The failure mode is asymmetric — a missing entry kills
-/// the turn with a 400, a spurious entry only leaves thinking on — so when in
-/// doubt a family belongs on this list.
-const MANDATORY_THINKING_CLAUDE: &[&str] = &["claude-fable"];
+/// answers HTTP 400 at every effort level and the documented "off" is to omit
+/// the block. The failure mode is asymmetric — a missing entry kills the turn
+/// with a 400, a spurious entry only leaves thinking on — so when in doubt a
+/// family belongs on this list. Opus 5 is *not* here: it still accepts the
+/// plain disable.
+const MANDATORY_THINKING_CLAUDE: &[&str] = &["claude-fable", "claude-opus-5-5", "claude-opus-5.5"];
 
-/// Whether `model` accepts an explicit `thinking: {"type": "disabled"}`.
-///
-/// Modern Claude models think by default, so omitting the `thinking` block is
-/// not a disable — it silently leaves thinking on and the user keeps paying
-/// for it. Legacy manual-thinking families need no disable (thinking is
-/// opt-in via `budget_tokens`), and mandatory-thinking families reject the
-/// disable with a 400. Non-Claude models served over the Anthropic Messages
-/// wire keep the omission: their disable contract is not Claude's.
-pub(crate) fn anthropic_accepts_thinking_disable(model: &str) -> bool {
+/// Claude families whose documented "off" is `thinking: {"type":"between_tools"}`
+/// (no up-front reasoning, short notes between tool calls). A plain disable
+/// answers HTTP 400 with a message that points at `between_tools`. The block
+/// takes no other field. Sonnet 5 is *not* here: it still accepts the plain
+/// disable.
+const BETWEEN_TOOLS_OFF_CLAUDE: &[&str] = &["claude-sonnet-5-5", "claude-sonnet-5.5"];
+
+/// The `thinking` block that turns thinking off for `model` on the Anthropic
+/// Messages wire, or `None` when the wire has no disable for it (legacy
+/// manual-thinking families, non-Claude models, and families that reject the
+/// disable and run adaptive thinking when the block is omitted).
+pub(crate) fn anthropic_thinking_off_block(model: &str) -> Option<serde_json::Value> {
     let m = model.to_ascii_lowercase();
-    if !m.contains("claude") {
-        return false;
+    if !m.contains("claude") || LEGACY_MANUAL_THINKING_CLAUDE.iter().any(|v| m.contains(v)) {
+        return None;
     }
-    if LEGACY_MANUAL_THINKING_CLAUDE.iter().any(|v| m.contains(v)) {
-        return false;
+    if BETWEEN_TOOLS_OFF_CLAUDE.iter().any(|v| m.contains(v)) {
+        return Some(serde_json::json!({"type": "between_tools"}));
     }
-    !MANDATORY_THINKING_CLAUDE.iter().any(|v| m.contains(v))
+    if MANDATORY_THINKING_CLAUDE.iter().any(|v| m.contains(v)) {
+        return None;
+    }
+    Some(serde_json::json!({"type": "disabled"}))
 }
 
 pub(crate) fn build_anthropic_request(
@@ -295,10 +303,11 @@ pub(crate) fn build_anthropic_request(
             "stream": stream,
         });
         // Thinking is off. Modern Claude models think by default, so the
-        // disable must be explicit; families that reject it keep the omission
-        // (a silently-ignored disable beats a dead turn).
-        if anthropic_accepts_thinking_disable(request.model) {
-            off_body["thinking"] = serde_json::json!({"type": "disabled"});
+        // off state must be explicit, in the form each family documents;
+        // families that reject every off form keep the omission (a
+        // silently-ignored disable beats a dead turn).
+        if let Some(off) = anthropic_thinking_off_block(request.model) {
+            off_body["thinking"] = off;
         }
         off_body
     };
@@ -345,6 +354,21 @@ pub(crate) fn strip_stream_options(body: &mut serde_json::Value) -> bool {
     body.as_object_mut()
         .is_some_and(|obj| obj.remove("stream_options").is_some())
 }
+
+/// OpenAI-compatible `finish_reason` values that mean a safety or content
+/// filter stopped the response: OpenAI/Azure `content_filter`, the
+/// structured-output `refusal`, and the Bedrock-style labels that compat
+/// relays pass through.
+const OPENAI_FILTERED_FINISH_REASONS: &[&str] = &[
+    "content_filter",
+    "refusal",
+    "guardrail_intervened",
+    "content_filtered",
+];
+
+/// Bedrock `stopReason` values that mean a guardrail or filter stopped the
+/// response.
+const BEDROCK_FILTERED_STOP_REASONS: &[&str] = &["guardrail_intervened", "content_filtered"];
 
 pub(crate) fn parse_openai_sse_line(
     line: &str,
@@ -445,6 +469,15 @@ pub(crate) fn parse_openai_sse_line(
                     }
                     if choice.finish_reason.as_deref() == Some("length") {
                         events.push(StreamEvent::Truncated);
+                    }
+                    if let Some(reason) = choice
+                        .finish_reason
+                        .as_deref()
+                        .filter(|r| OPENAI_FILTERED_FINISH_REASONS.contains(r))
+                    {
+                        events.push(StreamEvent::ContentFiltered {
+                            reason: reason.to_string(),
+                        });
                     }
                     if choice.finish_reason.as_deref() == Some("tool_calls") {
                         events.push(StreamEvent::ToolIntent);
@@ -614,6 +647,11 @@ pub(crate) fn parse_anthropic_sse_line(
                 if stop_reason == "max_tokens" {
                     events.push(StreamEvent::Truncated);
                 }
+                if stop_reason == "refusal" {
+                    events.push(StreamEvent::ContentFiltered {
+                        reason: stop_reason.to_string(),
+                    });
+                }
                 if stop_reason == "tool_use" {
                     events.push(StreamEvent::ToolIntent);
                 }
@@ -770,6 +808,25 @@ impl Transport for OpenAiCompatTransport {
             message: Message,
         }
 
+        // A provider error inside a 200 body: `{"error":{...}}` or the
+        // relay shape `{"success":false,"data":{"error":...}}`. Surface the
+        // provider's own message, classified the same way the streaming
+        // path classifies an error frame, instead of a generic "no
+        // response" that hides the cause.
+        if let Some(error) = in_body_provider_error(&response) {
+            return Err(anyhow::Error::new(classify_stream_error_frame(
+                &error.to_string(),
+                provider,
+            )));
+        }
+        // Some relays wrap the OpenAI body: `{"data":{"choices":[...]}}`.
+        let response = match response.get("data") {
+            Some(data) if response.get("choices").is_none() && data.get("choices").is_some() => {
+                data.clone()
+            }
+            _ => response,
+        };
+
         let resp: ChatResponse = serde_json::from_value(response)?;
         let message = resp
             .choices
@@ -792,6 +849,20 @@ impl Transport for OpenAiCompatTransport {
 
         Ok(TransportResponse { message, usage })
     }
+}
+
+/// The error object of a provider error that arrived inside a 200 body, as
+/// a `{"error": ...}` frame the stream-error classifier understands. `None`
+/// for a body with no error (an explicit `"error": null` included).
+fn in_body_provider_error(response: &serde_json::Value) -> Option<serde_json::Value> {
+    let top = response.get("error").filter(|e| !e.is_null());
+    let wrapped = response
+        .get("data")
+        .and_then(|d| d.get("error"))
+        .filter(|e| !e.is_null())
+        .filter(|_| response.get("success").and_then(serde_json::Value::as_bool) == Some(false));
+    let error = top.or(wrapped)?;
+    Some(serde_json::json!({ "error": error }))
 }
 
 struct AnthropicTransport;
@@ -1504,8 +1575,14 @@ fn parse_bedrock_event_payload(
 
     if let Some(stop) = event.get("messageStop") {
         let mut events = Vec::new();
-        if stop.get("stopReason").and_then(serde_json::Value::as_str) == Some("max_tokens") {
+        let stop_reason = stop.get("stopReason").and_then(serde_json::Value::as_str);
+        if stop_reason == Some("max_tokens") {
             events.push(StreamEvent::Truncated);
+        }
+        if let Some(reason) = stop_reason.filter(|r| BEDROCK_FILTERED_STOP_REASONS.contains(r)) {
+            events.push(StreamEvent::ContentFiltered {
+                reason: reason.to_string(),
+            });
         }
         events.push(StreamEvent::Done);
         return SseAction::Done(events);
@@ -1728,24 +1805,33 @@ mod tests {
 
     /// Thinking off must be an explicit wire-level disable on modern Claude
     /// models (they think by default, so omission leaves thinking ON), must
-    /// stay an omission on mandatory-thinking families (a disable answers
-    /// HTTP 400), and must stay an omission on legacy manual-thinking and
-    /// non-Claude models (no disable exists on their contract).
+    /// be `between_tools` on the family whose documented off form that is
+    /// (a plain disable answers HTTP 400 there), must stay an omission on
+    /// mandatory-thinking families (every off form answers HTTP 400), and
+    /// must stay an omission on legacy manual-thinking and non-Claude models
+    /// (no disable exists on their contract).
     #[test]
-    fn anthropic_thinking_off_sends_explicit_disable_only_where_accepted() {
+    fn anthropic_thinking_off_sends_the_off_form_each_family_accepts() {
         let mut off_cfg = LlmConfig::default();
         off_cfg.thinking = crate::config::ThinkingLevel::Off;
         off_cfg.thinking_overrides.clear();
 
+        let disabled = Some(serde_json::json!({"type": "disabled"}));
+        let between_tools = Some(serde_json::json!({"type": "between_tools"}));
         let cases = [
-            ("claude-opus-5", true),
-            ("claude-sonnet-4-6", true),
-            ("claude-fable-5", false),
-            ("claude-3-7-sonnet-20250219", false),
-            ("claude-haiku-4-5-20251001", false),
-            ("minimax-m2", false),
+            ("claude-opus-5", disabled.clone()),
+            ("claude-sonnet-5", disabled.clone()),
+            ("claude-sonnet-4-6", disabled.clone()),
+            ("claude-sonnet-5-5", between_tools.clone()),
+            ("anthropic/claude-sonnet-5.5", between_tools.clone()),
+            ("claude-opus-5-5", None),
+            ("claude-opus-5.5", None),
+            ("claude-fable-5", None),
+            ("claude-3-7-sonnet-20250219", None),
+            ("claude-haiku-4-5-20251001", None),
+            ("minimax-m2", None),
         ];
-        for (model, expect_disable) in cases {
+        for (model, expected) in cases {
             let messages = vec![Message::user("hi")];
             let request = TransportRequest {
                 provider: Provider::Anthropic,
@@ -1758,16 +1844,109 @@ mod tests {
                 cost_events_enabled: false,
             };
             let body = build_anthropic_request(&request, false);
-            if expect_disable {
-                assert_eq!(
-                    body["thinking"],
-                    serde_json::json!({"type": "disabled"}),
-                    "{model}: must send an explicit thinking disable"
-                );
-            } else {
+            assert_eq!(
+                body.get("thinking").cloned(),
+                expected,
+                "{model}: wrong thinking-off form on the wire"
+            );
+            if expected == between_tools {
+                // `between_tools` takes no companion field; any extra key is
+                // a 400 on that family.
+                assert_eq!(body["thinking"].as_object().map(|o| o.len()), Some(1));
+            }
+        }
+    }
+
+    /// A stop that a safety or content filter caused is its own event on
+    /// every wire. It is not `Truncated` (a length cut asks for compaction;
+    /// a filtered stop must not), and the provider's own label travels with
+    /// it. A normal stop emits neither.
+    #[test]
+    fn filtered_stop_reasons_emit_content_filtered_not_truncated() {
+        use crate::sse::SseAction;
+
+        fn events_of(action: SseAction) -> Vec<StreamEvent> {
+            match action {
+                SseAction::Emit(events) | SseAction::Done(events) => events,
+                SseAction::Continue => Vec::new(),
+                SseAction::Error(e) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        let openai = |finish: &str| {
+            let line = format!(
+                r#"data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish}"}}]}}"#
+            );
+            events_of(parse_openai_sse_line(
+                &line,
+                "openai",
+                "gpt-5",
+                &mut OpenAiStreamState::default(),
+            ))
+        };
+        let anthropic = |stop: &str| {
+            let line = format!(
+                r#"data: {{"type":"message_delta","delta":{{"stop_reason":"{stop}"}},"usage":{{"output_tokens":3}}}}"#
+            );
+            let (mut tool_index, mut is_tool, mut is_thinking) = (0usize, false, false);
+            let (mut input, mut cached, mut created) = (0u64, 0u64, 0u64);
+            let mut response_id = None;
+            events_of(parse_anthropic_sse_line(
+                &line,
+                "anthropic",
+                "claude",
+                &mut tool_index,
+                &mut is_tool,
+                &mut is_thinking,
+                &mut input,
+                &mut cached,
+                &mut created,
+                &mut response_id,
+            ))
+        };
+        let bedrock = |stop: &str| {
+            let payload = format!(r#"{{"messageStop":{{"stopReason":"{stop}"}}}}"#);
+            events_of(parse_bedrock_event_payload(
+                payload.as_bytes(),
+                "bedrock",
+                "anthropic.claude",
+                &mut BedrockStreamState::default(),
+            ))
+        };
+
+        // (wire, stop label, expect a filtered event)
+        let cases: Vec<(&str, Vec<StreamEvent>, Option<&str>)> = vec![
+            (
+                "openai content_filter",
+                openai("content_filter"),
+                Some("content_filter"),
+            ),
+            ("openai refusal", openai("refusal"), Some("refusal")),
+            (
+                "openai guardrail_intervened",
+                openai("guardrail_intervened"),
+                Some("guardrail_intervened"),
+            ),
+            ("openai stop", openai("stop"), None),
+            ("openai length", openai("length"), None),
+            ("anthropic refusal", anthropic("refusal"), Some("refusal")),
+            ("anthropic end_turn", anthropic("end_turn"), None),
+            (
+                "bedrock guardrail_intervened",
+                bedrock("guardrail_intervened"),
+                Some("guardrail_intervened"),
+            ),
+            ("bedrock end_turn", bedrock("end_turn"), None),
+        ];
+        for (name, events, expected) in cases {
+            let filtered = events.iter().find_map(|e| match e {
+                StreamEvent::ContentFiltered { reason } => Some(reason.as_str()),
+                _ => None,
+            });
+            assert_eq!(filtered, expected, "{name}: filtered event");
+            if expected.is_some() {
                 assert!(
-                    body.get("thinking").is_none(),
-                    "{model}: must omit the thinking block entirely"
+                    !events.iter().any(|e| matches!(e, StreamEvent::Truncated)),
+                    "{name}: a filtered stop must not read as a length cut"
                 );
             }
         }

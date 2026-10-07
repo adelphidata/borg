@@ -46,6 +46,20 @@ use crate::util::process_tree::signal_group;
 /// the process tree a chance to run its own cleanup before the hard kill.
 const KILL_GRACE: Duration = Duration::from_millis(300);
 
+/// Most sessions one daemon keeps alive at once. Each is a live shell plus a
+/// drain task and an output buffer; a model that starts sessions and never
+/// kills them must hit a clear error, not grow the process without bound. An
+/// exited session is removed by the `poll` that reports its exit, so a normal
+/// workflow never reaches this.
+pub const MAX_SESSIONS: usize = 16;
+
+/// Most sessions one owner (conversation) keeps alive at once. The registry
+/// is process-global, so without this one chatty conversation could fill
+/// every slot of [`MAX_SESSIONS`] and lock every other channel out of the
+/// session lane. Ownerless sessions share one bucket. Checked alongside the
+/// global cap; whichever is hit first refuses the start.
+pub const MAX_SESSIONS_PER_OWNER: usize = 8;
+
 /// Process-global session registry. The daemon installs one at startup so the
 /// `run_shell` handler can reach it across turns without threading a handle
 /// through every signature.
@@ -135,6 +149,18 @@ impl SessionOutput {
     }
 }
 
+/// What one [`ShellSessionRegistry::poll`] observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Polled {
+    /// New output since the last poll, plus any `cwd:` or exit note.
+    pub output: String,
+    /// Whether `output` must go through env-assignment masking (a prior
+    /// `write_stdin` read a blocked env/credential file). Read under the same
+    /// lock as the output, so the final poll of an exited session — which
+    /// removes the session — still carries the flag.
+    pub env_mask: bool,
+}
+
 /// One live interactive session.
 struct Session {
     /// The child handle, kept for `kill`. `kill_on_drop` is set at spawn so a
@@ -221,13 +247,31 @@ impl ShellSessionRegistry {
     ///
     /// `owner` is the starting conversation's session id; all later actions on
     /// the returned id must present the same value (see [`Session::owner`]).
+    ///
+    /// Errors when [`MAX_SESSIONS`] are already live, or `owner` already has
+    /// [`MAX_SESSIONS_PER_OWNER`]; the child is then dropped (and killed by
+    /// `kill_on_drop`) rather than registered.
     pub fn register(
         &self,
         mut child: Child,
         guard: Option<ProcessGuard>,
         max_output_bytes: usize,
         owner: Option<String>,
-    ) -> String {
+    ) -> Result<String> {
+        let mut inner = self.lock();
+        if inner.sessions.len() >= MAX_SESSIONS {
+            return Err(anyhow!(
+                "too many shell sessions are open ({MAX_SESSIONS}); kill one with \
+                 action=kill (or poll an exited one) before starting another"
+            ));
+        }
+        let owned = inner.sessions.values().filter(|s| s.owner == owner).count();
+        if owned >= MAX_SESSIONS_PER_OWNER {
+            return Err(anyhow!(
+                "this conversation already has {MAX_SESSIONS_PER_OWNER} shell sessions open; \
+                 kill one with action=kill (or poll an exited one) before starting another"
+            ));
+        }
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -235,7 +279,6 @@ impl ShellSessionRegistry {
         let output = Arc::new(Mutex::new(SessionOutput::new(max_output_bytes)));
         let drain = spawn_drain(stdout, stderr, output.clone());
 
-        let mut inner = self.lock();
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
         // The counter keeps ids readable and collision-free; the random
         // suffix keeps them unguessable, so a foreign conversation cannot
@@ -266,7 +309,7 @@ impl ShellSessionRegistry {
                 owner,
             },
         );
-        id
+        Ok(id)
     }
 
     /// Whether a session with `id` is currently registered.
@@ -319,34 +362,89 @@ impl ShellSessionRegistry {
     /// session's working directory changed since the last observation (a `cd`
     /// ran), a `cwd: <path>` note is appended so the model knows where the
     /// shell now lives. Errors if the session is unknown.
-    pub fn poll(&self, id: &str, caller: Option<&str>) -> Result<String> {
+    ///
+    /// Once the child has exited *and* its output is fully drained, the poll
+    /// that observes it returns the last output plus an
+    /// `[session <id> exited with code N]` line, finalizes the subprocess
+    /// guard, and removes the session — a later poll reports it as unknown
+    /// rather than "no new output" forever.
+    pub fn poll(&self, id: &str, caller: Option<&str>) -> Result<Polled> {
         let mut inner = self.lock();
-        let session = Self::get_owned(&mut inner, id, caller)?;
-        let mut out = {
-            let mut buf = session
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buf.take()
-        };
-        // Only note an *observed change*: a first-ever successful read (prior
-        // baseline unknown) seeds silently, and an unreadable cwd (dead child,
-        // unsupported platform) never fabricates a note.
-        if let Some(now) = session.pid.and_then(crate::util::process_tree::process_cwd) {
-            if session.last_cwd.as_ref().is_some_and(|prev| prev != &now) {
-                if !out.is_empty() {
-                    out.push('\n');
+        let (mut out, env_mask, exit) = {
+            let session = Self::get_owned(&mut inner, id, caller)?;
+            // Settle the exit BEFORE taking the buffer: the drain task appends
+            // its last bytes and then finishes, so checking it afterwards could
+            // see "finished" for bytes that landed after the take — and the
+            // removal below would drop them.
+            let exit = Self::settled_exit(session, id);
+            let mut out = {
+                let mut buf = session
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                buf.take()
+            };
+            // Only note an *observed change*: a first-ever successful read
+            // (prior baseline unknown) seeds silently, and an unreadable cwd
+            // (dead child, unsupported platform) never fabricates a note.
+            if let Some(now) = session.pid.and_then(crate::util::process_tree::process_cwd) {
+                if session.last_cwd.as_ref().is_some_and(|prev| prev != &now) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&format!("cwd: {}", now.display()));
                 }
-                out.push_str(&format!("cwd: {}", now.display()));
+                session.last_cwd = Some(now);
             }
-            session.last_cwd = Some(now);
+            (out, session.env_mask, exit)
+        };
+        let Some(status) = exit else {
+            return Ok(Polled {
+                output: out,
+                env_mask,
+            });
+        };
+        let mut session = inner
+            .sessions
+            .remove(id)
+            .ok_or_else(|| anyhow!("no such shell session: {id}"))?;
+        drop(inner);
+        if let Some(g) = session.guard.take() {
+            g.complete(status.code());
         }
-        Ok(out)
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&exit_note(id, status));
+        Ok(Polled {
+            output: out,
+            env_mask,
+        })
+    }
+
+    /// The child's exit status once it has exited *and* the drain task has
+    /// delivered everything it wrote — reporting the exit before the drain
+    /// finishes would cut off the final lines. `None` while either is pending.
+    /// A `try_wait` error is logged and treated as still running: the next
+    /// poll asks again.
+    fn settled_exit(session: &mut Session, id: &str) -> Option<std::process::ExitStatus> {
+        let status = match session.child.try_wait() {
+            Ok(status) => status?,
+            Err(e) => {
+                tracing::warn!(
+                    session = %id,
+                    error = %e,
+                    "shell_session: could not query child exit status; will retry on next poll"
+                );
+                return None;
+            }
+        };
+        session.drain.is_finished().then_some(status)
     }
 
     /// Mark this session as having read a blocked env/credential file via
-    /// `write_stdin`; every subsequent [`Self::poll`] is reported as needing
-    /// env-assignment masking (see [`Self::needs_env_mask`]). Sticky by design:
+    /// `write_stdin`; every subsequent [`Self::poll`] reports
+    /// [`Polled::env_mask`] so the caller masks env assignments. Sticky by design:
     /// session output is drained asynchronously, so the file's contents can
     /// surface on any later poll. Unknown ids are ignored — the corresponding
     /// `write_stdin` fails on the same missing session anyway.
@@ -359,18 +457,6 @@ impl ShellSessionRegistry {
         {
             session.env_mask = true;
         }
-    }
-
-    /// Whether output polled from this session must go through
-    /// env-assignment masking (a prior `write_stdin` read a blocked
-    /// env/credential file). Unknown ids report `false`; `poll` errors on
-    /// them before masking matters.
-    pub fn needs_env_mask(&self, id: &str, caller: Option<&str>) -> bool {
-        self.lock()
-            .sessions
-            .get(id)
-            .filter(|s| Self::caller_owns(s, caller))
-            .is_some_and(|session| session.env_mask)
     }
 
     /// Terminate a session: abort its drain task, kill the child's whole
@@ -394,6 +480,23 @@ impl ShellSessionRegistry {
             g.killed();
         }
         Ok(())
+    }
+}
+
+/// The line appended to the last poll of an exited session.
+fn exit_note(id: &str, status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("[session {id} exited with code {code}]"),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                if let Some(signal) = status.signal() {
+                    return format!("[session {id} exited by signal {signal}]");
+                }
+            }
+            format!("[session {id} exited]")
+        }
     }
 }
 
@@ -462,7 +565,12 @@ fn spawn_drain(
                     }
                 }, if !sdone => {
                     match r {
-                        Ok(0) | Err(_) => {
+                        Ok(0) => {
+                            sdone = true;
+                            append(&output, &sdec.flush());
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "shell_session: stdout read failed; treating the stream as closed");
                             sdone = true;
                             append(&output, &sdec.flush());
                         }
@@ -476,7 +584,12 @@ fn spawn_drain(
                     }
                 }, if !edone => {
                     match r {
-                        Ok(0) | Err(_) => {
+                        Ok(0) => {
+                            edone = true;
+                            append(&output, &edec.flush());
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "shell_session: stderr read failed; treating the stream as closed");
                             edone = true;
                             append(&output, &edec.flush());
                         }
@@ -513,6 +626,11 @@ mod tests {
     /// Mirrors the production spawn contract documented on [`register`]:
     /// `spawn_in_own_group` so `kill`'s group signal reaches the child.
     fn spawn_cat(reg: &ShellSessionRegistry) -> String {
+        spawn_cat_as(reg, None)
+    }
+
+    /// [`spawn_cat`] registered under `owner`.
+    fn spawn_cat_as(reg: &ShellSessionRegistry, owner: Option<&str>) -> String {
         let mut cmd = Command::new("cat");
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -520,7 +638,8 @@ mod tests {
             .kill_on_drop(true);
         crate::util::process_tree::spawn_in_own_group(&mut cmd);
         let child = cmd.spawn().expect("spawn cat");
-        reg.register(child, None, TEST_CAP, None)
+        reg.register(child, None, TEST_CAP, owner.map(str::to_string))
+            .expect("register")
     }
 
     /// Poll until `needle` shows up or we give up — drain is async, so the
@@ -539,13 +658,221 @@ mod tests {
     ) -> String {
         let mut acc = String::new();
         for _ in 0..50 {
-            acc.push_str(&reg.poll(id, caller).expect("poll"));
+            acc.push_str(&reg.poll(id, caller).expect("poll").output);
             if acc.contains(needle) {
                 return acc;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         acc
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poll_reports_the_exit_code_with_the_last_output_and_removes_the_session() {
+        // Before: an exited session answered every poll with "no new output"
+        // and lived until an explicit kill. The model could not tell "quiet"
+        // from "gone", and never learned the exit code.
+        let reg = ShellSessionRegistry::new();
+        let proc_reg = crate::process_registry::ProcessRegistry::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo hi; exit 3")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::util::process_tree::spawn_in_own_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sh");
+        let pid = child.id().expect("pid");
+        let guard = proc_reg.register(
+            pid,
+            crate::process_registry::ProcessKind::RunShell,
+            "echo hi; exit 3",
+            None,
+        );
+        let guard_id = guard.id();
+        let id = reg
+            .register(child, Some(guard), TEST_CAP, None)
+            .expect("register");
+
+        let out = poll_until(&reg, &id, "exited with code 3").await;
+        assert!(
+            out.contains("hi\n"),
+            "the final output must not be cut off: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("[session {id} exited with code 3]")),
+            "the exit must be reported with its code: {out:?}"
+        );
+        assert!(
+            !reg.contains(&id),
+            "an exited session must be removed once its exit was reported"
+        );
+        assert!(
+            reg.poll(&id, None).is_err(),
+            "a later poll must say the session is gone, not 'no new output'"
+        );
+        let finished = proc_reg.snapshot().finished;
+        let entry = finished
+            .iter()
+            .find(|e| e.id == guard_id)
+            .expect("the subprocess-registry entry must be finalized");
+        assert_eq!(entry.status, crate::process_registry::ProcessStatus::Exited);
+        assert_eq!(entry.exit_code, Some(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_session_is_not_reported_as_exited() {
+        // The exit note must come from a real exit, never from a quiet child.
+        let reg = ShellSessionRegistry::new();
+        let id = spawn_cat(&reg);
+        for _ in 0..5 {
+            let out = reg.poll(&id, None).expect("poll").output;
+            assert!(
+                !out.contains("exited"),
+                "live session reported as exited: {out:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reg.contains(&id));
+        reg.kill(&id, None).await.expect("kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_session_cap_refuses_the_next_start_with_a_clear_error() {
+        // Spread the sessions over owners so only the global cap is in play.
+        let reg = ShellSessionRegistry::new();
+        let owner_of = |i: usize| format!("owner-{}", i % 4);
+        let ids: Vec<String> = (0..MAX_SESSIONS)
+            .map(|i| spawn_cat_as(&reg, Some(&owner_of(i))))
+            .collect();
+
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn cat");
+        let err = reg
+            .register(child, None, TEST_CAP, Some("owner-fresh".into()))
+            .expect_err("the cap must refuse one more session");
+        let msg = err.to_string();
+        assert!(msg.contains(&MAX_SESSIONS.to_string()), "{msg}");
+        assert!(
+            msg.contains("action=kill"),
+            "the error names the next action: {msg}"
+        );
+
+        // Killing one frees a slot.
+        reg.kill(&ids[0], Some(&owner_of(0))).await.expect("kill");
+        let freed = spawn_cat_as(&reg, Some("owner-fresh"));
+        assert!(reg.contains(&freed));
+        for (i, id) in ids.iter().enumerate().skip(1) {
+            reg.kill(id, Some(&owner_of(i))).await.expect("kill");
+        }
+        reg.kill(&freed, Some("owner-fresh")).await.expect("kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_per_owner_cap_refuses_one_conversation_without_locking_out_others() {
+        // The registry is process-global: one conversation must not be able
+        // to take every slot and lock every other channel out of sessions.
+        let reg = ShellSessionRegistry::new();
+        let mine: Vec<String> = (0..MAX_SESSIONS_PER_OWNER)
+            .map(|_| spawn_cat_as(&reg, Some("owner-a")))
+            .collect();
+
+        let mut cmd = Command::new("cat");
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn cat");
+        let msg = reg
+            .register(child, None, TEST_CAP, Some("owner-a".into()))
+            .expect_err("the per-owner cap must refuse one more session")
+            .to_string();
+        assert!(msg.contains(&MAX_SESSIONS_PER_OWNER.to_string()), "{msg}");
+        assert!(msg.contains("action=kill"), "{msg}");
+
+        // Another conversation is unaffected by owner-a's sessions.
+        let theirs = spawn_cat_as(&reg, Some("owner-b"));
+        assert!(reg.contains(&theirs));
+
+        // Killing one of owner-a's frees a slot for owner-a.
+        reg.kill(&mine[0], Some("owner-a")).await.expect("kill");
+        let freed = spawn_cat_as(&reg, Some("owner-a"));
+        assert!(reg.contains(&freed));
+
+        for id in mine.iter().skip(1) {
+            reg.kill(id, Some("owner-a")).await.expect("kill");
+        }
+        reg.kill(&freed, Some("owner-a")).await.expect("kill");
+        reg.kill(&theirs, Some("owner-b")).await.expect("kill");
+    }
+
+    /// Spawn `sh -c <script>` as a session with `cap` bytes of retained output.
+    fn spawn_sh(reg: &ShellSessionRegistry, script: &str, cap: usize) -> String {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        crate::util::process_tree::spawn_in_own_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn sh");
+        reg.register(child, None, cap, None).expect("register")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_exit_poll_carries_every_byte_written_before_exit() {
+        // The drain appends its last bytes and then finishes. A poll that took
+        // the buffer first and checked the drain second could see "finished"
+        // for bytes that landed in between — and the removal dropped them.
+        // Flood output right before the exit so that window is as wide as the
+        // real thing gets; a cut-off tail shows up as a missing last line.
+        let reg = ShellSessionRegistry::new();
+        let id = spawn_sh(&reg, "seq 1 20000; exit 3", 1024 * 1024);
+        let out = poll_until(&reg, &id, "exited with code 3").await;
+        assert!(
+            out.contains("\n19999\n20000\n"),
+            "the tail of the output was cut off before the exit note: {:?}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(!out.contains("omitted"), "nothing may be dropped: {out:?}");
+        assert!(!reg.contains(&id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_exit_poll_still_reports_the_env_mask_flag() {
+        // `poll` removes an exited session, so a flag looked up by id after the
+        // poll is gone with it — the last chunk of `cat .env; exit` would go
+        // out unmasked. The flag must travel with the output instead.
+        let reg = ShellSessionRegistry::new();
+        let id = spawn_sh(&reg, "echo KEY=value", TEST_CAP);
+        reg.mark_env_mask(&id, None);
+        let mut saw_exit = false;
+        for _ in 0..50 {
+            let polled = reg.poll(&id, None).expect("poll");
+            assert!(
+                polled.env_mask,
+                "every poll after the mark carries the flag"
+            );
+            if polled.output.contains("exited with code 0") {
+                saw_exit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_exit, "the session never reported its exit");
+        assert!(!reg.contains(&id));
     }
 
     #[cfg(unix)]
@@ -578,7 +905,7 @@ mod tests {
         reg.write_stdin(&id, "first\n", None).await.expect("write");
         let _ = poll_until(&reg, &id, "first").await;
         // Nothing new written; next poll must be empty.
-        let second = reg.poll(&id, None).expect("poll");
+        let second = reg.poll(&id, None).expect("poll").output;
         assert_eq!(second, "", "second poll with no new output must be empty");
 
         reg.write_stdin(&id, "second\n", None).await.expect("write");
@@ -608,7 +935,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP, None);
+        let id = reg.register(child, None, TEST_CAP, None).expect("register");
 
         // Move somewhere distinct from the spawn-time cwd, then ask where we are
         // on a *separate* command. A fresh-process-per-command shell would
@@ -750,7 +1077,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP, None);
+        let id = reg.register(child, None, TEST_CAP, None).expect("register");
 
         // No directory change yet: output-producing polls carry no cwd note.
         reg.write_stdin(&id, "echo before\n", None)
@@ -805,7 +1132,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP, None);
+        let id = reg.register(child, None, TEST_CAP, None).expect("register");
         // First half of the emoji, no newline — lands as its own drain chunk.
         reg.write_stdin(&id, "printf '\\360\\237'\n", None)
             .await
@@ -854,7 +1181,9 @@ mod tests {
             .kill_on_drop(true);
         crate::util::process_tree::spawn_in_own_group(&mut cmd);
         let child = cmd.spawn().expect("spawn cat");
-        let id = reg.register(child, None, TEST_CAP, Some("owner-a".into()));
+        let id = reg
+            .register(child, None, TEST_CAP, Some("owner-a".into()))
+            .expect("register");
 
         for caller in [Some("owner-b"), None] {
             let write = reg.write_stdin(&id, "stolen\n", caller).await;
@@ -940,7 +1269,7 @@ mod tests {
         // Mirror the production spawn: the child must lead its own group.
         crate::util::process_tree::spawn_in_own_group(&mut cmd);
         let child = cmd.spawn().expect("spawn sh");
-        let id = reg.register(child, None, TEST_CAP, None);
+        let id = reg.register(child, None, TEST_CAP, None).expect("register");
 
         // The shell echoes the backgrounded grandchild's PID.
         let out = poll_until(&reg, &id, "\n").await;

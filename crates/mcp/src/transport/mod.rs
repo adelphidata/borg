@@ -16,7 +16,6 @@ use crate::manifest::{ServerManifest, Transport as TransportSpec};
 use crate::protocol::Message;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
 
 pub mod http;
 pub mod sse;
@@ -51,10 +50,7 @@ pub async fn open(
                 env: env.clone(),
                 max_line_bytes: 0,
             };
-            let sink: stdio::StderrSink = Arc::new(|srv: &str, line: &str| {
-                tracing::debug!(server = %srv, line = %line, "mcp stderr");
-            });
-            let t = stdio::spawn(cfg, sink).await?;
+            let t = stdio::spawn(cfg, stdio::debug_log_sink()).await?;
             Ok(Box::new(t))
         }
         TransportSpec::Http {
@@ -268,6 +264,40 @@ pub fn absolutize_ca_path(key: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_tail_keeps_only_the_newest_lines_and_cuts_long_ones() {
+        // Spec: the tail is a bounded ring on both axes. A child that floods
+        // stderr must not grow memory, and the operator sees the *last*
+        // lines — the ones that explain why the server died.
+        let tail = stdio::StderrTail::with_limits(3, 8);
+        for i in 0..25 {
+            tail.push(&format!("line {i}"));
+        }
+        assert_eq!(tail.lines(), vec!["line 22", "line 23", "line 24"]);
+
+        tail.push("0123456789 a very long diagnostic");
+        let last = tail.lines().pop().expect("just pushed");
+        assert_eq!(last, "01234567…", "lines are cut at the character cap");
+        assert_eq!(tail.lines().len(), 3, "a push never grows past the ring");
+    }
+
+    #[test]
+    fn stderr_tail_cuts_on_a_character_boundary() {
+        let tail = stdio::StderrTail::with_limits(1, 2);
+        tail.push("éèê");
+        assert_eq!(tail.lines(), vec!["éè…"]);
+    }
+
+    #[test]
+    fn stderr_tail_sink_records_and_a_zero_limit_still_keeps_one_line() {
+        let tail = std::sync::Arc::new(stdio::StderrTail::with_limits(0, 0));
+        assert!(tail.is_empty());
+        let sink = tail.sink();
+        sink("srv", "first");
+        sink("srv", "second");
+        assert_eq!(tail.lines(), vec!["s…"]);
+    }
 
     #[test]
     fn allowlist_admits_locale_and_path_but_not_credentials() {

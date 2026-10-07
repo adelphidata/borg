@@ -4891,6 +4891,62 @@ fn openai_stream_usage_without_id_or_provider_reports_none_not_empty() {
     }
 }
 
+/// A provider error that arrives inside a 200 body must surface the
+/// provider's own message, classified like a streamed error frame, and a
+/// relay that wraps the choices in `data` must still parse. Before this,
+/// every one of these shapes was the generic fatal "No response from LLM".
+#[test]
+fn in_body_provider_errors_and_data_wrapped_choices_parse() {
+    let transport = transport::openai_compat_transport();
+    let parse = |body: serde_json::Value| transport.parse_chat_response(body, "openai", "m");
+
+    let quota = parse(serde_json::json!({
+        "error": {"message": "You exceeded your current quota", "type": "insufficient_quota"}
+    }))
+    .err()
+    .expect("an error body is not a response");
+    let quota = quota
+        .downcast::<LlmError>()
+        .expect("the error carries the classification");
+    assert_eq!(quota.reason(), FailoverReason::Billing);
+    assert!(!quota.is_retryable());
+    assert!(
+        quota.to_string().contains("exceeded your current quota"),
+        "the provider's message must reach the caller: {quota}"
+    );
+
+    let wrapped = parse(serde_json::json!({
+        "success": false,
+        "data": {"error": {"message": "Rate limit reached", "code": "rate_limit_exceeded"}}
+    }))
+    .err()
+    .expect("a success:false envelope is not a response");
+    let wrapped = wrapped
+        .downcast::<LlmError>()
+        .expect("the error carries the classification");
+    assert_eq!(wrapped.reason(), FailoverReason::RateLimit);
+    assert!(wrapped.is_retryable());
+    assert!(wrapped.to_string().contains("Rate limit reached"));
+
+    let data_wrapped = parse(serde_json::json!({
+        "data": {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+        }
+    }))
+    .expect("data-wrapped choices are a response");
+    assert_eq!(data_wrapped.message.text_content(), Some("ok"));
+    assert_eq!(data_wrapped.usage.map(|u| u.total_tokens), Some(6));
+
+    // A null error next to real choices is the normal OpenAI shape.
+    let with_null_error = parse(serde_json::json!({
+        "error": null,
+        "choices": [{"message": {"role": "assistant", "content": "fine"}}]
+    }))
+    .expect("error: null is not an error");
+    assert_eq!(with_null_error.message.text_content(), Some("fine"));
+}
+
 #[test]
 fn openai_chat_response_carries_response_id_and_upstream() {
     let with = serde_json::json!({
@@ -5158,6 +5214,102 @@ async fn drive_fixture(
         events.push(event);
     }
     (result, events)
+}
+
+/// Once the parser has seen the completion marker, every byte of the answer
+/// is in. A stall or a dropped connection after that point must end the
+/// stream as complete: retrying it would request, and pay for, the same
+/// answer a second time. The same failure before the marker stays an error.
+#[tokio::test(start_paused = true)]
+async fn a_stall_after_the_completion_marker_is_a_complete_response() {
+    use futures_util::StreamExt;
+
+    const DELTA: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"},\"finish_reason\":null}]}\n\n";
+    const FINISH: &str =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    let io_error = || std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+
+    // (name, chunks before the failure, hang instead of erroring, complete)
+    let cases = [
+        (
+            "read error after finish_reason",
+            vec![DELTA, FINISH],
+            false,
+            true,
+        ),
+        (
+            "chunk timeout after finish_reason",
+            vec![DELTA, FINISH],
+            true,
+            true,
+        ),
+        ("read error before finish_reason", vec![DELTA], false, false),
+        (
+            "chunk timeout before finish_reason",
+            vec![DELTA],
+            true,
+            false,
+        ),
+    ];
+    for (name, chunks, hang, complete) in cases {
+        let mut items: Vec<Result<Vec<u8>, std::io::Error>> = chunks
+            .into_iter()
+            .map(|c| Ok(c.as_bytes().to_vec()))
+            .collect();
+        if !hang {
+            items.push(Err(io_error()));
+        }
+        let head = futures_util::stream::iter(items);
+        let tail = if hang {
+            futures_util::stream::pending().boxed()
+        } else {
+            futures_util::stream::empty().boxed()
+        };
+        let stream = head.chain(tail);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = LlmClient::drive_transport_stream(
+            transport::openai_compat_transport(),
+            stream,
+            &tx,
+            &cancel,
+            1,
+            "openai",
+            "m",
+            |_| {},
+        )
+        .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "the answer", "{name}: the deltas reach the consumer");
+        let done = matches!(events.last(), Some(StreamEvent::Done));
+        if complete {
+            assert!(
+                result.is_ok(),
+                "{name}: must be a complete response: {result:?}"
+            );
+            assert!(done, "{name}: the consumer must get Done, got {events:?}");
+        } else {
+            let err = result.expect_err(name);
+            assert!(
+                err.is_retryable(),
+                "{name}: a cut before the marker is retried"
+            );
+            assert!(!done, "{name}: no Done for a cut answer, got {events:?}");
+        }
+    }
 }
 
 #[tokio::test]

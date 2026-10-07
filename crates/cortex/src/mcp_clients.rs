@@ -430,8 +430,14 @@ enum StartState {
     /// Started and registered; the session map now holds an entry.
     Ready,
     /// Did not start. `detail` is the cause chain; `reauth` marks the class of
-    /// failure retrying cannot fix.
-    Failed { detail: String, reauth: bool },
+    /// failure retrying cannot fix. `stderr_tail` is the last lines the child
+    /// wrote to stderr — operator diagnostics only, never shown to the model
+    /// (see the stdio transport's security notes).
+    Failed {
+        detail: String,
+        reauth: bool,
+        stderr_tail: Vec<String>,
+    },
     /// A reload removed the server while it was starting.
     Superseded,
 }
@@ -535,6 +541,7 @@ impl Drop for StartClaim {
             self.slot.state.send_replace(StartState::Failed {
                 detail: "the start task ended without reporting an outcome".to_string(),
                 reauth: false,
+                stderr_tail: Vec::new(),
             });
         }
         self.retire();
@@ -1160,7 +1167,7 @@ async fn await_pending_start(server: &str, limit: Duration) -> Option<anyhow::Er
     }?;
     match await_start(rx, limit).await {
         Some(StartState::Ready) => None,
-        Some(StartState::Failed { detail, reauth }) if reauth => Some(anyhow!(
+        Some(StartState::Failed { detail, reauth, .. }) if reauth => Some(anyhow!(
             "MCP server '{server}' failed authentication while starting: {detail}. \
              Re-add its credentials; retrying will not help."
         )),
@@ -1688,20 +1695,61 @@ pub async fn initialize(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Why a server did not start: the error chain plus the last lines the child
+/// wrote to stderr.
+///
+/// The two halves have different audiences. `error` is what the model sees
+/// when a call is refused; `stderr_tail` is for the operator (logs, audit,
+/// `/reload mcp`) and must never be folded into model-facing text — a server's
+/// stderr routinely echoes tokens.
+#[derive(Debug)]
+struct StartFailure {
+    error: anyhow::Error,
+    stderr_tail: Vec<String>,
+}
+
+impl StartFailure {
+    /// The cause chain, as the model may see it.
+    fn detail(&self) -> String {
+        // Alternate Display (`{:#}`) walks the anyhow cause chain, so the
+        // underlying McpError (e.g. "authentication failed: 401") is kept —
+        // plain `{e}` would show only the outermost context line.
+        format!("{:#}", self.error)
+    }
+
+    /// The cause chain plus the stderr tail, for operator surfaces.
+    fn operator_detail(&self) -> String {
+        with_stderr_tail(&self.detail(), &self.stderr_tail)
+    }
+}
+
+/// Append the child's recent stderr to an operator-facing failure message.
+fn with_stderr_tail(detail: &str, stderr_tail: &[String]) -> String {
+    if stderr_tail.is_empty() {
+        return detail.to_string();
+    }
+    let mut out = String::with_capacity(detail.len() + 64);
+    out.push_str(detail);
+    out.push_str("\nrecent stderr from the server:");
+    for line in stderr_tail {
+        out.push_str("\n  ");
+        out.push_str(line);
+    }
+    out
+}
+
 /// Log + audit a server that failed to start, and mark it `AuthFailed` when the
 /// operator has to intervene. Shared by the inline and background start paths so
 /// a cache-warmed server's failure is as visible as any other.
-async fn report_start_failure(server_name: &str, e: &anyhow::Error, reg: &McpRegistry) {
+async fn report_start_failure(server_name: &str, failure: &StartFailure, reg: &McpRegistry) {
+    let e = &failure.error;
     let (error_kind, reauth_required) = classify_startup_failure(e);
-    // Alternate Display (`{:#}`) walks the anyhow cause chain, so the
-    // underlying McpError (e.g. "authentication failed: 401") is kept —
-    // plain `{e}` would show only the outermost context line, hiding the
-    // reason this commit exists to surface.
-    let detail = format!("{e:#}");
+    let detail = failure.detail();
     tracing::warn!(
         server = %server_name,
         error = %detail,
         error_kind,
+        stderr_tail = ?failure.stderr_tail,
         "MCP server failed to start — continuing without it",
     );
     // An auth failure needs operator action (fix/re-add credentials) and
@@ -1728,6 +1776,7 @@ async fn report_start_failure(server_name: &str, e: &anyhow::Error, reg: &McpReg
             "server": server_name,
             "phase": "initialize",
             "reason": format!("start_server failed: {detail}"),
+            "stderr_tail": &failure.stderr_tail,
             "error_kind": error_kind,
             "reauth_required": reauth_required,
         }),
@@ -1811,14 +1860,18 @@ fn spawn_claimed_start(
         let epoch = claim.epoch();
         let refs: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
         match start_server(&name, &cfg, &config, &reg, &refs).await {
-            Err(e) => {
+            Err(failure) => {
                 if on_failure == OnStartFailure::DropTools {
                     reg.drop_server(&name);
                 }
-                let (_, reauth) = classify_startup_failure(&e);
-                let detail = format!("{e:#}");
-                report_start_failure(&name, &e, &reg).await;
-                claim.finish(StartState::Failed { detail, reauth });
+                let (_, reauth) = classify_startup_failure(&failure.error);
+                let detail = failure.detail();
+                report_start_failure(&name, &failure, &reg).await;
+                claim.finish(StartState::Failed {
+                    detail,
+                    reauth,
+                    stderr_tail: failure.stderr_tail,
+                });
             }
             Ok(()) => {
                 if server_epoch(&name) != epoch {
@@ -2108,7 +2161,11 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                 let limit = Duration::from_millis(cfg.connect_timeout_ms);
                 match await_start(rx, limit).await {
                     Some(StartState::Ready) => added.push(name),
-                    Some(StartState::Failed { detail, .. }) => failures.push((name, detail)),
+                    Some(StartState::Failed {
+                        detail,
+                        stderr_tail,
+                        ..
+                    }) => failures.push((name, with_stderr_tail(&detail, &stderr_tail))),
                     // Removed under us — it is already in `to_remove`, so
                     // reporting it here too would double-count it.
                     Some(StartState::Superseded) => {}
@@ -2142,20 +2199,28 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                 tracing::info!(server = %name, "MCP server started via reload");
                 added.push(name);
             }
-            Err(e) => {
-                let (error_kind, reauth_required) = classify_startup_failure(&e);
+            Err(failure) => {
+                let (error_kind, reauth_required) = classify_startup_failure(&failure.error);
                 // `{:#}` preserves the McpError cause through the context wrap;
-                // `err_msg` feeds the AuthFailed message, the audit reason, and
-                // the ReloadReport failures entry, so all three keep the detail.
-                let err_msg = format!("{e:#}");
+                // `err_msg` feeds the AuthFailed message and the audit reason.
+                // The ReloadReport entry is operator-facing, so it also carries
+                // the child's stderr tail.
+                let err_msg = failure.detail();
                 // Publish before the reporting below: a dispatch parked on this
                 // start should be released as soon as the outcome is known, not
                 // after an audit write.
                 claim.finish(StartState::Failed {
                     detail: err_msg.clone(),
                     reauth: reauth_required,
+                    stderr_tail: failure.stderr_tail.clone(),
                 });
-                tracing::warn!(server = %name, error = %err_msg, error_kind, "MCP reload: server failed to start");
+                tracing::warn!(
+                    server = %name,
+                    error = %err_msg,
+                    error_kind,
+                    stderr_tail = ?failure.stderr_tail,
+                    "MCP reload: server failed to start"
+                );
                 if reauth_required {
                     reg.set_health(
                         &name,
@@ -2171,12 +2236,13 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
                         "server": name,
                         "phase": "reload",
                         "reason": format!("reload start_server failed: {err_msg}"),
+                        "stderr_tail": &failure.stderr_tail,
                         "error_kind": error_kind,
                         "reauth_required": reauth_required,
                     }),
                 )
                 .await;
-                failures.push((name, err_msg));
+                failures.push((name, failure.operator_detail()));
             }
         }
     }
@@ -2200,12 +2266,35 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
     })
 }
 
+/// How long a failed start waits for the stderr pump to catch up before the
+/// transport is dropped. A child that prints its reason and exits writes
+/// those lines a few milliseconds before the handshake sees EOF; without
+/// this grace the pump is aborted with the lines still in the pipe.
+const STDERR_SETTLE_ON_FAILURE: Duration = Duration::from_millis(100);
+
 async fn start_server(
     server_name: &str,
     server_cfg: &McpServerConfig,
     config: &Config,
     reg: &McpRegistry,
     builtin: &[&str],
+) -> std::result::Result<(), StartFailure> {
+    let stderr_tail = Arc::new(mcp::transport::stdio::StderrTail::default());
+    start_server_inner(server_name, server_cfg, config, reg, builtin, &stderr_tail)
+        .await
+        .map_err(|error| StartFailure {
+            error,
+            stderr_tail: stderr_tail.lines(),
+        })
+}
+
+async fn start_server_inner(
+    server_name: &str,
+    server_cfg: &McpServerConfig,
+    config: &Config,
+    reg: &McpRegistry,
+    builtin: &[&str],
+    stderr_tail: &Arc<mcp::transport::stdio::StderrTail>,
 ) -> Result<()> {
     let manifest = server_cfg.resolve_to_manifest(server_name, config)?;
 
@@ -2260,7 +2349,7 @@ async fn start_server(
             allow_plaintext_http: config.mcp.allow_plaintext_http,
             allow_local_network: config.mcp.allow_local_network,
         };
-        let transport = match open_transport(&manifest, policy).await {
+        let transport = match open_transport(&manifest, policy, stderr_tail).await {
             Ok(t) => t,
             Err(e) => {
                 let retryable = is_http
@@ -2291,10 +2380,13 @@ async fn start_server(
                 return Err(e);
             }
         };
-        let session = SessionActor::new(&manifest, transport);
-        match discover_session(&manifest, session).await {
-            Ok(pair) => break pair,
+        let mut session = SessionActor::new(&manifest, transport);
+        match discover_session(&manifest, &mut session).await {
+            Ok(discovered) => break (session, discovered),
             Err(e) => {
+                // Let the stderr pump drain what the child said before the
+                // transport (and the pump with it) is dropped.
+                tokio::time::sleep(STDERR_SETTLE_ON_FAILURE).await;
                 if is_http && attempt < max_attempts && e.is_retryable_startup() {
                     log_startup_retry(server_name, &manifest, attempt, "handshake", &e.to_string());
                     sleep_startup_backoff(config.mcp.startup_retry_base_ms, attempt).await;
@@ -2379,8 +2471,8 @@ fn transport_label(transport: &mcp::manifest::Transport) -> &'static str {
 /// caller may recreate the transport and call this again safely.
 async fn discover_session(
     manifest: &ServerManifest,
-    mut session: SessionActor,
-) -> std::result::Result<(SessionActor, mcp::session::DiscoveredTools), mcp::errors::McpError> {
+    session: &mut SessionActor,
+) -> std::result::Result<mcp::session::DiscoveredTools, mcp::errors::McpError> {
     match tokio::time::timeout(manifest.connect_timeout, session.handshake()).await {
         Ok(res) => {
             res?;
@@ -2391,8 +2483,7 @@ async fn discover_session(
             });
         }
     }
-    let discovered = session.list_tools().await?;
-    Ok((session, discovered))
+    session.list_tools().await
 }
 
 /// Drive a freshly-opened session through handshake → tool discovery →
@@ -2405,15 +2496,17 @@ async fn handshake_and_register(
     server_name: &str,
     server_cfg: &McpServerConfig,
     manifest: &ServerManifest,
-    session: SessionActor,
+    mut session: SessionActor,
     reg: &McpRegistry,
     builtin: &[&str],
 ) -> Result<()> {
-    let (session, discovered) = discover_session(manifest, session).await.map_err(|e| {
-        anyhow::Error::new(e).context(format!(
-            "handshake/discovery failed for server '{server_name}'"
-        ))
-    })?;
+    let discovered = discover_session(manifest, &mut session)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e).context(format!(
+                "handshake/discovery failed for server '{server_name}'"
+            ))
+        })?;
     register_discovered(
         server_name,
         server_cfg,
@@ -2574,6 +2667,7 @@ async fn register_discovered(
 async fn open_transport(
     manifest: &ServerManifest,
     policy: mcp::transport::http::HttpPolicy,
+    stderr_tail: &Arc<mcp::transport::stdio::StderrTail>,
 ) -> Result<Box<dyn Transport>> {
     match &manifest.transport {
         mcp::manifest::Transport::Stdio { command, args, env } => {
@@ -2591,11 +2685,9 @@ async fn open_transport(
                 env: env.clone(),
                 max_line_bytes,
             };
-            let stderr_sink: mcp::transport::stdio::StderrSink =
-                Arc::new(|srv: &str, line: &str| {
-                    tracing::debug!(server = %srv, line = %line, "mcp stderr");
-                });
-            let t = mcp::transport::stdio::spawn(cfg, stderr_sink).await?;
+            // Operator diagnostics only: the debug log plus the bounded tail
+            // a start failure reports. Never routed to the model.
+            let t = mcp::transport::stdio::spawn(cfg, stderr_tail.sink()).await?;
             Ok(Box::new(t))
         }
         mcp::manifest::Transport::Http {
@@ -3107,11 +3199,17 @@ pub mod testing {
         }
 
         /// Publish a failure, optionally the kind re-credentialling fixes.
-        pub fn finish_failed(mut self, detail: &str, reauth: bool) {
+        pub fn finish_failed(self, detail: &str, reauth: bool) {
+            self.finish_failed_with_stderr(detail, reauth, &[]);
+        }
+
+        /// Publish a failure that also carries the child's stderr tail.
+        pub fn finish_failed_with_stderr(mut self, detail: &str, reauth: bool, stderr: &[&str]) {
             if let Some(c) = self.0.take() {
                 c.finish(StartState::Failed {
                     detail: detail.to_string(),
                     reauth,
+                    stderr_tail: stderr.iter().map(ToString::to_string).collect(),
                 });
             }
         }
@@ -3552,6 +3650,33 @@ mod tests {
         }
 
         #[test]
+        fn a_failed_start_keeps_the_child_stderr_out_of_the_model_message() {
+            let _g = guard();
+            // The stdio transport's rule: stderr never reaches the model.
+            // The start state carries the tail for the operator, and the
+            // refusal the model reads must leave it out.
+            let claim = testing::begin_start_for_test("srv", false).expect("claim");
+            let err = rt()
+                .block_on(async {
+                    let waiter = tokio::spawn(await_pending_start("srv", Duration::from_secs(30)));
+                    tokio::task::yield_now().await;
+                    claim.finish_failed_with_stderr(
+                        "spawn failed",
+                        false,
+                        &["Traceback: api_key=sk-live-123"],
+                    );
+                    waiter.await.expect("waiter")
+                })
+                .expect("a failed start must refuse the call");
+            let msg = format!("{err}");
+            assert!(msg.contains("spawn failed"), "{msg}");
+            assert!(
+                !msg.contains("sk-live-123") && !msg.contains("Traceback"),
+                "stderr leaked into the model-facing refusal: {msg}"
+            );
+        }
+
+        #[test]
         fn dispatch_passes_through_when_nothing_is_starting() {
             let _g = guard();
             let got = rt().block_on(await_pending_start("srv", Duration::from_millis(20)));
@@ -3810,12 +3935,51 @@ mod tests {
         let err = start_server("evil", &server_cfg, &cfg, &reg, &builtin_refs)
             .await
             .expect_err("exfil-shaped stdio config must be refused");
-        let msg = err.to_string();
+        let msg = err.error.to_string();
         assert!(
             msg.contains("refused stdio MCP server"),
             "expected config-rejection error, got: {msg}"
         );
         assert!(msg.contains("network egress"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_stdio_start_reports_the_child_stderr_to_the_operator_only() {
+        // A server that prints why it cannot start and exits: the operator
+        // report must carry those lines, the model-facing error must not.
+        let cfg = crate::config::Config::default();
+        let reg = McpRegistry::new();
+        let builtin = builtin_tool_names();
+        let builtin_refs: Vec<&str> = builtin.to_vec();
+        let server_cfg = stdio_cfg(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo 'fatal: BAD_FLAG token=sk-live-123' 1>&2; echo 'exit status 2' 1>&2; exit 2",
+            ],
+            &[],
+        );
+
+        let failure = start_server("dying", &server_cfg, &cfg, &reg, &builtin_refs)
+            .await
+            .expect_err("a child that exits before the handshake must fail the start");
+
+        assert_eq!(
+            failure.stderr_tail,
+            vec!["fatal: BAD_FLAG token=sk-live-123", "exit status 2"],
+            "the tail must hold what the child said, in order"
+        );
+        let operator = failure.operator_detail();
+        assert!(
+            operator.contains("sk-live-123"),
+            "operator detail must include the stderr tail: {operator}"
+        );
+        let model = failure.detail();
+        assert!(
+            !model.contains("sk-live-123") && !model.contains("exit status 2"),
+            "stderr must not be in the model-facing cause chain: {model}"
+        );
     }
 
     /// Build a stdio server config for the catalog-cache tests.

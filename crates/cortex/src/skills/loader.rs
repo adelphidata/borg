@@ -3,7 +3,13 @@
 //! gating, runs the security audit on user skills, and deduplicates by name.
 //! `reload_user_skills` re-scans disk eagerly so operators get a parse/audit
 //! signal immediately rather than on the next turn.
+//!
+//! Name collisions are deterministic: directories load in path order, a
+//! higher tier (built-in > project > user) shadows a lower one with a warning
+//! that names both paths, and two skills of one directory that declare the
+//! same name are both refused rather than one being picked at random.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -63,175 +69,266 @@ pub(super) fn contained_path(root: &std::path::Path, path: &std::path::Path) -> 
     resolved.starts_with(root).then_some(resolved)
 }
 
+/// A loaded skill plus where it came from, so a name collision can be
+/// reported by path rather than by name alone.
+pub(super) struct Candidate {
+    pub(super) skill: Skill,
+    /// The skill directory; `None` for a built-in.
+    pub(super) origin: Option<PathBuf>,
+}
+
+/// A skill that was not loaded because another of the same name outranks it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ShadowedSkill {
+    pub(super) name: String,
+    /// Directory of the skill that lost; `None` for a built-in.
+    pub(super) dropped: Option<PathBuf>,
+    /// Directory of the skill that won; `None` for a built-in.
+    pub(super) winner: Option<PathBuf>,
+    pub(super) winning_tier: SkillSource,
+}
+
+fn origin_label(origin: Option<&PathBuf>) -> String {
+    origin.map_or_else(|| "<built-in>".to_string(), |p| p.display().to_string())
+}
+
+/// Keep the first candidate per name. Candidates arrive in tier order
+/// (built-in, then project, then user) and in path order within a tier, so
+/// "first" is "highest tier, then lexicographically first directory". Every
+/// loser is returned so the caller can say which path shadowed which.
+pub(super) fn dedup_by_name(candidates: Vec<Candidate>) -> (Vec<Skill>, Vec<ShadowedSkill>) {
+    let mut winners: Vec<Candidate> = Vec::with_capacity(candidates.len());
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut shadowed = Vec::new();
+    for candidate in candidates {
+        let name = candidate.skill.manifest.name.clone();
+        match index.get(&name) {
+            Some(&i) => shadowed.push(ShadowedSkill {
+                name,
+                dropped: candidate.origin,
+                winner: winners[i].origin.clone(),
+                winning_tier: winners[i].skill.source.clone(),
+            }),
+            None => {
+                index.insert(name, winners.len());
+                winners.push(candidate);
+            }
+        }
+    }
+    (winners.into_iter().map(|c| c.skill).collect(), shadowed)
+}
+
+/// Two directories in one tier directory that declare the same frontmatter
+/// name have no sensible winner, so neither loads. Picking one would make
+/// the catalog depend on directory names the author never meant as a rank.
+fn refuse_same_dir_duplicates(loaded: &mut Vec<Candidate>) {
+    let mut by_name: HashMap<&str, Vec<String>> = HashMap::new();
+    for c in loaded.iter() {
+        by_name
+            .entry(c.skill.manifest.name.as_str())
+            .or_default()
+            .push(origin_label(c.origin.as_ref()));
+    }
+    let refused: std::collections::HashSet<String> = by_name
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(name, paths)| {
+            warn!(
+                "Skill name '{name}' is declared by more than one directory ({}); none of them \
+                 is loaded. Give each skill a unique name.",
+                paths.join(", ")
+            );
+            name.to_string()
+        })
+        .collect();
+    if !refused.is_empty() {
+        loaded.retain(|c| !refused.contains(&c.skill.manifest.name));
+    }
+}
+
 /// Load every skill directory under `dir`, tagging each with `source`.
 ///
 /// Shared by the user tier (`~/.borg/skills/`) and the project tier
 /// (`<workspace>/.borg/skills/`, `<workspace>/.agents/skills/`): both are
 /// on-disk, author-controlled skills that must clear the same security scan.
+///
+/// Entries load in path order — `read_dir` order is whatever the filesystem
+/// feels like, and the catalog must be the same on every machine.
 fn load_skills_from_dir(
     dir: &std::path::Path,
     source: SkillSource,
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
-    skills: &mut Vec<Skill>,
+    out: &mut Vec<Candidate>,
 ) {
     if !dir.exists() {
         return;
     }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let skill_file = entry.path().join("SKILL.md");
-            if skill_file.exists() {
-                match std::fs::read_to_string(&skill_file) {
-                    Ok(content) => {
-                        let dir_name = entry.file_name().to_string_lossy().to_string();
-                        // Auto-installed copies of bundled skills (written by
-                        // `install_default_skills`) are byte-identical to the
-                        // embedded version. The bundled in-memory skill is
-                        // already loaded above; loading the disk copy as a
-                        // "user skill" would trigger noisy collision/env-var
-                        // warnings for nothing. Skip silently.
-                        if BUNDLED_SKILLS.iter().any(|(_, c)| content.as_str() == *c) {
-                            // Auto-installed copy of a bundled skill;
-                            // bundled in-memory version is already loaded.
-                            continue;
-                        }
-                        match parse_skill_md(&content) {
-                            Ok((manifest, mut body)) => {
-                                let name = manifest.name.clone();
-                                let skill_dir = entry.path();
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+        Err(e) => {
+            warn!("Cannot read skills directory {}: {e}", dir.display());
+            return;
+        }
+    };
+    paths.sort();
+    let mut loaded: Vec<Candidate> = Vec::new();
+    for skill_dir in paths {
+        let skill_file = skill_dir.join("SKILL.md");
+        if skill_file.exists() {
+            match std::fs::read_to_string(&skill_file) {
+                Ok(content) => {
+                    let dir_name = skill_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    // Auto-installed copies of bundled skills (written by
+                    // `install_default_skills`) are byte-identical to the
+                    // embedded version. The bundled in-memory skill is
+                    // already loaded above; loading the disk copy as a
+                    // "user skill" would trigger noisy collision/env-var
+                    // warnings for nothing. Skip silently.
+                    if BUNDLED_SKILLS.iter().any(|(_, c)| content.as_str() == *c) {
+                        // Auto-installed copy of a bundled skill;
+                        // bundled in-memory version is already loaded.
+                        continue;
+                    }
+                    match parse_skill_md(&content) {
+                        Ok((manifest, mut body)) => {
+                            let name = manifest.name.clone();
 
-                                // Older auto-installed bundled copies remain on disk after
-                                // built-in SKILL.md updates. Treat matching built-in
-                                // directory/name pairs as bundled identity rather than
-                                // noisy conflicting user skills.
-                                if dir_name == name && bundled_skill_content(&name).is_some() {
-                                    trace!("Skipping bundled skill copy on disk for '{}'", name);
-                                    continue;
-                                }
+                            // Older auto-installed bundled copies remain on disk after
+                            // built-in SKILL.md updates. Treat matching built-in
+                            // directory/name pairs as bundled identity rather than
+                            // noisy conflicting user skills.
+                            if dir_name == name && bundled_skill_content(&name).is_some() {
+                                trace!("Skipping bundled skill copy on disk for '{}'", name);
+                                continue;
+                            }
 
-                                // Everything downstream keys off the
-                                // frontmatter name — including the
-                                // built-in-shadow check just above, which
-                                // compares the two. A directory that
-                                // disagrees loads fine but behaves as the
-                                // name it declares, so an author editing
-                                // `foo/` and seeing `bar` in the catalog
-                                // has no way to connect the two. Warn, do
-                                // not reject: existing skills must keep
-                                // loading.
-                                if dir_name != name {
-                                    warn!(
-                                        "Skill directory '{dir_name}' declares name '{name}' \
-                                             in its frontmatter; '{name}' is what the catalog, \
-                                             invocation, and built-in shadowing all use. Rename \
-                                             the directory to match."
-                                    );
-                                }
-
-                                // The directory itself may be a symlink into a
-                                // checkout elsewhere; resolve it so supporting
-                                // files can be tested against where they really
-                                // load from, not where they were discovered.
-                                let Ok(source_dir) = std::fs::canonicalize(&skill_dir) else {
-                                    warn!(
-                                        "Skipping skill '{name}': cannot resolve {}",
-                                        skill_dir.display()
-                                    );
-                                    continue;
-                                };
-
-                                // References are loaded before validation so the
-                                // security scan sees them too — an injection payload
-                                // hides just as well in a reference file as in the body.
-                                let mut references = Vec::new();
-                                let refs_dir = skill_dir.join("references");
-                                if refs_dir.is_dir() {
-                                    if let Ok(ref_entries) = std::fs::read_dir(&refs_dir) {
-                                        for ref_entry in ref_entries.flatten() {
-                                            let ref_path = ref_entry.path();
-                                            if !ref_path.extension().is_some_and(|e| e == "md") {
-                                                continue;
-                                            }
-                                            let Some(ref_path) =
-                                                contained_path(&source_dir, &ref_path)
-                                            else {
-                                                warn!(
-                                                    "Skill '{name}': ignoring reference \
-                                                         '{}' — it resolves outside the skill \
-                                                         directory",
-                                                    ref_path.display()
-                                                );
-                                                continue;
-                                            };
-                                            if let Ok(ref_content) =
-                                                std::fs::read_to_string(&ref_path)
-                                            {
-                                                let ref_name = ref_path
-                                                    .file_name()
-                                                    .unwrap_or_default()
-                                                    .to_string_lossy()
-                                                    .to_string();
-                                                references.push((ref_name, ref_content));
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let skill_config = skills_config.entries.get(&name);
-                                let outcome = skill_security::validate_user_skill(
-                                    &name,
-                                    &manifest,
-                                    &body,
-                                    &references,
-                                    &skill_file,
-                                    skill_config,
+                            // Everything downstream keys off the
+                            // frontmatter name — including the
+                            // built-in-shadow check just above, which
+                            // compares the two. A directory that
+                            // disagrees loads fine but behaves as the
+                            // name it declares, so an author editing
+                            // `foo/` and seeing `bar` in the catalog
+                            // has no way to connect the two. Warn, do
+                            // not reject: existing skills must keep
+                            // loading.
+                            if dir_name != name {
+                                warn!(
+                                    "Skill directory '{dir_name}' declares name '{name}' \
+                                         in its frontmatter; '{name}' is what the catalog, \
+                                         invocation, and built-in shadowing all use. Rename \
+                                         the directory to match."
                                 );
-                                for f in &outcome.findings {
-                                    warn!("{}", f.message);
-                                }
-                                if !outcome.allowed {
-                                    debug!("Skipping {source:?} skill '{name}' due to security findings");
-                                    continue;
-                                }
-                                if matches!(outcome.threat_level, ThreatLevel::Flagged { .. }) {
-                                    body = sanitize::wrap_with_injection_warning(&name, &body);
-                                }
+                            }
 
-                                let mut scripts = Vec::new();
-                                let scripts_dir = skill_dir.join("scripts");
-                                if scripts_dir.is_dir() {
-                                    if let Ok(script_entries) = std::fs::read_dir(&scripts_dir) {
-                                        for script_entry in script_entries.flatten() {
-                                            // Defence in depth, not a boundary:
-                                            // the agent runs skill scripts by path
-                                            // through `run_shell`, which this does
-                                            // not gate. It keeps a symlinked-out
-                                            // script from being *advertised* as
-                                            // part of the skill.
-                                            match contained_path(&source_dir, &script_entry.path())
-                                            {
-                                                Some(script) => scripts.push(script),
-                                                None => warn!(
-                                                    "Skill '{name}': ignoring script '{}' \
-                                                         — it resolves outside the skill \
-                                                         directory",
-                                                    script_entry.path().display()
-                                                ),
-                                            }
+                            // The directory itself may be a symlink into a
+                            // checkout elsewhere; resolve it so supporting
+                            // files can be tested against where they really
+                            // load from, not where they were discovered.
+                            let Ok(source_dir) = std::fs::canonicalize(&skill_dir) else {
+                                warn!(
+                                    "Skipping skill '{name}': cannot resolve {}",
+                                    skill_dir.display()
+                                );
+                                continue;
+                            };
+
+                            // References are loaded before validation so the
+                            // security scan sees them too — an injection payload
+                            // hides just as well in a reference file as in the body.
+                            let mut references = Vec::new();
+                            let refs_dir = skill_dir.join("references");
+                            if refs_dir.is_dir() {
+                                if let Ok(ref_entries) = std::fs::read_dir(&refs_dir) {
+                                    for ref_entry in ref_entries.flatten() {
+                                        let ref_path = ref_entry.path();
+                                        if !ref_path.extension().is_some_and(|e| e == "md") {
+                                            continue;
+                                        }
+                                        let Some(ref_path) = contained_path(&source_dir, &ref_path)
+                                        else {
+                                            warn!(
+                                                "Skill '{name}': ignoring reference \
+                                                     '{}' — it resolves outside the skill \
+                                                     directory",
+                                                ref_path.display()
+                                            );
+                                            continue;
+                                        };
+                                        if let Ok(ref_content) = std::fs::read_to_string(&ref_path)
+                                        {
+                                            let ref_name = ref_path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string();
+                                            references.push((ref_name, ref_content));
                                         }
                                     }
                                 }
+                            }
 
-                                let disabled = is_skill_disabled(&manifest.name, skills_config);
-                                let available = !disabled
-                                    && check_requirements(
-                                        &manifest.requires,
-                                        &manifest.os,
-                                        resolved_creds,
-                                    );
+                            let skill_config = skills_config.entries.get(&name);
+                            let outcome = skill_security::validate_user_skill(
+                                &name,
+                                &manifest,
+                                &body,
+                                &references,
+                                &skill_file,
+                                skill_config,
+                            );
+                            for f in &outcome.findings {
+                                warn!("{}", f.message);
+                            }
+                            if !outcome.allowed {
+                                debug!(
+                                    "Skipping {source:?} skill '{name}' due to security findings"
+                                );
+                                continue;
+                            }
+                            if matches!(outcome.threat_level, ThreatLevel::Flagged { .. }) {
+                                body = sanitize::wrap_with_injection_warning(&name, &body);
+                            }
 
-                                skills.push(Skill {
+                            let mut scripts = Vec::new();
+                            let scripts_dir = skill_dir.join("scripts");
+                            if scripts_dir.is_dir() {
+                                if let Ok(script_entries) = std::fs::read_dir(&scripts_dir) {
+                                    for script_entry in script_entries.flatten() {
+                                        // Defence in depth, not a boundary:
+                                        // the agent runs skill scripts by path
+                                        // through `run_shell`, which this does
+                                        // not gate. It keeps a symlinked-out
+                                        // script from being *advertised* as
+                                        // part of the skill.
+                                        match contained_path(&source_dir, &script_entry.path()) {
+                                            Some(script) => scripts.push(script),
+                                            None => warn!(
+                                                "Skill '{name}': ignoring script '{}' \
+                                                     — it resolves outside the skill \
+                                                     directory",
+                                                script_entry.path().display()
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+
+                            let disabled = is_skill_disabled(&manifest.name, skills_config);
+                            let available = !disabled
+                                && check_requirements(
+                                    &manifest.requires,
+                                    &manifest.os,
+                                    resolved_creds,
+                                );
+
+                            loaded.push(Candidate {
+                                skill: Skill {
                                     manifest,
                                     body,
                                     source: source.clone(),
@@ -239,21 +336,24 @@ fn load_skills_from_dir(
                                     disabled,
                                     references,
                                     scripts,
-                                });
-                                debug!("Loaded {source:?} skill: {name}");
-                            }
-                            Err(e) => {
-                                debug!("Failed to parse {}: {e}", skill_file.display());
-                            }
+                                },
+                                origin: Some(skill_dir.clone()),
+                            });
+                            debug!("Loaded {source:?} skill: {name}");
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse {}: {e}", skill_file.display());
                         }
                     }
-                    Err(e) => {
-                        debug!("Failed to read {}: {e}", skill_file.display());
-                    }
+                }
+                Err(e) => {
+                    debug!("Failed to read {}: {e}", skill_file.display());
                 }
             }
         }
     }
+    refuse_same_dir_duplicates(&mut loaded);
+    out.extend(loaded);
 }
 
 /// Skill directories belonging to `workspace`, highest precedence first.
@@ -311,19 +411,23 @@ pub fn install_default_skills(data_dir: &std::path::Path) -> Result<usize> {
 /// skill's name is skipped and the embedded copy is used. (The doc here used
 /// to claim the opposite, which is how the `skills diff` output came to imply
 /// that edits to a bundled skill were live.) A bundled skill's supporting
-/// files — notably `scripts/` — still run from disk.
+/// files — notably `scripts/` — still run from disk. Every other collision
+/// is resolved by tier (project over user) and logged with both paths.
 pub fn load_all_skills(
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
     workspace: Option<&std::path::Path>,
 ) -> Result<Vec<Skill>> {
-    let mut skills: Vec<Skill> = Vec::new();
+    let mut skills: Vec<Candidate> = Vec::new();
 
     {
         for &(_name, content) in BUNDLED_SKILLS {
             match load_builtin_skill(content, resolved_creds, skills_config) {
                 Ok(skill) => {
-                    skills.push(skill);
+                    skills.push(Candidate {
+                        skill,
+                        origin: None,
+                    });
                 }
                 Err(e) => {
                     debug!("Failed to load built-in skill: {e}");
@@ -358,10 +462,17 @@ pub fn load_all_skills(
         &mut skills,
     );
 
-    // Deduplicate by skill name (keep first occurrence per name)
-    let mut seen = std::collections::HashSet::new();
-    skills.retain(|s| seen.insert(s.manifest.name.clone()));
-
+    let (skills, shadowed) = dedup_by_name(skills);
+    for s in &shadowed {
+        warn!(
+            "Skill '{}' at {} is not loaded: the {:?} skill at {} has the same name and \
+             outranks it. Rename one of them.",
+            s.name,
+            origin_label(s.dropped.as_ref()),
+            s.winning_tier,
+            origin_label(s.winner.as_ref()),
+        );
+    }
     Ok(skills)
 }
 

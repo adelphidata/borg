@@ -279,6 +279,17 @@ pub enum StreamEvent {
     /// `delta.stop_reason == "max_tokens"`. Non-terminal — the SSE driver
     /// still relies on `[DONE]` / `message_stop` to end the stream.
     Truncated,
+    /// Provider stopped the response because a safety or content filter
+    /// intervened (OpenAI-compat `finish_reason` `content_filter` /
+    /// `refusal` / `guardrail_intervened` / `content_filtered`, Anthropic
+    /// `stop_reason == "refusal"`, Bedrock `guardrail_intervened` /
+    /// `content_filtered`). The text that arrived before the stop is kept and
+    /// shown with a notice naming the stop, but the turn is not a complete
+    /// answer: it is not summarized as one. Distinct from
+    /// [`Self::Truncated`] on purpose: a length cut asks for compaction, a
+    /// filtered stop does not. `reason` is the provider's own stop label.
+    /// Non-terminal.
+    ContentFiltered { reason: String },
     /// Provider signaled the response was ending because the model chose to
     /// call tools (OpenAI-compat `finish_reason == "tool_calls"`, Anthropic
     /// `stop_reason == "tool_use"`). Some providers emit this with an empty
@@ -1468,10 +1479,7 @@ impl LlmClient {
         // straight back to OpenAI — the aux pin looked applied and wasn't.
         // Same reasoning as `resolve_scheduled_model` in the task runner.
         if !same_provider {
-            synthetic.base_url = None;
-            synthetic.api_key = None;
-            synthetic.api_keys.clear();
-            synthetic.api_key_env = aux_provider.default_env_var().to_string();
+            synthetic.route_to_provider(aux_provider);
         }
         synthetic.provider = Some(provider_str);
         synthetic.model = resolved_model;
@@ -1965,7 +1973,7 @@ impl LlmClient {
         use crate::sse::StreamEnd;
 
         let mut state = transport.new_stream_state();
-        let end = match transport.stream_protocol() {
+        let outcome = match transport.stream_protocol() {
             transport::StreamProtocol::Sse => {
                 crate::sse::process_sse_stream(
                     stream,
@@ -1979,7 +1987,7 @@ impl LlmClient {
                         action
                     },
                 )
-                .await?
+                .await
             }
             transport::StreamProtocol::AwsEventStream => {
                 Self::process_bedrock_stream(
@@ -1995,8 +2003,30 @@ impl LlmClient {
                         action
                     },
                 )
-                .await?
+                .await
             }
+        };
+
+        let end = match outcome {
+            Ok(end) => end,
+            // The parser already saw the completion marker (`finish_reason`
+            // / stop reason), so every byte of the answer is in. A stall or
+            // a dropped connection after that point is the provider being
+            // slow to close, not a failed response; retrying it would
+            // request and pay for the same answer a second time.
+            Err(e)
+                if matches!(
+                    e.reason(),
+                    FailoverReason::Timeout | FailoverReason::ConnectionLost
+                ) && transport.stream_completed(&state) =>
+            {
+                tracing::debug!(
+                    provider,
+                    "stream stalled after the completion marker ({e}); treating as complete"
+                );
+                StreamEnd::Eof
+            }
+            Err(e) => return Err(e),
         };
 
         match end {
@@ -2286,6 +2316,7 @@ impl LlmClient {
 
         let mut text = String::new();
         let mut truncated = false;
+        let mut filtered: Option<String> = None;
         let mut stream_result: Option<Result<()>> = None;
         loop {
             tokio::select! {
@@ -2298,6 +2329,9 @@ impl LlmClient {
                     match ev {
                         Some(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
                         Some(StreamEvent::Truncated) => truncated = true,
+                        Some(StreamEvent::ContentFiltered { reason }) => {
+                            filtered = Some(reason);
+                        }
                         // Each attempt sends the full answer again. The
                         // output of a failed attempt (a retry, or the
                         // attempt before a failover) must not stay in
@@ -2305,6 +2339,7 @@ impl LlmClient {
                         Some(StreamEvent::AttemptStarted { .. }) => {
                             text.clear();
                             truncated = false;
+                            filtered = None;
                         }
                         Some(_) => {}
                         None => break,
@@ -2331,6 +2366,11 @@ impl LlmClient {
         } else {
             // Channel closed before the driving future resolved — settle it.
             stream_fut.await?;
+        }
+        // A filtered stop is a failed call, not a short answer: the partial
+        // text must never be stored as a complete document.
+        if let Some(reason) = filtered {
+            bail!("{provider} stopped the response before it was complete ({reason})");
         }
         Ok((Message::assistant(&text), truncated))
     }
@@ -3344,9 +3384,14 @@ impl LlmClient {
         })?
         .map_err(|e| LlmError::retryable(anyhow::Error::new(e)))?;
 
+        // A provider error carried inside a 200 body is already classified
+        // by the parser; everything else is a malformed body, which is fatal.
         let parsed = transport
             .parse_chat_response(response_json, self.provider.as_str(), &request_model)
-            .map_err(LlmError::fatal)?;
+            .map_err(|e| match e.downcast::<LlmError>() {
+                Ok(classified) => classified,
+                Err(other) => LlmError::fatal(other),
+            })?;
         log_call_completed(&request_model, parsed.usage.as_ref(), started.elapsed());
         self.emit_cost_event_best_effort(req_id, parsed.usage.as_ref(), &request_model);
         Ok(parsed.message)

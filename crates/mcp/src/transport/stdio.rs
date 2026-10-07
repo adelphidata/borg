@@ -6,9 +6,11 @@
 //!   [`super::ENV_ALLOWLIST`] plus the explicit per-server `env` block from
 //!   config. Borg's API keys never reach the child unless the operator wired
 //!   them through `${SECRET:…}` placeholders for that specific server.
-//! - **Stderr to log file.** stderr is read on a background task and routed
-//!   through the caller-supplied [`StderrSink`]. It is *never* returned to
-//!   the LLM — that would be a credential-exfiltration vector.
+//! - **Stderr to the operator only.** stderr is read on a background task and
+//!   routed through the caller-supplied [`StderrSink`] (the debug log, plus a
+//!   bounded [`StderrTail`] so a start failure can show the operator the last
+//!   lines). It is *never* returned to the LLM — that would be a
+//!   credential-exfiltration vector.
 //! - **No shell.** The command and args are passed directly to `Command`;
 //!   no `sh -c` interpolation.
 //! - **Exfil-shape refusal.** Every spawn funnels through here, so this is the
@@ -21,7 +23,7 @@ use crate::errors::{McpError, Result};
 use crate::protocol::{decode_line, Message};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -54,11 +56,98 @@ pub struct StdioConfig {
     pub max_line_bytes: usize,
 }
 
-/// Callback invoked on every line of the child's stderr.
+/// Callback invoked on every line of the child's stderr, as
+/// `(server_name, line)`.
 ///
-/// The cortex adapter wires this to `~/.borg/logs/mcp-stderr.log` with the
-/// server name prefixed. Tests can use a `Vec<String>` collector.
+/// Stderr is operator diagnostics: the daemon echoes each line to the
+/// `tracing` debug stream and records it in a [`StderrTail`] so a start
+/// failure can say *why* the server died. Nothing here reaches the model.
+/// Tests can use a `Vec<String>` collector.
 pub type StderrSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// A sink that only echoes each line to the `tracing` debug stream.
+pub fn debug_log_sink() -> StderrSink {
+    Arc::new(|server: &str, line: &str| {
+        tracing::debug!(server = %server, line = %line, "mcp stderr");
+    })
+}
+
+/// Bounded ring of a child's most recent stderr lines.
+///
+/// A server that fails to start usually says why on stderr (a missing module,
+/// a bad flag, a rejected credential) and then exits; without this the
+/// operator sees only "transport closed". Both dimensions are capped so a
+/// chatty child cannot grow the daemon's memory: at most `max_lines` lines are
+/// kept (oldest evicted first) and each is cut to `max_line_chars`.
+#[derive(Debug)]
+pub struct StderrTail {
+    lines: std::sync::Mutex<VecDeque<String>>,
+    max_lines: usize,
+    max_line_chars: usize,
+}
+
+impl Default for StderrTail {
+    fn default() -> Self {
+        Self::with_limits(Self::DEFAULT_MAX_LINES, Self::DEFAULT_MAX_LINE_CHARS)
+    }
+}
+
+impl StderrTail {
+    /// Lines kept by [`StderrTail::default`].
+    pub const DEFAULT_MAX_LINES: usize = 20;
+    /// Characters kept per line by [`StderrTail::default`].
+    pub const DEFAULT_MAX_LINE_CHARS: usize = 400;
+
+    /// A tail keeping the last `max_lines` lines of at most `max_line_chars`
+    /// characters each. Zero is treated as one — the tail is never unbounded
+    /// and never silently empty.
+    pub fn with_limits(max_lines: usize, max_line_chars: usize) -> Self {
+        Self {
+            lines: std::sync::Mutex::new(VecDeque::with_capacity(max_lines.max(1))),
+            max_lines: max_lines.max(1),
+            max_line_chars: max_line_chars.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+        self.lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record one line, evicting the oldest once the ring is full.
+    pub fn push(&self, line: &str) {
+        let mut kept: String = line.chars().take(self.max_line_chars).collect();
+        if kept.len() < line.len() {
+            kept.push('…');
+        }
+        let mut lines = self.lock();
+        if lines.len() == self.max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(kept);
+    }
+
+    /// The retained lines, oldest first.
+    pub fn lines(&self) -> Vec<String> {
+        self.lock().iter().cloned().collect()
+    }
+
+    /// Whether nothing has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// A sink that records into this tail and echoes each line to the
+    /// `tracing` debug stream.
+    pub fn sink(self: &Arc<Self>) -> StderrSink {
+        let tail = Arc::clone(self);
+        Arc::new(move |server: &str, line: &str| {
+            tracing::debug!(server = %server, line = %line, "mcp stderr");
+            tail.push(line);
+        })
+    }
+}
 
 /// Spawn the child and return a connected transport.
 pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTransport> {

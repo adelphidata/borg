@@ -222,6 +222,37 @@ pub struct Config {
 }
 
 impl Config {
+    /// Point the LLM route at `provider`, as a unit with its credentials.
+    ///
+    /// A same-provider call is a no-op: the operator's endpoint override and
+    /// keys still apply. Switching provider drops the previous provider's
+    /// `base_url`, `api_key`, `api_keys`, and re-points `api_key_env` at the
+    /// new provider's own default variable. Carrying any of them across is
+    /// worse than failing: a stale `base_url` sends the new model to the old
+    /// endpoint, a stale key is either sent to a host it was never meant for
+    /// (a credential leak) or makes `correct_provider_from_key` silently route
+    /// the request straight back to the old provider — the override looks
+    /// applied and isn't. Every override lane (compaction, sub-agent roles,
+    /// scheduled-task pins) funnels through here so none of them can regress
+    /// on its own.
+    pub fn route_llm_to_provider(&mut self, provider: &str) {
+        if self.llm.provider.as_deref() == Some(provider) {
+            return;
+        }
+        match Provider::from_str(provider) {
+            Ok(parsed) => self.llm.route_to_provider(parsed),
+            Err(e) => {
+                // Keeping the old provider's variable would send its key to
+                // whatever this name resolves to; the default name is the
+                // "unset" marker `resolve_provider` ranks last.
+                warn!(provider, error = %e, "unknown LLM provider; route keeps no credentials");
+                self.llm
+                    .reset_route_credentials(crate::constants::DEFAULT_LLM_API_KEY_ENV);
+            }
+        }
+        self.llm.provider = Some(provider.to_string());
+    }
+
     /// Applies compaction overrides to the LLM section; if none are set,
     /// returns a clone of self unchanged.
     pub fn with_compaction_overrides(&self) -> Config {
@@ -230,11 +261,12 @@ impl Config {
         }
         let mut cfg = self.clone();
         if let Some(ref provider) = self.compaction.provider {
-            cfg.llm.provider = Some(provider.clone());
+            cfg.route_llm_to_provider(provider);
         }
         if let Some(ref model) = self.compaction.model {
             cfg.llm.model = model.clone();
         }
+        // An explicit compaction credential wins over the route's default.
         if let Some(ref api_key_env) = self.compaction.api_key_env {
             cfg.llm.api_key_env = api_key_env.clone();
         }
@@ -991,5 +1023,72 @@ fn correct_provider_from_key(configured: Provider, key: &str) -> Provider {
             detected
         }
         _ => configured,
+    }
+}
+
+#[cfg(test)]
+mod route_llm_tests {
+    use super::*;
+
+    fn routed_from_openai() -> Config {
+        let mut cfg = Config::default();
+        cfg.llm.provider = Some("openai".into());
+        cfg.llm.base_url = Some("https://proxy.example/v1".into());
+        cfg.llm.api_key = Some(SecretRef::Env {
+            var: "OLD_PRIMARY_KEY".into(),
+        });
+        cfg.llm.api_keys = vec![SecretRef::Env {
+            var: "OLD_POOL_KEY".into(),
+        }];
+        cfg.llm.api_key_env = "OPENAI_API_KEY".into();
+        cfg
+    }
+
+    #[test]
+    fn route_to_known_provider_switches_credentials_as_a_unit() {
+        let mut cfg = routed_from_openai();
+        cfg.route_llm_to_provider("anthropic");
+        assert_eq!(cfg.llm.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.llm.base_url, None);
+        assert!(cfg.llm.api_key.is_none());
+        assert!(cfg.llm.api_keys.is_empty());
+        assert_eq!(
+            cfg.llm.api_key_env,
+            Provider::Anthropic.default_env_var(),
+            "the new provider's own variable must replace the old one"
+        );
+    }
+
+    #[test]
+    fn route_to_unknown_provider_drops_the_old_env_var() {
+        // A typo'd provider used to keep `OPENAI_API_KEY`, so the OpenAI key
+        // was resolved for a route that is not OpenAI.
+        let mut cfg = routed_from_openai();
+        cfg.route_llm_to_provider("not-a-provider");
+        assert_eq!(cfg.llm.provider.as_deref(), Some("not-a-provider"));
+        assert!(cfg.llm.api_key.is_none());
+        assert!(cfg.llm.api_keys.is_empty());
+        assert_eq!(cfg.llm.base_url, None);
+        assert_eq!(
+            cfg.llm.api_key_env,
+            crate::constants::DEFAULT_LLM_API_KEY_ENV,
+            "an unknown provider must fall back to the unset marker"
+        );
+    }
+
+    #[test]
+    fn route_to_same_provider_keeps_overrides() {
+        let mut cfg = routed_from_openai();
+        cfg.route_llm_to_provider("openai");
+        assert_eq!(
+            cfg.llm.base_url.as_deref(),
+            Some("https://proxy.example/v1")
+        );
+        assert!(
+            matches!(&cfg.llm.api_key, Some(SecretRef::Env { var }) if var == "OLD_PRIMARY_KEY"),
+            "same-provider route must keep the configured key"
+        );
+        assert_eq!(cfg.llm.api_keys.len(), 1);
+        assert_eq!(cfg.llm.api_key_env, "OPENAI_API_KEY");
     }
 }

@@ -4,7 +4,6 @@
 use crate::session::DaemonSessionExecutor;
 use cortex::config::Config;
 use cortex::llm::{CostEventContext, CostEventSink, LlmClient};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -77,18 +76,9 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
     let Some(provider) = provider else {
         return config;
     };
-    if config.llm.provider.as_deref() != Some(provider.as_str()) {
-        config.llm.base_url = None;
-        // Point credential resolution at the pinned provider's own env var.
-        // Leaving the old provider's keys in place doesn't fail loudly — it
-        // reroutes, which is the worse outcome.
-        if let Ok(pinned) = cortex::llm::provider::Provider::from_str(&provider) {
-            config.llm.api_key_env = pinned.default_env_var().to_string();
-        }
-        config.llm.api_key = None;
-        config.llm.api_keys.clear();
-    }
-    config.llm.provider = Some(provider);
+    // Leaving the old provider's keys in place doesn't fail loudly — it
+    // reroutes, which is the worse outcome. The shared route helper drops them.
+    config.route_llm_to_provider(&provider);
     config
 }
 

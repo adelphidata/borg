@@ -117,6 +117,9 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
             StreamEvent::ToolIntent => {
                 events.push("tool_intent".into());
             }
+            StreamEvent::ContentFiltered { reason } => {
+                events.push(format!("filtered:{reason}"));
+            }
             StreamEvent::Failover { provider, model } => {
                 events.push(format!("failover:{provider}:{model}"));
             }

@@ -814,6 +814,13 @@ mod unusable_summary_tests {
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
+    /// A provider-side filter stopped the reply. The text that arrived
+    /// reads like a complete summary, so only the stop reason tells.
+    const FILTERED: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"## Goal\\nFix the crash.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
 
     /// Spec for a summary cut at the output limit: one more request for a
     /// shorter summary; a second cut is accepted with the marker line, so
@@ -869,6 +876,14 @@ mod unusable_summary_tests {
                 bodies: &[CUT, REFUSED],
                 expected: Err(SummarizeFailure::Transient),
                 requests: 2,
+            },
+            // A filtered reply is a failed attempt, never a saved summary:
+            // its text is whatever arrived before the filter stepped in.
+            Case {
+                name: "filtered",
+                bodies: &[FILTERED, GOOD],
+                expected: Err(SummarizeFailure::Transient),
+                requests: 1,
             },
         ];
         for case in cases {

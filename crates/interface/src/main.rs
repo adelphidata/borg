@@ -705,7 +705,12 @@ async fn init_diagnostics(
         cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
         Some(guard)
     } else {
-        let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+        // Diagnostics go to stderr: stdout is the data channel for
+        // `borg ask --json` and other machine-read output, and a stray warn
+        // line there corrupts the consumer's parse.
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr);
         cortex::telemetry::install_subscriber(otel_layers, env_filter, Box::new(fmt_layer));
         None
     };

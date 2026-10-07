@@ -954,19 +954,19 @@ impl Agent {
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
-        // Use the compaction-tuned client (operator overrides + a summary
-        // output-cap floor) so a manual /compact can't truncate the summary
-        // mid-section any more than the automatic paths can.
-        let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
-        let mut llm = match self.make_llm_client_from_config(&compaction_config).await {
-            Ok(l) => l,
+        // Same lane as the automatic paths: the compaction-tuned client
+        // (operator overrides + a summary output-cap floor) with the
+        // primary-model fallback, so a manual /compact can't truncate the
+        // summary mid-section or wedge on a dead override any more than
+        // they can.
+        let max_hist = self.effective_history_budget();
+        let (dropped, failure) = match self.run_compaction_with_fallback(max_hist).await {
+            Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Manual compaction could not build a summarizer client: {e}");
                 return (before, before);
             }
         };
-        let max_hist = self.effective_history_budget();
-        let (dropped, failure) = self.run_llm_compaction(max_hist, &mut llm).await;
         // No event channel here — the caller renders the before/after counts.
         // Still record the outcome so a persistent outage latches (and gets
         // announced by the next path that can reach the user) instead of
@@ -2111,13 +2111,11 @@ impl Agent {
         // pressure and about to run LLM-based compaction.
         self.metrics.record_memory_pressure("reactive");
 
-        let compaction_config = prompt_assembly::compaction_llm_config(&self.config);
-        let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         // Whether this pass updates a prior summary (UX hint only).
         let iterative =
             crate::conversation::extract_last_compaction_summary(&self.history).is_some();
 
-        let (dropped, failure) = self.run_llm_compaction(target, &mut compaction_llm).await;
+        let (dropped, failure) = self.run_compaction_with_fallback(target).await?;
         // Fold the outcome into the outage latch. This path reports its own
         // context-overflow error below, so it suppresses the generic notice by
         // passing no channel — the message here is strictly more specific.
@@ -2152,23 +2150,30 @@ impl Agent {
             // context-size problem they don't have. The latch itself was
             // recorded above; this message is a strictly richer version of the
             // generic notice, so mark the outage announced to suppress it.
-            let text = if let Some(crate::conversation::SummarizeFailure::Persistent(category)) =
-                failure
-            {
-                if let Some(outage) = self.compaction_outage.as_mut() {
-                    outage.announced = true;
+            let text = match failure {
+                Some(crate::conversation::SummarizeFailure::Persistent(category)) => {
+                    if let Some(outage) = self.compaction_outage.as_mut() {
+                        outage.announced = true;
+                    }
+                    format!(
+                        "Context overflow, and history compaction could not run — the summarizer \
+                         could not reach the model provider ({category}). Check your API key or \
+                         billing, then retry."
+                    )
                 }
-                format!(
-                    "Context overflow, and history compaction could not run — the summarizer \
-                     could not reach the model provider ({category}). Check your API key or \
-                     billing, then retry."
-                )
-            } else {
-                format!(
+                // A transient summarizer error is not a history-size problem:
+                // telling the user to raise the budget would send them after
+                // a knob that cannot help. Say the summarizer failed.
+                Some(crate::conversation::SummarizeFailure::Transient) => format!(
+                    "Context overflow, and the history summarizer failed on this attempt, \
+                     so nothing was freed ({after_tokens} tokens, target {target}). \
+                     Send your message again; if it keeps failing, check the model provider."
+                ),
+                None => format!(
                     "Context overflow and history compaction freed nothing \
                      ({after_tokens} tokens, target {target}). \
                      Start a new session or raise `conversation.max_history_tokens`."
-                )
+                ),
             };
             let _ = event_tx.send(AgentEvent::Error(text)).await;
         }

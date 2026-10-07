@@ -326,29 +326,41 @@ pub(crate) fn default_max_shell_output_bytes() -> usize {
     1024 * 1024
 }
 
+/// Credential *files* blocked by default, matched per path component with
+/// dotted-family coverage (`.env` also covers `.env.local`). Directories come
+/// from the sandbox crate's `CREDENTIAL_HOME_PATHS`, the list the host audit
+/// also consumes (the sandbox backends deny its `SENSITIVE_HOME_PATHS` subset).
+const DEFAULT_BLOCKED_FILES: &[&str] = &[
+    ".env",
+    // direnv file: not a dotted `.env.` family member, so it needs its own
+    // entry to be covered.
+    ".envrc",
+    "credentials",
+    "private_key",
+    // SSH private keys copied outside ~/.ssh are otherwise readable.
+    // Component-family matching also covers the `.pub` counterparts, which is
+    // harmless (fail-secure).
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+];
+
+/// The default `security.blocked_paths`: sensitive home directories followed
+/// by credential file names.
+pub fn default_blocked_paths() -> Vec<String> {
+    sandbox::constants::CREDENTIAL_HOME_PATHS
+        .iter()
+        .chain(DEFAULT_BLOCKED_FILES)
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             secret_detection: true,
-            blocked_paths: vec![
-                ".ssh".into(),
-                ".aws".into(),
-                ".gnupg".into(),
-                ".config/gh".into(),
-                ".env".into(),
-                // direnv file: not a dotted `.env.` family member, so it needs
-                // its own entry to be covered.
-                ".envrc".into(),
-                "credentials".into(),
-                "private_key".into(),
-                // SSH private keys copied outside ~/.ssh are otherwise readable.
-                // Component-family matching also covers the `.pub` counterparts,
-                // which is harmless (fail-secure).
-                "id_rsa".into(),
-                "id_ed25519".into(),
-                "id_ecdsa".into(),
-                "id_dsa".into(),
-            ],
+            blocked_paths: default_blocked_paths(),
             allowed_paths: Vec::new(),
             host_audit: true,
             startup_audit: true,
@@ -456,11 +468,23 @@ mod tests {
         );
         assert_eq!(cfg.verifier, VerifierKind::Tofu);
         assert_eq!(cfg.kek_backend, KekBackend::Auto);
-        assert_eq!(cfg.blocked_paths.len(), 12);
+        assert_eq!(cfg.blocked_paths.len(), 16);
+        // Every credential home directory is a manifest-level block, so the
+        // tool layer and the host audit cannot drift apart.
+        for dir in sandbox::constants::CREDENTIAL_HOME_PATHS {
+            assert!(
+                cfg.blocked_paths.contains(&(*dir).to_string()),
+                "sandbox-denied dir {dir} missing from blocked_paths"
+            );
+        }
         assert!(cfg.blocked_paths.contains(&".ssh".to_string()));
         assert!(cfg.blocked_paths.contains(&".aws".to_string()));
         assert!(cfg.blocked_paths.contains(&".gnupg".to_string()));
         assert!(cfg.blocked_paths.contains(&".config/gh".to_string()));
+        assert!(cfg.blocked_paths.contains(&".config/gcloud".to_string()));
+        assert!(cfg.blocked_paths.contains(&".kube".to_string()));
+        assert!(cfg.blocked_paths.contains(&".docker".to_string()));
+        assert!(cfg.blocked_paths.contains(&".azure".to_string()));
         assert!(cfg.blocked_paths.contains(&".env".to_string()));
         assert!(cfg.blocked_paths.contains(&".envrc".to_string()));
         assert!(cfg.blocked_paths.contains(&"credentials".to_string()));

@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -187,6 +186,9 @@ impl GatewayServer {
             None
         };
 
+        // Probes before bind: the registry below is immutable once built, so
+        // a channel must pass its probe here or stay out. The probe schedule
+        // bounds how long this can hold the bind (`STARTUP_PROBE_BUDGET`).
         let inits = self.init_channels().await?;
         let native_channels = self.register_native_channels(&inits);
 
@@ -375,20 +377,31 @@ impl GatewayServer {
 
     /// Initialize every configured native-channel client (Telegram, Slack,
     /// Twilio, Discord, Teams, Google Chat, Signal) plus the shared TTS
-    /// synthesizer, in startup order.
+    /// synthesizer.
+    ///
+    /// The four channels with a startup probe run concurrently: each probe
+    /// retries transient failures with backoff (see `channel_init`), so a
+    /// slow one must not hold the others — or the daemon — hostage. This
+    /// runs before the TCP bind and the native-channel registry is built
+    /// once from its result, so the retry schedule is capped at
+    /// `channel_init::STARTUP_PROBE_BUDGET`: a channel that is down delays
+    /// every webhook by at most that, then stays unregistered until restart.
     async fn init_channels(&self) -> Result<ChannelInits> {
-        let (telegram_client, telegram_bot_username, telegram_secret) =
-            crate::channel::channel_init::init_telegram(&self.config).await;
+        let (
+            (telegram_client, telegram_bot_username, telegram_secret),
+            (slack_client, slack_signing_secret, slack_bot_user_id),
+            (discord_client, discord_public_key),
+            signal_client,
+        ) = tokio::join!(
+            crate::channel::channel_init::init_telegram(&self.config),
+            crate::channel::channel_init::init_slack(&self.config),
+            crate::channel::channel_init::init_discord(&self.config),
+            crate::channel::channel_init::init_signal(&self.config),
+        );
         let telegram_dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
-
-        let (slack_client, slack_signing_secret, slack_bot_user_id) =
-            crate::channel::channel_init::init_slack(&self.config).await;
 
         let (twilio_client, twilio_auth_token, twilio_phone_number, twilio_whatsapp_number) =
             crate::channel::channel_init::init_twilio(&self.config);
-
-        let (discord_client, discord_public_key) =
-            crate::channel::channel_init::init_discord(&self.config).await;
 
         // Discord voice-channel manager (feature-gated). When the
         // `discord-voice-channels` feature is on AND a bot token is
@@ -411,8 +424,6 @@ impl GatewayServer {
 
         let (google_chat_client, google_chat_token) =
             crate::channel::channel_init::init_google_chat(&self.config)?;
-
-        let signal_client = crate::channel::channel_init::init_signal(&self.config).await;
 
         // TTS synthesizer (shared between webhook and polling paths)
         let tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>> =
@@ -1479,23 +1490,24 @@ async fn available_handler(
     )
 }
 
+/// Resolve the client address a request is attributed to.
+///
+/// Proxy headers are only honored when the direct peer is loopback (a local
+/// reverse proxy or tunnel). Those proxies *append* to `X-Forwarded-For`, so
+/// the entry they wrote is the RIGHTMOST one; everything to its left is
+/// whatever the remote client sent and is attacker-controlled. Taking the
+/// leftmost entry let a client pick its own rate-limit key.
 fn extract_client_ip(
     headers: &HeaderMap,
     connect_info: &ConnectInfo<std::net::SocketAddr>,
 ) -> String {
     let peer_ip = connect_info.0.ip();
 
-    // Only trust proxy headers when the peer is a loopback address (i.e. behind a
-    // local reverse proxy). This prevents arbitrary clients from spoofing their IP
-    // via X-Forwarded-For to bypass rate limiting.
     if peer_ip.is_loopback() {
         if let Some(xff) = headers.get("x-forwarded-for") {
             if let Ok(val) = xff.to_str() {
-                if let Some(first) = val.split(',').next() {
-                    let trimmed = first.trim();
-                    if !trimmed.is_empty() {
-                        return trimmed.to_string();
-                    }
+                if let Some(last) = val.rsplit(',').map(str::trim).find(|s| !s.is_empty()) {
+                    return last.to_string();
                 }
             }
         }
@@ -1512,6 +1524,20 @@ fn extract_client_ip(
 
     // Fall back to peer address
     peer_ip.to_string()
+}
+
+/// Whether a request may skip the webhook rate limiter: only a direct
+/// loopback peer that carries NO proxy headers. A loopback peer *with*
+/// `X-Forwarded-For`/`X-Real-IP` is a tunnelled remote request, and the
+/// header value is the client's own claim — a spoofed `127.0.0.1` there must
+/// still be limited, under whatever key `extract_client_ip` resolves.
+fn rate_limit_exempt(
+    headers: &HeaderMap,
+    connect_info: &ConnectInfo<std::net::SocketAddr>,
+) -> bool {
+    SlidingWindowLimiter::is_exempt(&connect_info.0.ip())
+        && !headers.contains_key("x-forwarded-for")
+        && !headers.contains_key("x-real-ip")
 }
 
 async fn webhook_handler(
@@ -1554,13 +1580,9 @@ async fn webhook_handler_inner(
     // Rate-limit before signature verification: HMAC over an attacker-sized
     // body is the expensive part we're protecting.
     if let Some(ref limiter) = state.rate_limiter {
-        let client_ip_str = extract_client_ip(&headers, &ConnectInfo(addr));
-        let is_loopback = client_ip_str
-            .parse::<IpAddr>()
-            .map(|ip| SlidingWindowLimiter::is_exempt(&ip))
-            .unwrap_or(false);
-
-        if !is_loopback {
+        let connect_info = ConnectInfo(addr);
+        if !rate_limit_exempt(&headers, &connect_info) {
+            let client_ip_str = extract_client_ip(&headers, &connect_info);
             let allowed = limiter.lock().await.check(&client_ip_str);
             if !allowed {
                 return (
@@ -1930,13 +1952,56 @@ mod tests {
 
     #[test]
     fn extract_client_ip_xff_from_loopback() {
+        // The trusted local proxy appends its observed peer LAST; the
+        // leftmost entry is whatever the remote client chose to send.
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
         );
         let info = loopback_connect_info();
-        assert_eq!(extract_client_ip(&headers, &info), "1.2.3.4");
+        assert_eq!(extract_client_ip(&headers, &info), "5.6.7.8");
+    }
+
+    #[test]
+    fn extract_client_ip_xff_skips_trailing_empty_entry() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, 5.6.7.8, "),
+        );
+        let info = loopback_connect_info();
+        assert_eq!(extract_client_ip(&headers, &info), "5.6.7.8");
+    }
+
+    #[test]
+    fn spoofed_loopback_xff_is_still_rate_limited() {
+        // A tunnelled request reaches the gateway from a loopback peer, so a
+        // client-supplied `X-Forwarded-For: 127.0.0.1` used to look like a
+        // local caller and skip the limiter protecting the HMAC check.
+        let cases: &[(&str, &str)] = &[
+            ("x-forwarded-for", "127.0.0.1"),
+            ("x-forwarded-for", "9.9.9.9, 127.0.0.1"),
+            ("x-real-ip", "127.0.0.1"),
+            ("x-forwarded-for", "1.2.3.4"),
+        ];
+        for (name, value) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(*name, HeaderValue::from_static(value));
+            assert!(
+                !rate_limit_exempt(&headers, &loopback_connect_info()),
+                "{name}: {value} must not be exempt"
+            );
+        }
+        // Only a bare loopback peer with no proxy header is exempt.
+        assert!(rate_limit_exempt(
+            &HeaderMap::new(),
+            &loopback_connect_info()
+        ));
+        assert!(!rate_limit_exempt(
+            &HeaderMap::new(),
+            &non_loopback_connect_info()
+        ));
     }
 
     #[test]

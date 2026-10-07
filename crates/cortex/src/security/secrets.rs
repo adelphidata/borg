@@ -88,6 +88,39 @@ fn credential_assignment_key_is_real(full_match: &str) -> bool {
         .any(|kw| lower.ends_with(kw) && is_word_start(key, key.len() - kw.len()))
 }
 
+/// Post-match validator for the CLI Credential Flag pattern. An `=` form
+/// (`--token=value`) is always a credential. A space-separated value is one
+/// only when it looks like a secret: it carries a digit, `_` or `-`, or mixes
+/// case beyond a leading capital. A plain word (`followed`) or a capitalized
+/// one (`Authenticate`) is prose or help text.
+fn cli_flag_value_is_credential(full_match: &str) -> bool {
+    let after_flag = &full_match[2..];
+    let name_end = after_flag
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(after_flag.len());
+    let rest = &after_flag[name_end..];
+    if rest.starts_with('=') {
+        return true;
+    }
+    let value = rest.trim_start();
+    if value
+        .chars()
+        .any(|c| c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return true;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let tail = chars.as_str();
+    let tail_has_upper = tail.chars().any(|c| c.is_ascii_uppercase());
+    let tail_has_lower = tail.chars().any(|c| c.is_ascii_lowercase());
+    // `AbCdEf…` and `abcDef…` are mixed; `Authenticate` and `followed`
+    // are words; `ABCDEFGH` could be either, so it is masked (fail-secure).
+    (tail_has_upper && tail_has_lower) || (first.is_ascii_uppercase() && !tail_has_lower)
+}
+
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
     type Validator = Option<fn(&str) -> bool>;
     let patterns: Vec<(&str, &str, bool, Validator)> = vec![
@@ -171,7 +204,21 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             false,
             None,
         ),
-        (r"sk-[A-Za-z0-9]{48,}", "API Key", false, None),
+        // OpenRouter keys carry a `sk-or-v1-` prefix and a hex body; the
+        // hyphens keep them out of the generic `sk-` pattern below.
+        // The leading `\b` keeps a word that merely ends in the prefix
+        // (`desk-<hex>`, `task-<id>`) out of the short-floor patterns.
+        (
+            r"\bsk-or-v1-[A-Za-z0-9]{32,}",
+            "OpenRouter API Key",
+            false,
+            None,
+        ),
+        // Generic `sk-` keys. 32 is the real floor — DeepSeek issues
+        // `sk-` + 32 hex — so the old 48-char minimum let those leak bare.
+        (r"\bsk-[A-Za-z0-9]{32,}", "API Key", false, None),
+        (r"\bgsk_[A-Za-z0-9]{32,}", "Groq API Key", false, None),
+        (r"\bxai-[A-Za-z0-9]{32,}", "xAI API Key", false, None),
         (
             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
             "JWT",
@@ -188,6 +235,19 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // Slack app-level tokens (`xapp-1-...`) are distinct from the `xox*`
         // bot/user tokens above.
         (r"xapp-[0-9]-[A-Za-z0-9-]{10,}", "Slack Token", false, None),
+        // Telegram bot tokens: an 8-10 digit bot id, a colon, then exactly
+        // 35 body chars. They sit inside the Bot API URL
+        // (`/bot<token>/sendMessage`), so a logged request error carries one
+        // glued to `bot`; that literal is the only word-char lead-in allowed.
+        // The exact body length plus the trailing `\b` keeps a
+        // `<timestamp>:<40-hex sha>` pair out. capture_only so the lead-in
+        // character stays in the clear.
+        (
+            r"(?:^|[^\w]|\bbot)(\d{8,10}:[A-Za-z0-9_-]{35})\b",
+            "Telegram Bot Token",
+            true,
+            None,
+        ),
         // `(?i)` so `Password:`/`PASSWORD:` are caught, not just lowercase —
         // the case asymmetry previously let a capitalized doc line leak while
         // masking the same text lowercased. `\b` keeps the keyword from
@@ -228,10 +288,11 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // HTTP auth headers. capture_only=true masks only the credential value and
         // keeps the header name + scheme word visible for debuggability, e.g.
         // `Authorization: Bearer [REDACTED Authorization Header]`. Covers the common
-        // schemes (Bearer/Basic/Digest/token); opaque no-scheme values are left alone
-        // to avoid clobbering the scheme word on a second pass.
+        // schemes (Bearer/Basic/Digest/token, plus the Discord-style `Bot`);
+        // opaque no-scheme values are left alone to avoid clobbering the
+        // scheme word on a second pass.
         (
-            r"(?i)authorization\s*:\s*(?:bearer|basic|digest|token)\s+(\S{4,})",
+            r"(?i)authorization\s*:\s*(?:bearer|basic|digest|token|bot)\s+(\S{4,})",
             "Authorization Header",
             true,
             None,
@@ -241,6 +302,59 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         (
             r"(?i)(?:x-api-key|api[-_]?key)\s*:\s*(\S{4,})",
             "API Key Header",
+            true,
+            None,
+        ),
+        // Other opaque credential headers. `\b` keeps the names from matching
+        // inside a longer word; the value is a single token.
+        (
+            r"(?i)\bx-(?:auth|access|amz-security|vault|session)-token\s*:\s*(\S{8,})",
+            "Credential Header",
+            true,
+            None,
+        ),
+        // Session cookies. The value is masked to end-of-line because cookie
+        // strings contain `; `-separated pairs. Requiring a `name=` shape keeps
+        // prose like `Cookie: chocolate chip` untouched.
+        (
+            r"(?i)\b(?:set-)?cookie\s*:\s*([^\s=;]+=[^\r\n]{4,})",
+            "Cookie Header",
+            true,
+            None,
+        ),
+        // JSON credential fields (`"api_key": "…"`, `"access_token":"…"`,
+        // `"secret":"…"`). The header patterns above need the key to run
+        // straight into the colon, so a quoted JSON key never reached them.
+        // The key must match whole, so `"token_type": "bearer"` is kept; only
+        // the quoted value is masked and both quotes survive.
+        (
+            r#"(?i)"(?:api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|token|secret|client[-_]?secret|password|passwd|private[-_]?key)"\s*:\s*"([^"]{8,})""#,
+            "JSON Credential",
+            true,
+            None,
+        ),
+        // CLI flags carrying a credential (`--api-key=…`, `--token …`). The
+        // flag must end at the name, so `--token-file path` and
+        // `--password-stdin` stay untouched; a value may not start with `-`,
+        // so a bare flag followed by another flag is not masked. The
+        // validator keeps prose (`--token followed by…`) and help text
+        // (`--token  Authenticate…`) in the clear: a space-separated value
+        // must look like a credential. See `cli_flag_value_is_credential`.
+        (
+            r"(?i)--(?:api[-_]?key|token|access[-_]?token|auth[-_]?token|secret|client[-_]?secret|password|passwd)(?:=|\s+)([^\s=-]\S{7,})",
+            "CLI Credential Flag",
+            true,
+            Some(cli_flag_value_is_credential as fn(&str) -> bool),
+        ),
+        // A percent-encoded URL carrying a credential query parameter, e.g.
+        // a redirect target `…?next=https%3A%2F%2Fx%3Ftoken%3Dabc…`. The raw
+        // `?token=` pattern below cannot see `%3F`/`%26`/`%23` delimiters.
+        // The value stops at an encoded `&` (`%26`) or `#` (`%23`) so the
+        // next parameter (`%26page%3D2`) stays readable; any other escape
+        // is part of the value.
+        (
+            r#"(?i)%(?:3F|26|23)(?:access_token|refresh_token|id_token|auth_token|token|api[-_]?key|client_secret|secret|password|signature|sig)%3D((?:[^&#;\s"'<>%]|%[013-9A-Fa-f][0-9A-Fa-f]|%2[0-24-57-9A-Fa-f]){8,})"#,
+            "URL Query Credential",
             true,
             None,
         ),
@@ -636,11 +750,15 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "sk_live_0123456789abcdefABCDEFghijkl",
     "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
     "sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
+    "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678aBcDeFgHiJkLm",
+    "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
+    "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
     "-----BEGIN RSA PRIVATE KEY-----",
     "xoxb-1234567890-abcdefghijklmnopqrstuvwx",
     "xapp-1-A012345678BCDEFGHIJ",
+    "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX",
     r#"password="super-secret-shh""#,
     "password=hunter2trustno1",
     "postgresql://user:hunter2pw@localhost:5432/mydb",
@@ -654,6 +772,11 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     // rather than fixing a live gap.)
     "Authorization: Basic dXNlcjpwYXNzd29yZA==",
     "x-api-key: AbCdEf0123456789TokenValue",
+    "x-auth-token: AbCdEf0123456789TokenValue",
+    "Cookie: session=AbCdEf0123456789; theme=dark",
+    r#"{"api_key": "AbCdEf0123456789TokenValue"}"#,
+    "--api-key=AbCdEf0123456789TokenValue",
+    "https://app.example/login?next=https%3A%2F%2Fx.example%2Fcb%3Ftoken%3DAbCdEf0123456789Value",
     "API_KEY=AbCdEf0123456789TokenValue",
     "https://app.example/cb?access_token=AbCdEf0123456789Value",
     "https://alice:hunter2pw@git.example/repo",
@@ -1203,6 +1326,169 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(redact_secrets(input), *expected, "input: {input}");
+        }
+    }
+
+    /// Bare vendor keys that used to leak when they appeared outside a
+    /// `KEY=value` assignment or a `Bearer` header.
+    #[test]
+    fn redacts_bare_vendor_keys_table() {
+        let positives: &[(&str, &str)] = &[
+            (
+                "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "OpenRouter API Key",
+            ),
+            // DeepSeek: `sk-` + 32 hex, below the old 48-char floor.
+            ("sk-0123456789abcdef0123456789abcdef", "API Key"),
+            (
+                "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
+                "Groq API Key",
+            ),
+            (
+                "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
+                "xAI API Key",
+            ),
+            (
+                "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX",
+                "Telegram Bot Token",
+            ),
+            (
+                "https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX/sendMessage",
+                "Telegram Bot Token",
+            ),
+        ];
+        for (secret, label) in positives {
+            let input = format!("saw {secret} in the log");
+            let out = redact_with_audit(&input);
+            assert!(!out.text.contains(secret), "{label} leaked: {}", out.text);
+            assert!(
+                out.hits.iter().any(|h| h.label == *label),
+                "{secret} expected {label}, got {:?}",
+                out.hits
+            );
+        }
+        let negatives = [
+            "sk-short",
+            "sk-0123456789abcdef0123456789abcde", // 31 chars: under the floor
+            "gsk_tooshort",
+            "xai-tooshort",
+            // A word that ends in the prefix is not a key.
+            "desk-0123456789abcdef0123456789abcdef01234567",
+            "task-0123456789abcdef0123456789abcdef01234567",
+            "12:34 meeting at room 56",
+            "1234567:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", // 7-digit id
+            // `<unix timestamp>:<sha1>` from a log line.
+            "1700000000:0123456789abcdef0123456789abcdef01234567",
+            "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw", // 34-char body
+            "127.0.0.1:8080/health",
+            "2026-10-06T12:34:56Z",
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
+        }
+    }
+
+    /// Credentials in structured carriers: JSON fields, CLI flags, opaque
+    /// headers, cookies and percent-encoded query strings. Only the value
+    /// is masked; the surrounding shape stays readable.
+    #[test]
+    fn redacts_structured_credential_carriers_table() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"{"api_key": "AbCdEf0123456789TokenValue", "model": "gpt"}"#,
+                r#"{"api_key": "[REDACTED JSON Credential]", "model": "gpt"}"#,
+            ),
+            (
+                r#"{"access_token":"AbCdEf0123456789TokenValue","token_type":"bearer"}"#,
+                r#"{"access_token":"[REDACTED JSON Credential]","token_type":"bearer"}"#,
+            ),
+            (
+                r#"{"secret":"AbCdEf0123456789TokenValue"}"#,
+                r#"{"secret":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                "borg --api-key=AbCdEf0123456789TokenValue ask",
+                "borg --api-key=[REDACTED CLI Credential Flag] ask",
+            ),
+            (
+                "gh auth login --token AbCdEf0123456789TokenValue",
+                "gh auth login --token [REDACTED CLI Credential Flag]",
+            ),
+            // Space-separated values that look like credentials: `_`/`-`
+            // carriers and mixed case without a digit.
+            (
+                "vault login --token hvs_CAESIabcdefgh",
+                "vault login --token [REDACTED CLI Credential Flag]",
+            ),
+            (
+                "borg --password correctHorseBattery",
+                "borg --password [REDACTED CLI Credential Flag]",
+            ),
+            // `=` always carries a value, even a plain word.
+            (
+                "borg --token=hunterhunter",
+                "borg --token=[REDACTED CLI Credential Flag]",
+            ),
+            (
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3DAbCdEf0123456789Value%26page%3D2",
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3D[REDACTED URL Query Credential]%26page%3D2",
+            ),
+            (
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3DAbCdEf0123456789Value%23section",
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3D[REDACTED URL Query Credential]%23section",
+            ),
+            // A value with an escape other than `%26`/`%23` keeps it.
+            (
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3DAbCd%2BEf0123456789Value%26page%3D2",
+                "u=https%3A%2F%2Fy.example%2F%3Ftoken%3D[REDACTED URL Query Credential]%26page%3D2",
+            ),
+            (
+                "Cookie: session=AbCdEf0123456789; theme=dark",
+                "Cookie: [REDACTED Cookie Header]",
+            ),
+            (
+                "x-auth-token: AbCdEf0123456789TokenValue",
+                "x-auth-token: [REDACTED Credential Header]",
+            ),
+            (
+                "X-Access-Token: AbCdEf0123456789TokenValue",
+                "X-Access-Token: [REDACTED Credential Header]",
+            ),
+            (
+                "Authorization: Bot MTIzNDU2Nzg5.AbCdEf.0123456789",
+                "Authorization: Bot [REDACTED Authorization Header]",
+            ),
+            (
+                "redirect to https://x.example/login?next=https%3A%2F%2Fy.example%2Fcb%3Ftoken%3DAbCdEf0123456789Value",
+                "redirect to https://x.example/login?next=https%3A%2F%2Fy.example%2Fcb%3Ftoken%3D[REDACTED URL Query Credential]",
+            ),
+            (
+                "u=https%3A%2F%2Fy.example%2F%3Fpage%3D2%26api_key%3DAbCdEf0123456789Value",
+                "u=https%3A%2F%2Fy.example%2F%3Fpage%3D2%26api_key%3D[REDACTED URL Query Credential]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), *expected, "input: {input}");
+        }
+
+        // Ordinary text that shares a keyword with the carriers must survive.
+        let negatives = [
+            r#"{"token_type": "bearer", "expires_in": 3600}"#,
+            r#"{"secret": "short"}"#,
+            r#"{"description": "the api_key field is required"}"#,
+            "docker login --password-stdin",
+            "vault read --token-file /tmp/t",
+            "gh auth login --token --with-scopes",
+            // Prose and help text after a flag name.
+            "the --token followed by the scopes",
+            "  --token  Authenticate with a personal token",
+            "--password  Password for the registry",
+            "Cookie: chocolate chip recipe",
+            "x-auth-token-policy: strict",
+            "see https://x.example/?page=2&next=%2Fhome",
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
         }
     }
 

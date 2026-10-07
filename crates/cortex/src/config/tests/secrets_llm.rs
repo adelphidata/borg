@@ -941,3 +941,83 @@ fn provider_without_model_adopts_the_catalog_default() {
     let cfg = Config::from_setting_rows(rows(&[]));
     assert_eq!(cfg.llm.model, "");
 }
+
+/// A `[compaction]` provider override must take the route as a unit. Left in
+/// place, the main provider's `base_url` sends the summarizer to the wrong
+/// host, and the main key is either leaked to that host or makes
+/// `correct_provider_from_key` route the call straight back to the main
+/// provider — so a `compaction.api_key_env` is ignored and the override
+/// looks applied when it isn't.
+#[test]
+fn compaction_provider_override_drops_the_main_providers_route_and_keys() {
+    let main_env = "BORG_TEST_COMPACTION_MAIN_KEY";
+    let override_env = "BORG_TEST_COMPACTION_OVERRIDE_KEY";
+    std::env::set_var(main_env, "sk-ant-api03-main-provider-key");
+    std::env::set_var(override_env, "sk-or-v1-override-provider-key");
+
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("anthropic".into());
+    cfg.llm.base_url = Some("https://proxy.example/anthropic".into());
+    cfg.llm.api_key_env = main_env.into();
+    cfg.llm.api_key = Some(SecretRef::Env {
+        var: main_env.into(),
+    });
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: main_env.into(),
+    }];
+    cfg.compaction.provider = Some("openrouter".into());
+    cfg.compaction.model = Some("cheap/summarizer".into());
+
+    let routed = cfg.with_compaction_overrides();
+    assert_eq!(routed.llm.provider.as_deref(), Some("openrouter"));
+    assert_eq!(routed.llm.model, "cheap/summarizer");
+    assert_eq!(
+        routed.llm.base_url, None,
+        "the main provider's endpoint must not follow the override"
+    );
+    assert!(
+        routed.llm.api_key.is_none() && routed.llm.api_keys.is_empty(),
+        "the main provider's keys must not be sent to the override provider"
+    );
+    assert_eq!(
+        routed.llm.api_key_env, "OPENROUTER_API_KEY",
+        "credential lookup must default to the override provider's own variable"
+    );
+
+    // An explicit compaction credential wins, and it is the one that resolves:
+    // the main key must not be able to pull the route back to Anthropic.
+    cfg.compaction.api_key_env = Some(override_env.into());
+    let routed = cfg.with_compaction_overrides();
+    assert_eq!(routed.llm.api_key_env, override_env);
+    let (provider, keys) = routed
+        .resolve_api_keys()
+        .expect("override provider resolves its own key");
+    assert_eq!(provider, Provider::OpenRouter);
+    assert_eq!(keys, vec!["sk-or-v1-override-provider-key".to_string()]);
+}
+
+/// Same-provider overrides (a cheaper model on the same vendor) must keep the
+/// operator's endpoint and credentials — that is the common case and the
+/// route reset is only for a provider switch.
+#[test]
+fn compaction_override_on_the_same_provider_keeps_the_route_and_keys() {
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".into());
+    cfg.llm.base_url = Some("http://localhost:8080/v1/chat/completions".into());
+    cfg.llm.api_key_env = "BORG_TEST_SAME_PROVIDER_KEY".into();
+    cfg.llm.api_key = Some(SecretRef::Env {
+        var: "BORG_TEST_SAME_PROVIDER_KEY".into(),
+    });
+    cfg.compaction.provider = Some("openai".into());
+    cfg.compaction.model = Some("gpt-cheap".into());
+
+    let routed = cfg.with_compaction_overrides();
+    assert_eq!(routed.llm.model, "gpt-cheap");
+    assert_eq!(routed.llm.base_url, cfg.llm.base_url);
+    assert!(
+        matches!(routed.llm.api_key, Some(SecretRef::Env { ref var }) if var == "BORG_TEST_SAME_PROVIDER_KEY"),
+        "same-provider override must keep the operator's key: {:?}",
+        routed.llm.api_key
+    );
+    assert_eq!(routed.llm.api_key_env, cfg.llm.api_key_env);
+}

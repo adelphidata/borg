@@ -18,7 +18,10 @@ use crate::types::{Message, MessageContent, Role, ToolDefinition};
 
 /// Find the `claude` CLI binary on the system.
 ///
-/// Checks `CLAUDE_CLI_PATH` env var first, then falls back to PATH lookup.
+/// Checks `CLAUDE_CLI_PATH` first, then PATH, then the usual install
+/// locations under the home directory. The last step matters under a
+/// service manager: the daemon's plist sets only `HOME`, so its PATH is the
+/// bare system default and a user-local `claude` is invisible to `which`.
 pub fn detect_cli_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CLAUDE_CLI_PATH") {
         let p = PathBuf::from(&path);
@@ -26,7 +29,65 @@ pub fn detect_cli_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    which::which("claude").ok()
+    if let Ok(p) = which::which("claude") {
+        return Some(p);
+    }
+    let home = dirs::home_dir()?;
+    find_cli_in_known_locations(&home, std::path::Path::is_file)
+}
+
+/// Probe the well-known `claude` install locations, in priority order, and
+/// return the first one `exists` accepts. Pure over `home` and the
+/// existence check so a temp dir can stand in for the real home.
+///
+/// Order: the native installer (`~/.local/bin`, `~/.claude/local`), Homebrew
+/// and `/usr/local`, then the npm-style prefixes (`~/.npm-global`, bun,
+/// volta) and finally every nvm node version, newest first.
+pub(crate) fn find_cli_in_known_locations(
+    home: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let fixed = [
+        home.join(".local/bin/claude"),
+        home.join(".claude/local/claude"),
+        PathBuf::from("/opt/homebrew/bin/claude"),
+        PathBuf::from("/usr/local/bin/claude"),
+        home.join(".npm-global/bin/claude"),
+        home.join(".bun/bin/claude"),
+        home.join(".volta/bin/claude"),
+    ];
+    if let Some(found) = fixed.into_iter().find(|p| exists(p)) {
+        return Some(found);
+    }
+    nvm_node_versions_newest_first(&home.join(".nvm/versions/node"))
+        .into_iter()
+        .map(|dir| dir.join("bin/claude"))
+        .find(|p| exists(p))
+}
+
+/// Version directories under an nvm `versions/node` root (`v20.11.0`, …),
+/// newest first by numeric version — a lexical sort would rank `v9` above
+/// `v20`. Unparseable names sort last, so a stray directory can never
+/// shadow a real version.
+fn nvm_node_versions_newest_first(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<(Vec<u64>, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|e| {
+            let name = e.file_name();
+            let parsed: Vec<u64> = name
+                .to_string_lossy()
+                .trim_start_matches('v')
+                .split('.')
+                .map(|part| part.parse().unwrap_or(0))
+                .collect();
+            (parsed, e.path())
+        })
+        .collect();
+    versions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    versions.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Check if Claude CLI has valid OAuth credentials.
@@ -737,5 +798,54 @@ mod tests {
         assert_eq!(normalize_cli_model("sonnet-4.6"), "sonnet");
         assert_eq!(normalize_cli_model("claude-opus-4.6"), "opus");
         assert_eq!(normalize_cli_model("haiku-4.5"), "haiku");
+    }
+
+    /// Existence check confined to the temp home, so a real `/opt/homebrew/bin/claude`
+    /// on the developer machine cannot leak into the assertions.
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn known_locations_probe_finds_user_local_install_without_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let under_home = |p: &Path| p.starts_with(home) && p.is_file();
+
+        assert_eq!(find_cli_in_known_locations(home, under_home), None);
+
+        touch(&home.join(".bun/bin/claude"));
+        assert_eq!(
+            find_cli_in_known_locations(home, under_home),
+            Some(home.join(".bun/bin/claude"))
+        );
+
+        // The native installer location outranks a package-manager shim.
+        touch(&home.join(".local/bin/claude"));
+        assert_eq!(
+            find_cli_in_known_locations(home, under_home),
+            Some(home.join(".local/bin/claude"))
+        );
+    }
+
+    #[test]
+    fn known_locations_probe_picks_newest_nvm_node_numerically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let under_home = |p: &Path| p.starts_with(home) && p.is_file();
+        let nvm = home.join(".nvm/versions/node");
+        // v9 sorts after v20 lexically; v22 has no claude and must be skipped.
+        for v in ["v9.11.2", "v18.20.4", "v20.11.0"] {
+            touch(&nvm.join(v).join("bin/claude"));
+        }
+        std::fs::create_dir_all(nvm.join("v22.1.0/bin")).unwrap();
+        std::fs::create_dir_all(nvm.join("not-a-version/bin")).unwrap();
+        touch(&nvm.join("not-a-version/bin/claude"));
+
+        assert_eq!(
+            find_cli_in_known_locations(home, under_home),
+            Some(nvm.join("v20.11.0/bin/claude"))
+        );
     }
 }

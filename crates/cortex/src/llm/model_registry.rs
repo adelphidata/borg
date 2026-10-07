@@ -35,6 +35,18 @@ const REGISTRY: &[ModelMetadata] = &[
     // both figures match. Listed before the 4-x rows purely for readability —
     // no `claude-opus-5` prefix collides with a `claude-opus-4` row.
     ModelMetadata {
+        slug: "claude-opus-5-5",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "claude-sonnet-5-5",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
         slug: "claude-opus-5",
         context_window: 1_000_000,
         max_context_window: 1_000_000,
@@ -677,7 +689,7 @@ pub(crate) fn strip_vendor_prefix(model: &str) -> &str {
 /// same regardless of its real window.
 pub fn lookup(model: &str) -> Option<&'static ModelMetadata> {
     let canonical = strip_vendor_prefix(crate::pricing::strip_bedrock_model_shape(model));
-    let lowered = canonical.to_lowercase();
+    let lowered = crate::pricing::fold_claude_dotted_version(canonical).to_lowercase();
     let mut best: Option<&'static ModelMetadata> = None;
     for entry in REGISTRY {
         if lowered.starts_with(entry.slug) {
@@ -980,6 +992,22 @@ mod tests {
         assert_eq!(context_window_for(""), DEFAULT_CONTEXT_WINDOW);
         // Default must be non-zero so downstream budget calcs don't divide by 0.
         assert!(DEFAULT_CONTEXT_WINDOW > 0);
+    }
+
+    #[test]
+    fn dotted_claude_version_resolves_to_its_own_entry() {
+        // Without folding, `claude-sonnet-5.5` prefix-matches the
+        // `claude-sonnet-5` row: a different model's window and flags.
+        assert_eq!(
+            lookup("claude-sonnet-5.5").unwrap().slug,
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(lookup("claude-opus-5.5").unwrap().slug, "claude-opus-5-5");
+        assert_eq!(
+            lookup("anthropic/claude-opus-5.5").unwrap().slug,
+            "claude-opus-5-5"
+        );
+        assert_eq!(lookup("gpt-5.5").unwrap().slug, "gpt-5.5");
     }
 
     #[test]

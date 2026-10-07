@@ -759,6 +759,35 @@ mod tests {
     }
 
     #[test]
+    fn default_blocklist_covers_cloud_cli_credential_dirs() {
+        // Cloud and cluster CLIs keep long-lived tokens under their own home
+        // dirs; the default list must deny them without any user config.
+        // `application_default_credentials.json` is not a `credentials.*`
+        // family member, so only the directory entry can cover it.
+        let home = dirs::home_dir().unwrap();
+        let blocked = crate::config::SecurityConfig::default().blocked_paths;
+        let denied = [
+            ".kube/config",
+            ".config/gcloud/application_default_credentials.json",
+            ".config/gcloud/access_tokens.db",
+            ".docker/config.json",
+            ".azure/accessTokens.json",
+        ];
+        for rel in denied {
+            assert!(
+                is_blocked_path(&home.join(rel), &blocked, &[]),
+                "~/{rel} must be blocked by default"
+            );
+        }
+        // A sibling under `.config` that is not a credential store stays open.
+        assert!(!is_blocked_path(
+            &home.join(".config/nvim/init.lua"),
+            &blocked,
+            &[]
+        ));
+    }
+
+    #[test]
     fn is_blocked_path_family_match_does_not_overblock() {
         let home = dirs::home_dir().unwrap();
         // Names that merely share a prefix (no dot boundary) must stay allowed.

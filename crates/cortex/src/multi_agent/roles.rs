@@ -52,13 +52,33 @@ pub fn builtin_role(name: &str) -> Option<AgentRole> {
         })
 }
 
+/// Decode a role's stored `tools_allowed` column.
+///
+/// `None` (nothing stored) stays `None`: no restriction. A stored list is
+/// returned as-is, `[]` included. A value that does not decode as a string
+/// array fails closed to "no tools" with a warning — treating corrupt JSON as
+/// "unrestricted" would hand a locked-down role every tool without a trace.
+fn decode_stored_tools_allowed(role: &str, json: Option<String>) -> Option<Vec<String>> {
+    let json = json?;
+    match serde_json::from_str::<Vec<String>>(&json) {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(
+                role,
+                error = %e,
+                "stored tools_allowed is not a JSON array of tool names; the role runs \
+                 with no tools until it is updated"
+            );
+            Some(Vec::new())
+        }
+    }
+}
+
 /// Load a role from the database, falling back to built-in defaults.
 pub async fn load_role(name: &str) -> Option<AgentRole> {
     if let Ok(db) = Database::open().await {
         if let Ok(Some(row)) = db.get_role(name).await {
-            let tools_allowed = row
-                .tools_allowed
-                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+            let tools_allowed = decode_stored_tools_allowed(&row.name, row.tools_allowed);
             return Some(AgentRole {
                 name: row.name,
                 description: row.description,
@@ -85,9 +105,7 @@ pub async fn list_all_roles() -> Vec<AgentRole> {
         if let Ok(db_roles) = db.list_roles().await {
             for row in db_roles {
                 seen.insert(row.name.clone());
-                let tools_allowed = row
-                    .tools_allowed
-                    .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+                let tools_allowed = decode_stored_tools_allowed(&row.name, row.tools_allowed);
                 roles.push(AgentRole {
                     name: row.name,
                     description: row.description,
@@ -116,6 +134,35 @@ pub async fn list_all_roles() -> Vec<AgentRole> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored allowlist that no longer decodes must fail closed. Mapping it
+    /// to `None` would hand a locked-down role every tool with no trace; `[]`
+    /// is "no tools", which is the safe reading of a list we cannot read.
+    #[test]
+    fn corrupt_stored_tools_allowed_means_no_tools_not_every_tool() {
+        assert_eq!(decode_stored_tools_allowed("r", None), None);
+        assert_eq!(
+            decode_stored_tools_allowed("r", Some(r#"["fs_read"]"#.into())),
+            Some(vec!["fs_read".to_string()])
+        );
+        assert_eq!(
+            decode_stored_tools_allowed("r", Some("[]".into())),
+            Some(Vec::new()),
+            "an explicit empty list stays empty"
+        );
+        for corrupt in [
+            "not json",
+            r#"{"fs_read": true}"#,
+            r#"["fs_read", 7]"#,
+            "null",
+        ] {
+            assert_eq!(
+                decode_stored_tools_allowed("r", Some(corrupt.into())),
+                Some(Vec::new()),
+                "{corrupt:?} must decode to an empty allowlist, never to unrestricted"
+            );
+        }
+    }
 
     #[test]
     fn test_builtin_role_nonexistent() {

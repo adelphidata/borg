@@ -678,6 +678,21 @@ async fn sweep_subprocess_registry(
                 );
                 crate::activity_log::log_activity(db, "warn", "process_registry", &line).await;
             }
+            // A signal that did not land is not a kill: the process is still
+            // running and the entry stays registered for the next sweep.
+            for entry in &auto_report.signal_failed {
+                let line = format!(
+                    "could not signal subprocess (still running, will retry next sweep) \
+                     id={} pid={} kind={} age={}s cmd={:?}",
+                    entry.id,
+                    entry.pid,
+                    entry.kind.tag(),
+                    now.saturating_sub(entry.started_at),
+                    entry.command
+                );
+                tracing::warn!("maintenance: {line}");
+                crate::activity_log::log_activity(db, "warn", "process_registry", &line).await;
+            }
 
             // Repeat-offender: same normalized command auto-reaped two
             // sweeps in a row → surface a persistent warning hinting

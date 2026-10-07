@@ -1018,35 +1018,10 @@ Rules:
                 }
             }
 
-            let compaction_config = compaction_llm_config(&self.config);
-            let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
-            let (mut dropped_count, mut failure) =
-                self.run_llm_compaction(max_hist, &mut compaction_llm).await;
-
-            // A `[compaction]` override that stops working (retired model
-            // slug, dead key) would otherwise wedge compaction forever: the
-            // summarizer bails without mutating history, history stays over
-            // budget, and every future turn repeats the failure. Retry once
-            // with the primary client before giving up for this turn.
-            if dropped_count == 0
-                && self.config.compaction.has_overrides()
-                && history_tokens(&self.history) > max_hist
-            {
-                warn!(
-                    "compaction via [compaction] override made no progress; retrying with the primary model"
-                );
-                let mut primary_llm = self.make_llm_client_from_config(&self.config).await?;
-                // The primary's verdict replaces the override's: if the primary
-                // can summarize, there is no outage to report — and if it can't
-                // either, the outage is real rather than an override typo.
-                let (retry_dropped, retry_failure) =
-                    self.run_llm_compaction(max_hist, &mut primary_llm).await;
-                dropped_count = retry_dropped;
-                failure = retry_failure;
-            }
+            let (dropped_count, failure) = self.run_compaction_with_fallback(max_hist).await?;
 
             self.record_compaction_outcome(dropped_count, failure, Some(event_tx))
                 .await;
@@ -1228,6 +1203,41 @@ Rules:
     /// [`crate::conversation::project_history`] while the raw rows stay on disk
     /// (non-destructive).
     ///
+    /// One LLM compaction pass to `target` with the operator's `[compaction]`
+    /// override client, retried once on the primary client when the override
+    /// makes no progress and history is still over `target`.
+    ///
+    /// A `[compaction]` override that stops working (retired model slug, dead
+    /// key) would otherwise wedge compaction forever: the summarizer bails
+    /// without mutating history, history stays over budget, and every later
+    /// pass repeats the failure. The primary's verdict replaces the override's:
+    /// if the primary can summarize there is no outage to report, and if it
+    /// can't either the outage is real rather than an override typo.
+    ///
+    /// Every compaction lane — proactive, reactive (context overflow), and
+    /// manual `/compact` — goes through here, so none of them can lose the
+    /// fallback on its own. Errors are client-construction failures only (no
+    /// provider, no key); summarizer failures come back as the failure class.
+    pub(super) async fn run_compaction_with_fallback(
+        &mut self,
+        target: usize,
+    ) -> Result<(usize, Option<SummarizeFailure>)> {
+        let compaction_config = compaction_llm_config(&self.config);
+        let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
+        let (dropped, failure) = self.run_llm_compaction(target, &mut compaction_llm).await;
+        if dropped > 0
+            || !self.config.compaction.has_overrides()
+            || history_tokens(&self.history) <= target
+        {
+            return Ok((dropped, failure));
+        }
+        warn!(
+            "compaction via [compaction] override made no progress; retrying with the primary model"
+        );
+        let mut primary_llm = self.make_llm_client_from_config(&self.config).await?;
+        Ok(self.run_llm_compaction(target, &mut primary_llm).await)
+    }
+
     /// Returns the number of messages dropped from the working view (0 = no-op).
     /// Returns how many messages were dropped, plus the summarizer's failure
     /// class when it produced nothing — the caller decides whether to keep

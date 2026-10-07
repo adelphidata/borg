@@ -18,8 +18,9 @@
 //! — songbird's `receive` feature + per-user RTP routing isn't wired here.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -237,6 +238,24 @@ pub fn spawn_voice_manager(bot_token: String, cortex_config: CortexConfig) -> Vo
 /// with the manager task so `DrainTranscripts` can hand them out.
 type TranscriptInbox = Arc<Mutex<Vec<String>>>;
 
+/// Transcripts kept per guild between `DrainTranscripts` calls. Past this
+/// the oldest is dropped: a channel nobody drains must not grow without
+/// bound.
+const MAX_INBOX_TRANSCRIPTS: usize = 256;
+
+/// Append a transcript, evicting the oldest once the inbox is full.
+async fn push_transcript(inbox: &TranscriptInbox, transcript: String) {
+    let mut v = inbox.lock().await;
+    if v.len() >= MAX_INBOX_TRANSCRIPTS {
+        warn!(
+            cap = MAX_INBOX_TRANSCRIPTS,
+            "voice transcript inbox full; dropping the oldest transcript"
+        );
+        v.remove(0);
+    }
+    v.push(transcript);
+}
+
 struct GuildState {
     driver: Driver,
     /// Target voice channel for this guild's connection. songbird 0.6's
@@ -250,6 +269,55 @@ struct GuildState {
     /// Buffer of transcripts captured from other speakers in this voice
     /// channel since the last `DrainTranscripts` call.
     inbox: TranscriptInbox,
+    /// The inbound speaker handler for this driver. Kept so a channel
+    /// switch can clear its per-speaker buffers.
+    inbound: InboundVoiceHandler,
+    /// Times a handler was registered on `driver`. The driver appends
+    /// global handlers rather than replacing them, so anything above one
+    /// transcribes every utterance that many times.
+    inbound_registrations: u32,
+}
+
+impl GuildState {
+    /// Fresh driver for `channel_id` with the inbound handler registered
+    /// exactly once — the only place a handler is ever added.
+    fn new(channel_id: u64, cortex_config: Arc<CortexConfig>) -> Self {
+        let inbox: TranscriptInbox = Arc::new(Mutex::new(Vec::new()));
+        let inbound = InboundVoiceHandler::new(inbox.clone(), cortex_config);
+        let mut state = Self {
+            driver: Driver::new(SongbirdConfig::default()),
+            channel_id,
+            pending_session_id: None,
+            pending_endpoint_token: None,
+            join_replies: Vec::new(),
+            inbox,
+            inbound,
+            inbound_registrations: 0,
+        };
+        state.register_inbound();
+        state
+    }
+
+    fn register_inbound(&mut self) {
+        self.driver.add_global_event(
+            Event::Core(songbird::CoreEvent::SpeakingStateUpdate),
+            self.inbound.clone(),
+        );
+        self.driver.add_global_event(
+            Event::Core(songbird::CoreEvent::VoiceTick),
+            self.inbound.clone(),
+        );
+        self.inbound_registrations += 1;
+    }
+
+    /// Drop audio and transcripts that belong to the previous channel so
+    /// nothing said there surfaces after a switch, and forget cached
+    /// speaker verdicts so the new channel re-reads pairing state.
+    async fn clear_inbound(&self) {
+        self.inbox.lock().await.clear();
+        self.inbound.speakers.lock().await.clear();
+        self.inbound.verdicts.lock().await.clear();
+    }
 }
 
 /// Per-(guild,user) → current voice channel cache. Populated from
@@ -425,28 +493,18 @@ where
             // Send op-4 VOICE_STATE_UPDATE; record reply for the
             // event handler to complete when both halves arrive.
             let mut g = guilds.lock().await;
-            let entry = g.entry(guild_id).or_insert_with(|| GuildState {
-                driver: Driver::new(SongbirdConfig::default()),
-                channel_id,
-                pending_session_id: None,
-                pending_endpoint_token: None,
-                join_replies: Vec::new(),
-                inbox: Arc::new(Mutex::new(Vec::new())),
-            });
-            // Reflect the current target channel on rejoin to a different one.
-            entry.channel_id = channel_id;
+            // The inbound handler is registered once, when the guild state
+            // is created; a rejoin reuses it.
+            let entry = g
+                .entry(guild_id)
+                .or_insert_with(|| GuildState::new(channel_id, cortex_config.clone()));
+            if entry.channel_id != channel_id {
+                // Switching channels: audio buffered for the old channel
+                // must not be transcribed into the new one.
+                entry.clear_inbound().await;
+                entry.channel_id = channel_id;
+            }
             entry.join_replies.push(reply);
-            // Register inbound voice handler the first time we touch
-            // this guild (no-op on repeat). Bridges songbird's decoded
-            // PCM stream → STT → inbox.
-            let handler = InboundVoiceHandler::new(entry.inbox.clone(), cortex_config.clone());
-            entry.driver.add_global_event(
-                Event::Core(songbird::CoreEvent::SpeakingStateUpdate),
-                handler.clone(),
-            );
-            entry
-                .driver
-                .add_global_event(Event::Core(songbird::CoreEvent::VoiceTick), handler);
             let payload = serde_json::json!({
                 "op": 4,
                 "d": {
@@ -676,6 +734,30 @@ const SILENT_TICKS_THRESHOLD: u32 = 50;
 /// almost always button-clicks or filler.
 const MIN_FLUSH_SAMPLES_48K_STEREO: usize = (48_000 * 2) / 4; // 250 ms
 
+/// Per-speaker PCM cap: 60 s of 48 kHz stereo (~11.5 MB). A source that
+/// never goes silent (an open mic, a music bot) stops accumulating here;
+/// what is buffered still flushes on the next silence.
+const MAX_SPEAKER_PCM_SAMPLES: usize = 48_000 * 2 * 60;
+
+/// How long a speaker verdict is cached, approved or denied. A denial must
+/// expire so a speaker who pairs on the text channel while in voice is heard
+/// without rejoining; an approval must expire so a sender revoked through
+/// the admin API stops being transcribed without a channel switch.
+const VERDICT_TTL: Duration = Duration::from_secs(60);
+
+/// A cached pairing verdict for one speaker in this guild.
+#[derive(Clone, Copy)]
+struct SpeakerVerdict {
+    allowed: bool,
+    checked_at: Instant,
+}
+
+impl SpeakerVerdict {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.duration_since(self.checked_at) < VERDICT_TTL
+    }
+}
+
 #[derive(Clone)]
 struct InboundVoiceHandler {
     inbox: TranscriptInbox,
@@ -683,6 +765,13 @@ struct InboundVoiceHandler {
     /// SSRC → SpeakerBuffer. Locked behind a Mutex because songbird's
     /// EventHandler::act is async and the per-tick rate is bursty.
     speakers: Arc<Mutex<HashMap<u32, SpeakerBuffer>>>,
+    /// Discord user id → pairing verdict, so one speaker costs one database
+    /// read per channel session rather than one per flushed utterance.
+    /// Cleared by [`GuildState::clear_inbound`] on a channel switch.
+    verdicts: Arc<Mutex<HashMap<u64, SpeakerVerdict>>>,
+    /// Times the pairing check opened the database. A test seam that
+    /// proves the verdict cache holds.
+    db_opens: Arc<AtomicUsize>,
 }
 
 impl InboundVoiceHandler {
@@ -691,6 +780,71 @@ impl InboundVoiceHandler {
             inbox,
             cortex_config,
             speakers: Arc::new(Mutex::new(HashMap::new())),
+            verdicts: Arc::new(Mutex::new(HashMap::new())),
+            db_opens: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Whether a speaker may be transcribed, evaluated before any audio
+    /// reaches an STT provider. The gate is read-only: it asks whether the
+    /// sender is already paired and never mints a code, because every
+    /// flushed utterance runs through here and `check_sender_access` would
+    /// expire the code the speaker was just sent on the text channel. A
+    /// speaker with no known user id passes only under an open policy —
+    /// pairing cannot have approved an anonymous SSRC.
+    async fn speaker_allowed(&self, user_id: Option<u64>) -> bool {
+        use cortex::pairing::{resolve_dm_policy, DmPolicy};
+        match resolve_dm_policy(&self.cortex_config, "discord") {
+            DmPolicy::Open => true,
+            DmPolicy::Disabled => false,
+            DmPolicy::Pairing => {
+                let Some(uid) = user_id else {
+                    return false;
+                };
+                let now = Instant::now();
+                if let Some(v) = self.verdicts.lock().await.get(&uid) {
+                    if v.is_fresh(now) {
+                        return v.allowed;
+                    }
+                }
+                let Some(allowed) = self.read_pairing_verdict(uid).await else {
+                    // Database unavailable: deny this utterance, cache
+                    // nothing so the next one retries.
+                    return false;
+                };
+                self.verdicts.lock().await.insert(
+                    uid,
+                    SpeakerVerdict {
+                        allowed,
+                        checked_at: now,
+                    },
+                );
+                allowed
+            }
+        }
+    }
+
+    /// One read of `approved_senders` for `uid`. `None` when the database
+    /// could not answer.
+    async fn read_pairing_verdict(&self, uid: u64) -> Option<bool> {
+        self.db_opens.fetch_add(1, Ordering::Relaxed);
+        let db = match cortex::db::Database::open_with_timeout(
+            cortex::db::Database::GATEWAY_BUSY_TIMEOUT_MS,
+        )
+        .await
+        {
+            Ok(db) => db,
+            Err(e) => {
+                warn!(error = %e, "voice speaker access check: database unavailable");
+                return None;
+            }
+        };
+        match db.is_sender_approved("discord", &uid.to_string()).await {
+            Ok(approved) => Some(approved),
+            Err(e) => {
+                warn!(error = %e, "voice speaker access check failed");
+                None
+            }
         }
     }
 
@@ -710,7 +864,16 @@ impl InboundVoiceHandler {
                     silent_ticks: 0,
                     user_id: None,
                 });
-                entry.pcm.extend_from_slice(pcm);
+                let room = MAX_SPEAKER_PCM_SAMPLES.saturating_sub(entry.pcm.len());
+                if room > 0 {
+                    entry.pcm.extend_from_slice(&pcm[..pcm.len().min(room)]);
+                    if entry.pcm.len() >= MAX_SPEAKER_PCM_SAMPLES {
+                        warn!(
+                            ssrc,
+                            "speaker buffer full; dropping further audio until silence"
+                        );
+                    }
+                }
                 entry.silent_ticks = 0;
             }
         }
@@ -737,6 +900,10 @@ impl InboundVoiceHandler {
         }
         drop(speakers);
         for (ssrc, buf) in to_flush {
+            if !self.speaker_allowed(buf.user_id).await {
+                debug!(ssrc, user_id = ?buf.user_id, "speaker not allowed; audio dropped");
+                continue;
+            }
             if let Err(e) = flush_buffer_to_inbox(ssrc, buf, &self.inbox, &self.cortex_config).await
             {
                 debug!(ssrc, error = %e, "inbound voice flush failed");
@@ -777,7 +944,9 @@ impl EventHandler for InboundVoiceHandler {
 
 /// Convert a SpeakerBuffer's 48 kHz stereo PCM into 16 kHz mono WAV bytes,
 /// run it through the configured STT pipeline, and append the transcript
-/// to the inbox. Best-effort — any failure is logged and dropped.
+/// to the inbox. Best-effort — any failure is logged and dropped. The
+/// caller has already passed the speaker through
+/// [`InboundVoiceHandler::speaker_allowed`].
 async fn flush_buffer_to_inbox(
     ssrc: u32,
     buf: SpeakerBuffer,
@@ -804,7 +973,7 @@ async fn flush_buffer_to_inbox(
                 Some(uid) => format!("[<@{uid}>]: {transcript}"),
                 None => transcript,
             };
-            inbox.lock().await.push(prefixed);
+            push_transcript(inbox, prefixed).await;
         }
         Err(e) => debug!(ssrc, error = %e, "discord voice STT failed"),
     }
@@ -1083,14 +1252,136 @@ mod tests {
     }
 
     fn test_guild_state(channel_id: u64) -> GuildState {
-        GuildState {
-            driver: Driver::new(SongbirdConfig::default()),
-            channel_id,
-            pending_session_id: None,
-            pending_endpoint_token: None,
-            join_replies: Vec::new(),
-            inbox: Arc::new(Mutex::new(Vec::new())),
+        GuildState::new(channel_id, Arc::new(CortexConfig::default()))
+    }
+
+    async fn join(
+        sink: &mut futures::channel::mpsc::UnboundedSender<Message>,
+        guilds: &Arc<Mutex<HashMap<u64, GuildState>>>,
+        config: &Arc<CortexConfig>,
+        channel_id: u64,
+    ) {
+        let (tx, _rx) = oneshot::channel();
+        handle_command(
+            VoiceCommand::Join {
+                guild_id: 1,
+                channel_id,
+                reply: tx,
+            },
+            sink,
+            guilds,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::new())),
+            config.clone(),
+            "t",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Spec: the inbound handler is registered on a guild's driver once.
+    /// The driver appends handlers, so a rejoin that registered again
+    /// would transcribe every utterance twice.
+    ///
+    /// songbird's `Driver` exposes no handler count, so this reads the
+    /// `inbound_registrations` counter that `register_inbound` bumps. The
+    /// assertion guards against a reintroduced second `register_inbound`
+    /// call on the rejoin path (the regression this test was written
+    /// for), not against the counter's own arithmetic.
+    #[tokio::test]
+    async fn rejoin_registers_inbound_handler_once() {
+        let (mut sink, _sent) = futures::channel::mpsc::unbounded::<Message>();
+        let guilds: Arc<Mutex<HashMap<u64, GuildState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let config = Arc::new(CortexConfig::default());
+
+        join(&mut sink, &guilds, &config, 777).await;
+        join(&mut sink, &guilds, &config, 777).await;
+        join(&mut sink, &guilds, &config, 778).await;
+
+        let g = guilds.lock().await;
+        assert_eq!(
+            g.get(&1).unwrap().inbound_registrations,
+            1,
+            "handler must be registered once per call, not per join"
+        );
+    }
+
+    /// Spec: switching channels discards audio and transcripts buffered
+    /// for the old channel; rejoining the same channel keeps them.
+    #[tokio::test]
+    async fn switching_channels_clears_buffered_audio_and_transcripts() {
+        let (mut sink, _sent) = futures::channel::mpsc::unbounded::<Message>();
+        let guilds: Arc<Mutex<HashMap<u64, GuildState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let config = Arc::new(CortexConfig::default());
+
+        join(&mut sink, &guilds, &config, 777).await;
+        {
+            let g = guilds.lock().await;
+            let state = g.get(&1).unwrap();
+            state.inbox.lock().await.push("said in 777".to_string());
+            let pcm = vec![1i16; 960];
+            state
+                .inbound
+                .on_voice_tick(&[(10, Some(pcm.as_slice()))], &[])
+                .await;
         }
+
+        // Same channel: nothing is lost.
+        join(&mut sink, &guilds, &config, 777).await;
+        {
+            let g = guilds.lock().await;
+            let state = g.get(&1).unwrap();
+            assert_eq!(state.inbox.lock().await.len(), 1);
+            assert_eq!(state.inbound.speakers.lock().await.len(), 1);
+        }
+
+        // Different channel: both buffers are cleared.
+        join(&mut sink, &guilds, &config, 778).await;
+        let g = guilds.lock().await;
+        let state = g.get(&1).unwrap();
+        assert_eq!(state.channel_id, 778);
+        assert!(
+            state.inbox.lock().await.is_empty(),
+            "old channel's transcripts must not leak into the new one"
+        );
+        assert!(
+            state.inbound.speakers.lock().await.is_empty(),
+            "old channel's audio must not be transcribed later"
+        );
+    }
+
+    /// Spec: the inbox is bounded; past the cap the oldest transcript goes.
+    #[tokio::test]
+    async fn inbox_drops_oldest_past_cap() {
+        let inbox: TranscriptInbox = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..=MAX_INBOX_TRANSCRIPTS {
+            push_transcript(&inbox, format!("t{i}")).await;
+        }
+        let v = inbox.lock().await;
+        assert_eq!(v.len(), MAX_INBOX_TRANSCRIPTS);
+        assert_eq!(v.first().map(String::as_str), Some("t1"), "oldest dropped");
+        assert_eq!(
+            v.last().map(String::as_str),
+            Some(&*format!("t{MAX_INBOX_TRANSCRIPTS}"))
+        );
+    }
+
+    /// Spec: a speaker who never goes silent stops accumulating at the cap
+    /// instead of growing without bound.
+    #[tokio::test]
+    async fn speaker_buffer_stops_growing_at_cap() {
+        let handler = handler_with_stub_stt("unused");
+        let chunk = vec![1i16; MAX_SPEAKER_PCM_SAMPLES / 2 + 1000];
+        for _ in 0..3 {
+            handler
+                .on_voice_tick(&[(10, Some(chunk.as_slice()))], &[])
+                .await;
+        }
+        let speakers = handler.speakers.lock().await;
+        assert_eq!(
+            speakers.get(&10).unwrap().pcm.len(),
+            MAX_SPEAKER_PCM_SAMPLES
+        );
     }
 
     type EventState = (
@@ -1448,6 +1739,12 @@ mod tests {
     /// Handler whose STT is the hermetic command-template provider — the
     /// transcript is whatever the shell command prints. No network, no keys.
     fn handler_with_stub_stt(transcript: &str) -> InboundVoiceHandler {
+        let mut config = stub_stt_config(transcript);
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        InboundVoiceHandler::new(Arc::new(Mutex::new(Vec::new())), Arc::new(config))
+    }
+
+    fn stub_stt_config(transcript: &str) -> CortexConfig {
         let mut config = CortexConfig::default();
         config.audio.enabled = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
@@ -1461,7 +1758,223 @@ mod tests {
             xai_stt_diarize: None,
             command: Some(format!(": {{audio_file}} && printf '{transcript}'")),
         }];
+        config
+    }
+
+    /// Spec: speaker access is checked before any audio reaches STT. Under
+    /// a disabled policy no speaker is transcribed; under pairing an SSRC
+    /// with no known user id cannot have been approved and is dropped.
+    #[tokio::test]
+    async fn denied_speaker_is_not_transcribed() {
+        let mut disabled = stub_stt_config("leaked");
+        disabled.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        let mut pairing = stub_stt_config("leaked");
+        pairing.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
+
+        for (label, config, user) in [
+            ("disabled policy", disabled, Some(4242u64)),
+            ("pairing, anonymous ssrc", pairing, None),
+        ] {
+            let handler =
+                InboundVoiceHandler::new(Arc::new(Mutex::new(Vec::new())), Arc::new(config));
+            if let Some(uid) = user {
+                handler.act(&speaking_update(10, uid)).await;
+            }
+            let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
+            handler
+                .on_voice_tick(&[(10, Some(pcm.as_slice()))], &[])
+                .await;
+            for _ in 0..SILENT_TICKS_THRESHOLD {
+                handler.on_voice_tick(&[], &[10]).await;
+            }
+            assert!(
+                handler.inbox.lock().await.is_empty(),
+                "{label}: denied speaker must not be transcribed"
+            );
+        }
+    }
+
+    /// A fresh `BORG_HOME` so the pairing tables start empty and nothing
+    /// touches the developer's real database.
+    struct VoiceHome {
+        _tmp: tempfile::TempDir,
+        _guard: crate::test_env::BorgHomeGuard,
+    }
+
+    fn hermetic_home() -> VoiceHome {
+        let guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
+        VoiceHome {
+            _tmp: tmp,
+            _guard: guard,
+        }
+    }
+
+    impl Drop for VoiceHome {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("BORG_HOME") };
+        }
+    }
+
+    async fn open_test_db() -> cortex::db::Database {
+        cortex::db::Database::open_with_timeout(cortex::db::Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .await
+            .unwrap()
+    }
+
+    async fn approve_discord_sender(db: &cortex::db::Database, uid: u64) {
+        let code = format!("dc/test-code-{uid}");
+        db.create_pairing_request("discord", &uid.to_string(), &code, None, 600)
+            .await
+            .unwrap();
+        db.approve_pairing("discord", &code).await.unwrap();
+    }
+
+    /// One complete utterance from `uid` on `ssrc`: a speaking update, a
+    /// tick of audio above the flush floor, then enough silence to flush.
+    async fn utter(handler: &InboundVoiceHandler, ssrc: u32, uid: u64) {
+        handler.act(&speaking_update(ssrc, uid)).await;
+        let pcm = vec![100i16; MIN_FLUSH_SAMPLES_48K_STEREO];
+        handler
+            .on_voice_tick(&[(ssrc, Some(pcm.as_slice()))], &[])
+            .await;
+        for _ in 0..SILENT_TICKS_THRESHOLD {
+            handler.on_voice_tick(&[], &[ssrc]).await;
+        }
+    }
+
+    fn pairing_handler(transcript: &str) -> InboundVoiceHandler {
+        let mut config = stub_stt_config(transcript);
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
         InboundVoiceHandler::new(Arc::new(Mutex::new(Vec::new())), Arc::new(config))
+    }
+
+    /// Spec: under pairing an unapproved speaker is dropped, and the check
+    /// is read-only. Routing it through the text path's access check would
+    /// mint a fresh code on every utterance and expire the one the speaker
+    /// was just sent on the text channel.
+    #[tokio::test]
+    async fn unpaired_speaker_is_denied_without_minting_a_pairing_code() {
+        let _home = hermetic_home();
+        let handler = pairing_handler("leaked");
+
+        utter(&handler, 10, 4242).await;
+
+        assert!(
+            handler.inbox.lock().await.is_empty(),
+            "unpaired speaker must not be transcribed"
+        );
+        let db = open_test_db().await;
+        assert!(
+            db.find_pending_for_sender("discord", "4242")
+                .await
+                .unwrap()
+                .is_none(),
+            "voice gate must not create a pairing request"
+        );
+        assert_eq!(
+            db.count_pairing_attempts("discord", "4242", 3600)
+                .await
+                .unwrap(),
+            0,
+            "voice gate must not count as a pairing attempt"
+        );
+    }
+
+    /// Spec: an approved speaker is transcribed, and the verdict is read
+    /// from the database once per speaker, not once per utterance.
+    #[tokio::test]
+    async fn approved_speaker_is_transcribed_and_verdict_is_cached() {
+        let _home = hermetic_home();
+        approve_discord_sender(&open_test_db().await, 4242).await;
+        let handler = pairing_handler("hello");
+
+        utter(&handler, 10, 4242).await;
+        utter(&handler, 10, 4242).await;
+
+        assert_eq!(
+            handler.inbox.lock().await.as_slice(),
+            ["[<@4242>]: hello", "[<@4242>]: hello"],
+        );
+        assert_eq!(
+            handler.db_opens.load(Ordering::Relaxed),
+            1,
+            "second utterance from the same speaker must hit the cache"
+        );
+    }
+
+    /// Spec: an approval is cached only for the verdict TTL, so a sender
+    /// revoked through the admin API stops being transcribed once the cached
+    /// verdict ages out, without a channel switch or a daemon restart.
+    #[tokio::test]
+    async fn revoked_speaker_is_denied_once_the_cached_approval_ages_out() {
+        let _home = hermetic_home();
+        let db = open_test_db().await;
+        approve_discord_sender(&db, 4242).await;
+        let handler = pairing_handler("hello");
+
+        utter(&handler, 10, 4242).await;
+        assert_eq!(handler.inbox.lock().await.as_slice(), ["[<@4242>]: hello"]);
+
+        assert!(
+            db.revoke_sender("discord", "4242")
+                .await
+                .expect("revoke sender"),
+            "the approved sender row must exist to be revoked"
+        );
+        let expired = Instant::now()
+            .checked_sub(VERDICT_TTL + Duration::from_secs(1))
+            .expect("instant arithmetic");
+        handler
+            .verdicts
+            .lock()
+            .await
+            .get_mut(&4242)
+            .expect("verdict cached after the first utterance")
+            .checked_at = expired;
+
+        utter(&handler, 10, 4242).await;
+        assert_eq!(
+            handler.inbox.lock().await.as_slice(),
+            ["[<@4242>]: hello"],
+            "a revoked speaker must not be transcribed after the verdict expires"
+        );
+        assert_eq!(
+            handler.db_opens.load(Ordering::Relaxed),
+            2,
+            "the expired approval must be re-read from the database"
+        );
+    }
+
+    /// Spec: a cached denial survives an approval until the channel is
+    /// switched (or the denial ages out), and a switch re-reads pairing
+    /// state so the newly approved speaker is heard.
+    #[tokio::test]
+    async fn channel_switch_forgets_cached_speaker_verdicts() {
+        let _home = hermetic_home();
+        let mut config = stub_stt_config("hello");
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
+        let state = GuildState::new(777, Arc::new(config));
+        let handler = &state.inbound;
+
+        utter(handler, 10, 4242).await;
+        approve_discord_sender(&open_test_db().await, 4242).await;
+        utter(handler, 10, 4242).await;
+        assert!(
+            handler.inbox.lock().await.is_empty(),
+            "denial is cached for the channel session"
+        );
+        assert_eq!(handler.db_opens.load(Ordering::Relaxed), 1);
+
+        state.clear_inbound().await;
+        utter(handler, 10, 4242).await;
+        assert_eq!(
+            handler.inbox.lock().await.as_slice(),
+            ["[<@4242>]: hello"],
+            "a channel switch must re-read pairing state"
+        );
+        assert_eq!(handler.db_opens.load(Ordering::Relaxed), 2);
     }
 
     fn speaking_update(ssrc: u32, user_id: u64) -> EventContext<'static> {

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mcp::transport::stdio::{spawn, StderrSink, StdioConfig};
+use mcp::transport::stdio::{spawn, StderrSink, StderrTail, StdioConfig};
 use mcp::transport::Transport;
 
 /// Serializes env-mutation across cases. `std::env::set_var` is
@@ -250,6 +250,36 @@ async fn explicit_env_reaches_child_after_clear() {
         Some("abc 123 with spaces \"quoted\""),
         "explicit env entry did not reach child (observed: {observed:?})",
     );
+}
+
+#[tokio::test]
+async fn stderr_tail_captures_what_a_dying_child_said() {
+    // Spec: a server that prints its reason and exits leaves that reason in
+    // the tail, in order, so the start-failure report can show it.
+    let _lock = env_lock();
+    let tail = Arc::new(StderrTail::default());
+    let stdio = cfg(
+        "/bin/sh",
+        &[
+            "-c",
+            "echo 'ModuleNotFoundError: no module named foo' 1>&2; echo 'exit 1' 1>&2; exit 1",
+        ],
+        HashMap::new(),
+    );
+    let mut t = spawn(stdio, tail.sink()).await.expect("spawn sh");
+    let mut lines = Vec::new();
+    for _ in 0..40 {
+        lines = tail.lines();
+        if lines.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        lines,
+        vec!["ModuleNotFoundError: no module named foo", "exit 1"]
+    );
+    let _ = t.close().await;
 }
 
 #[tokio::test]

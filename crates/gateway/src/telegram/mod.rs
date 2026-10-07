@@ -78,24 +78,38 @@ pub async fn enrich_parsed_message(
         if let Some(transcriber) =
             cortex::media::understanding::AudioTranscriber::from_config(config)
         {
-            match async {
+            // Download and transcription fail differently for the agent:
+            // a missing file is "[audio could not be downloaded]", a file
+            // that arrived but produced no text says why.
+            let downloaded = async {
                 let file_info = client.get_file(&audio.file_id).await?;
                 let file_path = file_info
                     .file_path
-                    .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-                let bytes = client.download_file(file_path).await?;
+                let bytes = client.download_file(&file_path).await?;
                 let filename = file_path
                     .rsplit('/')
                     .next()
                     .unwrap_or("audio.ogg")
                     .to_string();
-                let lang = config.audio.language.as_deref();
-                transcriber
-                    .transcribe(&bytes, &audio.mime_type, &filename, lang)
-                    .await
+                Ok::<_, anyhow::Error>((bytes, filename))
             }
-            .await
+            .await;
+            let (bytes, filename) = match downloaded {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("Telegram audio download failed: {e}");
+                    crate::message_processing::media_failure::append_download_failure(
+                        &mut parsed.inbound.text,
+                        "audio",
+                    );
+                    return;
+                }
+            };
+            let lang = config.audio.language.as_deref();
+            match transcriber
+                .transcribe(&bytes, &audio.mime_type, &filename, lang)
+                .await
             {
                 Ok((transcript, _attempts)) => {
                     parsed.inbound.text = format!("{VOICE_TRANSCRIPT_PREFIX}{transcript}");
@@ -118,6 +132,16 @@ pub async fn enrich_parsed_message(
                 }
                 Err(e) => {
                     tracing::warn!("Audio transcription failed: {e}");
+                    // "[Voice message]" alone reads as if the note were
+                    // empty; tell the agent the note exists and why it has
+                    // no text.
+                    let placeholder =
+                        crate::message_processing::voice::transcription_failure_placeholder(&e);
+                    parsed.inbound.text = if parsed.inbound.text.trim().is_empty() {
+                        placeholder
+                    } else {
+                        format!("{}\n{placeholder}", parsed.inbound.text)
+                    };
                 }
             }
         }
@@ -419,6 +443,112 @@ mod tests {
         // MockServer verifies the sendMessage expect(1) on drop; verify
         // explicitly so a missing echo fails here with context.
         server.verify().await;
+    }
+
+    /// A note that downloaded but failed STT must tell the agent so — a
+    /// bare "[Voice message]" reads as an empty note. The placeholder
+    /// names the reason without echoing the provider's error body.
+    #[tokio::test]
+    async fn enrich_appends_transcription_failure_note_when_stt_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottesttok/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "file_id": "vf2",
+                    "file_unique_id": "u3",
+                    "file_size": 1500,
+                    "file_path": "voice/b.oga"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottesttok/voice/b.oga"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1500]))
+            .mount(&server)
+            .await;
+
+        let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
+        let mut config = cortex::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            // Exits non-zero: the engine reports a provider failure.
+            command: Some("echo secret-host-detail >&2; : '{audio_file}'; exit 7".to_string()),
+        }];
+
+        let mut parsed = parse_body(
+            r#"{
+                "update_id": 33,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 4242, "type": "private" },
+                    "date": 1700000000,
+                    "voice": { "file_id": "vf2", "file_unique_id": "u3", "duration": 3 }
+                }
+            }"#,
+        )
+        .await;
+
+        enrich_parsed_message(&client, &config, &mut parsed).await;
+
+        assert_eq!(
+            parsed.inbound.text,
+            "[Voice message]\n[audio could not be transcribed: provider error]"
+        );
+    }
+
+    /// A voice note whose file never arrives is a download failure, not a
+    /// transcription failure — the two placeholders must stay distinct.
+    #[tokio::test]
+    async fn enrich_appends_download_failure_note_when_voice_fetch_fails() {
+        let client = api::TelegramClient::with_base("testtok", "http://127.0.0.1:9").unwrap();
+        let mut config = cortex::config::Config::default();
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some("cat '{audio_file}'".to_string()),
+        }];
+        let mut parsed = parse_body(
+            r#"{
+                "update_id": 34,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 4242, "type": "private" },
+                    "date": 1700000000,
+                    "voice": { "file_id": "vf3", "file_unique_id": "u4", "duration": 3 }
+                }
+            }"#,
+        )
+        .await;
+
+        enrich_parsed_message(&client, &config, &mut parsed).await;
+
+        assert_eq!(
+            parsed.inbound.text,
+            "[Voice message]\n[audio could not be downloaded]"
+        );
     }
 
     #[tokio::test]

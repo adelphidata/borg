@@ -4,9 +4,9 @@
 //! intentionally minimal — additions widen the trust surface and should come
 //! with a rationale in the commit message.
 //!
-//! Note: [`SENSITIVE_HOME_PATHS`] overlaps semantically with
-//! `cortex::config::security::blocked_paths`, but the sandbox copy is
-//! defense-in-depth and intentionally redundant. Do not cross-link them.
+//! Note: [`CREDENTIAL_HOME_PATHS`] feeds `cortex::config::security::blocked_paths`
+//! and the host audit; [`SENSITIVE_HOME_PATHS`] is the smaller sandbox deny
+//! list. A test keeps the sandbox list a subset of the tool list.
 
 /// Parent environment variables forwarded into sandboxed subprocesses.
 /// Everything not in this list is stripped. Order is not significant.
@@ -84,9 +84,33 @@ pub const SAFE_ENV_VARS: &[&str] = &["PATH", "TEMP", "TMP"];
 pub const STANDARD_EXEC_PATHS: &[&str] =
     &["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 
-/// Sensitive subpaths under `$HOME` that the Seatbelt profile denies reads
-/// to as a defense-in-depth backstop, even though `file-read*` is broadly
-/// allowed. Mirrors the manifest-level `blocked_paths` filter.
+/// Credential directories under `$HOME` that the tool layer hides by default:
+/// the manifest-level `security.blocked_paths` default and the host audit's
+/// permission check both consume this list. It is a superset of
+/// [`SENSITIVE_HOME_PATHS`].
+///
+/// Entries here are *not* denied by the sandbox backends: cloud and container
+/// CLIs (`kubectl`, `docker`, `gcloud`, `az`) read these directories to work
+/// at all, so denying them in the sandbox breaks every command that uses
+/// them. The tool layer blocks direct reads instead.
+pub const CREDENTIAL_HOME_PATHS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gh",
+    // Cloud CLIs keep long-lived refresh tokens here
+    // (`application_default_credentials.json`, `accessTokens.json`).
+    ".config/gcloud",
+    ".azure",
+    // Cluster and registry credentials (`config`, `config.json`).
+    ".kube",
+    ".docker",
+];
+
+/// Sensitive subpaths under `$HOME` that the Seatbelt and Bubblewrap profiles
+/// deny reads to as a defense-in-depth backstop, even though `file-read*` is
+/// broadly allowed. Must stay a subset of [`CREDENTIAL_HOME_PATHS`]; only
+/// directories no sandboxed command legitimately needs belong here.
 pub const SENSITIVE_HOME_PATHS: &[&str] = &[".ssh", ".aws", ".gnupg", ".config/gh"];
 
 /// Host system directories Bubblewrap binds read-only into every sandboxed
@@ -213,13 +237,43 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_deny_list_is_subset_of_tool_blocklist() {
+        // The sandbox may only deny what the tool layer already hides; a
+        // directory denied by the sandbox but readable by `fs_read` would be
+        // an inconsistent boundary.
+        let tool: HashSet<&&str> = CREDENTIAL_HOME_PATHS.iter().collect();
+        for p in SENSITIVE_HOME_PATHS {
+            assert!(
+                tool.contains(p),
+                "{p} denied by sandbox but not blocked by tools"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_credential_dirs_are_tool_blocked_but_not_sandbox_denied() {
+        // `kubectl`, `docker`, `gcloud` and `az` must keep working inside the
+        // sandbox, so their config dirs are hidden from direct tool reads
+        // only. Regression guard for a sandbox profile that broke them.
+        let sandbox: HashSet<&&str> = SENSITIVE_HOME_PATHS.iter().collect();
+        let tool: HashSet<&&str> = CREDENTIAL_HOME_PATHS.iter().collect();
+        for p in [".kube", ".docker", ".config/gcloud", ".azure"] {
+            assert!(tool.contains(&p), "{p} missing from CREDENTIAL_HOME_PATHS");
+            assert!(
+                !sandbox.contains(&p),
+                "{p} must not be denied by the sandbox"
+            );
+        }
+    }
+
+    #[test]
     fn sensitive_home_paths_are_dotfiles_not_root_paths() {
         // Each entry MUST be a relative path under $HOME — a leading `/`
         // here would mis-construct the Seatbelt rule and produce a
         // never-matching pattern (silent security regression).
-        for p in SENSITIVE_HOME_PATHS {
+        for p in SENSITIVE_HOME_PATHS.iter().chain(CREDENTIAL_HOME_PATHS) {
             assert!(!p.starts_with('/'), "{p} must be relative to $HOME");
-            assert!(!p.is_empty(), "empty SENSITIVE_HOME_PATHS entry");
+            assert!(!p.is_empty(), "empty home-path entry");
         }
     }
 }

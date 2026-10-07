@@ -171,6 +171,29 @@ static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = La
         // Opus dropped from $15/$75 to $5/$25 at 4.6 and has stayed there
         // through 4.7, 4.8, and 5. Cache multipliers are unchanged: read is
         // 0.1x input, 5m write 1.25x, 1h write 2x.
+        // Opus 5.5 is the cheaper successor of Opus 5: $4/$20, cache read
+        // $0.20 (0.05x input, not the 0.1x of the rows above). Sonnet 5.5 is
+        // $2/$10 with the same $0.20 cache read.
+        (
+            "claude-opus-5-5",
+            AnthropicModelRate {
+                input_per_mtok: "4.00",
+                cache_read_per_mtok: "0.20",
+                cache_write_5m_per_mtok: "5.00",
+                cache_write_1h_per_mtok: "8.00",
+                output_per_mtok: "20.00",
+            },
+        ),
+        (
+            "claude-sonnet-5-5",
+            AnthropicModelRate {
+                input_per_mtok: "2.00",
+                cache_read_per_mtok: "0.20",
+                cache_write_5m_per_mtok: "2.50",
+                cache_write_1h_per_mtok: "4.00",
+                output_per_mtok: "10.00",
+            },
+        ),
         (
             "claude-opus-5",
             AnthropicModelRate {
@@ -338,7 +361,8 @@ fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelR
 }
 
 fn anthropic_rates_for(model: &str) -> Option<&'static AnthropicModelRate> {
-    ANTHROPIC_RATES.get(normalize_model_id(model))
+    let key = crate::pricing::fold_claude_dotted_version(normalize_model_id(model));
+    ANTHROPIC_RATES.get(key.as_ref())
 }
 
 /// Return the exact USD string for a direct OpenAI-compatible model.
@@ -462,6 +486,8 @@ pub fn shipped_openai_models() -> &'static [&'static str] {
 #[cfg(test)]
 pub fn shipped_anthropic_models() -> &'static [&'static str] {
     &[
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
         "claude-fable-5",
@@ -612,6 +638,32 @@ mod tests {
         // .is_some() — a tautological check would pass for the wrong rate.
         let cost = estimate_cost_usd(Provider::XAi, "grok-4", 1_000, 500, 0).unwrap();
         assert_eq!(cost, "0.0125");
+    }
+
+    #[test]
+    fn anthropic_cost_folds_dotted_claude_version() {
+        // 1M input × $2 + 1M output × $10 = $12 for Sonnet 5.5, however the
+        // version is spelled.
+        let dashed = estimate_anthropic_cost_usd(
+            "claude-sonnet-5-5",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            CacheTtl::Auto,
+        )
+        .unwrap();
+        let dotted = estimate_anthropic_cost_usd(
+            "claude-sonnet-5.5",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            CacheTtl::Auto,
+        )
+        .expect("dotted alias must price");
+        assert_eq!(dotted, dashed);
+        assert_eq!(dotted, "12.00");
     }
 
     #[test]

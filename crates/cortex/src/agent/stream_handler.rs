@@ -137,6 +137,15 @@ pub(super) fn wedged_session_error(consecutive: u32) -> String {
     )
 }
 
+/// The visible notice for an answer that a provider-side filter stopped.
+/// `reason` is the provider's stop label (`content_filter`, `refusal`, ...).
+pub(super) fn content_filtered_notice(reason: &str) -> String {
+    format!(
+        "\n\n[The provider stopped this answer before it was complete ({reason}). \
+         Try again with different wording.]"
+    )
+}
+
 impl Agent {
     /// Process one streamed `StreamEvent` from the LLM. Mutates the inner-loop
     /// collectors and returns whether the inner loop should continue or break.
@@ -201,6 +210,17 @@ impl Agent {
                 // shows up when a tool call's argument string was
                 // unclosed by the cut-off.
                 *truncated_due_to_length = true;
+            }
+            StreamEvent::ContentFiltered { reason } => {
+                // A safety or content filter stopped the answer. This is not
+                // a length cut, so it must not trigger compaction; the stream
+                // still runs to Done. Tell the user plainly why the answer
+                // ends here, as visible text so every surface shows it. The
+                // notice counts as emitted text so a later retraction covers
+                // it too.
+                let notice = content_filtered_notice(&reason);
+                self.emitted_text_bytes += notice.len();
+                let _ = event_tx.send(AgentEvent::TextDelta(notice)).await;
             }
             StreamEvent::ToolIntent => {
                 // The provider says this response ends in tool calls. If none
@@ -668,6 +688,73 @@ mod tests {
                 "text:The answer is ",
                 "text:forty-two.",
             ]
+        );
+    }
+
+    /// Spec: a filtered stop tells the user, in visible text, that the
+    /// provider stopped the answer and why; it is not a length cut, so it
+    /// must not arm the output-cap compaction path.
+    #[tokio::test]
+    async fn a_filtered_stop_is_a_visible_notice_and_not_a_length_cut() {
+        use crate::agent::AgentEvent;
+        use crate::internal_tag_filter::InternalTagFilter;
+        use crate::llm::StreamEvent;
+
+        let mut agent = crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut tag_filter = InternalTagFilter::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None;
+        let mut truncated = false;
+        for event in [
+            StreamEvent::TextDelta("Here is how to".to_string()),
+            StreamEvent::ContentFiltered {
+                reason: "content_filter".to_string(),
+            },
+            StreamEvent::Done,
+        ] {
+            agent
+                .handle_stream_event(
+                    event,
+                    &mut tag_filter,
+                    &mut tool_calls,
+                    &mut stream_error,
+                    &mut truncated,
+                    &event_tx,
+                )
+                .await;
+        }
+        assert!(!truncated, "a filtered stop must not read as a length cut");
+        assert_eq!(stream_error, None, "the stream itself did not fail");
+
+        let mut texts = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::TextDelta(text) = event {
+                texts.push(text);
+            }
+        }
+        assert_eq!(
+            texts.len(),
+            2,
+            "the partial text, then the notice: {texts:?}"
+        );
+        assert_eq!(texts[0], "Here is how to");
+        assert!(
+            texts[1].contains("stopped this answer") && texts[1].contains("content_filter"),
+            "the notice names the provider's stop label: {}",
+            texts[1]
+        );
+        // The notice is visible text: a retraction after a retry must cover
+        // it as well as the partial answer.
+        assert_eq!(
+            agent.emitted_text_bytes,
+            texts[0].len() + texts[1].len(),
+            "the notice counts as emitted text"
+        );
+        assert_eq!(
+            tag_filter.full_clean(),
+            "Here is how to",
+            "the notice is display-only, never part of the saved assistant text"
         );
     }
 

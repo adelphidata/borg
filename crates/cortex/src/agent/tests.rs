@@ -401,6 +401,157 @@ async fn compaction_retries_with_primary_model_when_override_fails() {
     );
 }
 
+/// Mount a dead `[compaction]` override model and a live primary model on
+/// one mock endpoint, keyed on the model name in the request body.
+async fn mount_dead_override_live_primary(server: &wiremock::MockServer) {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("dead-compaction-model"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("live-primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"summary of earlier work\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            "text/event-stream",
+        ))
+        .mount(server)
+        .await;
+}
+
+/// An agent whose `[compaction]` override points at a dead model while the
+/// primary model still works, with history well over the budget.
+fn over_budget_agent_with_dead_override(server_uri: &str) -> Agent {
+    std::env::set_var("BORG_COMPACTION_FALLBACK_TEST_KEY", "test-key");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".into());
+    config.llm.model = "live-primary-model".into();
+    config.llm.base_url = Some(format!("{server_uri}/v1/chat/completions"));
+    config.llm.api_key_env = "BORG_COMPACTION_FALLBACK_TEST_KEY".into();
+    config.llm.max_retries = 0;
+    config.compaction.model = Some("dead-compaction-model".into());
+    config.conversation.max_history_tokens = 200;
+    config.memory.flush_before_compaction = false;
+    let mut agent = minimal_test_agent(config);
+    for i in 0..40 {
+        agent.history.push(crate::types::Message::user(format!(
+            "message {i}: {}",
+            "long filler text about ongoing work ".repeat(20)
+        )));
+    }
+    agent
+}
+
+/// The reactive (context-overflow) lane must get the same primary-model
+/// fallback as the proactive one. Without it, a dead `[compaction]` override
+/// turns every overflow into "compaction freed nothing" and the turn is lost,
+/// even though the primary model could have summarized.
+#[tokio::test]
+async fn reactive_compaction_retries_with_primary_model_when_override_fails() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    mount_dead_override_live_primary(&server).await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+    let before_len = agent.history.len();
+
+    let (tx, mut rx) = mpsc::channel(64);
+    agent
+        .reactive_compact_history(&tx)
+        .await
+        .expect("reactive compaction must not surface an error");
+
+    assert!(
+        agent.history.len() < before_len,
+        "override model failed, so the primary-model retry must have compacted \
+         history ({before_len} → {} messages)",
+        agent.history.len()
+    );
+    let mut compacted = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            AgentEvent::HistoryCompacted { dropped, .. } => compacted = dropped > 0,
+            AgentEvent::Error(text) => {
+                panic!("a successful primary retry must not report an error: {text}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        compacted,
+        "a successful retry must announce HistoryCompacted"
+    );
+}
+
+/// Manual `/compact` is the lane the user reaches for when the automatic
+/// ones are stuck, so it must have the same fallback.
+#[tokio::test]
+async fn manual_compact_retries_with_primary_model_when_override_fails() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    mount_dead_override_live_primary(&server).await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+
+    let (before, after) = agent.compact().await;
+
+    assert!(
+        after < before,
+        "override model failed, so the primary-model retry must have compacted \
+         history ({before} → {after} tokens)"
+    );
+}
+
+/// When the summarizer itself fails transiently, the reactive error must say
+/// so. "Compaction freed nothing — raise `max_history_tokens`" sends the user
+/// after a knob that cannot help with a provider hiccup.
+#[tokio::test]
+async fn reactive_compaction_names_a_transient_summarizer_failure() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+    let before_len = agent.history.len();
+
+    let (tx, mut rx) = mpsc::channel(64);
+    agent
+        .reactive_compact_history(&tx)
+        .await
+        .expect("a summarizer failure is reported as an event, not an Err");
+
+    assert_eq!(
+        agent.history.len(),
+        before_len,
+        "nothing could be summarized"
+    );
+    let mut error_text = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::Error(text) = ev {
+            error_text = Some(text);
+        }
+    }
+    let text = error_text.expect("a zero-drop reactive pass must emit an error event");
+    assert!(
+        text.contains("summarizer failed"),
+        "the error must name the summarizer failure: {text}"
+    );
+    assert!(
+        !text.contains("max_history_tokens"),
+        "a transient provider failure must not be blamed on the history budget: {text}"
+    );
+}
+
 /// Sub-agents must reuse the spawning tree's prompt-cache key — parent and
 /// child share most of their prompt prefix, and OpenAI-family caches only hit
 /// when both `prompt_cache_key` and prefix match. A root agent (no scope)

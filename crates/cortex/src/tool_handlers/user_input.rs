@@ -83,6 +83,16 @@ pub async fn handle_update_plan(
     let steps: Vec<crate::types::PlanStep> = serde_json::from_value(steps_val.clone())
         .map_err(|e| anyhow::anyhow!("Invalid steps format: {e}. Each step needs 'title' (string) and 'status' (pending|in_progress|completed)."))?;
 
+    // A blank title renders as an empty row the user cannot act on, and the
+    // model would carry it forward every update. Name the offending step so
+    // the model can fix exactly that one.
+    if let Some(idx) = steps.iter().position(|s| s.title.trim().is_empty()) {
+        return Ok(ToolOutput::Text(format!(
+            "Error: step {} has an empty title. Every step needs a short, non-empty 'title'.",
+            idx + 1
+        )));
+    }
+
     // At most one in_progress step: the surface renders it as "what Borg is
     // doing right now", which stops meaning anything if two can be current.
     let in_progress_count = steps
@@ -366,6 +376,45 @@ mod tests {
             "America/Los_Angeles"
         );
         assert_eq!(answers["channels"]["answers"][1].as_str().unwrap(), "Slack");
+    }
+
+    /// A blank step title renders as an empty row the user cannot act on. The
+    /// handler must reject it with the step number, before anything reaches
+    /// the surface, so the model can correct exactly that step.
+    #[tokio::test]
+    async fn update_plan_rejects_blank_step_titles_and_names_the_step() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        for blank in ["", "   ", "\t\n"] {
+            let args = serde_json::json!({"steps": [
+                {"title": "Read the code", "status": "completed"},
+                {"title": blank, "status": "in_progress"},
+            ]});
+            let out = handle_update_plan(&args, &tx)
+                .await
+                .expect("handler returns");
+            let ToolOutput::Text(text) = out else {
+                panic!("expected text output");
+            };
+            assert!(
+                text.starts_with("Error") && text.contains("step 2") && text.contains("title"),
+                "blank title {blank:?} must be rejected naming step 2: {text}"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a rejected plan must not reach the surface"
+            );
+        }
+
+        let ok = serde_json::json!({"steps": [{"title": "Read the code", "status": "pending"}]});
+        let out = handle_update_plan(&ok, &tx).await.expect("handler returns");
+        assert!(
+            matches!(out, ToolOutput::Text(ref t) if t == "Plan updated."),
+            "a valid plan must be accepted: {out:?}"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::PlanUpdated { steps }) if steps.len() == 1),
+            "a valid plan must be dispatched"
+        );
     }
 
     #[test]

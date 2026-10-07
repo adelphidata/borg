@@ -255,8 +255,9 @@ pub fn check_sensitive_permissions(checks: &mut Vec<DiagnosticCheck>) {
             }
         };
 
-        let dirs_to_check = [".ssh", ".gnupg", ".aws"];
-        for dir_name in &dirs_to_check {
+        // The same credential-directory list `security.blocked_paths`
+        // filters, so a new entry is audited too.
+        for dir_name in sandbox::constants::CREDENTIAL_HOME_PATHS {
             let path = home.join(dir_name);
             if !path.exists() {
                 continue;

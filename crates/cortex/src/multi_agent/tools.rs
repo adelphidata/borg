@@ -465,6 +465,31 @@ fn parse_thinking_arg(
 /// from "unset", since an empty `toolsets` means "no tools"). Non-string
 /// entries are dropped with a `tracing::warn!` so malformed-array bugs
 /// surface in logs rather than silently truncating the allowlist.
+/// Serialize the `tools_allowed` argument of `manage_roles` for storage.
+///
+/// Absent or `null` means "no restriction" and stores nothing. An array of
+/// tool names is stored as JSON — `[]` included, which is an explicit
+/// zero-tool allowlist. Anything else is an error: silently storing nothing
+/// would report the role as created while it runs with every tool.
+fn tools_allowed_json(args: &serde_json::Value) -> Result<Option<String>> {
+    match args.get("tools_allowed") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) => {
+            if let Some(bad) = items.iter().find(|x| !x.is_string()) {
+                anyhow::bail!(
+                    "`tools_allowed` must be an array of tool-name strings; found {bad} — \
+                     the role was not saved"
+                );
+            }
+            Ok(Some(serde_json::to_string(items)?))
+        }
+        Some(other) => anyhow::bail!(
+            "`tools_allowed` must be an array of tool names (or [] for no tools), got {other} — \
+             the role was not saved, it would otherwise run with every tool"
+        ),
+    }
+}
+
 fn parse_string_array(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let arr = v?.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
@@ -659,13 +684,7 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
             let provider = args["provider"].as_str();
             let temperature = args["temperature"].as_f64().map(|v| v as f32);
             let system_instructions = args["system_instructions"].as_str();
-            let tools_json = args.get("tools_allowed").and_then(|v| {
-                if v.is_array() {
-                    serde_json::to_string(v).ok()
-                } else {
-                    None
-                }
-            });
+            let tools_json = tools_allowed_json(args)?;
             let max_iterations = args["max_iterations"].as_u64().map(|v| v as i64);
 
             let db = crate::db::Database::open().await?;
@@ -685,6 +704,9 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
         }
         "update" => {
             let name = require_str_param(args, "name")?;
+            // Validate before touching the DB so a malformed allowlist can
+            // never half-apply.
+            let tools_json = tools_allowed_json(args)?;
             let db = crate::db::Database::open().await?;
             if db.get_role(name).await?.is_none() {
                 return Ok(json!({"error": format!("Role '{name}' not found")}).to_string());
@@ -694,13 +716,6 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
             let provider = args["provider"].as_str();
             let temperature = args["temperature"].as_f64().map(|v| v as f32);
             let system_instructions = args["system_instructions"].as_str();
-            let tools_json = args.get("tools_allowed").and_then(|v| {
-                if v.is_array() {
-                    serde_json::to_string(v).ok()
-                } else {
-                    None
-                }
-            });
             let max_iterations = args["max_iterations"].as_u64().map(|v| v as i64);
 
             db.update_role(
@@ -887,6 +902,56 @@ mod tests {
             parse_string_array(Some(&mixed)),
             Some(vec!["a".to_string(), "b".to_string()])
         );
+    }
+
+    /// A `tools_allowed` that is not an array must be an error, never stored
+    /// as "no restriction": the role would report "created" and run with every
+    /// tool. Absent/null keeps meaning unrestricted; `[]` is an explicit
+    /// zero-tool allowlist and must survive as `[]`.
+    #[test]
+    fn tools_allowed_json_fails_closed_on_non_array() {
+        for bad in [
+            json!({"tools_allowed": "run_shell"}),
+            json!({"tools_allowed": {"run_shell": true}}),
+            json!({"tools_allowed": 3}),
+            json!({"tools_allowed": ["run_shell", 7]}),
+        ] {
+            let err = tools_allowed_json(&bad).expect_err("non-array must error");
+            assert!(
+                err.to_string().contains("tools_allowed") && err.to_string().contains("array"),
+                "error must tell the model what shape is expected: {err}"
+            );
+        }
+        assert_eq!(tools_allowed_json(&json!({})).unwrap(), None);
+        assert_eq!(
+            tools_allowed_json(&json!({"tools_allowed": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            tools_allowed_json(&json!({"tools_allowed": []})).unwrap(),
+            Some("[]".to_string()),
+            "an explicit empty allowlist must be stored, not normalized away"
+        );
+        assert_eq!(
+            tools_allowed_json(&json!({"tools_allowed": ["fs_read", "web_search"]})).unwrap(),
+            Some(r#"["fs_read","web_search"]"#.to_string())
+        );
+    }
+
+    /// The `create` action must refuse a malformed allowlist before anything
+    /// is written, with an error rather than a "created" status.
+    #[tokio::test]
+    async fn manage_roles_create_rejects_non_array_tools_allowed() {
+        let args = json!({
+            "action": "create",
+            "name": "locked",
+            "description": "a locked-down role",
+            "tools_allowed": "fs_read",
+        });
+        let err = handle_manage_roles(&args)
+            .await
+            .expect_err("a string allowlist must not create the role");
+        assert!(err.to_string().contains("tools_allowed"), "{err}");
     }
 
     /// Batch entry missing `goal` must error with the offending index

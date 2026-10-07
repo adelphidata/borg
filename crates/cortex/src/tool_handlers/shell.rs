@@ -995,12 +995,17 @@ async fn start_session(
         })
     });
 
-    let id = sessions.register(
+    let id = match sessions.register(
         child,
         guard,
         resolved_shell_output_cap(config),
         ctx.session_id().map(str::to_string),
-    );
+    ) {
+        Ok(id) => id,
+        // Recoverable from the model's side (kill a session, retry), so a
+        // normal tool result rather than an error.
+        Err(e) => return Ok(e.to_string()),
+    };
     Ok(format!(
         "Started shell session {id}. Drive it with run_shell: action=write_stdin \
          (session_id={id}, stdin=…) to send input, action=poll (session_id={id}) to read new \
@@ -1072,12 +1077,17 @@ async fn session_action_with_registry(
                 Err(e) => Ok(e.to_string()),
             }
         }
+        // An exited session's last poll carries its output plus an
+        // "exited with code N" line and removes it from the registry.
+        // The mask flag rides along with the output: the exit poll removes
+        // the session, so a lookup by id afterwards would find nothing and
+        // let the last chunk out unmasked.
         "poll" => match sessions.poll(session_id, caller) {
-            Ok(out) if out.is_empty() => Ok(format!("[no new output from session {session_id}]")),
-            Ok(out) if sessions.needs_env_mask(session_id, caller) => {
-                Ok(mask_env_assignments(&out))
+            Ok(polled) if polled.output.is_empty() => {
+                Ok(format!("[no new output from session {session_id}]"))
             }
-            Ok(out) => Ok(out),
+            Ok(polled) if polled.env_mask => Ok(mask_env_assignments(&polled.output)),
+            Ok(polled) => Ok(polled.output),
             Err(e) => Ok(e.to_string()),
         },
         "kill" => match sessions.kill(session_id, caller).await {
@@ -2555,7 +2565,9 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let id = reg.register(child, None, 64 * 1024, Some("owner-a".into()));
+        let id = reg
+            .register(child, None, 64 * 1024, Some("owner-a".into()))
+            .expect("register");
         let security = crate::config::SecurityConfig::default();
 
         let write_args = serde_json::json!({ "session_id": id, "stdin": "cat .env\n" });
@@ -2599,6 +2611,78 @@ mod tests {
         super::session_action_with_registry("kill", &poll_args, &security, &reg, Some("owner-a"))
             .await
             .expect("kill");
+    }
+
+    /// The poll that reports a session's exit also removes it from the
+    /// registry. The mask must still apply to that final chunk — otherwise
+    /// `cat .env; exit` is a one-liner that leaks the file unmasked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_exit_poll_masks_env_values_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".env"),
+            "SOME_UNKNOWN_VENDOR_KEY=exit-secret-42\n",
+        )
+        .expect("write .env");
+
+        let reg = crate::shell_session::ShellSessionRegistry::new();
+        let child = tokio::process::Command::new("sh")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(tmp.path())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let id = reg
+            .register(child, None, 64 * 1024, Some("owner-a".into()))
+            .expect("register");
+        let security = crate::config::SecurityConfig::default();
+
+        let write_args = serde_json::json!({ "session_id": id, "stdin": "cat .env; exit\n" });
+        super::session_action_with_registry(
+            "write_stdin",
+            &write_args,
+            &security,
+            &reg,
+            Some("owner-a"),
+        )
+        .await
+        .expect("write_stdin");
+
+        let poll_args = serde_json::json!({ "session_id": id });
+        let mut out = String::new();
+        for _ in 0..50 {
+            out.push_str(
+                &super::session_action_with_registry(
+                    "poll",
+                    &poll_args,
+                    &security,
+                    &reg,
+                    Some("owner-a"),
+                )
+                .await
+                .expect("poll"),
+            );
+            if out.contains("exited with code") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            out.contains(&format!("[session {id} exited with code 0]")),
+            "the session never reported its exit: {out:?}"
+        );
+        assert!(
+            out.contains("SOME_UNKNOWN_VENDOR_KEY=[REDACTED]"),
+            "the exit poll must mask env values: {out:?}"
+        );
+        assert!(
+            !out.contains("exit-secret-42"),
+            "secret leaked through the exit poll: {out:?}"
+        );
+        assert!(!reg.contains(&id), "the exited session must be removed");
     }
 
     /// End-to-end hint attachment: a failing command with a known shape gets

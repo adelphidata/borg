@@ -187,6 +187,7 @@ async fn collect_btw_stream(rx: &mut mpsc::Receiver<StreamEvent>) -> BtwStream {
             StreamEvent::ThinkingDelta(_)
             | StreamEvent::Usage(_)
             | StreamEvent::Truncated
+            | StreamEvent::ContentFiltered { .. }
             | StreamEvent::ToolIntent
             | StreamEvent::Reconnecting { .. }
             | StreamEvent::Failover { .. } => {}

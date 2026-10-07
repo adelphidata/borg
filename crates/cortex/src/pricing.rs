@@ -71,9 +71,25 @@ fn strip_bedrock_version_suffix(model: &str) -> &str {
     }
 }
 
+/// Fold a dotted Claude version (`claude-sonnet-5.5`, as docs and chat
+/// pickers spell it) onto the dashed id Anthropic serves and every table here
+/// keys on (`claude-sonnet-5-5`). Other vendors use dots in their real ids
+/// (`gpt-5.5`, `gemini-2.5-pro`), so only the `claude-` family is folded.
+pub(crate) fn fold_claude_dotted_version(model: &str) -> std::borrow::Cow<'_, str> {
+    if model.starts_with("claude-") && model.contains('.') {
+        std::borrow::Cow::Owned(model.replace('.', "-"))
+    } else {
+        std::borrow::Cow::Borrowed(model)
+    }
+}
+
 static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(|| {
     let entries: Vec<(&str, f64, f64)> = vec![
-        // Claude 5 (frontier)
+        // Claude 5 (frontier). The 5.5 pair is cheaper than the 5 pair: Opus
+        // 5.5 is $4/$20 against Opus 5's $5/$25, Sonnet 5.5 is $2/$10 against
+        // Sonnet 5's $3/$15.
+        ("claude-opus-5-5", 4.0, 20.0),
+        ("claude-sonnet-5-5", 2.0, 10.0),
         ("claude-opus-5", 5.0, 25.0),
         ("claude-sonnet-5", 3.0, 15.0),
         ("claude-fable-5", 10.0, 50.0),
@@ -181,6 +197,18 @@ pub struct BundledRateCardEntry {
 pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
     &[
         // Anthropic
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-opus-5-5",
+            prompt_per_mtok_usd: "4.00",
+            completion_per_mtok_usd: "20.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-sonnet-5-5",
+            prompt_per_mtok_usd: "2.00",
+            completion_per_mtok_usd: "10.00",
+        },
         BundledRateCardEntry {
             provider_id: "anthropic",
             model: "claude-opus-5",
@@ -374,8 +402,8 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
 /// Estimate cost in USD for the given model and token counts.
 /// Returns `None` if the model is not in the pricing table.
 pub fn estimate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) -> Option<f64> {
-    let key = normalize_model(model);
-    let pricing = PRICING.get(key)?;
+    let key = fold_claude_dotted_version(normalize_model(model));
+    let pricing = PRICING.get(key.as_ref())?;
     let cost = (prompt_tokens as f64 * pricing.input_per_million
         + completion_tokens as f64 * pricing.output_per_million)
         / 1_000_000.0;
@@ -446,6 +474,32 @@ mod tests {
     fn zero_tokens_returns_zero_cost() {
         let cost = estimate_cost("claude-sonnet-4", 0, 0);
         assert_eq!(cost, Some(0.0));
+    }
+
+    #[test]
+    fn dotted_claude_version_prices_as_the_dashed_id() {
+        // `claude-sonnet-5.5` is how people write the model; the table is
+        // keyed on the served id. A miss here silently zeroes the cost.
+        for (dotted, dashed) in [
+            ("claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("claude-opus-5.5", "claude-opus-5-5"),
+            ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"),
+        ] {
+            let want = estimate_cost(dashed, 1_000_000, 1_000_000).unwrap();
+            let got = estimate_cost(dotted, 1_000_000, 1_000_000)
+                .unwrap_or_else(|| panic!("{dotted} must price like {dashed}"));
+            assert!((got - want).abs() < 1e-9, "{dotted}: {got} vs {want}");
+        }
+        // The 5.5 pair is the cheaper one; a swapped row would invert this.
+        let sonnet_5_5 = estimate_cost("claude-sonnet-5.5", 1_000_000, 1_000_000).unwrap();
+        let sonnet_5 = estimate_cost("claude-sonnet-5", 1_000_000, 1_000_000).unwrap();
+        assert!(sonnet_5_5 < sonnet_5, "{sonnet_5_5} vs {sonnet_5}");
+        // Dots in other vendors' ids are real.
+        assert_eq!(fold_claude_dotted_version("gpt-5.5").as_ref(), "gpt-5.5");
+        assert_eq!(
+            fold_claude_dotted_version("gemini-2.5-pro").as_ref(),
+            "gemini-2.5-pro"
+        );
     }
 
     #[test]
