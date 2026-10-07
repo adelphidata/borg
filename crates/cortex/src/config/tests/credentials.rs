@@ -348,16 +348,7 @@ fn resolve_credential_or_env_prefers_config_over_keychain() {
 
 // ── Credentials-file fallback (~/.borg/.credentials.json) ──
 
-/// Serializes tests that touch `$BORG_HOME` — Cargo runs tests
-/// multi-threaded in one process and would otherwise race on env and on the
-/// shared credentials file.
-fn creds_file_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
+use crate::config::creds_file_env_lock;
 
 struct CredsFileEnv {
     _lock: std::sync::MutexGuard<'static, ()>,

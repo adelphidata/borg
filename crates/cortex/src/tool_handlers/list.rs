@@ -174,8 +174,7 @@ mod tests {
         );
     }
 
-    /// Mutex to prevent env-var–mutating channel tests from racing each other.
-    static CHANNEL_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::config::{creds_file_env_lock, CHANNEL_ENV_MUTEX};
 
     #[test]
     fn list_channels_includes_native_telegram() {
@@ -196,6 +195,7 @@ mod tests {
 
     #[test]
     fn list_channels_no_native_when_no_credentials() {
+        let _home = creds_file_env_lock();
         let _lock = CHANNEL_ENV_MUTEX.lock().unwrap();
         let keys = [
             "TELEGRAM_BOT_TOKEN",

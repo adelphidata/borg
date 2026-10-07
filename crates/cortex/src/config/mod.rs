@@ -26,6 +26,24 @@ pub mod webhooks;
 #[cfg(test)]
 mod tests;
 
+/// Serializes every test that sets or clears a native-channel credential
+/// env var. Env vars are process-global, so tests in different modules race
+/// unless they all take this one lock.
+#[cfg(test)]
+pub(crate) static CHANNEL_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that repoint `$BORG_HOME` (and so the on-disk credentials
+/// file) against tests that read it. Take this lock BEFORE
+/// `CHANNEL_ENV_MUTEX` when both are needed.
+#[cfg(test)]
+pub(crate) fn creds_file_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub use apns::ApnsConfig;
 pub use computer_use::*;
 pub use consolidation::*;

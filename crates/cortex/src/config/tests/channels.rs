@@ -1,8 +1,6 @@
 use super::*;
 
-/// Serializes env-var-mutating channel tests so they don't race each other
-/// when cargo test runs them in parallel.
-static CHANNEL_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use crate::config::{creds_file_env_lock, CHANNEL_ENV_MUTEX};
 
 #[test]
 fn has_any_native_channel_detects_telegram_env() {
@@ -16,6 +14,9 @@ fn has_any_native_channel_detects_telegram_env() {
 
 #[test]
 fn has_any_native_channel_false_when_no_creds() {
+    // The resolver also reads `$BORG_HOME/.credentials.json`; hold the
+    // data-dir lock so a credentials-file test cannot repoint it mid-check.
+    let _home = creds_file_env_lock();
     let _lock = CHANNEL_ENV_MUTEX.lock().unwrap();
     // Temporarily clear all native channel env vars
     let keys = [
