@@ -105,8 +105,38 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .and_then(valid)
         })
-        .or_else(|| parse_google_retry_delay(&v).and_then(valid))?;
-    Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)))
+        .or_else(|| parse_google_retry_delay(&v).and_then(valid));
+    if let Some(secs) = secs {
+        return Some(Duration::from_secs_f64(secs.min(MAX_RETRY_SECS as f64)));
+    }
+    // An error delivered *inside* a stream never had HTTP headers of its own,
+    // so providers echo them in the JSON instead: `error.headers` (OpenAI),
+    // `error.metadata.headers` (OpenRouter), or top-level `headers`. Same
+    // guards as the header path; a zero delay is as meaningless here as above.
+    parse_embedded_retry_after_header(&v).filter(|d| !d.is_zero())
+}
+
+/// `Retry-After` echoed inside a JSON error body, matched case-insensitively
+/// under each place providers are known to put it.
+fn parse_embedded_retry_after_header(v: &serde_json::Value) -> Option<Duration> {
+    let places = [
+        v.get("error").and_then(|e| e.get("headers")),
+        v.get("error")
+            .and_then(|e| e.get("metadata"))
+            .and_then(|m| m.get("headers")),
+        v.get("headers"),
+    ];
+    places
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+        .flat_map(|headers| headers.iter())
+        .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .find_map(|(_, value)| match value {
+            serde_json::Value::String(s) => parse_retry_after_header(s),
+            serde_json::Value::Number(n) => parse_retry_after_header(&n.to_string()),
+            _ => None,
+        })
 }
 
 /// Walk `error.details[]` for the first `retryDelay` string in Google's

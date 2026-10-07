@@ -666,6 +666,26 @@ mod tests {
         std::env::remove_var("BORG_HOME");
     }
 
+    /// Spec: an unreadable session store is reported as a listing failure,
+    /// never as `NotFound` — the session may exist, and callers that start a
+    /// fresh session on `NotFound` would silently abandon it.
+    #[test]
+    fn resolve_session_id_reports_unreadable_store_as_listing_error() {
+        let _lock = SESSION_ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", tmp.path());
+        // A regular file where the directory belongs: neither creatable nor
+        // readable as a directory.
+        fs::write(tmp.path().join("sessions"), b"not a directory").unwrap();
+
+        let result = resolve_session_id("aaa");
+        std::env::remove_var("BORG_HOME");
+        match result {
+            Err(ResolveSessionError::Listing(msg)) => assert!(!msg.is_empty()),
+            other => panic!("expected Listing, got {other:?}"),
+        }
+    }
+
     #[test]
     fn resolve_session_id_not_found() {
         let _lock = SESSION_ENV_MUTEX.lock().unwrap();
@@ -781,6 +801,11 @@ pub enum ResolveSessionError {
         /// Number of matching sessions.
         count: usize,
     },
+    /// The session directory could not be listed, so nothing is known about
+    /// which sessions exist. Distinct from `NotFound`: the session may well be
+    /// there, and callers must not treat it as missing.
+    #[error("Could not list sessions: {0}")]
+    Listing(String),
 }
 
 /// Resolve a full or prefix session ID to a concrete [`SessionMeta`].
@@ -791,7 +816,10 @@ pub fn resolve_session_id(prefix: &str) -> std::result::Result<SessionMeta, Reso
     if prefix.is_empty() {
         return Err(ResolveSessionError::Empty);
     }
-    let sessions = list_sessions().unwrap_or_default();
+    // A directory that cannot be read is an error in its own right, never an
+    // empty listing: an unreadable store would otherwise make every id look
+    // missing and send the caller down the "start fresh" path.
+    let sessions = list_sessions().map_err(|e| ResolveSessionError::Listing(e.to_string()))?;
 
     // Prefer exact match to disambiguate when a short id is also a prefix of longer ids.
     if let Some(exact) = sessions.iter().find(|s| s.id == prefix) {

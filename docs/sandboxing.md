@@ -73,6 +73,8 @@ Requires `bwrap` to be installed. On Debian/Ubuntu:
 sudo apt install bubblewrap
 ```
 
+`bwrap` (and `sandbox-exec` on macOS) is the one program Borg runs *before* the sandbox exists, so it is never taken from a place a sandboxed tool could write to. Borg walks `PATH` and skips relative entries, any candidate under an `fs_write` grant or the tool's directory, any binary that is group- or world-writable or not executable, and any binary whose directory is world-writable; the first clean candidate is launched by its absolute path. If no entry passes, Borg logs a warning and runs without the sandbox, exactly as if `bwrap` were not installed. On macOS the helper is always `/usr/bin/sandbox-exec`.
+
 ## Windows (in development)
 
 Windows has no built-in command-line sandbox wrapper analogous to `sandbox-exec` or `bwrap`, so Borg implements its own using Windows kernel security primitives. **Tier 1 is ported but has not yet been validated on a real Windows host** — it cross-compiles cleanly and the platform-neutral pieces are unit-tested on every CI host, but the FFI paths run for the first time inside a Windows VM. Treat the Tier 1 enforcement as in-development until that smoke validation has been done.

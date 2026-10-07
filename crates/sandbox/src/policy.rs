@@ -240,6 +240,12 @@ fn normalize_deny_paths(paths: &[String]) -> Result<Vec<String>, String> {
 /// TLS trust-store roots a network-enabled policy needs to be able to read.
 const TLS_READ_ROOTS: &[&str] = &["/etc/ssl", "/etc/ssl/certs"];
 
+/// System location of the macOS Seatbelt helper. Addressed absolutely: it is
+/// launched before the sandbox exists, so a PATH lookup could be shadowed by
+/// a directory a sandboxed tool may write to.
+#[cfg(target_os = "macos")]
+const SEATBELT_HELPER: &str = "/usr/bin/sandbox-exec";
+
 /// Append the TLS roots that `exists` reports as present, skipping duplicates.
 ///
 /// Only existing paths are added: distros vary (`/etc/ssl/certs` is absent on
@@ -277,9 +283,9 @@ impl SandboxPolicy {
     /// covers the common locations as defense in depth on top of the allow-list
     /// scoping — it does NOT cover nested copies like `<workspace>/src/.env`.
     ///
-    /// Enforcement is also platform-dependent: Seatbelt (macOS) and the Windows
-    /// backend emit deny-read rules, but bwrap (Linux) currently enforces only
-    /// `deny_write` (see `bubblewrap.rs`), so the read side is unenforced there.
+    /// Every backend enforces the read side: Seatbelt (macOS) and Windows emit
+    /// deny-read rules, and bwrap (Linux) masks each entry with a tmpfs or a
+    /// `/dev/null` bind (see `hide_path` in `bubblewrap.rs`).
     pub fn with_blocked_paths_denied(mut self, blocked_paths: &[String], roots: &[String]) -> Self {
         let mut anchors: Vec<String> = Vec::new();
         if let Some(home) = dirs::home_dir() {
@@ -468,7 +474,10 @@ impl SandboxPolicy {
         sandbox_args.extend(args.iter().cloned());
 
         SandboxCommand {
-            program: "sandbox-exec".to_string(),
+            // The helper runs *before* the sandbox exists, so it is addressed
+            // by its system location rather than resolved through PATH, where
+            // a tool-writable directory could shadow it.
+            program: SEATBELT_HELPER.to_string(),
             args: sandbox_args,
             _resources: None,
         }
@@ -491,15 +500,20 @@ impl SandboxPolicy {
         args: &[String],
         tool_dir: &std::path::Path,
     ) -> SandboxCommand {
+        use crate::bubblewrap::{
+            build_bwrap_args, find_pre_sandbox_executable, wslg_distro_grant, WSLG_DISTRO_DIR,
+        };
         // Deliberate divergence from `wrap_windows`, which fails closed: bwrap is
         // an optional distro package, and hard-failing here would brick every
         // tool call on a host that simply never installed it. The warn is the
-        // operator's signal to install bubblewrap.
-        if which::which("bwrap").is_err() {
-            tracing::warn!("bwrap not found; running without sandbox");
+        // operator's signal to install bubblewrap. The lookup also refuses a
+        // `bwrap` a sandboxed tool could have planted (under an `fs_write`
+        // grant, the tool dir, or a relative PATH entry): the helper and its
+        // version probe are the one spawn this policy cannot confine.
+        let Some(bwrap) = find_pre_sandbox_executable("bwrap", self, tool_dir) else {
+            tracing::warn!("bwrap not found on a trusted PATH entry; running without sandbox");
             return SandboxCommand::passthrough(program, args);
-        }
-        use crate::bubblewrap::{build_bwrap_args, wslg_distro_grant, WSLG_DISTRO_DIR};
+        };
         // A grant under WSLg's duplicate root reaches, by a second name, the
         // very paths `deny_read` masks — and no overlay can mask both names
         // while honoring the grant. Refuse rather than silently widen it.
@@ -512,12 +526,12 @@ impl SandboxPolicy {
                 ),
             );
         }
-        let mut bwrap_args = build_bwrap_args(self, tool_dir);
+        let mut bwrap_args = build_bwrap_args(self, tool_dir, &bwrap);
         bwrap_args.push(program.to_string());
         bwrap_args.extend(args.iter().cloned());
 
         SandboxCommand {
-            program: "bwrap".to_string(),
+            program: bwrap.to_string_lossy().into_owned(),
             args: bwrap_args,
             _resources: None,
         }
@@ -856,10 +870,15 @@ mod tests {
         let policy = SandboxPolicy::default();
         let args = vec!["script.py".to_string()];
         let cmd = policy.wrap_command("python3", &args, Path::new(TEST_TOOL_DIR));
-        if which::which("bwrap").is_ok() {
-            assert_eq!(cmd.program, "bwrap");
-        } else {
-            assert_eq!(cmd.program, "python3");
+        match crate::bubblewrap::find_pre_sandbox_executable(
+            "bwrap",
+            &policy,
+            Path::new(TEST_TOOL_DIR),
+        ) {
+            // Spec: the helper is launched by its resolved absolute path, never
+            // re-looked-up on PATH at spawn time.
+            Some(bwrap) => assert_eq!(cmd.program, bwrap.to_string_lossy()),
+            None => assert_eq!(cmd.program, "python3"),
         }
         assert!(cmd.args.contains(&"script.py".to_string()));
     }

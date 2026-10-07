@@ -1622,6 +1622,10 @@ async fn run_event_loop(
                         ));
                         continue;
                     }
+                    Err(e @ cortex::session::ResolveSessionError::Listing(_)) => {
+                        app.push_system_message(format!("{e}. Check that ~/.borg is readable."));
+                        continue;
+                    }
                     // NotFound / Empty: fall through to load_agent_session which
                     // will surface a clean "Session '<id>' not found" error.
                     Err(_) => id.clone(),

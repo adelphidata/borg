@@ -972,14 +972,22 @@ async fn resolve_continue_session() -> Option<String> {
     // The TUI resume path resolves ids against the on-disk session files and
     // hard-exits on a miss; verify here so a DB row whose file is gone
     // degrades to a fresh session instead.
-    if cortex::session::resolve_session_id(&row.id).is_err() {
-        eprintln!(
-            "borg: most recent workspace session {} has no session file; starting fresh",
-            &row.id[..row.id.len().min(8)]
-        );
-        return None;
+    match cortex::session::resolve_session_id(&row.id) {
+        Ok(_) => Some(row.id),
+        // The store itself could not be read: say so, rather than claiming the
+        // file is gone. Starting fresh is still the only safe move.
+        Err(e @ cortex::session::ResolveSessionError::Listing(_)) => {
+            eprintln!("borg: {e}; starting fresh");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "borg: most recent workspace session {} has no session file; starting fresh",
+                &row.id[..row.id.len().min(8)]
+            );
+            None
+        }
     }
-    Some(row.id)
 }
 
 fn ensure_onboarded() -> Result<()> {

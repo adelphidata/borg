@@ -36,6 +36,37 @@ const SUBAGENT_CONTEXT_FRESHNESS_NOTE: &str =
     "[Point-in-time snapshot from when you were spawned — re-verify anything \
      time-sensitive against the live source before acting on it.]";
 
+/// Opening of every sub-agent preamble's first line.
+const SUBAGENT_PREAMBLE_LEAD: &str = "You are a sub-agent named \"";
+
+/// Opening tag of the preamble's goal block.
+const SUBAGENT_GOAL_OPEN: &str = "<goal>\n";
+
+/// Drop the parent's own identity preamble from a message that is being
+/// forked into a grandchild, keeping the parent's goal block.
+///
+/// A sub-agent's first user message is its preamble: "You are a sub-agent
+/// named X … Depth: 1/3 … You are a leaf — do not attempt to delegate."
+/// Forking that history verbatim hands a grandchild a second, stale identity
+/// (wrong name, depth, and delegation rule) alongside the one it gets in its
+/// own preamble. The goal block is still useful context, so it stays; the
+/// grandchild's own preamble carries the only identity.
+///
+/// Returns `None` when the message is nothing but preamble.
+fn strip_inherited_preamble(msg: crate::types::Message) -> Option<crate::types::Message> {
+    if msg.role != crate::types::Role::User {
+        return Some(msg);
+    }
+    let Some(text) = msg.text_content() else {
+        return Some(msg);
+    };
+    if !text.starts_with(SUBAGENT_PREAMBLE_LEAD) {
+        return Some(msg);
+    }
+    text.find(SUBAGENT_GOAL_OPEN)
+        .map(|goal_at| crate::types::Message::user(text[goal_at..].to_string()))
+}
+
 /// Render the child's initial user-message preamble: identity + role +
 /// delegation policy + workspace + optional context + goal.
 ///
@@ -43,6 +74,10 @@ const SUBAGENT_CONTEXT_FRESHNESS_NOTE: &str =
 /// `<goal>…</goal>` blocks let the child parse intent unambiguously and
 /// give callers (and downstream tests) stable anchors to grep against. The
 /// context block opens with [`SUBAGENT_CONTEXT_FRESHNESS_NOTE`].
+///
+/// The first line opens with [`SUBAGENT_PREAMBLE_LEAD`], which is how
+/// [`strip_inherited_preamble`] recognises the message when a sub-agent's
+/// history is forked into a grandchild.
 #[allow(clippy::too_many_arguments)]
 pub fn build_subagent_preamble(
     nickname: &str,
@@ -56,7 +91,7 @@ pub fn build_subagent_preamble(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "You are a sub-agent named \"{nickname}\" (id: {agent_id}).\n"
+        "{SUBAGENT_PREAMBLE_LEAD}{nickname}\" (id: {agent_id}).\n"
     ));
 
     let role_label = role.map_or("default", |r| r.name.as_str());
@@ -124,7 +159,7 @@ pub fn build_subagent_preamble(
         }
     }
 
-    out.push_str("<goal>\n");
+    out.push_str(SUBAGENT_GOAL_OPEN);
     // Same breakout guard for the goal block — a smuggled `</goal>` would let
     // following text escape the framing.
     let safe_goal = crate::security::sanitize::escape_trust_frame_tags(goal);
@@ -312,16 +347,30 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         live,
     } = spawn;
 
-    let _permit = match semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
+    // A child shut down while it still waits for its permit must report
+    // `Shutdown`, never start, and never overwrite the `Shutdown` row the
+    // parent just wrote with `Running`. `biased` so an already-cancelled
+    // token wins over a permit that happens to be free.
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        permit = semaphore.acquire() => Some(permit),
+    };
+    let _permit = match permit {
+        Some(Ok(p)) => p,
+        Some(Err(_)) | None => {
+            let status = if cancel.is_cancelled() {
+                SubAgentStatus::Shutdown
+            } else {
+                SubAgentStatus::Errored {
+                    error: "Semaphore closed".to_string(),
+                }
+            };
             if completion_tx
                 .send(SubAgentCompletion {
                     agent_id,
                     nickname,
-                    status: SubAgentStatus::Errored {
-                        error: "Semaphore closed".to_string(),
-                    },
+                    status,
                     final_response: None,
                     files_written: Vec::new(),
                     // Nothing could have been queued yet: the handle is only
@@ -337,6 +386,9 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
         }
     };
 
+    // Kept to tell a cancelled child from one that finished on its own: the
+    // run below moves the token.
+    let cancel_probe = cancel.clone();
     let files_written = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let result = run_sub_agent(
         agent_id.clone(),
@@ -382,6 +434,13 @@ pub(super) async fn run_sub_agent_task(spawn: SubAgentSpawn) {
     }
 
     let (status, final_response) = match result {
+        // The loop broke on the cancel token (a parent `shutdown_agent`,
+        // `shutdown_all`, or a timed-out wait), so whatever text it had
+        // gathered is a fragment of a killed run, not a result. Reporting it
+        // as `Completed` would let the parent — and the DB row — claim the
+        // task was done. A watchdog stall also cancels, but it returns `Err`
+        // and keeps its structured error below.
+        Ok(_) if cancel_probe.is_cancelled() => (SubAgentStatus::Shutdown, None),
         Ok(response) => (
             SubAgentStatus::Completed {
                 result: response.clone(),
@@ -520,7 +579,10 @@ fn run_sub_agent(
         agent.set_steer_channel(input_rx);
 
         if let Some(context_msgs) = fork_context {
-            for msg in context_msgs {
+            for msg in context_msgs
+                .into_iter()
+                .filter_map(strip_inherited_preamble)
+            {
                 agent.inject_history_message(msg);
             }
         }
@@ -535,6 +597,14 @@ fn run_sub_agent(
             depth,
             max_spawn_depth,
         );
+
+        // Building the agent above can take a while; a shutdown that landed
+        // in that window must not be overwritten with `Running` below. An
+        // empty `Ok` here is read as `Shutdown` by the caller, which checks
+        // the token before trusting any `Ok`.
+        if cancel.is_cancelled() {
+            return Ok(String::new());
+        }
 
         match crate::db::Database::open().await {
             Ok(db) => {
@@ -923,5 +993,148 @@ mod compaction_cap_tests {
             effective_history_budget_for(&parent),
             "0 must mean inherit"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::config::MultiAgentConfig;
+    use crate::types::{Message, Role};
+
+    /// Spec: forking a sub-agent's history into a grandchild must not carry
+    /// the parent's identity preamble (name, depth, delegation rule) — the
+    /// grandchild gets its own. The parent's goal block is still context and
+    /// stays; ordinary messages pass through untouched.
+    #[test]
+    fn forked_history_drops_the_parents_preamble_but_keeps_its_goal() {
+        let preamble = build_subagent_preamble(
+            "atlas",
+            "agent-1",
+            None,
+            AgentRoleKind::Leaf,
+            "Summarise the release notes",
+            Some("notes live in docs/"),
+            1,
+            3,
+        );
+        assert!(preamble.starts_with(SUBAGENT_PREAMBLE_LEAD));
+
+        let stripped = strip_inherited_preamble(Message::user(preamble.clone()))
+            .expect("a preamble with a goal keeps the goal");
+        let text = stripped.text_content().unwrap();
+        assert!(text.starts_with(SUBAGENT_GOAL_OPEN), "got: {text}");
+        assert!(text.contains("Summarise the release notes"));
+        assert!(!text.contains("atlas"), "parent identity must not leak");
+        assert!(!text.contains("do not attempt to delegate"));
+        assert!(
+            !text.contains("notes live in docs/"),
+            "parent context is a stale snapshot"
+        );
+
+        // Nothing but preamble: drop it rather than inject a stale identity.
+        let only_preamble = preamble[..preamble.find(SUBAGENT_GOAL_OPEN).unwrap()].to_string();
+        assert!(strip_inherited_preamble(Message::user(only_preamble)).is_none());
+
+        // Plain user and assistant messages are untouched.
+        let plain = Message::user("You are not a preamble; please run the tests");
+        let kept = strip_inherited_preamble(plain.clone()).unwrap();
+        assert_eq!(kept.text_content(), plain.text_content());
+        let reply = Message {
+            role: Role::Assistant,
+            ..Message::user(format!("{SUBAGENT_PREAMBLE_LEAD}quoted in a reply"))
+        };
+        let kept = strip_inherited_preamble(reply.clone()).unwrap();
+        assert_eq!(kept.role, Role::Assistant);
+        assert_eq!(kept.text_content(), reply.text_content());
+    }
+
+    fn spawn_for_test(
+        cancel: CancellationToken,
+        completion_tx: mpsc::Sender<SubAgentCompletion>,
+    ) -> SubAgentSpawn {
+        let (_input_tx, input_rx) = mpsc::unbounded_channel::<String>();
+        SubAgentSpawn {
+            agent_id: "agent-1".to_string(),
+            nickname: "atlas".to_string(),
+            config: Config::default(),
+            depth: 1,
+            max_spawn_depth: 3,
+            agents_config: MultiAgentConfig::default(),
+            message: "do the thing".to_string(),
+            context: None,
+            role: None,
+            role_kind: AgentRoleKind::Leaf,
+            fork_context: None,
+            input_rx,
+            pending_input: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cancel,
+            is_paused: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
+            tools_filter: None,
+            bus: None,
+            info: SubAgentInfo {
+                id: "agent-1".to_string(),
+                nickname: "atlas".to_string(),
+                role: "default".to_string(),
+                model: "test-model".to_string(),
+                parent_session_id: "root".to_string(),
+                session_id: "child-session".to_string(),
+                depth: 1,
+                status: SubAgentStatus::PendingInit,
+                created_at: 0,
+                ended_at: None,
+                metrics: Default::default(),
+                last_activity_at: None,
+                current_tool: None,
+            },
+            prompt_cache_scope: "root".to_string(),
+            execution_context: None,
+            semaphore: Arc::new(Semaphore::new(1)),
+            completion_tx,
+            live: Arc::new(LiveActivity::default()),
+        }
+    }
+
+    /// Spec: a child whose parent shut it down before it got its permit
+    /// reports `Shutdown` — not `Completed` ("no text output") and not an
+    /// error — and never starts an agent. Before this, the first thing a
+    /// cancelled-but-queued child did was overwrite the parent's `Shutdown`
+    /// row with `Running` and then report success for a run it never made.
+    #[tokio::test]
+    async fn child_cancelled_before_start_reports_shutdown_not_completed() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        run_sub_agent_task(spawn_for_test(cancel, tx)).await;
+
+        let completion = rx.recv().await.expect("a completion must still be shipped");
+        assert_eq!(completion.status, SubAgentStatus::Shutdown);
+        assert_eq!(completion.final_response, None);
+    }
+
+    /// Spec: a cancel that lands while the child waits for a permit is seen
+    /// as soon as the permit frees, with the same `Shutdown` outcome.
+    #[tokio::test]
+    async fn child_cancelled_while_queued_for_a_permit_reports_shutdown() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let mut spawn = spawn_for_test(cancel.clone(), tx);
+        let semaphore = Arc::new(Semaphore::new(1));
+        spawn.semaphore = semaphore.clone();
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+
+        let task = tokio::spawn(run_sub_agent_task(spawn));
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must still be queued behind the permit"
+        );
+        cancel.cancel();
+        drop(held);
+        task.await.unwrap();
+
+        let completion = rx.recv().await.expect("a completion must still be shipped");
+        assert_eq!(completion.status, SubAgentStatus::Shutdown);
     }
 }

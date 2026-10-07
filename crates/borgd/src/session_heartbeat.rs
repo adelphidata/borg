@@ -206,16 +206,26 @@ async fn poll_once(registry: &SessionRegistry, db: &Arc<Database>) -> anyhow::Re
             "firing session heartbeat"
         );
 
-        // Spawned, not awaited. `start_turn` internally awaits the prior turn's
-        // forwarder, so a session that went busy between the idle check above
-        // and this call would otherwise block the poller — and therefore every
-        // other session's heartbeat — for the length of that turn.
+        // Spawned, not awaited: the guarded start takes the turn lock, which a
+        // turn that is still draining can hold, and the poller must not stall
+        // every other session's heartbeat on one session. The guard re-checks
+        // idle *under* that lock — a session that went busy, or was closed,
+        // between the idle check above and here is skipped rather than queued
+        // behind the live turn (where it would fire after the user cancelled
+        // it, or on a closed backend). The row is already re-anchored, so a
+        // skipped fire simply coalesces into the next interval.
         let Some(host) = registry.get(&hb.session_id) else {
             continue;
         };
         let text = injected_text(&hb.prompt);
+        let session_id = hb.session_id.clone();
         tokio::spawn(async move {
-            host.start_turn(text, Vec::new(), None, None).await;
+            if host.start_turn_if_idle(text).await.is_none() {
+                tracing::info!(
+                    session_id = %session_id,
+                    "session heartbeat skipped: session went busy or closed before it could start"
+                );
+            }
         });
     }
     Ok(())

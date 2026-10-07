@@ -159,14 +159,124 @@ fn bind_covers(policy: &SandboxPolicy, target: &str) -> bool {
         .any(|p| Path::new(target).starts_with(p))
 }
 
-/// Detect the installed bwrap version by running `bwrap --version`.
-/// Returns `None` if bwrap is not found or version cannot be parsed.
-pub fn detect_bwrap_version() -> Option<BwrapVersion> {
-    let output = std::process::Command::new("bwrap")
+/// Detect the installed bwrap version by running `<bwrap> --version`.
+/// Returns `None` if the binary cannot run or the version cannot be parsed.
+///
+/// This probe runs *outside* the sandbox, so callers must hand it a path
+/// from [`find_pre_sandbox_executable`], never a bare name looked up on PATH.
+pub fn detect_bwrap_version(bwrap: &Path) -> Option<BwrapVersion> {
+    let output = std::process::Command::new(bwrap)
         .arg("--version")
         .output()
         .ok()?;
     parse_bwrap_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Locate `name` on PATH for a launch that happens *before* the sandbox
+/// exists (the sandbox helper itself, and its version probe).
+///
+/// Running the helper is the one spawn the policy cannot confine, so the
+/// binary must not be something a sandboxed tool could have planted:
+///
+/// - relative PATH entries (`.`, `node_modules/.bin`) resolve against the
+///   tool's working directory and are skipped;
+/// - a candidate whose real path sits under any `fs_write` grant or under
+///   `tool_dir` is rejected, since a tool can replace it;
+/// - on Unix, a candidate that is group- or world-writable, or whose parent
+///   directory is world-writable, is rejected — defense in depth against a
+///   sloppy install; a non-executable file is passed over.
+///
+/// The first acceptable candidate in PATH order wins. Returns `None` when
+/// nothing on PATH passes, which callers treat as "not installed".
+pub fn find_pre_sandbox_executable(
+    name: &str,
+    policy: &SandboxPolicy,
+    tool_dir: &Path,
+) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let mut writable_roots: Vec<std::path::PathBuf> = policy
+        .fs_write
+        .iter()
+        .map(|p| canonical_or_self(Path::new(p)))
+        .collect();
+    writable_roots.push(canonical_or_self(tool_dir));
+
+    for dir in std::env::split_paths(&path_var) {
+        if !dir.is_absolute() {
+            tracing::debug!(dir = %dir.display(), "skipping relative PATH entry for {name}");
+            continue;
+        }
+        let candidate = dir.join(name);
+        let Ok(real) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&real) else {
+            continue;
+        };
+        if !meta.is_file() || !is_executable(&meta) {
+            continue;
+        }
+        if let Some(root) = writable_roots.iter().find(|r| real.starts_with(r)) {
+            tracing::warn!(
+                candidate = %real.display(),
+                root = %root.display(),
+                "ignoring {name} under a sandbox-writable path"
+            );
+            continue;
+        }
+        if loosely_writable(&real, &meta) {
+            tracing::warn!(
+                candidate = %real.display(),
+                "ignoring {name}: binary or its directory is group/world-writable"
+            );
+            continue;
+        }
+        return Some(real);
+    }
+    None
+}
+
+fn canonical_or_self(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// True when `file` grants write to group or others, or its parent
+/// directory grants write to others.
+///
+/// The directory test is deliberately narrower than the file test: Debian
+/// policy ships `/usr/local/bin` as `2775 root:staff`, so a group-writable
+/// parent is an ordinary place for a from-source `bwrap` to live, and
+/// rejecting it would silently drop the sandbox on those hosts. World-writable
+/// is never ordinary for a binary's directory.
+#[cfg(unix)]
+fn loosely_writable(file: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+    const OTHER_WRITE: u32 = 0o002;
+    if meta.permissions().mode() & GROUP_OR_OTHER_WRITE != 0 {
+        return true;
+    }
+    file.parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .is_some_and(|m| m.permissions().mode() & OTHER_WRITE != 0)
+}
+
+#[cfg(not(unix))]
+fn loosely_writable(_file: &Path, _meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// True when the current user may execute `meta`'s file. A non-executable
+/// stray on PATH must be passed over, not selected and then fail at spawn.
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Parse a bwrap version string like "bubblewrap 0.4.1" or "0.6.2".
@@ -183,9 +293,12 @@ pub fn parse_bwrap_version(output: &str) -> Option<BwrapVersion> {
     })
 }
 
-/// Build bwrap (Bubblewrap) argument list for Linux sandboxing
-pub fn build_bwrap_args(policy: &SandboxPolicy, tool_dir: &Path) -> Vec<String> {
-    build_bwrap_args_versioned(policy, tool_dir, detect_bwrap_version().as_ref())
+/// Build bwrap (Bubblewrap) argument list for Linux sandboxing.
+///
+/// `bwrap` is the helper binary that will run the result; its version gates
+/// the hardening flags. Resolve it with [`find_pre_sandbox_executable`].
+pub fn build_bwrap_args(policy: &SandboxPolicy, tool_dir: &Path, bwrap: &Path) -> Vec<String> {
+    build_bwrap_args_versioned(policy, tool_dir, detect_bwrap_version(bwrap).as_ref())
 }
 
 fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
@@ -476,37 +589,143 @@ mod tests {
         SandboxPolicy::default()
     }
 
-    /// Spec: detection actually runs the `bwrap` binary found on `PATH` and
-    /// parses its `--version` output — it must not be hardwired to `None`
-    /// (which would silently disable every version-gated hardening flag).
-    #[cfg(unix)]
-    #[test]
-    fn detect_bwrap_version_reads_the_binary_on_path() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("bwrap");
-        std::fs::write(&fake, "#!/bin/sh\necho 'bubblewrap 0.7.3'\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// A helper path that does not exist: the version probe yields `None`,
+    /// which is the "unknown version" branch these tests have always run.
+    const NO_BWRAP: &str = "/nonexistent/bwrap";
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
+    /// Name of the fake helper in the lookup test. Not `bwrap`: the test
+    /// *prepends* its directories to the real PATH (other tests spawn
+    /// `sleep` and `sh` concurrently, so PATH can never be replaced), and a
+    /// host with a real `bwrap` further down would otherwise satisfy the
+    /// "nothing acceptable" case.
+    const FAKE_HELPER: &str = "borg-test-sandbox-helper";
+
+    #[cfg(unix)]
+    fn write_fake_helper(dir: &Path, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join(FAKE_HELPER);
+        std::fs::write(&fake, "#!/bin/sh\necho 'bubblewrap 0.7.3'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(mode)).unwrap();
+        fake
+    }
+
+    /// Run `f` with `dirs` prepended to PATH, restoring PATH afterwards.
+    #[cfg(unix)]
+    fn with_path_prefix<T>(dirs: &[std::path::PathBuf], f: impl FnOnce() -> T) -> T {
+        let _env = crate::test_support::env_lock();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries: Vec<std::path::PathBuf> = dirs.to_vec();
+        entries.extend(std::env::split_paths(&old_path));
+        let prefixed = std::env::join_paths(entries).unwrap();
         // SAFETY: prepend-only PATH change, restored below; every other lookup
         // in the test binary still resolves through the untouched tail.
         unsafe {
-            std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+            std::env::set_var("PATH", &prefixed);
         }
-        let detected = detect_bwrap_version();
-        // SAFETY: restore before asserting so a failure cannot leak the fake.
+        let out = f();
+        // SAFETY: restore before any assertion so a failure cannot leak it.
         unsafe {
             std::env::set_var("PATH", &old_path);
         }
+        out
+    }
 
+    /// Spec: detection actually runs the resolved `bwrap` binary and parses
+    /// its `--version` output — it must not be hardwired to `None` (which
+    /// would silently disable every version-gated hardening flag).
+    #[cfg(unix)]
+    #[test]
+    fn detect_bwrap_version_reads_the_resolved_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = write_fake_helper(dir.path(), 0o755);
         assert_eq!(
-            detected,
+            detect_bwrap_version(&fake),
             Some(BwrapVersion {
                 major: 0,
                 minor: 7,
                 patch: 3
             })
+        );
+        assert_eq!(detect_bwrap_version(Path::new(NO_BWRAP)), None);
+    }
+
+    /// Spec: the pre-sandbox helper lookup must never pick a binary a
+    /// sandboxed tool could have planted. Relative PATH entries, candidates
+    /// under an `fs_write` grant or the tool dir, and loosely-permissioned
+    /// files are all passed over in favour of the first clean candidate —
+    /// even when the clean one sits *later* in PATH.
+    #[cfg(unix)]
+    #[test]
+    fn pre_sandbox_lookup_rejects_plantable_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let d = root.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let writable_grant = mk("grant/bin");
+        let tool_dir = mk("tool");
+        let loose_dir = mk("loose");
+        let world_writable_dir = mk("world");
+        let staff_dir = mk("staff");
+        let noexec_dir = mk("noexec");
+        let clean_dir = mk("clean");
+        let relative = "relative-bin";
+        std::fs::create_dir_all(root.path().join(relative)).unwrap();
+
+        let planted_in_grant = write_fake_helper(&writable_grant, 0o755);
+        let planted_in_tool = write_fake_helper(&tool_dir, 0o755);
+        let _loose = write_fake_helper(&loose_dir, 0o777);
+        let _in_world_writable = write_fake_helper(&world_writable_dir, 0o755);
+        std::fs::set_permissions(&world_writable_dir, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let _not_executable = write_fake_helper(&noexec_dir, 0o644);
+        // Debian's `/usr/local/bin` shape: group-writable directory, clean file.
+        let in_staff = write_fake_helper(&staff_dir, 0o755);
+        std::fs::set_permissions(&staff_dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let clean = write_fake_helper(&clean_dir, 0o755);
+        std::fs::set_permissions(&clean_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy = SandboxPolicy {
+            fs_write: vec![root.path().join("grant").to_string_lossy().into_owned()],
+            ..SandboxPolicy::default()
+        };
+
+        let bad_dirs = [
+            Path::new(relative).to_path_buf(),
+            writable_grant.clone(),
+            tool_dir.clone(),
+            loose_dir.clone(),
+            world_writable_dir.clone(),
+            noexec_dir.clone(),
+        ];
+        let mut all_dirs = bad_dirs.to_vec();
+        all_dirs.push(clean_dir.clone());
+        let found = with_path_prefix(&all_dirs, || {
+            find_pre_sandbox_executable(FAKE_HELPER, &policy, &tool_dir)
+        });
+        let none = with_path_prefix(&bad_dirs, || {
+            find_pre_sandbox_executable(FAKE_HELPER, &policy, &tool_dir)
+        });
+        let mut with_staff = bad_dirs.to_vec();
+        with_staff.push(staff_dir.clone());
+        let staff_found = with_path_prefix(&with_staff, || {
+            find_pre_sandbox_executable(FAKE_HELPER, &policy, &tool_dir)
+        });
+        assert_eq!(
+            staff_found,
+            Some(std::fs::canonicalize(&in_staff).unwrap()),
+            "a group-writable (root:staff) directory must stay acceptable"
+        );
+
+        let found = found.expect("the clean candidate must be accepted");
+        assert_eq!(found, std::fs::canonicalize(&clean).unwrap());
+        assert_ne!(found, std::fs::canonicalize(&planted_in_grant).unwrap());
+        assert_ne!(found, std::fs::canonicalize(&planted_in_tool).unwrap());
+        assert_eq!(
+            none, None,
+            "no acceptable candidate must read as not installed"
         );
     }
 
@@ -518,7 +737,7 @@ mod tests {
         let tool_dir = tmp.path().join("tools/my-tool");
         std::fs::create_dir_all(&tool_dir).unwrap();
         let tool_dir_str = tool_dir.to_string_lossy().into_owned();
-        let args = build_bwrap_args(&default_policy(), &tool_dir);
+        let args = build_bwrap_args(&default_policy(), &tool_dir, Path::new(NO_BWRAP));
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--ro-bind" && w[1] == tool_dir_str && w[2] == tool_dir_str));
@@ -526,7 +745,11 @@ mod tests {
 
     #[test]
     fn network_isolated_by_default() {
-        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            Path::new(NO_BWRAP),
+        );
         assert!(args.contains(&"--unshare-net".to_string()));
     }
 
@@ -548,7 +771,7 @@ mod tests {
             ],
             ..SandboxPolicy::default()
         };
-        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR), Path::new(NO_BWRAP));
 
         let dir_s = dir.to_string_lossy().into_owned();
         assert!(
@@ -576,7 +799,7 @@ mod tests {
             network: true,
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR), Path::new(NO_BWRAP));
         assert!(!args.contains(&"--unshare-net".to_string()));
     }
 
@@ -590,7 +813,7 @@ mod tests {
             fs_read: vec![input_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, tmp.path());
+        let args = build_bwrap_args(&policy, tmp.path(), Path::new(NO_BWRAP));
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--ro-bind" && w[1] == input_str));
@@ -606,7 +829,7 @@ mod tests {
             fs_write: vec![output_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, tmp.path());
+        let args = build_bwrap_args(&policy, tmp.path(), Path::new(NO_BWRAP));
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == output_str));
@@ -632,7 +855,7 @@ mod tests {
             fs_read: vec![missing_read.clone(), present_read_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, tmp.path());
+        let args = build_bwrap_args(&policy, tmp.path(), Path::new(NO_BWRAP));
 
         assert!(
             !args.contains(&missing_read),
@@ -660,7 +883,7 @@ mod tests {
             fs_write: vec![missing_write_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, tmp.path());
+        let args = build_bwrap_args(&policy, tmp.path(), Path::new(NO_BWRAP));
 
         assert!(
             missing_write.is_dir(),
@@ -679,7 +902,7 @@ mod tests {
     fn tool_dir_bind_comes_after_the_tmp_tmpfs() {
         let tmp = tempfile::tempdir().unwrap();
         let tool_dir_str = tmp.path().to_string_lossy().into_owned();
-        let args = build_bwrap_args(&default_policy(), tmp.path());
+        let args = build_bwrap_args(&default_policy(), tmp.path(), Path::new(NO_BWRAP));
 
         let tmpfs_tmp = args
             .windows(2)
@@ -699,7 +922,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("not-created-yet");
         let absent_str = absent.to_string_lossy().into_owned();
-        let args = build_bwrap_args(&default_policy(), &absent);
+        let args = build_bwrap_args(&default_policy(), &absent, Path::new(NO_BWRAP));
         assert!(
             !args.contains(&absent_str),
             "missing tool dir must not be bound: {args:?}"
@@ -741,7 +964,11 @@ mod tests {
 
     #[test]
     fn always_includes_pid_isolation() {
-        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            Path::new(NO_BWRAP),
+        );
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
     }
@@ -759,7 +986,7 @@ mod tests {
             deny_write: vec![protected_str.clone()],
             ..Default::default()
         };
-        let args = build_bwrap_args(&policy, tmp.path());
+        let args = build_bwrap_args(&policy, tmp.path(), Path::new(NO_BWRAP));
         assert!(
             !args
                 .windows(3)
@@ -971,7 +1198,11 @@ mod tests {
     /// `fs_write`/`deny_write` rule covers.
     #[test]
     fn build_args_restores_dev_shm_as_a_private_tmpfs() {
-        let args = build_bwrap_args(&default_policy(), Path::new(TEST_TOOL_DIR));
+        let args = build_bwrap_args(
+            &default_policy(),
+            Path::new(TEST_TOOL_DIR),
+            Path::new(NO_BWRAP),
+        );
         let dev = args
             .iter()
             .position(|a| a == "--dev")

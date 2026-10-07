@@ -1101,6 +1101,64 @@ mod tests {
         assert_eq!(dur, Duration::from_secs(24 * 60 * 60));
     }
 
+    /// Spec: a rate-limit error delivered mid-stream carries its `Retry-After`
+    /// inside the JSON (`error.headers`, OpenRouter's `error.metadata.headers`,
+    /// or top-level `headers`) because the stream's own HTTP headers are long
+    /// gone. Each shape must yield the delay, header name case must not
+    /// matter, and the structured `retry_after` field still wins when present.
+    #[test]
+    fn parse_retry_after_reads_headers_embedded_in_the_body() {
+        let cases = [
+            (r#"{"error":{"headers":{"retry-after":"7"}}}"#, 7.0),
+            (r#"{"error":{"headers":{"Retry-After":12}}}"#, 12.0),
+            (
+                r#"{"error":{"metadata":{"headers":{"Retry-After":"1.5"}}}}"#,
+                1.5,
+            ),
+            (r#"{"headers":{"RETRY-AFTER":"30"}}"#, 30.0),
+        ];
+        for (body, secs) in cases {
+            assert_eq!(
+                parse_retry_after(body),
+                Some(Duration::from_secs_f64(secs)),
+                "body: {body}"
+            );
+        }
+        // Structured field beats the echoed header.
+        assert_eq!(
+            parse_retry_after(r#"{"error":{"retry_after":3,"headers":{"retry-after":"99"}}}"#),
+            Some(Duration::from_secs(3))
+        );
+        // A degenerate echoed header is rejected like a degenerate field.
+        assert_eq!(
+            parse_retry_after(r#"{"error":{"headers":{"retry-after":"0"}}}"#),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(r#"{"error":{"headers":{"retry-after":"soon"}}}"#),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(r#"{"error":{"headers":{"x-request-id":"abc"}}}"#),
+            None
+        );
+    }
+
+    /// Spec: the stream-frame classifier reaches the embedded header, so a
+    /// mid-stream 429 frame produces a `Retryable` error that carries the
+    /// provider's delay instead of `None`.
+    #[test]
+    fn stream_error_frame_honours_embedded_retry_after_header() {
+        let frame = r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","headers":{"retry-after":"20"}}}"#;
+        let err = classify_stream_error_frame(frame, "openai");
+        match err {
+            LlmError::Retryable { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(20)));
+            }
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+    }
+
     // ── parse_retry_after_header ──
 
     #[test]

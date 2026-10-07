@@ -640,6 +640,9 @@ mod tests {
         // Spec: `env_clear()` strips everything, and the SAFE_ENV_VARS
         // allowlist restores the handful a runtime genuinely needs. Without
         // the restore, the child would see an empty PATH and HOME.
+        // The child captures PATH at spawn; the assertion reads it afterwards,
+        // so a concurrent PATH-mutating test would make the two differ.
+        let _env = crate::test_support::ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("safe_env.sh");
         std::fs::write(&script, "#!/bin/bash\necho \"P=$PATH\"\necho \"H=$HOME\"\n").unwrap();

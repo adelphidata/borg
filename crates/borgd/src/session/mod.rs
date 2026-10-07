@@ -64,6 +64,10 @@ struct HostInner {
     /// removed so a retiring host's final drain cannot publish "settled" for
     /// an id that a fresh host has already taken over.
     publishes_activity: AtomicBool,
+    /// Set by [`SessionHost::close`]. An internal turn that was queued before
+    /// the close (a session heartbeat, say) checks this under the turn lock
+    /// and declines, so nothing runs on a backend that has been closed.
+    closed: AtomicBool,
 }
 
 impl HostInner {
@@ -157,6 +161,7 @@ impl SessionHost {
                 busy: AtomicBool::new(false),
                 activity: OnceLock::new(),
                 publishes_activity: AtomicBool::new(true),
+                closed: AtomicBool::new(false),
             }),
         }
     }
@@ -253,7 +258,13 @@ impl SessionHost {
     /// the session is being closed or replaced so any waiting agent task
     /// unblocks promptly and the next turn (if any) starts clean.
     pub async fn close(&self) {
-        let token = self.inner.turn_state.lock().await.cancel.clone();
+        let token = {
+            let state = self.inner.turn_state.lock().await;
+            // Under the turn lock, so a guarded internal start that is waiting on
+            // the same lock sees the flag and declines rather than queueing.
+            self.inner.closed.store(true, Ordering::SeqCst);
+            state.cancel.clone()
+        };
         token.cancel();
         self.inner.prompts.clear();
         if let Err(e) = self.inner.backend.close_session().await {
@@ -394,14 +405,60 @@ impl SessionHost {
         self.start_turn_of(TurnKind::Resume, deadline).await
     }
 
+    /// Start an internal turn only if the session is idle *at the moment the
+    /// turn would be installed*. Returns `None`, and installs nothing, when
+    /// a turn is in flight or the host has been closed.
+    ///
+    /// [`Self::start_turn`] queues behind a running turn, which is right for
+    /// a user's message but wrong for a session heartbeat: a heartbeat that
+    /// checked "idle" and then queued would still fire after the user
+    /// cancelled the turn it queued behind, or after the session closed. The
+    /// idle check here runs under the turn lock, so nothing can slip in
+    /// between the check and the install.
+    pub async fn start_turn_if_idle(&self, text: String) -> Option<(CancellationToken, u64)> {
+        // The check and the install share one lock acquisition. Declining
+        // here leaves no task behind: the forwarder is only spawned inside
+        // `install_turn`, and its final act is to clear `busy`, which would
+        // wrongly settle a turn that is still live.
+        let state = self.inner.turn_state.lock().await;
+        let closed = self.inner.closed.load(Ordering::SeqCst);
+        if closed || self.inner.busy.load(Ordering::SeqCst) {
+            tracing::debug!(
+                session_id = %self.inner.session_id,
+                closed,
+                "internal turn declined: session is busy or closed"
+            );
+            return None;
+        }
+        let kind = TurnKind::Send {
+            text,
+            images: Vec::new(),
+            text_file_bridge: None,
+        };
+        Some(self.install_turn(state, kind, None).await)
+    }
+
     async fn start_turn_of(
         &self,
+        kind: TurnKind,
+        deadline: Option<std::time::Instant>,
+    ) -> (CancellationToken, u64) {
+        let state = self.inner.turn_state.lock().await;
+        self.install_turn(state, kind, deadline).await
+    }
+
+    /// Install and start a turn. `state` is the turn lock, already held by
+    /// the caller so that any precondition it checked still holds here.
+    async fn install_turn(
+        &self,
+        mut state: tokio::sync::MutexGuard<'_, TurnState>,
         kind: TurnKind,
         deadline: Option<std::time::Instant>,
     ) -> (CancellationToken, u64) {
         let cancel = CancellationToken::new();
         let inner = self.inner.clone();
         let cancel_for_task = cancel.clone();
+
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
         // Forwarder: stamp + broadcast each core event as a proto event. The
@@ -427,13 +484,12 @@ impl SessionHost {
         });
 
         // Critical section: await prior forwarder's drain, install our turn
-        // state, capture baseline seq — all under the same mutex so a
-        // concurrent `Send`/`Cancel`/`close` can't observe a half-installed
-        // state. The await on `prior_forwarder` may block if the previous
-        // turn's backend is still running; that's intentional — turns are
-        // serialized per session.
+        // state, capture baseline seq — all under the same mutex (taken
+        // above) so a concurrent `Send`/`Cancel`/`close` can't observe a
+        // half-installed state. The await on `prior_forwarder` may block if
+        // the previous turn's backend is still running; that's intentional —
+        // turns are serialized per session.
         let baseline = {
-            let mut state = inner.turn_state.lock().await;
             if let Some(prior) = state.forwarder.take() {
                 if let Err(e) = prior.await {
                     tracing::warn!(error = %e, "prior turn's forwarder join failed");
@@ -446,6 +502,7 @@ impl SessionHost {
             inner.set_busy(true);
             inner.buffer.last_seq()
         };
+        drop(state);
 
         let event_tx_for_backend = event_tx.clone();
         let session_id_for_watcher = inner.session_id.clone();
@@ -1065,6 +1122,47 @@ mod tests {
             "expected terminal Error('cancelled'), got {:?}",
             last.kind
         );
+    }
+
+    /// Spec: a guarded internal start (the session heartbeat's path) must
+    /// not queue behind a live turn — it declines, installs nothing, and
+    /// leaves the live turn's `busy` state intact. Once the turn drains, the
+    /// same call installs a turn like any other.
+    #[tokio::test]
+    async fn guarded_turn_declines_while_busy_and_runs_once_idle() {
+        let host = SessionHost::new(stub("s-guard", &["a", "b"], 30));
+        let mut rx = host.subscribe();
+        host.start_turn("user".into(), Vec::new(), None, None).await;
+        assert!(host.is_busy());
+
+        assert!(
+            host.start_turn_if_idle("heartbeat".into()).await.is_none(),
+            "must decline while a turn is in flight"
+        );
+        assert!(
+            host.is_busy(),
+            "a declined start must not clear the live turn's busy flag"
+        );
+
+        drain_until_terminal(&mut rx).await;
+        wait_until_idle(&host).await;
+
+        let mut rx = host.subscribe();
+        let started = host.start_turn_if_idle("heartbeat".into()).await;
+        assert!(started.is_some(), "an idle session accepts the turn");
+        assert!(host.is_busy());
+        drain_until_terminal(&mut rx).await;
+        wait_until_idle(&host).await;
+    }
+
+    /// Spec: a closed host refuses a guarded start outright, so a heartbeat
+    /// that raced the close never runs on the closed backend.
+    #[tokio::test]
+    async fn guarded_turn_is_refused_after_close() {
+        let host = SessionHost::new(stub("s-closed", &["a"], 1));
+        host.close().await;
+        assert!(host.start_turn_if_idle("heartbeat".into()).await.is_none());
+        assert!(!host.is_busy());
     }
 
     #[tokio::test]

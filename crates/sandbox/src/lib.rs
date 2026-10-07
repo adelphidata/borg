@@ -49,3 +49,19 @@ pub mod violation;
 /// platform-neutral so it builds and tests on all hosts; the actual
 /// Windows API calls live under `cfg(target_os = "windows")` submodules.
 pub mod windows;
+
+/// Test-only serialisation of process-wide environment mutation.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Held by every test that changes `PATH` (or reads it expecting a
+    /// stable value across an await), since the test binary runs tests on
+    /// parallel threads and the environment is process-global. An async
+    /// mutex so an async test can hold it across the await that spawns the
+    /// child; sync tests take it with [`env_lock`].
+    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Lock [`ENV_LOCK`] from a synchronous test (no runtime on this thread).
+    pub(crate) fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.blocking_lock()
+    }
+}
