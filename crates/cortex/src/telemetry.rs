@@ -106,6 +106,37 @@ impl Drop for TelemetryGuard {
     }
 }
 
+/// Decide whether a `tracing` span or event may reach the OTLP exporters.
+///
+/// The exporters ship over tonic, so hyper/h2 and the tokio runtime emit
+/// spans and trace events *while exporting*. If those were exported too,
+/// each export batch would generate the spans for the next one — an
+/// unbounded feedback loop whenever `RUST_LOG` admits debug/trace output.
+/// Spans from the transport and runtime crates are therefore never exported.
+/// Events get the same treatment at the levels where the transport narrates
+/// its own frames (`h2`/`hyper` log every HEADERS/DATA frame at DEBUG) and
+/// where the runtime narrates channel sends and timer polls (TRACE); their
+/// INFO-and-above events still reach the log bridge. Application targets are
+/// unaffected.
+fn otel_export_allowed(target: &str, is_span: bool, level: tracing::Level) -> bool {
+    let root = target.split("::").next().unwrap_or(target);
+    let transport = matches!(root, "h2" | "hyper" | "hyper_util" | "tonic");
+    let runtime = matches!(root, "tokio" | "runtime");
+    if is_span {
+        !(transport || runtime)
+    } else {
+        !((transport && level >= tracing::Level::DEBUG)
+            || (runtime && level == tracing::Level::TRACE))
+    }
+}
+
+/// [`otel_export_allowed`] as a per-layer `tracing_subscriber` filter.
+fn otel_export_filter() -> tracing_subscriber::filter::FilterFn {
+    tracing_subscriber::filter::filter_fn(|meta| {
+        otel_export_allowed(meta.target(), meta.is_span(), *meta.level())
+    })
+}
+
 /// Type alias for a boxed tracing layer compatible with Registry.
 pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
 
@@ -178,6 +209,7 @@ impl Drop for LifecycleGuard {
 /// [`propagation::extract_parent_context`] carry `traceparent` across the
 /// outbound-HTTP and inbound-webhook boundaries.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Vec<BoxedLayer>, TelemetryGuard)> {
+    use tracing_subscriber::Layer as _;
     if !config.tracing_enabled && !config.metrics_enabled && !config.logs_enabled {
         return Ok((Vec::new(), TelemetryGuard::noop()));
     }
@@ -213,7 +245,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Vec<BoxedLayer>, Tele
             .build();
 
         let tracer = tp.tracer("borg");
-        let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(otel_export_filter());
         layers.push(Box::new(layer));
         tracer_provider = Some(tp);
     }
@@ -250,7 +284,8 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(Vec<BoxedLayer>, Tele
 
         // Bridge `tracing` events into OTel logs. Boxed as a Registry layer so
         // it composes with the span layer + fmt layer at the call site.
-        let bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&lp);
+        let bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&lp)
+            .with_filter(otel_export_filter());
         layers.push(Box::new(bridge));
         logger_provider = Some(lp);
     }
@@ -667,6 +702,45 @@ pub(crate) mod tests {
     use opentelemetry_sdk::Resource;
     use plugins::wasm::WasmExecuteErrorKind;
     use wasm_metrics::{is_resource_exhaustion, Instruments, WasmCacheOutcome};
+
+    /// Transport and runtime spans would be re-exported by the very exporter
+    /// they describe; application spans and ordinary events must pass.
+    #[test]
+    fn otel_export_filter_drops_only_transport_and_runtime_internals() {
+        const DEBUG: tracing::Level = tracing::Level::DEBUG;
+        const INFO: tracing::Level = tracing::Level::INFO;
+        const TRACE: tracing::Level = tracing::Level::TRACE;
+        let cases: &[(&str, bool, tracing::Level, bool)] = &[
+            // Spans from the exporter's own transport stack: never exported.
+            ("h2::codec::framed_write", true, DEBUG, false),
+            ("hyper::proto::h2", true, TRACE, false),
+            ("hyper_util::client", true, DEBUG, false),
+            ("tonic::transport::channel", true, INFO, false),
+            ("tokio::task", true, TRACE, false),
+            ("runtime::resource", true, TRACE, false),
+            // Application spans at any level: exported.
+            ("cortex::agent", true, INFO, true),
+            ("borgd::session", true, TRACE, true),
+            ("h2_like_app_crate", true, DEBUG, true),
+            // Events: transport frame narration (DEBUG/TRACE) and runtime
+            // TRACE chatter are dropped; anything louder still passes.
+            ("tokio::sync::mpsc", false, TRACE, false),
+            ("runtime::io", false, TRACE, false),
+            ("tokio::runtime", false, DEBUG, true),
+            ("h2::codec", false, TRACE, false),
+            ("h2::codec::framed_write", false, DEBUG, false),
+            ("hyper::client", false, INFO, true),
+            ("tonic::transport", false, tracing::Level::WARN, true),
+            ("cortex::llm", false, TRACE, true),
+        ];
+        for (target, is_span, level, expected) in cases {
+            assert_eq!(
+                otel_export_allowed(target, *is_span, *level),
+                *expected,
+                "target={target} span={is_span} level={level}"
+            );
+        }
+    }
 
     /// Stand up an isolated meter provider whose exports are captured by an
     /// in-memory exporter.

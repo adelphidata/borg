@@ -81,6 +81,21 @@ where
     Ok(Some(decoded))
 }
 
+/// Read a (possibly absent) child pipe to EOF into `buf`.
+///
+/// Cancel-safe in the sense `crate::drain` needs: dropped mid-read, the bytes
+/// already appended to `buf` stay there.
+async fn read_pipe_to_end<R>(pipe: Option<R>, buf: &mut Vec<u8>) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(buf).await?;
+    }
+    Ok(())
+}
+
 impl<'a> ScriptRunner<'a> {
     /// Build a sandboxed command, spawn it, and write input to stdin.
     fn spawn_child(&self, label: &str) -> Result<(tokio::process::Child, std::time::Duration)> {
@@ -170,11 +185,31 @@ impl<'a> ScriptRunner<'a> {
         let pid = child.id();
         self.write_stdin(&mut child, input_json).await;
 
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
         // Pinned rather than passed by value: on expiry the future — and with
         // it the unreaped child — is still alive, so the group signal lands
         // before anything can reap the pid and let the pgid be recycled.
-        let output = {
-            let wait = child.wait_with_output();
+        // Reaping runs alongside the pipe reads (see `crate::drain`) so a
+        // backgrounded grandchild holding the pipes cannot stall this call
+        // until the timeout.
+        let status = {
+            let read_loop = async {
+                let (out, err) = tokio::join!(
+                    read_pipe_to_end(stdout_pipe, &mut stdout),
+                    read_pipe_to_end(stderr_pipe, &mut stderr),
+                );
+                for (stream, res) in [("stdout", out), ("stderr", err)] {
+                    if let Err(e) = res {
+                        // Not clean EOF: keep what arrived, but say so.
+                        tracing::warn!(error = %e, sandbox.name = %self.name, "script {stream} read failed");
+                    }
+                }
+            };
+            let wait = crate::drain::wait_with_bounded_drain(&mut child, read_loop);
             tokio::pin!(wait);
             match tokio::time::timeout(timeout, &mut wait).await {
                 Ok(result) => result.context("Failed to wait for script process")?,
@@ -186,9 +221,9 @@ impl<'a> ScriptRunner<'a> {
         };
 
         Ok(ScriptOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
+            exit_code: status.code(),
         })
     }
 
@@ -216,11 +251,15 @@ impl<'a> ScriptRunner<'a> {
         // 10 MB cap per stream guards against a runaway child exhausting memory.
         const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
-        let streaming_future = async {
+        // Owned outside the read loop: a last line without a trailing newline
+        // is still sitting in `pending` if the loop is dropped at the drain
+        // grace boundary, and it is flushed below rather than lost with it.
+        let mut stdout_pending: Vec<u8> = Vec::new();
+        let mut stderr_pending: Vec<u8> = Vec::new();
+
+        let read_loop = async {
             let mut stdout_lines = stdout_pipe.map(BufReader::new);
             let mut stderr_lines = stderr_pipe.map(BufReader::new);
-            let mut stdout_pending: Vec<u8> = Vec::new();
-            let mut stderr_pending: Vec<u8> = Vec::new();
             let mut stdout_done = stdout_lines.is_none();
             let mut stderr_done = stderr_lines.is_none();
 
@@ -288,16 +327,18 @@ impl<'a> ScriptRunner<'a> {
                     }
                 }
             }
-
-            child.wait().await
         };
 
         // Pinned for the same reason as in `run`: the group must be signalled
         // while the child is still unreaped. Scoped so the future — and the
         // output buffers it borrows — are released before they are read below.
+        // The reap runs alongside the read loop so a descendant the script
+        // backgrounded cannot hold the pipes (and this call) open past the
+        // leader's exit by more than the drain grace period.
         let status = {
-            tokio::pin!(streaming_future);
-            match tokio::time::timeout(timeout, &mut streaming_future).await {
+            let wait = crate::drain::wait_with_bounded_drain(&mut child, read_loop);
+            tokio::pin!(wait);
+            match tokio::time::timeout(timeout, &mut wait).await {
                 Ok(result) => result.context("Failed to wait for script process")?,
                 Err(_) => {
                     kill_process_group(pid);
@@ -305,6 +346,36 @@ impl<'a> ScriptRunner<'a> {
                 }
             }
         };
+
+        for (pending, buf, truncated, is_err) in [
+            (
+                &stdout_pending,
+                &mut stdout_buf,
+                &mut stdout_truncated,
+                false,
+            ),
+            (
+                &stderr_pending,
+                &mut stderr_buf,
+                &mut stderr_truncated,
+                true,
+            ),
+        ] {
+            if pending.is_empty() {
+                continue;
+            }
+            let line = String::from_utf8_lossy(pending).into_owned();
+            if callback_bytes < STREAM_CALLBACK_LIMIT {
+                on_output(&line, is_err);
+                callback_bytes += line.len();
+            }
+            if buf.len() + line.len() < MAX_OUTPUT_BYTES {
+                buf.push_str(&line);
+                buf.push('\n');
+            } else {
+                *truncated = true;
+            }
+        }
 
         let truncation_note = format!(
             "\n[output truncated at {}MB]",
@@ -950,6 +1021,62 @@ mod tests {
         assert!(
             !alive,
             "grandchild {grandchild} survived the timeout's group kill"
+        );
+    }
+
+    /// Both entry points must finish once the script itself exits even when a
+    /// grandchild it backgrounded still holds the inherited pipes, and must
+    /// keep the script's own output and exit code.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_and_run_streaming_finish_despite_lingering_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("linger.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\nsleep 30 &\necho produced\necho warned >&2\nprintf tail\nexit 5\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let runner = ScriptRunner {
+            runtime: "bash",
+            script_path: &script,
+            work_dir: dir.path(),
+            sandbox_policy: SandboxPolicy::default(),
+            timeout_ms: 20_000,
+            extra_env: &[],
+            name: "linger-test",
+        };
+
+        let started = std::time::Instant::now();
+        let out = runner.run("{}").await.expect("script exited normally");
+        assert_eq!(out.exit_code, Some(5));
+        assert_eq!(out.stdout, "produced\ntail");
+        assert_eq!(out.stderr.trim(), "warned");
+
+        let mut lines = Vec::new();
+        let out = runner
+            .run_streaming("{}", |line, is_err| lines.push((line.to_string(), is_err)))
+            .await
+            .expect("script exited normally");
+        assert_eq!(out.exit_code, Some(5));
+        assert!(
+            lines.contains(&("produced".to_string(), false)),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&("warned".to_string(), true)), "{lines:?}");
+        // The unterminated last line was still pending when the drain grace
+        // expired; it must reach both the callback and the captured output.
+        assert!(lines.contains(&("tail".to_string(), false)), "{lines:?}");
+        assert_eq!(out.stdout, "produced\ntail\n");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "grandchild held both calls for {elapsed:?}"
         );
     }
 

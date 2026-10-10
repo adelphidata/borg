@@ -40,12 +40,21 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // Raise the soft open-file limit before any descriptor-hungry subsystem
+    // starts. Logging is not up yet, so the result is carried into
+    // `async_main` and reported once the subscriber is installed. Windows
+    // has no such limit, so there is nothing to report there.
+    #[cfg(unix)]
+    let nofile_result = Some(borgd::runtime::raise_nofile_limit());
+    #[cfg(not(unix))]
+    let nofile_result: Option<std::io::Result<u64>> = None;
+
     // The agent loop runs on a worker thread; its deep poll chain (large tool
     // futures like the browser handler + every `#[instrument]` layer) overflows
     // tokio's 2 MiB default worker stack, and a stack overflow `abort()`s the
     // whole daemon uncatchably. `build_runtime` enlarges the worker stack to
     // give that poll chain the headroom it needs.
-    borgd::runtime::build_runtime()?.block_on(async_main())
+    borgd::runtime::build_runtime()?.block_on(async_main(nofile_result))
 }
 
 /// Load `<home>/.env` into the process environment.
@@ -64,7 +73,7 @@ fn load_env_file(home: &std::path::Path) {
     }
 }
 
-async fn async_main() -> Result<()> {
+async fn async_main(nofile_result: Option<std::io::Result<impl std::fmt::Display>>) -> Result<()> {
     let args = Args::parse();
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
     // Point config/DB resolution at the resolved home so telemetry settings
@@ -96,6 +105,14 @@ async fn async_main() -> Result<()> {
         env_filter,
         Box::new(tracing_subscriber::fmt::layer()),
     );
+
+    match nofile_result {
+        Some(Ok(limit)) => tracing::debug!(%limit, "open-file soft limit in effect"),
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "could not raise the open-file soft limit")
+        }
+        None => {}
+    }
 
     tracing::info!(borg_home = %home.display(), "starting borgd");
 

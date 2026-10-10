@@ -249,7 +249,11 @@ async fn stream_child_output(
     let mut stdout_decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
     let mut stderr_decoder = crate::util::utf8_stream::Utf8StreamDecoder::new();
 
-    let streaming_future = async {
+    // Boxed: this future carries both 8 KiB read buffers plus the select
+    // state, and `stream_child_output` is itself inlined into the agent
+    // loop's poll chain. Held inline it tips a test thread's 2 MiB stack
+    // over; on the heap the parent future keeps only a pointer.
+    let read_loop = Box::pin(async {
         let mut stdout_pipe = stdout_pipe;
         let mut stderr_pipe = stderr_pipe;
         let mut stdout_done = stdout_pipe.is_none();
@@ -322,29 +326,35 @@ async fn stream_child_output(
                 }
             }
         }
+    });
 
-        // Both streams are done: a dangling partial UTF-8 sequence can never
-        // complete, so flush it into a final delta (one replacement char)
-        // rather than silently dropping the bytes from the live stream.
-        for (decoder, is_stderr) in [(&mut stdout_decoder, false), (&mut stderr_decoder, true)] {
-            let tail = decoder.flush();
-            if !suppress_deltas && !tail.is_empty() {
-                let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
-                    tool_call_id: tool_call_id.to_string(),
-                    name: tool_name.to_string(),
-                    delta: tail,
-                    is_stderr,
-                });
-            }
+    // The read loop and the reap run together: a descendant the command
+    // backgrounded (`server &`) inherits these pipes and never closes them, so
+    // waiting for EOF before reaping would stall until the timeout and then
+    // discard the output the shell itself produced. Once the leader exits the
+    // loop gets a short grace period and is then dropped (closing our ends).
+    let status = tokio::time::timeout(
+        timeout,
+        sandbox::drain::wait_with_bounded_drain(child, read_loop),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("command timed out after {}ms", timeout.as_millis()))?
+    .context("Failed to wait for shell process")?;
+
+    // Both streams are done (or abandoned): a dangling partial UTF-8 sequence
+    // can never complete, so flush it into a final delta (one replacement
+    // char) rather than silently dropping the bytes from the live stream.
+    for (decoder, is_stderr) in [(&mut stdout_decoder, false), (&mut stderr_decoder, true)] {
+        let tail = decoder.flush();
+        if !suppress_deltas && !tail.is_empty() {
+            let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                tool_call_id: tool_call_id.to_string(),
+                name: tool_name.to_string(),
+                delta: tail,
+                is_stderr,
+            });
         }
-
-        child.wait().await
-    };
-
-    let status = tokio::time::timeout(timeout, streaming_future)
-        .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {}ms", timeout.as_millis()))?
-        .context("Failed to wait for shell process")?;
+    }
 
     // Resolve the spill dir only when a stream actually overflowed, so the
     // common well-behaved case never touches the filesystem.
@@ -2072,6 +2082,39 @@ mod tests {
         assert!(
             crate::util::process_tree::wait_for_pid_exit(pid).await,
             "backgrounded descendant {pid} survived the timeout"
+        );
+    }
+
+    /// A backgrounded descendant inherits the shell's pipes and keeps them
+    /// open. The tool must return the shell's own output and exit code once
+    /// the shell exits (plus a short drain grace), not sit until the timeout
+    /// and then report a timeout with the output gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_returns_when_shell_exits_despite_lingering_background_job() {
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let args = serde_json::json!({
+            "command": "sleep 20 & echo started; exit 3",
+            "timeout_ms": 15_000,
+        });
+        let started = std::time::Instant::now();
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("shell exit is a normal result");
+        let elapsed = started.elapsed();
+
+        assert!(
+            !result.contains("timed out"),
+            "shell exited; must not be reported as a timeout: {result}"
+        );
+        assert!(result.contains("started"), "shell output lost: {result}");
+        assert!(result.contains("Exit code: 3"), "exit code lost: {result}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "lingering background job held the tool call for {elapsed:?}"
         );
     }
 

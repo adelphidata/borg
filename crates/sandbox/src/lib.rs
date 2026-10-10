@@ -32,6 +32,8 @@
 pub mod bubblewrap;
 /// Shared security-critical constants (env allowlist, exec paths, sensitive paths).
 pub mod constants;
+/// Bounded output draining once a process leader exits ahead of its descendants.
+pub mod drain;
 /// Path utilities shared across sandbox and channel code.
 pub mod paths;
 /// Sandbox policy definition and command wrapping.

@@ -38,9 +38,76 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
+/// Soft open-file limit the daemon raises itself to on Unix.
+///
+/// A launchd- or shell-spawned process inherits a soft `RLIMIT_NOFILE` of
+/// 256 on macOS (1024 on many Linux distributions). One long-lived daemon
+/// holds a libsql handle, every open session's gRPC stream, each MCP server's
+/// stdio pipes, browser CDP sockets, and channel websockets at once, so that
+/// default is reachable in ordinary use and shows up as a confusing `EMFILE`
+/// deep inside whichever subsystem opened the next descriptor.
+#[cfg(unix)]
+pub const NOFILE_SOFT_LIMIT: libc::rlim_t = 4096;
+
+/// Raise the soft `RLIMIT_NOFILE` to [`NOFILE_SOFT_LIMIT`], capped at the
+/// inherited hard limit. Never lowers an already higher soft limit. Returns
+/// the soft limit in effect afterwards.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> std::io::Result<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` only writes into the stack-owned struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let target = limit.rlim_cur.max(limit.rlim_max.min(NOFILE_SOFT_LIMIT));
+    if target == limit.rlim_cur {
+        return Ok(target);
+    }
+    limit.rlim_cur = target;
+    // SAFETY: the requested soft limit does not exceed the inherited hard
+    // limit, and the struct is fully initialised by the `getrlimit` above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(target)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn nofile() -> libc::rlimit {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: see `raise_nofile_limit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit
+    }
+
+    /// After the raise the daemon can open at least `NOFILE_SOFT_LIMIT`
+    /// descriptors (or as many as the hard limit allows), and a second call
+    /// is a no-op rather than a lowering.
+    #[test]
+    fn raise_nofile_limit_reaches_target_and_never_lowers() {
+        let before = nofile();
+        let after = raise_nofile_limit().expect("getrlimit/setrlimit");
+        let expected = before.rlim_cur.max(before.rlim_max.min(NOFILE_SOFT_LIMIT));
+        assert_eq!(after, expected);
+        assert_eq!(nofile().rlim_cur, expected);
+        assert!(after >= before.rlim_cur, "must never lower the soft limit");
+
+        let again = raise_nofile_limit().expect("second call");
+        assert_eq!(again, expected, "idempotent once at target");
+        assert_eq!(nofile().rlim_max, before.rlim_max, "hard limit untouched");
+    }
 
     /// Actual stack size of the calling thread, queried from the OS. Only the
     /// platforms borg ships on (macOS, Linux) are wired up; both expose the
