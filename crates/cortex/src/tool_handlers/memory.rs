@@ -268,7 +268,12 @@ async fn search_scope(
     let fts_rows = match db.fts_search(scope, query, max_results * 4).await {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!("FTS search failed for scope {scope}: {e}");
+            if !crate::maintenance::fts::log_corruption_once(
+                &format!("FTS search for scope {scope}"),
+                &e,
+            ) {
+                tracing::warn!("FTS search failed for scope {scope}: {e}");
+            }
             return Vec::new();
         }
     };
@@ -382,17 +387,17 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     let prov = provider::from_config(config);
     if prov.name() != "native" {
         let ctx = MemCtx::from_config(config);
-        let hits = prov
-            .search(
-                &ctx,
-                &SearchQuery {
-                    query: query.to_string(),
-                    max_results,
-                    min_score,
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let hits = provider::search_guarded(
+            prov.as_ref(),
+            &ctx,
+            &SearchQuery {
+                query: query.to_string(),
+                max_results,
+                min_score,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         return Ok(format_hits(&hits));
     }
 

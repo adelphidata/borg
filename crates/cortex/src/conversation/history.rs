@@ -224,6 +224,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -378,6 +381,9 @@ mod tests {
                         tool_call_id: None,
                         timestamp: None,
                         seq: None,
+                        reasoning_blocks: None,
+                        reasoning_content: None,
+                        reasoning_model: None,
                     },
                     make_tool_result("c1", "out"),
                 ],
@@ -425,6 +431,9 @@ mod tests {
                 tool_call_id: None,
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             },
             make_assistant("done"),
         ];
@@ -726,6 +735,9 @@ mod tests {
                 tool_call_id: None,
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             },
             make_tool_result("c1", "result1"),
             // c2 result is missing

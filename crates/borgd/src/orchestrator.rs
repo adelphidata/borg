@@ -119,6 +119,7 @@ pub struct OrchestratorHandles {
 /// handles so the gRPC layer can wire `Admin.Poke` and
 /// `SubscribeHeartbeatEvents`. Each task observes `shutdown` and drains on
 /// cancellation.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     registry: SessionRegistry,
     config: Config,
@@ -127,6 +128,7 @@ pub async fn start(
     cost_event_sink: Arc<dyn CostEventSink>,
     goal_bus: GoalEventBus,
     grpc_web: gateway::webui::GrpcWebSlot,
+    shutdown_process: scheduler::ProcessShutdown,
 ) -> OrchestratorHandles {
     // Cloned before the executor takes ownership; the session-heartbeat poller
     // needs the same live-session map to decide what is hosted and idle.
@@ -320,6 +322,7 @@ pub async fn start(
     // The executor lets heartbeat ticks run the full agent loop (tools + the
     // goal/Ralph loop) for remediation; all other scheduled tasks ignore it.
     let scheduler_executor = executor.clone();
+    let scheduler_shutdown_process = shutdown_process;
     // Stall detection: the dispatcher bumps this once per loop iteration and
     // the supervisor arms a watchdog against each incarnation. Replaces the
     // dispatcher's own watchdog, which called `std::process::exit(1)` — a
@@ -337,6 +340,7 @@ pub async fn start(
             let liveness_for_loop = liveness_for_loop.clone();
             let task_cost_event_sink = task_cost_event_sink.clone();
             let scheduler_executor = scheduler_executor.clone();
+            let shutdown_process = scheduler_shutdown_process.clone();
             async move {
                 let cost_for_hook = task_cost_event_sink.clone();
                 let exec_for_hook = scheduler_executor.clone();
@@ -362,6 +366,7 @@ pub async fn start(
                             task_runner::deliver_celebration_to_channels(cfg, c).await
                         })
                     }),
+                    shutdown_process,
                 };
                 scheduler::run(
                     scheduler_config,
@@ -403,6 +408,9 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         &config,
         BorgMetrics::noop(),
     ));
+    // The cli shim has no process-level server to stop: cancelling the
+    // lifecycle token is the whole shutdown.
+    let shutdown_for_process = shutdown.clone();
     let _handles = start(
         registry,
         config,
@@ -411,6 +419,7 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         cost_event_sink,
         GoalEventBus::new(),
         gateway::webui::GrpcWebSlot::default(),
+        Arc::new(move || shutdown_for_process.cancel()),
     )
     .await;
     shutdown.cancelled().await;

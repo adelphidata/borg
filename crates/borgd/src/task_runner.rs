@@ -82,26 +82,20 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
     config
 }
 
-/// Spawn a single scheduled-task execution.
-pub async fn spawn_task_execution(
-    task: cortex::db::ScheduledTaskRow,
-    run_id: i64,
-    is_retry: bool,
-    semaphore: Arc<Semaphore>,
+/// What a run needs resolved before it can execute. Built inside the spawned
+/// task, under `catch_unwind`, so a panic here settles the run row instead of
+/// unwinding the dispatcher and leaving the batch's rows `running`.
+struct RunSetup {
     config: Config,
-    cost_event_sink: Option<Arc<dyn CostEventSink>>,
-    executor: Option<Arc<DaemonSessionExecutor>>,
-) {
+    task_prompt: String,
+    failure_delivery: Option<(String, String)>,
+}
+
+async fn prepare_run(config: Config, task: &cortex::db::ScheduledTaskRow) -> RunSetup {
     // Resolve the model this run uses before anything reads `config.llm`:
     // every downstream client (prompt, heartbeat, consolidation) builds from
     // this config, so overriding here covers all of them at one seam.
-    let config = resolve_scheduled_model(config, &task);
-
-    // Acquire the permit *inside* the spawned task, not on the caller's
-    // dispatcher loop. If we awaited here while all permits were claimed, the
-    // scheduler dispatcher would stall and the watchdog would kill the daemon.
-    let task_name = task.name.clone();
-    let task_id = task.id.clone();
+    let config = resolve_scheduled_model(config, task);
     let task_prompt = match task.id.as_str() {
         cortex::daily_summary::DAILY_SUMMARY_TASK_ID => {
             match cortex::daily_summary::build_daily_summary_prompt().await {
@@ -114,22 +108,9 @@ pub async fn spawn_task_execution(
         }
         _ => task.prompt.clone(),
     };
-    let task_timeout = std::time::Duration::from_millis(task.timeout_ms as u64);
-    let max_retries = task.max_retries;
-    let retry_count = task.retry_count;
-    let delivery_channel = task.delivery_channel.clone();
-    let delivery_target = task.delivery_target.clone();
-    let schedule_type = task.schedule_type.clone();
-    let task_type = task.task_type.clone();
-    let pre_run_command = task.pre_run_command.clone();
-    let pre_run_cwd = task.pre_run_cwd.clone();
-    let pre_run_timeout_ms = task.pre_run_timeout_ms;
-    let monitor_mode = task.monitor_mode;
-    let last_pre_run_hash = task.last_pre_run_hash.clone();
-    let continuity = task.continuity;
     // Resolved once, here, so every failure path (panic, exit code, spawn,
     // timeout) sends — or deliberately does not send — to the same place.
-    let failure_delivery = match cortex::tasks::task_failure_delivery(&task) {
+    let failure_delivery = match cortex::tasks::task_failure_delivery(task) {
         cortex::tasks::FailureDelivery::Route(ch, tgt) => Some((ch, tgt)),
         cortex::tasks::FailureDelivery::Suppress => {
             tracing::debug!(
@@ -140,7 +121,58 @@ pub async fn spawn_task_execution(
         }
         cortex::tasks::FailureDelivery::Unrouted => None,
     };
+    RunSetup {
+        config,
+        task_prompt,
+        failure_delivery,
+    }
+}
 
+/// Close a run row whose body never started.
+///
+/// Every claimed run has a `running` row, and only the run itself writes the
+/// final status. A dispatch step that fails before the body (a setup panic,
+/// a closed concurrency semaphore) would otherwise leave the row `running`
+/// until the wedged-run sweep guesses at it hours later.
+///
+/// The task row's `last_error` is stamped too (when empty, as
+/// `recover_stale_runs` does): `task_runs` is history nobody reads unless
+/// they ask, while `last_error` is what `borg tasks` shows.
+async fn settle_unstarted(run_id: i64, task_id: &str, task_name: &str, step: &str, err: &str) {
+    let error = format!("dispatch failed at {step}: {err}");
+    tracing::warn!(task = %task_name, run_id, step, "run never started: {err}");
+    let db = match cortex::db::Database::open().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(task = %task_name, run_id, "settle: DB open failed: {e}");
+            return;
+        }
+    };
+    match db.complete_task_run(run_id, 0, None, Some(&error)).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(task = %task_name, run_id, "no run row to settle"),
+        Err(e) => tracing::warn!(task = %task_name, run_id, "failed to settle unstarted run: {e}"),
+    }
+    if let Err(e) = db.note_task_error_if_empty(task_id, &error).await {
+        tracing::warn!(task = %task_name, run_id, "failed to record last_error: {e}");
+    }
+}
+
+/// Spawn a single scheduled-task execution.
+pub async fn spawn_task_execution(
+    task: cortex::db::ScheduledTaskRow,
+    run_id: i64,
+    is_retry: bool,
+    semaphore: Arc<Semaphore>,
+    config: Config,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    executor: Option<Arc<DaemonSessionExecutor>>,
+) {
+    // Nothing runs on the caller's dispatcher loop: the permit wait, the
+    // setup and the body all happen inside the spawned task. If the
+    // dispatcher awaited the permit, it would stall when every permit was
+    // claimed and the watchdog would restart it; if setup panicked on the
+    // dispatcher, the whole claimed batch would be left `running`.
     tokio::spawn(async move {
         // Liveness registration for the wedged-run recovery sweep: while
         // this future is alive (queued on the semaphore or executing), the
@@ -148,6 +180,39 @@ pub async fn spawn_task_execution(
         // RAII — the id deregisters when this task ends, including via
         // panic unwind or tokio's task-boundary panic catch.
         let _live_guard = cortex::tasks::LiveRunGuard::register(run_id);
+        let task_name = task.name.clone();
+        let task_id = task.id.clone();
+
+        let setup = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(prepare_run(
+            config, &task,
+        )))
+        .await;
+        let RunSetup {
+            config,
+            task_prompt,
+            failure_delivery,
+        } = match setup {
+            Ok(setup) => setup,
+            Err(panic_err) => {
+                let text = panic_error_text(panic_err.as_ref(), None, &task_id);
+                settle_unstarted(run_id, &task_id, &task_name, "setup", &text).await;
+                return;
+            }
+        };
+
+        let task_timeout = std::time::Duration::from_millis(task.timeout_ms as u64);
+        let max_retries = task.max_retries;
+        let retry_count = task.retry_count;
+        let delivery_channel = task.delivery_channel.clone();
+        let delivery_target = task.delivery_target.clone();
+        let schedule_type = task.schedule_type.clone();
+        let task_type = task.task_type.clone();
+        let pre_run_command = task.pre_run_command.clone();
+        let pre_run_cwd = task.pre_run_cwd.clone();
+        let pre_run_timeout_ms = task.pre_run_timeout_ms;
+        let monitor_mode = task.monitor_mode;
+        let last_pre_run_hash = task.last_pre_run_hash.clone();
+        let continuity = task.continuity;
         // Emergency stop (`borg pause`): the dispatcher gate normally stops
         // runs from being claimed at all, but a run can reach here through
         // the claim-vs-pause race window or the orchestrator path. This run
@@ -207,9 +272,17 @@ pub async fn spawn_task_execution(
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
-                // Normal backpressure when concurrency cap is hit. Supervisor
-                // and scheduler tick will retry — not a WARN-level event.
-                tracing::debug!(task = %task_name, error = %e, "failed to acquire semaphore");
+                // Backpressure is a wait, not an error: `acquire_owned` only
+                // fails once the semaphore is closed, and this run will never
+                // execute. Its row is `running`; close it truthfully.
+                settle_unstarted(
+                    run_id,
+                    &task_id,
+                    &task_name,
+                    "semaphore acquire",
+                    &e.to_string(),
+                )
+                .await;
                 return;
             }
         };
@@ -2135,17 +2208,40 @@ async fn handle_task_failure(
     }
 }
 
-fn parse_sender(target: &str) -> String {
+/// Where a task result goes on its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryTarget {
+    /// Chat / channel / user id the channel client addresses.
+    pub sender: String,
+    /// Thread inside that chat (Telegram topic, Slack thread, Discord
+    /// thread) when the task was created in one.
+    pub thread_id: Option<String>,
+}
+
+/// Parse a persisted `delivery_target`: either a bare sender id or the
+/// `{sender, thread_id, session_key}` JSON the `schedule` tool stores for an
+/// origin-resolved task. A task created inside a thread is answered inside
+/// that thread, not in the parent chat.
+pub(crate) fn parse_delivery_target(target: &str) -> DeliveryTarget {
     if target.starts_with('{') {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(target) {
-            return parsed
+            let sender = parsed
                 .get("sender")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let thread_id = parsed
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            return DeliveryTarget { sender, thread_id };
         }
     }
-    target.to_string()
+    DeliveryTarget {
+        sender: target.to_string(),
+        thread_id: None,
+    }
 }
 
 /// Identifies the run a delivery belongs to, so a failed hand-off can be
@@ -2170,13 +2266,22 @@ async fn deliver_task_result(
         record_delivery_failure(run, "unresolved 'origin' delivery target — result dropped").await;
         return;
     }
-    let sender = parse_sender(target);
+    let DeliveryTarget { sender, thread_id } = parse_delivery_target(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    // Redact here, not only inside `send`: the same string is mirrored into
-    // the chat session below, and the session must not keep the raw secret.
+    // Redact here, not only inside `send_threaded`: the same string is
+    // mirrored into the chat session below, and the session must not keep the
+    // raw secret.
     let msg = crate::channel_delivery::prepare_outbound(channel, &sender, &msg);
     let msg = msg.as_ref();
-    match crate::channel_delivery::send(config, channel, &sender, msg).await {
+    match crate::channel_delivery::send_threaded(
+        config,
+        channel,
+        &sender,
+        msg,
+        thread_id.as_deref(),
+    )
+    .await
+    {
         Ok(()) => {
             // Mirror the delivered message into the originating chat session so
             // the agent remembers its own proactive output and a later user
@@ -3582,5 +3687,169 @@ mod continuity_tests {
                 "no character may be split by the cut"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_target_tests {
+    use super::*;
+
+    #[test]
+    fn a_task_created_in_a_thread_is_delivered_into_that_thread() {
+        let cases: [(&str, &str, Option<&str>); 6] = [
+            // Origin-resolved target from a Telegram topic / Slack thread.
+            (
+                r#"{"sender":"-100123","thread_id":"42","session_key":"-100123:42"}"#,
+                "-100123",
+                Some("42"),
+            ),
+            // Same shape, no thread: the parent chat.
+            (r#"{"sender":"u1","thread_id":null}"#, "u1", None),
+            (r#"{"sender":"u1","thread_id":""}"#, "u1", None),
+            (r#"{"sender":"u1"}"#, "u1", None),
+            // A plain single-channel id has no thread to honour.
+            ("+15551234567", "+15551234567", None),
+            // Malformed JSON falls back to the raw string, never panics.
+            ("{not json", "{not json", None),
+        ];
+        for (target, sender, thread_id) in cases {
+            assert_eq!(
+                parse_delivery_target(target),
+                DeliveryTarget {
+                    sender: sender.to_string(),
+                    thread_id: thread_id.map(str::to_string),
+                },
+                "target {target}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod unstarted_run_tests {
+    use super::*;
+    use cortex::db::{Database, NewTask};
+
+    /// `spawn_task_execution` opens the database by `BORG_HOME`, so the test
+    /// points it at a fresh directory and holds the crate-wide env lock.
+    struct HomeGuard {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn isolated() -> Self {
+            let lock = crate::test_env::env_lock();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let prev = std::env::var("BORG_HOME").ok();
+            std::env::set_var("BORG_HOME", tmp.path());
+            Self {
+                prev,
+                _tmp: tmp,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("BORG_HOME", v),
+                None => std::env::remove_var("BORG_HOME"),
+            }
+        }
+    }
+
+    async fn run_status(db: &Database, task_id: &str) -> cortex::db::TaskRunRow {
+        db.task_run_history(task_id, 1)
+            .await
+            .expect("history")
+            .remove(0)
+    }
+
+    /// A run that can never execute must not stay `running`: the row is the
+    /// only record of the claim, and only this code path knows it was never
+    /// started.
+    #[tokio::test]
+    async fn a_closed_semaphore_settles_the_run_as_failed() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.expect("open db under BORG_HOME");
+        db.create_task(&NewTask {
+            id: "t-unstarted",
+            name: "unstarted",
+            prompt: "true",
+            schedule_type: "interval",
+            schedule_expr: "1m",
+            timezone: "UTC",
+            next_run: Some(0),
+            max_retries: Some(0),
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "command",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        })
+        .await
+        .expect("create task");
+        let run_id = db
+            .start_task_run("t-unstarted", 100)
+            .await
+            .expect("start run");
+        let task = db
+            .get_task_by_id("t-unstarted")
+            .await
+            .expect("read task")
+            .expect("task exists");
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        semaphore.close();
+        spawn_task_execution(
+            task,
+            run_id,
+            false,
+            semaphore,
+            Config::default(),
+            None,
+            None,
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let row = loop {
+            let row = run_status(&db, "t-unstarted").await;
+            if row.status != cortex::tasks::RUN_STATUS_RUNNING {
+                break row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run row stayed `running` after the semaphore refused it"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(row.id, run_id);
+        assert_eq!(row.status, cortex::tasks::RUN_STATUS_FAILED);
+        let error = row.error.expect("a settled run names why");
+        assert!(
+            error.starts_with("dispatch failed at semaphore acquire: "),
+            "the error must name the step, got: {error}"
+        );
+        // The task row carries it too — `borg tasks` reads `last_error`,
+        // not `task_runs`.
+        let task = db
+            .get_task_by_id("t-unstarted")
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some(error.as_str()),
+            "the task row must show the same failure"
+        );
     }
 }

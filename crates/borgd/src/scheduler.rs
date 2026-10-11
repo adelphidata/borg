@@ -9,12 +9,13 @@ use crate::tick_lock::TickLock;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{
-    DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, SLEEP_DRIFT_THRESHOLD,
-    STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL,
+    DAEMON_LOCK_STALE_SECS, DAEMON_LOOP_INTERVAL, SLEEP_DRIFT_THRESHOLD, STALLED_TASK_GRACE_SECS,
+    STALLED_TASK_SCAN_INTERVAL,
 };
 use cortex::paths::tick_lock_path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Callback the dispatcher invokes for each claimed task. The cli's
@@ -38,6 +39,14 @@ pub type CelebrationDeliver = Arc<
         + Sync,
 >;
 
+/// Asks the whole process to stop — not just the orchestrator subsystems.
+///
+/// The dispatcher calls this when it can no longer prove it holds the daemon
+/// lock. Cancelling only the orchestrator token would stop the gateway,
+/// heartbeat and dispatcher while the gRPC servers keep the process alive
+/// half-dead; a full stop lets launchd/systemd restart a whole daemon.
+pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
+
 /// Hooks the dispatcher needs to run task bodies. The cli wires these to the
 /// existing `service::*` async helpers; production callers from inside borgd
 /// can supply their own implementation later.
@@ -48,6 +57,226 @@ pub struct DispatcherHooks {
     pub spawn_task: TaskSpawn,
     /// Deliver an evolution/milestone celebration.
     pub deliver_celebration: CelebrationDeliver,
+    /// Stop the entire process (see [`ProcessShutdown`]).
+    pub shutdown_process: ProcessShutdown,
+}
+
+/// Boot recovery runs once per process, not once per dispatcher incarnation.
+///
+/// The dispatcher is supervised: a wedge aborts and respawns `run`, but the
+/// task futures the previous incarnation spawned keep executing in this
+/// process. Re-running recovery would fail those live runs and reclaim the
+/// session leases this very process still holds.
+static BOOT_RECOVERY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claim the one boot-recovery pass this process gets. `true` for the first
+/// caller only.
+fn claim_boot_recovery() -> bool {
+    !BOOT_RECOVERY_CLAIMED.swap(true, Ordering::SeqCst)
+}
+
+// ── Daemon-lock refresh policy ──
+
+/// What one `refresh_daemon_lock` call told us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRefresh {
+    /// Our row was stamped; we provably still hold the lock.
+    Refreshed,
+    /// No row matched our pid: stolen or released. Another daemon may be
+    /// dispatching right now.
+    Lost,
+    /// The store refused the write (busy timeout, I/O). Says nothing about
+    /// who holds the lock.
+    Transient,
+}
+
+impl LockRefresh {
+    pub(crate) fn from_result(result: &anyhow::Result<bool>) -> Self {
+        match result {
+            Ok(true) => Self::Refreshed,
+            Ok(false) => Self::Lost,
+            Err(_) => Self::Transient,
+        }
+    }
+}
+
+/// The dispatcher's decision after a refresh attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockVerdict {
+    Continue,
+    /// Stop dispatching and ask the process to exit.
+    Cancel,
+}
+
+/// Safety margin, in seconds, kept between the last successful refresh and the
+/// moment another daemon could legally take the lock
+/// (`DAEMON_LOCK_STALE_SECS`). The dispatcher gives up on transient store
+/// errors *before* that moment, so two daemons never dispatch at once.
+///
+/// Two loop intervals: one for the tick that discovers the budget is gone,
+/// one for the shutdown to drain.
+pub(crate) const LOCK_GIVE_UP_MARGIN_SECS: i64 = 2 * DAEMON_LOOP_INTERVAL.as_secs() as i64;
+
+const _: () = assert!(
+    LOCK_GIVE_UP_MARGIN_SECS < DAEMON_LOCK_STALE_SECS,
+    "the give-up margin must leave a positive budget for transient refresh errors"
+);
+
+/// Pure policy for lock-refresh outcomes. Tolerates transient store errors
+/// for as long as the row cannot yet have gone stale; a lost lock is fatal at
+/// once.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LockRefreshPolicy {
+    /// Unix seconds of the last refresh that provably stamped our row (or the
+    /// acquire, before any refresh has run).
+    last_ok_at: i64,
+}
+
+impl LockRefreshPolicy {
+    pub(crate) fn new(acquired_at: i64) -> Self {
+        Self {
+            last_ok_at: acquired_at,
+        }
+    }
+
+    /// Seconds of transient errors tolerated after the last good refresh.
+    pub(crate) const fn transient_budget_secs() -> i64 {
+        DAEMON_LOCK_STALE_SECS - LOCK_GIVE_UP_MARGIN_SECS
+    }
+
+    pub(crate) fn observe(&mut self, outcome: LockRefresh, now: i64) -> LockVerdict {
+        match outcome {
+            LockRefresh::Refreshed => {
+                self.last_ok_at = now;
+                LockVerdict::Continue
+            }
+            LockRefresh::Lost => LockVerdict::Cancel,
+            LockRefresh::Transient => {
+                if now.saturating_sub(self.last_ok_at) < Self::transient_budget_secs() {
+                    LockVerdict::Continue
+                } else {
+                    LockVerdict::Cancel
+                }
+            }
+        }
+    }
+}
+
+// ── Tick failure classification ──
+
+/// Why a tick could not reach a dispatch decision, grouped by what a restart
+/// would do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickFailure {
+    /// The store is full or another writer holds it. The loop itself is fine
+    /// and a restart changes nothing — it would re-run `Database::open` and
+    /// `acquire_daemon_lock` against the same store, trip the supervisor's
+    /// restart cap, and leave the daemon without a dispatcher for good. The
+    /// tick counts as alive; the warning is throttled per class.
+    HealthySkip(TickFailureClass),
+    /// Anything else — descriptor exhaustion above all — where the restart
+    /// *is* the fix (it frees what the loop leaked). Liveness is withheld so
+    /// the watchdog restarts the subsystem.
+    Unhealthy,
+}
+
+/// The healthy-skip classes, each with its own warning throttle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickFailureClass {
+    StorageExhausted,
+    LockContention,
+}
+
+impl TickFailureClass {
+    const COUNT: usize = 2;
+
+    fn index(self) -> usize {
+        match self {
+            Self::StorageExhausted => 0,
+            Self::LockContention => 1,
+        }
+    }
+
+    fn operator_hint(self) -> &'static str {
+        match self {
+            Self::StorageExhausted => {
+                "the data store is full or read-only; no scheduled task can run until space is freed"
+            }
+            Self::LockContention => {
+                "another process holds the database write lock; scheduled tasks are deferred until it releases"
+            }
+        }
+    }
+}
+
+/// Classify a failed tick. Walks the error chain for the raw storage errnos:
+/// the tick-lock path wraps its I/O error in context, and `cortex::db`'s
+/// predicates look only at the top-level error.
+pub(crate) fn classify_tick_failure(e: &anyhow::Error) -> TickFailure {
+    if cortex::db::is_storage_exhausted(e) {
+        return TickFailure::HealthySkip(TickFailureClass::StorageExhausted);
+    }
+    if cortex::db::is_lock_contention(e) {
+        return TickFailure::HealthySkip(TickFailureClass::LockContention);
+    }
+    let storage_errno = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .filter_map(std::io::Error::raw_os_error)
+        .any(|errno| errno == libc::ENOSPC || errno == libc::EDQUOT || errno == libc::EROFS);
+    if storage_errno {
+        return TickFailure::HealthySkip(TickFailureClass::StorageExhausted);
+    }
+    TickFailure::Unhealthy
+}
+
+/// Minimum spacing between two warnings of the same healthy-skip class.
+pub(crate) const HEALTHY_SKIP_WARN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Per-class warning throttle for healthy skips. A full disk fails every tick
+/// identically; one warning per class per quarter hour says the same thing
+/// without burying the log.
+#[derive(Debug, Default)]
+pub(crate) struct HealthySkipWarnThrottle {
+    last_warned: [Option<Instant>; TickFailureClass::COUNT],
+}
+
+impl HealthySkipWarnThrottle {
+    /// Whether to emit a warning for `class` at `now`; records it if so.
+    pub(crate) fn should_warn(&mut self, class: TickFailureClass, now: Instant) -> bool {
+        let slot = &mut self.last_warned[class.index()];
+        match slot {
+            Some(last) if now.duration_since(*last) < HEALTHY_SKIP_WARN_INTERVAL => false,
+            _ => {
+                *slot = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Apply a failed tick's classification: a healthy skip counts as alive and
+/// warns at most once per class per [`HEALTHY_SKIP_WARN_INTERVAL`]; an
+/// unhealthy failure leaves the liveness counter alone so the watchdog can
+/// restart the loop.
+fn note_tick_failure(
+    failure: TickFailure,
+    liveness: &AtomicU64,
+    throttle: &mut HealthySkipWarnThrottle,
+) {
+    let TickFailure::HealthySkip(class) = failure else {
+        return;
+    };
+    liveness.fetch_add(1, Ordering::Relaxed);
+    if throttle.should_warn(class, Instant::now()) {
+        tracing::warn!(
+            class = ?class,
+            "scheduler tick skipped: {}. A restart would not help, so the dispatcher stays up \
+             and retries; this warning repeats at most every {} minutes",
+            class.operator_hint(),
+            HEALTHY_SKIP_WARN_INTERVAL.as_secs() / 60
+        );
+    }
 }
 
 /// Notice, and record, that the previous daemon never released its lock.
@@ -171,6 +400,25 @@ async fn backoff_after_failed_tick(
     }
 }
 
+/// The dispatcher's clean-stop bookkeeping: release the daemon lock and
+/// stamp the clean-shutdown time, so the doctor's unclean-exit warning
+/// clears itself on a graceful stop rather than needing a squelch. Runs on
+/// the shutdown arm and before a lock-loss process stop.
+async fn record_clean_shutdown(db: &cortex::db::Database, daemon_pid: u32) {
+    if let Err(e) = db.release_daemon_lock(daemon_pid).await {
+        tracing::warn!(error = %e, "release daemon lock on shutdown failed");
+    }
+    if let Err(e) = db
+        .set_meta(
+            cortex::constants::META_LAST_CLEAN_SHUTDOWN_AT,
+            &chrono::Utc::now().timestamp().to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "recording clean shutdown timestamp failed");
+    }
+}
+
 /// Run the dispatcher loop until `shutdown` fires. Returns when shutdown is
 /// observed — caller should drain any remaining permits.
 pub async fn run(
@@ -205,12 +453,21 @@ pub async fn run(
     // overdue gets its `next_run` advanced so we don't replay every
     // missed window in a burst. Concentrated into the maintenance
     // module — see `crates/borgd/src/maintenance/sweep.rs`.
-    let boot_report = sweep::boot_recovery(&db).await;
-    if boot_report.stale_tasks_advanced > 0 {
-        tracing::info!(
-            advanced = boot_report.stale_tasks_advanced,
-            "boot recovery: advanced stale tasks past 7-day overdue threshold",
-        );
+    //
+    // Once per process: a supervisor respawn of this loop must not fail the
+    // runs its previous incarnation spawned (see `BOOT_RECOVERY_CLAIMED`).
+    // Deliberately after `acquire_daemon_lock`: another live daemon's
+    // in-flight rows are its own.
+    if claim_boot_recovery() {
+        let boot_report = sweep::boot_recovery(&db).await;
+        if boot_report.stale_tasks_advanced > 0 {
+            tracing::info!(
+                advanced = boot_report.stale_tasks_advanced,
+                "boot recovery: advanced stale tasks past 7-day overdue threshold",
+            );
+        }
+    } else {
+        tracing::debug!("dispatcher respawned; boot recovery already ran in this process");
     }
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
@@ -233,7 +490,8 @@ pub async fn run(
 
     let mut last_tick_wall = std::time::Instant::now();
     let mut last_stalled_scan = std::time::Instant::now();
-    let mut lock_refresh_failures: u32 = 0;
+    let mut lock_policy = LockRefreshPolicy::new(now);
+    let mut skip_warn_throttle = HealthySkipWarnThrottle::default();
     // Consecutive ticks that could not reach a dispatch decision. Drives the
     // backoff below and, by withholding the liveness bump, lets the
     // supervisor's watchdog restart a scheduler that is stuck.
@@ -247,21 +505,7 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                if let Err(e) = db.release_daemon_lock(daemon_pid).await {
-                    tracing::warn!(error = %e, "release daemon lock on shutdown failed");
-                }
-                // Stamp the clean stop so the doctor's unclean-exit warning
-                // clears itself on the next graceful shutdown rather than
-                // needing a squelch.
-                if let Err(e) = db
-                    .set_meta(
-                        cortex::constants::META_LAST_CLEAN_SHUTDOWN_AT,
-                        &chrono::Utc::now().timestamp().to_string(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "recording clean shutdown timestamp failed");
-                }
+                record_clean_shutdown(&db, daemon_pid).await;
                 return Ok(());
             }
             _ = interval.tick() => {}
@@ -294,19 +538,37 @@ pub async fn run(
 
         let now = chrono::Utc::now().timestamp();
 
-        match db.refresh_daemon_lock(daemon_pid, now).await {
-            Ok(()) => lock_refresh_failures = 0,
-            Err(e) => {
-                lock_refresh_failures += 1;
-                tracing::warn!(
-                    "Failed to refresh daemon lock ({lock_refresh_failures}/{DAEMON_LOCK_MAX_REFRESH_FAILURES}): {e}"
-                );
-                if lock_refresh_failures >= DAEMON_LOCK_MAX_REFRESH_FAILURES {
-                    tracing::error!("Daemon lock lost, exiting");
-                    shutdown.cancel();
-                    continue;
-                }
+        let refresh = db.refresh_daemon_lock(daemon_pid, now).await;
+        let outcome = LockRefresh::from_result(&refresh);
+        if let Err(e) = &refresh {
+            tracing::warn!(
+                error = %e,
+                budget_secs = LockRefreshPolicy::transient_budget_secs(),
+                "daemon lock refresh failed; tolerated until the lock could go stale"
+            );
+        }
+        if lock_policy.observe(outcome, now) == LockVerdict::Cancel {
+            match outcome {
+                LockRefresh::Lost => tracing::error!(
+                    "daemon lock lost to another process — stopping this daemon so only one dispatches"
+                ),
+                _ => tracing::error!(
+                    "daemon lock could not be refreshed for {}s — stopping this daemon before \
+                     another could take the lock; the service manager restarts it",
+                    LockRefreshPolicy::transient_budget_secs()
+                ),
             }
+            // Release and stamp *before* asking the process to stop: a fast
+            // exit must not leave the lock row behind as an unclean-shutdown
+            // marker. Then a whole-process stop, so the service manager
+            // restarts a complete daemon rather than leaving one with dead
+            // subsystems behind live gRPC servers. The token cancel covers
+            // callers whose process hook is a no-op; the shutdown work is
+            // already done, so this loop simply ends.
+            record_clean_shutdown(&db, daemon_pid).await;
+            (hooks.shutdown_process)();
+            shutdown.cancel();
+            return Ok(());
         }
 
         // Emergency stop (`borg pause`): skip the entire claim+dispatch arm
@@ -338,18 +600,6 @@ pub async fn run(
             pause_gate.observe(false)
         {
             tracing::info!("emergency pause released — scheduled-task dispatch resumed");
-        }
-
-        if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
-            last_stalled_scan = std::time::Instant::now();
-            let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS).await;
-            if scan.tasks_healed > 0 || scan.wedged_runs_recovered > 0 {
-                tracing::info!(
-                    healed = scan.tasks_healed,
-                    wedged = scan.wedged_runs_recovered,
-                    "stalled-task scan made repairs",
-                );
-            }
         }
 
         // Claim+dispatch critical section. The non-blocking tick lock makes
@@ -401,6 +651,11 @@ pub async fn run(
                          open-file limit (`ulimit -n`) for the daemon."
                     );
                 }
+                note_tick_failure(
+                    classify_tick_failure(&e),
+                    &liveness,
+                    &mut skip_warn_throttle,
+                );
                 // A shutdown during the wait falls through to the loop
                 // top, where the `select!` runs the shutdown arm.
                 backoff_after_failed_tick(tick_failures, &shutdown).await;
@@ -424,12 +679,19 @@ pub async fn run(
             Err(e) => {
                 // The database refused the claim: nothing was dispatched, so
                 // this tick did not do its job. Counting it keeps a
-                // persistently unusable DB from reading as a healthy loop.
+                // persistently unusable DB from reading as a healthy loop —
+                // unless the cause is one a restart cannot fix (full disk,
+                // write-lock contention), where the loop is alive and only
+                // the store is unwell.
                 tick_failures = tick_failures.saturating_add(1);
-                tracing::warn!(
-                    consecutive_failures = tick_failures,
-                    "Failed to claim due tasks: {e}"
-                );
+                let failure = classify_tick_failure(&e);
+                if failure == TickFailure::Unhealthy {
+                    tracing::warn!(
+                        consecutive_failures = tick_failures,
+                        "Failed to claim due tasks: {e}"
+                    );
+                }
+                note_tick_failure(failure, &liveness, &mut skip_warn_throttle);
                 // This also skips the retry and celebration passes below for
                 // this tick. Deliberate: they use the same database that just
                 // refused the claim, so they would fail too — and each failure
@@ -450,6 +712,23 @@ pub async fn run(
         // A tick that reached and completed the claim did its job.
         liveness.fetch_add(1, Ordering::Relaxed);
         tick_failures = 0;
+
+        // Stalled scan — after the claim, never before it. The scan re-arms
+        // overdue recurring tasks to their next occurrence and records the
+        // skipped fires as missed. Run ahead of the claim, a store that
+        // refused claims for longer than the grace window would have every
+        // due task re-armed the moment it recovered, instead of fired once.
+        if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
+            last_stalled_scan = std::time::Instant::now();
+            let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS).await;
+            if scan.tasks_healed > 0 || scan.wedged_runs_recovered > 0 {
+                tracing::info!(
+                    healed = scan.tasks_healed,
+                    wedged = scan.wedged_runs_recovered,
+                    "stalled-task scan made repairs",
+                );
+            }
+        }
 
         // Retries.
         match db.get_tasks_pending_retry(now).await {
@@ -683,6 +962,197 @@ mod tick_health_tests {
             first_bump > first_decision,
             "the liveness bump must come after the tick has reached a dispatch \
              decision — bumping earlier hides a scheduler that dispatches nothing"
+        );
+    }
+
+    // ── daemon-lock refresh policy ──
+
+    #[test]
+    fn transient_refresh_errors_are_tolerated_until_the_lock_could_go_stale() {
+        // A busy timeout says nothing about who holds the lock, so the
+        // dispatcher keeps going — but only while the row provably cannot
+        // have gone stale. Past that, another daemon could take the lock, and
+        // two dispatchers would run.
+        let acquired = 10_000;
+        let budget = LockRefreshPolicy::transient_budget_secs();
+        assert!(
+            budget > 0 && budget < DAEMON_LOCK_STALE_SECS,
+            "the budget must end before the stale threshold, got {budget}"
+        );
+        let cases = [
+            (acquired + 60, LockVerdict::Continue),
+            (acquired + budget - 1, LockVerdict::Continue),
+            (acquired + budget, LockVerdict::Cancel),
+            (acquired + DAEMON_LOCK_STALE_SECS, LockVerdict::Cancel),
+        ];
+        // Fed through `from_result`, as the loop does: a refresh error of any
+        // kind is the transient class.
+        let transient = LockRefresh::from_result(&Err(anyhow::anyhow!("database is locked")));
+        for (now, expected) in cases {
+            let mut policy = LockRefreshPolicy::new(acquired);
+            assert_eq!(
+                policy.observe(transient, now),
+                expected,
+                "transient error at +{}s",
+                now - acquired
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_refresh_restarts_the_transient_budget() {
+        let mut policy = LockRefreshPolicy::new(0);
+        let budget = LockRefreshPolicy::transient_budget_secs();
+        assert_eq!(
+            policy.observe(LockRefresh::from_result(&Ok(true)), budget - 10),
+            LockVerdict::Continue
+        );
+        // Without the refresh above this would be past the budget.
+        assert_eq!(
+            policy.observe(LockRefresh::Transient, budget + 10),
+            LockVerdict::Continue,
+            "the budget is measured from the last good refresh, not from acquire"
+        );
+        assert_eq!(
+            policy.observe(LockRefresh::Transient, budget - 10 + budget),
+            LockVerdict::Cancel
+        );
+    }
+
+    #[test]
+    fn a_lost_lock_cancels_at_once() {
+        // 0 rows updated means another pid owns the row: there is no budget
+        // to spend, the other daemon may already be dispatching.
+        let mut policy = LockRefreshPolicy::new(0);
+        assert_eq!(
+            policy.observe(LockRefresh::from_result(&Ok(false)), 1),
+            LockVerdict::Cancel
+        );
+    }
+
+    // ── tick failure classes ──
+
+    #[test]
+    fn store_faults_a_restart_cannot_fix_are_healthy_skips() {
+        // SQLITE_FULL = 13, SQLITE_BUSY = 5, SQLITE_LOCKED = 6; EMFILE = 24.
+        let sqlite = |code: i32, msg: &str| -> anyhow::Error {
+            libsql::Error::SqliteFailure(code, msg.to_string()).into()
+        };
+        let io = |errno: i32| -> anyhow::Error {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(errno))
+                .context("opening tick lock file")
+        };
+        let cases: Vec<(&str, anyhow::Error, TickFailure)> = vec![
+            (
+                "SQLITE_FULL",
+                sqlite(13, "database or disk is full"),
+                TickFailure::HealthySkip(TickFailureClass::StorageExhausted),
+            ),
+            (
+                "SQLITE_BUSY",
+                sqlite(5, "database is locked"),
+                TickFailure::HealthySkip(TickFailureClass::LockContention),
+            ),
+            (
+                "SQLITE_LOCKED",
+                sqlite(6, "database table is locked"),
+                TickFailure::HealthySkip(TickFailureClass::LockContention),
+            ),
+            (
+                "ENOSPC behind context",
+                io(libc::ENOSPC),
+                TickFailure::HealthySkip(TickFailureClass::StorageExhausted),
+            ),
+            ("EMFILE", io(libc::EMFILE), TickFailure::Unhealthy),
+            (
+                "unknown message",
+                anyhow::anyhow!("no such table: task_runs"),
+                TickFailure::Unhealthy,
+            ),
+        ];
+        for (name, err, expected) in cases {
+            assert_eq!(classify_tick_failure(&err), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn healthy_skip_warnings_repeat_once_per_class_per_interval() {
+        let mut throttle = HealthySkipWarnThrottle::default();
+        let t0 = Instant::now();
+        assert!(throttle.should_warn(TickFailureClass::StorageExhausted, t0));
+        assert!(
+            !throttle.should_warn(
+                TickFailureClass::StorageExhausted,
+                t0 + Duration::from_secs(60)
+            ),
+            "the same class must stay quiet inside the interval"
+        );
+        assert!(
+            throttle.should_warn(
+                TickFailureClass::LockContention,
+                t0 + Duration::from_secs(60)
+            ),
+            "a different class is throttled independently"
+        );
+        assert!(
+            throttle.should_warn(
+                TickFailureClass::StorageExhausted,
+                t0 + HEALTHY_SKIP_WARN_INTERVAL
+            ),
+            "the class warns again once the interval has passed"
+        );
+    }
+
+    #[test]
+    fn a_healthy_skip_counts_as_alive_and_an_unhealthy_one_does_not() {
+        let liveness = AtomicU64::new(0);
+        let mut throttle = HealthySkipWarnThrottle::default();
+        note_tick_failure(TickFailure::Unhealthy, &liveness, &mut throttle);
+        assert_eq!(
+            liveness.load(Ordering::Relaxed),
+            0,
+            "an unhealthy tick must leave the watchdog free to restart the loop"
+        );
+        note_tick_failure(
+            TickFailure::HealthySkip(TickFailureClass::LockContention),
+            &liveness,
+            &mut throttle,
+        );
+        assert_eq!(liveness.load(Ordering::Relaxed), 1);
+    }
+
+    // ── boot recovery once per process ──
+
+    #[test]
+    fn boot_recovery_is_claimed_by_the_first_incarnation_only() {
+        // No other test in this binary touches the claim, so the first call
+        // here is the process's first.
+        assert!(claim_boot_recovery(), "the first dispatcher runs recovery");
+        assert!(
+            !claim_boot_recovery(),
+            "a respawned dispatcher must not fail the runs the first one spawned"
+        );
+    }
+
+    /// Guard: the stalled-task scan must run after the claim.
+    ///
+    /// Before the claim, a store that refused claims for longer than the
+    /// scan's grace window would have every due recurring task recorded as
+    /// missed and re-armed the moment it recovered, instead of fired once.
+    #[test]
+    fn the_stalled_scan_runs_after_the_claim() {
+        let src = include_str!("scheduler.rs");
+        let body = src
+            .split_once("_ = interval.tick() => {}")
+            .expect("scheduler loop shape changed")
+            .1;
+        let claim = body.find("db.claim_due_tasks").expect("claim not found");
+        let scan = body
+            .find("sweep::stalled_scan")
+            .expect("stalled scan not found");
+        assert!(
+            scan > claim,
+            "the scan must come after the claim, or an outage turns due fires into missed ones"
         );
     }
 

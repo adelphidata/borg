@@ -120,6 +120,9 @@ fn message_row_to_message(row: &MessageRow) -> Option<Message> {
         tool_call_id: None,
         timestamp: row.timestamp.clone(),
         seq: Some(row.id),
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     })
 }
 

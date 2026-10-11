@@ -66,6 +66,9 @@ fn user_message(text: &str) -> Vec<Message> {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     }]
 }
 
@@ -84,6 +87,7 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
         match ev {
             StreamEvent::TextDelta(t) => events.push(format!("text:{t}")),
             StreamEvent::ThinkingDelta(t) => events.push(format!("thinking:{t}")),
+            StreamEvent::ReasoningBlock(b) => events.push(format!("reasoning_block:{b}")),
             StreamEvent::ToolCallDelta {
                 index,
                 id,
@@ -960,6 +964,9 @@ fn message_with_image(text: &str) -> Vec<Message> {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     }]
 }
 

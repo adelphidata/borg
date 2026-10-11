@@ -347,7 +347,17 @@ fn content_parts_to_anthropic_blocks(
 pub(super) const EMPTY_ASSISTANT_PLACEHOLDER: &str = "(no content)";
 
 /// Convert internal Messages to Anthropic format.
-pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+///
+/// `replay_model` is the model this request goes to on a native Anthropic
+/// route, or `None` when stored reasoning must not be replayed (a
+/// third-party endpoint). An assistant turn's signed reasoning blocks lead
+/// its content only when they were produced by that same model: the
+/// signature is bound to it, and a failover or model switch leaves the
+/// reasoning behind.
+pub(super) fn build_anthropic_messages(
+    messages: &[Message],
+    replay_model: Option<&str>,
+) -> Vec<serde_json::Value> {
     let mut result: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
@@ -385,6 +395,32 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
             },
             Role::Assistant => {
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+
+                let replay_ok = replay_model.is_some()
+                    && msg.reasoning_model.as_deref() == replay_model
+                    && msg.tool_calls.is_some();
+                if let (true, Some(blocks)) = (replay_ok, &msg.reasoning_blocks) {
+                    content_blocks.extend(blocks.iter().cloned());
+                } else if let (Some(request_model), Some(stored_model), Some(blocks)) = (
+                    replay_model,
+                    msg.reasoning_model.as_deref(),
+                    msg.reasoning_blocks.as_ref(),
+                ) {
+                    // A native route with signed blocks that cannot go back:
+                    // the model changed under the tool loop (failover, a
+                    // switch mid-loop). The provider may answer 400 for the
+                    // missing thinking ahead of the `tool_use`; name both
+                    // models so that 400 is explainable from the log.
+                    if msg.tool_calls.is_some() && stored_model != request_model {
+                        tracing::warn!(
+                            target: "cortex::llm",
+                            stored_model,
+                            request_model,
+                            blocks = blocks.len(),
+                            "dropping signed thinking blocks: they were produced by another model and will not verify on this request"
+                        );
+                    }
+                }
 
                 if let Some(text) = msg.text_content() {
                     if !text.trim().is_empty() {
@@ -650,6 +686,7 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut reasoning_blocks: Vec<serde_json::Value> = Vec::new();
 
     for block in content_blocks {
         match block["type"].as_str() {
@@ -658,6 +695,9 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
                     text_parts.push(text.to_string());
                 }
             }
+            // Signed reasoning is kept whole: the signature only verifies
+            // on the exact bytes the wire returned.
+            Some("thinking" | "redacted_thinking") => reasoning_blocks.push(block.clone()),
             Some("tool_use") => {
                 let id = block["id"].as_str().unwrap_or("").to_string();
                 let name = block["name"].as_str().unwrap_or("").to_string();
@@ -694,6 +734,10 @@ pub(super) fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Messa
         tool_call_id: None,
         timestamp: Some(chrono::Local::now().to_rfc3339()),
         seq: None,
+        reasoning_blocks: (!reasoning_blocks.is_empty()).then_some(reasoning_blocks),
+        reasoning_content: None,
+        // Stamped by the transport, which knows the model that answered.
+        reasoning_model: None,
     })
 }
 
@@ -750,6 +794,9 @@ pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
                 tool_call_id: msg.tool_call_id.clone(),
                 timestamp: msg.timestamp.clone(),
                 seq: msg.seq,
+                reasoning_blocks: msg.reasoning_blocks.clone(),
+                reasoning_content: msg.reasoning_content.clone(),
+                reasoning_model: msg.reasoning_model.clone(),
             }
         })
         .collect()
@@ -784,6 +831,9 @@ mod strip_images_tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let out = strip_images(&[msg]);
         let Some(MessageContent::Parts(parts)) = &out[0].content else {
@@ -812,6 +862,9 @@ mod strip_images_tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let out = strip_images(&[msg]);
         assert!(
@@ -830,6 +883,9 @@ mod strip_images_tests {
             tool_call_id: Some("call_1".into()),
             timestamp: Some("t".into()),
             seq: Some(7),
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let out = strip_images(std::slice::from_ref(&msg));
         assert!(

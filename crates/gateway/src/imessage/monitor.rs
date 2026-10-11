@@ -28,6 +28,8 @@ const STATE_FILE: &str = "state.json";
 /// Max attachment file size we will base64-encode and forward to the agent.
 /// Larger files surface as a placeholder text note instead of binary payload.
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// Attribution used when the quoted parent is the assistant's own message.
+const OWN_MESSAGE_ATTRIBUTION: &str = "your earlier message";
 
 /// Start the iMessage monitor loop in a background task.
 ///
@@ -365,12 +367,19 @@ fn attachment_placeholder(attachment_count: usize) -> String {
 /// inline replies. Keeps the parent visible to the agent so it can answer with
 /// context even though iMessage's outbound API can't link to the parent.
 fn format_reply_quote(reply: &ReplyContext, body: &str) -> String {
-    let attribution = reply
-        .sender
-        .as_deref()
-        .map(normalize_handle)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "you".to_string());
+    // An own bubble must never be attributed to the handle on its row: for a
+    // 1:1 send chat.db stores the *recipient's* handle there, so the quote
+    // would read as if the user were replying to themselves.
+    let attribution = if reply.from_self {
+        OWN_MESSAGE_ATTRIBUTION.to_string()
+    } else {
+        reply
+            .sender
+            .as_deref()
+            .map(normalize_handle)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "an unknown sender".to_string())
+    };
     // Prefix every line of the parent so multi-line quotes render correctly.
     let quoted: String = reply
         .text
@@ -439,14 +448,19 @@ async fn poll_new_messages_with_conn(
         .query(
             "SELECT m.ROWID, m.text, m.date, h.id, m.is_from_me, m.cache_roomnames, \
          c.chat_identifier, c.guid, m.thread_originator_guid, \
-         parent.text AS reply_text, ph.id AS reply_sender \
+         parent.text AS reply_text, ph.id AS reply_sender, \
+         parent.is_from_me AS reply_from_me, m.attributedBody, \
+         parent.attributedBody AS reply_body \
          FROM message m \
          LEFT JOIN handle h ON m.handle_id = h.ROWID \
          LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID \
          LEFT JOIN chat c ON c.ROWID = cmj.chat_id \
          LEFT JOIN message parent ON parent.guid = m.thread_originator_guid \
          LEFT JOIN handle ph ON parent.handle_id = ph.ROWID \
-         WHERE m.ROWID > ?1 AND (m.text IS NOT NULL OR EXISTS (\
+         WHERE m.ROWID > ?1 \
+           AND COALESCE(m.associated_message_type, 0) = 0 \
+           AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL \
+           OR EXISTS (\
              SELECT 1 FROM message_attachment_join maj WHERE maj.message_id = m.ROWID\
          )) \
          ORDER BY m.ROWID ASC \
@@ -462,13 +476,20 @@ async fn poll_new_messages_with_conn(
             let is_group = cache_roomnames.as_deref().is_some_and(|r| !r.is_empty());
             let reply_text: Option<String> = row.get::<Option<String>>(9)?;
             let reply_sender: Option<String> = row.get::<Option<String>>(10)?;
-            let reply_to = reply_text.map(|t| ReplyContext {
-                text: t,
-                sender: reply_sender,
-            });
+            let reply_from_me = row.get::<Option<i64>>(11)?.unwrap_or(0) != 0;
+            let body_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(12)?;
+            let reply_body_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(13)?;
+            let reply_to =
+                text_or_attributed_body(reply_text, reply_body_blob.as_deref()).map(|t| {
+                    ReplyContext {
+                        text: t,
+                        sender: reply_sender,
+                        from_self: reply_from_me,
+                    }
+                });
             Ok(IMessagePayload {
                 rowid: row.get::<i64>(0)?,
-                text: row.get::<Option<String>>(1)?,
+                text: text_or_attributed_body(row.get::<Option<String>>(1)?, body_blob.as_deref()),
                 sender: row.get::<Option<String>>(3)?,
                 is_from_me: row.get::<i32>(4)? != 0,
                 chat_identifier: row.get::<Option<String>>(6)?,
@@ -488,6 +509,61 @@ async fn poll_new_messages_with_conn(
     }
 
     Ok(messages)
+}
+
+/// Prefer the plain `text` column; when it is NULL or blank (recent macOS
+/// stores some bodies only in `attributedBody`), decode the archived string.
+fn text_or_attributed_body(text: Option<String>, blob: Option<&[u8]>) -> Option<String> {
+    match text {
+        Some(t) if !t.trim().is_empty() => Some(t),
+        _ => blob.and_then(decode_attributed_body),
+    }
+}
+
+/// Extract the plain string from a `message.attributedBody` typedstream.
+///
+/// The archive is an `NSAttributedString`; its backing string is the first
+/// `NSString` object, serialized as the class name, a short type signature
+/// ending in `+`, a length (one byte, or `0x81` + u16 LE / `0x82` + u32 LE
+/// for longer bodies), then the UTF-8 bytes. Only that payload is read —
+/// attribute runs after it are ignored. Returns `None` for anything that
+/// does not match this shape so a malformed blob never fabricates text.
+fn decode_attributed_body(blob: &[u8]) -> Option<String> {
+    const CLASS: &[u8] = b"NSString";
+    const MARKER_WINDOW: usize = 16;
+    let class_at = blob.windows(CLASS.len()).position(|w| w == CLASS)?;
+    let after_class = class_at + CLASS.len();
+    let window_end = blob.len().min(after_class + MARKER_WINDOW);
+    let plus_at = blob[after_class..window_end]
+        .iter()
+        .position(|&b| b == b'+')?
+        + after_class;
+    let mut cursor = plus_at + 1;
+    let len = match *blob.get(cursor)? {
+        0x81 => {
+            let bytes = blob.get(cursor + 1..cursor + 3)?;
+            cursor += 3;
+            u16::from_le_bytes([bytes[0], bytes[1]]) as usize
+        }
+        0x82 => {
+            let bytes = blob.get(cursor + 1..cursor + 5)?;
+            cursor += 5;
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+        }
+        // A one-byte length is always below 0x80; the encoder never emits
+        // 0x80 or 0x83..=0xFF here, so such a byte is a malformed stream.
+        n if n < 0x80 => {
+            cursor += 1;
+            n as usize
+        }
+        _ => return None,
+    };
+    let payload = blob.get(cursor..cursor + len)?;
+    let text = std::str::from_utf8(payload).ok()?.trim();
+    // An attachment-only or sticker body is a lone object-replacement
+    // character; that is not text the agent should answer.
+    let text = text.trim_matches('\u{FFFC}').trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Fetch attachment metadata for a single message. Returns empty on error so
@@ -863,6 +939,7 @@ mod tests {
         payload.reply_to = Some(ReplyContext {
             text: "Are you free?".into(),
             sender: Some("alice@example.com".into()),
+            from_self: false,
         });
         let mut echo = EchoCache::new();
         let mut self_chat = SelfChatCache::new();
@@ -881,13 +958,18 @@ mod tests {
         let mut payload = make_payload(1, Some("yes"), Some("+1234"), false, Some("chat1"));
         payload.reply_to = Some(ReplyContext {
             text: "line one\nline two".into(),
-            sender: None,
+            sender: Some("+1234".into()),
+            from_self: true,
         });
         let mut echo = EchoCache::new();
         let mut self_chat = SelfChatCache::new();
         match evaluate_message(&payload, &mut echo, &mut self_chat, no_allowlist()) {
             InboundDecision::Dispatch { text, .. } => {
-                assert!(text.contains("In reply to you"));
+                assert!(
+                    text.contains("In reply to your earlier message:"),
+                    "an own bubble must not be attributed to the handle on its row: {text}"
+                );
+                assert!(!text.contains("In reply to +1234"));
                 assert!(text.contains("> line one\n> line two"));
             }
             InboundDecision::Drop { .. } => panic!("expected Dispatch"),
@@ -928,6 +1010,7 @@ mod tests {
         payload.reply_to = Some(ReplyContext {
             text: "see screenshot".into(),
             sender: Some("alice@example.com".into()),
+            from_self: false,
         });
         let mut echo = EchoCache::new();
         let mut self_chat = SelfChatCache::new();
@@ -974,7 +1057,9 @@ mod tests {
                 handle_id INTEGER,
                 is_from_me INTEGER DEFAULT 0,
                 cache_roomnames TEXT,
-                thread_originator_guid TEXT
+                thread_originator_guid TEXT,
+                attributedBody BLOB,
+                associated_message_type INTEGER DEFAULT 0
             );
             CREATE TABLE chat_message_join (
                 chat_id INTEGER,
@@ -1105,6 +1190,220 @@ mod tests {
         .await;
         let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert!(msgs[0].reply_to.is_none());
+    }
+
+    /// A swipe-reply to the assistant's own bubble in a DM: chat.db stamps
+    /// the outgoing parent with the *recipient's* handle, so attributing the
+    /// quote by handle would read "In reply to +1…" — the user replying to
+    /// themselves. The parent's `is_from_me` is what names the author.
+    #[tokio::test]
+    async fn reply_to_own_bubble_is_attributed_to_the_assistant_not_the_handle() {
+        let conn = build_fixture_db().await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (1, '+15551234567')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, '+15551234567', 'iMessage;-;+15551234567')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me) \
+             VALUES (5, 'own-guid', 'Want me to book it?', 1, 1)",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me, thread_originator_guid) \
+             VALUES (10, 'child-guid', 'yes please', 1, 0, 'own-guid')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 5)",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)",
+        )
+        .await;
+
+        let msgs = poll_new_messages_with_conn(&conn, 9).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        let reply = msgs[0].reply_to.as_ref().expect("reply_to populated");
+        assert!(
+            reply.from_self,
+            "parent.is_from_me=1 must mark the parent as our own"
+        );
+
+        let mut echo = EchoCache::new();
+        let mut self_chat = SelfChatCache::new();
+        match evaluate_message(&msgs[0], &mut echo, &mut self_chat, no_allowlist()) {
+            InboundDecision::Dispatch { text, .. } => {
+                assert!(
+                    text.starts_with("In reply to your earlier message:\n> Want me to book it?"),
+                    "got: {text}"
+                );
+                assert!(!text.contains("In reply to +1"), "got: {text}");
+                assert!(text.ends_with("\n\nyes please"));
+            }
+            InboundDecision::Drop { reason } => panic!("expected Dispatch, got Drop: {reason}"),
+        }
+    }
+
+    /// Build a minimal `attributedBody` typedstream around `text`, using the
+    /// one-byte or `0x81` + u16 LE length form as the real archiver does.
+    fn attributed_body(text: &str) -> Vec<u8> {
+        let mut blob = b"\x04\x0bstreamtyped\x81\xe8\x03\x84\x01@\x84\x84\x84\x12NSAttributedString\x00\x84\x84\x08NSObject\x00\x85\x92\x84\x84\x84\x08NSString\x01\x94\x84\x01+".to_vec();
+        let len = text.len();
+        if len < 0x80 {
+            blob.push(len as u8);
+        } else {
+            blob.push(0x81);
+            blob.extend_from_slice(&(len as u16).to_le_bytes());
+        }
+        blob.extend_from_slice(text.as_bytes());
+        blob.extend_from_slice(b"\x86\x84\x02iI\x01\x0a\x92\x84\x84\x84\x0cNSDictionary");
+        blob
+    }
+
+    #[test]
+    fn decode_attributed_body_reads_short_and_long_strings_and_rejects_garbage() {
+        let long = "y".repeat(300);
+        let cases: Vec<(Vec<u8>, Option<&str>)> = vec![
+            (attributed_body("hello there"), Some("hello there")),
+            (attributed_body(&long), Some(long.as_str())),
+            (b"not a typedstream at all".to_vec(), None),
+            // Class name present but the length runs past the blob: no text
+            // must be fabricated from a truncated archive.
+            (b"NSString\x01\x94\x84\x01+\x40abc".to_vec(), None),
+            (Vec::new(), None),
+        ];
+        for (blob, want) in cases {
+            assert_eq!(decode_attributed_body(&blob).as_deref(), want);
+        }
+    }
+
+    /// Recent macOS leaves `text` NULL on some rows and keeps the body only in
+    /// `attributedBody`; those rows must still be polled and carry their text,
+    /// for the message itself and for a quoted parent.
+    #[tokio::test]
+    async fn sql_falls_back_to_attributed_body_when_text_is_null() {
+        let conn = build_fixture_db().await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
+        )
+        .await;
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, attributedBody) VALUES (5, 'p', NULL, 1, ?1)",
+            libsql::params!(attributed_body("archived parent")),
+        )
+        .await
+        .expect("insert parent");
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, thread_originator_guid, attributedBody) \
+             VALUES (10, 'c', '', 1, 'p', ?1)",
+            libsql::params!(attributed_body("archived child")),
+        )
+        .await
+        .expect("insert child");
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 5)",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)",
+        )
+        .await;
+
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "text-NULL rows with an attributedBody must be polled"
+        );
+        assert_eq!(msgs[0].text.as_deref(), Some("archived parent"));
+        assert_eq!(msgs[1].text.as_deref(), Some("archived child"));
+        let reply = msgs[1]
+            .reply_to
+            .as_ref()
+            .expect("parent resolved via attributedBody");
+        assert_eq!(reply.text, "archived parent");
+    }
+
+    /// A tapback ("Loved …") keeps `text` NULL and carries its label only in
+    /// `attributedBody`, with a non-zero `associated_message_type`. Admitting
+    /// `attributedBody` rows must not turn reactions into user turns, and a
+    /// sticker body that is only the object-replacement character is blank.
+    #[tokio::test]
+    async fn reactions_and_sticker_bodies_are_not_polled_as_messages() {
+        let conn = build_fixture_db().await;
+        exec(
+            &conn,
+            "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')",
+        )
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
+        )
+        .await;
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, attributedBody, associated_message_type) \
+             VALUES (5, 'love', NULL, 1, ?1, 2000)",
+            libsql::params!(attributed_body("Loved \u{201c}Want me to book it?\u{201d}")),
+        )
+        .await
+        .expect("insert tapback");
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, attributedBody) VALUES (6, 'sticker', NULL, 1, ?1)",
+            libsql::params!(attributed_body("\u{FFFC}")),
+        )
+        .await
+        .expect("insert sticker");
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, attributedBody) VALUES (7, 'real', NULL, 1, ?1)",
+            libsql::params!(attributed_body("yes please")),
+        )
+        .await
+        .expect("insert real message");
+        for id in [5, 6, 7] {
+            exec(
+                &conn,
+                &format!("INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, {id})"),
+            )
+            .await;
+        }
+
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
+        let texts: Vec<Option<&str>> = msgs.iter().map(|m| m.text.as_deref()).collect();
+        assert!(
+            !texts.iter().flatten().any(|t| t.starts_with("Loved")),
+            "a tapback must not be polled as a message: {texts:?}"
+        );
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| m.text.as_deref() == Some("yes please"))
+                .count(),
+            1,
+            "the real message is still polled: {texts:?}"
+        );
+        assert!(
+            !texts.iter().flatten().any(|t| t.contains('\u{FFFC}')),
+            "a sticker body must decode as blank: {texts:?}"
+        );
     }
 
     #[tokio::test]

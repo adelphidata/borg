@@ -7,9 +7,9 @@
 //!
 //! The MCP spec (2025-06-18) wraps tool results in a list of `content`
 //! blocks; we model the text-bearing subset (text, json, embedded text
-//! resources, resource links) since that's the agent-loop-relevant
-//! surface. Binary payloads (blobs, audio, images) are never
-//! materialized — they render as typed placeholders.
+//! resources, resource links) plus `image`, whose base64 bytes are carried
+//! so a vision-capable model can see them. Other binary payloads (blobs,
+//! audio) are never materialized — they render as typed placeholders.
 
 use crate::errors::{McpError, Result};
 use serde::{Deserialize, Serialize};
@@ -326,8 +326,18 @@ pub enum ContentBlock {
         /// Human-readable description, if provided.
         description: Option<String>,
     },
-    /// Anything else (image, audio, future block types) — surfaced to the
-    /// agent as a typed placeholder, never silently dropped.
+    /// Image content (`type: "image"`). The base64 payload rides along so a
+    /// vision-capable model can see it; the declared `mimeType` is advisory
+    /// only — the consumer sniffs the real type from the bytes. The text
+    /// rendering is a size placeholder, never the base64 itself.
+    Image {
+        /// Base64-encoded image bytes, exactly as the server sent them.
+        data: String,
+        /// Server-declared MIME type, if any.
+        mime_type: Option<String>,
+    },
+    /// Anything else (audio, future block types) — surfaced to the agent as
+    /// a typed placeholder, never silently dropped.
     Other {
         /// The wire `type` string, when present, so the placeholder can
         /// name what was elided.
@@ -393,6 +403,14 @@ impl ContentBlock {
                     }
                 }
             }
+            Some("image") => {
+                if let Some(data) = v.get("data").and_then(Value::as_str) {
+                    return Self::Image {
+                        data: data.to_owned(),
+                        mime_type: v.get("mimeType").and_then(Value::as_str).map(str::to_owned),
+                    };
+                }
+            }
             Some("resource_link") => {
                 let as_str = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
                 return Self::ResourceLink {
@@ -435,6 +453,13 @@ impl ContentBlock {
                      server's resource-read capability if it exposes one)",
                 );
                 out
+            }
+            Self::Image { data, mime_type } => {
+                // Base64 inflates by 4/3; report the approximate decoded size,
+                // rounded up so a tiny image never reads as "0 KB".
+                let kb = (data.len() * 3 / 4).div_ceil(1024);
+                let mime = mime_type.as_deref().unwrap_or("unknown type");
+                format!("[mcp image: {mime}, ~{kb} KB]")
             }
             Self::Other { kind } => match kind {
                 Some(kind) => format!("[unsupported mcp content block: {kind}]"),
@@ -720,14 +745,50 @@ mod tests {
     }
 
     #[test]
+    fn image_block_carries_data_and_mime_and_renders_a_size_placeholder() {
+        // Spec: an `image` block keeps its base64 payload (so a vision model
+        // can be shown it downstream) but renders as a size placeholder —
+        // the base64 must never be inlined into the transcript text.
+        let data = "A".repeat(4096); // ~3 KB decoded
+        let resp = format!(
+            r#"{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}},
+                            {{"type":"image","data":"QUJD"}}]}}"#
+        );
+        let result: ToolCallResult = serde_json::from_str(&resp).expect("decode");
+        match &result.content[0] {
+            ContentBlock::Image { data: d, mime_type } => {
+                assert_eq!(d, &data);
+                assert_eq!(mime_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+        let out = render_call_result(&result);
+        assert!(out.contains("[mcp image: image/png, ~3 KB]"), "got: {out}");
+        assert!(
+            out.contains("[mcp image: unknown type, ~1 KB]"),
+            "a tiny untyped image still gets a placeholder: {out}"
+        );
+        assert!(!out.contains(&data), "base64 must not be inlined: {out}");
+        // A malformed image block (no `data`) degrades to the typed
+        // placeholder rather than failing the decode.
+        let bad: ToolCallResult =
+            serde_json::from_str(r#"{"content":[{"type":"image","mimeType":"image/png"}]}"#)
+                .expect("decode");
+        assert_eq!(
+            render_call_result(&bad),
+            "[unsupported mcp content block: image]"
+        );
+    }
+
+    #[test]
     fn other_variant_decodes_from_unknown_block_type() {
-        // Real-world failure: a block type we don't inline (e.g. "image")
+        // Real-world failure: a block type we don't inline (e.g. "audio")
         // must NOT fail decode of the whole response — it should land in
         // `Other`, carrying the wire type name so the placeholder isn't
         // vague. Encode the spec.
         let resp = br#"{
             "content":[
-                {"type":"image","data":"..."},
+                {"type":"audio","data":"..."},
                 {"type":"text","text":"caption"}
             ],
             "isError":false
@@ -735,7 +796,7 @@ mod tests {
         let result: ToolCallResult = serde_json::from_slice(resp).expect("decode");
         assert_eq!(result.content.len(), 2);
         match &result.content[0] {
-            ContentBlock::Other { kind } => assert_eq!(kind.as_deref(), Some("image")),
+            ContentBlock::Other { kind } => assert_eq!(kind.as_deref(), Some("audio")),
             other => panic!("expected Other, got {other:?}"),
         }
         match &result.content[1] {
@@ -746,7 +807,7 @@ mod tests {
 
     #[test]
     fn unsupported_block_placeholder_names_the_wire_type() {
-        // Spec: audio / image / future block types keep placeholder-only
+        // Spec: audio / video / future block types keep placeholder-only
         // behavior (no binary materialization) but the placeholder must
         // NAME the elided type so nothing is silently vague. A typeless
         // block falls back to the generic placeholder.

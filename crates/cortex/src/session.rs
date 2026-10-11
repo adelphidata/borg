@@ -333,6 +333,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.message_count, 1);
@@ -378,6 +381,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         });
         populated.save().expect("save populated session");
         ensure_session_on_disk(id).expect("second ensure is a no-op");
@@ -407,6 +413,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert!(session.meta.title.ends_with("..."));
@@ -424,6 +433,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         // Title should not change since it's not "New conversation"
@@ -440,6 +452,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "New conversation");
@@ -465,6 +480,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "*heartbeat tick*");
@@ -482,6 +500,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "Hello world");
@@ -499,6 +520,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert_eq!(session.meta.title, "Simple question about code");
@@ -516,6 +540,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }];
         session.update_from_history(&messages);
         assert!(session.meta.title.ends_with("..."));
@@ -541,6 +568,9 @@ mod tests {
                 tool_call_id: None,
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             }],
         };
         let path = sessions_dir.join(format!("{id}.json"));

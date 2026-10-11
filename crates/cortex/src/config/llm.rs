@@ -9,9 +9,11 @@ use crate::constants::{
 use crate::security::secrets_resolve::SecretRef;
 
 /// Extended thinking level. Mapped per-provider at request-build time:
-/// Anthropic `budget_tokens`, OpenAI `reasoning_effort`, Gemini 2.5
-/// `thinkingBudget` (integer; `-1` is the dynamic-thinking sentinel), and
-/// Gemini 3 `thinkingLevel` (`"LOW"`/`"MEDIUM"`/`"HIGH"`).
+/// Anthropic adaptive `output_config.effort` (current Claude families) or
+/// `budget_tokens` (legacy manual-thinking families), OpenAI
+/// `reasoning_effort`, Gemini 2.5 `thinkingBudget` (integer; `-1` is the
+/// dynamic-thinking sentinel), and Gemini 3 `thinkingLevel`
+/// (`"LOW"`/`"MEDIUM"`/`"HIGH"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -24,19 +26,45 @@ pub enum ThinkingLevel {
     High,
     Xhigh,
     /// Let the provider decide. Gemini 2.5: dynamic (`thinkingBudget: -1`).
-    /// Anthropic/OpenAI have no native adaptive mode — mapped to a moderate
-    /// default so the model can still spend tokens if it chooses.
+    /// Anthropic: adaptive thinking at `medium` effort. OpenAI has no native
+    /// adaptive mode and maps to a moderate default so the model can still
+    /// spend tokens if it chooses.
     Adaptive,
     /// Provider's practical ceiling.
     Max,
 }
 
 impl ThinkingLevel {
-    /// Anthropic `budget_tokens`. `None` when thinking is off. Minimum
-    /// Anthropic accepts is 1024 so Minimal and Low both produce 1024 (they
-    /// differ on OpenAI reasoning effort only). Existing Low/Medium/High/Xhigh
-    /// budgets are unchanged from the pre-eight-level mapping so operator
-    /// config keeps its old meaning.
+    /// Anthropic `output_config.effort` for adaptive thinking. `None` when
+    /// thinking is off. Adaptive maps to `medium`; Minimal has no Anthropic
+    /// counterpart and rounds up to `low`. The 4.6 family lacks `xhigh`, so
+    /// Xhigh rounds up to `max` there (the next level that family accepts).
+    pub fn anthropic_adaptive_effort(&self, model: &str) -> Option<&'static str> {
+        const LACKS_XHIGH: &[&str] = &[
+            "claude-opus-4-6",
+            "claude-opus-4.6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4.6",
+        ];
+        let m = model.to_ascii_lowercase();
+        let lacks_xhigh = LACKS_XHIGH.iter().any(|family| m.contains(family));
+        match self {
+            Self::Off => None,
+            Self::Minimal | Self::Low => Some("low"),
+            Self::Medium | Self::Adaptive => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh if lacks_xhigh => Some("max"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+
+    /// Anthropic `budget_tokens` for legacy manual-thinking Claude families.
+    /// `None` when thinking is off. Minimum Anthropic accepts is 1024 so
+    /// Minimal and Low both produce 1024 (they differ on OpenAI reasoning
+    /// effort only). Existing Low/Medium/High/Xhigh budgets are unchanged
+    /// from the pre-eight-level mapping so operator config keeps its old
+    /// meaning.
     pub fn anthropic_budget_tokens(&self) -> Option<u32> {
         match self {
             Self::Off => None,
@@ -814,6 +842,37 @@ mod tests {
     #[test]
     fn thinking_level_default_is_off() {
         assert_eq!(ThinkingLevel::default(), ThinkingLevel::Off);
+    }
+
+    /// Every enabled level maps to an Anthropic effort the wire accepts;
+    /// `xhigh` exists only from Opus 4.7 on, so the 4.6 family rounds it up
+    /// to `max` rather than sending a value that answers HTTP 400.
+    #[test]
+    fn anthropic_adaptive_effort_maps_levels_and_rounds_xhigh_on_4_6() {
+        let cases = [
+            (ThinkingLevel::Off, "claude-opus-4-7", None),
+            (ThinkingLevel::Minimal, "claude-opus-4-7", Some("low")),
+            (ThinkingLevel::Low, "claude-opus-4-7", Some("low")),
+            (ThinkingLevel::Medium, "claude-opus-4-7", Some("medium")),
+            (ThinkingLevel::Adaptive, "claude-opus-4-7", Some("medium")),
+            (ThinkingLevel::High, "claude-opus-4-7", Some("high")),
+            (ThinkingLevel::Xhigh, "claude-opus-4-7", Some("xhigh")),
+            (ThinkingLevel::Max, "claude-opus-4-7", Some("max")),
+            (ThinkingLevel::Xhigh, "claude-sonnet-4-6", Some("max")),
+            (
+                ThinkingLevel::Xhigh,
+                "anthropic/Claude-Opus-4.6",
+                Some("max"),
+            ),
+            (ThinkingLevel::High, "claude-sonnet-4-6", Some("high")),
+        ];
+        for (level, model, expected) in cases {
+            assert_eq!(
+                level.anthropic_adaptive_effort(model),
+                expected,
+                "{level:?} on {model}"
+            );
+        }
     }
 
     #[test]

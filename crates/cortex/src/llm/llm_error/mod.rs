@@ -10,13 +10,13 @@ mod retry;
 // `classify_status` (below) dispatches 400/404 bodies through these refinements.
 use classify::{
     body_indicates_billing_exhaustion, body_indicates_cloudflare_block,
-    body_indicates_context_overflow, body_indicates_expired_credential,
-    body_indicates_image_unsupported, body_indicates_malformed_tool_call,
-    body_indicates_no_allowed_providers, body_indicates_server_injected_param,
-    body_indicates_slow_down, body_mentions_model,
+    body_indicates_content_policy, body_indicates_context_overflow,
+    body_indicates_expired_credential, body_indicates_image_unsupported,
+    body_indicates_malformed_tool_call, body_indicates_no_allowed_providers,
+    body_indicates_server_injected_param, body_indicates_slow_down, body_mentions_model,
 };
 
-pub use classify::{classify_402, classify_error_text};
+pub use classify::{affordable_max_tokens, classify_402, classify_error_text};
 pub(crate) use classify::{classify_anthropic_stream_error, classify_network_error};
 pub(crate) use retry::{in_loop_retry_delay, override_retry_after};
 pub use retry::{parse_retry_after, parse_retry_after_header, parse_retry_hint_from_body};
@@ -48,6 +48,16 @@ pub enum FailoverReason {
     AuthPermanent,
     /// Billing or quota exhaustion (402).
     Billing,
+    /// A 402 that names the output cap the account can still afford: the
+    /// credential has credit, only the requested `max_tokens` outruns it.
+    /// The client lowers the cap and re-sends once; a second one is
+    /// [`Self::Billing`]. Never benches the credential on its own.
+    OutputCapUnaffordable,
+    /// The provider refused the request on content grounds. The verdict is
+    /// about the conversation, not the credential or the server, so no
+    /// retry, backoff, or key rotation can change it. A different provider
+    /// may still answer, so the fallback chain gets its turn.
+    ContentPolicy,
     /// Too many requests (429).
     RateLimit,
     /// Server overloaded or unavailable (500/502/503/504).
@@ -101,6 +111,8 @@ impl fmt::Display for FailoverReason {
             Self::Auth => write!(f, "auth"),
             Self::AuthPermanent => write!(f, "auth_permanent"),
             Self::Billing => write!(f, "billing"),
+            Self::OutputCapUnaffordable => write!(f, "output_cap_unaffordable"),
+            Self::ContentPolicy => write!(f, "content_policy"),
             Self::RateLimit => write!(f, "rate_limit"),
             Self::Overloaded => write!(f, "overloaded"),
             Self::Timeout => write!(f, "timeout"),
@@ -285,6 +297,9 @@ impl LlmError {
                 | FailoverReason::ImageUnsupported
                 // The broken tool-call arguments are in the request itself.
                 | FailoverReason::MalformedToolCall
+                // The refusal is about the content; the same request gets
+                // the same verdict.
+                | FailoverReason::ContentPolicy
         )
     }
 }
@@ -318,6 +333,12 @@ fn stream_error_status(frame: &serde_json::Value) -> Option<reqwest::StatusCode>
 /// Without one, the message text decides. The result is always an error.
 pub(crate) fn classify_stream_error_frame(data: &str, provider: &str) -> LlmError {
     let frame: serde_json::Value = serde_json::from_str(data).unwrap_or(serde_json::Value::Null);
+
+    // A content refusal is terminal whatever status (if any) wraps it, so it
+    // is decided before the status lookup can route it to a retryable arm.
+    if body_indicates_content_policy(data) {
+        return content_policy_error(provider, data, None);
+    }
 
     if let Some(status) = stream_error_status(&frame) {
         // An unknown provider name only changes the provider-specific arms.
@@ -362,11 +383,36 @@ pub(crate) fn classify_stream_error_frame(data: &str, provider: &str) -> LlmErro
     }
 }
 
+/// The terminal error for a content-policy refusal. The user-facing text
+/// names the next action; the provider body goes to the chain for the log.
+fn content_policy_error(provider: impl fmt::Display, body: &str, status: Option<u16>) -> LlmError {
+    LlmError::Fatal {
+        source: anyhow::anyhow!(
+            "{provider} refused this content (content policy). The provider will not \
+             answer this request as written; change the request or use another provider: {}",
+            sanitize_body(body)
+        ),
+        reason: FailoverReason::ContentPolicy,
+        status,
+    }
+}
+
 pub(crate) fn classify_status(
     status: reqwest::StatusCode,
     body: &str,
     provider: Provider,
 ) -> LlmError {
+    // A content refusal is decided before any status arm: a gateway may wrap
+    // it in a 502 (which would walk the whole backoff ladder) or a 400 (which
+    // would read as a malformed request). Not on 401/403: there the body
+    // explains why the *credential* is refused ("suspended because it
+    // violates our usage policies"), and the credential must still be
+    // retired rather than the request blamed.
+    let auth_status = matches!(status.as_u16(), 401 | 403);
+    if !auth_status && body_indicates_content_policy(body) {
+        return content_policy_error(provider, body, Some(status.as_u16()));
+    }
+
     // Prefer the structured `retry_after` field; fall back to free-form body hints
     // (`quotaResetDelay`, `resets_at`, "try again in N seconds", …).
     let retry_after = parse_retry_after(body).or_else(|| parse_retry_hint_from_body(body));
@@ -483,6 +529,16 @@ pub(crate) fn classify_status(
         403 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
+            status: Some(status.as_u16()),
+        },
+        // The account can still pay for a smaller answer: the client lowers
+        // `max_tokens` to the stated cap and re-sends once. Fatal so the
+        // backoff ladder stays out of it; the credential is not benched.
+        402 if affordable_max_tokens(body).is_some() => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} returned {status} (output cap exceeds remaining credit): {safe}"
+            ),
+            reason: FailoverReason::OutputCapUnaffordable,
             status: Some(status.as_u16()),
         },
         402 => {
@@ -829,6 +885,119 @@ mod tests {
             assert_eq!(err.retry_after(), *retry_after, "{body}");
             assert_eq!(err.status_code(), Some(503), "{body}");
         }
+    }
+
+    /// A content refusal is terminal whatever wraps it: a 502 wrapper must
+    /// not walk the backoff ladder, a 400 wrapper must not read as a
+    /// malformed request, and an in-stream frame with no status must not
+    /// fall to the retryable `Unknown` arm. The fallback chain still gets a
+    /// turn (another provider may answer); the credential does not rotate.
+    #[test]
+    fn content_policy_refusals_are_fatal_under_every_wrapper() {
+        let bodies = [
+            r#"{"error":{"message":"Output data may contain inappropriate content.","code":502}}"#,
+            r#"{"error":{"code":"data_inspection_failed","message":"Input data may contain inappropriate content."}}"#,
+            r#"{"error":{"code":"content_policy_violation","message":"Your request was rejected."}}"#,
+            r#"{"error":{"message":"This request violates our usage policies."}}"#,
+            r#"{"error":{"code":"ResponsibleAIPolicyViolation","message":"The response was filtered."}}"#,
+            r#"{"error":{"message":"Content Exists Risk"}}"#,
+        ];
+        for body in bodies {
+            for status in [
+                reqwest::StatusCode::BAD_GATEWAY,
+                reqwest::StatusCode::BAD_REQUEST,
+            ] {
+                let err = classify_status(status, body, Provider::OpenRouter);
+                assert!(!err.is_retryable(), "{status} {body}");
+                assert_eq!(
+                    err.reason(),
+                    FailoverReason::ContentPolicy,
+                    "{status} {body}"
+                );
+                assert!(err.is_fast_fail(), "{status} {body}");
+                assert!(err.should_fallback(), "{status} {body}");
+                assert!(!err.should_rotate_credential(), "{status} {body}");
+                assert_eq!(err.status_code(), Some(status.as_u16()), "{status} {body}");
+                let text = err.to_string();
+                assert!(text.contains("refused this content"), "{text}");
+            }
+            let err = classify_stream_error_frame(body, "openrouter");
+            assert!(!err.is_retryable(), "stream {body}");
+            assert_eq!(err.reason(), FailoverReason::ContentPolicy, "stream {body}");
+        }
+        // The needles do not swallow an ordinary outage.
+        let plain = classify_status(
+            reqwest::StatusCode::BAD_GATEWAY,
+            r#"{"error":{"message":"upstream connect error"}}"#,
+            Provider::OpenRouter,
+        );
+        assert!(plain.is_retryable());
+        assert_eq!(plain.reason(), FailoverReason::Overloaded);
+        // On 401/403 the same words explain why the *credential* is refused,
+        // not the request: the auth arms keep their verdict so the dead key
+        // is retired instead of the request being blamed.
+        let suspended = r#"{"error":{"message":"Your account was suspended because it violates our usage policies."}}"#;
+        for (status, reason) in [
+            (reqwest::StatusCode::UNAUTHORIZED, FailoverReason::Auth),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                FailoverReason::AuthPermanent,
+            ),
+        ] {
+            let err = classify_status(status, suspended, Provider::OpenRouter);
+            assert_eq!(err.reason(), reason, "{status}");
+            assert!(!err.is_retryable(), "{status}");
+            assert_eq!(err.status_code(), Some(status.as_u16()), "{status}");
+        }
+    }
+
+    /// The cap after "afford" is the only figure that matters: the requested
+    /// count, thousands separators, and casing must not change the result,
+    /// and a body with no cap (or a zero) is not an affordable 402.
+    #[test]
+    fn affordable_max_tokens_reads_the_cap_after_afford() {
+        let cases: &[(&str, Option<u32>)] = &[
+            (
+                "This request requires more credits, or fewer max_tokens. You requested up to 56272 tokens, but can only afford 12000. To increase, visit https://openrouter.ai/settings/credits",
+                Some(12000),
+            ),
+            ("You requested up to 8,192 tokens, but can only AFFORD 1,500.", Some(1500)),
+            ("can only afford 0 tokens", None),
+            ("Insufficient credits. Add more credits and retry.", None),
+            ("we cannot afford this", None),
+            ("", None),
+        ];
+        for (body, want) in cases {
+            assert_eq!(affordable_max_tokens(body), *want, "{body}");
+        }
+    }
+
+    /// An affordable-cap 402 is its own class: fatal (no backoff ladder),
+    /// not a credential bench, not the generic billing verdict. A 402 with no
+    /// cap keeps the billing classification.
+    #[test]
+    fn classify_402_with_an_affordable_cap_is_output_cap_unaffordable() {
+        let body = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 56272 tokens, but can only afford 12000.","code":402}}"#;
+        let err = classify_status(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            body,
+            Provider::OpenRouter,
+        );
+        assert!(!err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::OutputCapUnaffordable);
+        assert!(!err.should_rotate_credential());
+        assert_eq!(
+            affordable_max_tokens(&err.to_string()),
+            Some(12000),
+            "the cap must survive into the error text the client re-reads"
+        );
+
+        let spent = classify_status(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            r#"{"error":{"message":"Insufficient credits"}}"#,
+            Provider::OpenRouter,
+        );
+        assert_eq!(spent.reason(), FailoverReason::Billing);
     }
 
     #[test]

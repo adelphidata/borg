@@ -235,6 +235,137 @@ async fn air_gap_skips_public_cloud_fallback_slot() {
     );
 }
 
+/// The fallback chain holds one slot per distinct (provider, model,
+/// endpoint, credentials). A duplicate entry, in any spelling, and an entry
+/// that restates the primary would only re-run the same failed request on
+/// the same endpoint with the same key; a different model, endpoint (host
+/// case aside — paths are case-sensitive), or key on the same provider is a
+/// real alternative and stays.
+#[tokio::test]
+async fn fallback_chain_drops_duplicates_and_the_primary() {
+    let env_var = "BORG_TEST_FALLBACK_DEDUP";
+    let paid_env_var = "BORG_TEST_FALLBACK_DEDUP_PAID";
+    std::env::set_var(env_var, "sk-test");
+    std::env::set_var(paid_env_var, "sk-paid");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".to_string());
+    config.llm.model = "gpt-4.1".to_string();
+    config.llm.api_key_env = env_var.to_string();
+    let keyed = |provider: &str, model: &str, base_url: Option<&str>, key_env: &str| {
+        crate::config::LlmFallback {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            api_key: None,
+            api_key_env: Some(key_env.to_string()),
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: base_url.map(str::to_string),
+        }
+    };
+    let entry = |provider: &str, model: &str, base_url: Option<&str>| {
+        keyed(provider, model, base_url, env_var)
+    };
+    config.llm.fallback = vec![
+        entry("anthropic", "claude-sonnet-4", None),
+        entry("Anthropic", "Claude-Sonnet-4", None),
+        entry("anthropic", "claude-sonnet-4", Some("")),
+        entry("openai", "GPT-4.1", None),
+        entry("openai", "gpt-4.1-mini", None),
+        entry("openai", "gpt-4.1-mini", Some("https://proxy.example/v1/")),
+        entry("openai", "gpt-4.1-mini", Some("https://PROXY.example/v1")),
+        entry("openai", "gpt-4.1-mini", Some("https://proxy.example/V1")),
+        // The primary's provider and model under a different key: the paid
+        // account behind the free one is the whole point of the entry.
+        keyed("openai", "gpt-4.1", None, paid_env_var),
+        keyed("openai", "gpt-4.1", None, paid_env_var),
+    ];
+
+    let client = LlmClient::new(&config).await.expect("client");
+    let slots: Vec<(Provider, String, Option<String>, Vec<String>)> = client
+        .provider_slots
+        .iter()
+        .map(|s| {
+            (
+                s.provider,
+                s.model.clone(),
+                s.base_url.clone(),
+                s.keys.clone(),
+            )
+        })
+        .collect();
+    let free = vec!["sk-test".to_string()];
+    assert_eq!(
+        slots,
+        vec![
+            (
+                Provider::Anthropic,
+                "claude-sonnet-4".to_string(),
+                None,
+                free.clone()
+            ),
+            (
+                Provider::OpenAi,
+                "gpt-4.1-mini".to_string(),
+                None,
+                free.clone()
+            ),
+            (
+                Provider::OpenAi,
+                "gpt-4.1-mini".to_string(),
+                Some("https://proxy.example/v1/".to_string()),
+                free.clone(),
+            ),
+            (
+                Provider::OpenAi,
+                "gpt-4.1-mini".to_string(),
+                Some("https://proxy.example/V1".to_string()),
+                free,
+            ),
+            (
+                Provider::OpenAi,
+                "gpt-4.1".to_string(),
+                None,
+                vec!["sk-paid".to_string()],
+            ),
+        ]
+    );
+}
+
+/// The re-send cap is the affordable figure less the headroom, and only
+/// when that lands on or above the floor: a cap whose remainder would be
+/// cut off anyway (100, or 64 under the floor) is not worth one more
+/// request, and a result that is not a credit-limited 402 never lowers.
+#[test]
+fn lowered_output_cap_keeps_headroom_and_honors_the_floor() {
+    let affordable = |cap: u32| -> std::result::Result<(), LlmError> {
+        Err(llm_error::classify_status(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            &format!("You requested up to 56272 tokens, but can only afford {cap}."),
+            Provider::OpenRouter,
+        ))
+    };
+    let cases: &[(u32, Option<u32>)] = &[
+        (12000, Some(12000 - OUTPUT_CAP_HEADROOM)),
+        (
+            OUTPUT_CAP_FLOOR + OUTPUT_CAP_HEADROOM,
+            Some(OUTPUT_CAP_FLOOR),
+        ),
+        (OUTPUT_CAP_FLOOR + OUTPUT_CAP_HEADROOM - 1, None),
+        (100, None),
+    ];
+    for (cap, want) in cases {
+        assert_eq!(lowered_output_cap(&affordable(*cap)), *want, "afford {cap}");
+    }
+    let billing: std::result::Result<(), LlmError> = Err(llm_error::classify_status(
+        reqwest::StatusCode::PAYMENT_REQUIRED,
+        "Insufficient credits. Add more credits and retry.",
+        Provider::OpenRouter,
+    ));
+    assert_eq!(lowered_output_cap(&billing), None);
+    assert_eq!(lowered_output_cap::<()>(&Ok(())), None);
+}
+
 /// A host that blackholes SYNs must cost one connect timeout, not one per
 /// attempt. Once recorded, the request path has to bail before dialing so the
 /// fallback chain gets its turn immediately — and the error must stay
@@ -481,6 +612,7 @@ fn anthropic_sse_tool_use_stop_reason_emits_tool_intent() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
         &mut None,
     );
     let events = match action {
@@ -909,11 +1041,14 @@ fn anthropic_tool_result_conversion() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::tool_result("call_1", "file contents here"),
     ];
 
-    let anthropic_msgs = build_anthropic_messages(&messages);
+    let anthropic_msgs = build_anthropic_messages(&messages, None);
 
     // Should have: user, assistant, user (with tool_result)
     assert_eq!(anthropic_msgs.len(), 3);
@@ -965,11 +1100,14 @@ fn anthropic_tool_result_carries_multimodal_image_blocks() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::tool_result_multimodal("call_cap", parts),
     ];
 
-    let anthropic_msgs = build_anthropic_messages(&messages);
+    let anthropic_msgs = build_anthropic_messages(&messages, None);
     let tool_user = &anthropic_msgs[2];
     let tool_result = &tool_user["content"][0];
     assert_eq!(tool_result["type"], "tool_result");
@@ -1036,12 +1174,15 @@ fn anthropic_adjacent_tool_results_merge() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::tool_result("call_1", "result a"),
         Message::tool_result("call_2", "result b"),
     ];
 
-    let anthropic_msgs = build_anthropic_messages(&messages);
+    let anthropic_msgs = build_anthropic_messages(&messages, None);
 
     // user, assistant, user (merged tool results)
     assert_eq!(anthropic_msgs.len(), 3);
@@ -1090,6 +1231,38 @@ fn parse_anthropic_response_with_tool_use() {
     assert_eq!(tcs[0].id, "toolu_123");
     assert_eq!(tcs[0].function.name, "read_memory");
     assert!(tcs[0].function.arguments.contains("test.md"));
+}
+
+/// A non-streaming reply keeps its signed `thinking` and `redacted_thinking`
+/// blocks verbatim and in order, so the next tool-loop request can replay
+/// them exactly as returned; text and tool calls are unaffected.
+#[test]
+fn parse_anthropic_response_keeps_signed_reasoning_blocks_verbatim() {
+    let thinking =
+        serde_json::json!({"type": "thinking", "thinking": "plan", "signature": "sig_1"});
+    let redacted = serde_json::json!({"type": "redacted_thinking", "data": "opaque=="});
+    let resp = serde_json::json!({
+        "content": [
+            thinking, redacted,
+            {"type": "text", "text": "Checking."},
+            {"type": "tool_use", "id": "toolu_9", "name": "fs_read", "input": {"path": "a"}}
+        ],
+        "stop_reason": "tool_use"
+    });
+
+    let msg = parse_anthropic_response(&resp).unwrap();
+    assert_eq!(msg.reasoning_blocks, Some(vec![thinking, redacted]));
+    assert_eq!(msg.text_content(), Some("Checking."));
+    assert_eq!(msg.tool_calls.as_ref().map(Vec::len), Some(1));
+
+    let plain = parse_anthropic_response(&serde_json::json!({
+        "content": [{"type": "text", "text": "hi"}]
+    }))
+    .unwrap();
+    assert!(
+        plain.reasoning_blocks.is_none(),
+        "no blocks means None, not an empty list"
+    );
 }
 
 // ── ProviderCooldown tests ──
@@ -1860,6 +2033,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
         &mut pending_cached,
         &mut pending_created,
         &mut None,
+        &mut None,
     );
     assert!(matches!(action, SseAction::Continue));
     assert_eq!(pending_input, 150);
@@ -1876,6 +2050,7 @@ fn anthropic_usage_carries_input_tokens_from_message_start() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
         &mut None,
     );
     let events = match action {
@@ -1918,6 +2093,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
         &mut pending_cached,
         &mut pending_created,
         &mut None,
+        &mut None,
     );
 
     let delta = r#"data: {"type":"message_delta","usage":{"input_tokens":120,"output_tokens":10},"delta":{"stop_reason":"end_turn"}}"#;
@@ -1931,6 +2107,7 @@ fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
         &mut pending_input,
         &mut pending_cached,
         &mut pending_created,
+        &mut None,
         &mut None,
     );
     let events = match action {
@@ -1969,6 +2146,9 @@ fn openai_sanitizes_null_content_on_tool_call_messages() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::tool_result("call_1", "result"),
     ];
@@ -2012,6 +2192,9 @@ fn openai_drops_empty_user_message_for_gemini_compat() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
     ];
 
@@ -2041,6 +2224,9 @@ fn openai_drops_empty_assistant_message_without_tool_calls() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::user("actual question"),
     ];
@@ -2070,6 +2256,9 @@ fn openai_drops_none_content_assistant_without_tool_calls() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message::user("follow up"),
     ];
@@ -2096,6 +2285,9 @@ fn repair_asst_tool_call(id: &str) -> Message {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     }
 }
 
@@ -2153,6 +2345,9 @@ fn repair_asst_calls(calls: &[(&str, &str, &str)]) -> Message {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     }
 }
 
@@ -2378,6 +2573,9 @@ fn openai_preserves_tool_result_messages() {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
         Message {
             role: Role::Tool,
@@ -2386,6 +2584,9 @@ fn openai_preserves_tool_result_messages() {
             tool_call_id: Some("call_1".to_string()),
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         },
     ];
 
@@ -3644,6 +3845,7 @@ fn parse_anthropic_error_sse(err_type: &str, err_msg: &str) -> crate::sse::SseAc
         &mut pending_cached,
         &mut pending_created,
         &mut None,
+        &mut None,
     )
 }
 
@@ -4177,7 +4379,7 @@ fn anthropic_messages_never_emit_blank_text_block() {
         assistant_with_calls,
         Message::tool_result("call_1", "  "),
     ];
-    let built = crate::llm::anthropic::build_anthropic_messages(&messages);
+    let built = crate::llm::anthropic::build_anthropic_messages(&messages, None);
     let body = serde_json::Value::Array(built);
 
     let mut texts = Vec::new();
@@ -4334,6 +4536,9 @@ fn an_anthropic_request_never_carries_a_repeated_tool_use_id() {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     };
     let messages = vec![
         Message::user("do a two-step task"),
@@ -4997,6 +5202,7 @@ fn anthropic_usage_carries_message_id_from_message_start() {
         &mut pending_cached,
         &mut pending_created,
         &mut pending_id,
+        &mut None,
     );
     let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":4},"delta":{"stop_reason":"end_turn"}}"#;
     let action = transport::parse_anthropic_sse_line(
@@ -5010,6 +5216,7 @@ fn anthropic_usage_carries_message_id_from_message_start() {
         &mut pending_cached,
         &mut pending_created,
         &mut pending_id,
+        &mut None,
     );
     let events = match action {
         SseAction::Done(ev) | SseAction::Emit(ev) => ev,

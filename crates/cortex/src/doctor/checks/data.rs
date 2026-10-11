@@ -6,7 +6,9 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::doctor::{DiagnosticCheck, RemediationKind};
 
-pub(in crate::doctor) async fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
+/// `deep_scans` admits the FTS5 `integrity-check`, a full index scan that
+/// belongs in an explicit `borg doctor` run, not the nightly sweep.
+pub(in crate::doctor) async fn check_data_dir(checks: &mut Vec<DiagnosticCheck>, deep_scans: bool) {
     match Config::data_dir() {
         Ok(data_dir) => {
             if data_dir.exists() {
@@ -66,30 +68,69 @@ pub(in crate::doctor) async fn check_data_dir(checks: &mut Vec<DiagnosticCheck>)
     // `Err` branch already surfaced by the "database accessible" check
     // above — don't double-report. Only run integrity if we could open.
     if let Ok(db) = Database::open().await {
-        let integrity_result: Result<String> = async {
-            let mut rows = db.conn().query("PRAGMA integrity_check", ()).await?;
-            match rows.next().await? {
-                Some(row) => Ok(row.get::<String>(0)?),
-                None => Ok(String::new()),
-            }
-        }
-        .await;
-        match integrity_result {
-            Ok(result) if result == "ok" => {
-                checks.push(DiagnosticCheck::pass("Data", "database integrity"));
-            }
-            Ok(result) => {
-                checks.push(DiagnosticCheck::warn("Data", "database integrity", result));
-            }
-            Err(e) => {
-                checks.push(DiagnosticCheck::fail(
-                    "Data",
-                    "database integrity",
-                    format!("{e}"),
-                ));
-            }
+        checks.extend(database_checks(&db, deep_scans).await);
+    }
+}
+
+/// The checks that need an open database: SQLite's `integrity_check`
+/// always, the FTS5 index scans only when `deep_scans` is set.
+pub(in crate::doctor) async fn database_checks(
+    db: &Database,
+    deep_scans: bool,
+) -> Vec<DiagnosticCheck> {
+    let mut checks = Vec::new();
+    let integrity_result: Result<String> = async {
+        let mut rows = db.conn().query("PRAGMA integrity_check", ()).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<String>(0)?),
+            None => Ok(String::new()),
         }
     }
+    .await;
+    match integrity_result {
+        Ok(result) if result == "ok" => {
+            checks.push(DiagnosticCheck::pass("Data", "database integrity"));
+        }
+        Ok(result) => {
+            checks.push(DiagnosticCheck::warn("Data", "database integrity", result));
+        }
+        Err(e) => {
+            checks.push(DiagnosticCheck::fail(
+                "Data",
+                "database integrity",
+                format!("{e}"),
+            ));
+        }
+    }
+    if deep_scans {
+        checks.extend(fts_index_checks(db).await);
+    }
+    checks
+}
+
+/// One row per FTS5 index: `PRAGMA integrity_check` above does not look
+/// inside the shadow tables, so a torn segment that makes every search
+/// return nothing passes it. FTS5's own `integrity-check` catches that; a
+/// failure is `AutoSafe` because `rebuild` regenerates the index from the
+/// content table it mirrors, losing nothing.
+pub(in crate::doctor) async fn fts_index_checks(db: &crate::db::Database) -> Vec<DiagnosticCheck> {
+    use crate::maintenance::fts::{check_all, FTS_REMEDIATION_KEY, FTS_REPAIR_HINT};
+    check_all(db)
+        .await
+        .into_iter()
+        .map(|(table, outcome)| {
+            let name = format!("search index {table}");
+            match outcome {
+                Ok(()) => DiagnosticCheck::pass("Data", name),
+                Err(e) => DiagnosticCheck::warn("Data", name, format!("{e:#} — {FTS_REPAIR_HINT}"))
+                    .with_remediation(
+                        RemediationKind::AutoSafe,
+                        FTS_REMEDIATION_KEY,
+                        FTS_REPAIR_HINT,
+                    ),
+            }
+        })
+        .collect()
 }
 
 /// Surface an automatic database recovery that happened earlier in this
@@ -275,6 +316,112 @@ mod tests {
         assert!(
             available_bytes(&temp.path().join("no-such-child")).is_none(),
             "a path that does not exist must report nothing, not zero"
+        );
+    }
+
+    /// The FTS5 `integrity-check` walks every index segment. The nightly
+    /// sweep (no deep scans) must get the cheap SQLite integrity row only;
+    /// an explicit `borg doctor` (deep scans) gets the index rows as well.
+    #[tokio::test]
+    async fn fts_index_scans_run_only_when_deep_scans_are_requested() {
+        let db = crate::db::Database::test_db().await;
+        let names = |checks: &[DiagnosticCheck]| -> Vec<String> {
+            checks.iter().map(|c| c.name.clone()).collect()
+        };
+
+        let sweep = database_checks(&db, false).await;
+        assert_eq!(names(&sweep), vec!["database integrity"]);
+
+        let doctor = database_checks(&db, true).await;
+        assert_eq!(
+            names(&doctor),
+            vec![
+                "database integrity",
+                "search index messages_fts",
+                "search index memory_chunks_fts",
+            ]
+        );
+        assert!(
+            doctor.iter().all(|c| matches!(c.status, CheckStatus::Pass)),
+            "a fresh database passes every row: {doctor:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fts_check_warns_with_repair_hint_on_a_garbled_index_and_passes_after_repair() {
+        use crate::maintenance::fts::tests::garble_fts_data;
+        let db = crate::db::Database::test_db().await;
+        db.conn()
+            .execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES (1, 's', 'user', 'wombat ledger', 0)",
+                (),
+            )
+            .await
+            .expect("insert message");
+
+        let healthy = fts_index_checks(&db).await;
+        assert_eq!(healthy.len(), 2, "one row per index: {healthy:?}");
+        assert!(
+            healthy
+                .iter()
+                .all(|c| matches!(c.status, CheckStatus::Pass)),
+            "a fresh index must pass: {healthy:?}"
+        );
+
+        garble_fts_data(&db, "messages_fts").await;
+        let checks = fts_index_checks(&db).await;
+        let bad = checks
+            .iter()
+            .find(|c| c.name == "search index messages_fts")
+            .expect("messages_fts row");
+        match &bad.status {
+            CheckStatus::Warn(msg) => assert!(
+                msg.contains("borg doctor --repair"),
+                "the warning must name the next action: {msg}"
+            ),
+            other => panic!("garbled index must warn, got {other:?}"),
+        }
+        assert_eq!(bad.remediation_key, Some("fts.rebuild"));
+        assert_eq!(
+            bad.remediation_kind,
+            crate::doctor::RemediationKind::AutoSafe
+        );
+        let good = checks
+            .iter()
+            .find(|c| c.name == "search index memory_chunks_fts")
+            .expect("memory_chunks_fts row");
+        assert!(
+            matches!(good.status, CheckStatus::Pass),
+            "the untouched index must still pass: {good:?}"
+        );
+
+        // The repair driver's key must round-trip: applying it heals the row.
+        let outcome = crate::maintenance::apply_remediation_key(
+            &db,
+            &crate::config::Config::default(),
+            "fts.rebuild",
+        )
+        .await
+        .expect("rebuild succeeds");
+        assert!(outcome.changed);
+        let after = fts_index_checks(&db).await;
+        assert!(
+            after.iter().all(|c| matches!(c.status, CheckStatus::Pass)),
+            "every index must pass after the repair: {after:?}"
+        );
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'wombat'",
+                (),
+            )
+            .await
+            .expect("match");
+        let n = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(
+            n, 1,
+            "the message must be searchable again after the rebuild"
         );
     }
 

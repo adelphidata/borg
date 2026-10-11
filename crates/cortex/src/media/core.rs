@@ -145,7 +145,31 @@ pub fn compress_image(
         return Ok((base64_data.to_string(), mime_type.to_string()));
     }
 
-    let img = image::ImageReader::new(Cursor::new(&bytes))
+    compress_decoded_image(&bytes, max_bytes)
+}
+
+/// [`compress_image`] for a caller that already holds the decoded bytes
+/// (and has already validated them): no HEIC handling, no second base64
+/// round-trip. Returns `(base64_data, mime_type)`; passthrough re-encodes
+/// the bytes unchanged when they fit.
+pub fn compress_image_bytes(
+    bytes: &[u8],
+    mime_type: &str,
+    max_bytes: usize,
+) -> Result<(String, String)> {
+    if bytes.len() <= max_bytes {
+        let engine = base64::engine::general_purpose::STANDARD;
+        return Ok((engine.encode(bytes), mime_type.to_string()));
+    }
+    compress_decoded_image(bytes, max_bytes)
+}
+
+/// Re-encode `bytes` as a JPEG that fits in `max_bytes`, shrinking
+/// dimensions and quality until it does.
+fn compress_decoded_image(bytes: &[u8], max_bytes: usize) -> Result<(String, String)> {
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    let img = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| anyhow::anyhow!("failed to guess image format: {e}"))?
         .decode()

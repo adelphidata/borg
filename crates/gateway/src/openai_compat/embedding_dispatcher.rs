@@ -17,6 +17,19 @@ use super::dispatcher::{EmbeddingDispatchError, EmbeddingDispatcher};
 /// operator config edits (`memory.embeddings.enabled`, etc.) propagate
 /// without a daemon restart — `get_or_init_provider` is internally
 /// cached and only re-resolves when the config fingerprint changes.
+///
+/// # Egress
+///
+/// Every input is passed through secret redaction before it leaves the
+/// machine (`generate_embedding_cached` redacts unconditionally, not
+/// gated on the local `secret_detection` setting). Two consequences a
+/// `/v1/embeddings` client should expect:
+///
+/// - A vector for text that contains a credential differs from what a
+///   direct call to the upstream provider would return, because the
+///   provider embeds the redacted placeholder, not the secret.
+/// - Two inputs that differ only in a secret redact to the same text,
+///   so they share one vector and one cache row.
 pub struct ConfigEmbeddingDispatcher {
     config: Arc<Config>,
 }

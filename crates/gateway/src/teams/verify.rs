@@ -85,6 +85,25 @@ mod tests {
             .contains("verification failed"));
     }
 
+    /// A secret that base64-decodes to all-NUL (`AA==`) or all-whitespace
+    /// (`ICAg` is three spaces) must fail closed even when the attacker signs
+    /// with that very key: HMAC zero-pads short keys, so `[0x00]` is the empty
+    /// key, and a blank key is a placeholder an operator never meant to deploy.
+    #[test]
+    fn degenerate_decoded_secret_fails_even_with_matching_signature() {
+        let body = b"hello teams";
+        for secret in ["AA==", "AAAAAAAA", "ICAg", "CQo="] {
+            let sig = compute_signature(secret, body);
+            let headers = make_headers(&sig);
+            let err = verify_teams_signature(&headers, body, secret)
+                .expect_err(&format!("secret {secret}: degenerate key must be refused"));
+            assert!(
+                err.to_string().contains("empty or blank"),
+                "secret {secret}: must fail at the key gate, not the comparison: {err}"
+            );
+        }
+    }
+
     #[test]
     fn tampered_body_fails() {
         let secret = make_secret();

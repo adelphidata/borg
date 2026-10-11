@@ -51,6 +51,12 @@ pub fn require_verification_secret(
     Ok(())
 }
 
+/// True when `key` carries no real entropy: empty, every byte NUL, or every
+/// byte ASCII whitespace. Such a key must never gate authentication.
+pub fn is_degenerate_hmac_key(key: &[u8]) -> bool {
+    key.iter().all(|b| *b == 0 || b.is_ascii_whitespace())
+}
+
 /// Compute HMAC-SHA256 over `data` keyed by `key` and constant-time compare
 /// against the expected raw signature bytes. Used by Slack (hex-encoded
 /// expected) and Teams (base64-encoded expected); each caller decodes its
@@ -61,11 +67,14 @@ pub fn hmac_sha256_verify(
     expected: &[u8],
     label: &'static str,
 ) -> Result<()> {
-    // Reject empty signing secrets up-front. HMAC over an empty key is
-    // mathematically well-defined, so a request signed with `""` would
-    // verify against a misconfigured (empty) secret — a silent auth bypass.
-    if key.is_empty() {
-        bail!("{label} signing secret is empty — refusing to verify");
+    // Reject empty and degenerate signing secrets up-front. HMAC over an
+    // empty key is mathematically well-defined, so a request signed with `""`
+    // would verify against a misconfigured (empty) secret — a silent auth
+    // bypass. HMAC also zero-pads short keys, so an all-NUL key signs exactly
+    // like the empty one, and a whitespace-only key is a placeholder an
+    // operator never meant to deploy.
+    if is_degenerate_hmac_key(key) {
+        bail!("{label} signing secret is empty or blank — refusing to verify");
     }
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
@@ -114,10 +123,32 @@ mod tests {
     }
 
     #[test]
-    fn hmac_rejects_empty_key() {
-        // Regression: empty secret used to verify against any signature.
-        let err = hmac_sha256_verify(b"", b"data", b"sig", "Test").unwrap_err();
-        assert!(err.to_string().contains("empty"));
+    fn hmac_rejects_empty_blank_and_nul_keys_even_with_matching_signature() {
+        // Regression: empty secret used to verify against any signature. An
+        // all-NUL key is zero-padded by HMAC into the same key as `""`, and a
+        // whitespace-only key is a placeholder — both must fail closed even
+        // when the caller presents the signature that key would produce.
+        let cases: &[(&str, &[u8])] = &[
+            ("empty", b""),
+            ("spaces", b"   "),
+            ("tab-newline", b"\t\n"),
+            ("single-nul", &[0]),
+            ("multi-nul", &[0, 0, 0, 0]),
+            ("nul-and-space", &[0, b' ', 0]),
+        ];
+        for (name, key) in cases {
+            let mut mac = HmacSha256::new_from_slice(key).unwrap();
+            mac.update(b"data");
+            let sig = mac.finalize().into_bytes();
+            let err = hmac_sha256_verify(key, b"data", &sig, "Test")
+                .expect_err(&format!("{name}: degenerate key must be refused"));
+            assert!(err.to_string().contains("empty or blank"), "{name}: {err}");
+        }
+        // A key with any real byte still verifies.
+        let mut mac = HmacSha256::new_from_slice(b" k ").unwrap();
+        mac.update(b"data");
+        let sig = mac.finalize().into_bytes();
+        hmac_sha256_verify(b" k ", b"data", &sig, "Test").unwrap();
     }
 
     #[test]

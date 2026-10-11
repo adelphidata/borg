@@ -341,6 +341,33 @@ pub struct Message {
     /// Provider adapters ignore it; it is not part of the model-facing payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<i64>,
+    /// The signed `thinking` / `redacted_thinking` blocks the Anthropic wire
+    /// returned with this assistant turn, verbatim. Anthropic requires them
+    /// replayed ahead of a `tool_use` that continues the same tool loop; the
+    /// signature binds them to [`Self::reasoning_model`], so they go back
+    /// only on a native Anthropic route to that same model. Assistant turns
+    /// only; never sent to a third-party endpoint.
+    ///
+    /// Reasoning replay is in-process only today. This field,
+    /// [`Self::reasoning_content`] and [`Self::reasoning_model`] live on the
+    /// in-memory history and in the session JSON export, but not in the
+    /// `messages` table: `MessageRow` has no column for them and
+    /// `message_from_row` sets all three to `None`. A tool loop that spans
+    /// a daemon restart therefore continues without its reasoning, exactly
+    /// as it does after a model switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_blocks: Option<Vec<serde_json::Value>>,
+    /// The `reasoning_content` an OpenAI-compatible reasoning provider
+    /// (DeepSeek, Kimi, Ollama cloud) streamed with this assistant turn.
+    /// Those providers require it echoed on the assistant tool-call message
+    /// of the same loop; every other provider must not see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// The model that produced [`Self::reasoning_blocks`] and
+    /// [`Self::reasoning_content`]. Replay is valid only to this model: a
+    /// failover or a model switch leaves the reasoning behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_model: Option<String>,
 }
 
 /// An LLM-requested tool invocation.
@@ -410,6 +437,9 @@ impl Message {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -422,6 +452,9 @@ impl Message {
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -434,6 +467,9 @@ impl Message {
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -446,6 +482,9 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             timestamp: Some(Self::now_rfc3339()),
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -458,6 +497,9 @@ impl Message {
             tool_call_id: None,
             timestamp: Some(Self::now_rfc3339()),
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -522,6 +564,16 @@ pub enum ToolOutput {
     },
 }
 
+impl ToolOutput {
+    /// The text half of the output: the whole payload for `Text`, the
+    /// summary for `Multimodal`.
+    pub fn text(&self) -> &str {
+        match self {
+            ToolOutput::Text(t) | ToolOutput::Multimodal { text: t, .. } => t,
+        }
+    }
+}
+
 impl From<String> for ToolOutput {
     fn from(s: String) -> Self {
         ToolOutput::Text(s)
@@ -550,6 +602,9 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             timestamp: Some(Self::now_rfc3339()),
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 }
@@ -755,6 +810,40 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[1]["type"], "image_url");
+    }
+
+    /// Session and DB JSON written before the reasoning fields existed must
+    /// still load, with the fields empty; and a message that carries them
+    /// round-trips them while a message without them serializes exactly as
+    /// before (no new keys appear on the wire for the common case).
+    #[test]
+    fn message_json_without_reasoning_fields_still_deserializes() {
+        let legacy = r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}],"seq":4}"#;
+        let msg: Message = serde_json::from_str(legacy).expect("legacy message JSON must load");
+        assert_eq!(msg.text_content(), Some("hi"));
+        assert_eq!(msg.seq, Some(4));
+        assert_eq!(msg.tool_calls.as_ref().map(Vec::len), Some(1));
+        assert!(msg.reasoning_blocks.is_none());
+        assert!(msg.reasoning_content.is_none());
+        assert!(msg.reasoning_model.is_none());
+        let out = serde_json::to_value(&msg).unwrap();
+        for key in ["reasoning_blocks", "reasoning_content", "reasoning_model"] {
+            assert!(
+                out.get(key).is_none(),
+                "{key} must not appear when unset: {out}"
+            );
+        }
+
+        let mut with = msg.clone();
+        with.reasoning_blocks = Some(vec![
+            serde_json::json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+        ]);
+        with.reasoning_content = Some("because".into());
+        with.reasoning_model = Some("claude-opus-4-7".into());
+        let back: Message = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.reasoning_blocks, with.reasoning_blocks);
+        assert_eq!(back.reasoning_content.as_deref(), Some("because"));
+        assert_eq!(back.reasoning_model.as_deref(), Some("claude-opus-4-7"));
     }
 
     #[test]

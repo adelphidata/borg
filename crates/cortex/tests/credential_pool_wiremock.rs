@@ -110,6 +110,9 @@ fn user_message(text: &str) -> Vec<Message> {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     }]
 }
 
@@ -1798,4 +1801,420 @@ async fn pool_load_skips_an_example_placeholder_in_the_environment() {
         vec![real_var],
         "only the variable with a real key becomes a credential"
     );
+}
+
+// ── credit-limited 402: lower the output cap once, then it is billing ─────
+
+/// The 402 body OpenRouter sends when the requested `max_tokens` outruns the
+/// remaining credit. The account still has credit for 12000 output tokens.
+const AFFORDABLE_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 56272 tokens, but can only afford 12000. To increase, visit https://openrouter.ai/settings/credits and upgrade to a paid account","code":402}}"#;
+
+/// The cap the re-send must carry: the affordable figure less the headroom.
+const LOWERED_CAP: u64 = 12000 - 64;
+
+fn max_tokens_of(req: &wiremock::Request) -> u64 {
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
+    body["max_tokens"]
+        .as_u64()
+        .expect("every request carries max_tokens")
+}
+
+async fn mount_affordable_402(server: &MockServer, times: u64) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(402).set_body_string(AFFORDABLE_402_BODY))
+        .up_to_n_times(times)
+        .mount(server)
+        .await;
+}
+
+async fn mount_success(server: &MockServer, streaming: bool, text: &str) {
+    let response = if streaming {
+        ResponseTemplate::new(200).set_body_raw(sse_done(text), "text/event-stream")
+    } else {
+        ResponseTemplate::new(200).set_body_raw(chat_completion(text), "application/json")
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_credit_limited_402_is_resent_once_with_the_affordable_cap() {
+    // The account can still pay for a smaller answer, so the turn must be
+    // served with `max_tokens` lowered to what the body says is affordable,
+    // and the credential must not be benched: it has credit.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        let config = sole_key_with_retries_config(&server.uri(), None);
+        mount_affordable_402(&server, 1).await;
+        mount_success(&server, streaming, "served").await;
+
+        let mut client = LlmClient::new(&config).await.expect("client");
+        if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            client
+                .stream_chat(&user_message("hi"), None, tx)
+                .await
+                .expect("the lowered re-send must carry the turn");
+            assert_eq!(collect_events(rx).await, vec!["text:served", "done"]);
+        } else {
+            let reply = client
+                .chat(&user_message("hi"), None)
+                .await
+                .expect("the lowered re-send must carry the call");
+            assert_eq!(
+                reply.text_content(),
+                Some("served"),
+                "streaming={streaming}"
+            );
+        }
+
+        let requests = server.received_requests().await.expect("recording");
+        assert_eq!(
+            requests.len(),
+            2,
+            "streaming={streaming}: one re-send, no more"
+        );
+        assert_eq!(
+            max_tokens_of(&requests[0]),
+            u64::from(config.llm.max_tokens),
+            "streaming={streaming}: the first request carries the configured cap"
+        );
+        assert_eq!(
+            max_tokens_of(&requests[1]),
+            LOWERED_CAP,
+            "streaming={streaming}: the re-send carries the affordable cap less headroom"
+        );
+
+        let pool = client
+            .primary_pool()
+            .cloned()
+            .expect("primary pool present");
+        let entry = pool.entries().remove(0);
+        assert!(
+            entry.last_error_reset_at_ms.is_none() && entry.removed_at_ms.is_none(),
+            "streaming={streaming}: a credential with credit must not be benched: {entry:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_configured_cap_returns_after_a_lowered_re_send() {
+    // The lowered cap belongs to the one re-send. The next call of the same
+    // client must ask for the configured cap again, or one tight-credit
+    // moment would shrink every later answer for the life of the client.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        let config = sole_key_with_retries_config(&server.uri(), None);
+        mount_affordable_402(&server, 1).await;
+        mount_success(&server, streaming, "served").await;
+
+        let mut client = LlmClient::new(&config).await.expect("client");
+        for call in 0..2 {
+            if streaming {
+                let (tx, rx) = mpsc::channel(64);
+                client
+                    .stream_chat(&user_message("hi"), None, tx)
+                    .await
+                    .unwrap_or_else(|e| panic!("streaming call {call} must be served: {e}"));
+                assert_eq!(collect_events(rx).await, vec!["text:served", "done"]);
+            } else {
+                let reply = client
+                    .chat(&user_message("hi"), None)
+                    .await
+                    .unwrap_or_else(|e| panic!("call {call} must be served: {e}"));
+                assert_eq!(reply.text_content(), Some("served"), "call {call}");
+            }
+        }
+
+        let requests = server.received_requests().await.expect("recording");
+        let caps: Vec<u64> = requests.iter().map(max_tokens_of).collect();
+        assert_eq!(
+            caps,
+            vec![
+                u64::from(config.llm.max_tokens),
+                LOWERED_CAP,
+                u64::from(config.llm.max_tokens),
+            ],
+            "streaming={streaming}: the second call must carry the configured cap again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_affordable_cap_under_the_floor_is_a_billing_error_without_a_re_send() {
+    // "can only afford 100": the cap less headroom is under the floor, so
+    // the re-send would be cut off anyway. One request, a billing error,
+    // and the credential takes the billing bench.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        let config = sole_key_with_retries_config(&server.uri(), None);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(
+                r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 56272 tokens, but can only afford 100.","code":402}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let mut client = LlmClient::new(&config).await.expect("client");
+        let error = if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            let res = client.stream_chat(&user_message("hi"), None, tx).await;
+            let events = collect_events(rx).await;
+            let text = res.expect_err("no credit for the floor").to_string();
+            assert_eq!(
+                events,
+                vec![format!("error:{text}")],
+                "streaming={streaming}"
+            );
+            text
+        } else {
+            client
+                .chat(&user_message("hi"), None)
+                .await
+                .expect_err("no credit for the floor")
+                .to_string()
+        };
+
+        assert!(
+            error.to_ascii_lowercase().contains("billing"),
+            "streaming={streaming}: {error}"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            1,
+            "streaming={streaming}: a cap under the floor is not worth a re-send"
+        );
+        let pool = client
+            .primary_pool()
+            .cloned()
+            .expect("primary pool present");
+        let entry = pool.entries().remove(0);
+        assert!(
+            entry.last_error_reset_at_ms.is_some(),
+            "streaming={streaming}: the credential takes the billing bench: {entry:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_credit_limited_402_is_a_billing_error() {
+    // The lowered re-send failed the same way: the account cannot pay for the
+    // floor either, so the turn ends as billing and the credential takes the
+    // billing bench. No third request.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        let config = sole_key_with_retries_config(&server.uri(), None);
+        mount_affordable_402(&server, 10).await;
+
+        let mut client = LlmClient::new(&config).await.expect("client");
+        let error = if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            let res = client.stream_chat(&user_message("hi"), None, tx).await;
+            let events = collect_events(rx).await;
+            let text = res.expect_err("no credit for the floor").to_string();
+            assert_eq!(
+                events,
+                vec![format!("error:{text}")],
+                "streaming={streaming}"
+            );
+            text
+        } else {
+            client
+                .chat(&user_message("hi"), None)
+                .await
+                .expect_err("no credit for the floor")
+                .to_string()
+        };
+
+        assert!(
+            error.to_ascii_lowercase().contains("billing"),
+            "streaming={streaming}: {error}"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            2,
+            "streaming={streaming}: exactly one lowered re-send"
+        );
+        let pool = client
+            .primary_pool()
+            .cloned()
+            .expect("primary pool present");
+        let entry = pool.entries().remove(0);
+        assert!(
+            entry.last_error_reset_at_ms.is_some(),
+            "streaming={streaming}: the second 402 benches the credential for billing: {entry:?}"
+        );
+    }
+}
+
+// ── pool exhausted with a far-off recovery: no salvage, name the reset ───
+
+#[tokio::test]
+async fn an_exhausted_pool_that_recovers_too_late_fails_with_the_reset_time() {
+    // Every key is benched for hours. A salvage request would re-probe a key
+    // the provider already refused, so the turn must end without one HTTP
+    // request, and the user must read when the limit resets.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let server = MockServer::start().await;
+        mount_success(&server, streaming, "must-not-be-served").await;
+        let config = sole_key_no_fallback_config(&server.uri());
+        let mut client = LlmClient::new(&config).await.expect("client");
+
+        let pool = client
+            .primary_pool()
+            .cloned()
+            .expect("primary pool present");
+        let id = pool.entries().remove(0).id;
+        pool.report_failure(
+            &id,
+            FailoverReason::RateLimit,
+            Some(429),
+            Some(std::time::Duration::from_secs(2 * 60 * 60)),
+            Some("plan limit reached"),
+        );
+
+        let error = if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            let res = tokio::time::timeout(
+                TURN_DEADLINE,
+                client.stream_chat(&user_message("hi"), None, tx),
+            )
+            .await
+            .expect("the turn must not wait for the reset");
+            let events = collect_events(rx).await;
+            let text = res.expect_err("no key can serve").to_string();
+            assert_eq!(
+                events,
+                vec![format!("error:{text}")],
+                "streaming={streaming}"
+            );
+            text
+        } else {
+            tokio::time::timeout(TURN_DEADLINE, client.chat(&user_message("hi"), None))
+                .await
+                .expect("the call must not wait for the reset")
+                .expect_err("no key can serve")
+                .to_string()
+        };
+
+        assert!(
+            error.contains("usage limit reached. It resets in about 2 hours"),
+            "streaming={streaming}: {error}"
+        );
+        assert!(
+            error.contains("Add another provider or key"),
+            "streaming={streaming}: {error}"
+        );
+        assert!(
+            !error.contains("exhausted"),
+            "streaming={streaming}: the bare exhaustion text must not reach the user: {error}"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "streaming={streaming}: no salvage request inside the reset window"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_pool_hands_the_turn_to_a_healthy_fallback() {
+    // The fast bail above is for a chain with nowhere else to go. With a
+    // fallback slot configured and healthy, the turn goes there in one
+    // request: no salvage probe of the benched primary, no error.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+
+    for streaming in [true, false] {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        mount_success(&primary, streaming, "must-not-be-served").await;
+        mount_success(&fallback, streaming, "fallback-ok").await;
+        let config = sole_key_with_retries_config(&primary.uri(), Some(&fallback.uri()));
+        let mut client = LlmClient::new(&config).await.expect("client");
+
+        let pool = client
+            .primary_pool()
+            .cloned()
+            .expect("primary pool present");
+        let id = pool.entries().remove(0).id;
+        pool.report_failure(
+            &id,
+            FailoverReason::RateLimit,
+            Some(429),
+            Some(std::time::Duration::from_secs(2 * 60 * 60)),
+            Some("plan limit reached"),
+        );
+
+        if streaming {
+            let (tx, rx) = mpsc::channel(64);
+            tokio::time::timeout(
+                TURN_DEADLINE,
+                client.stream_chat(&user_message("hi"), None, tx),
+            )
+            .await
+            .expect("the turn must not wait for the reset")
+            .expect("the fallback must serve the request");
+            assert_eq!(collect_events(rx).await, vec!["text:fallback-ok", "done"]);
+        } else {
+            let reply = tokio::time::timeout(TURN_DEADLINE, client.chat(&user_message("hi"), None))
+                .await
+                .expect("the call must not wait for the reset")
+                .expect("the fallback must serve the call");
+            assert_eq!(
+                reply.text_content(),
+                Some("fallback-ok"),
+                "streaming={streaming}"
+            );
+        }
+
+        assert!(
+            primary
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "streaming={streaming}: the benched primary is not probed"
+        );
+        assert_eq!(
+            fallback.received_requests().await.expect("recording").len(),
+            1,
+            "streaming={streaming}: one request to the fallback"
+        );
+    }
 }

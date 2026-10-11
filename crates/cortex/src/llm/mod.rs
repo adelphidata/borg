@@ -179,6 +179,7 @@ pub mod provider_catalog;
 pub mod rate_limit_headers;
 pub mod reasoning_timeouts;
 mod transport;
+pub(crate) use transport::provider_echoes_reasoning;
 pub(crate) mod vertex;
 
 pub(crate) use anthropic::normalize_cache_tokens;
@@ -261,6 +262,11 @@ pub enum StreamEvent {
     TextDelta(String),
     /// Incremental reasoning/thinking content.
     ThinkingDelta(String),
+    /// One complete, signed Anthropic `thinking` or `redacted_thinking`
+    /// block, verbatim, emitted at its `content_block_stop`. The agent keeps
+    /// it on the assistant message so a `tool_use` that continues the loop
+    /// can replay it to the same model. Non-terminal.
+    ReasoningBlock(serde_json::Value),
     /// Incremental tool call data.
     ToolCallDelta {
         index: usize,
@@ -532,6 +538,8 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct Delta {
     content: Option<String>,
+    /// Reasoning text from DeepSeek / Kimi / Ollama-cloud style providers.
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
@@ -655,6 +663,57 @@ const MAX_IN_TURN_RETRY_WAIT: Duration = Duration::from_secs(120);
 fn is_long_provider_wait(err: &LlmError) -> bool {
     err.retry_after()
         .is_some_and(|wait| wait > MAX_IN_TURN_RETRY_WAIT)
+}
+
+/// The wait until the first pool credential recovers, when it is longer
+/// than the turn can hold. `None` when a key recovers soon (or none is
+/// cooling), in which case a salvage attempt is still worth a request.
+fn pool_long_wait(pool: &credential_pool::CredentialPool) -> Option<Duration> {
+    pool.time_until_recovery()
+        .filter(|wait| *wait > MAX_IN_TURN_RETRY_WAIT)
+}
+
+/// Headroom kept under the output cap a credit-limited 402 names, so the
+/// re-send does not land on the exact boundary the provider computed.
+const OUTPUT_CAP_HEADROOM: u32 = 64;
+
+/// The smallest output cap worth re-sending with. Below this the answer
+/// would be cut off anyway, so the account is treated as out of credit.
+const OUTPUT_CAP_FLOOR: u32 = 512;
+
+/// The `max_tokens` to re-send with after a credit-limited 402, when the
+/// result is one and its body names an affordable cap.
+fn lowered_output_cap<T>(result: &std::result::Result<T, LlmError>) -> Option<u32> {
+    let Err(err) = result else {
+        return None;
+    };
+    if err.reason() != FailoverReason::OutputCapUnaffordable {
+        return None;
+    }
+    let cap = llm_error::affordable_max_tokens(&err.to_string())?;
+    let lowered = cap.saturating_sub(OUTPUT_CAP_HEADROOM);
+    // Below the floor the re-send would still be unaffordable, so it is
+    // not worth one more request: treat it as billing at once.
+    (lowered >= OUTPUT_CAP_FLOOR).then_some(lowered)
+}
+
+/// A credit-limited 402 that survives the lowered re-send (or carries no
+/// usable cap) is plain billing: the credential takes the billing bench.
+fn unaffordable_as_billing(err: LlmError) -> LlmError {
+    match err {
+        LlmError::Fatal {
+            source,
+            reason: FailoverReason::OutputCapUnaffordable,
+            status,
+        } => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "billing error (the account cannot pay for the lowered output cap either): {source}"
+            ),
+            reason: FailoverReason::Billing,
+            status,
+        },
+        other => other,
+    }
 }
 
 /// A wait in hours and minutes, rounded up to the minute: "2 hours 5 minutes".
@@ -1201,6 +1260,63 @@ fn configured_base_url(base_url: Option<&str>) -> Option<&str> {
     base_url.filter(|s| !s.trim().is_empty())
 }
 
+/// What makes a fallback slot distinct from the primary and from its
+/// siblings: provider, model (case-insensitive), endpoint, and the
+/// credentials it sends. Two entries with the same identity reach the same
+/// endpoint with the same request under the same key, so the second one
+/// buys nothing. A different key on the same provider and model is a real
+/// alternative (a paid key behind a free one) and stays.
+///
+/// The endpoint is trimmed, without a trailing slash, with only its scheme
+/// and host lowercased: paths are case-sensitive on most servers, so `/v1`
+/// and `/V1` are two endpoints. `None` is the provider's default.
+/// Credentials enter as a digest of the key set, never as the keys.
+fn slot_identity(
+    provider: Provider,
+    model: &str,
+    base_url: Option<&str>,
+    keys: &[String],
+) -> (String, String, Option<String>, [u8; 32]) {
+    (
+        provider.to_string(),
+        model.trim().to_ascii_lowercase(),
+        configured_base_url(base_url).map(normalize_endpoint),
+        credential_fingerprint(keys),
+    )
+}
+
+/// `url` trimmed, without a trailing slash, with scheme and host lowercased
+/// and the path left as written. An unparseable value is kept verbatim
+/// (trimmed) so two copies of the same typo still collapse.
+fn normalize_endpoint(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    match url::Url::parse(trimmed) {
+        // The parser already lowercases scheme and host; the path, query and
+        // fragment come back as written.
+        Ok(parsed) if parsed.host_str().is_some() => format!(
+            "{}{}",
+            &parsed[..url::Position::BeforePath],
+            parsed[url::Position::BeforePath..].trim_end_matches('/')
+        ),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// SHA-256 over the sorted, de-duplicated key set, so two slots' credentials
+/// can be compared without the identity holding the keys themselves.
+fn credential_fingerprint(keys: &[String]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = sha2::Sha256::new();
+    for key in sorted {
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
 /// The endpoint `provider` talks to when no `base_url` is set, composed the
 /// same way [`LlmClient::new`] does from `cfg` (Azure resource, Vertex
 /// project/location, `OLLAMA_HOST`). `None` when it cannot be known: no
@@ -1363,6 +1479,17 @@ impl LlmClient {
             };
 
         let mut provider_slots = Vec::new();
+        // One slot per distinct (provider, model, endpoint, credentials). A
+        // duplicate entry (or one that restates the primary) would only re-run
+        // the same failed request on the same endpoint with the same key and
+        // delay the real error.
+        let mut seen_slots = std::collections::HashSet::new();
+        seen_slots.insert(slot_identity(
+            provider,
+            &config.llm.model,
+            llm_config.base_url.as_deref(),
+            &keys,
+        ));
         for fb in &config.llm.fallback {
             match Self::resolve_fallback_slot(fb, config).await {
                 Ok(slot) => {
@@ -1373,6 +1500,19 @@ impl LlmClient {
                         warn!(
                             "Skipping fallback provider '{}' under air-gap policy: {e}",
                             fb.provider
+                        );
+                        continue;
+                    }
+                    let identity = slot_identity(
+                        slot.provider,
+                        &slot.model,
+                        slot.base_url.as_deref(),
+                        &slot.keys,
+                    );
+                    if !seen_slots.insert(identity) {
+                        warn!(
+                            "Skipping duplicate fallback '{}/{}': the same provider, model, endpoint, and credentials are already in the chain",
+                            fb.provider, fb.model
                         );
                         continue;
                     }
@@ -2459,6 +2599,9 @@ impl LlmClient {
         // pool that is exhausted now will still be exhausted on the next retry,
         // so re-salvaging would just hammer a benched key.
         let mut salvage_used = false;
+        // One lowered re-send per call for a credit-limited 402: the second
+        // one means the account cannot pay for the floor either.
+        let mut output_cap_lowered = false;
 
         for _provider_attempt in 0..max_provider_attempts {
             let max_retries = self.llm_config.max_retries;
@@ -2532,6 +2675,23 @@ impl LlmClient {
                             should_failover = true;
                             break;
                         }
+                        // Every key is benched for longer than the turn can
+                        // hold: a salvage request would only re-probe a key
+                        // the provider already said no to. Fail now and name
+                        // the reset time instead.
+                        if let Some(wait) = pool_long_wait(&pool) {
+                            let msg =
+                                usage_limit_message(self.provider, wait, chrono::Local::now());
+                            warn!(
+                                target: "cortex::llm",
+                                wait_secs = wait.as_secs(),
+                                "credential pool recovers too late for this turn; not salvaging"
+                            );
+                            if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
+                                tracing::trace!("llm: stream receiver closed");
+                            }
+                            bail!("{msg}");
+                        }
                         // No fallback to move to, so the alternative to trying a
                         // cooling key is going dark. That is the wrong trade for
                         // a single-key install, where an ordinary burst throttle
@@ -2600,6 +2760,38 @@ impl LlmClient {
                             .await
                     };
                 }
+
+                // A credit-limited 402 names the output cap the account can
+                // still pay for. Lower `max_tokens` to it and re-send once;
+                // the credential is not benched, it still has credit.
+                if !output_cap_lowered {
+                    if let Some(cap) = lowered_output_cap(&result) {
+                        output_cap_lowered = true;
+                        warn!(
+                            target: "cortex::llm",
+                            requested = self.llm_config.max_tokens,
+                            lowered_to = cap,
+                            "provider cannot afford the requested output cap; re-sending with a lower max_tokens"
+                        );
+                        // The lowered cap applies to this one re-send only;
+                        // the configured cap is restored before anything
+                        // else can read it (the next turn, a failover
+                        // snapshot, or the log line above).
+                        let configured_cap = self.llm_config.max_tokens;
+                        self.llm_config.max_tokens = cap;
+                        result = if matches!(self.provider, Provider::ClaudeCli) {
+                            self.stream_chat_claude_cli_inner(&messages, tools, &tx, &cancel)
+                                .await
+                        } else {
+                            self.stream_http_transport_inner(&messages, tools, &tx, &cancel)
+                                .await
+                        };
+                        self.llm_config.max_tokens = configured_cap;
+                    }
+                }
+                // A second one (or one with no usable figure) is plain billing:
+                // the account cannot pay for the floor either.
+                let result = result.map_err(unaffordable_as_billing);
 
                 // Lease drop happens here as we re-bind below; report outcome
                 // to the pool by id before the lease's Drop returns it.
@@ -3418,6 +3610,7 @@ impl LlmClient {
         let req_id = short_request_id();
         let max_provider_attempts = 1 + self.provider_slots.len();
         let mut last_error: Option<String> = None;
+        let mut output_cap_lowered = false;
         // Mirrors the streaming path: one strip-and-resend per call, honor a
         // provider verdict already learned in this session, and learn one here
         // if it arrives.
@@ -3475,6 +3668,20 @@ impl LlmClient {
                                 should_failover = true;
                                 break;
                             }
+                            // See the streaming path: a pool that recovers
+                            // too late for this call fails with the reset
+                            // time, not with a bare "exhausted".
+                            if let Some(wait) = pool_long_wait(&pool) {
+                                warn!(
+                                    target: "cortex::llm",
+                                    wait_secs = wait.as_secs(),
+                                    "credential pool recovers too late for this call"
+                                );
+                                bail!(
+                                    "{}",
+                                    usage_limit_message(self.provider, wait, chrono::Local::now())
+                                );
+                            }
                             bail!("{}", last_error.unwrap_or_default());
                         }
                     }
@@ -3499,6 +3706,25 @@ impl LlmClient {
                     messages = strip_images(&messages);
                     result = self.chat_once(&messages, tools, &req_id).await;
                 }
+
+                // See the streaming path: one lowered re-send for a
+                // credit-limited 402, then it is plain billing.
+                if !output_cap_lowered {
+                    if let Some(cap) = lowered_output_cap(&result) {
+                        output_cap_lowered = true;
+                        warn!(
+                            target: "cortex::llm",
+                            requested = self.llm_config.max_tokens,
+                            lowered_to = cap,
+                            "provider cannot afford the requested output cap; re-sending with a lower max_tokens"
+                        );
+                        let configured_cap = self.llm_config.max_tokens;
+                        self.llm_config.max_tokens = cap;
+                        result = self.chat_once(&messages, tools, &req_id).await;
+                        self.llm_config.max_tokens = configured_cap;
+                    }
+                }
+                let result = result.map_err(unaffordable_as_billing);
 
                 match result {
                     Ok(message) => {

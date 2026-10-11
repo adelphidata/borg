@@ -585,7 +585,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     /// Keys that `has_any_native_channel` checks — cleared before each test
     /// so ambient environment (dev machines, CI secrets) can't flip the
@@ -604,10 +604,7 @@ mod tests {
     /// they must run serially — cargo test's default thread pool would
     /// otherwise let them race and observe each other's state.
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_env::env_lock()
     }
 
     struct EnvGuard {

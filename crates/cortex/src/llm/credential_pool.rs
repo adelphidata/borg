@@ -764,6 +764,15 @@ impl CredentialPool {
             .min()
     }
 
+    /// How long until the first cooling credential recovers, on the pool's
+    /// clock. `Some(0)` when a reset time has already passed; `None` when
+    /// nothing is cooling (see [`Self::next_recovery_at_ms`]).
+    pub fn time_until_recovery(&self) -> Option<Duration> {
+        let now = self.clock.now_ms();
+        self.next_recovery_at_ms()
+            .map(|at| Duration::from_millis(at.saturating_sub(now).max(0) as u64))
+    }
+
     /// True when at least one cooling (non-removed) credential will recover
     /// within `within`. Used by the LLM caller to *defer* provider fallback on
     /// a transient 429/402 when a sibling key is about to come back — jumping

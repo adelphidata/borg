@@ -243,6 +243,9 @@ fn message_from_row(row: &MessageRow) -> Option<Message> {
         // The working set carries its log position so compaction can record an
         // exact checkpoint range and any reader can map back to the log.
         seq: Some(row.id),
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     })
 }
 
@@ -420,6 +423,9 @@ mod tests {
                 tool_call_id: None,
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             }),
             hmac: None,
             prev_hmac: None,
@@ -558,6 +564,9 @@ mod tests {
                 tool_call_id: row.tool_call_id.clone(),
                 timestamp: row.timestamp.clone(),
                 seq: Some(row.id),
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             });
         }
         messages

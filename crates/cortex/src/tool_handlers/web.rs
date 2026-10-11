@@ -189,7 +189,7 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
             // Cache unavailable — degrade to a live fetch rather than failing the tool.
             tracing::warn!(error = %e, "web_search cache unavailable, falling back to live");
             return match web::web_search(query, &config.web).await {
-                Ok(r) => Ok(scan_and_wrap("web_search", &r)),
+                Ok(r) => Ok(scan_and_wrap("web_search", &r.text)),
                 Err(e) => Ok(format!("Error searching: {e}")),
             };
         }
@@ -205,26 +205,54 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
 
     match decision {
         CacheDecision::Serve(body) => Ok(scan_and_wrap("web_search", &body)),
-        CacheDecision::CallLive => match web::web_search(query, &config.web).await {
-            Ok(body) => {
-                // Cache the raw body so the trust wrapper is applied once, at
-                // read time, and never accumulates across cache round-trips.
-                match Database::open().await {
-                    Ok(db2) => {
-                        if let Err(e) = cache_store(&db2, &provider, &hash, query, &body, now).await
-                        {
-                            tracing::warn!(error = %e, "web_search cache write failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "web_search cache reopen failed; result not cached");
-                    }
+        CacheDecision::CallLive => {
+            let env = |var: &str| std::env::var(var).ok();
+            let live =
+                web::web_search_with(query, &config.web, &web::SearchEndpoints::default(), &env)
+                    .await;
+            // Cache the raw body so the trust wrapper is applied once, at
+            // read time, and never accumulates across cache round-trips.
+            let db2 = match Database::open().await {
+                Ok(db2) => Some(db2),
+                Err(e) => {
+                    tracing::warn!(error = %e, "web_search cache reopen failed; result not cached");
+                    None
                 }
-                Ok(scan_and_wrap("web_search", &body))
-            }
-            Err(e) => Ok(format!("Error searching: {e}")),
-        },
+            };
+            Ok(finish_live_search(db2.as_ref(), live, &provider, &hash, query, now).await)
+        }
     }
+}
+
+/// Turn a live search outcome into the tool's reply, caching the raw body
+/// only when it carried results. An error or an empty page is never
+/// cached: a provider challenge or a transient blank would otherwise be
+/// served as "no results" for the whole TTL. A fallback result is not
+/// cached either: it is keyed by the primary provider and carries the
+/// "[fallback: …]" label, so the primary's next hour of answers would come
+/// from DuckDuckGo long after the primary recovered.
+async fn finish_live_search(
+    db: Option<&Database>,
+    live: Result<web::SearchOutcome>,
+    provider: &str,
+    hash: &str,
+    query: &str,
+    now: i64,
+) -> String {
+    let outcome = match live {
+        Ok(outcome) => outcome,
+        Err(e) => return format!("Error searching: {e:#}"),
+    };
+    if outcome.is_empty() {
+        tracing::debug!(provider, "web_search returned no results; not cached");
+    } else if let Some(from) = &outcome.fallback_from {
+        tracing::debug!(provider, fallback_from = %from, "web_search fallback result; not cached");
+    } else if let Some(db) = db {
+        if let Err(e) = cache_store(db, provider, hash, query, &outcome.text, now).await {
+            tracing::warn!(error = %e, "web_search cache write failed");
+        }
+    }
+    scan_and_wrap("web_search", &outcome.text)
 }
 
 #[cfg(test)]
@@ -470,6 +498,139 @@ mod tests {
         assert_eq!(row.body, "v2");
         assert_eq!(row.fetched_at, 2000);
         assert_eq!(db.web_search_cache_count().await.unwrap(), 1);
+    }
+
+    fn outcome(text: &str, result_count: usize) -> web::SearchOutcome {
+        web::SearchOutcome {
+            text: text.to_string(),
+            result_count,
+            fallback_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_search_caches_only_bodies_that_carry_results() {
+        let db = Database::test_db().await;
+        let hash = crate::db::web_search_cache::hash_query("q");
+
+        // A provider failure (e.g. DuckDuckGo 403) is reported, not cached.
+        let reply = finish_live_search(
+            Some(&db),
+            Err(anyhow::anyhow!(
+                "DuckDuckGo returned HTTP 403 Forbidden: blocked"
+            )),
+            "duckduckgo",
+            &hash,
+            "q",
+            1000,
+        )
+        .await;
+        assert!(reply.contains("HTTP 403"), "got: {reply}");
+        assert!(
+            db.web_search_cache_get("duckduckgo", &hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "an error must leave no cache row"
+        );
+
+        // An empty page is served but not cached either.
+        let reply = finish_live_search(
+            Some(&db),
+            Ok(outcome("No search results found for: q", 0)),
+            "duckduckgo",
+            &hash,
+            "q",
+            1000,
+        )
+        .await;
+        assert!(reply.contains("No search results found"), "got: {reply}");
+        assert_eq!(db.web_search_cache_count().await.unwrap(), 0);
+
+        // A fallback answer is served but never cached under the primary
+        // provider: the next call must try the primary again.
+        let fallback = web::SearchOutcome {
+            fallback_from: Some("Tavily returned HTTP 429".to_string()),
+            ..outcome("1. Beta\n   URL: https://b\n   snippet", 1)
+        };
+        let reply = finish_live_search(Some(&db), Ok(fallback), "tavily", &hash, "q", 1000).await;
+        assert!(reply.contains("Beta"), "got: {reply}");
+        assert_eq!(
+            db.web_search_cache_count().await.unwrap(),
+            0,
+            "a fallback result must leave no cache row"
+        );
+
+        // Real results are cached raw (no trust wrapper in the stored body).
+        let reply = finish_live_search(
+            Some(&db),
+            Ok(outcome("1. Alpha\n   URL: https://a\n   snippet", 1)),
+            "duckduckgo",
+            &hash,
+            "q",
+            1000,
+        )
+        .await;
+        assert!(reply.contains("Alpha"), "got: {reply}");
+        let row = db
+            .web_search_cache_get("duckduckgo", &hash)
+            .await
+            .unwrap()
+            .expect("results are cached");
+        assert_eq!(row.body, "1. Alpha\n   URL: https://a\n   snippet");
+        assert_eq!(row.fetched_at, 1000);
+    }
+
+    /// Tavily rate-limits, DuckDuckGo answers: the reply carries the
+    /// fallback label, and nothing is cached under the Tavily key — a cached
+    /// fallback would serve DuckDuckGo results, label and all, for the whole
+    /// TTL after Tavily recovered.
+    #[tokio::test]
+    async fn a_fallback_result_is_served_but_never_cached() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tavily/search"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<html><body><div class="result">
+                   <a class="result__a" href="https://example.org/a">Alpha page</a>
+                   <div class="result__snippet">first snippet</div></div></body></html>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoints = web::SearchEndpoints {
+            duckduckgo: format!("{}/html/", server.uri()),
+            tavily: format!("{}/tavily/search", server.uri()),
+            serper: format!("{}/serper/search", server.uri()),
+            brave: format!("{}/brave/search", server.uri()),
+        };
+        let mut config = Config::default();
+        config.web.search_provider = "auto".into();
+        let tavily_key = |var: &str| (var == "TAVILY_API_KEY").then(|| "tvly-test".to_string());
+
+        let live = web::web_search_with("rust", &config.web, &endpoints, &tavily_key).await;
+        let db = Database::test_db().await;
+        let hash = crate::db::web_search_cache::hash_query("rust");
+        let reply = finish_live_search(Some(&db), live, "tavily", &hash, "rust", 1000).await;
+
+        assert!(
+            reply.contains("[fallback: Tavily returned HTTP 429"),
+            "got: {reply}"
+        );
+        assert!(reply.contains("Alpha page"), "got: {reply}");
+        assert_eq!(
+            db.web_search_cache_count().await.unwrap(),
+            0,
+            "a fallback result must not be cached under the primary provider"
+        );
     }
 
     #[tokio::test]

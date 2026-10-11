@@ -209,8 +209,28 @@ pub fn invalidate_provider_cache() {
 }
 
 /// Generate an embedding vector via OpenAI-compatible API.
+///
+/// The input is redacted before it leaves the machine; see
+/// [`generate_embedding_redacted`] for the raw seam shared with the cached path.
 #[instrument(skip_all)]
 pub async fn generate_embedding(
+    client: &reqwest::Client,
+    provider: &EmbeddingProvider,
+    text: &str,
+) -> Result<Vec<f32>> {
+    // Third-party egress: a pasted key in a memory file or a session
+    // transcript must never reach the embedding endpoint. Unconditional —
+    // not gated on the local `secret_detection` setting.
+    let text = crate::security::secrets::redact_secrets(text);
+    generate_embedding_redacted(client, provider, &text).await
+}
+
+/// Send already-redacted `text` to the embedding endpoint.
+///
+/// Private on purpose: every public entry point redacts exactly once and
+/// then lands here, so the cached path never redacts twice and no caller
+/// can reach the wire with raw text.
+async fn generate_embedding_redacted(
     client: &reqwest::Client,
     provider: &EmbeddingProvider,
     text: &str,
@@ -328,6 +348,9 @@ pub async fn generate_embedding_cached(
     provider: &EmbeddingProvider,
     text: &str,
 ) -> Result<Vec<f32>> {
+    // Key the cache on the redacted text: that is the input the endpoint
+    // actually embeds, and it keeps the raw secret out of the cache row.
+    let text = &crate::security::secrets::redact_secrets(text);
     let hash = content_hash(text);
     let db = match Database::open().await {
         Ok(db) => Some(db),
@@ -356,7 +379,9 @@ pub async fn generate_embedding_cached(
         }
     }
 
-    let embedding = generate_embedding(client, provider, text).await?;
+    // `text` is already redacted above (the cache key depends on it), so
+    // skip the public wrapper's second pass.
+    let embedding = generate_embedding_redacted(client, provider, text).await?;
 
     if let Some(ref db) = db {
         let bytes = embedding_to_bytes(&embedding);

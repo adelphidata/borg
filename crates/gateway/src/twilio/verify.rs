@@ -43,8 +43,8 @@ pub fn verify_twilio_signature(
 pub fn compute_signature(url: &str, body: &str, auth_token: &str) -> Result<String> {
     // Empty auth token is a misconfiguration: a signature computed under `""`
     // would silently verify any inbound request. Refuse outright.
-    if auth_token.is_empty() {
-        anyhow::bail!("Twilio auth token is empty — refusing to compute signature");
+    if auth_token.trim().is_empty() {
+        anyhow::bail!("Twilio auth token is blank — refusing to compute signature");
     }
     let mut data_string = url.to_string();
 
@@ -185,18 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_auth_token_refuses() {
-        // Regression: empty auth token must not produce a usable signature
+    fn empty_or_blank_auth_token_refuses() {
+        // Regression: an empty auth token must not produce a usable signature
         // — otherwise inbound requests verify under the operator's missing
-        // config.
-        let err = compute_signature("https://example.com/wh", "Body=Hi", "").unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("empty"));
+        // config. A whitespace-only token is the same misconfiguration.
+        for token in ["", "   ", "\t\n"] {
+            let err = compute_signature("https://example.com/wh", "Body=Hi", token)
+                .expect_err("blank token must refuse");
+            assert!(
+                err.to_string().to_lowercase().contains("blank"),
+                "token {token:?}: {err}"
+            );
 
-        // And verification refuses too, regardless of what header arrives.
-        let mut headers = HeaderMap::new();
-        headers.insert("x-twilio-signature", HeaderValue::from_static("anything"));
-        assert!(
-            verify_twilio_signature(&headers, "https://example.com/wh", "Body=Hi", "").is_err()
-        );
+            // And verification refuses too, regardless of what header arrives.
+            let mut headers = HeaderMap::new();
+            headers.insert("x-twilio-signature", HeaderValue::from_static("anything"));
+            assert!(
+                verify_twilio_signature(&headers, "https://example.com/wh", "Body=Hi", token)
+                    .is_err(),
+                "token {token:?}"
+            );
+        }
     }
 }

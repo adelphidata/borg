@@ -234,6 +234,61 @@ mod tests {
         assert!(transcript.trim().is_empty());
     }
 
+    /// A session transcript is embedded by a third-party endpoint. A key the
+    /// user pasted into a turn must be redacted before the request leaves
+    /// the machine; the mock records the bytes actually sent.
+    #[tokio::test]
+    async fn transcript_embedding_request_redacts_pasted_secret() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": [0.1, 0.2, 0.3] }]
+            })))
+            .mount(&server)
+            .await;
+
+        let aws_key = "AKIAIOSFODNN7EXAMPLE";
+        let messages = vec![
+            make_message("user", &format!("my access key is {aws_key}, why 403?")),
+            make_message("assistant", "Check the bucket policy."),
+        ];
+        let transcript = build_transcript(&messages);
+        assert!(
+            transcript.contains(aws_key),
+            "the local transcript itself is not the egress boundary"
+        );
+
+        let provider = crate::memory::embeddings::EmbeddingProvider {
+            endpoint: format!("{}/v1/embeddings", server.uri()),
+            api_key: "k".into(),
+            model: "text-embedding-3-small".into(),
+            dimension: 3,
+            provider_tag: "openai".into(),
+        };
+        let client = reqwest::Client::new();
+        let embedding =
+            crate::memory::embeddings::generate_embedding(&client, &provider, &transcript)
+                .await
+                .expect("embedding call must succeed");
+        assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
+
+        let requests = server.received_requests().await.expect("recording enabled");
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body).into_owned();
+        assert!(
+            !body.contains(aws_key) && body.contains("[REDACTED"),
+            "embedding request must carry the marker, not the key: {body}"
+        );
+        assert!(
+            body.contains("why 403?") && body.contains("Check the bucket policy."),
+            "non-secret transcript text must survive: {body}"
+        );
+    }
+
     #[cfg(feature = "phase9-tests-disabled")]
     #[test]
     fn get_unindexed_sessions_works() {}

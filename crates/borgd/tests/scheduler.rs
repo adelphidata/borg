@@ -75,6 +75,7 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
         deliver_celebration: Arc::new(|cfg, c| {
             Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
         }),
+        shutdown_process: Arc::new(|| {}),
     };
     let cfg = Config::default();
     let shutdown_for_run = shutdown.clone();
@@ -165,6 +166,7 @@ async fn emergency_pause_defers_dispatch_and_resume_restores_it() {
         deliver_celebration: Arc::new(|cfg, c| {
             Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
         }),
+        shutdown_process: Arc::new(|| {}),
     };
 
     // Phase 1: paused. The dispatcher's first tick fires immediately; give it

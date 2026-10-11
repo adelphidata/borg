@@ -548,7 +548,9 @@ async fn server_output_with_api_key_is_redacted() {
     let out = mcp_clients::try_execute_tool("mcp_r_search", &json!({}))
         .await
         .expect("call ok")
-        .expect("got output");
+        .expect("got output")
+        .text()
+        .to_string();
 
     assert!(
         out.contains("[REDACTED"),
@@ -600,7 +602,9 @@ async fn prompt_injection_payload_is_wrapped_with_warning() {
     let out = mcp_clients::try_execute_tool("mcp_p_evil", &json!({}))
         .await
         .expect("call ok")
-        .expect("got output");
+        .expect("got output")
+        .text()
+        .to_string();
 
     assert!(
         out.contains("trust=\"untrusted\""),
@@ -821,7 +825,9 @@ async fn boundary_breakout_in_payload_is_escaped() {
     let out = mcp_clients::try_execute_tool("mcp_b_ok", &json!({}))
         .await
         .expect("call ok")
-        .expect("got output");
+        .expect("got output")
+        .text()
+        .to_string();
 
     // Exactly one literal `</mcp_tool_result>` — the trailing wrapper
     // close. The injected one in the payload must be escaped.
@@ -971,7 +977,9 @@ async fn clean_tool_output_wraps_with_server_and_tool_attributes() {
     let out = mcp_clients::try_execute_tool("mcp_w_echo", &json!({}))
         .await
         .expect("call ok")
-        .expect("got output");
+        .expect("got output")
+        .text()
+        .to_string();
 
     assert!(
         out.contains(r#"server="w""#),
@@ -1078,7 +1086,9 @@ async fn tools_list_changed_refreshes_registry_without_reconnect() {
             let out = mcp_clients::try_execute_tool("mcp_rs_b", &json!({}))
                 .await
                 .expect("b call ok")
-                .expect("got body");
+                .expect("got body")
+                .text()
+                .to_string();
             assert!(out.contains("called b"), "{out}");
             return;
         }
@@ -1279,7 +1289,9 @@ async fn reload_keeps_unchanged_servers_alive() {
     let out = mcp_clients::try_execute_tool("mcp_stable_echo", &json!({}))
         .await
         .expect("call ok")
-        .expect("got body");
+        .expect("got body")
+        .text()
+        .to_string();
     assert!(
         out.contains("ok"),
         "unchanged server must remain dispatchable: {out}"
@@ -1919,7 +1931,9 @@ async fn response_truncation_kicks_in_above_max_response_bytes_cap() {
     let out = mcp_clients::try_execute_tool("mcp_s_blob", &json!({}))
         .await
         .expect("dispatch should succeed even when truncated")
-        .expect("non-MCP fallback path returned None");
+        .expect("non-MCP fallback path returned None")
+        .text()
+        .to_string();
 
     assert!(
         out.contains("[truncated]"),
@@ -2075,7 +2089,9 @@ async fn execute_emits_otel_event_with_outcome_label() {
     let _ = mcp_clients::try_execute_tool("mcp_metricsrv_ping", &json!({}))
         .await
         .expect("dispatch")
-        .expect("non-MCP fallback");
+        .expect("non-MCP fallback")
+        .text()
+        .to_string();
 
     let snap = events.snapshot();
     let new: Vec<_> = snap.iter().skip(before).cloned().collect();
@@ -2177,7 +2193,9 @@ async fn max_response_bytes_zero_falls_back_to_default_not_unbounded() {
     let out = mcp_clients::try_execute_tool("mcp_s_blob", &json!({}))
         .await
         .expect("dispatch")
-        .expect("non-MCP fallback");
+        .expect("non-MCP fallback")
+        .text()
+        .to_string();
 
     // Default cap is 1 MiB; the 2 MiB payload must be truncated.
     assert!(
@@ -2243,7 +2261,9 @@ async fn server_initiated_request_refusal_does_not_break_subsequent_dispatch() {
     let out = mcp_clients::try_execute_tool("mcp_s_echo", &json!({}))
         .await
         .expect("dispatch succeeded despite refused server request")
-        .expect("non-MCP fallback");
+        .expect("non-MCP fallback")
+        .text()
+        .to_string();
     assert!(
         out.contains("pong"),
         "tool result missing despite refusal; got: {out}",
@@ -2415,7 +2435,9 @@ async fn blind_call_missing_required_args_refused_before_dispatch() {
     let out = mcp_clients::try_execute_tool("mcp_fs_write", &json!({"path": "a.txt"}))
         .await
         .expect("probe refusal is Ok, not Err")
-        .expect("mcp tool must be handled");
+        .expect("mcp tool must be handled")
+        .text()
+        .to_string();
     assert_eq!(
         *dispatched.lock().unwrap(),
         0,
@@ -2442,7 +2464,9 @@ async fn blind_call_missing_required_args_refused_before_dispatch() {
         mcp_clients::try_execute_tool("mcp_fs_write", &json!({"path": "a.txt", "content": "hi"}))
             .await
             .expect("call ok")
-            .expect("got output");
+            .expect("got output")
+            .text()
+            .to_string();
     assert_eq!(
         *dispatched.lock().unwrap(),
         1,

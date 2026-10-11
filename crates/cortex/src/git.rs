@@ -1112,7 +1112,13 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         commit_args.push(parent);
     }
 
-    let commit_id = run_git(&commit_args, repo_root).await?;
+    // `commit-tree` needs an author. On a headless host with no gitconfig
+    // and no auto-detectable email, git refuses — and the turn would lose
+    // its undo point. Ghost commits are never pushed, so a synthetic
+    // identity is safe; the operator's real identity wins whenever git can
+    // resolve one.
+    let identity_env = ghost_identity_env(repo_root).await;
+    let commit_id = run_git_inner(&commit_args, repo_root, &identity_env).await?;
 
     Ok(GhostCommit {
         commit_id,
@@ -1120,6 +1126,27 @@ pub async fn create_ghost_commit(repo_root: &Path) -> Result<GhostCommit> {
         preexisting_untracked,
         uncaptured_nested_repos,
     })
+}
+
+/// Env that gives `commit-tree` an author when git cannot resolve one.
+/// Empty when `git var GIT_COMMITTER_IDENT` succeeds (config, env, or
+/// auto-detection), so a real identity is never overridden.
+async fn ghost_identity_env(repo_root: &Path) -> Vec<(String, String)> {
+    match run_git(&["var", "GIT_COMMITTER_IDENT"], repo_root).await {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::debug!("no git identity for ghost commit, using synthetic one: {e:#}");
+            [
+                ("GIT_AUTHOR_NAME", "borg"),
+                ("GIT_COMMITTER_NAME", "borg"),
+                ("GIT_AUTHOR_EMAIL", "borg@localhost"),
+                ("GIT_COMMITTER_EMAIL", "borg@localhost"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+        }
+    }
 }
 
 /// Restore working tree to match a ghost commit.
@@ -2262,6 +2289,63 @@ mod tests {
             !sentinel.exists(),
             "repo-configured clean filter must not execute during ghost snapshot"
         );
+    }
+
+    /// A repo with no resolvable identity (as on a headless host with an
+    /// empty HOME and no gitconfig) must still get its undo point: the
+    /// snapshot falls back to a synthetic author and the commit is a real
+    /// parent-linked object. The fixture blanks `user.*` in the repo-local
+    /// config, which outranks the developer's global identity and makes git
+    /// refuse ("empty ident name") without touching process-wide env.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_ghost_commit_without_git_identity_uses_synthetic_author() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("spawn git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["config", "user.email", ""]);
+        run(&["config", "user.name", ""]);
+        // Precondition: git itself cannot name an author here.
+        assert!(
+            run_git(&["var", "GIT_COMMITTER_IDENT"], dir).await.is_err(),
+            "fixture must leave git with no identity"
+        );
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+
+        let gc = create_ghost_commit(dir)
+            .await
+            .expect("snapshot must not depend on a configured git identity");
+        let author = run_git(&["log", "-1", "--format=%an <%ae>", &gc.commit_id], dir)
+            .await
+            .unwrap();
+        assert_eq!(author, "borg <borg@localhost>");
+        let head = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+        assert_eq!(gc.parent_id.as_deref(), Some(head.as_str()));
+    }
+
+    /// The synthetic identity is a fallback only: a configured `user.*`
+    /// still authors the snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_ghost_commit_keeps_configured_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo_with_commit(dir);
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        let gc = create_ghost_commit(dir).await.unwrap();
+        let author = run_git(&["log", "-1", "--format=%an <%ae>", &gc.commit_id], dir)
+            .await
+            .unwrap();
+        assert_eq!(author, "borg-test <t@borg.test>");
     }
 
     #[cfg(unix)]

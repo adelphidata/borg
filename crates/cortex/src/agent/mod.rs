@@ -384,6 +384,19 @@ pub struct Agent {
     /// Buffered regardless of `show_thinking` because the terminal excerpt is
     /// a fallback for a broken turn, not a thinking-trace feature.
     pub(super) turn_reasoning: String,
+    /// Signed Anthropic reasoning blocks of the current stream, verbatim, in
+    /// wire order. Attached to the assistant tool-call message so the next
+    /// request of the same tool loop can replay them. Scoped to one stream.
+    pub(super) turn_reasoning_blocks: Vec<serde_json::Value>,
+    /// Full `reasoning_content` of the current stream, uncapped (unlike
+    /// [`Self::turn_reasoning`], which keeps a display tail). Attached to
+    /// the assistant tool-call message for providers that require it
+    /// echoed. Scoped to one stream.
+    pub(super) turn_reasoning_content: String,
+    /// The model the current stream's usage record names: the model that
+    /// actually served it, after any failover. Tags the stored reasoning
+    /// so replay stays bound to the model that produced it.
+    pub(super) turn_reasoning_model: Option<String>,
     /// Provider signalled tool use for the current stream (`finish_reason ==
     /// "tool_calls"` / `stop_reason == "tool_use"`). Scoped to one iteration —
     /// cleared where the stream collectors re-bind. Lets the text-only path
@@ -597,6 +610,9 @@ impl Agent {
             expensive_tool_budget,
             unknown_tool_tracker,
             turn_reasoning: String::new(),
+            turn_reasoning_blocks: Vec::new(),
+            turn_reasoning_content: String::new(),
+            turn_reasoning_model: None,
             tool_intent_signalled: false,
             emitted_text_bytes: 0,
             nudged_for_dropped_tools: false,
@@ -1136,7 +1152,9 @@ impl Agent {
                         }
                         self.ghost_commit = Some(gc);
                     }
-                    Err(e) => tracing::debug!("Skipping ghost commit: {e}"),
+                    Err(e) => {
+                        tracing::warn!("Skipping ghost commit (no undo point for this turn): {e:#}")
+                    }
                 }
             }
         }
@@ -1451,6 +1469,9 @@ impl Agent {
             // must quote the thinking that led to *this* silence, not a
             // previous iteration's.
             self.turn_reasoning.clear();
+            self.turn_reasoning_blocks.clear();
+            self.turn_reasoning_content.clear();
+            self.turn_reasoning_model = None;
             // Tool intent is likewise per-stream: a prior iteration's signal
             // must not make this iteration's text-only answer look dropped.
             self.tool_intent_signalled = false;

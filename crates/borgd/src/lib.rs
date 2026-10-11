@@ -53,3 +53,18 @@ pub mod tick_lock;
 pub mod tunnel_supervisor;
 
 pub use error::{Error, Result};
+
+/// Serialises tests that mutate process-wide environment variables
+/// (`BORG_HOME`, channel tokens). One lock for the whole crate: two modules
+/// with private locks still race each other.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}

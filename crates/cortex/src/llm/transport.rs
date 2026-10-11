@@ -247,6 +247,81 @@ pub(crate) fn anthropic_thinking_off_block(model: &str) -> Option<serde_json::Va
     Some(serde_json::json!({"type": "disabled"}))
 }
 
+/// Claude families that still accept sampling parameters (`temperature`,
+/// `top_p`, `top_k`) on the Messages wire. Every other Claude family answers
+/// HTTP 400 to a non-default value, so the body omits them there.
+const SAMPLING_OK_CLAUDE: &[&str] = &[
+    "claude-opus-4-6",
+    "claude-opus-4.6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4.6",
+];
+
+/// True when `model` is a Claude family that rejects `temperature`, `top_p`
+/// and `top_k` regardless of thinking mode: everything except the 4.6
+/// family and the legacy manual-thinking list. Unknown Claude ids forbid
+/// sampling too — a dropped knob only costs determinism, a sent one kills
+/// the turn with a 400. Non-Claude models are never affected.
+pub(crate) fn claude_forbids_sampling(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if !m.contains("claude") {
+        return false;
+    }
+    !(SAMPLING_OK_CLAUDE.iter().any(|v| m.contains(v))
+        || LEGACY_MANUAL_THINKING_CLAUDE.iter().any(|v| m.contains(v)))
+}
+
+/// The thinking-on fields for `model`: `(thinking, output_config)`.
+///
+/// Current Claude families take adaptive thinking (`display: "summarized"`
+/// so the reasoning still streams as readable text) plus
+/// `output_config.effort`; legacy manual-thinking families keep
+/// `enabled` + `budget_tokens`. Haiku up to 4.5 never takes a thinking
+/// field at all, so its body is the plain non-thinking shape. Returns
+/// `None` when `level` is off or the model has no thinking contract.
+pub(crate) fn anthropic_thinking_on_fields(
+    model: &str,
+    level: &crate::config::ThinkingLevel,
+) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
+    let m = model.to_ascii_lowercase();
+    if LEGACY_MANUAL_THINKING_CLAUDE.iter().any(|v| m.contains(v)) {
+        // Every Haiku on the legacy list has no thinking at all: 4.5
+        // (`claude-haiku-4-5`) and the 3.x generation (`claude-3-5-haiku-…`,
+        // `claude-3-haiku-…`), whose ids carry the version first. Haiku 5.5+
+        // is not on the list and takes adaptive thinking below.
+        if m.contains("haiku") {
+            return None;
+        }
+        let budget = level.anthropic_budget_tokens()?;
+        return Some((
+            serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+            None,
+        ));
+    }
+    let effort = level.anthropic_adaptive_effort(model)?;
+    Some((
+        serde_json::json!({"type": "adaptive", "display": "summarized"}),
+        Some(serde_json::json!({"effort": effort})),
+    ))
+}
+
+/// The model that stored Anthropic reasoning blocks may be replayed to for
+/// this request, or `None` when the route is not a native Anthropic wire.
+/// Native routes are the first-party API, the Claude Code OAuth flavor of
+/// it, and Vertex; an operator `base_url` means a third-party endpoint.
+fn anthropic_reasoning_replay_model<'a>(request: &TransportRequest<'a>) -> Option<&'a str> {
+    let native = matches!(
+        request.provider,
+        Provider::Anthropic | Provider::ClaudeCodeOAuth | Provider::VertexAi
+    );
+    let custom_endpoint = request
+        .llm_config
+        .base_url
+        .as_deref()
+        .is_some_and(|u| !u.is_empty());
+    (native && !custom_endpoint).then_some(request.model)
+}
+
 pub(crate) fn build_anthropic_request(
     request: &TransportRequest<'_>,
     stream: bool,
@@ -265,7 +340,11 @@ pub(crate) fn build_anthropic_request(
     // to be restored here. `repair_message_sequence` renames the later
     // occurrence and its paired result rather than dropping either.
     let repaired = repair_message_sequence(request.messages);
-    let anthropic_messages = build_anthropic_messages(&repaired);
+    // Signed reasoning replays only on a native Anthropic route (first-party,
+    // OAuth, Vertex) to the model that signed it. A custom `base_url` is a
+    // third-party endpoint: it gets no reasoning blocks at all.
+    let replay_model = anthropic_reasoning_replay_model(request);
+    let anthropic_messages = build_anthropic_messages(&repaired, replay_model);
     let anthropic_tools: Option<Vec<serde_json::Value>> = request.tools.map(|ts| {
         ts.iter()
             .map(|t| {
@@ -284,32 +363,52 @@ pub(crate) fn build_anthropic_request(
     let (cache_system_eff, cache_tools_eff, rolling_eff) = cache_cfg.effective_layout();
 
     let effective_thinking = request.llm_config.effective_thinking(request.model);
-    let mut body = if let Some(budget) = effective_thinking.anthropic_budget_tokens() {
-        let max_tokens = request.llm_config.max_tokens.max(budget + 1024);
-        serde_json::json!({
-            "model": request.model,
-            "max_tokens": max_tokens,
-            "stream": stream,
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": budget
+    let mut body = match anthropic_thinking_on_fields(request.model, &effective_thinking) {
+        Some((thinking, output_config)) => {
+            // Legacy manual thinking must leave room for the budget on top
+            // of the answer; adaptive thinking has no budget to reserve.
+            let max_tokens = match thinking
+                .get("budget_tokens")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(budget) => request.llm_config.max_tokens.max(budget as u32 + 1024),
+                None => request.llm_config.max_tokens,
+            };
+            let mut on_body = serde_json::json!({
+                "model": request.model,
+                "max_tokens": max_tokens,
+                "stream": stream,
+                "thinking": thinking,
+            });
+            if let Some(output_config) = output_config {
+                on_body["output_config"] = output_config;
             }
-        })
-    } else {
-        let mut off_body = serde_json::json!({
-            "model": request.model,
-            "max_tokens": request.llm_config.max_tokens,
-            "temperature": request.llm_config.temperature,
-            "stream": stream,
-        });
-        // Thinking is off. Modern Claude models think by default, so the
-        // off state must be explicit, in the form each family documents;
-        // families that reject every off form keep the omission (a
-        // silently-ignored disable beats a dead turn).
-        if let Some(off) = anthropic_thinking_off_block(request.model) {
-            off_body["thinking"] = off;
+            on_body
         }
-        off_body
+        None => {
+            let mut off_body = serde_json::json!({
+                "model": request.model,
+                "max_tokens": request.llm_config.max_tokens,
+                "stream": stream,
+            });
+            // The operator's temperature travels only where the family still
+            // accepts sampling parameters; elsewhere it is a 400.
+            if !claude_forbids_sampling(request.model) {
+                off_body["temperature"] = serde_json::json!(request.llm_config.temperature);
+            }
+            // Thinking is off (or the family has no thinking contract at
+            // all, like Haiku up to 4.5, whose body is this plain shape).
+            // Modern Claude models think by default, so a real "off" must
+            // be explicit, in the form each family documents; families that
+            // reject every off form keep the omission (a silently-ignored
+            // disable beats a dead turn).
+            if !effective_thinking.is_enabled() {
+                if let Some(off) = anthropic_thinking_off_block(request.model) {
+                    off_body["thinking"] = off;
+                }
+            }
+            off_body
+        }
     };
 
     if let Some(sys) = system_text {
@@ -446,6 +545,11 @@ pub(crate) fn parse_openai_sse_line(
             if let Some(choices) = chunk.choices {
                 for choice in choices {
                     if let Some(delta) = choice.delta {
+                        if let Some(reasoning) = delta.reasoning_content {
+                            if !reasoning.is_empty() {
+                                events.push(StreamEvent::ThinkingDelta(reasoning));
+                            }
+                        }
                         if let Some(content) = delta.content {
                             events.push(StreamEvent::TextDelta(content));
                         }
@@ -498,6 +602,30 @@ pub(crate) fn parse_openai_sse_line(
     }
 }
 
+/// The reasoning block the Anthropic stream is in the middle of. A
+/// `thinking` block arrives as `thinking_delta` text followed by one
+/// `signature_delta`; a `redacted_thinking` block arrives whole on its
+/// `content_block_start`. Either is emitted as one
+/// [`StreamEvent::ReasoningBlock`] at `content_block_stop`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PendingReasoningBlock {
+    Thinking { text: String, signature: String },
+    Redacted(serde_json::Value),
+}
+
+impl PendingReasoningBlock {
+    fn into_block(self) -> serde_json::Value {
+        match self {
+            Self::Thinking { text, signature } => serde_json::json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": signature,
+            }),
+            Self::Redacted(block) => block,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_anthropic_sse_line(
     line: &str,
@@ -510,6 +638,7 @@ pub(crate) fn parse_anthropic_sse_line(
     pending_cached_input_tokens: &mut u64,
     pending_cache_creation_tokens: &mut u64,
     pending_response_id: &mut Option<String>,
+    pending_reasoning: &mut Option<PendingReasoningBlock>,
 ) -> crate::sse::SseAction {
     use crate::sse::SseAction;
 
@@ -547,6 +676,7 @@ pub(crate) fn parse_anthropic_sse_line(
             let block_type = block["type"].as_str().unwrap_or("");
             *current_block_is_tool = false;
             *current_block_is_thinking = false;
+            *pending_reasoning = None;
             match block_type {
                 "tool_use" => {
                     *current_block_is_tool = true;
@@ -561,6 +691,15 @@ pub(crate) fn parse_anthropic_sse_line(
                 }
                 "thinking" => {
                     *current_block_is_thinking = true;
+                    *pending_reasoning = Some(PendingReasoningBlock::Thinking {
+                        text: block["thinking"].as_str().unwrap_or("").to_string(),
+                        signature: block["signature"].as_str().unwrap_or("").to_string(),
+                    });
+                    SseAction::Continue
+                }
+                "redacted_thinking" => {
+                    // Opaque and signed: kept whole so it replays verbatim.
+                    *pending_reasoning = Some(PendingReasoningBlock::Redacted(block.clone()));
                     SseAction::Continue
                 }
                 _ => SseAction::Continue,
@@ -578,10 +717,23 @@ pub(crate) fn parse_anthropic_sse_line(
                 }
                 Some("thinking_delta") => {
                     if let Some(text) = delta["thinking"].as_str() {
+                        if let Some(PendingReasoningBlock::Thinking { text: acc, .. }) =
+                            pending_reasoning
+                        {
+                            acc.push_str(text);
+                        }
                         SseAction::Emit(vec![StreamEvent::ThinkingDelta(text.to_string())])
                     } else {
                         SseAction::Continue
                     }
+                }
+                Some("signature_delta") => {
+                    if let (Some(sig), Some(PendingReasoningBlock::Thinking { signature, .. })) =
+                        (delta["signature"].as_str(), pending_reasoning)
+                    {
+                        signature.push_str(sig);
+                    }
+                    SseAction::Continue
                 }
                 Some("input_json_delta") => {
                     if let Some(json_delta) = delta["partial_json"].as_str() {
@@ -611,7 +763,12 @@ pub(crate) fn parse_anthropic_sse_line(
             if *current_block_is_tool {
                 *current_tool_index += 1;
             }
-            SseAction::Continue
+            match pending_reasoning.take() {
+                Some(block) => {
+                    SseAction::Emit(vec![StreamEvent::ReasoningBlock(block.into_block())])
+                }
+                None => SseAction::Continue,
+            }
         }
         "message_stop" => SseAction::Done(vec![StreamEvent::Done]),
         "message_delta" => {
@@ -688,6 +845,8 @@ pub(crate) struct AnthropicStreamState {
     /// `message.id` from `message_start`, carried onto the usage record that
     /// `message_delta` emits so the per-call log can name the response.
     pending_response_id: Option<String>,
+    /// The reasoning block currently being streamed, if any.
+    pending_reasoning: Option<PendingReasoningBlock>,
     /// Set when `message_stop`, or a `message_delta` with a stop reason,
     /// ended the response.
     completed: bool,
@@ -921,6 +1080,7 @@ impl Transport for AnthropicTransport {
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
             &mut state.pending_response_id,
+            &mut state.pending_reasoning,
         );
         note_completion(action, &mut state.completed)
     }
@@ -931,7 +1091,10 @@ impl Transport for AnthropicTransport {
         provider: &str,
         model: &str,
     ) -> Result<TransportResponse> {
-        let message = parse_anthropic_response(&response)?;
+        let mut message = parse_anthropic_response(&response)?;
+        if message.reasoning_blocks.is_some() {
+            message.reasoning_model = Some(model.to_string());
+        }
         let usage = response["usage"].as_object().map(|usage| {
             let usage_value = serde_json::Value::Object(usage.clone());
             let (cached_input_tokens, cache_creation_tokens) = normalize_cache_tokens(&usage_value);
@@ -1102,6 +1265,7 @@ impl Transport for VertexAnthropicTransport {
             &mut state.pending_cached_input_tokens,
             &mut state.pending_cache_creation_tokens,
             &mut state.pending_response_id,
+            &mut state.pending_reasoning,
         );
         note_completion(action, &mut state.completed)
     }
@@ -1114,6 +1278,63 @@ impl Transport for VertexAnthropicTransport {
     ) -> Result<TransportResponse> {
         ANTHROPIC_TRANSPORT.parse_chat_response(response, provider, model)
     }
+}
+
+/// True when the OpenAI-compatible provider behind `request` requires
+/// `reasoning_content` echoed on assistant tool-call messages. See
+/// [`provider_echoes_reasoning`].
+fn openai_wire_echoes_reasoning(request: &TransportRequest<'_>) -> bool {
+    provider_echoes_reasoning(request.provider, request.llm_config.base_url.as_deref())
+}
+
+/// True when `provider` (at `base_url`, when one is set) requires the
+/// `reasoning_content` of an assistant tool-call turn echoed on the next
+/// request: DeepSeek, Kimi/Moonshot and Ollama (cloud). Every other
+/// provider rejects or ignores the field, so it is neither sent there nor
+/// kept for it. The agent uses the same predicate to decide whether a
+/// stream's thinking text is stored on the turn at all.
+pub(crate) fn provider_echoes_reasoning(provider: Provider, base_url: Option<&str>) -> bool {
+    if matches!(provider, Provider::DeepSeek | Provider::Ollama) {
+        return true;
+    }
+    // A custom endpoint that is one of those vendors' own hosts. Only the
+    // host is consulted: a corporate gateway at `gw.corp/kimi/v1` is not
+    // Kimi. The model id is deliberately not consulted either: a DeepSeek
+    // model reached through an OpenAI-compatible router does not take the
+    // field.
+    let Some(host) = base_url
+        .and_then(|url| url::Url::parse(url.trim()).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    ["deepseek", "moonshot", "kimi"]
+        .iter()
+        .any(|needle| host.contains(needle))
+}
+
+/// Strip stored reasoning from messages bound for the OpenAI-compatible
+/// wire. Anthropic reasoning blocks and the producing-model tag never leave
+/// the process on this wire; `reasoning_content` stays only on assistant
+/// tool-call turns, only for providers that require the echo, and only when
+/// the model that produced it is the model this request goes to.
+fn scrub_reasoning_for_openai_wire(
+    mut messages: Vec<Message>,
+    request: &TransportRequest<'_>,
+) -> Vec<Message> {
+    let echo = openai_wire_echoes_reasoning(request);
+    for m in &mut messages {
+        let keep_content = echo
+            && m.role == Role::Assistant
+            && m.tool_calls.is_some()
+            && m.reasoning_model.as_deref() == Some(request.model);
+        if !keep_content {
+            m.reasoning_content = None;
+        }
+        m.reasoning_blocks = None;
+        m.reasoning_model = None;
+    }
+    messages
 }
 
 pub(crate) fn build_openai_request(
@@ -1148,7 +1369,10 @@ pub(crate) fn build_openai_request(
         // non-streaming paths need this: non-streaming carries summarization,
         // title generation, and aux-model calls, and a resumed session with a
         // stub message would otherwise 400 exactly when it tries to compact.
-        messages: repair_message_sequence(&sanitize_openai_messages(request.messages)),
+        messages: scrub_reasoning_for_openai_wire(
+            repair_message_sequence(&sanitize_openai_messages(request.messages)),
+            request,
+        ),
         tools,
         temperature: request.llm_config.temperature,
         // Gemini bills thought tokens against the output cap on this wire too,
@@ -1385,10 +1609,14 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "messages": bedrock_messages,
         "inferenceConfig": {
-            "temperature": request.llm_config.temperature,
             "maxTokens": request.llm_config.max_tokens,
         },
     });
+    // Converse forwards `temperature` to the model; current Claude families
+    // reject it there just as on the native wire.
+    if !claude_forbids_sampling(request.model) {
+        body["inferenceConfig"]["temperature"] = serde_json::json!(request.llm_config.temperature);
+    }
     if !system_blocks.is_empty() {
         body["system"] = serde_json::json!(system_blocks);
     }
@@ -1736,6 +1964,9 @@ fn parse_bedrock_message(message_json: &serde_json::Value) -> Result<Message> {
         tool_call_id: None,
         timestamp: None,
         seq: None,
+        reasoning_blocks: None,
+        reasoning_content: None,
+        reasoning_model: None,
     })
 }
 
@@ -1857,6 +2088,578 @@ mod tests {
         }
     }
 
+    fn anthropic_request_for<'a>(
+        model: &'a str,
+        messages: &'a [Message],
+        cfg: &'a LlmConfig,
+    ) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::Anthropic,
+            model,
+            messages,
+            tools: None,
+            llm_config: cfg,
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        }
+    }
+
+    /// Thinking on must be adaptive + `output_config.effort` on current
+    /// Claude families: `budget_tokens` answers HTTP 400 there, and the
+    /// old budget+1024 `max_tokens` bump has nothing to reserve. The 4.6
+    /// family lacks `xhigh`, so Xhigh rounds up to `max` rather than 400.
+    #[test]
+    fn anthropic_thinking_on_sends_adaptive_effort_on_current_families() {
+        use crate::config::ThinkingLevel;
+        let cases = [
+            ("claude-opus-4-7", ThinkingLevel::High, "high"),
+            ("claude-sonnet-5-5", ThinkingLevel::High, "high"),
+            ("claude-haiku-5-5", ThinkingLevel::High, "high"),
+            ("claude-opus-4-7", ThinkingLevel::Xhigh, "xhigh"),
+            ("claude-sonnet-4-6", ThinkingLevel::Xhigh, "max"),
+            ("claude-opus-4.6", ThinkingLevel::Xhigh, "max"),
+            ("claude-fable-5-1", ThinkingLevel::Max, "max"),
+            ("claude-opus-5-5", ThinkingLevel::Adaptive, "medium"),
+            ("claude-sonnet-5", ThinkingLevel::Minimal, "low"),
+            ("claude-opus-5", ThinkingLevel::Low, "low"),
+        ];
+        for (model, level, effort) in cases {
+            let mut cfg = LlmConfig::default();
+            cfg.thinking = level;
+            cfg.thinking_overrides.clear();
+            cfg.max_tokens = 2048;
+            let messages = vec![Message::user("hi")];
+            let body =
+                build_anthropic_request(&anthropic_request_for(model, &messages, &cfg), false);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "summarized"}),
+                "{model}: wrong thinking-on form"
+            );
+            assert_eq!(
+                body["output_config"]["effort"], effort,
+                "{model}: wrong effort for {:?}",
+                cfg.thinking
+            );
+            assert_eq!(
+                body["max_tokens"], 2048,
+                "{model}: adaptive thinking must not bump max_tokens"
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "{model}: temperature must not travel with adaptive thinking"
+            );
+        }
+    }
+
+    /// Legacy manual-thinking families keep `enabled` + `budget_tokens`
+    /// with `max_tokens` raised to fit the budget; Haiku up to 4.5 has no
+    /// thinking contract and must get the plain non-thinking body (no
+    /// `thinking`, no `output_config`, temperature still present).
+    #[test]
+    fn anthropic_thinking_on_keeps_budget_form_on_legacy_families() {
+        use crate::config::ThinkingLevel;
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = ThinkingLevel::High;
+        cfg.thinking_overrides.clear();
+        cfg.max_tokens = 2048;
+        let messages = vec![Message::user("hi")];
+
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "claude-3-7-sonnet-20250219",
+        ] {
+            let body =
+                build_anthropic_request(&anthropic_request_for(model, &messages, &cfg), false);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "enabled", "budget_tokens": 16384}),
+                "{model}: legacy family must keep the budget form"
+            );
+            assert!(
+                body.get("output_config").is_none(),
+                "{model}: no effort on legacy"
+            );
+            assert_eq!(
+                body["max_tokens"],
+                16384 + 1024,
+                "{model}: max_tokens must fit the budget"
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "{model}: budget thinking forces temperature 1"
+            );
+        }
+
+        // Haiku 4.5 and the 3.x Haiku generation (version before the family
+        // name in the id) have no thinking contract at all.
+        cfg.temperature = 0.3;
+        for model in [
+            "claude-haiku-4-5",
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307",
+        ] {
+            let body =
+                build_anthropic_request(&anthropic_request_for(model, &messages, &cfg), false);
+            assert!(
+                body.get("thinking").is_none(),
+                "{model}: haiku takes no thinking field"
+            );
+            assert!(body.get("output_config").is_none(), "{model}");
+            assert_eq!(body["max_tokens"], 2048, "{model}");
+            assert_eq!(
+                body["temperature"],
+                serde_json::json!(cfg.temperature),
+                "{model}"
+            );
+        }
+    }
+
+    /// With thinking off, `temperature` goes only to families that still
+    /// accept sampling parameters (4.6 and the legacy list); every other
+    /// Claude id — including ones Borg has never seen — drops it, since a
+    /// non-default value is a 400 there. Non-Claude models are untouched.
+    #[test]
+    fn anthropic_thinking_off_strips_sampling_on_current_families() {
+        let mut cfg = LlmConfig::default();
+        cfg.thinking = crate::config::ThinkingLevel::Off;
+        cfg.thinking_overrides.clear();
+        // Not the default: "keeps temperature" must mean the operator's
+        // value travels, not that a default happened to be present.
+        cfg.temperature = 0.2;
+        assert_ne!(cfg.temperature, LlmConfig::default().temperature);
+        let messages = vec![Message::user("hi")];
+        let cases = [
+            ("claude-opus-4-7", false),
+            ("claude-sonnet-5-5", false),
+            ("claude-haiku-5-5", false),
+            ("claude-opus-5-5", false),
+            ("claude-fable-5-1", false),
+            ("claude-nova-9", false),
+            ("claude-sonnet-4-6", true),
+            ("claude-opus-4-6", true),
+            ("claude-sonnet-4-5", true),
+            ("claude-haiku-4-5", true),
+            ("claude-3-7-sonnet-20250219", true),
+            ("minimax-m2", true),
+        ];
+        for (model, keeps_temperature) in cases {
+            let body =
+                build_anthropic_request(&anthropic_request_for(model, &messages, &cfg), false);
+            assert_eq!(
+                body.get("temperature"),
+                keeps_temperature
+                    .then(|| serde_json::json!(cfg.temperature))
+                    .as_ref(),
+                "{model}: temperature wrong; body: {body}"
+            );
+            for key in ["top_p", "top_k"] {
+                assert!(body.get(key).is_none(), "{model}: {key} must never be sent");
+            }
+        }
+    }
+
+    /// Drive the Anthropic SSE parser over `lines` with one shared state and
+    /// return every event it emitted.
+    fn anthropic_sse_events(lines: &[&str]) -> Vec<StreamEvent> {
+        use crate::sse::SseAction;
+        let mut state = AnthropicStreamState::default();
+        let mut events = Vec::new();
+        for line in lines {
+            let action = parse_anthropic_sse_line(
+                line,
+                "anthropic",
+                "claude-opus-4-7",
+                &mut state.current_tool_index,
+                &mut state.current_block_is_tool,
+                &mut state.current_block_is_thinking,
+                &mut state.pending_input_tokens,
+                &mut state.pending_cached_input_tokens,
+                &mut state.pending_cache_creation_tokens,
+                &mut state.pending_response_id,
+                &mut state.pending_reasoning,
+            );
+            match action {
+                SseAction::Emit(ev) | SseAction::Done(ev) => events.extend(ev),
+                SseAction::Continue => {}
+                SseAction::Error(e) => panic!("unexpected stream error: {e}"),
+            }
+        }
+        events
+    }
+
+    const THINKING_TOOL_USE_SSE: &[&str] = &[
+        r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5}}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need to "}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"read it."}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_abc"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque=="}}"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs_read","input":{}}}"#,
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":2}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}"#,
+    ];
+
+    /// The assistant turn the stream above produced, as the agent stores it.
+    fn assistant_turn_with_reasoning(blocks: Vec<serde_json::Value>, model: &str) -> Message {
+        let mut msg = Message::assistant("");
+        msg.content = None;
+        msg.tool_calls = Some(vec![crate::types::ToolCall {
+            id: "toolu_1".to_string(),
+            call_type: "function".to_string(),
+            function: crate::types::FunctionCall {
+                name: "fs_read".to_string(),
+                arguments: r#"{"path":"a"}"#.to_string(),
+            },
+        }]);
+        msg.reasoning_blocks = Some(blocks);
+        msg.reasoning_model = Some(model.to_string());
+        msg
+    }
+
+    /// Anthropic requires the signed `thinking` / `redacted_thinking` blocks
+    /// of the previous assistant turn replayed verbatim, ahead of its
+    /// `tool_use`, when the tool loop continues on the same model. The SSE
+    /// parser must therefore assemble each block whole (text + signature,
+    /// or the opaque redacted block) and the next request must lead the
+    /// assistant content with them — but only on a native Anthropic route
+    /// to the model that signed them.
+    #[test]
+    fn anthropic_signed_thinking_replays_ahead_of_tool_use_on_the_same_native_model() {
+        let events = anthropic_sse_events(THINKING_TOOL_USE_SSE);
+        let blocks: Vec<serde_json::Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ReasoningBlock(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![
+                serde_json::json!({"type": "thinking", "thinking": "Need to read it.", "signature": "sig_abc"}),
+                serde_json::json!({"type": "redacted_thinking", "data": "opaque=="}),
+            ],
+            "parser must assemble whole signed blocks in wire order; events: {events:?}"
+        );
+        let thinking_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking_text, "Need to read it.",
+            "thinking text must still stream"
+        );
+
+        let messages = vec![
+            Message::user("read a"),
+            assistant_turn_with_reasoning(blocks.clone(), "claude-opus-4-7"),
+            Message::tool_result("toolu_1", "contents"),
+        ];
+        let mut custom_cfg = LlmConfig::default();
+        custom_cfg.base_url = Some("https://proxy.example.com/v1".to_string());
+
+        let cases: [(&str, Provider, &LlmConfig, &str, bool); 5] = [
+            (
+                "native anthropic, same model",
+                Provider::Anthropic,
+                default_llm_config(),
+                "claude-opus-4-7",
+                true,
+            ),
+            (
+                "claude code oauth, same model",
+                Provider::ClaudeCodeOAuth,
+                default_llm_config(),
+                "claude-opus-4-7",
+                true,
+            ),
+            (
+                "vertex, same model",
+                Provider::VertexAi,
+                default_llm_config(),
+                "claude-opus-4-7",
+                true,
+            ),
+            (
+                "third-party base_url",
+                Provider::Anthropic,
+                &custom_cfg,
+                "claude-opus-4-7",
+                false,
+            ),
+            (
+                "model switched",
+                Provider::Anthropic,
+                default_llm_config(),
+                "claude-sonnet-5-5",
+                false,
+            ),
+        ];
+        for (name, provider, cfg, model, replays) in cases {
+            let mut request = anthropic_request_for(model, &messages, cfg);
+            request.provider = provider;
+            let body = build_anthropic_request(&request, false);
+            let content = body["messages"][1]["content"]
+                .as_array()
+                .expect("assistant content array");
+            if replays {
+                assert_eq!(
+                    content.len(),
+                    3,
+                    "{name}: two reasoning blocks + tool_use; got {content:?}"
+                );
+                assert_eq!(
+                    content[0], blocks[0],
+                    "{name}: thinking block must come first, verbatim"
+                );
+                assert_eq!(
+                    content[1], blocks[1],
+                    "{name}: redacted block must follow, verbatim"
+                );
+                assert_eq!(content[2]["type"], "tool_use", "{name}");
+                assert_eq!(content[2]["id"], "toolu_1", "{name}");
+            } else {
+                assert_eq!(
+                    content.len(),
+                    1,
+                    "{name}: reasoning must be dropped; got {content:?}"
+                );
+                assert_eq!(content[0]["type"], "tool_use", "{name}");
+            }
+        }
+    }
+
+    /// Reasoning blocks ride only on assistant turns: a tool result or user
+    /// message that somehow carries them must not leak them into its own
+    /// content, and an assistant turn without a tool call has nothing to
+    /// continue, so its reasoning stays home too.
+    #[test]
+    fn anthropic_reasoning_replay_is_limited_to_assistant_tool_call_turns() {
+        let block = serde_json::json!({"type": "thinking", "thinking": "t", "signature": "s"});
+        let mut user = Message::user("hi");
+        user.reasoning_blocks = Some(vec![block.clone()]);
+        user.reasoning_model = Some("claude-opus-4-7".to_string());
+        let mut final_answer = Message::assistant("done");
+        final_answer.reasoning_blocks = Some(vec![block.clone()]);
+        final_answer.reasoning_model = Some("claude-opus-4-7".to_string());
+        let messages = vec![user, final_answer];
+
+        let request = anthropic_request_for("claude-opus-4-7", &messages, default_llm_config());
+        let body = build_anthropic_request(&request, false);
+        let wire = body["messages"].to_string();
+        assert!(
+            !wire.contains("\"thinking\""),
+            "no reasoning block may appear on a user or final-answer turn: {wire}"
+        );
+        assert!(
+            wire.contains("\"hi\"") && wire.contains("\"done\""),
+            "{wire}"
+        );
+    }
+
+    /// DeepSeek, Kimi/Moonshot and Ollama (cloud) require the
+    /// `reasoning_content` of an assistant tool-call turn echoed back on the
+    /// next request; OpenAI and the rest must never see it. Anthropic signed
+    /// blocks and the producing-model tag are internal and never cross the
+    /// OpenAI-compatible wire.
+    #[test]
+    fn openai_wire_echoes_reasoning_content_only_for_reasoning_providers() {
+        let mut turn = assistant_turn_with_reasoning(
+            vec![serde_json::json!({"type": "thinking", "thinking": "x", "signature": "s"})],
+            "deepseek-reasoner",
+        );
+        turn.reasoning_content = Some("Let me read the file first.".to_string());
+        let messages = vec![
+            Message::user("read a"),
+            turn,
+            Message::tool_result("toolu_1", "contents"),
+        ];
+        let mut moonshot_cfg = LlmConfig::default();
+        moonshot_cfg.base_url = Some("https://api.moonshot.ai/v1".to_string());
+        let mut ollama_cfg = LlmConfig::default();
+        ollama_cfg.base_url = Some("https://ollama.com".to_string());
+        let mut gateway_cfg = LlmConfig::default();
+        gateway_cfg.base_url = Some("https://gw.corp/kimi/v1".to_string());
+
+        let cases: [(&str, Provider, &LlmConfig, &str, bool); 7] = [
+            (
+                "deepseek",
+                Provider::DeepSeek,
+                default_llm_config(),
+                "deepseek-reasoner",
+                true,
+            ),
+            (
+                "ollama cloud",
+                Provider::Ollama,
+                &ollama_cfg,
+                "deepseek-reasoner",
+                true,
+            ),
+            (
+                "kimi via custom endpoint",
+                Provider::Custom,
+                &moonshot_cfg,
+                "deepseek-reasoner",
+                true,
+            ),
+            (
+                "gateway with kimi in the path",
+                Provider::Custom,
+                &gateway_cfg,
+                "deepseek-reasoner",
+                false,
+            ),
+            (
+                "openai",
+                Provider::OpenAi,
+                default_llm_config(),
+                "deepseek-reasoner",
+                false,
+            ),
+            (
+                "openrouter",
+                Provider::OpenRouter,
+                default_llm_config(),
+                "deepseek-reasoner",
+                false,
+            ),
+            (
+                "deepseek after a model switch",
+                Provider::DeepSeek,
+                default_llm_config(),
+                "deepseek-chat",
+                false,
+            ),
+        ];
+        for (name, provider, cfg, model, echoes) in cases {
+            let request = TransportRequest {
+                provider,
+                model,
+                messages: &messages,
+                tools: None,
+                llm_config: cfg,
+                prompt_cache_key: None,
+                system_stable_prefix: None,
+                cost_events_enabled: false,
+            };
+            let body = build_openai_request(&request, false).expect("openai body");
+            let assistant = &body["messages"][1];
+            assert_eq!(assistant["role"], "assistant", "{name}: {body}");
+            assert_eq!(
+                assistant.get("reasoning_content").and_then(|v| v.as_str()),
+                echoes.then_some("Let me read the file first."),
+                "{name}: reasoning_content echo wrong; body: {body}"
+            );
+            for m in body["messages"].as_array().expect("messages") {
+                assert!(
+                    m.get("reasoning_blocks").is_none(),
+                    "{name}: signed blocks leaked: {m}"
+                );
+                assert!(
+                    m.get("reasoning_model").is_none(),
+                    "{name}: model tag leaked: {m}"
+                );
+            }
+        }
+    }
+
+    /// The echo decision reads the host of `base_url`, never the whole
+    /// string: a vendor name in the path or query of some other host does
+    /// not make that host the vendor, and an unparseable value is no host.
+    #[test]
+    fn provider_echoes_reasoning_matches_the_host_only() {
+        let cases: &[(Provider, Option<&str>, bool)] = &[
+            (Provider::DeepSeek, None, true),
+            (Provider::Ollama, Some("https://gw.corp/v1"), true),
+            (Provider::Custom, Some("https://api.moonshot.ai/v1"), true),
+            (Provider::Custom, Some("https://API.DeepSeek.com/v1"), true),
+            (
+                Provider::Custom,
+                Some("https://api.kimi.com/coding/v1"),
+                true,
+            ),
+            (Provider::Custom, Some("https://gw.corp/kimi/v1"), false),
+            (
+                Provider::Custom,
+                Some("https://gw.corp/v1?vendor=deepseek"),
+                false,
+            ),
+            (Provider::Custom, Some("https://gw.corp/v1#moonshot"), false),
+            (Provider::Custom, Some("not a url with kimi in it"), false),
+            (Provider::Custom, None, false),
+            (Provider::OpenAi, Some("https://api.deepseek.com/v1"), true),
+            (Provider::OpenAi, None, false),
+        ];
+        for (provider, base_url, want) in cases {
+            assert_eq!(
+                provider_echoes_reasoning(*provider, *base_url),
+                *want,
+                "{provider} at {base_url:?}"
+            );
+        }
+    }
+
+    /// A `reasoning_content` delta on the OpenAI-compatible stream is the
+    /// model's thinking: it must reach the agent as `ThinkingDelta` (so it
+    /// can be shown and stored for the echo), never as answer text.
+    #[test]
+    fn openai_reasoning_content_delta_streams_as_thinking() {
+        use crate::sse::SseAction;
+        let line = r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"hmm, ","content":null}}]}"#;
+        let action = parse_openai_sse_line(
+            line,
+            "deepseek",
+            "deepseek-reasoner",
+            &mut OpenAiStreamState::default(),
+        );
+        let events = match action {
+            SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+            _ => panic!("expected the reasoning delta to emit events"),
+        };
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::ThinkingDelta(t)] if t == "hmm, "),
+            "got {events:?}"
+        );
+    }
+
+    /// Bedrock Converse forwards `inferenceConfig.temperature` to the model,
+    /// so the same sampling rule applies: current Claude families lose it,
+    /// legacy ids keep it.
+    #[test]
+    fn bedrock_request_strips_temperature_on_current_claude_families() {
+        let messages = vec![Message::user("hi")];
+        let cases = [
+            ("anthropic.claude-sonnet-5-5", false),
+            ("us.anthropic.claude-opus-4-7-v1:0", false),
+            ("anthropic.claude-sonnet-4-6", true),
+            ("anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+        ];
+        for (model, keeps_temperature) in cases {
+            let mut request = bedrock_request(&messages);
+            request.model = model;
+            let body = build_bedrock_request(&request);
+            assert_eq!(
+                body["inferenceConfig"].get("temperature").is_some(),
+                keeps_temperature,
+                "{model}: inferenceConfig.temperature presence wrong"
+            );
+            assert_eq!(
+                body["inferenceConfig"]["maxTokens"],
+                default_llm_config().max_tokens
+            );
+        }
+    }
+
     /// A stop that a safety or content filter caused is its own event on
     /// every wire. It is not `Truncated` (a length cut asks for compaction;
     /// a filtered stop must not), and the provider's own label travels with
@@ -1901,6 +2704,7 @@ mod tests {
                 &mut cached,
                 &mut created,
                 &mut response_id,
+                &mut None,
             ))
         };
         let bedrock = |stop: &str| {

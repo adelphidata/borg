@@ -216,6 +216,13 @@ const ALLOWED_NAMES: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_NOSYSTEM",
+    // Identity, not credentials: a commit needs an author even when no
+    // global gitconfig is reachable (headless service, empty HOME).
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "EMAIL",
     // -- Docker / container (non-credential subset only). --
     // `DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` /
     // `CONTAINER_CONNECTION` are deliberately absent: they repoint the
@@ -437,6 +444,43 @@ mod tests {
         // breaks — these are the irreducible floor.
         for name in ["PATH", "HOME", "SHELL", "USER", "TERM", "TZ"] {
             assert!(is_allowed(name), "expected {name} to be allowed");
+        }
+    }
+
+    #[test]
+    fn forwards_git_identity_but_not_git_credentials() {
+        // A ghost commit or a `git commit` in a child shell needs the
+        // operator's identity; the credential-bearing git vars stay out.
+        // Drive `filter_iter` directly: setting `GIT_AUTHOR_EMAIL` on the
+        // process would outrank repo config for every other test that runs
+        // `git commit` in parallel (the ghost-commit identity tests).
+        let key = "GIT_AUTHOR_EMAIL";
+        let forwarded = filter_iter(
+            [
+                (key.to_string(), "ops@borg.test".to_string()),
+                ("GITHUB_TOKEN".to_string(), "ghp_secret".to_string()),
+            ],
+            &HashSet::new(),
+        );
+        assert_eq!(
+            forwarded.get(key).map(String::as_str),
+            Some("ops@borg.test"),
+            "{key} must reach the child"
+        );
+        assert!(
+            !forwarded.contains_key("GITHUB_TOKEN"),
+            "GITHUB_TOKEN must not reach the child"
+        );
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "EMAIL",
+        ] {
+            assert!(is_allowed(name), "{name} is identity, not a credential");
+        }
+        for name in ["GIT_ASKPASS", "GITHUB_TOKEN", "GIT_SSH_COMMAND"] {
+            assert!(!is_allowed(name), "{name} must stay out");
         }
     }
 

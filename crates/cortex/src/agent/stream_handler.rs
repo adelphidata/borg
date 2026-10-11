@@ -199,6 +199,9 @@ impl Agent {
                 self.compaction_strikes
                     .observe_real_prompt_tokens(real_prompt);
                 self.record_usage(&usage).await;
+                if !usage.model.is_empty() {
+                    self.turn_reasoning_model = Some(usage.model.clone());
+                }
                 let _ = event_tx.send(AgentEvent::Usage(usage)).await;
             }
             StreamEvent::Truncated => {
@@ -266,6 +269,9 @@ impl Agent {
                 *truncated_due_to_length = false;
                 self.tool_intent_signalled = false;
                 self.turn_reasoning.clear();
+                self.turn_reasoning_blocks.clear();
+                self.turn_reasoning_content.clear();
+                self.turn_reasoning_model = None;
                 if event_tx
                     .send(AgentEvent::LlmAttemptStarted { attempt })
                     .await
@@ -306,7 +312,20 @@ impl Agent {
                 }
                 return StreamEventOutcome::Terminal;
             }
+            StreamEvent::ReasoningBlock(block) => {
+                // Verbatim, in wire order: the signature verifies only on
+                // the exact block the model returned.
+                self.turn_reasoning_blocks.push(block);
+            }
             StreamEvent::ThinkingDelta(delta) => {
+                // The full text travels back to providers that require their
+                // reasoning echoed on the next tool-call turn. Every other
+                // provider also streams thinking as deltas, yet never takes
+                // it back, so for them nothing is kept: the full trace would
+                // otherwise sit in history and the session file for nothing.
+                if self.reasoning_echo_expected() {
+                    self.turn_reasoning_content.push_str(&delta);
+                }
                 // Buffer regardless of `show_thinking`: the empty-response
                 // terminal delivers an excerpt of this, and a user who turned
                 // the thinking trace off still deserves an answer when the
@@ -327,6 +346,26 @@ impl Agent {
             }
         }
         StreamEventOutcome::Continue
+    }
+
+    /// Whether the provider serving this stream takes the turn's thinking
+    /// text back as `reasoning_content` on the next tool-call request (the
+    /// same rule the OpenAI-compatible wire applies when it builds that
+    /// request). After a failover only the slot's provider is known, not
+    /// its endpoint, so a custom endpoint reached by failover reads as
+    /// "no echo": a missing echo costs one 400 at most, a stored trace for
+    /// a provider that never wanted it costs every session.
+    fn reasoning_echo_expected(&self) -> bool {
+        let (provider, base_url) = match self.active_failover_identity.as_ref() {
+            Some((provider, _)) => (provider.as_str(), None),
+            None => (
+                self.config.llm.provider.as_deref().unwrap_or(""),
+                self.config.llm.base_url.as_deref(),
+            ),
+        };
+        provider
+            .parse::<crate::llm::provider::Provider>()
+            .is_ok_and(|provider| crate::llm::provider_echoes_reasoning(provider, base_url))
     }
 
     /// Tell the consumers to drop the text deltas of the current iteration,
@@ -590,6 +629,176 @@ mod tests {
             None,
             "a reconnect kind would double-count the attempt AttemptStarted already reports"
         );
+    }
+
+    /// Spec: the reasoning a stream produced rides on the assistant tool-call
+    /// message it led to — signed Anthropic blocks verbatim and in order and
+    /// the model the usage record names — so the next request of the loop
+    /// can replay it. Anthropic never takes the thinking text back, so
+    /// `reasoning_content` stays `None` for it. A failed attempt leaves none
+    /// of it behind, and a saved message takes it with it so the next stream
+    /// starts clean.
+    #[tokio::test]
+    async fn stream_reasoning_rides_on_the_assistant_tool_call_message() {
+        use crate::internal_tag_filter::InternalTagFilter;
+        use crate::llm::{StreamEvent, UsageData};
+
+        let mut config = crate::config::Config::default();
+        config.llm.provider = Some("anthropic".to_string());
+        let mut agent = crate::agent::tests::minimal_test_agent(config);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        let mut tag_filter = InternalTagFilter::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None;
+        let mut truncated = false;
+        let usage = |model: &str| {
+            StreamEvent::Usage(UsageData {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                cached_input_tokens: 0,
+                cache_creation_tokens: 0,
+                provider: "anthropic".to_string(),
+                model: model.to_string(),
+                provider_cost_usd: None,
+                response_id: None,
+                upstream: None,
+            })
+        };
+        let first = serde_json::json!({"type": "thinking", "thinking": "stale", "signature": "s0"});
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "plan", "signature": "s1"});
+        let redacted = serde_json::json!({"type": "redacted_thinking", "data": "opaque=="});
+        for event in [
+            StreamEvent::AttemptStarted { attempt: 0 },
+            StreamEvent::ReasoningBlock(first.clone()),
+            StreamEvent::ThinkingDelta("stale".to_string()),
+            usage("claude-opus-4-6"),
+            StreamEvent::AttemptStarted { attempt: 1 },
+            StreamEvent::ReasoningBlock(thinking.clone()),
+            StreamEvent::ThinkingDelta("pl".to_string()),
+            StreamEvent::ThinkingDelta("an".to_string()),
+            StreamEvent::ReasoningBlock(redacted.clone()),
+            usage("claude-opus-4-7"),
+            StreamEvent::Done,
+        ] {
+            agent
+                .handle_stream_event(
+                    event,
+                    &mut tag_filter,
+                    &mut tool_calls,
+                    &mut stream_error,
+                    &mut truncated,
+                    &event_tx,
+                )
+                .await;
+        }
+
+        let invalid = vec![super::super::tool_validation::InvalidToolCall {
+            id: "call_1".to_string(),
+            name: "fs_read".to_string(),
+            reason: "malformed JSON".to_string(),
+            raw_arguments: "{".to_string(),
+        }];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        agent
+            .execute_tool_calls(&[], &invalid, "", &event_tx, &cancel)
+            .await;
+
+        let saved = agent
+            .history
+            .iter()
+            .find(|m| m.role == crate::types::Role::Assistant && m.tool_calls.is_some())
+            .expect("the assistant tool-call message must be saved");
+        assert_eq!(
+            saved.reasoning_blocks,
+            Some(vec![thinking, redacted]),
+            "only the completing attempt's blocks, in wire order"
+        );
+        assert_eq!(
+            saved.reasoning_content, None,
+            "Anthropic never takes the thinking text back, so none is stored"
+        );
+        assert_eq!(saved.reasoning_model.as_deref(), Some("claude-opus-4-7"));
+        assert!(agent.turn_reasoning_blocks.is_empty(), "taken, not copied");
+        assert!(agent.turn_reasoning_content.is_empty());
+        assert!(agent.turn_reasoning_model.is_none());
+    }
+
+    /// Spec: the thinking text is kept on the tool-call turn only for a
+    /// provider that requires it echoed on the next request (DeepSeek-style
+    /// `reasoning_content`). Anthropic and OpenAI stream thinking as the
+    /// same deltas and never take it back, so for them nothing is stored:
+    /// the trace would otherwise sit in history and the session file for
+    /// every tool-call turn, for nothing.
+    #[tokio::test]
+    async fn thinking_text_is_stored_only_for_providers_that_echo_it() {
+        use crate::internal_tag_filter::InternalTagFilter;
+        use crate::llm::{StreamEvent, UsageData};
+
+        let cases: [(&str, Option<&str>, &str, Option<&str>); 3] = [
+            ("anthropic", None, "claude-opus-4-7", None),
+            ("openai", None, "o4-mini", None),
+            ("deepseek", None, "deepseek-reasoner", Some("plan")),
+        ];
+        for (provider, base_url, model, want) in cases {
+            let mut config = crate::config::Config::default();
+            config.llm.provider = Some(provider.to_string());
+            config.llm.base_url = base_url.map(str::to_string);
+            let mut agent = crate::agent::tests::minimal_test_agent(config);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+            let mut tag_filter = InternalTagFilter::new();
+            let mut tool_calls = Vec::new();
+            let mut stream_error = None;
+            let mut truncated = false;
+            for event in [
+                StreamEvent::AttemptStarted { attempt: 0 },
+                StreamEvent::ThinkingDelta("pl".to_string()),
+                StreamEvent::ThinkingDelta("an".to_string()),
+                StreamEvent::Usage(UsageData {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    cached_input_tokens: 0,
+                    cache_creation_tokens: 0,
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    provider_cost_usd: None,
+                    response_id: None,
+                    upstream: None,
+                }),
+                StreamEvent::Done,
+            ] {
+                agent
+                    .handle_stream_event(
+                        event,
+                        &mut tag_filter,
+                        &mut tool_calls,
+                        &mut stream_error,
+                        &mut truncated,
+                        &event_tx,
+                    )
+                    .await;
+            }
+            let invalid = vec![super::super::tool_validation::InvalidToolCall {
+                id: "call_1".to_string(),
+                name: "fs_read".to_string(),
+                reason: "malformed JSON".to_string(),
+                raw_arguments: "{".to_string(),
+            }];
+            let cancel = tokio_util::sync::CancellationToken::new();
+            agent
+                .execute_tool_calls(&[], &invalid, "", &event_tx, &cancel)
+                .await;
+
+            let saved = agent
+                .history
+                .iter()
+                .find(|m| m.role == crate::types::Role::Assistant && m.tool_calls.is_some())
+                .expect("the assistant tool-call message must be saved");
+            assert_eq!(saved.reasoning_content.as_deref(), want, "{provider}");
+            assert_eq!(saved.reasoning_model.as_deref(), Some(model), "{provider}");
+        }
     }
 
     /// Spec: the saved assistant message holds the output of the attempt

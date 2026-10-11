@@ -465,6 +465,91 @@ async fn mem0_backend_error_message_redacts_api_key() {
     assert!(msg.contains("<redacted>"));
 }
 
+/// External providers are third-party egress: a pasted credential must be
+/// redacted before the request leaves the machine, on both the write and the
+/// search path, regardless of any local secret-detection setting. The mock
+/// records the raw request body so the assertion is on the bytes sent.
+#[tokio::test]
+async fn external_write_and_search_redact_secrets_before_egress() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memories/search/"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
+        )
+        .mount(&server)
+        .await;
+    let cfg = Config::default();
+    let ctx = MemCtx::from_config(&cfg);
+    let prov = mem0::Mem0Provider::for_tests(server.uri());
+
+    let aws_key = "AKIAIOSFODNN7EXAMPLE";
+    let gh_token = format!("ghp_{}", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+    write_guarded(
+        &prov,
+        &ctx,
+        "global",
+        "aws-notes",
+        &format!("deploy uses access key {aws_key} in us-east-1"),
+        WriteMode::Overwrite,
+    )
+    .await
+    .expect("write must succeed");
+    search_guarded(
+        &prov,
+        &ctx,
+        &SearchQuery {
+            query: format!("why does {gh_token} return 401"),
+            max_results: 5,
+            min_score: 0.0,
+        },
+    )
+    .await
+    .expect("search must succeed");
+
+    let requests = server.received_requests().await.expect("recording enabled");
+    let bodies: Vec<(String, String)> = requests
+        .iter()
+        .map(|r| {
+            (
+                r.url.path().to_string(),
+                String::from_utf8_lossy(&r.body).into_owned(),
+            )
+        })
+        .collect();
+    let write_body = &bodies
+        .iter()
+        .find(|(p, _)| p == "/v1/memories/")
+        .expect("write reached the mock")
+        .1;
+    let search_body = &bodies
+        .iter()
+        .find(|(p, _)| p == "/v1/memories/search/")
+        .expect("search reached the mock")
+        .1;
+    assert!(
+        !write_body.contains(aws_key) && write_body.contains("[REDACTED"),
+        "write body must carry the redaction marker, not the key: {write_body}"
+    );
+    assert!(
+        write_body.contains("us-east-1"),
+        "non-secret content must survive redaction: {write_body}"
+    );
+    assert!(
+        !search_body.contains(&gh_token) && search_body.contains("[REDACTED"),
+        "search body must carry the redaction marker, not the token: {search_body}"
+    );
+    assert!(
+        search_body.contains("return 401"),
+        "non-secret query text must survive redaction: {search_body}"
+    );
+}
+
 // ── Honcho HTTP fixture ──
 
 #[tokio::test]

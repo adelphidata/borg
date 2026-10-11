@@ -55,9 +55,18 @@ pub(crate) struct StalledScan {
 /// Mark in-flight task runs as failed (daemon crashed mid-execution) and
 /// advance any due tasks more than seven days overdue. Returns the
 /// observed counts; failures inside individual steps log and yield zero.
+///
+/// Runs still executing in this process (`cortex::tasks::live_run_ids`) are
+/// left alone: the dispatcher is supervised, and a respawn after a wedge does
+/// not stop the runs its previous incarnation spawned. The scheduler also
+/// only calls this once per process, so a respawn never re-fails rows or
+/// re-reclaims the session leases the live process holds.
 pub(crate) async fn boot_recovery(db: &Database) -> BootRecovery {
     let stale_runs_recovered = match db
-        .recover_stale_runs("Daemon crashed during execution")
+        .recover_stale_runs(
+            "Daemon crashed during execution",
+            &cortex::tasks::live_run_ids(),
+        )
         .await
     {
         Ok(n) => {
@@ -244,6 +253,42 @@ mod tests {
         assert_eq!(
             stale_run.status, "failed",
             "stale run must be marked failed: {stale_run:?}"
+        );
+    }
+
+    /// A supervisor respawn of the dispatcher must not fail the runs the
+    /// previous incarnation spawned: they are still polling in this process
+    /// and will write their own final status.
+    #[tokio::test]
+    async fn boot_recovery_skips_runs_that_are_live_in_this_process() {
+        let db = test_db().await;
+        seed_interval_task(&db, "live", Some(0)).await;
+        seed_interval_task(&db, "dead", Some(0)).await;
+        let live_id = db.start_task_run("live", 100).await.expect("start run");
+        let _dead_id = db.start_task_run("dead", 100).await.expect("start run");
+        let _guard = cortex::tasks::LiveRunGuard::register(live_id);
+
+        let report = boot_recovery(&db).await;
+        assert_eq!(
+            report.stale_runs_recovered, 1,
+            "only the dead run: {report:?}"
+        );
+
+        let live_run = db
+            .task_run_history("live", 1)
+            .await
+            .expect("history")
+            .remove(0);
+        assert_eq!(live_run.status, "running", "live run must be left running");
+        assert_eq!(live_run.error, None, "live run's error must be unchanged");
+        let dead_run = db
+            .task_run_history("dead", 1)
+            .await
+            .expect("history")
+            .remove(0);
+        assert_eq!(
+            dead_run.status, "failed",
+            "a non-live running row is still failed"
         );
     }
 

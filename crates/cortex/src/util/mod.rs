@@ -6,6 +6,9 @@
 pub mod ansi;
 /// Lowercase hex encode/decode helpers.
 pub mod hex;
+/// Invisible and bidi-override Unicode detection shared by the shell policy
+/// and the memory injection scanner.
+pub mod invisible;
 /// Shared helpers for panic-isolated supervised loops.
 pub mod panic_utils;
 /// Process-group spawn/kill helpers so abandoned children don't orphan trees.

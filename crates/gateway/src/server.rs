@@ -1716,26 +1716,23 @@ async fn slack_command_handler(
     // prompt, so an unauthenticated request here is equivalent to full command
     // injection. If no signing secret is configured we refuse rather than trust
     // the request (matching the inbound webhook fail-closed posture).
-    match state.slack_signing_secret.as_deref() {
-        Some(secret) => {
-            if let Err(e) = crate::slack::verify::verify_slack_signature(&headers, &body, secret) {
-                warn!("Slack command signature verification failed: {e}");
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    axum::Json(serde_json::json!({ "error": "Unauthorized" })),
-                );
-            }
-        }
-        None => {
-            warn!(
-                "Slack slash command refused: no signing secret configured \
-                 (set SLACK_SIGNING_SECRET to enable this endpoint)"
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({ "error": "Unauthorized" })),
-            );
-        }
+    let secret = state.slack_signing_secret.as_deref();
+    if let Err(e) =
+        crate::verify_common::require_verification_secret("Slack", secret, "SLACK_SIGNING_SECRET")
+    {
+        warn!("Slack slash command refused: {e}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": "Unauthorized" })),
+        );
+    }
+    let secret = secret.unwrap_or_default();
+    if let Err(e) = crate::slack::verify::verify_slack_signature(&headers, &body, secret) {
+        warn!("Slack command signature verification failed: {e}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": "Unauthorized" })),
+        );
     }
 
     let payload: crate::slack::types::SlashCommandPayload = match serde_urlencoded::from_str(&body)
@@ -3073,6 +3070,56 @@ description = "Script fallback"
         // Let the spawned work finish against the temp BORG_HOME before the
         // guard restores the real one.
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// A blank signing secret is unconfigured: the slash-command route must
+    /// refuse a request even when it was signed with that same blank secret,
+    /// just as the webhook route does through `require_verification_secret`.
+    #[tokio::test]
+    async fn slack_command_rejects_blank_signing_secret_even_when_signature_matches() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+
+        for secret in ["", "  ", "\t\n"] {
+            let body = "command=%2Fborg&text=hi&user_id=U1&channel_id=C1";
+            let ts = chrono::Utc::now().timestamp().to_string();
+            let sig = {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+                mac.update(format!("v0:{ts}:{body}").as_bytes());
+                format!("v0={}", hex::encode(mac.finalize().into_bytes()))
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("x-slack-request-timestamp", ts.parse().unwrap());
+            headers.insert("x-slack-signature", sig.parse().unwrap());
+
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+            let slack_client = Arc::new(SlackClient::new("xoxb-test-token").unwrap());
+            let state = test_state(
+                Config::default(),
+                registry,
+                &[],
+                0,
+                None,
+                Some((slack_client, secret.to_string())),
+            );
+
+            let (status, resp_body) =
+                slack_command_handler(State(state.clone()), headers, body.to_string()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "secret {secret:?}: blank signing secret must fail closed: {}",
+                resp_body.0
+            );
+            assert_eq!(
+                state.session_queue.active_sessions().await,
+                0,
+                "secret {secret:?}: no turn may start"
+            );
+        }
     }
 
     /// `gateway.slack_channel_allowlist` gates slash commands: a channel off

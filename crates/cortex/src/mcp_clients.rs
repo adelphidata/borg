@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Config, McpServerConfig};
-use crate::types::ToolDefinition;
+use crate::types::{ContentPart, MediaData, ToolDefinition, ToolOutput};
 use mcp::manifest::ServerManifest;
 use mcp::registry::{McpRegistry, RegisteredTool, ToolRegistrationOutcome};
 use mcp::session::SessionActor;
@@ -142,6 +142,179 @@ struct ServerLimits {
 struct CallOutcome {
     text: String,
     is_error: bool,
+    /// `image` content blocks, still base64 and unverified. Dispatch decodes
+    /// them into parts; the rendered `text` already carries a placeholder per
+    /// image, so a block that fails decoding is still visible to the model.
+    images: Vec<McpImage>,
+}
+
+/// One `image` block from a `tools/call` reply, as the server sent it.
+#[derive(Debug, Clone)]
+struct McpImage {
+    data: String,
+    mime_type: Option<String>,
+}
+
+/// Most image parts one MCP result may contribute to a tool message. Every
+/// part costs a fixed token estimate, so an unbounded server cannot blow the
+/// context with a gallery.
+const MCP_MAX_IMAGES_PER_RESULT: usize = 4;
+
+/// Pull the `image` blocks out of a raw `tools/call` result.
+fn collect_images(raw: &mcp::protocol::ToolCallResult) -> Vec<McpImage> {
+    raw.content
+        .iter()
+        .filter_map(|block| match block {
+            mcp::protocol::ContentBlock::Image { data, mime_type } => Some(McpImage {
+                data: data.clone(),
+                mime_type: mime_type.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Largest width or height an MCP image may declare. The decoder allocates
+/// `width × height × bpp` before it sees a single pixel, so a hostile
+/// server could otherwise name a 100k × 100k header and take gigabytes.
+/// 8192 covers any real screenshot or chart.
+const MCP_MAX_IMAGE_DIMENSION: u32 = 8192;
+
+/// Image formats accepted from an MCP server, by sniffed MIME. Everything a
+/// vision provider takes inline; BMP is deliberately out (uncompressed, no
+/// provider wants it, and the sniff is only two bytes).
+const MCP_ACCEPTED_IMAGE_MIMES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Verify and bound one server-supplied image: canonical base64, a MIME
+/// sniffed from the bytes (the server's declaration is untrusted), a full
+/// decode under dimension limits so a truncated, hostile or absurdly large
+/// file is rejected here rather than by the provider, then the usual size
+/// cap. CPU-bound: callers run it off the async runtime.
+fn decode_mcp_image(image: &McpImage, max_bytes: usize) -> Result<MediaData> {
+    use base64::Engine as _;
+    let b64 = crate::media::validate_base64(&image.data)
+        .ok_or_else(|| anyhow!("image data is not valid base64"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&b64)?;
+    let mime = crate::media::infer_mime_from_bytes(&bytes)
+        .filter(|m| MCP_ACCEPTED_IMAGE_MIMES.contains(m))
+        .ok_or_else(|| {
+            anyhow!(
+                "bytes are not a supported image (server declared {})",
+                image.mime_type.as_deref().unwrap_or("no type")
+            )
+        })?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| anyhow!("image format could not be read: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MCP_MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MCP_MAX_IMAGE_DIMENSION);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|e| anyhow!("image does not decode: {e}"))?;
+    let (data, mime_type) = crate::media::compress_image_bytes(&bytes, mime, max_bytes)?;
+    Ok(MediaData {
+        mime_type,
+        data,
+        filename: None,
+    })
+}
+
+/// Cap on one decoded MCP image, from `media.max_image_bytes`. Written by
+/// [`initialize`] / [`reload_from_config`] like [`MAX_RESPONSE_BYTES`];
+/// `0` means "not configured yet" and reads as the `MediaConfig` default.
+static MAX_IMAGE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn max_image_bytes() -> usize {
+    match MAX_IMAGE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::config::MediaConfig::default().max_image_bytes,
+        n => n,
+    }
+}
+
+fn set_max_image_bytes(config: &Config) {
+    MAX_IMAGE_BYTES.store(
+        config.media.max_image_bytes,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// [`decode_mcp_images`] on the blocking pool: a full decode of several
+/// multi-megabyte images must not stall the runtime that drives every other
+/// session. A panic inside the decoder drops the parts and keeps the
+/// placeholders, like any other rejected image.
+async fn decode_mcp_images_blocking(
+    server: &str,
+    tool: &str,
+    images: Vec<McpImage>,
+    max_bytes: usize,
+) -> Vec<ContentPart> {
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let (server_owned, tool_owned) = (server.to_string(), tool.to_string());
+    match tokio::task::spawn_blocking(move || {
+        decode_mcp_images(&server_owned, &tool_owned, &images, max_bytes)
+    })
+    .await
+    {
+        Ok(parts) => parts,
+        Err(e) => {
+            tracing::warn!(
+                server,
+                tool,
+                "MCP image decode task failed; placeholders kept: {e}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Turn a result's image blocks into content parts, keeping at most
+/// [`MCP_MAX_IMAGES_PER_RESULT`] that decode cleanly. A failing image is
+/// logged and skipped: its placeholder in the rendered text still tells the
+/// model an image was there.
+fn decode_mcp_images(
+    server: &str,
+    tool: &str,
+    images: &[McpImage],
+    max_bytes: usize,
+) -> Vec<ContentPart> {
+    let mut parts = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        if parts.len() >= MCP_MAX_IMAGES_PER_RESULT {
+            tracing::warn!(
+                server,
+                tool,
+                total = images.len(),
+                "MCP result carried more than {MCP_MAX_IMAGES_PER_RESULT} images; the rest were dropped",
+            );
+            break;
+        }
+        match decode_mcp_image(image, max_bytes) {
+            Ok(media) => parts.push(ContentPart::ImageBase64 { media }),
+            Err(e) => tracing::warn!(
+                server,
+                tool,
+                index,
+                "MCP image block rejected, placeholder kept: {e:#}",
+            ),
+        }
+    }
+    parts
+}
+
+/// Combine the wrapped text with any decoded image parts.
+fn assemble_tool_output(wrapped: String, parts: Vec<ContentPart>) -> ToolOutput {
+    if parts.is_empty() {
+        ToolOutput::Text(wrapped)
+    } else {
+        ToolOutput::Multimodal {
+            text: wrapped,
+            parts,
+        }
+    }
 }
 
 /// Commands the session actor accepts.
@@ -1189,7 +1362,7 @@ async fn await_pending_start(server: &str, limit: Duration) -> Option<anyhow::Er
     }
 }
 
-pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>> {
+pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOutput>> {
     if !name.starts_with("mcp_") {
         return Ok(None);
     }
@@ -1219,11 +1392,11 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     // succeed must not consume a rate token.
     let missing = missing_required_args(&tool.input_schema, args);
     if !missing.is_empty() {
-        return Ok(Some(blind_call_refusal(
+        return Ok(Some(ToolOutput::Text(blind_call_refusal(
             &tool.full_name,
             &tool.input_schema,
             &missing,
-        )));
+        ))));
     }
 
     // Rate-limit gate. Limits are pinned at session-install time so
@@ -1332,8 +1505,12 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
     // forever. The session enforces the inner per-call timeout; this
     // covers actor-side deadlock.
     let outer_deadline = call_timeout + Duration::from_secs(5);
-    let (raw_text, is_error) = match tokio::time::timeout(outer_deadline, reply_rx).await {
-        Ok(Ok(Ok(CallOutcome { text, is_error }))) => (text, is_error),
+    let (raw_text, is_error, images) = match tokio::time::timeout(outer_deadline, reply_rx).await {
+        Ok(Ok(Ok(CallOutcome {
+            text,
+            is_error,
+            images,
+        }))) => (text, is_error, images),
         Ok(Ok(Err(e))) => {
             breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -1536,7 +1713,9 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<String>
         "mcp tool executed",
     );
 
-    Ok(Some(wrapped))
+    let parts =
+        decode_mcp_images_blocking(&tool.server, &tool.full_name, images, max_image_bytes()).await;
+    Ok(Some(assemble_tool_output(wrapped, parts)))
 }
 
 /// Classify a server *startup* failure for audit attribution and health
@@ -1593,6 +1772,7 @@ pub async fn initialize(config: &Config) -> Result<()> {
         resolve_max_response_bytes(config.mcp.max_response_bytes),
         std::sync::atomic::Ordering::Relaxed,
     );
+    set_max_image_bytes(config);
 
     let builtin = builtin_tool_names();
     let builtin_refs: Vec<&str> = builtin.to_vec();
@@ -2108,6 +2288,7 @@ pub async fn reload_from_config(config: &Config) -> Result<ReloadReport> {
         resolve_max_response_bytes(config.mcp.max_response_bytes),
         std::sync::atomic::Ordering::Relaxed,
     );
+    set_max_image_bytes(config);
 
     for name in &to_remove {
         // Dropping the sender closes the actor's receiver — the task exits
@@ -3063,6 +3244,7 @@ async fn run_session_task(
                     .map(|(text, raw)| CallOutcome {
                         text,
                         is_error: raw.is_error,
+                        images: collect_images(&raw),
                     })
                     .map_err(anyhow::Error::new);
                 // Best-effort send — caller may have dropped its receiver
@@ -4904,7 +5086,215 @@ mod tests {
             Ok(CallOutcome {
                 text: text.to_string(),
                 is_error,
+                images: Vec::new(),
             })
+        }
+
+        fn output_text(out: ToolOutput) -> String {
+            match out {
+                ToolOutput::Text(t) | ToolOutput::Multimodal { text: t, .. } => t,
+            }
+        }
+
+        fn png_base64() -> String {
+            use base64::Engine as _;
+            let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 30, 30, 255]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png)
+                .expect("encode png");
+            base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+        }
+
+        /// A JPEG that starts with a valid SOI/APP0 header and then stops:
+        /// the magic-bytes sniff accepts it, only a full decode rejects it.
+        fn truncated_jpeg_base64() -> String {
+            use base64::Engine as _;
+            let bytes = [
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x48, 0x00, 0x48, 0x00, 0x00,
+            ];
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+
+        fn image_parts(out: &ToolOutput) -> Vec<&MediaData> {
+            match out {
+                ToolOutput::Text(_) => Vec::new(),
+                ToolOutput::Multimodal { parts, .. } => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ImageBase64 { media } => Some(media),
+                        _ => None,
+                    })
+                    .collect(),
+            }
+        }
+
+        #[test]
+        fn image_blocks_reach_a_vision_model_as_image_parts_and_a_text_model_as_a_note() {
+            let _g = guard();
+            let rt = rt();
+            // The server declares the wrong type on purpose: the part's MIME
+            // must come from the bytes, never from the server.
+            let script = vec![Ok(CallOutcome {
+                text: "chart ready
+[mcp image: image/jpeg, ~1 KB]"
+                    .to_string(),
+                is_error: false,
+                images: vec![McpImage {
+                    data: png_base64(),
+                    mime_type: Some("image/jpeg".into()),
+                }],
+            })];
+            install_scripted_server(&rt, "viz", script);
+
+            let out = rt
+                .block_on(try_execute_tool("mcp_viz_echo", &serde_json::json!({})))
+                .expect("call succeeds")
+                .expect("mcp tool");
+            let images = image_parts(&out);
+            assert_eq!(images.len(), 1, "one png block → one image part: {out:?}");
+            assert_eq!(images[0].mime_type, "image/png");
+            assert_eq!(
+                images[0].data,
+                png_base64(),
+                "a small image passes through unchanged"
+            );
+            let text = output_text(out.clone());
+            assert!(
+                text.contains("<mcp_tool_result"),
+                "trust wrapper kept: {text}"
+            );
+            assert!(
+                text.contains("[mcp image: image/jpeg, ~1 KB]"),
+                "placeholder kept: {text}"
+            );
+
+            // A text-only main model must be told the pixels were dropped
+            // rather than have the part silently stripped at the LLM layer.
+            let mut config = Config::default();
+            config.llm.provider = Some("openai".into());
+            config.llm.model = "gpt-3.5-turbo".into();
+            let downgraded = crate::tool::vision::downgrade_for_non_vision_model(
+                out,
+                &config,
+                "the MCP tool returned an image",
+                "Ask the tool for a text description instead.",
+            );
+            match downgraded {
+                ToolOutput::Text(t) => {
+                    assert!(t.contains("does not support image input"), "got: {t}");
+                    assert!(t.contains("chart ready"), "summary dropped: {t}");
+                }
+                other => panic!("expected Text for a text-only model, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn truncated_jpeg_yields_no_image_part_but_keeps_the_placeholder() {
+            let _g = guard();
+            let rt = rt();
+            let script = vec![Ok(CallOutcome {
+                text: "[mcp image: image/jpeg, ~1 KB]".to_string(),
+                is_error: false,
+                images: vec![McpImage {
+                    data: truncated_jpeg_base64(),
+                    mime_type: Some("image/jpeg".into()),
+                }],
+            })];
+            install_scripted_server(&rt, "trunc", script);
+
+            let out = rt
+                .block_on(try_execute_tool("mcp_trunc_echo", &serde_json::json!({})))
+                .expect("a bad image never fails the call")
+                .expect("mcp tool");
+            assert!(
+                matches!(out, ToolOutput::Text(_)),
+                "no decodable image → plain text output, got {out:?}"
+            );
+            assert!(
+                output_text(out).contains("[mcp image: image/jpeg, ~1 KB]"),
+                "the placeholder must survive so the model knows an image was there"
+            );
+        }
+
+        /// A PNG whose header declares a 9000-pixel edge is over the
+        /// dimension limit: the decoder refuses it before allocating, so the
+        /// result carries no image part — only the text placeholder.
+        #[test]
+        fn oversize_dimension_png_yields_no_image_part_but_keeps_the_placeholder() {
+            use base64::Engine as _;
+            let _g = guard();
+            let rt = rt();
+            let wide = image::RgbaImage::from_pixel(
+                MCP_MAX_IMAGE_DIMENSION + 808,
+                1,
+                image::Rgba([0, 0, 0, 255]),
+            );
+            let mut buf = std::io::Cursor::new(Vec::new());
+            wide.write_to(&mut buf, image::ImageFormat::Png)
+                .expect("encode png");
+            let data = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+            let script = vec![Ok(CallOutcome {
+                text: "[mcp image: image/png, ~1 KB]".to_string(),
+                is_error: false,
+                images: vec![McpImage {
+                    data,
+                    mime_type: Some("image/png".into()),
+                }],
+            })];
+            install_scripted_server(&rt, "wide", script);
+
+            let out = rt
+                .block_on(try_execute_tool("mcp_wide_echo", &serde_json::json!({})))
+                .expect("an oversize image never fails the call")
+                .expect("mcp tool");
+            assert!(
+                matches!(out, ToolOutput::Text(_)),
+                "over the dimension limit → no image part, got {out:?}"
+            );
+            assert!(
+                output_text(out).contains("[mcp image: image/png, ~1 KB]"),
+                "the placeholder must survive so the model knows an image was there"
+            );
+        }
+
+        /// BMP sniffs as an image but no provider takes it inline; the block
+        /// is rejected rather than forwarded.
+        #[test]
+        fn bmp_is_not_an_accepted_mcp_image() {
+            use base64::Engine as _;
+            let img = image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Bmp)
+                .expect("encode bmp");
+            let bmp = McpImage {
+                data: base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
+                mime_type: Some("image/bmp".into()),
+            };
+            let err = decode_mcp_image(&bmp, usize::MAX).expect_err("bmp must be rejected");
+            assert!(
+                err.to_string().contains("not a supported image"),
+                "got: {err:#}"
+            );
+        }
+
+        #[test]
+        fn image_parts_are_capped_at_four_per_result_counting_only_decodable_ones() {
+            let good = McpImage {
+                data: png_base64(),
+                mime_type: None,
+            };
+            let bad = McpImage {
+                data: "not base64!!".into(),
+                mime_type: Some("image/png".into()),
+            };
+            let cap = crate::config::MediaConfig::default().max_image_bytes;
+            let six: Vec<McpImage> = (0..6).map(|_| good.clone()).collect();
+            assert_eq!(decode_mcp_images("s", "t", &six, cap).len(), 4);
+            // A rejected block does not use up a slot.
+            let mixed = vec![bad, good.clone(), good.clone(), good.clone(), good.clone()];
+            assert_eq!(decode_mcp_images("s", "t", &mixed, cap).len(), 4);
+            assert!(decode_mcp_images("s", "t", &[], cap).is_empty());
         }
 
         fn transport_err() -> Result<CallOutcome> {
@@ -4926,6 +5316,7 @@ mod tests {
                     .block_on(try_execute_tool("mcp_brk_echo", &serde_json::json!({})))
                     .unwrap_or_else(|e| panic!("call {i} must still reach the model: {e}"))
                     .expect("mcp tool");
+                let out = output_text(out);
                 assert!(
                     out.contains("bad args: missing q"),
                     "the server's own explanation must survive: {out}"
@@ -5030,6 +5421,7 @@ mod tests {
                 .block_on(try_execute_tool("mcp_probe_echo", &serde_json::json!({})))
                 .expect("half-open admits the probe")
                 .expect("mcp tool");
+            let out = output_text(out);
             assert!(out.contains("recovered"), "{out}");
             assert_eq!(
                 calls.load(Ordering::SeqCst),

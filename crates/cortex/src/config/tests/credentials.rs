@@ -244,14 +244,38 @@ fn resolve_credential_or_env_finds_env_var() {
     assert_eq!(result.as_deref(), Some("env-value"));
 }
 
+/// A blank credential is as unset as a missing one on both the credential
+/// store branch and the raw env branch: a whitespace-only secret would
+/// otherwise key a webhook HMAC verifier.
 #[test]
-fn resolve_credential_or_env_skips_empty_env() {
-    let config = Config::default();
-    let key = "BORG_TEST_RESOLVE_CRED_EMPTY";
-    unsafe { std::env::set_var(key, "") };
-    let result = config.resolve_credential_or_env(key);
-    unsafe { std::env::remove_var(key) };
-    assert!(result.is_none());
+fn resolve_credential_or_env_treats_blank_as_unset() {
+    for (i, blank) in ["", "   ", "\t\n", " \u{a0}"].iter().enumerate() {
+        // Raw env branch.
+        let env_key = format!("BORG_TEST_RESOLVE_CRED_BLANK_ENV_{i}");
+        unsafe { std::env::set_var(&env_key, blank) };
+        let env_result = Config::default().resolve_credential_or_env(&env_key);
+        unsafe { std::env::remove_var(&env_key) };
+        assert!(
+            env_result.is_none(),
+            "env value {blank:?} must resolve to None, got {env_result:?}"
+        );
+
+        // Credential store branch: the store entry points at a different env
+        // var that holds the blank value, and nothing else answers the name.
+        let backing = format!("BORG_TEST_RESOLVE_CRED_BLANK_STORE_{i}");
+        let name = format!("BORG_TEST_RESOLVE_CRED_BLANK_NAME_{i}");
+        unsafe { std::env::set_var(&backing, blank) };
+        let mut config = Config::default();
+        config
+            .credentials
+            .insert(name.clone(), CredentialValue::EnvVar(backing.clone()));
+        let store_result = config.resolve_credential_or_env(&name);
+        unsafe { std::env::remove_var(&backing) };
+        assert!(
+            store_result.is_none(),
+            "store value {blank:?} must resolve to None, got {store_result:?}"
+        );
+    }
 }
 
 #[test]

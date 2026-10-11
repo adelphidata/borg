@@ -18,6 +18,10 @@ pub struct DiagnosticRunner {
     /// interactive `borg doctor` / TUI paths opt in via
     /// [`DiagnosticRunner::interactive`].
     probe_network: bool,
+    /// Whether checks may run full-table scans (the FTS5 `integrity-check`
+    /// walks every index segment). `false` by default so the nightly sweep
+    /// stays cheap on a large DB; an explicit `borg doctor` opts in.
+    deep_scans: bool,
 }
 
 /// The ordered diagnostic groups. Adding a check is one entry here plus the
@@ -152,7 +156,13 @@ impl StepKind {
         )
     }
 
-    async fn run(self, config: &Config, checks: &mut Vec<DiagnosticCheck>, probe_network: bool) {
+    async fn run(
+        self,
+        config: &Config,
+        checks: &mut Vec<DiagnosticCheck>,
+        probe_network: bool,
+        deep_scans: bool,
+    ) {
         match self {
             Self::Provider => {
                 checks::provider::check_provider(config, checks);
@@ -166,7 +176,7 @@ impl StepKind {
             Self::Skills => checks::system::check_skills(config, checks).await,
             Self::Memory => checks::memory::check_memory(config, checks, probe_network).await,
             Self::Embeddings => checks::memory::check_embeddings(config, checks).await,
-            Self::Data => checks::data::check_data_dir(checks).await,
+            Self::Data => checks::data::check_data_dir(checks, deep_scans).await,
             Self::Locks => checks::runtime::check_daemon_lock(checks).await,
             Self::Gateway => checks::network::check_gateway(config, checks),
             Self::Tunnel => checks::network::check_tunnel(config, checks),
@@ -200,6 +210,7 @@ impl DiagnosticRunner {
         Self {
             step: 0,
             probe_network: true,
+            deep_scans: true,
         }
     }
 
@@ -215,7 +226,8 @@ impl DiagnosticRunner {
                 continue;
             }
             let mut checks = Vec::new();
-            kind.run(config, &mut checks, self.probe_network).await;
+            kind.run(config, &mut checks, self.probe_network, self.deep_scans)
+                .await;
             if kind.suppress_when_empty() && checks.is_empty() {
                 continue;
             }

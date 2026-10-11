@@ -471,6 +471,11 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
     if lower.contains("(malformed tool call)") || body_indicates_malformed_tool_call(lower) {
         return Some(FailoverReason::MalformedToolCall);
     }
+    // Same shape: the marker from `classify_status`, or a raw refusal body
+    // that reached the formatter without a status.
+    if lower.contains("(content policy)") || body_indicates_content_policy(lower) {
+        return Some(FailoverReason::ContentPolicy);
+    }
 
     // Disambiguation: a context-overflow phrase wins only when nothing in
     // the body signals a rate limit. Throttle bodies routinely embed token
@@ -586,4 +591,43 @@ pub fn classify_402(error_msg: &str) -> FailoverReason {
     } else {
         FailoverReason::Billing
     }
+}
+
+/// Phrases a provider uses when it refused the request on content grounds.
+/// The refusal is about the conversation itself, so a retry, a key rotation,
+/// or a backoff ladder cannot change the verdict; only a different provider
+/// (or a different request) can.
+const CONTENT_POLICY_NEEDLES: &[&str] = &[
+    "data may contain inappropriate content",
+    "data_inspection_failed",
+    "content_policy_violation",
+    "violates our usage policies",
+    "responsibleaipolicyviolation",
+    "content exists risk",
+];
+
+/// True when the body is a content-policy refusal, whatever status wraps it
+/// (some gateways send one as a 502).
+pub(crate) fn body_indicates_content_policy(body: &str) -> bool {
+    matches_any(&body.to_ascii_lowercase(), CONTENT_POLICY_NEEDLES)
+}
+
+/// The output cap a credit-limited 402 says the account can still pay for.
+///
+/// OpenRouter answers a request whose `max_tokens` outruns the remaining
+/// credit with "You requested up to 56272 tokens, but can only afford 12000".
+/// The account still has credit; only the requested cap is too high. The
+/// number after "afford" is that cap. `None` when the body carries no such
+/// figure, including a zero (nothing is affordable, which is plain billing).
+pub fn affordable_max_tokens(body: &str) -> Option<u32> {
+    let lower = body.to_ascii_lowercase();
+    let idx = lower.find("afford")?;
+    let rest = &lower[idx + "afford".len()..];
+    let start = rest.find(|c: char| c.is_ascii_digit())?;
+    let digits: String = rest[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(char::is_ascii_digit)
+        .collect();
+    digits.parse::<u32>().ok().filter(|n| *n > 0)
 }

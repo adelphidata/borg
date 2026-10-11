@@ -146,6 +146,11 @@ fn sanitize_for_summarizer(messages: &[Message]) -> Vec<Message> {
                 return m.clone();
             }
             let mut cleaned = m.clone();
+            // Stored provider reasoning is bound to the model that produced
+            // it; the summarizer is a different call and must not see it.
+            cleaned.reasoning_blocks = None;
+            cleaned.reasoning_content = None;
+            cleaned.reasoning_model = None;
             match &m.content {
                 Some(MessageContent::Text(t)) => {
                     cleaned.content = Some(MessageContent::Text(strip_reasoning_traces(t)));
@@ -649,6 +654,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -665,6 +673,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: Some(seq),
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -1178,6 +1189,9 @@ mod tests {
                 tool_call_id: None,
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             },
         ];
         let sanitized = sanitize_for_summarizer(&history);
@@ -1200,6 +1214,42 @@ mod tests {
             "trace in Parts must be stripped"
         );
         assert!(a2.contains("Answer: 42"), "Parts answer must survive");
+    }
+
+    /// Stored provider reasoning (signed Anthropic blocks, DeepSeek-style
+    /// `reasoning_content`, and the model tag) is bound to the model that
+    /// produced it. The summarizer is a different call, so the copy it gets
+    /// must carry none of it — while the answer text and tool calls survive.
+    #[test]
+    fn sanitize_for_summarizer_drops_stored_provider_reasoning() {
+        let mut turn = Message::assistant("Reading the file.");
+        turn.tool_calls = Some(vec![crate::types::ToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: crate::types::FunctionCall {
+                name: "fs_read".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        turn.reasoning_blocks = Some(vec![
+            serde_json::json!({"type": "thinking", "thinking": "t", "signature": "s"}),
+        ]);
+        turn.reasoning_content = Some("because".into());
+        turn.reasoning_model = Some("deepseek-reasoner".into());
+
+        let sanitized = sanitize_for_summarizer(&[Message::user("go"), turn]);
+        let a = &sanitized[1];
+        assert!(
+            a.reasoning_blocks.is_none(),
+            "signed blocks must not reach the summarizer"
+        );
+        assert!(
+            a.reasoning_content.is_none(),
+            "reasoning_content must not reach the summarizer"
+        );
+        assert!(a.reasoning_model.is_none());
+        assert_eq!(a.text_content(), Some("Reading the file."));
+        assert_eq!(a.tool_calls.as_ref().map(Vec::len), Some(1));
     }
 
     /// Serve one canned SSE summary and return the base URL to point a client at.

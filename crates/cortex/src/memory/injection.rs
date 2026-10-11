@@ -59,12 +59,15 @@ static INJECTION_PATTERNS: LazyLock<Vec<(regex::Regex, InjectionCategory)>> = La
             InjectionCategory::Exfiltration,
         ),
         (
-            // Only reject zero-width joiners and bidi overrides that are
-            // commonly used for prompt-injection hiding. BOM (FEFF) and
-            // LTR/RTL marks (200E/200F) are legitimate in multilingual
-            // content and Windows-authored files — excluded here.
+            // Only reject zero-width joiners, bidi overrides and bidi
+            // isolates that are commonly used for prompt-injection hiding.
+            // BOM (FEFF) and LTR/RTL marks (200E/200F) are legitimate in
+            // multilingual content and Windows-authored files — excluded
+            // here. The shell policy applies the stricter full set through
+            // `crate::util::invisible`, because a command has no legitimate
+            // use for any of them.
             regex::Regex::new(
-                r"[\x{200B}\x{200C}\x{200D}\x{202A}-\x{202E}\x{2060}]"
+                r"[\x{200B}\x{200C}\x{200D}\x{202A}-\x{202E}\x{2060}\x{2066}-\x{2069}]"
             ).expect("compile-time valid regex"),
             InjectionCategory::InvisibleUnicode,
         ),
@@ -152,6 +155,14 @@ mod tests {
             ),
             (
                 "bidi override: \u{202E}reversed",
+                Some(InjectionCategory::InvisibleUnicode),
+            ),
+            (
+                "bidi isolate: \u{2066}hidden\u{2069}",
+                Some(InjectionCategory::InvisibleUnicode),
+            ),
+            (
+                "first strong isolate: \u{2068}x",
                 Some(InjectionCategory::InvisibleUnicode),
             ),
             // Negative: false-positive guards documented inline at injection.rs:40-66.

@@ -112,6 +112,7 @@ async fn run_and_read_output(config: &Config, task_id: &str) -> Option<String> {
         deliver_celebration: Arc::new(|cfg, c| {
             Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
         }),
+        shutdown_process: Arc::new(|| {}),
     };
     let cfg = config.clone();
     let shutdown_for_run = shutdown.clone();

@@ -676,7 +676,9 @@ fn recover_stale_runs_marks_failed() {
     db.start_task_run("t1", 1000).expect("start");
     db.start_task_run("t1", 2000).expect("start");
 
-    let count = db.recover_stale_runs("Daemon crashed").expect("recover");
+    let count = db
+        .recover_stale_runs("Daemon crashed", &Default::default())
+        .expect("recover");
     assert_eq!(count, 2);
 
     let runs = db.task_run_history("t1", 10).expect("history");
@@ -705,7 +707,9 @@ fn recover_stale_runs_ignores_completed() {
     db.record_task_run("t1", 2000, 300, None, Some("err"))
         .expect("record");
 
-    let count = db.recover_stale_runs("Daemon crashed").expect("recover");
+    let count = db
+        .recover_stale_runs("Daemon crashed", &Default::default())
+        .expect("recover");
     assert_eq!(count, 0);
 }
 
@@ -741,7 +745,9 @@ fn recover_stale_runs_propagates_error_to_parent_last_error() {
     db.start_task_run("t1", 1000).expect("start t1");
     db.start_task_run("t2", 1100).expect("start t2");
 
-    let count = db.recover_stale_runs("Daemon crashed").expect("recover");
+    let count = db
+        .recover_stale_runs("Daemon crashed", &Default::default())
+        .expect("recover");
     assert_eq!(count, 2);
 
     let t1 = db.get_task_by_id("t1").expect("get").expect("some");
@@ -767,7 +773,8 @@ fn recover_stale_runs_does_not_overwrite_existing_last_error() {
         .expect("set retry");
 
     db.start_task_run("t1", 1000).expect("start");
-    db.recover_stale_runs("Daemon crashed").expect("recover");
+    db.recover_stale_runs("Daemon crashed", &Default::default())
+        .expect("recover");
 
     let t1 = db.get_task_by_id("t1").expect("get").expect("some");
     assert_eq!(
@@ -793,7 +800,8 @@ fn recover_stale_runs_does_not_touch_tasks_without_running_runs() {
     db.record_task_run("t1", 1000, 500, Some("ok"), None)
         .expect("record");
 
-    db.recover_stale_runs("Daemon crashed").expect("recover");
+    db.recover_stale_runs("Daemon crashed", &Default::default())
+        .expect("recover");
 
     let t1 = db.get_task_by_id("t1").expect("get").expect("some");
     assert!(
@@ -932,7 +940,7 @@ fn refresh_daemon_lock_updates_heartbeat() {
     assert!(db.acquire_daemon_lock(100, now).unwrap());
 
     // Refresh should succeed and update heartbeat
-    db.refresh_daemon_lock(100, now + 60).unwrap();
+    assert!(db.refresh_daemon_lock(100, now + 60).unwrap());
 
     // Verify heartbeat was updated (lock should still be held)
     assert!(db.is_daemon_lock_held());
@@ -950,11 +958,10 @@ fn refresh_daemon_lock_stolen_returns_error() {
         .unwrap();
 
     // Refresh with original PID should fail (0 rows matched)
-    let result = db.refresh_daemon_lock(100, now + 60);
-    assert!(result.is_err(), "refresh should fail when lock is stolen");
+    let refreshed = db.refresh_daemon_lock(100, now + 60).unwrap();
     assert!(
-        result.unwrap_err().to_string().contains("lock lost"),
-        "error should mention lock lost"
+        !refreshed,
+        "refresh must report the lock as lost when stolen"
     );
 }
 
@@ -966,8 +973,11 @@ fn refresh_daemon_lock_after_release_returns_error() {
     db.release_daemon_lock(100).unwrap();
 
     // Refresh after release should fail (no row to update)
-    let result = db.refresh_daemon_lock(100, now + 60);
-    assert!(result.is_err(), "refresh should fail after release");
+    let refreshed = db.refresh_daemon_lock(100, now + 60).unwrap();
+    assert!(
+        !refreshed,
+        "refresh must report the lock as lost after release"
+    );
 }
 
 // ── Tamper-proof validation tests ──

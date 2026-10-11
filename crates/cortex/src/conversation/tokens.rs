@@ -56,7 +56,14 @@ pub(super) fn message_tokens(msg: &Message) -> usize {
                 .sum()
         })
         .unwrap_or(0);
-    role_overhead + content_tokens + tool_call_tokens
+    // Stored reasoning goes back on the wire for the providers that require
+    // the echo, so it is prompt budget like any other field of the turn.
+    let reasoning_tokens = msg
+        .reasoning_content
+        .as_deref()
+        .map(estimate_tokens)
+        .unwrap_or(0);
+    role_overhead + content_tokens + tool_call_tokens + reasoning_tokens
 }
 
 /// Total estimated tokens for a conversation history.
@@ -96,6 +103,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -119,6 +129,21 @@ mod tests {
         assert!(tokens > 4, "should include overhead + tool call tokens");
     }
 
+    /// Stored `reasoning_content` is echoed to the provider on the next
+    /// request of the loop, so it counts toward the turn's prompt budget by
+    /// its own text size.
+    #[test]
+    fn message_tokens_count_stored_reasoning_content() {
+        let without = make_tool_call_msg("", "id1", "read_memory");
+        let reasoning = "I should read the file before I change it. ".repeat(20);
+        let mut with = without.clone();
+        with.reasoning_content = Some(reasoning.clone());
+        assert_eq!(
+            message_tokens(&with),
+            message_tokens(&without) + estimate_tokens(&reasoning)
+        );
+    }
+
     /// Build an assistant message carrying a single tool call with explicit
     /// id / type / arguments, so tests can probe which fields the estimator counts.
     fn tool_call_with(id: &str, call_type: &str, name: &str, args: &str) -> Message {
@@ -136,6 +161,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         }
     }
 
@@ -192,6 +220,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         assert_eq!(message_tokens(&msg), 4); // just overhead
     }
@@ -214,6 +245,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let tokens = message_tokens(&msg);
         // Should include overhead + text tokens + IMAGE_TOKEN_ESTIMATE
@@ -235,6 +269,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let large_audio = Message {
             role: Role::User,
@@ -249,6 +286,9 @@ mod tests {
             tool_call_id: None,
             timestamp: None,
             seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         };
         let small_tokens = message_tokens(&small_audio);
         let large_tokens = message_tokens(&large_audio);

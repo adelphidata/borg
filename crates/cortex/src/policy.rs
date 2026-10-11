@@ -137,8 +137,9 @@ const HARDCODED_DENY: &[&str] = &[
     "* >> /etc/sudoers*",
     // `bash -c` / `eval` of base64-decoded payloads. The standard
     // pattern for hiding intent from log scrapers and reviewers.
-    "*base64 -d* | *sh",
-    "*base64 --decode* | *sh",
+    // Pipe-to-interpreter forms are covered pipe-aware by
+    // `is_decode_piped_to_interpreter`, which also handles `openssl`
+    // decoders, `python`/`perl`/`node` sinks and unspaced pipes.
     "bash -c *base64*",
     "sh -c *base64 -d*",
     "eval *base64*",
@@ -1740,8 +1741,12 @@ fn uploads_blocked_credential(fragment: &str) -> bool {
 pub enum DenyReason {
     /// NUL or CR control characters make command parsing ambiguous.
     ControlCharacters,
+    /// Zero-width or bidi-override scalars hide the command's real shape.
+    InvisibleUnicode,
     /// A network download piped straight into a shell/interpreter.
     DownloadPipedToInterpreter,
+    /// A base64/openssl decode piped straight into a shell/interpreter.
+    DecodePipedToInterpreter,
     /// Target paths piped into a recursive delete (`… | xargs rm -rf`).
     PipedRecursiveDelete,
     /// A blocked credential file handed to a curl/wget upload flag, or piped
@@ -1766,7 +1771,9 @@ impl DenyReason {
     pub fn audit_label(&self) -> &'static str {
         match self {
             Self::ControlCharacters => "control_characters",
+            Self::InvisibleUnicode => "invisible_unicode",
             Self::DownloadPipedToInterpreter => "download_piped_to_interpreter",
+            Self::DecodePipedToInterpreter => "decode_piped_to_interpreter",
             Self::PipedRecursiveDelete => "piped_recursive_delete",
             Self::CredentialUpload => "credential_upload",
             Self::ContainerDaemonRedirect => "container_daemon_redirect",
@@ -1786,9 +1793,18 @@ impl DenyReason {
             Self::ControlCharacters => "the command contains NUL or CR control characters. \
                  Re-issue it as plain single-line text; chain steps with `&&` or `;`."
                 .to_string(),
+            Self::InvisibleUnicode => "the command contains invisible or bidirectional \
+                 Unicode characters (zero-width space, RTL override, tag characters), so \
+                 what it displays as is not what the shell would run. Retype the command \
+                 in plain text instead of pasting it."
+                .to_string(),
             Self::DownloadPipedToInterpreter => "it pipes a network download straight into an \
                  interpreter. Download to a file first, inspect it, then run the file as a \
                  separate command."
+                .to_string(),
+            Self::DecodePipedToInterpreter => "it pipes a base64 or openssl decode straight \
+                 into an interpreter, which hides what would run. Decode to a file first, \
+                 inspect it, then run the file as a separate command."
                 .to_string(),
             Self::PipedRecursiveDelete => "it pipes target paths into a recursive delete. Run \
                  the delete directly against explicit paths instead."
@@ -1886,6 +1902,12 @@ fn catastrophic_deny_reason_at_depth(command: &str, depth: u8) -> Option<DenyRea
     if command.contains('\r') || command.contains('\0') {
         return Some(DenyReason::ControlCharacters);
     }
+    // Zero-width and bidi scalars let a command display as one thing and
+    // execute as another (`rm` with a zero-width space is not `rm`; an RTL
+    // override renders `sh | base64 -d` reversed). No shell command needs them.
+    if crate::util::invisible::has_invisible_or_bidi(command) {
+        return Some(DenyReason::InvisibleUnicode);
+    }
 
     let deob_whole = deobfuscate(command);
 
@@ -1909,6 +1931,9 @@ fn catastrophic_deny_reason_at_depth(command: &str, depth: u8) -> Option<DenyRea
         for frag in command_fragments(source) {
             if is_download_piped_to_interpreter(frag) {
                 return Some(DenyReason::DownloadPipedToInterpreter);
+            }
+            if is_decode_piped_to_interpreter(frag) {
+                return Some(DenyReason::DecodePipedToInterpreter);
             }
             if pipeline_xargs_rm_is_catastrophic(frag) {
                 return Some(DenyReason::PipedRecursiveDelete);
@@ -2202,6 +2227,55 @@ fn is_download_piped_to_interpreter(fragment: &str) -> bool {
         }
     }
     false
+}
+
+/// True if a pipeline stage decodes base64: `base64`/`gbase64` with `-d`,
+/// `-D`, `--decode`, or a combined short flag that contains `d` (`-di`), or
+/// `openssl base64`/`openssl enc` with `-d` anywhere. Leading privilege and
+/// no-op wrappers (`sudo base64 -d`) are stripped first.
+fn stage_decodes_base64(stage: &str) -> bool {
+    let mut tokens: Vec<String> = stage.split_whitespace().map(str::to_string).collect();
+    strip_wrappers_and_control_flow(&mut tokens);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    // Case-fold for case-insensitive macOS APFS, as the other stage checks do.
+    let base = strip_path_prefix(first).to_ascii_lowercase();
+    let rest = &tokens[1..];
+    match base.as_str() {
+        "base64" | "gbase64" => rest.iter().any(|t| {
+            t == "--decode"
+                || (t.starts_with('-')
+                    && !t.starts_with("--")
+                    && t[1..].chars().any(|c| c == 'd' || c == 'D'))
+        }),
+        "openssl" => {
+            rest.first()
+                .is_some_and(|sub| matches!(sub.to_ascii_lowercase().as_str(), "base64" | "enc"))
+                && rest.iter().any(|t| t == "-d")
+        }
+        _ => false,
+    }
+}
+
+/// True if `fragment` (a single pipeline, no `;`/`&&`/`||`) decodes base64
+/// and pipes the result into a code interpreter — the standard trick for
+/// hiding a payload from reviewers and log scrapers. Pipe-aware like
+/// [`is_download_piped_to_interpreter`]: robust to pipe spacing, interpreter
+/// flags (`sh -x`, `bash -s`), version suffixes (`python3`), and wrappers.
+/// A decode piped into `grep`, `jq`, or a file is not an execution.
+fn is_decode_piped_to_interpreter(fragment: &str) -> bool {
+    let stages: Vec<&str> = fragment
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if stages.len() < 2 {
+        return false;
+    }
+    (1..stages.len()).any(|i| {
+        stages[..i].iter().any(|s| stage_decodes_base64(s)) && stage_runs_interpreter(stages[i])
+    })
 }
 
 /// Environment variables that repoint a container CLI at a different daemon.
@@ -2974,7 +3048,9 @@ mod tests {
     fn every_deny_reason_guidance_is_actionable() {
         let variants = [
             DenyReason::ControlCharacters,
+            DenyReason::InvisibleUnicode,
             DenyReason::DownloadPipedToInterpreter,
+            DenyReason::DecodePipedToInterpreter,
             DenyReason::PipedRecursiveDelete,
             DenyReason::CredentialUpload,
             DenyReason::ContainerDaemonRedirect,
@@ -2991,7 +3067,9 @@ mod tests {
         for reason in &variants {
             match reason {
                 DenyReason::ControlCharacters
+                | DenyReason::InvisibleUnicode
                 | DenyReason::DownloadPipedToInterpreter
+                | DenyReason::DecodePipedToInterpreter
                 | DenyReason::PipedRecursiveDelete
                 | DenyReason::CredentialUpload
                 | DenyReason::ContainerDaemonRedirect
@@ -4702,12 +4780,100 @@ mod tests {
     #[test]
     fn base64_no_false_positives() {
         // Encoding (no pipe-to-shell, no eval) is benign. Decoding to a
-        // file is benign. Only pipe-into-shell / eval forms are denied.
+        // file, or into a non-executing consumer, is benign. Only
+        // pipe-into-interpreter / eval forms are denied.
         assert_decisions(&[
             ("base64 file.bin > out.b64", PolicyDecision::AutoApprove),
             ("echo hello | base64", PolicyDecision::AutoApprove),
             (
                 "echo Zm9vCg== | base64 -d > out.txt",
+                PolicyDecision::AutoApprove,
+            ),
+            ("base64 -d f > out", PolicyDecision::AutoApprove),
+            ("base64 -d f | jq .", PolicyDecision::AutoApprove),
+            ("base64 -d f | grep sh", PolicyDecision::AutoApprove),
+            ("base64 -d x | grep sh", PolicyDecision::AutoApprove),
+            ("base64 -w0 f | sh", PolicyDecision::AutoApprove),
+            (
+                "openssl enc -a -in f | grep key",
+                PolicyDecision::AutoApprove,
+            ),
+        ]);
+    }
+
+    /// A base64/openssl decode piped into an interpreter is denied per pipe
+    /// stage: unspaced pipes, interpreter flags, non-shell interpreters,
+    /// `-D`/combined short flags, and both `openssl` decoder spellings.
+    #[test]
+    fn decode_piped_to_interpreter_is_denied_per_stage() {
+        let policy = ExecutionPolicy::default();
+        for cmd in [
+            "base64 -d f|sh",
+            "base64 -d f | sh -x",
+            "base64 -d f | bash -s",
+            "base64 -d f | python3",
+            "base64 -d f | perl",
+            "base64 -d f | node",
+            "base64 -d f | fish",
+            "base64 -D f | zsh",
+            "base64 -di f | sh",
+            "gbase64 --decode f | sh",
+            "sudo base64 -d f | sudo bash",
+            "cat f | base64 -d | tee x | sh",
+            "openssl enc -d -base64 -in f | sh",
+            "openssl enc -a -d -in f | sh",
+            "openssl base64 -d -in f | bash",
+            "BASE64 -d f | SH",
+        ] {
+            let reason = policy
+                .deny_reason(cmd)
+                .unwrap_or_else(|| panic!("{cmd:?} must be denied"));
+            assert_eq!(reason, DenyReason::DecodePipedToInterpreter, "{cmd:?}");
+        }
+        // Inside a shell payload the deobfuscated fragment still reaches the
+        // pipe-aware pass; the `sh -c *base64 -d*` glob may claim it first,
+        // but either way it is denied.
+        assert_decisions(&[("sh -c 'base64 -d f|sh'", PolicyDecision::Deny)]);
+    }
+
+    /// Invisible and bidi scalars hide the real shape of a command; emoji
+    /// joiners and ordinary non-ASCII text do not.
+    #[test]
+    fn invisible_unicode_in_command_is_denied() {
+        let policy = ExecutionPolicy::default();
+        for cmd in [
+            "echo \u{202E}abc",
+            "rm\u{200B} -rf x",
+            "echo \u{2066}x\u{2069}",
+            "\u{FEFF}ls",
+            "ls \u{E0041}",
+        ] {
+            let reason = policy
+                .deny_reason(cmd)
+                .unwrap_or_else(|| panic!("{} must be denied", cmd.escape_unicode()));
+            assert_eq!(
+                reason,
+                DenyReason::InvisibleUnicode,
+                "{}",
+                cmd.escape_unicode()
+            );
+            assert!(
+                reason
+                    .guidance()
+                    .contains("Retype the command in plain text"),
+                "guidance tells the model to retype: {}",
+                reason.guidance()
+            );
+        }
+        assert_decisions(&[
+            (
+                "git commit -m \"\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\"",
+                PolicyDecision::AutoApprove,
+            ),
+            ("echo caf\u{e9}", PolicyDecision::AutoApprove),
+            // Script-mandatory joiners (Persian ZWNJ) are plain text.
+            (
+                "git commit -m \"\u{645}\u{6cc}\u{200c}\u{634}\u{648}\u{62f}\"",
                 PolicyDecision::AutoApprove,
             ),
         ]);

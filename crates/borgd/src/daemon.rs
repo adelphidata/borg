@@ -482,6 +482,20 @@ async fn start_orchestrator_extras(
                     );
                 }
             }
+            // The dispatcher asks for a whole-process stop when it loses the
+            // daemon lock: the same broadcast SIGTERM uses, so the gRPC
+            // servers drain too and the service manager restarts a complete
+            // daemon instead of one with dead subsystems behind live servers.
+            let process_shutdown_tx = shutdown_tx.clone();
+            let shutdown_process: crate::scheduler::ProcessShutdown =
+                std::sync::Arc::new(move || {
+                    if process_shutdown_tx.send(()).is_err() {
+                        tracing::warn!(
+                            "process shutdown requested but nothing is listening — the servers \
+                         have already stopped"
+                        );
+                    }
+                });
             let handles = orchestrator::start(
                 registry.clone(),
                 core_config,
@@ -490,6 +504,7 @@ async fn start_orchestrator_extras(
                 cost_event_sink.clone(),
                 goal_bus.clone(),
                 grpc_web_slot.clone(),
+                shutdown_process,
             )
             .await;
             grpc::AdminExtras {

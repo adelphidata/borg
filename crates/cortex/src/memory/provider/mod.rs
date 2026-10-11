@@ -221,8 +221,12 @@ pub trait MemoryProvider: Send + Sync {
 }
 
 /// Common-path guard wrapper for [`MemoryProvider::write`]. Every backend
-/// gets the same prompt-injection scan and 20k-token cap — defined once
-/// here so a new provider can't silently skip either invariant.
+/// gets the same prompt-injection scan, secret redaction, and 20k-token cap
+/// — defined once here so a new provider can't silently skip any invariant.
+///
+/// Redaction is unconditional: an external provider is third-party egress,
+/// so a pasted API key must never leave the machine regardless of the
+/// `secret_detection` setting that governs local transcript scrubbing.
 ///
 /// Mirrors the legacy `write_memory_db` behavior (`memory::write_memory_db`)
 /// so swapping providers doesn't change failure messages.
@@ -235,6 +239,7 @@ pub async fn write_guarded(
     mode: WriteMode,
 ) -> Result<String, MemoryError> {
     scan_for_injection(content).map_err(|e| MemoryError::Invariant(e.to_string()))?;
+    let content = &crate::security::secrets::redact_secrets(content);
     let projected = match mode {
         WriteMode::Overwrite => estimate_tokens(content),
         WriteMode::Append => {
@@ -272,6 +277,23 @@ pub async fn write_guarded(
     }
     provider.write(ctx, scope, name, content, mode).await?;
     Ok(format!("Written to memory: {name} (scope: {scope})"))
+}
+
+/// Common-path guard wrapper for [`MemoryProvider::search`]: the query is
+/// redacted before it leaves the machine. A user turn that pastes a token
+/// ("why does ghp_… get 401?") becomes the ranking query verbatim, and an
+/// external provider would otherwise receive — and often persist — it.
+pub async fn search_guarded(
+    provider: &dyn MemoryProvider,
+    ctx: &MemCtx<'_>,
+    query: &SearchQuery,
+) -> Result<Vec<SearchHit>, MemoryError> {
+    let redacted = SearchQuery {
+        query: crate::security::secrets::redact_secrets(&query.query),
+        max_results: query.max_results,
+        min_score: query.min_score,
+    };
+    provider.search(ctx, &redacted).await
 }
 
 /// Convenience: format a vec of [`SearchHit`] using the same shape the

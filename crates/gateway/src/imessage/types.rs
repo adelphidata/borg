@@ -5,8 +5,14 @@
 pub struct ReplyContext {
     /// Text of the parent message.
     pub text: String,
-    /// Sender identifier of the parent message (phone or email; `None` if from self).
+    /// Sender identifier of the parent message (phone or email), when the
+    /// parent carried a handle. Ignored when `from_self` is set: chat.db
+    /// stamps an outgoing 1:1 message with the *recipient's* handle, so the
+    /// handle on an own message names the other party, not the author.
     pub sender: Option<String>,
+    /// Whether the parent was written by this Mac's account (`is_from_me`),
+    /// i.e. it was the assistant's own bubble.
+    pub from_self: bool,
 }
 
 /// Metadata for an attachment surfaced from chat.db.

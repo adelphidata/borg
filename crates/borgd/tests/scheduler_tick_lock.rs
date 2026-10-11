@@ -88,6 +88,7 @@ async fn dispatcher_skips_claim_while_external_holder_owns_tick_lock() {
         deliver_celebration: Arc::new(|cfg, c| {
             Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
         }),
+        shutdown_process: Arc::new(|| {}),
     };
     let cfg = Config::default();
     let shutdown_for_run = shutdown.clone();

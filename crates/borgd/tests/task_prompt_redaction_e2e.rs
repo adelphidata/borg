@@ -141,6 +141,7 @@ impl Harness {
             deliver_celebration: Arc::new(|cfg, c| {
                 Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
             }),
+            shutdown_process: Arc::new(|| {}),
         };
         let cfg = self.config.clone();
         let shutdown_for_run = shutdown.clone();

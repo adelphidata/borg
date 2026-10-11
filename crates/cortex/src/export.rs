@@ -203,6 +203,9 @@ async fn load_session(db: &Database, session_id: &str) -> Result<Session> {
             tool_call_id: mr.tool_call_id,
             timestamp: mr.timestamp,
             seq: Some(mr.id),
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
         });
     }
 
@@ -819,6 +822,9 @@ mod tests {
                     tool_call_id: None,
                     timestamp: None,
                     seq: None,
+                    reasoning_blocks: None,
+                    reasoning_content: None,
+                    reasoning_model: None,
                 },
                 Message {
                     role: Role::Tool,
@@ -827,6 +833,9 @@ mod tests {
                     tool_call_id: Some("tc1".into()),
                     timestamp: None,
                     seq: None,
+                    reasoning_blocks: None,
+                    reasoning_content: None,
+                    reasoning_model: None,
                 },
             ],
         };
@@ -861,6 +870,9 @@ mod tests {
                 tool_call_id: Some("tc1".into()),
                 timestamp: None,
                 seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
             }],
         };
         let out = render_markdown(&session);

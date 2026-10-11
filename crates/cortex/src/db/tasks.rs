@@ -408,6 +408,22 @@ impl Database {
         Ok(marked > 0)
     }
 
+    /// Stamp `scheduled_tasks.last_error` for `task_id` when it is currently
+    /// empty, so a failure that happened outside the run body still reaches
+    /// `borg tasks` and `tasks_with_last_error()`. NULL-guarded like
+    /// `recover_stale_runs`: a more specific diagnosis already on the row
+    /// wins over this generic one.
+    pub async fn note_task_error_if_empty(&self, task_id: &str, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET last_error = ?2 \
+                 WHERE id = ?1 AND (last_error IS NULL OR last_error = '')",
+                params!(task_id, error),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// The status of the newest finished run before `before_run_id`, ignoring
     /// runs still in flight.
     ///
@@ -946,7 +962,12 @@ impl Database {
         Ok(updated)
     }
 
-    /// Mark any 'running' task_runs as 'failed' (from a crashed daemon). Returns count.
+    /// Mark 'running' task_runs as 'failed' (from a crashed daemon). Returns count.
+    ///
+    /// Runs in `live_run_ids` are left untouched: they belong to executions
+    /// still polling in *this* process (a supervisor respawn of the dispatcher
+    /// does not stop the runs the previous incarnation spawned), and their
+    /// own future will write the final status.
     ///
     /// Also propagates `error_msg` to the parent `scheduled_tasks.last_error`
     /// for affected tasks — but only when `last_error` is currently NULL, so
@@ -955,29 +976,55 @@ impl Database {
     /// Without this, daemon-crash victims show as failed in `task_runs` but
     /// invisible to anything reading `scheduled_tasks.last_error` (e.g. the
     /// `borg tasks` listing, `tasks_with_last_error()`).
-    pub async fn recover_stale_runs(&self, error_msg: &str) -> Result<u64> {
+    pub async fn recover_stale_runs(
+        &self,
+        error_msg: &str,
+        live_run_ids: &std::collections::HashSet<i64>,
+    ) -> Result<u64> {
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<u64> = async {
-            self.conn
-                .execute(
-                    "UPDATE scheduled_tasks SET last_error = ?1
-             WHERE last_error IS NULL
-               AND id IN (SELECT DISTINCT task_id FROM task_runs WHERE status = ?2)",
-                    params!(error_msg, crate::tasks::RUN_STATUS_RUNNING),
-                )
-                .await?;
-            let updated = self
+            let mut rows = self
                 .conn
-                .execute(
-                    "UPDATE task_runs SET status = ?1, error = ?2
-             WHERE status = ?3",
-                    params!(
-                        crate::tasks::RUN_STATUS_FAILED,
-                        error_msg,
-                        crate::tasks::RUN_STATUS_RUNNING
-                    ),
+                .query(
+                    "SELECT id, task_id FROM task_runs WHERE status = ?1",
+                    params!(crate::tasks::RUN_STATUS_RUNNING),
                 )
                 .await?;
+            let mut stale: Vec<(i64, String)> = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let id = row.get::<i64>(0)?;
+                if live_run_ids.contains(&id) {
+                    tracing::info!(
+                        run_id = id,
+                        "stale-run recovery: run is still executing in-process — leaving it"
+                    );
+                    continue;
+                }
+                stale.push((id, row.get::<String>(1)?));
+            }
+            let mut updated = 0u64;
+            for (run_id, task_id) in &stale {
+                self.conn
+                    .execute(
+                        "UPDATE scheduled_tasks SET last_error = ?1
+             WHERE last_error IS NULL AND id = ?2",
+                        params!(error_msg, task_id.as_str()),
+                    )
+                    .await?;
+                updated += self
+                    .conn
+                    .execute(
+                        "UPDATE task_runs SET status = ?1, error = ?2
+             WHERE id = ?3 AND status = ?4",
+                        params!(
+                            crate::tasks::RUN_STATUS_FAILED,
+                            error_msg,
+                            *run_id,
+                            crate::tasks::RUN_STATUS_RUNNING
+                        ),
+                    )
+                    .await?;
+            }
             Ok(updated)
         }
         .await;
@@ -1070,8 +1117,13 @@ impl Database {
     }
 
     /// Refresh the daemon lock heartbeat timestamp.
-    /// Returns an error if the lock was stolen (0 rows updated).
-    pub async fn refresh_daemon_lock(&self, pid: u32, now: i64) -> Result<()> {
+    ///
+    /// The two failure modes are deliberately distinct: `Ok(false)` means the
+    /// lock is no longer ours (stolen or released — another daemon may be
+    /// dispatching, so the caller must stop at once), while `Err` is a
+    /// transient store failure (busy timeout, I/O) that says nothing about
+    /// who holds the lock and can be retried until the row would go stale.
+    pub async fn refresh_daemon_lock(&self, pid: u32, now: i64) -> Result<bool> {
         let rows = self
             .conn
             .execute(
@@ -1079,10 +1131,7 @@ impl Database {
                 params!(now, pid as i64),
             )
             .await?;
-        if rows == 0 {
-            anyhow::bail!("daemon lock lost: no row matched pid {pid} (lock stolen or released)");
-        }
-        Ok(())
+        Ok(rows > 0)
     }
 
     /// Returns true if a daemon holds a non-stale lock (heartbeat within 300s).
@@ -1706,6 +1755,88 @@ mod tests {
         let db = test_db().await;
         assert_eq!(db.daemon_lock_orphan_age(1_000, 300).await.unwrap(), None);
         assert!(!db.clear_stale_daemon_lock(1_000, 300).await.unwrap());
+    }
+
+    // ── refresh_daemon_lock: lost vs transient ──
+
+    #[tokio::test]
+    async fn refresh_reports_a_held_lock_as_refreshed_and_a_lost_one_as_lost() {
+        let db = test_db().await;
+        assert!(db.acquire_daemon_lock(100, 1_000).await.unwrap());
+        assert!(
+            db.refresh_daemon_lock(100, 1_060).await.unwrap(),
+            "a held lock refreshes"
+        );
+        assert_eq!(
+            db.daemon_lock_snapshot().await.unwrap(),
+            Some((100, 1_060)),
+            "the heartbeat must advance"
+        );
+
+        // Theft: another pid now owns the row.
+        db.conn
+            .execute("UPDATE daemon_lock SET pid = 999 WHERE id = 1", ())
+            .await
+            .unwrap();
+        assert!(
+            !db.refresh_daemon_lock(100, 1_120).await.unwrap(),
+            "a stolen lock is reported as lost, not as a store error"
+        );
+        assert_eq!(
+            db.daemon_lock_snapshot().await.unwrap(),
+            Some((999, 1_060)),
+            "a lost lock must not be written to"
+        );
+
+        // Release: no row at all.
+        db.release_daemon_lock(999).await.unwrap();
+        assert!(!db.refresh_daemon_lock(100, 1_180).await.unwrap());
+    }
+
+    // ── recover_stale_runs: live runs survive ──
+
+    #[tokio::test]
+    async fn recover_stale_runs_leaves_live_in_process_runs_alone() {
+        let db = test_db().await;
+        db.create_task(&cron_task("t-live", "UTC", Some(0)))
+            .await
+            .unwrap();
+        db.create_task(&cron_task("t-dead", "UTC", Some(0)))
+            .await
+            .unwrap();
+        let live = db.start_task_run("t-live", 100).await.unwrap();
+        let dead = db.start_task_run("t-dead", 100).await.unwrap();
+
+        let mut live_ids = std::collections::HashSet::new();
+        live_ids.insert(live);
+        let recovered = db
+            .recover_stale_runs("Daemon crashed during execution", &live_ids)
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1, "only the dead run is recovered");
+
+        let live_row = db.task_run_history("t-live", 1).await.unwrap().remove(0);
+        assert_eq!(live_row.id, live);
+        assert_eq!(live_row.status, crate::tasks::RUN_STATUS_RUNNING);
+        assert_eq!(live_row.error, None, "a live run gets no crash error");
+        let live_task = db.get_task_by_id("t-live").await.unwrap().unwrap();
+        assert_eq!(
+            live_task.last_error, None,
+            "the live run's task must not be marked as crashed"
+        );
+
+        let dead_row = db.task_run_history("t-dead", 1).await.unwrap().remove(0);
+        assert_eq!(dead_row.id, dead);
+        assert_eq!(dead_row.status, crate::tasks::RUN_STATUS_FAILED);
+        assert_eq!(
+            dead_row.error.as_deref(),
+            Some("Daemon crashed during execution")
+        );
+        let dead_task = db.get_task_by_id("t-dead").await.unwrap().unwrap();
+        assert_eq!(
+            dead_task.last_error.as_deref(),
+            Some("Daemon crashed during execution")
+        );
     }
 }
 

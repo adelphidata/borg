@@ -13,7 +13,7 @@ use super::types::ChatEvent;
 /// to enable the channel.
 pub fn verify_google_chat_token(event: &ChatEvent, expected_token: Option<&str>) -> Result<()> {
     let expected = match expected_token {
-        Some(t) if !t.is_empty() => t,
+        Some(t) if !t.trim().is_empty() => t,
         _ => {
             bail!(
                 "Google Chat webhook verification token not configured — \
@@ -82,13 +82,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_expected_token_fails_closed() {
-        let event = make_event(Some("some-token"));
-        let result = verify_google_chat_token(&event, Some(""));
-        assert!(
-            result.is_err(),
-            "empty expected token must be treated as unconfigured"
-        );
+    fn empty_or_blank_expected_token_fails_closed() {
+        // A blank configured token is as unconfigured as an empty one — even
+        // when the event carries the identical blank value.
+        for expected in ["", "  ", "\t\n"] {
+            for event_token in [Some("some-token"), Some(expected)] {
+                let event = make_event(event_token);
+                let err = verify_google_chat_token(&event, Some(expected))
+                    .expect_err("blank expected token must be treated as unconfigured");
+                assert!(
+                    err.to_string().contains("not configured"),
+                    "expected {expected:?}: must fail at the unconfigured gate: {err}"
+                );
+            }
+        }
     }
 
     #[test]

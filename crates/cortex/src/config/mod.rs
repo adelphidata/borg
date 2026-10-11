@@ -850,14 +850,16 @@ impl Config {
 
     /// Resolve a credential by name: credential store first, then env var,
     /// then OS keychain fallback using the plugin naming convention.
-    /// Returns `None` if not found or empty.
+    /// Returns `None` if not found or blank. A whitespace-only value is
+    /// treated as unset: a secret of `"   "` would otherwise key an HMAC
+    /// verifier, and short keys are zero-padded so it signs like no key.
     pub fn resolve_credential_or_env(&self, name: &str) -> Option<String> {
         // 1. Config credential store (may itself be a keychain SecretRef)
         if let Some(cv) = self.credentials.get(name) {
             match cv.resolve() {
-                Ok(v) if !v.is_empty() => return Some(v),
+                Ok(v) if !v.trim().is_empty() => return Some(v),
                 Ok(_) => {
-                    tracing::warn!("Credential '{name}' resolved to empty string");
+                    tracing::warn!("Credential '{name}' resolved to a blank string");
                 }
                 Err(e) => {
                     tracing::warn!("Failed to resolve credential '{name}': {e}");
@@ -866,7 +868,7 @@ impl Config {
         }
 
         // 2. Environment variable
-        if let Some(v) = std::env::var(name).ok().filter(|t| !t.is_empty()) {
+        if let Some(v) = std::env::var(name).ok().filter(|t| !t.trim().is_empty()) {
             return Some(v);
         }
 

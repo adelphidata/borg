@@ -155,6 +155,20 @@ impl Agent {
             tool_call_id: None,
             timestamp: Some(chrono::Local::now().to_rfc3339()),
             seq: None,
+            // The reasoning that led to these calls rides on the message so
+            // the next request of this tool loop can replay it to the model
+            // that produced it (Anthropic signed blocks, DeepSeek-style
+            // `reasoning_content`). Taken, not cloned: it belongs to this
+            // stream only.
+            reasoning_blocks: {
+                let blocks = std::mem::take(&mut self.turn_reasoning_blocks);
+                (!blocks.is_empty()).then_some(blocks)
+            },
+            reasoning_content: {
+                let content = std::mem::take(&mut self.turn_reasoning_content);
+                (!content.is_empty()).then_some(content)
+            },
+            reasoning_model: self.turn_reasoning_model.take(),
         };
         // The assistant message and its invalid-call results are adjacent
         // rows: flush them as one batch (one transaction) instead of N+1.
@@ -696,7 +710,15 @@ impl Agent {
         if name.starts_with("mcp_") {
             let result = crate::mcp_clients::try_execute_tool(name, &raw_args).await?;
             return match result {
-                Some(text) => Ok(ToolOutput::Text(text)),
+                // An image-bearing result goes through the same vision gate
+                // as every other image-producing tool: a text-only model is
+                // told the pixels were dropped instead of answering blind.
+                Some(out) => Ok(crate::tool::vision::downgrade_for_non_vision_model(
+                    out,
+                    &self.config,
+                    "the MCP tool returned an image",
+                    "Ask the tool for a text description, or switch to a vision-capable model.",
+                )),
                 None => Err(anyhow::anyhow!("Unknown MCP tool: {name}")),
             };
         }

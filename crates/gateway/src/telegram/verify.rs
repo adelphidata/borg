@@ -7,11 +7,11 @@ use super::types::Update;
 
 /// Verify the `X-Telegram-Bot-Api-Secret-Token` header using constant-time comparison.
 ///
-/// Returns false if the configured `secret` is empty — an empty secret would
-/// silently match any caller supplying an empty header (or none at all on the
-/// header-empty path), turning the verifier into a no-op.
+/// Returns false if the configured `secret` is blank — an empty or
+/// whitespace-only secret would silently match any caller supplying the same
+/// placeholder header, turning the verifier into a no-op.
 pub fn verify_secret_token(headers: &HeaderMap, secret: &str) -> bool {
-    if secret.is_empty() {
+    if secret.trim().is_empty() {
         return false;
     }
 
@@ -70,13 +70,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_secret_rejects_any_header() {
+    fn empty_or_blank_secret_rejects_any_header() {
         // Regression: an empty configured secret used to verify against an
         // empty header — silent auth bypass for any caller who omitted the
-        // header. Empty secret must refuse outright.
-        assert!(!verify_secret_token(&make_headers(Some("")), ""));
-        assert!(!verify_secret_token(&make_headers(None), ""));
-        assert!(!verify_secret_token(&make_headers(Some("anything")), ""));
+        // header. A blank secret must refuse outright, even against a header
+        // carrying the identical blank value. (A newline is not a legal
+        // header byte, so the table stops at space and tab.)
+        for secret in ["", "   ", "\t"] {
+            for header in [Some(secret), None, Some("anything")] {
+                assert!(
+                    !verify_secret_token(&make_headers(header), secret),
+                    "secret {secret:?} header {header:?}"
+                );
+            }
+        }
     }
 
     #[test]

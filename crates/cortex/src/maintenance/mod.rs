@@ -25,7 +25,7 @@ mod budget;
 mod db_quarantine_prune;
 mod embeddings;
 mod fs_setup;
-mod fts;
+pub(crate) mod fts;
 mod gateway_recovery;
 mod issues;
 mod log_prune;
@@ -278,6 +278,25 @@ pub async fn apply_remediation_key(
                 }),
             }
         }),
+        fts::FTS_REMEDIATION_KEY => {
+            let report = fts::rebuild_all(db).await;
+            if !report.failed.is_empty() {
+                let errors: Vec<String> = report
+                    .failed
+                    .iter()
+                    .map(|(table, err)| format!("{table}: {err}"))
+                    .collect();
+                return Err(anyhow::anyhow!(
+                    "rebuilt {:?}; failed: {}",
+                    report.rebuilt,
+                    errors.join("; ")
+                ));
+            }
+            Ok(RemediationOutcome {
+                changed: !report.rebuilt.is_empty(),
+                embeddings: None,
+            })
+        }
         "locks.clear_orphan" => {
             let now = chrono::Utc::now().timestamp();
             db.clear_stale_daemon_lock(now, crate::doctor::DAEMON_LOCK_STALE_SECS)
@@ -752,7 +771,9 @@ async fn run_sqlite_and_gateway_housekeeping(
     //     next sweep). Without this, per-insert segments accumulate without
     //     bound and every MATCH / insert pays for the fragmentation.
     if let Err(e) = fts::merge_messages_fts_segments(db).await {
-        tracing::warn!("maintenance: messages_fts segment merge failed: {e}");
+        if !fts::log_corruption_once("maintenance: messages_fts segment merge", &e) {
+            tracing::warn!("maintenance: messages_fts segment merge failed: {e}");
+        }
     }
 
     // 5b. Gateway recovery probe. The orchestrator's respawn supervisor

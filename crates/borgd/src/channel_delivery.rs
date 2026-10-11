@@ -87,7 +87,9 @@ pub(crate) fn prepare_outbound<'a>(
     )
 }
 
-async fn send_threaded(
+/// Send `text` to `sender_id` on `channel`, inside `thread_id` when given:
+/// a Telegram forum topic, a Slack thread, or a Discord thread channel.
+pub(crate) async fn send_threaded(
     config: &Config,
     channel: &str,
     sender_id: &str,
@@ -107,7 +109,17 @@ async fn send_threaded(
             let chat_id: i64 = sender_id
                 .parse()
                 .map_err(|_| anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
-            let message_thread_id: Option<i64> = thread_id.and_then(|s| s.parse().ok());
+            let message_thread_id: Option<i64> = thread_id.and_then(|s| match s.parse() {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id = %s,
+                        chat_id,
+                        "Telegram thread id is not numeric; replying in the parent chat"
+                    );
+                    None
+                }
+            });
             client
                 .send_message(chat_id, text, None, None, message_thread_id)
                 .await

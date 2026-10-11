@@ -40,6 +40,9 @@ pub enum ErrorCategory {
     /// part of the conversation, so every retry replays it: this is the one
     /// error class the user has to act on before anything else can work.
     MalformedToolCall,
+    /// The provider refused the request on content grounds. Retrying the
+    /// same request gets the same verdict.
+    ContentPolicy,
     /// Unclassified error.
     Unknown,
 }
@@ -56,6 +59,7 @@ impl fmt::Display for ErrorCategory {
             Self::Timeout => write!(f, "timeout"),
             Self::ImageUnsupported => write!(f, "image_unsupported"),
             Self::MalformedToolCall => write!(f, "malformed_tool_call"),
+            Self::ContentPolicy => write!(f, "content_policy"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -79,6 +83,7 @@ impl std::str::FromStr for ErrorCategory {
             "timeout" => Self::Timeout,
             "image_unsupported" => Self::ImageUnsupported,
             "malformed_tool_call" => Self::MalformedToolCall,
+            "content_policy" => Self::ContentPolicy,
             "unknown" => Self::Unknown,
             _ => return Err(()),
         })
@@ -106,7 +111,11 @@ pub fn classify_error(raw: &str) -> ErrorCategory {
 
     match classify_error_text(raw) {
         Some(FailoverReason::RateLimit) => ErrorCategory::RateLimit,
-        Some(FailoverReason::Billing) => ErrorCategory::Billing,
+        // An unaffordable output cap only reaches the user once the lowered
+        // re-send also failed, which is a billing problem by then.
+        Some(FailoverReason::Billing) | Some(FailoverReason::OutputCapUnaffordable) => {
+            ErrorCategory::Billing
+        }
         Some(FailoverReason::Auth) | Some(FailoverReason::AuthPermanent) => ErrorCategory::Auth,
         Some(FailoverReason::Overloaded) => ErrorCategory::Overloaded,
         Some(FailoverReason::ContextOverflow) | Some(FailoverReason::PayloadTooLarge) => {
@@ -130,6 +139,7 @@ pub fn classify_error(raw: &str) -> ErrorCategory {
         // the next turn replays it and hits the same wall. The user needs
         // the way out, not a truncated provider blob.
         Some(FailoverReason::MalformedToolCall) => ErrorCategory::MalformedToolCall,
+        Some(FailoverReason::ContentPolicy) => ErrorCategory::ContentPolicy,
         Some(FailoverReason::ModelNotFound)
         | Some(FailoverReason::Format)
         | Some(FailoverReason::Unknown)
@@ -236,6 +246,12 @@ pub fn format_friendly_error(raw: &str) -> String {
             "The AI provider rejected a tool call in this conversation, and it will \
              reject it again on every retry. Undo the last turn, or start a new \
              conversation to continue."
+                .to_string()
+        }
+
+        ErrorCategory::ContentPolicy => {
+            "The provider refused this content under its usage policy, and a retry \
+             gets the same answer. Rephrase the request, or switch to another provider."
                 .to_string()
         }
 
@@ -472,6 +488,34 @@ mod tests {
             .parse()
             .expect("token must parse back");
         assert_eq!(parsed, ErrorCategory::MalformedToolCall);
+    }
+
+    /// A content refusal gets the same verdict on every retry, so the user
+    /// must read the way out (rephrase or switch provider), not a provider
+    /// blob or the "high load, retrying" text a 502 wrapper would suggest.
+    #[test]
+    fn a_content_refusal_names_the_way_out() {
+        for raw in [
+            "openrouter refused this content (content policy). The provider will not answer: {\"error\":{\"message\":\"Output data may contain inappropriate content.\"}}",
+            "{\"error\":{\"code\":\"data_inspection_failed\",\"message\":\"Input data may contain inappropriate content.\"}}",
+            "Your request was rejected as a result of our safety system. content_policy_violation",
+        ] {
+            assert_eq!(classify_error(raw), ErrorCategory::ContentPolicy, "{raw}");
+            let msg = format_friendly_error(raw);
+            assert!(
+                msg.contains("Rephrase") && msg.contains("another provider"),
+                "must name the next action, got: {msg}"
+            );
+            assert!(
+                !msg.contains("high load") && !msg.contains("inappropriate"),
+                "must not read as an outage or echo the provider blob, got: {msg}"
+            );
+        }
+        let parsed: ErrorCategory = ErrorCategory::ContentPolicy
+            .to_string()
+            .parse()
+            .expect("token must parse back");
+        assert_eq!(parsed, ErrorCategory::ContentPolicy);
     }
 
     /// Table-driven classifier check. Each row pins a real provider/transport

@@ -185,6 +185,7 @@ async fn collect_btw_stream(rx: &mut mpsc::Receiver<StreamEvent>) -> BtwStream {
             // Failover identity only matters for the conversational
             // <environment> section; this one-shot helper has none to sync.
             StreamEvent::ThinkingDelta(_)
+            | StreamEvent::ReasoningBlock(_)
             | StreamEvent::Usage(_)
             | StreamEvent::Truncated
             | StreamEvent::ContentFiltered { .. }

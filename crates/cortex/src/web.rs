@@ -114,6 +114,99 @@ fn with_trace_context(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     req.headers(headers)
 }
 
+/// Where each search provider is reached. Production uses the real hosts;
+/// tests point every field at a local mock server.
+#[derive(Debug, Clone)]
+pub struct SearchEndpoints {
+    /// DuckDuckGo HTML endpoint (keyless).
+    pub duckduckgo: String,
+    /// Tavily `POST /search`.
+    pub tavily: String,
+    /// Serper `POST /search`.
+    pub serper: String,
+    /// Brave `GET /res/v1/web/search`.
+    pub brave: String,
+}
+
+impl Default for SearchEndpoints {
+    fn default() -> Self {
+        Self {
+            duckduckgo: "https://html.duckduckgo.com/html/".to_string(),
+            tavily: "https://api.tavily.com/search".to_string(),
+            serper: "https://google.serper.dev/search".to_string(),
+            brave: "https://api.search.brave.com/res/v1/web/search".to_string(),
+        }
+    }
+}
+
+/// Environment lookup for API keys, injected so provider selection and key
+/// resolution are testable without racing on process env vars.
+pub type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<String> + Sync);
+
+/// A search provider answered with a non-success status. Typed (rather than
+/// a bare string) so `auto` mode can tell a key/quota/outage failure, which
+/// a keyless fallback can cover, from a malformed request, which it cannot.
+#[derive(Debug)]
+pub struct SearchHttpError {
+    /// Provider display name ("Tavily", "DuckDuckGo", ...).
+    pub provider: String,
+    /// The HTTP status the provider returned.
+    pub status: reqwest::StatusCode,
+    /// Response body, for the error message.
+    pub body: String,
+}
+
+impl std::fmt::Display for SearchHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} returned HTTP {}: {}",
+            self.provider, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for SearchHttpError {}
+
+impl SearchHttpError {
+    /// True for the failures a keyless provider can stand in for: bad or
+    /// exhausted credentials, rate limiting, and provider outages. A 4xx
+    /// about the request itself (400, 404, 422) is not retried elsewhere —
+    /// the same query would fail the same way.
+    pub fn is_fallback_worthy(&self) -> bool {
+        matches!(self.status.as_u16(), 401 | 402 | 403 | 429) || self.status.is_server_error()
+    }
+}
+
+/// What a search call produced. `result_count` lets the caller refuse to
+/// cache an empty page (a challenge page or a transient blank must not be
+/// served from cache for the whole TTL).
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    /// Formatted results for the model.
+    pub text: String,
+    /// Number of results in `text`.
+    pub result_count: usize,
+    /// Set when `auto` mode fell back to DuckDuckGo: names the provider
+    /// that failed and how.
+    pub fallback_from: Option<String>,
+}
+
+impl SearchOutcome {
+    fn new(query: &str, results: &[SearchResult]) -> Self {
+        Self {
+            text: format_results(query, results),
+            result_count: results.len(),
+            fallback_from: None,
+        }
+    }
+
+    /// True when no results came back — never worth caching.
+    pub fn is_empty(&self) -> bool {
+        self.result_count == 0
+    }
+}
+
 /// A single search result from any provider.
 pub struct SearchResult {
     pub title: String,
@@ -301,33 +394,95 @@ pub async fn web_fetch(
 }
 
 /// Search the web and return formatted results.
-pub async fn web_search(query: &str, config: &WebConfig) -> Result<String> {
-    let provider = resolve_provider_id(config);
-    match provider {
-        "tavily" => tavily_search(query, config).await,
-        "serper" => serper_search(query, config).await,
-        "brave" => brave_search(query, config).await,
-        _ => duckduckgo_search(query).await,
+pub async fn web_search(query: &str, config: &WebConfig) -> Result<SearchOutcome> {
+    let env = |var: &str| std::env::var(var).ok();
+    web_search_with(query, config, &SearchEndpoints::default(), &env).await
+}
+
+/// [`web_search`] with the provider endpoints and env lookup injected.
+///
+/// In `auto` mode a keyed provider that fails with a credential, quota,
+/// rate-limit or server error is retried once on DuckDuckGo and the result
+/// is labelled as a fallback. An explicitly configured provider never falls
+/// back: the operator chose it, so its failure is the answer.
+pub async fn web_search_with(
+    query: &str,
+    config: &WebConfig,
+    endpoints: &SearchEndpoints,
+    env: EnvLookup<'_>,
+) -> Result<SearchOutcome> {
+    let provider = resolve_provider_with(config, |var| env(var).is_some());
+    let primary = match provider {
+        "tavily" => tavily_search(query, config, &endpoints.tavily, env).await,
+        "serper" => serper_search(query, config, &endpoints.serper, env).await,
+        "brave" => brave_search(query, config, &endpoints.brave, env).await,
+        _ => duckduckgo_search(query, &endpoints.duckduckgo).await,
+    };
+    let err = match primary {
+        Ok(outcome) => return Ok(outcome),
+        Err(err) => err,
+    };
+    let fallback_worthy = config.search_provider == "auto"
+        && provider != "duckduckgo"
+        && err
+            .downcast_ref::<SearchHttpError>()
+            .is_some_and(SearchHttpError::is_fallback_worthy);
+    if !fallback_worthy {
+        return Err(err);
     }
+    let reason = err
+        .downcast_ref::<SearchHttpError>()
+        .map(|e| format!("{} returned HTTP {}", e.provider, e.status))
+        .unwrap_or_else(|| err.to_string());
+    tracing::warn!("web_search: {reason}; falling back to DuckDuckGo");
+    let mut outcome = duckduckgo_search(query, &endpoints.duckduckgo)
+        .await
+        .with_context(|| format!("DuckDuckGo fallback after {reason}"))?;
+    outcome.text = format!(
+        "[fallback: {reason}; results below are from DuckDuckGo]\n\n{}",
+        outcome.text
+    );
+    outcome.fallback_from = Some(reason);
+    Ok(outcome)
 }
 
 // Provider implementations
 
+/// Fragments that mark DuckDuckGo's bot-challenge page. It can arrive with
+/// a 2xx status and parses to zero results, which must not pass as "no
+/// results found".
+const DUCKDUCKGO_CHALLENGE_MARKERS: &[&str] = &[
+    "anomaly-modal",
+    "anomaly_modal",
+    "bots use DuckDuckGo too",
+    "challenge-form",
+    "cf-chl",
+];
+
+/// True when a DuckDuckGo body is a challenge page rather than results.
+fn is_duckduckgo_challenge(html: &str) -> bool {
+    DUCKDUCKGO_CHALLENGE_MARKERS
+        .iter()
+        .any(|marker| html.contains(marker))
+}
+
 /// Search via DuckDuckGo HTML endpoint (no API key needed).
 #[tracing::instrument(skip_all, fields(search.provider = "duckduckgo"))]
-async fn duckduckgo_search(query: &str) -> Result<String> {
+async fn duckduckgo_search(query: &str, endpoint: &str) -> Result<SearchOutcome> {
     let client = build_http_client(15)?;
 
-    let resp = with_trace_context(
-        client
-            .post("https://html.duckduckgo.com/html/")
-            .form(&[("q", query)]),
-    )
-    .send()
-    .await
-    .context("Failed to reach DuckDuckGo")?;
+    let resp = with_trace_context(client.post(endpoint).form(&[("q", query)]))
+        .send()
+        .await
+        .context("Failed to reach DuckDuckGo")?;
 
+    let resp = ensure_search_ok(resp, "DuckDuckGo").await?;
     let html = resp.text().await?;
+    if is_duckduckgo_challenge(&html) {
+        anyhow::bail!(
+            "DuckDuckGo returned a bot-challenge page instead of results; retry later or configure a keyed search provider"
+        );
+    }
     let document = Html::parse_document(&html);
 
     static RESULT_SEL: LazyLock<Option<Selector>> =
@@ -342,7 +497,7 @@ async fn duckduckgo_search(query: &str) -> Result<String> {
         SNIPPET_SEL.as_ref(),
     ) else {
         tracing::error!("Failed to parse DuckDuckGo CSS selectors");
-        return Ok(format_results(query, &[]));
+        return Ok(SearchOutcome::new(query, &[]));
     };
 
     let mut results = Vec::new();
@@ -381,19 +536,24 @@ async fn duckduckgo_search(query: &str) -> Result<String> {
         });
     }
 
-    Ok(format_results(query, &results))
+    Ok(SearchOutcome::new(query, &results))
 }
 
 /// Resolve a search provider's API key from the configured env var (falling
 /// back to the provider's default). `provider` names the provider in the error.
-fn resolve_search_api_key(config: &WebConfig, default_env: &str, provider: &str) -> Result<String> {
+fn resolve_search_api_key(
+    config: &WebConfig,
+    default_env: &str,
+    provider: &str,
+    env: EnvLookup<'_>,
+) -> Result<String> {
     let api_key_env = config.search_api_key_env.as_deref().unwrap_or(default_env);
-    std::env::var(api_key_env)
-        .with_context(|| format!("{provider} API key not found. Set {api_key_env}"))
+    env(api_key_env).with_context(|| format!("{provider} API key not found. Set {api_key_env}"))
 }
 
-/// Bail with the provider name, status, and response body when a search call
-/// returned a non-success status; otherwise pass the response through.
+/// Fail with a typed [`SearchHttpError`] (provider, status, body) when a
+/// search call returned a non-success status; otherwise pass the response
+/// through.
 async fn ensure_search_ok(resp: reqwest::Response, provider: &str) -> Result<reqwest::Response> {
     if resp.status().is_success() {
         return Ok(resp);
@@ -403,7 +563,12 @@ async fn ensure_search_ok(resp: reqwest::Response, provider: &str) -> Result<req
         tracing::warn!("Failed to read error response body: {e}");
         String::new()
     });
-    anyhow::bail!("{provider} returned HTTP {status}: {body}")
+    Err(SearchHttpError {
+        provider: provider.to_string(),
+        status,
+        body,
+    }
+    .into())
 }
 
 /// Collect up to [`MAX_SEARCH_RESULTS`] results from a provider's JSON result
@@ -428,13 +593,18 @@ fn collect_search_results(
 
 /// Search via Brave Search API (requires API key).
 #[tracing::instrument(skip_all, fields(search.provider = "brave"))]
-async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key = resolve_search_api_key(config, "BRAVE_SEARCH_API_KEY", "Brave Search")?;
+async fn brave_search(
+    query: &str,
+    config: &WebConfig,
+    endpoint: &str,
+    env: EnvLookup<'_>,
+) -> Result<SearchOutcome> {
+    let api_key = resolve_search_api_key(config, "BRAVE_SEARCH_API_KEY", "Brave Search", env)?;
     let client = build_http_client(15)?;
 
     let resp = with_trace_context(
         client
-            .get("https://api.search.brave.com/res/v1/web/search")
+            .get(endpoint)
             .header("X-Subscription-Token", &api_key)
             .header("Accept", "application/json")
             .query(&[("q", query), ("count", "8")]),
@@ -451,13 +621,18 @@ async fn brave_search(query: &str, config: &WebConfig) -> Result<String> {
         "url",
         "description",
     );
-    Ok(format_results(query, &results))
+    Ok(SearchOutcome::new(query, &results))
 }
 
 /// Search via Tavily API (AI-optimized search, requires TAVILY_API_KEY).
 #[tracing::instrument(skip_all, fields(search.provider = "tavily"))]
-async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key = resolve_search_api_key(config, "TAVILY_API_KEY", "Tavily")?;
+async fn tavily_search(
+    query: &str,
+    config: &WebConfig,
+    endpoint: &str,
+    env: EnvLookup<'_>,
+) -> Result<SearchOutcome> {
+    let api_key = resolve_search_api_key(config, "TAVILY_API_KEY", "Tavily", env)?;
     let client = build_http_client(15)?;
 
     let body = serde_json::json!({
@@ -468,7 +643,7 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let resp = with_trace_context(
         client
-            .post("https://api.tavily.com/search")
+            .post(endpoint)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(&body),
@@ -481,13 +656,18 @@ async fn tavily_search(query: &str, config: &WebConfig) -> Result<String> {
     let resp_body: serde_json::Value = resp.json().await?;
     let results =
         collect_search_results(resp_body["results"].as_array(), "title", "url", "content");
-    Ok(format_results(query, &results))
+    Ok(SearchOutcome::new(query, &results))
 }
 
 /// Search via Serper API (Google results, requires SERPER_API_KEY).
 #[tracing::instrument(skip_all, fields(search.provider = "serper"))]
-async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
-    let api_key = resolve_search_api_key(config, "SERPER_API_KEY", "Serper")?;
+async fn serper_search(
+    query: &str,
+    config: &WebConfig,
+    endpoint: &str,
+    env: EnvLookup<'_>,
+) -> Result<SearchOutcome> {
+    let api_key = resolve_search_api_key(config, "SERPER_API_KEY", "Serper", env)?;
     let client = build_http_client(15)?;
 
     let body = serde_json::json!({
@@ -497,7 +677,7 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
 
     let resp = with_trace_context(
         client
-            .post("https://google.serper.dev/search")
+            .post(endpoint)
             .header("X-API-KEY", &api_key)
             .header("Content-Type", "application/json")
             .json(&body),
@@ -510,7 +690,7 @@ async fn serper_search(query: &str, config: &WebConfig) -> Result<String> {
     let resp_body: serde_json::Value = resp.json().await?;
     let results =
         collect_search_results(resp_body["organic"].as_array(), "title", "link", "snippet");
-    Ok(format_results(query, &results))
+    Ok(SearchOutcome::new(query, &results))
 }
 
 // HTML helpers
@@ -761,6 +941,213 @@ mod tests {
     /// An explicitly configured provider must win even when API keys for
     /// higher-priority providers are present — auto-detection only runs
     /// for `"auto"`.
+    /// Point every provider at one mock server. Tavily/Serper/Brave share
+    /// the path shape of their real APIs so the mounted routes read like
+    /// the production ones.
+    fn endpoints_for(server: &wiremock::MockServer) -> SearchEndpoints {
+        SearchEndpoints {
+            duckduckgo: format!("{}/html/", server.uri()),
+            tavily: format!("{}/tavily/search", server.uri()),
+            serper: format!("{}/serper/search", server.uri()),
+            brave: format!("{}/brave/search", server.uri()),
+        }
+    }
+
+    const DDG_RESULTS_HTML: &str = r#"<html><body>
+        <div class="result"><a class="result__a" href="https://example.org/a">Alpha page</a>
+          <div class="result__snippet">first snippet</div></div>
+        <div class="result"><a class="result__a" href="https://example.org/b">Beta page</a>
+          <div class="result__snippet">second snippet</div></div>
+    </body></html>"#;
+
+    fn no_keys(_: &str) -> Option<String> {
+        None
+    }
+
+    fn tavily_key(var: &str) -> Option<String> {
+        (var == "TAVILY_API_KEY").then(|| "tvly-test".to_string())
+    }
+
+    #[tokio::test]
+    async fn duckduckgo_non_success_status_is_an_error_not_an_empty_result() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("<html>blocked</html>"))
+            .mount(&server)
+            .await;
+
+        let err = web_search_with(
+            "rust",
+            &web_config("duckduckgo"),
+            &endpoints_for(&server),
+            &no_keys,
+        )
+        .await
+        .expect_err("a 403 must not parse to 'no results found'");
+        assert!(err.to_string().contains("HTTP 403"), "got: {err:#}");
+        let typed = err
+            .downcast_ref::<SearchHttpError>()
+            .expect("typed status error");
+        assert_eq!(typed.status.as_u16(), 403);
+    }
+
+    #[tokio::test]
+    async fn duckduckgo_challenge_page_with_2xx_is_an_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(202).set_body_string(
+                r#"<html><body><div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div></body></html>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let err = web_search_with(
+            "rust",
+            &web_config("duckduckgo"),
+            &endpoints_for(&server),
+            &no_keys,
+        )
+        .await
+        .expect_err("a challenge page parses to zero results and must surface as an error");
+        assert!(err.to_string().contains("challenge"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn duckduckgo_results_are_counted_so_empty_pages_are_distinguishable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_RESULTS_HTML))
+            .mount(&server)
+            .await;
+        let outcome = web_search_with(
+            "rust",
+            &web_config("duckduckgo"),
+            &endpoints_for(&server),
+            &no_keys,
+        )
+        .await
+        .expect("results page");
+        assert_eq!(outcome.result_count, 2);
+        assert!(!outcome.is_empty());
+        assert!(outcome.fallback_from.is_none());
+        assert!(outcome.text.contains("Alpha page"), "got: {}", outcome.text);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_to_duckduckgo_when_keyed_provider_fails_on_quota() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tavily/search"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(r#"{"detail":"quota"}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DDG_RESULTS_HTML))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = web_search_with(
+            "rust",
+            &web_config("auto"),
+            &endpoints_for(&server),
+            &tavily_key,
+        )
+        .await
+        .expect("fallback must rescue a quota failure");
+        assert_eq!(outcome.result_count, 2);
+        assert!(outcome.text.contains("Alpha page"), "got: {}", outcome.text);
+        let from = outcome
+            .fallback_from
+            .as_deref()
+            .expect("labelled as a fallback");
+        assert!(
+            from.contains("Tavily") && from.contains("402"),
+            "got: {from}"
+        );
+        assert!(
+            outcome
+                .text
+                .starts_with("[fallback: Tavily returned HTTP 402"),
+            "the model must see the fallback label: {}",
+            outcome.text
+        );
+    }
+
+    /// A malformed request (400) would fail identically on any provider, and
+    /// an explicitly chosen provider is the operator's decision: neither
+    /// falls back. The DuckDuckGo mock expects zero hits in both cases.
+    #[tokio::test]
+    async fn no_fallback_for_request_errors_or_explicit_providers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (config, status) in [(web_config("auto"), 400), (web_config("tavily"), 402)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/tavily/search"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("bad"))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/html/"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(DDG_RESULTS_HTML))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let err = web_search_with("rust", &config, &endpoints_for(&server), &tavily_key)
+                .await
+                .expect_err("must surface the provider's own failure");
+            assert!(
+                err.to_string().contains(&format!("HTTP {status}")),
+                "provider={} got: {err:#}",
+                config.search_provider
+            );
+            assert!(
+                !err.to_string().contains("DuckDuckGo"),
+                "provider={} must not fall back: {err:#}",
+                config.search_provider
+            );
+            server.verify().await;
+        }
+    }
+
+    #[test]
+    fn fallback_worthy_statuses_are_credential_quota_rate_and_server_errors() {
+        let cases = [
+            (401, true),
+            (402, true),
+            (403, true),
+            (429, true),
+            (500, true),
+            (503, true),
+            (400, false),
+            (404, false),
+            (422, false),
+        ];
+        for (code, want) in cases {
+            let err = SearchHttpError {
+                provider: "Tavily".into(),
+                status: reqwest::StatusCode::from_u16(code).unwrap(),
+                body: String::new(),
+            };
+            assert_eq!(err.is_fallback_worthy(), want, "status {code}");
+        }
+    }
+
     #[test]
     fn explicit_provider_beats_available_keys() {
         let config = web_config("duckduckgo");
