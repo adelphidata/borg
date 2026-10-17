@@ -494,6 +494,13 @@ impl ServerBreaker {
         *self = Self::default();
     }
 
+    /// The caller gave up before the call reported back (turn cancelled).
+    /// That says nothing about the server, so no verdict is recorded; a
+    /// half-open probe slot is just freed for the next call.
+    fn release_probe(&mut self) {
+        self.probing_since = None;
+    }
+
     /// One more strike. Opens (or re-opens, for a failed probe) at the
     /// threshold. The streak survives a transport recovery on purpose: a
     /// server that comes back only to reject the call is still failing.
@@ -541,6 +548,69 @@ fn breaker_admit(server: &str, now: Instant) -> Result<(), BreakerRefusal> {
         );
     }
     outcome
+}
+
+/// Free `server`'s half-open probe slot without a verdict.
+fn breaker_release_probe(server: &str) {
+    if let Some(breaker) = lock_recover(breakers()).get_mut(server) {
+        breaker.release_probe();
+    }
+}
+
+/// Settles a call whose caller gave up after handing it to the session — the
+/// turn was cancelled, so the dispatch future was dropped mid-wait. The
+/// server may already have acted, so the call still gets its audit row; and
+/// a cancel says nothing about server health, so a half-open probe slot is
+/// released instead of holding every later call off for a full cooldown.
+struct AbandonedCallGuard {
+    server: String,
+    tool: String,
+    start: Instant,
+    settled: bool,
+}
+
+impl Drop for AbandonedCallGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        breaker_release_probe(&self.server);
+        let duration_ms = self.start.elapsed().as_millis() as u64;
+        tracing::info!(
+            target: MCP_LOG_TARGET,
+            event = "execute",
+            server = %self.server,
+            tool = %self.tool,
+            outcome = "cancelled",
+            duration_ms,
+            "mcp tool call abandoned by its caller",
+        );
+        let payload = serde_json::json!({
+            "server": &self.server,
+            "tool": &self.tool,
+            "success": false,
+            "duration_ms": duration_ms,
+            "error_kind": "cancelled",
+            "error": "caller abandoned the call; the server was told to stop",
+        });
+        let server = std::mem::take(&mut self.server);
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    crate::db::try_emit_global(
+                        crate::db::audit_events::MCP_TOOL_EXECUTED,
+                        &server,
+                        &payload,
+                    )
+                    .await;
+                });
+            }
+            Err(_) => tracing::warn!(
+                server = %server,
+                "no runtime left to record the abandoned MCP call's audit row",
+            ),
+        }
+    }
 }
 
 /// Report a call's outcome to `server`'s breaker. `None` is a success.
@@ -1501,11 +1571,19 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
     }
 
     let start = Instant::now();
+    let mut abandoned = AbandonedCallGuard {
+        server: tool.server.clone(),
+        tool: tool.full_name.clone(),
+        start,
+        settled: false,
+    };
     // Outer watchdog so a wedged actor cannot starve the agent loop
     // forever. The session enforces the inner per-call timeout; this
     // covers actor-side deadlock.
     let outer_deadline = call_timeout + Duration::from_secs(5);
-    let (raw_text, is_error, images) = match tokio::time::timeout(outer_deadline, reply_rx).await {
+    let reply = tokio::time::timeout(outer_deadline, reply_rx).await;
+    abandoned.settled = true;
+    let (raw_text, is_error, images) = match reply {
         Ok(Ok(Ok(CallOutcome {
             text,
             is_error,
@@ -3222,9 +3300,15 @@ async fn run_session_task(
             SessionCmd::Call {
                 original_name,
                 args,
-                reply,
+                mut reply,
             } => {
-                let raw_result = session.call_tool(&original_name, args).await;
+                // The dispatcher drops its receiver when the turn is
+                // cancelled or its outer watchdog fires. Stop waiting then,
+                // and tell the server, instead of holding the session — and
+                // every call queued behind this one — until call_timeout.
+                let raw_result = session
+                    .call_tool_or_abandon(&original_name, args, reply.closed())
+                    .await;
                 // Classify transport-level failures so the session tears down
                 // cleanly rather than looping with a wedged transport: a dead
                 // subprocess, a reset socket, a deterministic 4xx. A
@@ -3235,6 +3319,7 @@ async fn run_session_task(
                 // operator sees one clear error per call.
                 let transport_dead =
                     matches!(&raw_result, Err(mcp::errors::McpError::TransportClosed(_)));
+                let caller_left = matches!(&raw_result, Err(mcp::errors::McpError::Cancelled(_)));
                 // Preserve the typed `McpError` as the anyhow root (rather than
                 // flattening to a string) so the dispatch site can downcast it
                 // for a structured `error_kind` in the audit row. The Display
@@ -3247,15 +3332,24 @@ async fn run_session_task(
                         images: collect_images(&raw),
                     })
                     .map_err(anyhow::Error::new);
-                // Best-effort send — caller may have dropped its receiver
-                // (e.g. outer-watchdog fired). Log on the drop path so it
-                // isn't silent.
+                // Best-effort send — the caller may have dropped its receiver
+                // (turn cancelled, outer watchdog fired). An abandoned call
+                // has already told the server, so only a reply that arrived
+                // and then had nowhere to go is worth a warning.
                 if let Err(_dropped) = reply.send(result) {
-                    tracing::warn!(
-                        server = %server_name,
-                        tool = %original_name,
-                        "MCP reply channel closed before send — caller likely timed out",
-                    );
+                    if caller_left {
+                        tracing::debug!(
+                            server = %server_name,
+                            tool = %original_name,
+                            "MCP caller left before its reply arrived",
+                        );
+                    } else {
+                        tracing::warn!(
+                            server = %server_name,
+                            tool = %original_name,
+                            "MCP reply channel closed before send — caller likely timed out",
+                        );
+                    }
                 }
 
                 drain_peer_side_traffic(&mut session, &server_name, &registry, &filter, &builtin)
@@ -3311,6 +3405,16 @@ pub mod testing {
     /// `OnceLock`s themselves can't be reset, but their *interiors* can:
     /// drop every server's tools from the registry, drop every mpsc
     /// sender so the actor tasks exit, and empty the rate-limit buckets.
+    /// The MCP state is process-global. An in-crate test that installs a
+    /// server or drives the breaker holds this for its whole run, so tests in
+    /// different modules cannot reset each other's state mid-flight.
+    pub fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn reset_all() {
         IDLE_PING_INTERVAL_MS.store(60_000, std::sync::atomic::Ordering::Relaxed);
         if let Some(reg) = REGISTRY.get() {
@@ -3717,14 +3821,11 @@ mod tests {
 
     mod start_registry {
         use super::*;
-        use std::sync::Mutex as StdMutex;
 
         /// The start registry is process-global, so these cannot interleave.
         /// Shared with `breaker` below, which drives the same globals.
-        static SERIAL: StdMutex<()> = StdMutex::new(());
-
         pub(super) fn guard() -> std::sync::MutexGuard<'static, ()> {
-            let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let g = testing::serial_guard();
             testing::reset_all();
             g
         }
@@ -5435,6 +5536,55 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), n + 2);
             let b = lock_recover(breakers());
             assert_eq!(b.get("probe").expect("row").strikes, 0);
+        }
+
+        /// A user cancel says nothing about the server. A half-open probe
+        /// whose turn was cancelled must free the slot at once, not refuse
+        /// every call as "probe in flight" for a full cooldown.
+        #[test]
+        fn a_cancelled_probe_frees_the_slot_for_the_next_call() {
+            let _g = guard();
+            let rt = rt();
+            install_scripted_server(&rt, "held", Vec::new());
+            // Swap in a session that never answers its first call.
+            let (tx, mut rx) = mpsc::channel::<SessionCmd>(8);
+            lock_recover(session_map()).insert("held".to_string(), tx);
+            let reached = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&reached);
+            rt.spawn(async move {
+                let mut held = Vec::new();
+                while let Some(SessionCmd::Call { reply, .. }) = rx.recv().await {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        held.push(reply);
+                    } else {
+                        reply.send(ok("answered", false)).ok();
+                    }
+                }
+            });
+            {
+                let mut map = lock_recover(breakers());
+                let breaker = map.entry("held".to_string()).or_default();
+                for _ in 0..MCP_BREAKER_STRIKE_THRESHOLD {
+                    breaker.record_strike(APP, Instant::now());
+                }
+                breaker.open_until = Some(Instant::now() - Duration::from_millis(1));
+            }
+
+            let dropped = rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    try_execute_tool("mcp_held_echo", &serde_json::json!({})),
+                )
+                .await
+            });
+            assert!(dropped.is_err(), "the probe must still be waiting");
+
+            let out = rt
+                .block_on(try_execute_tool("mcp_held_echo", &serde_json::json!({})))
+                .expect("a cancelled probe must not hold the gate shut")
+                .expect("mcp tool");
+            assert!(output_text(out).contains("answered"));
+            assert_eq!(reached.load(Ordering::SeqCst), 2);
         }
     }
 }

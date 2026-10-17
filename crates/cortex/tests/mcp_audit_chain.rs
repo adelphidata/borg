@@ -71,6 +71,10 @@ impl Transport for ScriptedTransport {
             let mut handlers = self.handlers.lock().unwrap();
             if let Some(factory) = handlers.get_mut(&method) {
                 let result = factory(&msg);
+                // `Null` models a call the server is still working on.
+                if result.is_null() {
+                    return Ok(());
+                }
                 self.inbound.lock().unwrap().push_back(Message {
                     jsonrpc: Some("2.0".into()),
                     id: Some(id),
@@ -220,7 +224,13 @@ async fn mcp_audit_chain_records_server_started_registered_rejected_and_executed
         );
         h.insert(
             methods::TOOLS_CALL.into(),
-            Box::new(|_| text_call_result("ok")),
+            Box::new(|msg| {
+                if msg.pointer("/params/arguments/q") == Some(&json!("hang")) {
+                    Value::Null
+                } else {
+                    text_call_result("ok")
+                }
+            }),
         );
     }
 
@@ -235,6 +245,38 @@ async fn mcp_audit_chain_records_server_started_registered_rejected_and_executed
         .await
         .expect("dispatch");
     assert!(out.is_some(), "dispatch must return a result");
+
+    // ---- a call whose turn is cancelled mid-wait still leaves a row ---
+    // The server may already have acted on it, so the chain must say so.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        mcp_clients::try_execute_tool("mcp_audit_good", &json!({"q": "hang"})),
+    )
+    .await;
+    assert!(dropped.is_err(), "the hanging call must still be in flight");
+    let cancelled_row = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let rows = dbref
+                .lock()
+                .await
+                .list_audit_events()
+                .await
+                .expect("list audit");
+            let found = rows.into_iter().find_map(|r| {
+                let v: Value = serde_json::from_str(&r.event_json).ok()?;
+                (r.event_type == audit_events::MCP_TOOL_EXECUTED && v["error_kind"] == "cancelled")
+                    .then_some(v)
+            });
+            if let Some(v) = found {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an abandoned call must write an MCP_TOOL_EXECUTED row");
+    assert_eq!(cancelled_row["tool"], "mcp_audit_good");
+    assert_eq!(cancelled_row["success"], false);
 
     // ---- inspect the persisted audit chain ----------------------------
     let rows = dbref

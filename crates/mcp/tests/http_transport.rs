@@ -36,6 +36,10 @@ use tokio::sync::Mutex;
 /// One scripted reply: `(status, body, session-id to emit)`.
 type ScriptedReply = (u16, Value, Option<String>);
 
+/// Scripted status that never answers: the handler parks for good, so the
+/// client's request future is the side that gives up.
+const HANG: u16 = 0;
+
 #[derive(Clone, Default)]
 struct ServerLog {
     /// Headers from every POST so far.
@@ -111,6 +115,9 @@ async fn rpc_handler(
             .next_status
             .swap(200, std::sync::atomic::Ordering::SeqCst),
     };
+    if status == HANG {
+        std::future::pending::<()>().await;
+    }
     let mut resp_headers = HeaderMap::new();
     if let Some(sid) = scripted
         .as_ref()
@@ -401,6 +408,211 @@ async fn a_second_404_after_reinitializing_is_terminal() {
     assert!(
         matches!(err, McpError::TransportClosed(_)),
         "recovery failure must be terminal for the supervisor; got: {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_reinitialize_dropped_part_way_is_finished_by_the_next_send() {
+    // An abandoned tool call can drop `send` in the middle of the 404
+    // recovery handshake. The next message must not go out on that half-made
+    // session (no id, no `initialized`): the transport finishes the
+    // handshake first.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = open(config(url)).await.expect("open");
+
+    server.emit_session_id("session-X").await;
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect("send 1");
+    let _ = transport.recv().await.expect("recv 1");
+
+    // The call 404s, the re-initialize never answers, and the caller gives up.
+    server.script_reply(404, json!({}), None).await;
+    server.script_reply(HANG, json!({}), None).await;
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(300),
+        transport.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call"})),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the re-initialize must still be in flight"
+    );
+
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "result": {"protocolVersion": "2025-06-18"}}),
+            Some("session-Y"),
+        )
+        .await;
+    server.script_reply(200, json!({}), None).await;
+    server.script_reply(200, json!({}), None).await;
+    transport
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 2},
+        }))
+        .await
+        .expect("the next send must recover the session");
+
+    let headers = server.next_request_headers().await;
+    assert_eq!(
+        headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        Some("session-Y"),
+        "the message must ride the fresh session",
+    );
+    let bodies = server.bodies.lock().await.clone();
+    let methods: Vec<&str> = bodies
+        .iter()
+        .filter_map(|b| b.get("method").and_then(|m| m.as_str()))
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "initialize",
+            "tools/call",
+            "initialize",
+            "initialize",
+            "notifications/initialized",
+            "notifications/cancelled"
+        ],
+        "the dropped handshake must be redone in full before the next message",
+    );
+}
+
+/// Open a transport and complete a first handshake on `session-X`.
+async fn handshaken_transport(
+    url: String,
+    server: &ServerLog,
+) -> mcp::transport::http::HttpTransport {
+    let mut transport = open(config(url)).await.expect("open");
+    server.emit_session_id("session-X").await;
+    server
+        .expect_response(json!({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+        .await
+        .expect("send 1");
+    let _ = transport.recv().await.expect("recv 1");
+    transport
+}
+
+async fn sent_methods(server: &ServerLog) -> Vec<String> {
+    server
+        .bodies
+        .lock()
+        .await
+        .iter()
+        .filter_map(|b| b.get("method").and_then(|m| m.as_str()).map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_reinitialize_is_retried_by_the_next_send() {
+    // A re-initialize whose own post fails leaves the session without an
+    // id. The next message must not go out on it bare: it re-runs the
+    // handshake first.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = handshaken_transport(url, &server).await;
+
+    server.script_reply(404, json!({}), None).await;
+    server.script_reply(503, json!({}), None).await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call"}))
+        .await
+        .expect_err("a failed recovery must fail the call");
+
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "result": {"protocolVersion": "2025-06-18"}}),
+            Some("session-Y"),
+        )
+        .await;
+    server.script_reply(200, json!({}), None).await;
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": 3, "result": {"tools": []}}),
+            None,
+        )
+        .await;
+    transport
+        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+        .await
+        .expect("the next send must finish the handshake and go through");
+
+    assert_eq!(transport.session_id(), Some("session-Y"));
+    assert_eq!(
+        sent_methods(&server).await,
+        [
+            "initialize",
+            "tools/call",
+            "initialize",
+            "initialize",
+            "notifications/initialized",
+            "tools/list"
+        ],
+    );
+}
+
+#[tokio::test]
+async fn finishing_a_pending_reinitialize_is_the_sends_only_recovery() {
+    // A send that had to finish a dropped re-initialize has used its one
+    // recovery attempt. A 404 right after is the server rejecting the
+    // session it just issued — terminal, not a second handshake.
+    let (url, server, _shutdown) = spawn_fixture().await;
+    let mut transport = handshaken_transport(url, &server).await;
+
+    server.script_reply(404, json!({}), None).await;
+    server.script_reply(HANG, json!({}), None).await;
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(300),
+        transport.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call"})),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the re-initialize must still be in flight"
+    );
+
+    server
+        .script_reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "result": {}}),
+            Some("session-Y"),
+        )
+        .await;
+    server.script_reply(200, json!({}), None).await;
+    server.script_reply(404, json!({}), None).await;
+    let err = transport
+        .send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call"}))
+        .await
+        .expect_err("a 404 right after recovering must fail the call");
+    assert!(
+        matches!(err, McpError::TransportClosed(_)),
+        "recovery failure must be terminal for the supervisor; got: {err:?}",
+    );
+    assert_eq!(
+        sent_methods(&server).await,
+        [
+            "initialize",
+            "tools/call",
+            "initialize",
+            "initialize",
+            "notifications/initialized",
+            "tools/call"
+        ],
+        "exactly one handshake may run per send",
     );
 }
 

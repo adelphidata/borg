@@ -756,7 +756,24 @@ impl Agent {
         // tagged deser, and so MCP failures surface with structured error
         // shape rather than masquerading as `UnknownTool`.
         if name.starts_with("mcp_") {
-            let result = crate::mcp_clients::try_execute_tool(name, &raw_args).await?;
+            // MCP calls have no builtin deadline and can run for the whole
+            // `call_timeout`, so a cancelled turn must not wait them out.
+            // Dropping the dispatch drops its reply receiver, which makes the
+            // session actor abandon the call and tell the server. A reply
+            // that is already here wins over the cancel.
+            let result = tokio::select! {
+                biased;
+                result = crate::mcp_clients::try_execute_tool(name, &raw_args) => result?,
+                () = cancel.cancelled() => {
+                    // Cancellation is only a request to the server: say so,
+                    // or the model may repeat an action that already ran.
+                    return Ok(ToolOutput::Text(format!(
+                        "{} The MCP server was told to stop, but it may already \
+                         have acted — check before calling it again.",
+                        crate::constants::TOOL_CANCELLED_BY_USER
+                    )));
+                }
+            };
             return match result {
                 // An image-bearing result goes through the same vision gate
                 // as every other image-producing tool: a text-only model is
@@ -1527,5 +1544,146 @@ mod session_availability_tests {
             );
             assert!(executing, "parallel={parallel}: dispatch must be announced");
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_cancel_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Answers the handshake and `tools/list` (one tool, `slow`), then never
+    /// answers `tools/call`: a server still working when the turn ends.
+    struct BusyServer {
+        replies: VecDeque<mcp::protocol::Message>,
+        sent: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl mcp::transport::Transport for BusyServer {
+        async fn send(&mut self, msg: serde_json::Value) -> mcp::errors::Result<()> {
+            let method = msg["method"].as_str().unwrap_or_default().to_string();
+            let result = match method.as_str() {
+                "initialize" => Some(serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "busy", "version": "0"}
+                })),
+                "tools/list" => Some(serde_json::json!({"tools": [{
+                    "name": "slow",
+                    "inputSchema": {"type": "object", "properties": {}}
+                }]})),
+                _ => None,
+            };
+            if let Some(result) = result {
+                self.replies.push_back(mcp::protocol::Message {
+                    jsonrpc: Some("2.0".into()),
+                    id: msg["id"].as_u64(),
+                    method: None,
+                    result: Some(result),
+                    error: None,
+                    params: None,
+                });
+            }
+            self.sent.lock().unwrap().push(method);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> mcp::errors::Result<Option<mcp::protocol::Message>> {
+            match self.replies.pop_front() {
+                Some(m) => Ok(Some(m)),
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn close(&mut self) -> mcp::errors::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// MCP calls are exempt from the builtin deadline, so the turn's cancel
+    /// token is the only thing that ends one before `call_timeout`. The
+    /// server must hear about it, and the model must learn that the call may
+    /// still have run.
+    #[test]
+    fn cancelling_the_turn_ends_an_mcp_call_in_flight() {
+        let _serial = crate::mcp_clients::testing::serial_guard();
+        crate::mcp_clients::testing::reset_all();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        rt.block_on(async {
+            let mut cfg = crate::config::Config::default();
+            cfg.mcp.enabled = true;
+            let server_cfg = crate::config::McpServerConfig {
+                enabled: true,
+                transport: crate::config::TransportSpec::Stdio {
+                    command: "/bin/false".into(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                },
+                connect_timeout_ms: 5_000,
+                call_timeout_ms: 60_000,
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+                tools: mcp::manifest::ToolFilter::default(),
+                cache_tools: false,
+            };
+            let server = BusyServer {
+                replies: VecDeque::new(),
+                sent: Arc::clone(&sent),
+            };
+            crate::mcp_clients::testing::install_session(
+                "busy",
+                &server_cfg,
+                &cfg,
+                Box::new(server),
+            )
+            .await
+            .expect("install");
+
+            let mut agent =
+                super::super::tests::minimal_test_agent(crate::config::Config::default());
+            let (event_tx, _event_rx) = mpsc::channel(8);
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                trigger.cancel();
+            });
+
+            let out = tokio::time::timeout(
+                Duration::from_secs(5),
+                agent.execute_tool("mcp_busy_slow", "{}", &event_tx, "call-1", &cancel),
+            )
+            .await
+            .expect("the cancel must end the call, not call_timeout")
+            .expect("a cancelled call is a tool result, not an error");
+            let ToolOutput::Text(text) = out else {
+                panic!("expected the cancel marker, got {out:?}");
+            };
+            assert!(
+                text.starts_with(crate::constants::TOOL_CANCELLED_BY_USER)
+                    && text.contains("may already have acted"),
+                "got {text}"
+            );
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m == "notifications/cancelled")
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the server must be told the call was abandoned");
+        });
+        crate::mcp_clients::testing::reset_all();
     }
 }

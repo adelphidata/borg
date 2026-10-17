@@ -121,6 +121,15 @@ pub trait Transport: Send {
     /// Best-effort graceful shutdown.
     async fn close(&mut self) -> Result<()>;
 
+    /// Whether dropping an in-flight [`Transport::send`] leaves the transport
+    /// usable. A byte stream (stdio) must finish a frame once it starts
+    /// writing it, hence the default `false`. Streamable HTTP waits for the
+    /// reply inside `send` and can drop that POST cleanly, so it opts in —
+    /// which is what lets an abandoned call stop waiting there.
+    fn send_is_cancel_safe(&self) -> bool {
+        false
+    }
+
     /// Record the protocol version agreed during `initialize`.
     ///
     /// Transports that carry the version out-of-band (streamable HTTP puts it

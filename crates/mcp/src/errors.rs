@@ -57,6 +57,12 @@ pub enum McpError {
         ms: u64,
     },
 
+    /// The caller stopped waiting (turn cancelled, or its reply receiver was
+    /// dropped) before the response arrived. The peer was sent
+    /// `notifications/cancelled` for the abandoned request.
+    #[error("cancelled: {0}")]
+    Cancelled(String),
+
     /// Per-server rate limit refused the call.
     #[error("rate limited (server={server}, retry_after_ms={retry_after_ms})")]
     RateLimited {
@@ -129,6 +135,7 @@ impl McpError {
             McpError::TransientHttp { .. } => "transient_http",
             McpError::SessionExpired(_) => "session_expired",
             McpError::Timeout { .. } => "timeout",
+            McpError::Cancelled(_) => "cancelled",
             McpError::RateLimited { .. } => "rate_limited",
             McpError::SchemaRejected { .. } => "schema_rejected",
             McpError::NameCollision { .. } => "name_collision",
@@ -287,6 +294,7 @@ mod tests {
                 "transient_http",
             ),
             (McpError::Timeout { ms: 10 }, "timeout"),
+            (McpError::Cancelled("caller gone".into()), "cancelled"),
             (
                 McpError::RateLimited {
                     server: "s".into(),

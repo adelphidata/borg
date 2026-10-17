@@ -408,6 +408,35 @@ fn b64_decode_round_trip() {
 }
 
 #[tokio::test]
+async fn a_bad_line_does_not_poison_the_next_frame() {
+    // `recv` clears its line buffer only after a line is used up, so that a
+    // read dropped mid-frame can resume. A line that fails to decode (and an
+    // empty keepalive) must still be cleared, or its bytes prefix the next
+    // frame and every later read fails too.
+    let script = r#"printf 'not json\n\n{"jsonrpc":"2.0","method":"ok","params":{}}\n'; sleep 1"#;
+    let (sink, _) = collecting_sink();
+    let mut transport = spawn(cfg("/bin/sh", &["-c", script], HashMap::new()), sink)
+        .await
+        .expect("spawn sh");
+
+    let first = tokio::time::timeout(Duration::from_secs(2), transport.recv())
+        .await
+        .expect("recv timed out");
+    assert!(
+        first.is_err(),
+        "a malformed line must surface, got {first:?}"
+    );
+    let msg = tokio::time::timeout(Duration::from_secs(2), transport.recv())
+        .await
+        .expect("recv timed out")
+        .expect("the frame after a bad line must decode on its own")
+        .expect("eof before frame");
+    transport.close().await.expect("close");
+
+    assert_eq!(msg.method.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
 async fn spawned_server_does_not_inherit_non_stdio_fds() {
     // Spec: a stdio MCP server is untrusted code and must receive stdin,
     // stdout, and stderr only. An inheritable descriptor held by the daemon

@@ -297,13 +297,30 @@ impl SessionActor {
         tool_name: &str,
         arguments: Value,
     ) -> Result<(String, ToolCallResult)> {
+        self.call_tool_or_abandon(tool_name, arguments, std::future::pending())
+            .await
+    }
+
+    /// [`Self::call_tool`] that stops waiting as soon as `abandoned`
+    /// resolves — the caller's turn was cancelled, or the receiver for this
+    /// reply was dropped. The server is sent `notifications/cancelled` so it
+    /// stops the work (a call abandoned before it was written is never sent
+    /// at all), the result is [`McpError::Cancelled`], and the session stays
+    /// usable for the next request.
+    pub async fn call_tool_or_abandon(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+        abandoned: impl std::future::Future<Output = ()>,
+    ) -> Result<(String, ToolCallResult)> {
         let params = json!({
             "name": tool_name,
             "arguments": arguments,
         });
-        let raw: ToolCallResult = self
-            .request_typed(methods::TOOLS_CALL, Some(params))
+        let raw = self
+            .request_or_abandon(methods::TOOLS_CALL, Some(params), abandoned)
             .await?;
+        let raw: ToolCallResult = serde_json::from_value(raw)?;
         let text = render_call_result(&raw);
         Ok((text, raw))
     }
@@ -421,13 +438,13 @@ impl SessionActor {
     /// Best-effort `notifications/cancelled` for a request this client is
     /// abandoning (spec: the receiver SHOULD stop processing it).
     ///
-    /// Without this, a timed-out `tools/call` keeps the server computing a
-    /// result nobody will read — and, because sessions are single-request,
-    /// every queued call behind it waits on that dead work. The eventual
-    /// stale reply is still swallowed by the non-current-id branch of the
-    /// recv loop, which stays as the backstop for servers that ignore
-    /// cancellation. Send failures are logged, never surfaced: the caller
-    /// is already unwinding with the real (timeout) error.
+    /// Without this, a timed-out or abandoned `tools/call` keeps the server
+    /// computing a result nobody will read — and, because sessions are
+    /// single-request, every queued call behind it waits on that dead work.
+    /// The eventual stale reply is still swallowed by the non-current-id
+    /// branch of the recv loop, which stays as the backstop for servers that
+    /// ignore cancellation. Send failures are logged, never surfaced: the
+    /// caller is already unwinding with the real (timeout/cancelled) error.
     ///
     /// The write itself is deadline-bounded: the very scenario that triggers
     /// cancellation — a hung server — is also the one where the child may
@@ -468,7 +485,39 @@ impl SessionActor {
         }
     }
 
+    /// Notify the server that the caller gave up on `request_id`, and build
+    /// the error the abandoned call returns.
+    async fn abandon(&mut self, request_id: u64) -> McpError {
+        self.notify_cancelled(request_id, "abandoned by caller")
+            .await;
+        self.abandoned_error()
+    }
+
+    fn abandoned_error(&self) -> McpError {
+        McpError::Cancelled(format!(
+            "{}: caller abandoned the request",
+            self.server_name
+        ))
+    }
+
     async fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_or_abandon(method, params, std::future::pending())
+            .await
+    }
+
+    async fn request_or_abandon(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        abandoned: impl std::future::Future<Output = ()>,
+    ) -> Result<Value> {
+        tokio::pin!(abandoned);
+        // A caller that gave up while this request sat in the session queue
+        // costs the server nothing: return before anything is written.
+        if futures::poll!(abandoned.as_mut()).is_ready() {
+            return Err(self.abandoned_error());
+        }
+
         let id = self.next_id;
         // wrapping_add: at 1M calls/sec, u64 wrap takes ~580k years; the
         // wrap branch is unreachable in any real session lifetime.
@@ -476,7 +525,31 @@ impl SessionActor {
 
         let req = Request::new(id, method, params);
         let payload = serde_json::to_value(&req)?;
-        self.transport.send(payload).await?;
+        if self.transport.send_is_cancel_safe() {
+            // Streamable HTTP waits for the reply inside the POST, so the
+            // send is where an abandoned call has to stop waiting.
+            tokio::select! {
+                biased;
+                () = &mut abandoned => return Err(self.abandon(id).await),
+                sent = self.transport.send(payload) => sent?,
+            }
+        } else {
+            // A byte stream cannot drop a frame part-way, so this send is
+            // never raced against abandonment. It is still bounded: a server
+            // that stopped reading stdin would otherwise park it — and every
+            // call queued behind it — forever. Past the deadline the frame
+            // may be half-written, so the transport is finished.
+            match tokio::time::timeout(self.call_timeout, self.transport.send(payload)).await {
+                Ok(sent) => sent?,
+                Err(_) => {
+                    return Err(McpError::TransportClosed(format!(
+                        "{}: request write stalled for {}ms; the frame may be partial",
+                        self.server_name,
+                        self.call_timeout.as_millis()
+                    )));
+                }
+            }
+        }
 
         let deadline = Instant::now() + self.call_timeout;
         loop {
@@ -488,8 +561,12 @@ impl SessionActor {
                 });
             }
 
-            let recv_fut = self.transport.recv();
-            let msg = match tokio::time::timeout(remaining, recv_fut).await {
+            let received = tokio::select! {
+                biased;
+                () = &mut abandoned => return Err(self.abandon(id).await),
+                received = tokio::time::timeout(remaining, self.transport.recv()) => received,
+            };
+            let msg = match received {
                 Ok(Ok(Some(m))) => m,
                 Ok(Ok(None)) => {
                     return Err(McpError::TransportClosed(format!(
@@ -1361,6 +1438,200 @@ mod tests {
             cancel.pointer("/params/requestId").and_then(Value::as_u64),
             Some(call_id),
             "cancellation must reference the abandoned request id: {cancel}"
+        );
+    }
+
+    fn reply(id: u64, result: Value) -> Message {
+        Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(id),
+            method: None,
+            result: Some(result),
+            error: None,
+            params: None,
+        }
+    }
+
+    fn init_reply() -> Message {
+        reply(
+            1,
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            }),
+        )
+    }
+
+    fn methods_sent(sent: &Mutex<Vec<Value>>) -> Vec<String> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.get("method").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    /// Streamable-HTTP shape: the reply to `tools/call` arrives inside
+    /// `send`, which here never finishes, and the transport declares a
+    /// dropped send safe.
+    struct ReplyInSendTransport {
+        inner: ScriptedTransport,
+    }
+
+    #[async_trait]
+    impl Transport for ReplyInSendTransport {
+        async fn send(&mut self, msg: Value) -> Result<()> {
+            let is_call = msg.get("method").and_then(Value::as_str) == Some(methods::TOOLS_CALL);
+            self.inner.send(msg).await?;
+            if is_call {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn recv(&mut self) -> Result<Option<Message>> {
+            self.inner.recv().await
+        }
+        async fn close(&mut self) -> Result<()> {
+            self.inner.close().await
+        }
+        fn send_is_cancel_safe(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_abandoning_a_call_cancels_it_and_keeps_the_session() {
+        // A cancelled turn drops its call. The server must hear
+        // `notifications/cancelled` at once — not after call_timeout — and
+        // the session must serve the next call, ignoring the late reply to
+        // the abandoned one.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::from([init_reply()])));
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound.clone()));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let err = session
+            .call_tool_or_abandon(
+                "slow_tool",
+                json!({}),
+                tokio::time::sleep(Duration::from_millis(20)),
+            )
+            .await
+            .expect_err("an abandoned call must not wait for its reply");
+        assert!(matches!(err, McpError::Cancelled(_)), "got {err:?}");
+
+        let call_id = {
+            let sent = sent.lock().unwrap();
+            let call_id = sent
+                .iter()
+                .find(|v| v.get("method").and_then(Value::as_str) == Some("tools/call"))
+                .and_then(|v| v.get("id").and_then(Value::as_u64))
+                .expect("tools/call frame with an id");
+            let cancel = sent
+                .iter()
+                .find(|v| {
+                    v.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+                })
+                .expect("abandoning a call must emit notifications/cancelled");
+            assert_eq!(
+                cancel.pointer("/params/requestId").and_then(Value::as_u64),
+                Some(call_id),
+            );
+            call_id
+        };
+
+        // The server answers the abandoned call late, then the next one.
+        let text_result = |t: &str| json!({"content": [{"type": "text", "text": t}]});
+        inbound.lock().unwrap().extend([
+            reply(call_id, text_result("stale")),
+            reply(call_id + 1, text_result("fresh")),
+        ]);
+        let (text, _) = session
+            .call_tool("next_tool", json!({}))
+            .await
+            .expect("the session must stay usable after an abandoned call");
+        assert!(
+            text.contains("fresh") && !text.contains("stale"),
+            "got {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_write_that_stalls_ends_the_transport() {
+        // A server that stops reading stdin fills the pipe. An unbounded
+        // write would park the session, and every queued call, forever; a
+        // write cut off part-way leaves a partial frame, so it is fatal.
+        let inbound = Arc::new(Mutex::new(VecDeque::from([init_reply()])));
+        let transport = Box::new(HangAfterTransport {
+            inner: ScriptedTransport::new(Arc::new(Mutex::new(Vec::new())), inbound),
+            hang_after: 2,
+            sends: 0,
+        });
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let err = tokio::time::timeout(Duration::from_secs(5), session.call_tool("t", json!({})))
+            .await
+            .expect("a stalled write must be bounded by call_timeout")
+            .expect_err("a stalled write must fail the call");
+        assert!(matches!(err, McpError::TransportClosed(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_call_abandoned_before_it_is_sent_never_reaches_the_server() {
+        // A call that waited in the session queue while its turn was
+        // cancelled must not start remote work only to cancel it.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::from([init_reply()])));
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let err = session
+            .call_tool_or_abandon("t", json!({}), std::future::ready(()))
+            .await
+            .expect_err("an already-abandoned call must not run");
+        assert!(matches!(err, McpError::Cancelled(_)), "got {err:?}");
+        assert_eq!(
+            methods_sent(&sent),
+            ["initialize", "notifications/initialized"]
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoning_stops_a_send_that_carries_the_reply() {
+        // Streamable HTTP waits for the reply inside the POST. If only the
+        // receive phase honored abandonment, the call would hang until the
+        // HTTP timeout with the server still working.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::from([init_reply()])));
+        let transport = Box::new(ReplyInSendTransport {
+            inner: ScriptedTransport::new(sent.clone(), inbound),
+        });
+        let mut session = SessionActor::new(&manifest(), transport);
+        session.handshake().await.expect("handshake");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.call_tool_or_abandon(
+                "t",
+                json!({}),
+                tokio::time::sleep(Duration::from_millis(20)),
+            ),
+        )
+        .await
+        .expect("an abandoned call must not stay parked in send")
+        .expect_err("abandoned");
+        assert!(matches!(err, McpError::Cancelled(_)), "got {err:?}");
+        assert_eq!(
+            methods_sent(&sent),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+                "notifications/cancelled"
+            ]
         );
     }
 }

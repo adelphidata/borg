@@ -180,6 +180,7 @@ pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
         session_id: None,
         max_response_bytes,
         protocol_version: None,
+        reinit_pending: false,
     })
 }
 
@@ -222,6 +223,11 @@ pub struct HttpTransport {
     /// until the handshake completes — the handshake itself declares its
     /// version in the body.
     protocol_version: Option<String>,
+    /// A re-initialize started but never finished — its future was dropped
+    /// part-way (an abandoned call) or one of its posts failed — leaving no
+    /// session id or no `initialized` notification. The next `send`
+    /// completes it first, and that counts as the send's one recovery.
+    reinit_pending: bool,
 }
 
 impl HttpTransport {
@@ -436,6 +442,7 @@ impl HttpTransport {
     /// own monotonic counter, because its response is consumed here and never
     /// reaches the inbox.
     async fn reinitialize(&mut self) -> Result<()> {
+        self.reinit_pending = true;
         self.session_id = None;
         self.protocol_version = None;
         let init = serde_json::json!({
@@ -468,6 +475,7 @@ impl HttpTransport {
             "method": crate::protocol::methods::INITIALIZED_NOTIFICATION,
         });
         self.post(&notif).await?;
+        self.reinit_pending = false;
         Ok(())
     }
 }
@@ -480,8 +488,19 @@ const REINIT_REQUEST_ID: u64 = u64::MAX;
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&mut self, msg: Value) -> Result<()> {
+        let recovered = self.reinit_pending;
+        if recovered {
+            self.reinitialize()
+                .await
+                .map_err(Self::terminal_recovery_failure)?;
+        }
         let messages = match self.post(&msg).await {
             Ok(messages) => messages,
+            // The pending re-initialize above was this send's one attempt; a
+            // server that 404s the session it just issued is broken.
+            Err(e @ McpError::SessionExpired(_)) if recovered => {
+                return Err(Self::terminal_recovery_failure(e));
+            }
             Err(McpError::SessionExpired(_)) if self.session_id.is_some() => {
                 // The server forgot this session — a restart, or a TTL that
                 // expired while we were idle. The spec's remedy is to
@@ -554,6 +573,12 @@ impl Transport for HttpTransport {
         // deliberately do not send the spec's `DELETE` since a hostile or
         // unreachable server must not be able to block shutdown.
         Ok(())
+    }
+
+    fn send_is_cancel_safe(&self) -> bool {
+        // A dropped POST leaves nothing half-written; a dropped re-initialize
+        // is finished by the next `send` (`reinit_pending`).
+        true
     }
 }
 

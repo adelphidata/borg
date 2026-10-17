@@ -68,6 +68,8 @@ struct ScriptedTransport {
     inbound: Arc<Mutex<VecDeque<Message>>>,
     pending_notifications: Arc<Mutex<VecDeque<Message>>>,
     eof: Arc<Mutex<bool>>,
+    /// The `method` of every frame the client sent, in order.
+    sent_methods: Arc<Mutex<Vec<String>>>,
 }
 
 impl ScriptedTransport {
@@ -77,11 +79,16 @@ impl ScriptedTransport {
             inbound: Arc::new(Mutex::new(VecDeque::new())),
             pending_notifications: Arc::new(Mutex::new(VecDeque::new())),
             eof: Arc::new(Mutex::new(false)),
+            sent_methods: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn notifications(&self) -> Arc<Mutex<VecDeque<Message>>> {
         Arc::clone(&self.pending_notifications)
+    }
+
+    fn sent_methods(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.sent_methods)
     }
 }
 
@@ -93,6 +100,9 @@ impl Transport for ScriptedTransport {
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
         let id = msg.get("id").and_then(|i| i.as_u64());
+        if let Some(method) = &method {
+            self.sent_methods.lock().unwrap().push(method.clone());
+        }
 
         // Drain pending peer-side notifications *before* the response so
         // the session observes them in-flight (during the same `request`
@@ -110,6 +120,11 @@ impl Transport for ScriptedTransport {
             let mut handlers = self.handlers.lock().unwrap();
             if let Some(factory) = handlers.get_mut(&method) {
                 let result = factory(&msg);
+                // `Null` models a request the server is still working on:
+                // it arrived, but no reply is ever queued.
+                if result.is_null() {
+                    return Ok(());
+                }
                 self.inbound.lock().unwrap().push_back(Message {
                     jsonrpc: Some("2.0".into()),
                     id: Some(id),
@@ -1737,6 +1752,85 @@ async fn call_timeout_ms_surfaces_clean_timeout_error_on_wedged_server() {
         elapsed < Duration::from_secs(2),
         "inner per-call timeout must fire well before the outer watchdog; \
          observed {elapsed:?}",
+    );
+}
+
+/// A cancelled turn drops its MCP dispatch. The session must abandon that
+/// call — telling the server with `notifications/cancelled` — and serve the
+/// next one at once, rather than hold both behind a 60 s `call_timeout`.
+#[tokio::test]
+async fn dropped_dispatch_cancels_the_call_and_frees_the_session() {
+    let _g = begin_test();
+
+    let transport = ScriptedTransport::new();
+    let sent = transport.sent_methods();
+    {
+        let mut h = transport.handlers.lock().unwrap();
+        h.insert(
+            methods::INITIALIZE.into(),
+            Box::new(|_| initialize_result()),
+        );
+        h.insert(
+            methods::TOOLS_LIST.into(),
+            Box::new(|_| {
+                tools_list(&[
+                    ("slow", well_formed_schema()),
+                    ("fast", well_formed_schema()),
+                ])
+            }),
+        );
+        h.insert(
+            methods::TOOLS_CALL.into(),
+            Box::new(|msg| {
+                if msg.pointer("/params/name") == Some(&json!("slow")) {
+                    Value::Null
+                } else {
+                    text_call_result("fast done")
+                }
+            }),
+        );
+    }
+
+    let cfg = enabled_config();
+    let sc = server_config_tuned(ToolFilter::DEFAULT_MAX, 60_000, vec![], vec![]);
+    mcp_clients::testing::install_session("t", &sc, &cfg, Box::new(transport))
+        .await
+        .expect("install");
+
+    // The turn is cancelled while the slow call is in flight.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        mcp_clients::try_execute_tool("mcp_t_slow", &json!({})),
+    )
+    .await;
+    assert!(dropped.is_err(), "the slow call must still be in flight");
+
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        mcp_clients::try_execute_tool("mcp_t_fast", &json!({})),
+    )
+    .await
+    .expect("the next call must not wait out the abandoned call's call_timeout")
+    .expect("dispatch")
+    .expect("known tool");
+    let text = match out {
+        cortex::types::ToolOutput::Text(t)
+        | cortex::types::ToolOutput::Multimodal { text: t, .. } => t,
+    };
+    assert!(text.contains("fast done"), "got {text}");
+
+    let sent = sent.lock().unwrap().clone();
+    let cancel_at = sent
+        .iter()
+        .position(|m| m == "notifications/cancelled")
+        .expect("the abandoned call must be cancelled at the server");
+    let last_call = sent
+        .iter()
+        .rposition(|m| m == "tools/call")
+        .expect("tools/call frames");
+    assert!(
+        cancel_at < last_call,
+        "the cancel must reach the server before the next call: {sent:?}"
     );
 }
 

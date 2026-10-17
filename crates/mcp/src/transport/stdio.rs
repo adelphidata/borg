@@ -259,10 +259,13 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
         let mut buf: Vec<u8> = Vec::new();
         loop {
             match read_capped_line(&mut reader, &mut buf, max_line_bytes).await {
-                Ok(true) => stderr(
-                    &server_name,
-                    &String::from_utf8_lossy(trim_trailing_cr(&buf)),
-                ),
+                Ok(true) => {
+                    stderr(
+                        &server_name,
+                        &String::from_utf8_lossy(trim_trailing_cr(&buf)),
+                    );
+                    buf.clear();
+                }
                 Ok(false) => break,
                 Err(e) => {
                     tracing::warn!(server = %server_name, error = %e, "mcp stderr read failed");
@@ -287,19 +290,23 @@ pub async fn spawn(config: StdioConfig, stderr: StderrSink) -> Result<StdioTrans
     })
 }
 
-/// Read one newline-delimited line from `reader` into `buf` (cleared first),
-/// enforcing a hard byte cap as bytes arrive. Unlike [`AsyncBufReadExt::read_line`]
-/// / `read_until`, which grow their target without limit, this errors the moment
-/// a single pre-newline line would exceed `cap`, so a peer streaming megabytes
-/// with no newline can't OOM the process. Returns `Ok(true)` when a line was
-/// read (`buf` holds it, sans trailing `\n`), `Ok(false)` on clean EOF with no
+/// Read one newline-delimited line from `reader` into `buf`, enforcing a hard
+/// byte cap as bytes arrive. Unlike [`AsyncBufReadExt::read_line`] / `read_until`,
+/// which grow their target without limit, this errors the moment a single
+/// pre-newline line would exceed `cap`, so a peer streaming megabytes with no
+/// newline can't OOM the process. Returns `Ok(true)` when a line was read
+/// (`buf` holds it, sans trailing `\n`), `Ok(false)` on clean EOF with no
 /// buffered bytes, and an `InvalidData` error when the cap is exceeded.
+///
+/// Cancel-safe: bytes move from `reader` into `buf` only, and the *caller*
+/// clears `buf` once it has consumed a complete line. A read dropped
+/// mid-line (an abandoned tool call) keeps what it already took, and the next
+/// call resumes the same line instead of decoding its tail as a fresh frame.
 async fn read_capped_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<bool> {
-    buf.clear();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -412,10 +419,12 @@ impl Transport for StdioTransport {
                 // Empty keepalive line — loop instead of recursing.
                 // Hostile peer sending infinite empty lines would otherwise
                 // blow the stack via boxed-future allocation.
+                self.line_buf.clear();
                 continue;
             }
-            let msg = decode_line(trimmed)?;
-            return Ok(Some(msg));
+            let decoded = decode_line(trimmed);
+            self.line_buf.clear();
+            return decoded.map(Some);
         }
     }
 
@@ -534,6 +543,7 @@ mod tests {
 
         assert!(read_capped_line(&mut reader, &mut buf, 16).await.unwrap());
         assert_eq!(buf, b"valid");
+        buf.clear();
 
         let err = read_capped_line(&mut reader, &mut buf, 16)
             .await
@@ -566,6 +576,29 @@ mod tests {
 
         assert!(read_capped_line(&mut reader, &mut buf, 4096).await.unwrap());
         assert_eq!(buf.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn capped_line_resumes_a_line_after_the_read_is_dropped() {
+        // An abandoned call drops `recv` mid-frame. The bytes already taken
+        // from the pipe must survive in `buf`, or the next read decodes only
+        // the tail of the frame and the session reports a protocol error.
+        use tokio::io::AsyncWriteExt;
+        let (mut peer, ours) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(ours);
+        let mut buf = Vec::new();
+
+        peer.write_all(br#"{"jsonrpc":"2.0","#).await.unwrap();
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_capped_line(&mut reader, &mut buf, 4096),
+        )
+        .await;
+        assert!(dropped.is_err(), "no newline yet, so the read is pending");
+
+        peer.write_all(b"\"id\":7}\n").await.unwrap();
+        assert!(read_capped_line(&mut reader, &mut buf, 4096).await.unwrap());
+        assert_eq!(buf, br#"{"jsonrpc":"2.0","id":7}"#);
     }
 
     #[tokio::test]
