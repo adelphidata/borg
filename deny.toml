@@ -26,6 +26,14 @@ ignore = [
     # buffer holds `u8` (input/adapters/async_adapter.rs), which has no `Drop`.
     # No songbird release takes ringbuf >= 0.5.2 yet; drop this when one does.
     "RUSTSEC-2026-0293", # ringbuf: double free in Consumer::skip/clear on panicking Drop
+    # zip 8 reaches the graph only through anydoc and calamine (document
+    # text extraction), and every release of both still requires `zip ^8`.
+    # All three bugs live in `ZipArchive::extract` / `ZipStreamReader::extract`
+    # writing to disk; neither crate calls them — they read entries into
+    # memory. Drop these once anydoc/calamine move to zip >= 9.
+    "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extract
+    "RUSTSEC-2026-0368", # zip: extract creates symlinks escaping the destination
+    "RUSTSEC-2026-0369", # zip: extract applies permissions through symlinks
 ]
 
 [licenses]
