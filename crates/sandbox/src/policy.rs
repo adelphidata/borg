@@ -97,8 +97,9 @@ fn is_path_blocked(path: &str, blocked_paths: &[String]) -> bool {
         .collect();
 
     for blocked in blocked_paths {
+        let fold = blocked_entry_folds_case(blocked);
         for component in &components {
-            if component_matches_family(component, blocked) {
+            if component_matches_family(component, blocked, fold) {
                 return true;
             }
         }
@@ -106,21 +107,67 @@ fn is_path_blocked(path: &str, blocked_paths: &[String]) -> bool {
     false
 }
 
+/// `s` as a case-insensitive volume compares names: Unicode full case folding.
+///
+/// APFS (the macOS default) folds this way, so `.ßh` opens `.ssh` and `.conﬁg`
+/// (with the `ﬁ` ligature) opens `.config`. [`char::to_lowercase`] covers the
+/// simple folds, the Kelvin sign included. The table adds the full folds that
+/// expand to ASCII, the only ones that can alias a blocklist entry or a
+/// control-plane name, which are all ASCII.
+pub fn fold_case(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            'ß' | 'ẞ' => out.push_str("ss"),
+            'ſ' => out.push('s'),
+            'ﬀ' => out.push_str("ff"),
+            'ﬁ' => out.push_str("fi"),
+            'ﬂ' => out.push_str("fl"),
+            'ﬃ' => out.push_str("ffi"),
+            'ﬄ' => out.push_str("ffl"),
+            'ﬅ' | 'ﬆ' => out.push_str("st"),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether a blocklist entry matches every case spelling of itself.
+///
+/// Only a dotted entry does. A dotted name is a fixed location that tools look
+/// up by that name (`~/.aws/config`, `.envrc`). On a case-insensitive volume a
+/// write that creates `~/.AWS/config` creates the real file, and a name that
+/// does not exist yet keeps the caller's spelling through canonicalization. An
+/// undotted entry (`credentials`, `private_key`) is a common word that also
+/// names ordinary source files (`Credentials.java`). The secrets it guards
+/// already exist, and canonicalization returns an existing name in its on-disk
+/// case, so an exact match still catches each alias of a real one.
+pub fn blocked_entry_folds_case(entry: &str) -> bool {
+    entry.starts_with('.')
+}
+
 /// Component-level match with dotted-family coverage: `.env` also matches
-/// `.env.local`, `private_key` also matches `private_key.pem`.
+/// `.env.local`, `private_key` also matches `private_key.pem`. With `fold`
+/// (see [`blocked_entry_folds_case`]) both sides go through [`fold_case`].
 ///
 /// Deliberately a suffix-after-a-dot rule, not a substring one, so
 /// `.environment` and `.sshrc` are not over-blocked.
 ///
-/// This duplicates `component_matches_family` in
-/// `cortex::tool_handlers::filesystem::blocked` — `sandbox` sits below
-/// `cortex` in the dependency graph, so the rule cannot be shared. Keep the
-/// two in step: a policy entry the tool-side blocklist rejects must not be
-/// handed to the sandbox as an allowed bind.
-fn component_matches_family(component: &str, entry: &str) -> bool {
+/// `cortex::tool_handlers::filesystem::blocked` calls this too, so a policy
+/// entry the tool-side blocklist rejects is never handed to the sandbox as an
+/// allowed bind.
+pub fn component_matches_family(component: &str, entry: &str, fold: bool) -> bool {
+    let (component, entry) = if fold {
+        (fold_case(component), fold_case(entry))
+    } else {
+        (component.into(), entry.into())
+    };
     component == entry
         || component
-            .strip_prefix(entry)
+            .strip_prefix(&*entry)
             .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1)
 }
 
@@ -680,9 +727,81 @@ mod blocked_path_tests {
     /// empty-extension edge stays on the unblocked side with `.env_backup`.
     #[test]
     fn a_trailing_dot_with_no_extension_is_not_a_family_member() {
-        assert!(component_matches_family(".env.local", ".env"));
-        assert!(!component_matches_family(".env.", ".env"));
-        assert!(!component_matches_family("credentials.", "credentials"));
+        assert!(component_matches_family(".env.local", ".env", true));
+        assert!(!component_matches_family(".env.", ".env", true));
+        assert!(!component_matches_family(
+            "credentials.",
+            "credentials",
+            false
+        ));
+    }
+
+    /// On APFS every spelling below opens the blocked name (checked on a real
+    /// volume), so none may reach the sandbox as an allowed bind.
+    #[test]
+    fn dotted_entries_match_every_case_spelling() {
+        let blocked = vec![
+            ".aws".to_string(),
+            ".env".to_string(),
+            ".ssh".to_string(),
+            ".config".to_string(),
+            ".kube".to_string(),
+        ];
+        for path in [
+            "/home/u/.AWS/credentials",
+            "/home/u/.Env",
+            "/home/u/.ENV.local",
+            "/home/u/.awſ/config",    // long s
+            "/home/u/.ßh/id_ed25519", // sharp s folds to "ss"
+            "/home/u/.SSH/authorized_keys",
+            "/home/u/.conﬁg/gh",           // "fi" ligature
+            "/home/u/.\u{212A}ube/config", // Kelvin sign
+        ] {
+            assert!(is_path_blocked(path, &blocked), "{path} must be blocked");
+        }
+        // Folding must not widen the family rule. `.enéx` also puts a
+        // multi-byte char where `.env` ends.
+        for path in [
+            "/home/u/.AWS_notes",
+            "/home/u/.ENVIRONMENT",
+            "/home/u/.enéx",
+        ] {
+            assert!(!is_path_blocked(path, &blocked), "{path} must stay allowed");
+        }
+    }
+
+    /// An undotted entry is a common word that also names source files, so it
+    /// matches as written: `Credentials.java` is not `credentials`.
+    #[test]
+    fn undotted_entries_match_as_written() {
+        let blocked = vec!["credentials".to_string(), "private_key".to_string()];
+        for path in ["/home/u/.aws/credentials", "/w/private_key.pem"] {
+            assert!(is_path_blocked(path, &blocked), "{path} must be blocked");
+        }
+        for path in [
+            "/w/src/Credentials.java",
+            "/w/Sources/Credentials/Store.swift",
+            "/w/Private_Key.md",
+        ] {
+            assert!(!is_path_blocked(path, &blocked), "{path} must stay allowed");
+        }
+    }
+
+    #[test]
+    fn fold_case_expands_the_full_folds_that_reach_ascii() {
+        for (input, folded) in [
+            (".ssh", ".ssh"),
+            (".SSH", ".ssh"),
+            ("ẞ", "ss"),
+            ("ﬃ", "ffi"),
+            ("ﬄ", "ffl"),
+            ("ﬂ", "fl"),
+            ("ﬀ", "ff"),
+            ("ﬅﬆ", "stst"),
+            ("É", "é"),
+        ] {
+            assert_eq!(fold_case(input), folded, "fold of {input:?}");
+        }
     }
 
     #[test]

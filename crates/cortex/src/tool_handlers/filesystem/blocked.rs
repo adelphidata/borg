@@ -134,12 +134,19 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
     // `private_key.pem`, `credentials.json` etc. A component-suffix rule
     // (`entry` followed by a `.`) is used rather than a substring match so
     // unrelated files like `.environment` or `foo.ssh.txt` are not over-blocked.
+    // A dotted entry matches every case spelling of itself
+    // (`sandbox::policy::blocked_entry_folds_case` says why only those).
+    let fold = sandbox::policy::blocked_entry_folds_case(entry);
     for start in 0..=path_components.len() - entry_components.len() {
         let window = &path_components[start..start + entry_components.len()];
         let Some((win_last, win_head)) = window.split_last() else {
             continue;
         };
-        if win_head == entry_head && component_matches_family(win_last, entry_last) {
+        let head_matches = win_head
+            .iter()
+            .zip(entry_head)
+            .all(|(w, e)| names_match(w, e, fold));
+        if head_matches && component_matches_family(win_last, entry_last, fold) {
             return true;
         }
     }
@@ -147,21 +154,53 @@ fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
     false
 }
 
+/// `component` is `entry`, compared through [`sandbox::policy::fold_case`]
+/// when `fold` is set. A name that is not UTF-8 matches only exactly.
+fn names_match(component: &std::ffi::OsStr, entry: &std::ffi::OsStr, fold: bool) -> bool {
+    if component == entry {
+        return true;
+    }
+    match (fold, component.to_str(), entry.to_str()) {
+        (true, Some(c), Some(e)) => sandbox::policy::fold_case(c) == sandbox::policy::fold_case(e),
+        _ => false,
+    }
+}
+
 /// Whether a path component matches a blocked entry component, either exactly or
 /// as a dotted "family" member (`entry` immediately followed by `.` and any
 /// suffix). Family matching lets `.env` cover `.env.local`, `private_key` cover
 /// `private_key.pem`, and `credentials` cover `credentials.json`, without the
 /// false positives a substring match would produce (`.environment`, `.sshrc`).
-fn component_matches_family(component: &std::ffi::OsStr, entry: &std::ffi::OsStr) -> bool {
-    if component == entry {
-        return true;
-    }
+///
+/// The rule is the sandbox's own [`sandbox::policy::component_matches_family`],
+/// so the two blocklists cannot disagree. A name that is not UTF-8 matches only
+/// exactly.
+fn component_matches_family(
+    component: &std::ffi::OsStr,
+    entry: &std::ffi::OsStr,
+    fold: bool,
+) -> bool {
     match (component.to_str(), entry.to_str()) {
-        (Some(c), Some(e)) => c
-            .strip_prefix(e)
-            .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1),
-        _ => false,
+        (Some(c), Some(e)) => sandbox::policy::component_matches_family(c, e, fold),
+        _ => component == entry,
     }
+}
+
+/// `path` begins with `prefix`, comparing components through
+/// [`sandbox::policy::fold_case`] (see [`is_control_plane_write_denied`]).
+fn starts_with_ignoring_case(path: &std::path::Path, prefix: &std::path::Path) -> bool {
+    let mut components = path.components();
+    prefix.components().all(|p| {
+        components
+            .next()
+            .is_some_and(|c| names_match(c.as_os_str(), p.as_os_str(), true))
+    })
+}
+
+/// `a` and `b` name the same path, comparing components through
+/// [`sandbox::policy::fold_case`].
+fn same_path_ignoring_case(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.components().count() == b.components().count() && starts_with_ignoring_case(a, b)
 }
 
 /// Canonicalize a path that may not exist yet (the `apply_patch` add-file
@@ -282,8 +321,8 @@ pub fn is_instruction_file_write_denied(path: &std::path::Path) -> bool {
     let literal = lexically_normalized(path);
     [resolved.as_path(), literal.as_path()].iter().any(|p| {
         p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-            let lower = name.to_ascii_lowercase();
-            INSTRUCTION_FILE_BASENAMES.contains(&lower.as_str())
+            let folded = sandbox::policy::fold_case(name);
+            INSTRUCTION_FILE_BASENAMES.contains(&&*folded)
         })
     })
 }
@@ -310,7 +349,9 @@ pub(crate) fn instruction_write_denied_message(raw_path: &str) -> String {
 /// Resolution uses `canonicalize` on both sides so `..` traversal and symlink
 /// chains cannot bypass the check. Falls back to the literal path if
 /// canonicalize fails (path doesn't exist yet) — the agent shouldn't be
-/// creating new files at those locations either.
+/// creating new files at those locations either. Comparison folds case the way
+/// APFS does ([`sandbox::policy::fold_case`]), so `HOOKS.JSON` or `hookſ.json`
+/// cannot create the file the hooks loader reads as `hooks.json`.
 ///
 /// Operator escape hatch is intentional absence: there is none. Use the
 /// daemon's gRPC API or shell out manually if you need to touch control-plane
@@ -324,13 +365,13 @@ pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
 
     // SQLite DB plus its WAL/SHM siblings — `borg.db`, `borg.db-wal`, `borg.db-shm`.
     for sibling in ["borg.db", "borg.db-wal", "borg.db-shm"] {
-        if target == home.join(sibling) {
+        if same_path_ignoring_case(&target, &home.join(sibling)) {
             return true;
         }
     }
 
     // Whole-tree denies for secret material.
-    if target.starts_with(home.join("secrets")) {
+    if starts_with_ignoring_case(&target, &home.join("secrets")) {
         return true;
     }
 
@@ -344,7 +385,7 @@ pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
         "borgd.pid",
         "scheduler.tick.lock",
     ] {
-        if target == home.join(name) {
+        if same_path_ignoring_case(&target, &home.join(name)) {
             return true;
         }
     }
@@ -363,13 +404,15 @@ const CONTROL_PLANE_LEAVES: &[&str] = &["hooks.json", "borg.db", "secrets"];
 /// custom home, a `~/.borg/...` path, and a bare `.borg/...` relative path are
 /// all caught. `$BORG_HOME` is fixed for the life of the process, so this is
 /// cached to keep a `canonicalize` syscall and six allocations off the
-/// per-shell-command hot path.
+/// per-shell-command hot path. Stored case-folded, to be compared with
+/// [`folded_token`].
 static CONTROL_PLANE_NEEDLES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     let mut needles = Vec::new();
     if let Ok(home) = crate::paths::resolve_borg_home_readonly(None) {
         let home = home.canonicalize().unwrap_or(home);
         for leaf in CONTROL_PLANE_LEAVES {
-            needles.push(home.join(leaf).to_string_lossy().into_owned());
+            needles
+                .push(sandbox::policy::fold_case(&home.join(leaf).to_string_lossy()).into_owned());
         }
     }
     for leaf in CONTROL_PLANE_LEAVES {
@@ -400,32 +443,41 @@ const CONTROL_PLANE_BARE_LEAVES: &[&str] = &[
 /// `$BORG_HOME`, its `secrets/` subtree, and the conventional `.borg` /
 /// `.borg/secrets` relative forms. Used to detect a `cd` into control-plane
 /// territory so a subsequent bare-leaf write (`cd ~/.borg && … > hooks.json`)
-/// is still caught.
+/// is still caught. Stored case-folded, like [`CONTROL_PLANE_NEEDLES`].
 static CONTROL_PLANE_DIR_NEEDLES: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
         let mut needles = Vec::new();
         if let Ok(home) = crate::paths::resolve_borg_home_readonly(None) {
             let home = home.canonicalize().unwrap_or(home);
-            needles.push(home.to_string_lossy().into_owned());
-            needles.push(home.join("secrets").to_string_lossy().into_owned());
+            needles.push(sandbox::policy::fold_case(&home.to_string_lossy()).into_owned());
+            needles.push(
+                sandbox::policy::fold_case(&home.join("secrets").to_string_lossy()).into_owned(),
+            );
         }
         needles.push(".borg/secrets".to_string());
         needles.push(".borg".to_string());
         needles
     });
 
+/// `token` with a leading `~` expanded and case folded
+/// ([`sandbox::policy::fold_case`]), for comparison with the folded needles.
+/// On a case-insensitive disk `~/.BORG/HOOKS.JSON` *is* the hooks file, so the
+/// guard must not care how it is spelled. Expansion runs before folding
+/// because it inserts the home path in its on-disk case.
+fn folded_token(token: &str) -> String {
+    if token.starts_with('~') {
+        sandbox::policy::fold_case(&crate::util::unix_ext::expand_tilde(token)).into_owned()
+    } else {
+        sandbox::policy::fold_case(token).into_owned()
+    }
+}
+
 /// True if `token`, after tilde expansion, references a control-plane file.
-/// Expansion (and its allocation) is skipped for the common case of a token
-/// without a leading `~`, where `expand_tilde` is a no-op. When
-/// `include_bare_leaves` is set (the caller has established the command runs
-/// with a control-plane cwd) a token whose *final path component* is a
+/// When `include_bare_leaves` is set (the caller has established the command
+/// runs with a control-plane cwd) a token whose *final path component* is a
 /// control-plane leaf also matches.
 fn token_targets_control_plane_ext(token: &str, include_bare_leaves: bool) -> bool {
-    let expanded = if token.starts_with('~') {
-        std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(token))
-    } else {
-        std::borrow::Cow::Borrowed(token)
-    };
+    let expanded = folded_token(token);
     if CONTROL_PLANE_NEEDLES
         .iter()
         .any(|n| expanded.contains(n.as_str()))
@@ -469,11 +521,7 @@ fn command_cwd_is_control_plane(command: &str) -> bool {
                     return false;
                 }
                 toks.get(idx + 1).is_some_and(|target| {
-                    let expanded = if target.starts_with('~') {
-                        std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(target))
-                    } else {
-                        std::borrow::Cow::Borrowed(*target)
-                    };
+                    let expanded = folded_token(target);
                     CONTROL_PLANE_DIR_NEEDLES
                         .iter()
                         .any(|n| expanded.contains(n.as_str()))
@@ -542,7 +590,9 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
     // `borg settings get|list` stay allowed. Checked on the raw tokens (before
     // wrapper stripping) so `borg` at any position is seen.
     for w in raw.windows(3) {
-        if command_basename(w[0]) == "borg" && w[1] == "settings" && matches!(w[2], "set" | "unset")
+        if sandbox::policy::fold_case(command_basename(w[0])) == "borg"
+            && w[1] == "settings"
+            && matches!(w[2], "set" | "unset")
         {
             return true;
         }
@@ -575,20 +625,15 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
         toks.iter()
             .any(|t| token_targets_control_plane_ext(t, bare_leaves))
     };
-    match command_basename(first) {
+    // Folded: a `PATH` lookup of `TEE` finds `/usr/bin/tee` on a
+    // case-insensitive disk.
+    match &*sandbox::policy::fold_case(command_basename(first)) {
         // `sqlite3 <control-plane db>` — the encrypted DB has no legitimate
         // agent use and sqlite3 opens read-write by default.
         "sqlite3" => any_ref(),
         // `tee`/`truncate` overwrite their referenced file args.
         "tee" | "truncate" => any_ref(),
-        // `sed -i` / `sed -i.bak` / `sed --in-place` mutate the file in place.
-        "sed"
-            if toks
-                .iter()
-                .any(|t| t.starts_with("-i") || *t == "--in-place") =>
-        {
-            any_ref()
-        }
+        "sed" if sed_edits_in_place(&toks[1..]) => any_ref(),
         "dd" => toks.iter().any(|t| {
             t.strip_prefix("of=")
                 .is_some_and(|p| token_targets_control_plane_ext(p, bare_leaves))
@@ -626,6 +671,29 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
     }
 }
 
+/// `sed` with these arguments edits its files in place: `-i`, `-i.bak`, the
+/// BSD `-I`, `--in-place[=SUFFIX]`, or an in-place flag inside a short-option
+/// cluster (`-ni`, `-Ei`). A cluster stops at `e`, `f` or `l`, whose argument
+/// may follow attached (`-es/i/x/` is a script, not a flag).
+fn sed_edits_in_place(args: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        if arg.starts_with("--") {
+            return arg.starts_with("--in-place");
+        }
+        let Some(cluster) = arg.strip_prefix('-') else {
+            return false;
+        };
+        for flag in cluster.chars() {
+            match flag {
+                'i' | 'I' => return true,
+                'e' | 'f' | 'l' => return false,
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
 /// True if `token` points at a control-plane *directory*: the resolved
 /// `$BORG_HOME` (absolute needles) or any path with a literal `.borg`
 /// component. Component matching — not substring — so `foo.borg`/`.borgrc`
@@ -636,11 +704,7 @@ fn stage_verb_mutates_control_plane(stage: &str, bare_leaves: bool) -> bool {
 /// allow on ours is not. Only deletion verbs consult this; the write verbs
 /// need a file target and keep their leaf-needle matching.
 fn token_targets_control_plane_dir(token: &str) -> bool {
-    let expanded = if token.starts_with('~') {
-        std::borrow::Cow::Owned(crate::util::unix_ext::expand_tilde(token))
-    } else {
-        std::borrow::Cow::Borrowed(token)
-    };
+    let expanded = folded_token(token);
     // Boundary-aware needle match: the home needle must be followed by `/` or
     // end-of-token, so `/Users/x/.borg` doesn't swallow `/Users/x/.borgrc`.
     let at_dir_boundary = |needle: &str| {
@@ -807,6 +871,65 @@ mod tests {
     }
 
     #[test]
+    fn is_blocked_path_matches_case_aliases_of_dotted_entries() {
+        // On APFS each denied spelling opens the dotted entry (checked on a
+        // real volume). A name that does not exist yet keeps the caller's
+        // spelling through canonicalization, so the match itself has to fold
+        // case. The root does not exist, so no on-disk lookup can fix the case.
+        let root = std::path::Path::new("/nonexistent-borg-case-root");
+        let blocked: Vec<String> = [".aws", ".env", ".ssh", ".config/gh", "credentials"]
+            .map(String::from)
+            .to_vec();
+        for denied in [
+            ".AWS/config",
+            ".Env",
+            ".ENV.local",
+            ".Config/GH/hosts.yml",
+            ".awſ/config",         // long s
+            ".ßh/authorized_keys", // sharp s folds to "ss"
+            ".conﬁg/gh/hosts.yml", // "fi" ligature
+        ] {
+            assert!(
+                is_blocked_path(&root.join(denied), &blocked, &[]),
+                "{denied} must be blocked"
+            );
+        }
+        // Folding must not widen the family rule, and an undotted entry is a
+        // common word that matches only as written. `.enéx` also puts a
+        // multi-byte char where `.env` ends.
+        for allowed in [
+            ".AWS_backup/config",
+            ".ENVIRONMENT",
+            ".config/GHOST/x",
+            ".enéx",
+            "src/Credentials.java",
+            "Sources/Credentials/Store.swift",
+        ] {
+            assert!(
+                !is_blocked_path(&root.join(allowed), &blocked, &[]),
+                "{allowed} must stay allowed"
+            );
+        }
+    }
+
+    /// Undotted entries match as written. That is safe only because
+    /// canonicalization returns an existing name in its on-disk case, so an
+    /// alias of a real secret still resolves to the blocked spelling.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_existing_secret_is_blocked_under_any_spelling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("private_key.pem"), "k").expect("write");
+        let alias = root.join("PRIVATE_KEY.pem");
+        if !alias.exists() {
+            // A case-sensitive volume: the alias is a different file.
+            return;
+        }
+        assert!(is_blocked_path(&alias, &["private_key".to_string()], &[]));
+    }
+
+    #[test]
     fn is_blocked_path_absolute_path_not_under_home() {
         let blocked = vec![".aws".to_string()];
         let path = std::path::Path::new("/etc/hosts");
@@ -943,6 +1066,40 @@ mod tests {
         // Lexical traversal through a non-existent prefix still resolves.
         let traversal = home.join("ghost").join("..").join("borg.db");
         assert!(is_control_plane_write_denied(&traversal));
+
+        std::env::remove_var("BORG_HOME");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_plane_deny_folds_case() {
+        // A `HOOKS.JSON` that does not exist yet keeps the caller's spelling
+        // through canonicalization; on APFS the hooks loader then reads it as
+        // `hooks.json` and runs it unsandboxed. None of these files are
+        // created, so no on-disk lookup can fix the case.
+        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().canonicalize().expect("canonicalize tempdir");
+        std::env::set_var("BORG_HOME", &home);
+
+        for name in [
+            "HOOKS.JSON",
+            "hookſ.json", // long s
+            "Borg.DB",
+            "borg.DB-wal",
+            "Secrets/new-kek.enc",
+            "ſecrets/new-kek.enc",
+            "BORGD.SOCK",
+        ] {
+            assert!(
+                is_control_plane_write_denied(&home.join(name)),
+                "{name} must be denied"
+            );
+        }
+        assert!(!is_control_plane_write_denied(&home.join("HOOKS.JSON.bak")));
+        assert!(!is_control_plane_write_denied(
+            &home.join("SecretsArchive/x")
+        ));
 
         std::env::remove_var("BORG_HOME");
     }
@@ -1163,6 +1320,58 @@ mod tests {
     }
 
     #[test]
+    fn shell_guard_folds_case() {
+        // On APFS every spelling below names the real control-plane file, and
+        // a `PATH` lookup of `TEE` finds `tee`.
+        for cmd in [
+            "echo pwned > ~/.borg/HOOKS.JSON",
+            "echo pwned > ~/.BORG/hooks.json",
+            "echo pwned > ~/.borg/hookſ.json",
+            "TEE ~/.borg/hooks.json",
+            "cd ~/.BORG && echo x > Hooks.Json",
+            "rm -rf ~/.Borg",
+            "BORG settings set security.blocked_paths []",
+        ] {
+            assert!(
+                shell_command_targets_control_plane(cmd),
+                "expected control-plane guard to fire for: {cmd:?}"
+            );
+        }
+        assert!(!shell_command_targets_control_plane(
+            "cat ~/.borg/HOOKS.JSON"
+        ));
+    }
+
+    #[test]
+    fn shell_guard_sees_every_sed_in_place_spelling() {
+        for cmd in [
+            "sed -i s/a/b/ ~/.borg/hooks.json",
+            "sed -i.bak s/a/b/ ~/.borg/hooks.json",
+            "sed -I '' s/a/b/ ~/.borg/hooks.json", // BSD
+            "sed -ni s/a/b/p ~/.borg/hooks.json",
+            "sed -Ei s/a/b/ ~/.borg/hooks.json",
+            "sed --in-place s/a/b/ ~/.borg/hooks.json",
+            "sed --in-place=.bak s/a/b/ ~/.borg/hooks.json",
+        ] {
+            assert!(
+                shell_command_targets_control_plane(cmd),
+                "expected control-plane guard to fire for: {cmd:?}"
+            );
+        }
+        // Printing is a read. An `i` inside an attached script is not a flag.
+        for cmd in [
+            "sed -n p ~/.borg/hooks.json",
+            "sed -es/i/x/ ~/.borg/hooks.json",
+            "sed --expression=s/i/x/ ~/.borg/hooks.json",
+        ] {
+            assert!(
+                !shell_command_targets_control_plane(cmd),
+                "a read-only sed must stay allowed: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_guard_allows_reads_and_unrelated_writes() {
         // Reads of control-plane files, settings *reads*, and writes that only
         // touch non-control-plane paths must keep auto-approving — over-blocking
@@ -1307,6 +1516,8 @@ mod tests {
             (".clinerules", true),
             (".windsurfrules", true),
             ("GEMINI.md", true),
+            ("AGENTſ.md", true),      // long s: APFS opens it as AGENTS.md
+            (".cursorruleſ", true),   // same fold on a dotted name
             ("NOTES.md", false),      // unrelated markdown
             ("sub/README.md", false), // unrelated nested
             ("MYAGENTS.md", false),   // shares a suffix, not the basename
