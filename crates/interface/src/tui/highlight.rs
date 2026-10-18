@@ -1,8 +1,9 @@
 //! Syntax highlighting for fenced code blocks and diff context lines.
 //!
-//! Wraps [`syntect`] with a bundled theme + default syntax set. Lookups and
-//! highlight state are created per-call but the `SyntaxSet` / `ThemeSet` are
-//! loaded once via `OnceLock` to amortize parsing cost.
+//! Wraps [`syntect`] with two bundled themes (one per terminal background) +
+//! default syntax set. Lookups and highlight state are created per-call but
+//! the syntax set and themes are loaded once via `OnceLock` to amortize
+//! parsing cost.
 
 use std::sync::OnceLock;
 
@@ -15,22 +16,42 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use super::theme;
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<Theme> = OnceLock::new();
+/// `[dark, light]` background themes.
+static THEMES: OnceLock<[Theme; 2]> = OnceLock::new();
 
 fn syntax_set() -> &'static SyntaxSet {
     SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
+/// The bundled theme that reads on the terminal's background.
+///
+/// Only foreground colors are painted, so the theme must suit the terminal's
+/// own background. `base16-ocean.dark` draws plain code in a light gray that
+/// almost vanishes on white. Chosen on each call, like the other light/dark
+/// styles, so a block drawn before the background probe answers is not
+/// stuck with the dark theme.
 fn active_theme() -> &'static Theme {
-    THEME.get_or_init(|| {
-        let ts = ThemeSet::load_defaults();
-        // base16-ocean.dark reads clearly on a dark terminal; fall back gracefully.
-        ts.themes
-            .get("base16-ocean.dark")
-            .or_else(|| ts.themes.values().next())
-            .cloned()
-            .unwrap_or_default()
-    })
+    theme_for(super::colors::is_light_terminal())
+}
+
+fn theme_for(light_background: bool) -> &'static Theme {
+    let [dark, light] = THEMES.get_or_init(|| {
+        let mut themes = ThemeSet::load_defaults().themes;
+        ["base16-ocean.dark", "InspiredGitHub"].map(|name| {
+            themes.remove(name).unwrap_or_else(|| {
+                tracing::warn!(
+                    theme = name,
+                    "bundled syntax theme missing; using the default"
+                );
+                Theme::default()
+            })
+        })
+    });
+    if light_background {
+        light
+    } else {
+        dark
+    }
 }
 
 fn find_syntax<'a>(ss: &'a SyntaxSet, lang: &str) -> Option<&'a SyntaxReference> {
@@ -89,6 +110,10 @@ fn within_highlight_limits(code: &str) -> bool {
 /// back to a single cyan span per line (same as the existing code-style
 /// treatment).
 pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
+    highlight_with_theme(code, lang, active_theme())
+}
+
+fn highlight_with_theme(code: &str, lang: &str, theme_ref: &Theme) -> Vec<Line<'static>> {
     if !within_highlight_limits(code) {
         return fallback_lines(code);
     }
@@ -96,7 +121,6 @@ pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
     let Some(syntax) = find_syntax(ss, lang) else {
         return fallback_lines(code);
     };
-    let theme_ref = active_theme();
     let mut h = HighlightLines::new(syntax, theme_ref);
 
     let mut out = Vec::new();
@@ -286,5 +310,62 @@ mod tests {
             "js resolved to {:?}",
             js.name
         );
+    }
+
+    /// WCAG contrast ratio of two sRGB colors.
+    fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        fn lum((r, g, b): (u8, u8, u8)) -> f64 {
+            let lin = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        }
+        let (hi, lo) = {
+            let (x, y) = (lum(a), lum(b));
+            if x > y {
+                (x, y)
+            } else {
+                (y, x)
+            }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Only the foreground is painted, so code must read on the terminal's
+    /// own background. The floor sits under the dimmest comment gray of the
+    /// chosen themes (2.55:1 on the light gray `COLORFGBG` implies) and well
+    /// over a dark theme's plain text on white (about 1.7:1), the failure
+    /// this guards.
+    #[test]
+    fn code_colors_contrast_with_the_terminal_background() {
+        const FLOOR: f64 = 2.5;
+        let code = "// say hi\nfn main() {\n    let name = \"borg\";\n    println!(\"{name} {}\", 42);\n}\n";
+        for (light, background) in [
+            (true, (255, 255, 255)),
+            (true, (240, 240, 240)),
+            (false, (30, 30, 30)),
+        ] {
+            for line in highlight_with_theme(code, "rust", theme_for(light)) {
+                for span in &line.spans {
+                    if span.content.trim().is_empty() {
+                        continue;
+                    }
+                    let Some(Color::Rgb(r, g, b)) = span.style.fg else {
+                        panic!("span {:?} has no RGB foreground", span.content);
+                    };
+                    let ratio = contrast((r, g, b), background);
+                    assert!(
+                        ratio >= FLOOR,
+                        "{:?} in #{r:02x}{g:02x}{b:02x} is {ratio:.2}:1 on {background:?}",
+                        span.content
+                    );
+                }
+            }
+        }
     }
 }
