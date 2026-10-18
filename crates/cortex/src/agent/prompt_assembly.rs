@@ -664,18 +664,7 @@ impl Agent {
     }
 
     pub(super) fn latest_user_query(&self) -> String {
-        // Skip compaction markers: they are Role::User rows, and when the
-        // protected tail holds no real user row the summary text would
-        // otherwise become the "query" driving memory retrieval.
-        self.history
-            .iter()
-            .rev()
-            .find(|m| {
-                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
-            })
-            .and_then(|m| m.text_content())
-            .unwrap_or("")
-            .to_string()
+        crate::conversation::latest_user_text(&self.history).to_string()
     }
 
     /// Pre-compaction flush: extract durable information from messages about to be dropped
@@ -1515,18 +1504,10 @@ Rules:
         self.drain_pending_goal_steering().await;
 
         // Extract user message early — needed for conditional tool loading and
-        // hooks. Compaction markers are skipped: gating tools on the summary
-        // text instead of the user's actual request loads the wrong toolset.
-        let user_msg = self
-            .history
-            .iter()
-            .rev()
-            .find(|m| {
-                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
-            })
-            .and_then(|m| m.text_content())
-            .unwrap_or("")
-            .to_string();
+        // hooks. Rows Borg wrote are skipped: gating tools on a summary or a
+        // sub-agent's report instead of the user's request loads the wrong
+        // toolset.
+        let user_msg = crate::conversation::latest_user_text(&self.history).to_string();
 
         // Tools are resolved BEFORE the system prompt: the prompt's `<tooling>`
         // section is rendered from this exact slice, so it can never advertise a

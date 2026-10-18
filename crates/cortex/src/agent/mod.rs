@@ -542,16 +542,7 @@ impl Agent {
     }
 
     pub(super) fn latest_user_message_text(&self) -> &str {
-        // Compaction markers are Role::User rows — skip them so callers get
-        // the user's actual latest message, never the summary text.
-        self.history
-            .iter()
-            .rev()
-            .find(|m| {
-                m.role == crate::types::Role::User && !crate::conversation::is_compaction_marker(m)
-            })
-            .and_then(|m| m.text_content())
-            .unwrap_or("")
+        crate::conversation::latest_user_text(&self.history)
     }
 
     /// Assemble an `Agent` from pre-computed parts shared by all constructors.
@@ -2073,25 +2064,31 @@ impl Agent {
         }
     }
 
-    /// Collect completed sub-agent results and persist them as tool result messages.
+    /// Hand the model the sub-agents that finished since the last iteration
+    /// and that no `wait_for_agent` call collected, as one user-role notice
+    /// ([`crate::multi_agent::completion_notice`] says why not a tool row).
     async fn drain_sub_agent_completions(&mut self) {
-        if let Some(ref mut ctrl) = self.agent_control {
-            let completions = ctrl.drain_completions();
-            for completion in completions {
-                let ctx = format!(
-                    "[Sub-agent \"{}\" (id: {}) status: {}]\n{}",
-                    completion.nickname,
-                    completion.agent_id,
-                    completion.status.as_str(),
-                    completion
-                        .final_response
-                        .as_deref()
-                        .unwrap_or("(no output)")
-                );
-                self.persist_message(Message::tool_result("sub-agent", &ctx))
-                    .await;
-            }
+        // A resumed turn continues the assistant's own partial reply, which
+        // must stay the last row. The reports wait for the next iteration.
+        if self
+            .history
+            .last()
+            .is_some_and(|m| m.role == Role::Assistant)
+        {
+            return;
         }
+        let Some(ctrl) = self.agent_control.as_mut() else {
+            return;
+        };
+        let completions = ctrl.drain_completions();
+        let Some(reports) = crate::multi_agent::completion_reports(&completions) else {
+            return;
+        };
+        // The cap and secret redaction a delegate tool result gets: a child's
+        // answer can repeat a key it read.
+        let reports = self.truncate_and_redact(&reports);
+        let notice = crate::multi_agent::completion_notice(&reports);
+        self.persist_message(Message::user(notice)).await;
     }
 
     /// Force a compaction pass now, bypassing the proactive token-budget gate.

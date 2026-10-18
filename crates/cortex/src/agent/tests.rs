@@ -607,6 +607,123 @@ fn prompt_cache_scope_propagates_to_controller_for_grandchildren() {
     );
 }
 
+/// A child the model started without waiting on must still reach the model.
+/// Its result used to be stored as a tool result that answered no call, which
+/// `normalize_history` drops before every request, so the work was lost.
+#[tokio::test]
+async fn a_finished_background_sub_agent_reaches_the_model() {
+    let (mut agent, tx) = agent_with_sub_agents();
+    agent.history.push(Message::user("audit the deps"));
+    tx.send(finished_child("found 3 stale crates"))
+        .await
+        .expect("send completion");
+
+    agent.drain_sub_agent_completions().await;
+    normalize_history(&mut agent.history);
+
+    let notice = agent
+        .history
+        .iter()
+        .find(|m| {
+            m.text_content()
+                .is_some_and(|t| t.contains("found 3 stale crates"))
+        })
+        .expect("the child's report must survive normalization");
+    assert_eq!(notice.role, crate::types::Role::User);
+    assert!(
+        notice
+            .text_content()
+            .is_some_and(|t| t.contains("<untrusted_content source=\"sub-agent\">")),
+        "the report must sit inside an untrusted block"
+    );
+    assert_eq!(
+        agent.latest_user_message_text(),
+        "audit the deps",
+        "the notice must not stand in for what the user asked"
+    );
+}
+
+fn agent_with_sub_agents() -> (
+    Agent,
+    tokio::sync::mpsc::Sender<crate::multi_agent::SubAgentCompletion>,
+) {
+    let mut config = Config::default();
+    config.agents.enabled = true;
+    let mut agent = minimal_test_agent(config.clone());
+    let own_session = agent.session.meta.id.clone();
+    let control = crate::multi_agent::AgentControl::new(&config.agents, &own_session, 1);
+    let tx = control.test_completion_tx();
+    agent.agent_control = Some(control);
+    (agent, tx)
+}
+
+fn finished_child(result: &str) -> crate::multi_agent::SubAgentCompletion {
+    crate::multi_agent::SubAgentCompletion {
+        agent_id: "a1".into(),
+        nickname: "Scout".into(),
+        status: crate::multi_agent::SubAgentStatus::Completed {
+            result: result.into(),
+        },
+        final_response: Some(result.into()),
+        files_written: Vec::new(),
+        undelivered_input: Vec::new(),
+    }
+}
+
+/// A child's answer can repeat a secret it read. The notice gets the same
+/// redaction a delegate tool result gets before it reaches the provider.
+#[tokio::test]
+async fn a_background_sub_agent_report_is_redacted() {
+    const TOKEN: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk";
+    let (mut agent, tx) = agent_with_sub_agents();
+    agent.history.push(Message::user("check the CI config"));
+    tx.send(finished_child(&format!("the workflow uses {TOKEN}")))
+        .await
+        .expect("send completion");
+
+    agent.drain_sub_agent_completions().await;
+
+    let notice = agent
+        .history
+        .last()
+        .and_then(|m| m.text_content())
+        .expect("a notice");
+    assert!(
+        notice.contains("the workflow uses"),
+        "report kept: {notice}"
+    );
+    assert!(
+        !notice.contains(TOKEN),
+        "the token must be redacted: {notice}"
+    );
+}
+
+/// A resumed turn continues the assistant's partial reply, which must stay the
+/// last row. A report that arrives then waits for the next iteration.
+#[tokio::test]
+async fn a_report_never_lands_after_a_partial_reply() {
+    let (mut agent, tx) = agent_with_sub_agents();
+    agent.history.push(Message::user("audit the deps"));
+    agent
+        .history
+        .push(Message::assistant("So far I have checked"));
+    tx.send(finished_child("found 3 stale crates"))
+        .await
+        .expect("send completion");
+
+    agent.drain_sub_agent_completions().await;
+    assert_eq!(agent.history.len(), 2, "the partial reply must stay last");
+
+    agent.history.push(Message::user("go on"));
+    agent.drain_sub_agent_completions().await;
+    assert!(
+        agent.history.last().is_some_and(|m| m
+            .text_content()
+            .is_some_and(|t| t.contains("found 3 stale crates"))),
+        "the report must arrive once the reply is no longer last"
+    );
+}
+
 /// After a provider failover, the `<environment>` runtime line must report the
 /// model that actually served the response — not the configured primary — so
 /// the model identifies itself truthfully during an outage. Guards the

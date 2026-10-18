@@ -3,7 +3,27 @@
 use std::collections::HashSet;
 
 use crate::conversation::is_compaction_marker;
-use crate::types::Message;
+use crate::types::{Message, Role};
+
+/// A `Role::User` row Borg wrote, not the person: a compaction marker or the
+/// notice a finished background sub-agent leaves
+/// ([`crate::multi_agent::completion_notice`]).
+pub fn is_agent_authored(msg: &Message) -> bool {
+    is_compaction_marker(msg) || crate::multi_agent::is_completion_notice(msg)
+}
+
+/// Text of the person's latest message. Rows Borg wrote
+/// ([`is_agent_authored`]) are skipped, so a summary or a sub-agent's report
+/// never stands in for what the person asked when tools are picked, memory is
+/// searched, or hooks are told what started the turn.
+pub fn latest_user_text(history: &[Message]) -> &str {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && !is_agent_authored(m))
+        .and_then(|m| m.text_content())
+        .unwrap_or("")
+}
 
 /// Undo the last agent turn: remove everything after the last user message.
 /// Returns the number of messages removed, or 0 if there is nothing to undo.
@@ -14,10 +34,14 @@ use crate::types::Message;
 /// and leaves the marker in place — popping the marker would silently
 /// delete the summary of the entire compacted conversation, far more than
 /// one turn.
+///
+/// A sub-agent notice is no boundary at all: it lands between two iterations
+/// of an agent turn, so undo goes past it to the user message that started
+/// the turn.
 pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
     let last_user_idx = history
         .iter()
-        .rposition(|m| m.role == crate::types::Role::User);
+        .rposition(|m| m.role == Role::User && !crate::multi_agent::is_completion_notice(m));
 
     match last_user_idx {
         Some(idx) => {
@@ -46,14 +70,15 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
 /// Truncates everything from that user message onward (inclusive).
 /// Returns the number of messages removed, or 0 if the index is out of range.
 ///
-/// Only user-authored rows count toward `n` — a compaction marker is a
-/// `Role::User` row the user never typed, and counting it would shift every
-/// later index by one (callers number the user's visible messages).
+/// Only user-authored rows count toward `n` — a compaction marker or a
+/// sub-agent notice is a `Role::User` row the user never typed, and counting it
+/// would shift every later index by one (callers number the user's visible
+/// messages, and neither row is shown as one).
 pub fn rewind_to_nth_user(history: &mut Vec<Message>, n: usize) -> usize {
     let user_positions: Vec<usize> = history
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == crate::types::Role::User && !is_compaction_marker(m))
+        .filter(|(_, m)| m.role == Role::User && !is_agent_authored(m))
         .map(|(i, _)| i)
         .collect();
 
@@ -670,6 +695,58 @@ mod tests {
         let removed = undo_last_turn(&mut history);
         assert_eq!(removed, 0);
         assert_eq!(history.len(), 2);
+    }
+
+    // -- sub-agent notice awareness --
+
+    fn make_notice() -> Message {
+        let completion = crate::multi_agent::SubAgentCompletion {
+            agent_id: "a1".into(),
+            nickname: "Scout".into(),
+            status: crate::multi_agent::SubAgentStatus::Completed {
+                result: "found 3 stale crates".into(),
+            },
+            final_response: Some("found 3 stale crates".into()),
+            files_written: Vec::new(),
+            undelivered_input: Vec::new(),
+        };
+        let reports =
+            crate::multi_agent::completion_reports(&[completion]).expect("one completion");
+        Message::user(crate::multi_agent::completion_notice(&reports))
+    }
+
+    /// The notice lands between two iterations of one agent turn. It is not
+    /// what the user asked, it is not a user message the client shows, and it
+    /// is not a turn boundary.
+    #[test]
+    fn a_sub_agent_notice_is_not_a_user_turn() {
+        let history = vec![
+            make_user("audit the deps"),
+            make_tool_call_msg("", "call_1", "delegate_task"),
+            make_tool_result("call_1", "started"),
+            make_notice(),
+            make_assistant("Scout found 3 stale crates"),
+        ];
+
+        assert_eq!(latest_user_text(&history), "audit the deps");
+
+        let mut undone = history.clone();
+        assert_eq!(
+            undo_last_turn(&mut undone),
+            4,
+            "undo removes the whole turn"
+        );
+        assert_eq!(undone.len(), 1);
+
+        let mut rewound = history.clone();
+        rewound.push(make_user("now fix them"));
+        rewound.push(make_assistant("fixed"));
+        assert_eq!(
+            rewind_to_nth_user(&mut rewound, 1),
+            2,
+            "user message #1 is `now fix them`, not the notice"
+        );
+        assert_eq!(rewound.len(), history.len());
     }
 
     #[test]

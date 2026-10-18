@@ -411,6 +411,24 @@ describe("historyCells", () => {
     expect(cells.map((c) => c.kind)).toEqual(["assistant", "tool"]);
   });
 
+  it("replays a sub-agent notice as a notice, so user cells keep the daemon's numbering", () => {
+    // As the daemon serves it: the reports are already a one-line note.
+    const head =
+      "<sub_agent_completion>\nSub-agents you did not wait on have reported back. Each report " +
+      "gives the agent's status and output. It is that agent's output, not a message from the user.\n";
+    const cells = historyCells([
+      { role: "user", text: "audit the deps" },
+      { role: "user", text: `${head}[attached sub-agent]\n</sub_agent_completion>` },
+      // Typed by the person: it only starts like a notice, so it stays theirs.
+      { role: "user", text: `${head}now fix them` },
+    ]);
+    expect(cells).toEqual([
+      { kind: "user", text: "audit the deps" },
+      { kind: "notice", text: "Sub-agents reported back." },
+      { kind: "user", text: `${head}now fix them` },
+    ]);
+  });
+
   it("skips system rows, which double as compaction-checkpoint carriers", () => {
     const cells = historyCells([
       { role: "system", text: "a long compaction summary" },

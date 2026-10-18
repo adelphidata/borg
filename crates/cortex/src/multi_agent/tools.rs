@@ -348,21 +348,7 @@ pub async fn handle_spawn_agent(
         let per_child = super::per_child_summary_cap(completions.len());
         let results: Vec<serde_json::Value> = completions
             .iter()
-            .map(|c| {
-                let mut obj = json!({
-                    "agent_id": c.agent_id,
-                    "nickname": c.nickname,
-                    "status": c.status.as_str(),
-                    "result": c
-                        .final_response
-                        .as_deref()
-                        .map(|s| super::bound_sub_agent_summary(s, per_child)),
-                    "files_written": c.files_written,
-                });
-                attach_error_detail(&mut obj, c.error_detail());
-                attach_undelivered_input(&mut obj, &c.undelivered_input);
-                obj
-            })
+            .map(|c| completion_report(c, per_child))
             .collect();
         return Ok(json!({
             "mode": "batch",
@@ -399,19 +385,8 @@ pub async fn handle_spawn_agent(
                 timeout_secs,
             )
             .await?;
-        let mut obj = json!({
-            "mode": "blocking",
-            "agent_id": completion.agent_id,
-            "nickname": completion.nickname,
-            "status": completion.status.as_str(),
-            "result": completion
-                .final_response
-                .as_deref()
-                .map(|s| super::bound_sub_agent_summary(s, super::SUB_AGENT_SUMMARY_MAX_CHARS)),
-            "files_written": completion.files_written,
-        });
-        attach_error_detail(&mut obj, completion.error_detail());
-        attach_undelivered_input(&mut obj, &completion.undelivered_input);
+        let mut obj = completion_report(&completion, super::SUB_AGENT_SUMMARY_MAX_CHARS);
+        obj["mode"] = json!("blocking");
         return Ok(obj.to_string());
     }
 
@@ -578,6 +553,30 @@ fn attach_timeout_adjustment(
         "Requested timeout_secs={requested_secs} was raised to {effective_secs}. \
          A wait that expires cancels the sub-agent, so short waits are not polls."
     ));
+}
+
+/// What the parent sees of a finished child: id, name, status, the summary
+/// bounded to `max_chars`, the files it wrote, and any error detail or
+/// undelivered input. Shared by the delegate paths and the notice a
+/// fire-and-forget child leaves (`super::completion_notice`), so each one
+/// reports a child the same way.
+pub(super) fn completion_report(
+    completion: &super::SubAgentCompletion,
+    max_chars: usize,
+) -> serde_json::Value {
+    let mut obj = json!({
+        "agent_id": completion.agent_id,
+        "nickname": completion.nickname,
+        "status": completion.status.as_str(),
+        "result": completion
+            .final_response
+            .as_deref()
+            .map(|s| super::bound_sub_agent_summary(s, max_chars)),
+        "files_written": completion.files_written,
+    });
+    attach_error_detail(&mut obj, completion.error_detail());
+    attach_undelivered_input(&mut obj, &completion.undelivered_input);
+    obj
 }
 
 /// Fold a sub-agent's terminal-error detail (bounded error text + recovery

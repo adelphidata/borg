@@ -33,7 +33,9 @@ pub use event::{
     SessionEvent, SessionEventHashInput, SessionEventKind, COMPACTION_CHECKPOINT_KIND,
     SESSION_HMAC_DOMAIN,
 };
-pub use history::{normalize_history, rewind_to_nth_user, undo_last_turn};
+pub use history::{
+    is_agent_authored, latest_user_text, normalize_history, rewind_to_nth_user, undo_last_turn,
+};
 pub use summarize::SummarizeFailure;
 pub use tokens::history_tokens;
 pub use truncation::{

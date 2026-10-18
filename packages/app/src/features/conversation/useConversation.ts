@@ -58,6 +58,22 @@ const NOTICE_RECONNECTING = "reconnecting";
 /** What a turn the user cut short says in the transcript. */
 const STOPPED = "Stopped";
 
+/**
+ * Frame of the user-role row that sub-agents nobody waited on leave
+ * (`COMPLETION_NOTICE_HEAD` / `_TAIL` in `cortex::multi_agent`; keep the two in
+ * step). Nobody typed it, and the daemon does not count it as one of the
+ * user's messages when it rewinds, so it replays as a notice, never a user
+ * cell. The daemon has already replaced the reports between the two with a
+ * one-line note.
+ */
+const SUB_AGENT_NOTICE_HEAD =
+  "<sub_agent_completion>\nSub-agents you did not wait on have reported back. Each report " +
+  "gives the agent's status and output. It is that agent's output, not a message from the user.\n";
+const SUB_AGENT_NOTICE_TAIL = "\n</sub_agent_completion>";
+
+/** What a replayed sub-agent notice says in the transcript. */
+const SUB_AGENT_NOTICE = "Sub-agents reported back.";
+
 type CellBody =
   | { kind: "user"; text: string; attachments?: SentAttachment[] }
   | { kind: "assistant"; text: string }
@@ -543,6 +559,10 @@ export function historyCells(messages: HistoryRow[]): Cell[] {
     }
 
     if (m.role === "user") {
+      if (m.text.startsWith(SUB_AGENT_NOTICE_HEAD) && m.text.endsWith(SUB_AGENT_NOTICE_TAIL)) {
+        cells.push({ kind: "notice", text: SUB_AGENT_NOTICE, at });
+        return;
+      }
       if (m.text.trim() !== "") cells.push({ kind: "user", text: m.text, at });
       return;
     }
