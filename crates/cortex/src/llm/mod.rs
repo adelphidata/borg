@@ -2452,6 +2452,10 @@ impl LlmClient {
     /// its length limit. A caller that stores the text as a complete
     /// document (a compaction summary) must reject a cut one.
     ///
+    /// A content-filter stop, or an error the provider reports in the stream,
+    /// is an `Err` even when the stream then closes normally: the text before
+    /// it is not an answer.
+    ///
     /// The flag is always `false` on the plain `chat` fallback: that path
     /// does not report the stop reason.
     pub async fn chat_streamed_checked(&mut self, messages: &[Message]) -> Result<(Message, bool)> {
@@ -2484,6 +2488,12 @@ impl LlmClient {
         let mut text = String::new();
         let mut truncated = false;
         let mut filtered: Option<String> = None;
+        // A provider can report a failure as an event and then close the
+        // stream normally (a Gemini malformed function call or prompt block,
+        // a Claude CLI error). The first one is kept: a later one (the CLI's
+        // "exited with code 1") only restates it, and loses what classifies
+        // the failure.
+        let mut stream_error: Option<String> = None;
         let mut stream_result: Option<Result<()>> = None;
         loop {
             tokio::select! {
@@ -2499,6 +2509,9 @@ impl LlmClient {
                         Some(StreamEvent::ContentFiltered { reason }) => {
                             filtered = Some(reason);
                         }
+                        Some(StreamEvent::Error(message)) => {
+                            stream_error.get_or_insert(message);
+                        }
                         // Each attempt sends the full answer again. The
                         // output of a failed attempt (a retry, or the
                         // attempt before a failover) must not stay in
@@ -2507,6 +2520,9 @@ impl LlmClient {
                             text.clear();
                             truncated = false;
                             filtered = None;
+                            // Defensive: no path reports an error and then
+                            // retries today.
+                            stream_error = None;
                         }
                         Some(_) => {}
                         None => break,
@@ -2534,10 +2550,13 @@ impl LlmClient {
             // Channel closed before the driving future resolved — settle it.
             stream_fut.await?;
         }
-        // A filtered stop is a failed call, not a short answer: the partial
-        // text must never be stored as a complete document.
+        // A filtered stop or a reported error is a failed call, not a short
+        // answer: the partial text must never be stored as a complete document.
         if let Some(reason) = filtered {
             bail!("{provider} stopped the response before it was complete ({reason})");
+        }
+        if let Some(message) = stream_error {
+            bail!("{provider} stream failed: {message}");
         }
         Ok((Message::assistant(&text), truncated))
     }
