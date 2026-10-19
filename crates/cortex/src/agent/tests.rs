@@ -643,6 +643,127 @@ async fn a_finished_background_sub_agent_reaches_the_model() {
     );
 }
 
+/// Compaction runs on its own client beside the turn's stream. Its usage
+/// reached no stream handler, so the monthly token budget never counted it.
+#[tokio::test]
+async fn compaction_usage_counts_against_the_token_budget() {
+    let (mut agent, requests) = agent_on_a_local_llm(crate::llm::test_server::reply_with_usage(
+        "The user asked for a dependency audit.",
+        "stop",
+    ))
+    .await;
+    fill_history(&mut agent);
+
+    let (dropped, failure) = agent
+        .run_compaction_with_fallback(400)
+        .await
+        .expect("clients build");
+    assert!(
+        dropped > 0 && failure.is_none(),
+        "compaction must run: dropped {dropped}, failure {failure:?}"
+    );
+
+    let calls = requests_served(&requests);
+    assert!(calls >= 1, "the summarizer must have been called");
+    assert_eq!(
+        monthly_tokens(&agent).await,
+        18 * calls,
+        "every summarizer call counts"
+    );
+}
+
+/// A `[compaction]` override that makes no progress is retried on the
+/// primary model, on a second client. Both clients' calls count.
+#[tokio::test]
+async fn a_compaction_retry_on_the_primary_model_counts_too() {
+    let (mut agent, requests) = agent_on_a_local_llm(crate::llm::test_server::reply_with_usage(
+        "",
+        "content_filter",
+    ))
+    .await;
+    agent.config.compaction.model = Some("override-model".to_string());
+    fill_history(&mut agent);
+
+    let (dropped, _) = agent
+        .run_compaction_with_fallback(400)
+        .await
+        .expect("clients build");
+    assert_eq!(dropped, 0, "a filtered summary drops nothing");
+
+    let models: Vec<bool> = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|r| r.contains("\"override-model\""))
+        .collect();
+    assert!(
+        models.contains(&true) && models.contains(&false),
+        "both the override and the primary must have been asked: {models:?}"
+    );
+    assert_eq!(monthly_tokens(&agent).await, 18 * models.len() as u64);
+}
+
+/// The pre-compaction memory flush is a side call too. "SKIP" is the flush
+/// model's answer when nothing is worth saving, so no memory is written.
+#[tokio::test]
+async fn memory_flush_usage_counts_against_the_token_budget() {
+    let (agent, requests) =
+        agent_on_a_local_llm(crate::llm::test_server::reply_with_usage("SKIP", "stop")).await;
+
+    agent
+        .flush_memory_before_compaction(&[
+            Message::user("I prefer tabs over spaces"),
+            Message::assistant("Noted."),
+        ])
+        .await;
+
+    assert_eq!(requests_served(&requests), 1);
+    assert_eq!(monthly_tokens(&agent).await, 18);
+}
+
+/// An agent with a test DB whose LLM is a local server that answers each
+/// request with `body`.
+async fn agent_on_a_local_llm(body: String) -> (Agent, crate::llm::test_server::Requests) {
+    let (url, requests) = crate::llm::test_server::serve_sse(vec![body; 16]);
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "test-model".to_string();
+    config.llm.base_url = Some(url);
+    config.llm.max_retries = 0;
+    let agent = minimal_test_agent(config);
+    *agent.db.lock().await = Some(crate::db::Database::test_db().await);
+    (agent, requests)
+}
+
+/// Enough history that a compaction to 400 tokens must summarize.
+fn fill_history(agent: &mut Agent) {
+    for i in 0..12 {
+        agent.history.push(Message::user(format!(
+            "Turn {i}: {}",
+            "audit the deps ".repeat(40)
+        )));
+        agent.history.push(Message::assistant(format!(
+            "Reply {i}: {}",
+            "checked another crate ".repeat(40)
+        )));
+    }
+}
+
+fn requests_served(requests: &crate::llm::test_server::Requests) -> u64 {
+    requests.lock().expect("requests").len() as u64
+}
+
+async fn monthly_tokens(agent: &Agent) -> u64 {
+    agent
+        .db_guard()
+        .await
+        .as_ref()
+        .expect("db")
+        .monthly_token_total()
+        .await
+        .expect("token total")
+}
+
 fn agent_with_sub_agents() -> (
     Agent,
     tokio::sync::mpsc::Sender<crate::multi_agent::SubAgentCompletion>,

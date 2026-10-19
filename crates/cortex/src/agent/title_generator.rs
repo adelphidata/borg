@@ -15,7 +15,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, UsageData};
 use crate::session::Session;
 use crate::types::Message;
 
@@ -108,13 +108,14 @@ fn is_default_title(current_title: &str, first_user_message: &str) -> bool {
 }
 
 /// Build the aux LLM client and request a title for the given exchange.
-/// Returns `None` on any aux-pipeline failure (cleaned and logged at `warn`).
+/// The title is `None` on any aux-pipeline failure (cleaned and logged at
+/// `warn`). The usage is what the call spent, a failed call's included.
 async fn generate_session_title(
     session_id: &str,
     user_message: &str,
     assistant_response: &str,
     config: &Config,
-) -> Option<String> {
+) -> (Option<String>, Vec<UsageData>) {
     let user_snippet = char_truncate(user_message, SNIPPET_CHAR_CAP);
     let assistant_snippet = char_truncate(assistant_response, SNIPPET_CHAR_CAP);
 
@@ -122,7 +123,7 @@ async fn generate_session_title(
         Ok(c) => c.with_prompt_cache_key(session_id).with_one_shot(),
         Err(e) => {
             warn!("auto-title: aux LLM init failed: {e}");
-            return None;
+            return (None, Vec::new());
         }
     };
 
@@ -134,15 +135,17 @@ async fn generate_session_title(
     ];
     // Streamed aggregate: the timeout is inactivity-based (same contract as
     // compaction), so a slow aux model finishes while a wedged one dies.
-    let response = match llm.chat_streamed(&messages).await {
+    let reply = llm.chat_streamed(&messages).await;
+    let usage = llm.take_usage();
+    let response = match reply {
         Ok(m) => m,
         Err(e) => {
             warn!("auto-title: aux chat failed: {e}");
-            return None;
+            return (None, usage);
         }
     };
     let raw = response.text_content().unwrap_or("");
-    clean_title(raw)
+    (clean_title(raw), usage)
 }
 
 /// Background entry point. Wraps the full lifecycle: skip if the user has
@@ -154,36 +157,66 @@ pub(super) async fn auto_title_session(
     assistant_response: String,
     config: Config,
 ) {
+    let db = match Database::open().await {
+        Ok(db) => Some(db),
+        Err(e) => {
+            warn!("auto-title: DB open failed: {e}");
+            None
+        }
+    };
+    title_session(
+        db.as_ref(),
+        &session_id,
+        &user_message,
+        &assistant_response,
+        &config,
+    )
+    .await;
+}
+
+/// Body of [`auto_title_session`] on the DB it opened, `None` when the open
+/// failed: the title still reaches the session JSON then.
+async fn title_session(
+    db: Option<&Database>,
+    session_id: &str,
+    user_message: &str,
+    assistant_response: &str,
+    config: &Config,
+) {
     // Skip if the user already named the session via `/title` between the
     // first turn ending and this background task running.
-    if let Ok(db) = Database::open().await {
-        if let Ok(Some(row)) = db.session_by_id(&session_id).await {
-            if !is_default_title(&row.title, &user_message) {
+    if let Some(db) = db {
+        if let Ok(Some(row)) = db.session_by_id(session_id).await {
+            if !is_default_title(&row.title, user_message) {
                 return;
             }
         }
     }
 
-    let Some(title) =
-        generate_session_title(&session_id, &user_message, &assistant_response, &config).await
-    else {
+    let (title, usage) =
+        generate_session_title(session_id, user_message, assistant_response, config).await;
+    // The title call runs after the turn on its own client, so no stream
+    // handler records its usage; count it against the monthly token budget.
+    if let Some(db) = db {
+        for u in &usage {
+            super::Agent::log_usage(db, u, Some(session_id)).await;
+        }
+    }
+    let Some(title) = title else {
         return;
     };
 
     // Mirror to SQLite (source of truth for the daemon-side session list).
-    match Database::open().await {
-        Ok(db) => {
-            if let Err(e) = db.update_session_title(&session_id, &title).await {
-                warn!("auto-title: DB update failed for {session_id}: {e}");
-            }
+    if let Some(db) = db {
+        if let Err(e) = db.update_session_title(session_id, &title).await {
+            warn!("auto-title: DB update failed for {session_id}: {e}");
         }
-        Err(e) => warn!("auto-title: DB open failed: {e}"),
     }
 
     // Mirror to the JSON session file (source of truth for `list_sessions`
     // in the TUI). Best-effort — if the JSON file isn't on disk yet (forked
     // sessions, in-memory tests) the DB update above is still durable.
-    match Session::load(&session_id) {
+    match Session::load(session_id) {
         Ok(mut session) => {
             session.meta.title = title;
             if let Err(e) = session.save() {
@@ -297,5 +330,32 @@ mod tests {
         // A user-set title (anything not matching the sync derivation or
         // the placeholder) must be preserved.
         assert!(!is_default_title("My custom title", "Hello, world!"));
+    }
+
+    /// The title call runs after the turn on its own client. Its usage
+    /// reached no stream handler, so the monthly token budget never counted it.
+    #[tokio::test]
+    async fn a_title_call_counts_against_the_token_budget() {
+        use crate::llm::test_server::{reply_with_usage, serve_sse};
+        let (url, requests) = serve_sse(vec![reply_with_usage("Fix the flaky build", "stop")]);
+        let mut config = Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "test-model".to_string();
+        config.llm.base_url = Some(url);
+        config.llm.max_retries = 0;
+        let db = Database::test_db().await;
+
+        // No session JSON exists under this id, so only the DB is written.
+        title_session(
+            Some(&db),
+            "title-usage-test-0d6f",
+            "the build fails on CI",
+            "I pinned the flaky test.",
+            &config,
+        )
+        .await;
+
+        assert_eq!(requests.lock().expect("requests").len(), 1);
+        assert_eq!(db.monthly_token_total().await.expect("token total"), 18);
     }
 }

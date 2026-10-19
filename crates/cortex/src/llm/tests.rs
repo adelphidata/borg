@@ -1499,49 +1499,67 @@ async fn chat_streamed_aggregates_sse_text_deltas() {
     assert_eq!(message.text_content(), Some("Hello summary world"));
 }
 
+/// Calls beside a turn (compaction, titles) have no stream handler to record
+/// their usage, so the client keeps what the stream reported until the owner
+/// takes it. A failed call's usage is kept too: the provider billed it.
+#[tokio::test]
+async fn chat_streamed_keeps_the_usage_for_the_owner_to_record() {
+    use super::test_server::{reply_with_usage, serve_sse};
+    for (finish, succeeds) in [("stop", true), ("content_filter", false)] {
+        let (url, _) = serve_sse(vec![reply_with_usage("Summary", finish)]);
+        let mut config = Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "test-model".to_string();
+        config.llm.base_url = Some(url);
+        config.llm.max_retries = 0;
+        let mut client = LlmClient::new(&config).await.expect("client builds");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.chat_streamed_checked(&[Message::user("summarize")]),
+        )
+        .await
+        .expect("stream must complete promptly");
+
+        assert_eq!(outcome.is_ok(), succeeds, "finish_reason {finish}");
+        let usage: Vec<(u64, u64)> = client
+            .take_usage()
+            .iter()
+            .map(|u| (u.prompt_tokens, u.completion_tokens))
+            .collect();
+        assert_eq!(usage, vec![(11, 7)], "finish_reason {finish}");
+        assert!(client.take_usage().is_empty(), "a take drains the usage");
+    }
+}
+
 /// A retry sends the full answer again. The aggregate must hold the text of
 /// the attempt that completes, without the text of the attempt that failed.
+/// The usage of both attempts is kept: the provider billed both.
 ///
-/// The first connection sends two deltas and a length cut, then closes with
-/// no completion marker. The second connection sends a complete answer. The
-/// wait between the two is the real reconnect delay, so the test is slow.
+/// The first connection sends two deltas and a usage report, then closes
+/// with no completion marker. The second connection sends a complete
+/// answer. The wait between the two is the real reconnect delay, so the
+/// test is slow.
 #[tokio::test]
 async fn chat_streamed_keeps_only_the_text_of_the_attempt_that_completes() {
-    use std::io::{Read, Write};
     const CUT_SHORT: &str = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summ\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
     );
     const COMPLETE: &str = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"summary world\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n",
         "data: [DONE]\n\n",
     );
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = listener.local_addr().expect("local addr").port();
-    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let served_by_thread = served.clone();
-    std::thread::spawn(move || {
-        for body in [CUT_SHORT, COMPLETE] {
-            let Ok((mut sock, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 8192];
-            let _ = sock.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
-            );
-            let _ = sock.write_all(response.as_bytes());
-            let _ = sock.flush();
-            served_by_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
+    let (url, requests) = super::test_server::serve_sse(vec![CUT_SHORT, COMPLETE]);
 
     let mut config = Config::default();
     config.llm.provider = Some("custom".to_string());
     config.llm.model = "test-model".to_string();
-    config.llm.base_url = Some(format!("http://127.0.0.1:{port}/v1/chat/completions"));
+    config.llm.base_url = Some(url);
     config.llm.max_retries = 1;
     let mut client = LlmClient::new(&config).await.expect("client builds");
 
@@ -1554,12 +1572,63 @@ async fn chat_streamed_keeps_only_the_text_of_the_attempt_that_completes() {
     .expect("the second attempt is complete");
 
     assert_eq!(
-        served.load(std::sync::atomic::Ordering::SeqCst),
+        requests.lock().expect("requests").len(),
         2,
         "the test is valid only when the first attempt failed and a second one ran"
     );
     assert_eq!(message.text_content(), Some("Hello summary world"));
     assert!(!truncated);
+    let usage: Vec<(u64, u64)> = client
+        .take_usage()
+        .iter()
+        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .collect();
+    assert_eq!(usage, vec![(5, 2), (11, 7)]);
+}
+
+/// A model without tool support takes the non-streamed path. Its usage
+/// must reach the owner the same way.
+#[tokio::test]
+async fn a_model_without_tool_support_keeps_its_usage_too() {
+    // The non-streamed path reads the body as JSON whatever its content
+    // type says.
+    let reply = serde_json::json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Summary"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    });
+    let (url, requests) = super::test_server::serve_sse(vec![reply.to_string()]);
+    let mut config = Config::default();
+    config.llm.provider = Some("custom".to_string());
+    config.llm.model = "deepseek-r1".to_string();
+    config.llm.base_url = Some(url);
+    config.llm.max_retries = 0;
+    let mut client = LlmClient::new(&config).await.expect("client builds");
+
+    let message = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_streamed(&[Message::user("summarize")]),
+    )
+    .await
+    .expect("the call must complete promptly")
+    .expect("the reply parses");
+
+    assert!(
+        !requests.lock().expect("requests")[0].contains("\"stream\":true"),
+        "the test is valid only when the non-streamed path ran"
+    );
+    assert_eq!(message.text_content(), Some("Summary"));
+    let usage: Vec<(u64, u64)> = client
+        .take_usage()
+        .iter()
+        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .collect();
+    assert_eq!(usage, vec![(11, 7)]);
 }
 
 #[tokio::test]

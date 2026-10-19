@@ -846,6 +846,9 @@ pub struct LlmClient {
     /// [`Self::for_auxiliary`]; primary/interactive clients are `None` and are
     /// never gated.
     aux_concurrency: Option<u32>,
+    /// Usage of [`Self::chat_streamed_checked`] calls not yet taken by
+    /// [`Self::take_usage`].
+    unrecorded_usage: Vec<UsageData>,
     /// Set once this client has seen the provider answer "this model cannot
     /// accept image input", so a single call retries the strip at most once.
     /// The verdict is also recorded in [`IMAGE_REJECTED_MODELS`] for the rest
@@ -1554,6 +1557,7 @@ impl LlmClient {
             cost_event_sink: None,
             cost_event_context: None,
             aux_concurrency: None,
+            unrecorded_usage: Vec::new(),
             images_rejected: false,
             stream_options_unsupported: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2436,8 +2440,8 @@ impl LlmClient {
     /// *inactivity* instead, so tokens flowing = alive, while a wedged
     /// stream still dies. A total ceiling — `max(600s, 4 × per-chunk
     /// budget)` — bounds degenerate trickle streams with no new config
-    /// knob. Models without tool support fall back to plain `chat` (the
-    /// streaming entrypoint rejects them).
+    /// knob. Models without tool support fall back to the non-streamed
+    /// call, `chat_with_usage` (the streaming entrypoint rejects them).
     ///
     /// Text-only by design: no `tools` parameter, because tool-call stream
     /// events would be silently discarded by the aggregation below. Callers
@@ -2458,9 +2462,35 @@ impl LlmClient {
     ///
     /// The flag is always `false` on the plain `chat` fallback: that path
     /// does not report the stop reason.
+    ///
+    /// The usage the stream reports, a failed call's included, is kept for
+    /// [`Self::take_usage`].
     pub async fn chat_streamed_checked(&mut self, messages: &[Message]) -> Result<(Message, bool)> {
+        let mut usage = Vec::new();
+        let outcome = self.chat_streamed_collecting(messages, &mut usage).await;
+        self.unrecorded_usage.extend(usage);
+        outcome
+    }
+
+    /// The usage of the [`Self::chat_streamed_checked`] calls made since the
+    /// last take. Those calls run beside a turn (compaction, the memory
+    /// flush, titles), where no stream handler records their usage events, so
+    /// the owner records them or the monthly token budget never counts them.
+    pub fn take_usage(&mut self) -> Vec<UsageData> {
+        std::mem::take(&mut self.unrecorded_usage)
+    }
+
+    /// Body of [`Self::chat_streamed_checked`]. The stream holds `self` for
+    /// the whole call, so usage goes to `usage` and the caller files it.
+    async fn chat_streamed_collecting(
+        &mut self,
+        messages: &[Message],
+        usage: &mut Vec<UsageData>,
+    ) -> Result<(Message, bool)> {
         if !self.provider.supports_tools(&self.llm_config.model) {
-            return Ok((self.chat(messages, None).await?, false));
+            let (message, reported) = self.chat_with_usage(messages, None).await?;
+            usage.extend(reported);
+            return Ok((message, false));
         }
 
         // Ceiling: 0 chunk-timeout means the operator disabled idle
@@ -2506,6 +2536,9 @@ impl LlmClient {
                     match ev {
                         Some(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
                         Some(StreamEvent::Truncated) => truncated = true,
+                        // Every attempt that reports usage was billed, so a
+                        // retry does not reset this.
+                        Some(StreamEvent::Usage(u)) => usage.push(u),
                         Some(StreamEvent::ContentFiltered { reason }) => {
                             filtered = Some(reason);
                         }
@@ -3048,6 +3081,15 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
+        Ok(self.chat_with_usage(messages, tools).await?.0)
+    }
+
+    /// [`Self::chat`], plus the usage the provider reported for the call.
+    async fn chat_with_usage(
+        &mut self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<(Message, Option<UsageData>)> {
         let _aux_slot = self.acquire_aux_slot().await;
         self.chat_http_transport_inner(messages, tools).await
     }
@@ -3060,8 +3102,8 @@ impl LlmClient {
     /// Deliberately NOT taken in `chat_http_transport_inner`: that sits below
     /// the fallback-chain loop, so acquiring there would re-enter the gate
     /// while already holding a permit and self-deadlock at a limit of 1.
-    /// `chat_streamed` doesn't take one either — it delegates to `chat` or
-    /// `stream_chat_with_cancel`, both of which do.
+    /// `chat_streamed` doesn't take one either — it delegates to
+    /// `chat_with_usage` or `stream_chat_with_cancel`, both of which do.
     async fn acquire_aux_slot(&self) -> Option<tokio::sync::SemaphorePermit<'static>> {
         match self.aux_concurrency {
             Some(limit) => Some(aux_admission::acquire(limit).await),
@@ -3589,7 +3631,7 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         req_id: &str,
-    ) -> std::result::Result<Message, LlmError> {
+    ) -> std::result::Result<(Message, Option<UsageData>), LlmError> {
         let transport = self.wire_path().transport();
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
@@ -3638,7 +3680,7 @@ impl LlmClient {
             })?;
         log_call_completed(&request_model, parsed.usage.as_ref(), started.elapsed());
         self.emit_cost_event_best_effort(req_id, parsed.usage.as_ref(), &request_model);
-        Ok(parsed.message)
+        Ok((parsed.message, parsed.usage))
     }
 
     /// Non-streaming chat with the same resilience the streaming path has:
@@ -3646,8 +3688,8 @@ impl LlmClient {
     /// token), per-key cooldown reporting, key rotation, and the
     /// `llm.fallback` provider chain.
     ///
-    /// This path carries the autonomous lanes — scheduled prompt tasks, the
-    /// heartbeat turn, and the pre-compaction flush. It used to retry a single
+    /// This path carries the autonomous lanes — scheduled prompt tasks and
+    /// the heartbeat turn. It used to retry a single
     /// `self.api_key` in place, so a rate-limited or expired key was retried
     /// until exhaustion and never cooled, rotated, refreshed, or failed over;
     /// an expired OAuth token 401'd forever because only the lease path
@@ -3657,7 +3699,7 @@ impl LlmClient {
         &mut self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-    ) -> Result<Message> {
+    ) -> Result<(Message, Option<UsageData>)> {
         self.maybe_restore_primary();
         let req_id = short_request_id();
         let max_provider_attempts = 1 + self.provider_slots.len();
@@ -3779,7 +3821,7 @@ impl LlmClient {
                 let result = result.map_err(unaffordable_as_billing);
 
                 match result {
-                    Ok(message) => {
+                    Ok(reply) => {
                         if let (Some(pool), Some(id)) =
                             (self.primary_pool.as_ref(), lease_id.as_deref())
                         {
@@ -3788,7 +3830,7 @@ impl LlmClient {
                         self._active_lease = None;
                         self.active_credential_base_url = None;
                         self.record_provider_success();
-                        return Ok(message);
+                        return Ok(reply);
                     }
                     Err(e) => {
                         let reason = e.reason();
@@ -3940,6 +3982,9 @@ impl LlmClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_server;
 
 #[cfg(test)]
 mod bedrock_air_gap_tests {

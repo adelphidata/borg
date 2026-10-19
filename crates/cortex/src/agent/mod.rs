@@ -1934,6 +1934,27 @@ impl Agent {
         self.metrics.llm_tokens.add(total, &[]);
         let guard = self.db_guard().await;
         let Some(ref db) = *guard else { return };
+        Self::log_usage(db, usage, Some(self.session.meta.id.as_str())).await;
+    }
+
+    /// Record what calls made beside the turn's own stream spent: compaction
+    /// and the pre-compaction memory flush. No stream handler sees their
+    /// usage events, so without this they never reach `token_usage` and the
+    /// monthly token budget does not count them.
+    pub(super) async fn record_side_call_usage(&self, llm: &mut LlmClient) {
+        for usage in llm.take_usage() {
+            self.record_usage(&usage).await;
+        }
+    }
+
+    /// Persist one call's usage to the token-usage table and reconcile it
+    /// against the budget. Takes no agent, so the title generator, which runs
+    /// after the turn on its own client, records its call the same way.
+    pub(super) async fn log_usage(db: &Database, usage: &UsageData, session_id: Option<&str>) {
+        let total = usage.prompt_tokens + usage.completion_tokens;
+        if total == 0 {
+            return;
+        }
         let cost = crate::pricing::estimate_cost(
             &usage.model,
             usage.prompt_tokens,
@@ -2033,7 +2054,7 @@ impl Agent {
             usage.completion_tokens,
             usage.cached_input_tokens,
             actual_usd,
-            Some(self.session.meta.id.as_str()),
+            session_id,
         )
         .await
         {

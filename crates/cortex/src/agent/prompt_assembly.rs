@@ -729,12 +729,15 @@ Rules:
             }
         };
 
-        match llm.chat(&flush_messages, None).await {
+        // Streamed rather than `chat`: the streamed call reports its usage,
+        // which the monthly token budget must count.
+        let flushed = llm.chat_streamed(&flush_messages).await;
+        self.record_side_call_usage(&mut llm).await;
+        match flushed {
             Ok(response) => {
                 if let Some(text) = response.text_content() {
-                    // Respect the minimum-signal gate: if the LLM says SKIP, don't write
-                    if text.trim().eq_ignore_ascii_case("SKIP") {
-                        tracing::debug!("Pre-compaction flush: no signal worth saving (SKIP)");
+                    if !flush_reply_has_signal(text) {
+                        tracing::debug!("Pre-compaction flush: no signal worth saving");
                         return;
                     }
                     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1214,6 +1217,7 @@ Rules:
         let compaction_config = compaction_llm_config(&self.config);
         let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
         let (dropped, failure) = self.run_llm_compaction(target, &mut compaction_llm).await;
+        self.record_side_call_usage(&mut compaction_llm).await;
         if dropped > 0
             || !self.config.compaction.has_overrides()
             || history_tokens(&self.history) <= target
@@ -1224,7 +1228,9 @@ Rules:
             "compaction via [compaction] override made no progress; retrying with the primary model"
         );
         let mut primary_llm = self.make_llm_client_from_config(&self.config).await?;
-        Ok(self.run_llm_compaction(target, &mut primary_llm).await)
+        let outcome = self.run_llm_compaction(target, &mut primary_llm).await;
+        self.record_side_call_usage(&mut primary_llm).await;
+        Ok(outcome)
     }
 
     /// Returns the number of messages dropped from the working view (0 = no-op).
@@ -1655,14 +1661,35 @@ fn contains_untrusted_marker(content: &str) -> bool {
         || content.contains("<mcp_tool_result")
 }
 
+/// Whether the memory writer's reply is worth saving. "SKIP" is its answer
+/// when nothing is; an empty reply (a reasoning-only stream) is no answer,
+/// and saving it would add an empty section to the daily note.
+fn flush_reply_has_signal(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && !text.eq_ignore_ascii_case("SKIP")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         breakdown_components, build_flush_transcript, compaction_llm_config,
-        contains_untrusted_marker, CompactionGate, CompactionStrikes, ContextBreakdown,
-        MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
+        contains_untrusted_marker, flush_reply_has_signal, CompactionGate, CompactionStrikes,
+        ContextBreakdown, MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
     };
     use crate::types::Message;
+
+    #[test]
+    fn only_a_flush_reply_with_content_is_saved() {
+        for (reply, saved) in [
+            ("The user prefers tabs over spaces.", true),
+            ("SKIP", false),
+            ("  skip\n", false),
+            ("", false),
+            (" \n\t", false),
+        ] {
+            assert_eq!(flush_reply_has_signal(reply), saved, "{reply:?}");
+        }
+    }
 
     /// Spec for the `/context` detail rows: two skills and two MCP servers
     /// must each produce a child row directly under their parent bucket,
