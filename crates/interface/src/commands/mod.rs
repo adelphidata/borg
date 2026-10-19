@@ -72,6 +72,109 @@ pub(crate) fn resolve_unique_prefix(
     }
 }
 
+/// Print `lines` to stdout, one per line.
+///
+/// Long output is often piped into a reader that stops early (`borg logs |
+/// head`). The closed pipe ends the output, not the command: `println!`
+/// panics on it. Every other write error is returned.
+///
+/// Make it the command's last write to stdout: after a closed pipe it
+/// returns `Ok`, and a later `println!` would still panic.
+pub(crate) fn print_lines<T: std::fmt::Display>(
+    lines: impl IntoIterator<Item = T>,
+) -> anyhow::Result<()> {
+    write_lines(&mut std::io::stdout().lock(), lines)
+}
+
+fn write_lines<T: std::fmt::Display>(
+    out: &mut impl std::io::Write,
+    lines: impl IntoIterator<Item = T>,
+) -> anyhow::Result<()> {
+    let written = lines
+        .into_iter()
+        .try_for_each(|line| writeln!(out, "{line}"))
+        .and_then(|()| out.flush());
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            tracing::debug!("stdout reader closed the pipe; output stopped early");
+            Ok(())
+        }
+        other => anyhow::Context::context(other, "could not write to stdout"),
+    }
+}
+
+#[cfg(test)]
+mod print_lines_tests {
+    use super::write_lines;
+    use std::io::{self, ErrorKind, Write};
+
+    /// Takes `room` bytes, then fails each write with `kind`. With
+    /// `fail_flush` set, the flush fails with `kind` too.
+    struct ClosingWriter {
+        written: Vec<u8>,
+        room: usize,
+        fail_flush: bool,
+        kind: ErrorKind,
+    }
+
+    impl Write for ClosingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written.len() >= self.room {
+                return Err(self.kind.into());
+            }
+            let n = buf.len().min(self.room - self.written.len());
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(self.kind.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_pipe_ends_the_output_and_other_errors_fail() {
+        for (room, fail_flush, kind, ok) in [
+            // The reader left in the middle of the output.
+            (8, false, ErrorKind::BrokenPipe, true),
+            // The reader left before the last flush.
+            (usize::MAX, true, ErrorKind::BrokenPipe, true),
+            // A full disk under `borg logs > file` is a real failure.
+            (8, false, ErrorKind::StorageFull, false),
+            (usize::MAX, true, ErrorKind::StorageFull, false),
+        ] {
+            let mut out = ClosingWriter {
+                written: Vec::new(),
+                room,
+                fail_flush,
+                kind,
+            };
+            let result = write_lines(&mut out, ["first line", "second line"]);
+            assert_eq!(
+                result.is_ok(),
+                ok,
+                "room {room}, fail_flush {fail_flush}, {kind:?}: {result:?}"
+            );
+            if !ok {
+                let err = result.expect_err("checked above");
+                let io_err = err.downcast_ref::<io::Error>().expect("an io error");
+                assert_eq!(io_err.kind(), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn every_line_is_written_in_order() {
+        let mut out = Vec::new();
+        write_lines(&mut out, ["first line", "second line"]).expect("write to a vec");
+        assert_eq!(out, b"first line\nsecond line\n");
+    }
+}
+
 #[cfg(test)]
 mod resolve_prefix_tests {
     use super::resolve_unique_prefix;

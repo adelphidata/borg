@@ -50,11 +50,10 @@ pub(crate) async fn dispatch_logs(
 pub(crate) async fn run_settings_show() -> Result<()> {
     let resolver = cortex::settings::SettingsResolver::load().await?;
     let all = resolver.list_all().await?;
-    println!("Settings:");
-    for info in &all {
-        println!("  {:40} = {:20} [{}]", info.key, info.value, info.source);
-    }
-    Ok(())
+    let rows = all
+        .iter()
+        .map(|info| format!("  {:40} = {:20} [{}]", info.key, info.value, info.source));
+    super::print_lines(std::iter::once("Settings:".to_string()).chain(rows))
 }
 
 pub(crate) async fn run_settings_set(key: &str, value: &str) -> Result<()> {
@@ -82,13 +81,9 @@ pub(crate) async fn run_settings_unset(key: &str) -> Result<()> {
 pub(crate) fn run_logs(count: usize, verbose: bool) -> Result<()> {
     let lines = cortex::logging::read_history_formatted(count, verbose)?;
     if lines.is_empty() {
-        println!("No conversation history.");
-    } else {
-        for line in &lines {
-            println!("{line}");
-        }
+        return super::print_lines(["No conversation history."]);
     }
-    Ok(())
+    super::print_lines(&lines)
 }
 
 pub(crate) async fn run_activity_logs(
@@ -99,11 +94,12 @@ pub(crate) async fn run_activity_logs(
     let db = cortex::db::Database::open_readonly().await?;
     let entries = db.query_activity(count, Some(level), category).await?;
     if entries.is_empty() {
-        println!("No activity log entries.");
-    } else {
-        for entry in entries.iter().rev() {
-            println!("{}", cortex::activity_log::format_activity_entry(entry));
-        }
+        return super::print_lines(["No activity log entries."]);
     }
-    Ok(())
+    super::print_lines(
+        entries
+            .iter()
+            .rev()
+            .map(cortex::activity_log::format_activity_entry),
+    )
 }
