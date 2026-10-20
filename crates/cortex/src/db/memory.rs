@@ -484,6 +484,57 @@ impl Database {
             .await
     }
 
+    /// Compare-and-swap overwrite: replace the entry's content only when its
+    /// stored `content_hash` (hex SHA-256 of the content bytes, as
+    /// `upsert_memory_entry` stores it) still equals `expected_hash` — the
+    /// hash of the content the caller read and derived `content` from.
+    /// Returns `Ok(false)` when nothing matched — the entry changed or
+    /// vanished since the read — so a read-modify-write (memory patch) can
+    /// never silently drop a concurrent append.
+    pub async fn update_memory_entry_if_hash(
+        &self,
+        scope: &str,
+        name: &str,
+        expected_hash: &str,
+        content: &str,
+    ) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<bool> = async {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE memory_entries SET content = ?3, content_hash = ?4, updated_at = ?5, \
+                     estimated_tokens = NULL \
+                     WHERE scope = ?1 AND name = ?2 AND content_hash = ?6",
+                    params!(scope, name, content, hash, now, expected_hash),
+                )
+                .await?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            // Same stale-index cleanup as `upsert_memory_entry`.
+            self.conn
+                .execute(
+                    "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+                    params!(scope, name),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+                    params!(scope, name),
+                )
+                .await?;
+            Ok(true)
+        }
+        .await;
+        self.finish_immediate_tx(result, "memory update_memory_entry_if_hash")
+            .await
+    }
+
     /// Retrieve a memory entry by scope and name.
     pub async fn get_memory_entry(
         &self,

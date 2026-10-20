@@ -227,6 +227,46 @@ pub(crate) fn enforce_memory_size(name: &str, scope: &str, projected_tokens: usi
     Ok(())
 }
 
+/// Compute the content of entry `name` after replacing `old_text` with
+/// `new_text`. The pure half of a memory patch: `current` is the stored
+/// content (`None` = the entry does not exist) and the result is what the
+/// caller then writes as a whole-entry overwrite, so the injection scan and
+/// the token cap still run on the merged text.
+///
+/// `old_text` must occur exactly once. Zero matches and ambiguous matches
+/// are errors (naming the entry, and asking for more context respectively)
+/// so a model can never swap the wrong span or silently drop sibling facts.
+pub fn patch_entry_content(
+    name: &str,
+    current: Option<&str>,
+    old_text: &str,
+    new_text: &str,
+) -> Result<String> {
+    if old_text.is_empty() {
+        anyhow::bail!(
+            "write_memory: 'old_text' must not be empty for memory entry '{name}' \
+             (omit it to overwrite or append instead)"
+        );
+    }
+    let Some(current) = current else {
+        anyhow::bail!(
+            "write_memory: memory entry '{name}' does not exist, so 'old_text' cannot \
+             match — write it without 'old_text' to create it"
+        );
+    };
+    match current.matches(old_text).count() {
+        0 => anyhow::bail!(
+            "write_memory: 'old_text' was not found in memory entry '{name}' — read the \
+             entry and copy the exact text to replace (nothing written)"
+        ),
+        1 => Ok(current.replacen(old_text, new_text, 1)),
+        n => anyhow::bail!(
+            "write_memory: 'old_text' matches {n} places in memory entry '{name}' — include \
+             more surrounding context so it matches exactly once (nothing written)"
+        ),
+    }
+}
+
 /// Write a memory entry to the database. Scans for injection and enforces
 /// a hard size cap before writing — large entries get silently dropped by
 /// the token-budget loader, so we fail loud at write time and force the
@@ -254,6 +294,40 @@ pub async fn write_memory_db(
     match mode {
         WriteMode::Overwrite => db.upsert_memory_entry(scope, name, content).await?,
         WriteMode::Append => db.append_memory_entry(scope, name, content).await?,
+    }
+    Ok(format!("Written to memory: {name} (scope: {scope})"))
+}
+
+/// The `memory_entries.content_hash` value for `content` (hex SHA-256 of the
+/// bytes). A read-modify-write hashes what it read and passes the result to
+/// [`write_memory_db_if_unchanged`] as its precondition.
+pub fn memory_content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// Overwrite a memory entry whose new `content` was derived from a read
+/// (a patch): runs the same injection scan and size cap as
+/// [`write_memory_db`], then commits only if the stored hash still equals
+/// `expected_hash` — the hash of the content that was read. A concurrent
+/// write in between fails this call instead of being silently dropped.
+pub async fn write_memory_db_if_unchanged(
+    name: &str,
+    content: &str,
+    scope: &str,
+    expected_hash: &str,
+) -> Result<String> {
+    scan_for_injection(content)?;
+    enforce_memory_size(name, scope, estimate_tokens(content))?;
+    let db = crate::db::Database::open().await?;
+    if !db
+        .update_memory_entry_if_hash(scope, name, expected_hash, content)
+        .await?
+    {
+        anyhow::bail!(
+            "memory entry '{name}' (scope {scope}) changed since it was read — read it again \
+             and retry (nothing written)"
+        );
     }
     Ok(format!("Written to memory: {name} (scope: {scope})"))
 }
@@ -1295,6 +1369,49 @@ pub fn load_extra_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patch_entry_content_table() {
+        // (current, old_text, new_text, expected Ok content or Err fragment)
+        type Case = (
+            Option<&'static str>,
+            &'static str,
+            &'static str,
+            Result<&'static str, &'static str>,
+        );
+        let cases: &[Case] = &[
+            (
+                Some("a: 1\nb: 2\nc: 3"),
+                "b: 2",
+                "b: 20",
+                Ok("a: 1\nb: 20\nc: 3"),
+            ),
+            // Only the first of exactly one match is touched; siblings survive.
+            (
+                Some("keep\nswap me\nkeep too"),
+                "swap me",
+                "",
+                Ok("keep\n\nkeep too"),
+            ),
+            (Some("x\ny"), "zzz", "q", Err("not found")),
+            (Some("x\nx"), "x", "q", Err("matches 2 places")),
+            (None, "x", "q", Err("does not exist")),
+            (Some("x"), "", "q", Err("must not be empty")),
+        ];
+        for (current, old, new, expected) in cases {
+            let got = patch_entry_content("notes", *current, old, new);
+            match expected {
+                Ok(want) => assert_eq!(got.expect("patch ok").as_str(), *want),
+                Err(frag) => {
+                    let err = got.expect_err("patch must fail").to_string();
+                    assert!(
+                        err.contains(frag) && err.contains("notes"),
+                        "expected {frag:?} naming the entry, got: {err}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn estimate_tokens_nonempty() {

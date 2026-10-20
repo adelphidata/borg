@@ -15,9 +15,10 @@ use crate::agent::system_prompt_cache::SystemPromptCache;
 use crate::config::Config;
 use crate::tool_handlers;
 
-/// Action for a batch [`MemoryOp`]. `add` and `replace` both upsert the entry
-/// (append-aware); the two verbs exist so the model can signal intent — Borg
-/// upserts either way. `remove` deletes the entry (and its embeddings/chunks).
+/// Action for a batch [`MemoryOp`]. `add` appends to an existing entry (or
+/// creates it) so it can never drop sibling facts; `replace` is the explicit
+/// whole-entry overwrite. Either verb with `old_text` patches exactly one
+/// span. `remove` deletes the entry (and its embeddings/chunks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum MemoryOpAction {
@@ -34,8 +35,14 @@ pub(crate) struct MemoryOp {
     /// Required for `add`/`replace`; ignored for `remove`.
     #[serde(default)]
     pub content: Option<String>,
+    /// Exact span of the current entry that `content` replaces. Must match
+    /// exactly once; the rest of the entry is preserved.
+    #[serde(default)]
+    pub old_text: Option<String>,
     #[serde(default)]
     pub append: bool,
+    /// Per-op scope. Inherits the call's top-level scope when omitted; a
+    /// value that conflicts with a given top-level scope rejects the batch.
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -53,6 +60,10 @@ pub(crate) struct WriteMemoryArgs {
     pub filename: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Single-op patch: the exact span of the current entry that `content`
+    /// replaces (must match exactly once).
+    #[serde(default)]
+    pub old_text: Option<String>,
     #[serde(default)]
     pub append: bool,
     #[serde(default)]
@@ -91,7 +102,7 @@ pub(crate) async fn handle(
     // precedence and the single-op fields are ignored.
     if let Some(ops) = args.operations.as_deref() {
         if !ops.is_empty() {
-            return handle_batch(ops, config, config_arc, caches).await;
+            return handle_batch(ops, args.scope.as_deref(), config, config_arc, caches).await;
         }
     }
 
@@ -119,24 +130,27 @@ pub(crate) async fn handle(
 /// Apply a batch of memory operations atomically. The validate-then-apply
 /// happens in [`tool_handlers::handle_write_memory_batch`]; here we fire the
 /// per-op side effects (IDENTITY-cache invalidation, embedding, tz-slide) on
-/// success, mirroring the single-op path.
+/// success, mirroring the single-op path. Side effects use the same
+/// per-op effective scope the handler wrote to (top-level scope inherited
+/// by ops that omit their own).
 async fn handle_batch(
     ops: &[MemoryOp],
+    top_scope: Option<&str>,
     config: &Config,
     config_arc: &Arc<Config>,
     caches: &mut SystemPromptCache,
 ) -> Result<String> {
-    let summary = tool_handlers::handle_write_memory_batch(ops, config).await?;
+    let summary = tool_handlers::handle_write_memory_batch(ops, top_scope, config).await?;
+    let scopes = tool_handlers::effective_batch_scopes(ops, top_scope)?;
 
-    for op in ops {
-        let scope = op.scope.as_deref().unwrap_or("global");
+    for (op, scope) in ops.iter().zip(scopes.iter()) {
         // Invalidate the IDENTITY cache for any touched entry (incl. removals).
         caches.on_memory_written(scope, &op.filename);
         match op.action {
             MemoryOpAction::Add | MemoryOpAction::Replace => {
                 let entry_name = op.filename.strip_suffix(".md").unwrap_or(&op.filename);
                 if config.memory.embeddings.enabled {
-                    spawn_embedding_task(entry_name, op.scope.as_deref(), config_arc);
+                    spawn_embedding_task(entry_name, Some(scope), config_arc);
                 }
                 if let Some(c) = op.content.as_deref() {
                     maybe_slide_quiet_hours_tz(c);
@@ -390,6 +404,7 @@ mod tests {
         let args = WriteMemoryArgs {
             filename: Some("non_identity.md".into()),
             content: Some("x".into()),
+            old_text: None,
             append: false,
             scope: Some("nonexistent_scope_just_for_test".into()),
             operations: None,

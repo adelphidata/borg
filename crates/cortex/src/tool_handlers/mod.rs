@@ -78,10 +78,10 @@ pub use filesystem::{
 };
 pub use list::{handle_list, handle_list_channels, handle_list_skills};
 pub use media::{handle_browser, handle_generate_image, handle_text_to_speech};
+pub(crate) use memory::{effective_batch_scopes, handle_write_memory_batch, native_memory_search};
 pub use memory::{
     format_search_results, handle_memory_search, handle_read_memory, handle_write_memory,
 };
-pub(crate) use memory::{handle_write_memory_batch, native_memory_search};
 pub use schedule::{handle_manage_cron, handle_manage_tasks, handle_schedule, update_task_status};
 pub use scripts::{handle_manage_scripts, handle_run_script, handle_security_audit};
 pub use shell::{handle_run_shell, handle_run_shell_with_context, SHELL_DENIED_PREFIX};
