@@ -468,17 +468,95 @@ pub(super) struct PartialToolCall {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) arguments: String,
+    /// The provider's stream index this slot was opened for. Several slots
+    /// may share one index when a provider restarts the index for every
+    /// call of a parallel batch (see [`apply_tool_call_delta`]).
+    pub(super) stream_index: usize,
+    /// Incremental bracket scan over `arguments`, advanced on demand by
+    /// [`PartialToolCall::arguments_closed`].
+    pub(super) scan: ArgumentScan,
 }
 
-/// Merge one `ToolCallDelta` into the index-keyed accumulator. Keying by
-/// `index` (not `id`) is load-bearing: providers that emit parallel tool calls
-/// (OpenAI `parallel_tool_calls`, Kimi-for-coding, etc.) send `id` and `name`
-/// only on the first delta of each call; subsequent deltas carry only
-/// `arguments` fragments tagged with their `index`. An `id`-keyed aggregator
-/// collapses later argument fragments into the wrong call or spawns phantoms.
+/// Structural-completion scanner for a streamed JSON argument string: tracks
+/// bracket depth outside string literals so "the call has closed" can be
+/// answered without re-parsing the whole prefix on every fragment (linear over
+/// the call, zero cost for providers that never need the question answered).
+/// Structural completion, not strict validity, is deliberate: a repairable
+/// first call (trailing comma) must still end its slot so a second call of the
+/// same tool is not glued onto it.
+#[derive(Default, Clone, Copy)]
+pub(super) struct ArgumentScan {
+    scanned: usize,
+    depth: i32,
+    in_string: bool,
+    escaped: bool,
+    started: bool,
+}
+
+impl PartialToolCall {
+    fn is_empty(&self) -> bool {
+        self.id.is_empty() && self.name.is_empty() && self.arguments.is_empty()
+    }
+
+    /// Whether `arguments` has opened at least one bracket and every bracket
+    /// opened outside a string has been closed again. Scans only the bytes
+    /// appended since the last call. An empty (or whitespace-only) buffer is
+    /// closed too: a no-argument call is complete, so a same-name call that
+    /// follows it is the next call of the batch, not a fragment.
+    fn arguments_closed(&mut self) -> bool {
+        if self.arguments.trim().is_empty() {
+            return true;
+        }
+        let s = &mut self.scan;
+        // JSON's structural bytes are ASCII; UTF-8 continuation bytes are
+        // >= 0x80 and can never collide with them, so a byte walk is exact.
+        for &b in &self.arguments.as_bytes()[s.scanned..] {
+            if s.in_string {
+                if s.escaped {
+                    s.escaped = false;
+                } else if b == b'\\' {
+                    s.escaped = true;
+                } else if b == b'"' {
+                    s.in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => s.in_string = true,
+                    b'{' | b'[' => {
+                        s.depth += 1;
+                        s.started = true;
+                    }
+                    b'}' | b']' => s.depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        s.scanned = self.arguments.len();
+        s.started && s.depth == 0 && !s.in_string
+    }
+}
+
+/// Merge one `ToolCallDelta` into the accumulator.
 ///
-/// Returns `false` and emits a `tracing::warn!` when `index >= max_tool_calls`;
-/// caller discards the delta.
+/// Slots are looked up by the provider's stream `index` (not `id`): providers
+/// that emit parallel tool calls (OpenAI `parallel_tool_calls`, Kimi, etc.)
+/// send `id` and `name` only on the first delta of each call, and later
+/// fragments carry only `arguments` tagged with their `index`. An `id`-keyed
+/// aggregator collapses those fragments into the wrong call or spawns phantoms.
+///
+/// One index may still hold several calls. Ollama's OpenAI-compatible endpoint
+/// streams every call of a parallel batch at index 0 with a fresh `id`, so a
+/// delta that carries a new `id` at a used index can mean "next call". It can
+/// also mean "next fragment": LM Studio and Kimi mint a new `id` for every
+/// nameless argument fragment, and some MiniMax routes re-send the same name on
+/// every fragment. The rule that keeps all of them whole: a new `id` opens a
+/// new slot only when the delta is *named* and either names a different tool
+/// than the active slot or follows arguments that have structurally closed.
+/// Anything else appends to the active slot for that index.
+///
+/// Returns `false` and emits a `tracing::warn!` when `index >= max_tool_calls`
+/// or when a split would exceed `max_tool_calls` slots; caller discards the
+/// delta.
 pub(super) fn apply_tool_call_delta(
     tool_calls: &mut Vec<PartialToolCall>,
     index: usize,
@@ -491,16 +569,45 @@ pub(super) fn apply_tool_call_delta(
         warn!("Tool call index {index} exceeds limit {max_tool_calls}, ignoring");
         return false;
     }
-    while tool_calls.len() <= index {
-        tool_calls.push(PartialToolCall::default());
-    }
+    let active = tool_calls
+        .iter()
+        .rposition(|call| call.stream_index == index);
+    let opens_new_call = match active {
+        None => true,
+        Some(slot) => {
+            let call = &mut tool_calls[slot];
+            let new_id = id
+                .as_deref()
+                .is_some_and(|id| !call.id.is_empty() && id != call.id);
+            let renamed = name.as_deref().is_some_and(|n| n != call.name);
+            !call.is_empty() && new_id && name.is_some() && (renamed || call.arguments_closed())
+        }
+    };
+    let slot = if opens_new_call {
+        if tool_calls.len() >= max_tool_calls {
+            warn!("Tool call count exceeds limit {max_tool_calls}, ignoring call at index {index}");
+            return false;
+        }
+        tool_calls.push(PartialToolCall {
+            stream_index: index,
+            ..PartialToolCall::default()
+        });
+        tool_calls.len() - 1
+    } else {
+        active.unwrap_or_default()
+    };
+    let call = &mut tool_calls[slot];
     if let Some(id) = id {
-        tool_calls[index].id = id;
+        // The first id names the call; a fragment that re-mints one (LM
+        // Studio, Kimi) must not rename a call the model will be answered on.
+        if call.id.is_empty() {
+            call.id = id;
+        }
     }
     if let Some(name) = name {
-        tool_calls[index].name = name;
+        call.name = name;
     }
-    tool_calls[index].arguments.push_str(arguments_delta);
+    call.arguments.push_str(arguments_delta);
     true
 }
 
@@ -783,6 +890,166 @@ mod tests {
         assert!(tool_calls.is_empty(), "over-cap delta must not grow vec");
     }
 
+    /// One streamed delta: `(index, id, name, arguments_delta)`.
+    type Delta = (
+        usize,
+        Option<&'static str>,
+        Option<&'static str>,
+        &'static str,
+    );
+
+    fn feed(deltas: &[Delta]) -> Vec<PartialToolCall> {
+        let mut tool_calls = Vec::new();
+        for (index, id, name, args) in deltas {
+            assert!(apply_tool_call_delta(
+                &mut tool_calls,
+                *index,
+                id.map(str::to_string),
+                name.map(str::to_string),
+                args,
+                64,
+            ));
+        }
+        tool_calls
+    }
+
+    /// Provider quirks that share one wire shape (a fresh `id` at a reused
+    /// index) but mean opposite things. Ollama's parallel batch must split
+    /// into separate calls; LM Studio/Kimi fragment ids and MiniMax's resent
+    /// name must stay one call, or the model's call shatters into nameless
+    /// `{..}{..}` garbage that nothing can run.
+    #[test]
+    fn same_index_new_id_splits_only_on_a_named_call_boundary() {
+        struct Case {
+            name: &'static str,
+            deltas: Vec<Delta>,
+            expected: Vec<(&'static str, &'static str, &'static str)>,
+        }
+        let cases = vec![
+            Case {
+                name: "ollama parallel pair at index 0",
+                deltas: vec![
+                    (0, Some("call_a"), Some("fs_read"), "{\"path\":\"/a\"}"),
+                    (0, Some("call_b"), Some("run_shell"), "{\"cmd\":\"ls\"}"),
+                ],
+                expected: vec![
+                    ("call_a", "fs_read", "{\"path\":\"/a\"}"),
+                    ("call_b", "run_shell", "{\"cmd\":\"ls\"}"),
+                ],
+            },
+            Case {
+                name: "lm studio / kimi: fresh id per nameless fragment",
+                deltas: vec![
+                    (0, Some("id-1"), Some("fs_read"), "{\"pa"),
+                    (0, Some("id-2"), None, "th\":\"/"),
+                    (0, Some("id-3"), None, "etc\"}"),
+                ],
+                expected: vec![("id-1", "fs_read", "{\"path\":\"/etc\"}")],
+            },
+            Case {
+                name: "minimax: same name re-sent mid-json",
+                deltas: vec![
+                    (0, Some("id-1"), Some("fs_write"), "{\"path\":\"a\","),
+                    (0, Some("id-2"), Some("fs_write"), "\"content\":\"{not"),
+                    (0, Some("id-3"), Some("fs_write"), " closed\"}"),
+                ],
+                expected: vec![(
+                    "id-1",
+                    "fs_write",
+                    "{\"path\":\"a\",\"content\":\"{not closed\"}",
+                )],
+            },
+            Case {
+                name: "two calls of the same tool, first args complete",
+                deltas: vec![
+                    (0, Some("call_a"), Some("fs_read"), "{\"path\":\"/a\"}"),
+                    (0, Some("call_b"), Some("fs_read"), "{\"path\":\"/b\"}"),
+                ],
+                expected: vec![
+                    ("call_a", "fs_read", "{\"path\":\"/a\"}"),
+                    ("call_b", "fs_read", "{\"path\":\"/b\"}"),
+                ],
+            },
+            Case {
+                name: "same tool twice, first args repairable (trailing comma + whitespace)",
+                deltas: vec![
+                    (0, Some("call_a"), Some("fs_read"), "{\"path\":\"/a\",} \n"),
+                    (0, Some("call_b"), Some("fs_read"), "{\"path\":\"/b\"}"),
+                ],
+                expected: vec![
+                    ("call_a", "fs_read", "{\"path\":\"/a\",} \n"),
+                    ("call_b", "fs_read", "{\"path\":\"/b\"}"),
+                ],
+            },
+            Case {
+                name: "same tool twice, first call takes no arguments",
+                deltas: vec![
+                    (0, Some("call_a"), Some("list_dir"), ""),
+                    (0, Some("call_b"), Some("list_dir"), "{\"path\":\"/b\"}"),
+                ],
+                expected: vec![
+                    ("call_a", "list_dir", ""),
+                    ("call_b", "list_dir", "{\"path\":\"/b\"}"),
+                ],
+            },
+            Case {
+                name: "brackets inside strings do not close the call",
+                deltas: vec![
+                    (
+                        0,
+                        Some("id-1"),
+                        Some("fs_write"),
+                        "{\"content\":\"}\\\"}\",",
+                    ),
+                    (0, Some("id-2"), Some("fs_write"), "\"path\":\"x\"}"),
+                ],
+                expected: vec![(
+                    "id-1",
+                    "fs_write",
+                    "{\"content\":\"}\\\"}\",\"path\":\"x\"}",
+                )],
+            },
+            Case {
+                name: "plain indexed stream (index 0, index 1)",
+                deltas: vec![
+                    (0, Some("call_a"), Some("fs_read"), "{\"path\":"),
+                    (1, Some("call_b"), Some("run_shell"), "{\"cmd\":"),
+                    (1, None, None, "\"ls\"}"),
+                    (0, None, None, "\"/etc\"}"),
+                ],
+                expected: vec![
+                    ("call_a", "fs_read", "{\"path\":\"/etc\"}"),
+                    ("call_b", "run_shell", "{\"cmd\":\"ls\"}"),
+                ],
+            },
+        ];
+        for case in cases {
+            let calls = feed(&case.deltas);
+            let got: Vec<(&str, &str, &str)> = calls
+                .iter()
+                .map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str()))
+                .collect();
+            assert_eq!(got, case.expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn same_index_split_respects_the_call_cap() {
+        let mut tool_calls = Vec::new();
+        for i in 0..3 {
+            let accepted = apply_tool_call_delta(
+                &mut tool_calls,
+                0,
+                Some(format!("call_{i}")),
+                Some("fs_read".into()),
+                "{}",
+                2,
+            );
+            assert_eq!(accepted, i < 2, "call {i} vs cap 2");
+        }
+        assert_eq!(tool_calls.len(), 2);
+    }
+
     #[test]
     fn has_unresolved_tool_calls_idle_history_returns_false() {
         let history = vec![
@@ -825,6 +1092,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments: args.to_string(),
+            ..PartialToolCall::default()
         }
     }
 

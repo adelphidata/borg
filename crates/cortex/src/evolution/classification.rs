@@ -689,7 +689,8 @@ pub async fn generate_evolution_name(
             .map_err(|e| anyhow::anyhow!("config load: {e}"))?;
         let mut client = crate::llm::LlmClient::new(&config)
             .await
-            .map_err(|e| anyhow::anyhow!("llm client: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("llm client: {e}"))?
+            .with_one_shot();
 
         let archetype_str = archetype
             .map(|a| a.to_string())

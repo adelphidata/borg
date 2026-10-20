@@ -802,6 +802,254 @@ pub(super) fn strip_images(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
+/// What a retired tool-result image becomes on the wire.
+fn retired_image_stub(dimensions: Option<(u32, u32)>) -> crate::types::ContentPart {
+    crate::types::ContentPart::Text(match dimensions {
+        Some((w, h)) => format!("[image retired: {w}\u{d7}{h} px screenshot]"),
+        None => "[image retired: screenshot]".to_string(),
+    })
+}
+
+fn part_dimensions(part: &crate::types::ContentPart) -> Option<(u32, u32)> {
+    match part {
+        crate::types::ContentPart::ImageBase64 { media } => {
+            crate::media::image_header::image_dimensions_from_base64(&media.data)
+        }
+        _ => None,
+    }
+}
+
+fn is_image_part(part: &crate::types::ContentPart) -> bool {
+    matches!(
+        part,
+        crate::types::ContentPart::ImageBase64 { .. } | crate::types::ContentPart::ImageUrl { .. }
+    )
+}
+
+/// Keep the outgoing request inside Anthropic's image ceiling.
+///
+/// Two limits apply per request: at most [`MAX_IMAGES_PER_REQUEST`] images,
+/// and once more than [`MANY_IMAGE_THRESHOLD`] images are present *every*
+/// image must fit [`MANY_IMAGE_MAX_SIDE_PX`] per side. `computer_use` Retina
+/// captures exceed that side, and images persist in history, so without this
+/// pass the 21st screenshot makes every later request a 400 forever.
+///
+/// The oldest tool-result images are replaced by a short text stub, in
+/// batches of [`IMAGE_RETIRE_BATCH`] so the retired prefix moves rarely and
+/// the prompt cache survives. User-authored images are never touched: they
+/// are what the person asked about. Dimensions are read from the header only;
+/// an unreadable image counts as oversize (fail closed). Operates on a copy —
+/// stored history is never mutated — and borrows when nothing needs to change.
+pub(super) fn retire_excess_images(messages: &[Message]) -> std::borrow::Cow<'_, [Message]> {
+    use crate::constants::{
+        IMAGE_RETIRE_BATCH, MANY_IMAGE_MAX_SIDE_PX, MANY_IMAGE_THRESHOLD, MAX_IMAGES_PER_REQUEST,
+    };
+    use crate::types::MessageContent;
+
+    /// A retirable image: `(message index, part index, header dimensions)`.
+    type ToolImage = (usize, usize, Option<(u32, u32)>);
+
+    let mut total = 0usize;
+    let mut oversize = false;
+    // Oldest first: message order, then part order.
+    let mut tool_images: Vec<ToolImage> = Vec::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        let Some(MessageContent::Parts(parts)) = &msg.content else {
+            continue;
+        };
+        for (pi, part) in parts.iter().enumerate().filter(|(_, p)| is_image_part(p)) {
+            total += 1;
+            let dims = part_dimensions(part);
+            oversize |=
+                dims.is_none_or(|(w, h)| w > MANY_IMAGE_MAX_SIDE_PX || h > MANY_IMAGE_MAX_SIDE_PX);
+            if msg.role == Role::Tool {
+                tool_images.push((mi, pi, dims));
+            }
+        }
+    }
+    if total <= MANY_IMAGE_THRESHOLD {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    let mut retire = total.saturating_sub(MAX_IMAGES_PER_REQUEST);
+    if oversize && total - retire > MANY_IMAGE_THRESHOLD {
+        let needed = total - retire - MANY_IMAGE_THRESHOLD;
+        retire += needed.div_ceil(IMAGE_RETIRE_BATCH) * IMAGE_RETIRE_BATCH;
+    }
+    let retire = retire.min(tool_images.len());
+    if retire == 0 {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    tracing::info!(
+        target: "cortex::llm",
+        total,
+        retire,
+        oversize,
+        "retiring the oldest tool-result images to stay inside the provider's image ceiling"
+    );
+    let mut outgoing = messages.to_vec();
+    for &(mi, pi, dims) in &tool_images[..retire] {
+        if let Some(MessageContent::Parts(parts)) = &mut outgoing[mi].content {
+            parts[pi] = retired_image_stub(dims);
+        }
+    }
+    std::borrow::Cow::Owned(outgoing)
+}
+
+#[cfg(test)]
+mod image_ceiling_tests {
+    use super::*;
+    use crate::constants::{MANY_IMAGE_THRESHOLD, MAX_IMAGES_PER_REQUEST};
+    use crate::media::image_header::test_images::{b64, png};
+    use crate::types::{ContentPart, MediaData, MessageContent};
+
+    fn image(w: u32, h: u32) -> ContentPart {
+        ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".into(),
+                data: b64(&png(w, h)),
+                filename: None,
+            },
+        }
+    }
+
+    /// `n` tool turns, each returning one screenshot of the given size, with
+    /// the user-authored image (when any) uploaded first.
+    fn history(user_image: Option<(u32, u32)>, sizes: &[(u32, u32)]) -> Vec<Message> {
+        let mut messages = vec![Message::system("sys")];
+        match user_image {
+            Some((w, h)) => messages.push(Message::user_multimodal(vec![
+                ContentPart::Text("what is this".into()),
+                image(w, h),
+            ])),
+            None => messages.push(Message::user("go")),
+        }
+        for (i, (w, h)) in sizes.iter().enumerate() {
+            messages.push(Message::assistant(format!("step {i}")));
+            messages.push(Message::tool_result_multimodal(
+                format!("call_{i}"),
+                vec![ContentPart::Text("shot".into()), image(*w, *h)],
+            ));
+        }
+        messages
+    }
+
+    fn count_images(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                Some(MessageContent::Parts(parts)) => Some(parts),
+                _ => None,
+            })
+            .flatten()
+            .filter(|p| is_image_part(p))
+            .count()
+    }
+
+    fn stubs(messages: &[Message]) -> Vec<(usize, String)> {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match &m.content {
+                Some(MessageContent::Parts(parts)) => Some((i, parts)),
+                _ => None,
+            })
+            .flat_map(|(i, parts)| {
+                parts.iter().filter_map(move |p| match p {
+                    ContentPart::Text(t) if t.starts_with("[image retired") => Some((i, t.clone())),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn many_small_images_cross_no_constraint_and_stay_untouched() {
+        let sizes = vec![(1456, 816); MANY_IMAGE_THRESHOLD + 1];
+        let messages = history(None, &sizes);
+        let out = retire_excess_images(&messages);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "21 images all within 2000 px must not be rewritten"
+        );
+        assert_eq!(count_images(&out), MANY_IMAGE_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn one_oversize_image_past_the_threshold_retires_the_oldest_tool_batch() {
+        // 20 tool screenshots + 1 user image = 21; the newest capture is Retina.
+        let mut sizes = vec![(1456, 816); MANY_IMAGE_THRESHOLD - 1];
+        sizes.push((2880, 1800));
+        let messages = history(Some((4000, 3000)), &sizes);
+        assert_eq!(count_images(&messages), MANY_IMAGE_THRESHOLD + 1);
+
+        let out = retire_excess_images(&messages);
+        assert_eq!(
+            count_images(&out),
+            MANY_IMAGE_THRESHOLD + 1 - 8,
+            "one batch of 8 must go"
+        );
+        // The user's upload is never retired, even though it is the oldest
+        // and the largest image in the request.
+        assert_eq!(count_images(&out[1..2]), 1, "user image kept");
+        let retired = stubs(&out);
+        assert_eq!(retired.len(), 8);
+        // Oldest tool results first: tool messages sit at 3, 5, 7, ...
+        let expected_msgs: Vec<usize> = (0..8).map(|i| 3 + 2 * i).collect();
+        assert_eq!(
+            retired.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            expected_msgs
+        );
+        assert_eq!(retired[0].1, "[image retired: 1456\u{d7}816 px screenshot]");
+        // Stored history is untouched: the pass works on a copy.
+        assert_eq!(count_images(&messages), MANY_IMAGE_THRESHOLD + 1);
+        assert!(stubs(&messages).is_empty());
+    }
+
+    #[test]
+    fn unreadable_image_counts_as_oversize() {
+        let mut messages = history(None, &vec![(100, 100); MANY_IMAGE_THRESHOLD]);
+        messages.push(Message::assistant("look"));
+        messages.push(Message::tool_result_multimodal(
+            "call_url",
+            vec![ContentPart::ImageUrl {
+                url: "https://example.com/shot.png".into(),
+            }],
+        ));
+        let out = retire_excess_images(&messages);
+        assert_eq!(count_images(&out), MANY_IMAGE_THRESHOLD + 1 - 8);
+        assert_eq!(stubs(&out).len(), 8);
+    }
+
+    #[test]
+    fn hard_cap_retires_down_to_one_hundred_regardless_of_size() {
+        let messages = history(None, &vec![(100, 100); MAX_IMAGES_PER_REQUEST + 5]);
+        let out = retire_excess_images(&messages);
+        assert_eq!(count_images(&out), MAX_IMAGES_PER_REQUEST);
+        let retired = stubs(&out);
+        assert_eq!(retired.len(), 5);
+        assert_eq!(
+            retired.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (0..5).map(|i| 3 + 2 * i).collect::<Vec<_>>(),
+            "the five oldest tool images go"
+        );
+    }
+
+    #[test]
+    fn retirement_stops_when_only_user_images_remain() {
+        // 25 user uploads, nothing retirable: the request goes out as-is and
+        // the provider's own error, not a silent rewrite, tells the story.
+        let mut messages = vec![Message::system("sys")];
+        for _ in 0..25 {
+            messages.push(Message::user_multimodal(vec![image(2500, 2500)]));
+        }
+        let out = retire_excess_images(&messages);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(count_images(&out), 25);
+    }
+}
+
 #[cfg(test)]
 mod strip_images_tests {
     use super::*;

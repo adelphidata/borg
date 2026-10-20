@@ -2600,6 +2600,9 @@ fn openai_preserves_tool_result_messages() {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[tokio::test]
 async fn anthropic_request_includes_cache_control_on_system() {
+    // Turn one of an agent conversation: no tools yet, one user message. The
+    // next turn reads this prefix back, so it must be cached — the one-shot
+    // exemption is an explicit client flag, never a guess from this shape.
     let client = make_test_anthropic_client().await;
     let messages = vec![Message::system("stable system prompt"), Message::user("hi")];
     let body = client.build_anthropic_request(&messages, None, false);
@@ -3419,6 +3422,60 @@ fn openrouter_disabled_cache_skips_helper_entirely() {
             "no message must be marked when cache layout is fully off: {msg}"
         );
     }
+}
+
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[tokio::test]
+async fn one_shot_client_sends_no_cache_markers_at_all() {
+    // A summarizer/title/classification call is never read back from the
+    // cache, so a marker only buys the cache write (1.25x / 2x input). The
+    // flag is the caller's explicit claim; the same request without it is
+    // turn one of a conversation and keeps its markers (see
+    // `anthropic_request_includes_cache_control_on_system`).
+    fn marker_count(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| usize::from(k == "cache_control") + marker_count(v))
+                .sum(),
+            serde_json::Value::Array(items) => items.iter().map(marker_count).sum(),
+            _ => 0,
+        }
+    }
+    let messages = vec![
+        Message::system("Summarize the conversation."),
+        Message::user("a very long transcript"),
+    ];
+    let tools = vec![ToolDefinition::new(
+        "t",
+        "d",
+        serde_json::json!({"type": "object"}),
+    )];
+
+    let plain = make_test_anthropic_client().await;
+    assert!(marker_count(&plain.build_anthropic_request(&messages, None, false)) > 0);
+
+    let one_shot = make_test_anthropic_client().await.with_one_shot();
+    assert_eq!(
+        marker_count(&one_shot.build_anthropic_request(&messages, None, false)),
+        0
+    );
+    assert_eq!(
+        marker_count(&one_shot.build_anthropic_request(&messages, Some(&tools), false)),
+        0,
+        "the flag wins even over the tools breakpoint"
+    );
+
+    // A shared client can be flagged for one call and handed back as it was.
+    let mut shared = make_test_anthropic_client().await;
+    let prior = shared.set_one_shot(true);
+    assert!(!prior);
+    assert_eq!(
+        marker_count(&shared.build_anthropic_request(&messages, None, false)),
+        0
+    );
+    shared.set_one_shot(prior);
+    assert!(marker_count(&shared.build_anthropic_request(&messages, None, false)) > 0);
 }
 
 #[test]

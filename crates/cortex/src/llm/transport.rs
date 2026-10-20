@@ -340,11 +340,14 @@ pub(crate) fn build_anthropic_request(
     // to be restored here. `repair_message_sequence` renames the later
     // occurrence and its paired result rather than dropping either.
     let repaired = repair_message_sequence(request.messages);
+    // Outgoing copy only: the oldest tool screenshots become text stubs when
+    // the request would breach the provider's image ceiling.
+    let outgoing = super::anthropic::retire_excess_images(&repaired);
     // Signed reasoning replays only on a native Anthropic route (first-party,
     // OAuth, Vertex) to the model that signed it. A custom `base_url` is a
     // third-party endpoint: it gets no reasoning blocks at all.
     let replay_model = anthropic_reasoning_replay_model(request);
-    let anthropic_messages = build_anthropic_messages(&repaired, replay_model);
+    let anthropic_messages = build_anthropic_messages(&outgoing, replay_model);
     let anthropic_tools: Option<Vec<serde_json::Value>> = request.tools.map(|ts| {
         ts.iter()
             .map(|t| {
@@ -437,6 +440,22 @@ pub(crate) fn build_anthropic_request(
     }
 
     body
+}
+
+/// Remove every `cache_control` marker from a built request body, whatever
+/// its wire shape (Anthropic system/message/tool blocks, OpenAI-compatible
+/// content blocks). Used for one-shot calls that nothing reads back from the
+/// cache — the marker would buy only the cache-write premium. Block arrays
+/// the marker pass created stay as they are; they are valid without it.
+pub(crate) fn strip_cache_markers(body: &mut serde_json::Value) {
+    match body {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            map.values_mut().for_each(strip_cache_markers);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_cache_markers),
+        _ => {}
+    }
 }
 
 /// `Some` only for a non-empty string: a provider that sends `"id": ""`
@@ -1484,7 +1503,9 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
     let mut bedrock_messages = Vec::new();
     let mut system_blocks = Vec::new();
 
-    for message in request.messages {
+    // Same Claude image ceiling as the native route; outgoing copy only.
+    let outgoing = super::anthropic::retire_excess_images(request.messages);
+    for message in outgoing.iter() {
         match message.role {
             Role::System => {
                 if let Some(text) = message.text_content() {
@@ -2766,8 +2787,18 @@ mod tests {
         let turn_one = format!("{stable}<environment>\nCurrent Time: 12:00:01\n</environment>\n");
         let turn_two = format!("{stable}<environment>\nCurrent Time: 12:00:02\n</environment>\n");
 
-        let m1 = vec![Message::system(&turn_one), Message::user("hi")];
-        let m2 = vec![Message::system(&turn_two), Message::user("hi")];
+        let m1 = vec![
+            Message::system(&turn_one),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
+        let m2 = vec![
+            Message::system(&turn_two),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
 
         let b1 = build_anthropic_request(&anthropic_system_request(&m1, Some(stable)), false);
         let b2 = build_anthropic_request(&anthropic_system_request(&m2, Some(stable)), false);
@@ -2800,7 +2831,12 @@ mod tests {
     fn anthropic_system_split_does_not_spend_an_extra_breakpoint() {
         let stable = "stable head\n";
         let system = format!("{stable}volatile tail");
-        let messages = vec![Message::system(&system), Message::user("hi")];
+        let messages = vec![
+            Message::system(&system),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
 
         let unsplit = build_anthropic_request(&anthropic_system_request(&messages, None), false);
         let split =
@@ -2828,7 +2864,12 @@ mod tests {
         // Prefix ends with a 4-byte emoji; suffix opens with 3-byte CJK.
         let stable = "identity 🙂\n";
         let system = format!("{stable}環境 Current Time: 12:00:01");
-        let messages = vec![Message::system(&system), Message::user("hi")];
+        let messages = vec![
+            Message::system(&system),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
 
         let body =
             build_anthropic_request(&anthropic_system_request(&messages, Some(stable)), false);
@@ -2849,7 +2890,12 @@ mod tests {
         // 4-byte emoji of `system`. Slicing there would panic; `starts_with`
         // must reject it first.
         let emoji_system = "🙂🙂🙂 rest of prompt";
-        let emoji_messages = vec![Message::system(emoji_system), Message::user("hi")];
+        let emoji_messages = vec![
+            Message::system(emoji_system),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
         let mismatched = "0123456789";
         assert!(!emoji_system.is_char_boundary(mismatched.len()));
 
@@ -2868,7 +2914,12 @@ mod tests {
     #[test]
     fn anthropic_system_falls_back_to_one_block_on_prefix_mismatch() {
         let system = "a completely different system prompt";
-        let messages = vec![Message::system(system), Message::user("hi")];
+        let messages = vec![
+            Message::system(system),
+            Message::user("hi"),
+            Message::assistant("hello"),
+            Message::user("again"),
+        ];
 
         for prefix in [
             Some("prefix from an earlier turn"), // no longer matches
@@ -2882,6 +2933,123 @@ mod tests {
             assert_eq!(blocks[0]["text"], system);
             assert!(blocks[0].get("cache_control").is_some());
         }
+    }
+
+    /// The builder must not guess from the message shape that a request is a
+    /// one-shot: the agent loop sends a tool-less system + user request on
+    /// turn one (and on every turn of a conversation with an empty toolset),
+    /// and the next turn reads that prefix back. Markers stay; only the
+    /// caller-set flag strips them, and then it strips every one.
+    #[test]
+    fn builder_keeps_markers_on_a_tool_less_single_turn_and_strip_removes_them_all() {
+        let stable = "stable head\n";
+        let system = format!("{stable}volatile tail");
+        let turn_one = vec![Message::system(&system), Message::user("hi")];
+        let mut body =
+            build_anthropic_request(&anthropic_system_request(&turn_one, Some(stable)), false);
+        assert!(
+            breakpoint_count(&body) >= 2,
+            "turn one of an agent conversation keeps system + rolling markers: {body}"
+        );
+
+        let tools = vec![ToolDefinition::new(
+            "fs_read",
+            "read",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut with_tools = anthropic_system_request(&turn_one, Some(stable));
+        with_tools.tools = Some(&tools);
+        let mut tool_body = build_anthropic_request(&with_tools, false);
+        assert_eq!(tool_body["tools"][0]["cache_control"]["type"], "ephemeral");
+
+        strip_cache_markers(&mut body);
+        strip_cache_markers(&mut tool_body);
+        assert_eq!(breakpoint_count(&body), 0, "{body}");
+        assert_eq!(breakpoint_count(&tool_body), 0, "{tool_body}");
+        // The content itself survives: the split blocks are still the prompt.
+        let rejoined: String = system_blocks(&body)
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        assert_eq!(rejoined, system);
+        assert_eq!(tool_body["tools"][0]["name"], "fs_read");
+    }
+
+    /// The image ceiling runs on the wire-building path for both Anthropic
+    /// shapes, on an outgoing copy: a 21-image history with one Retina
+    /// capture leaves the stored messages alone and sends 13 images plus
+    /// eight text stubs in the oldest tool results.
+    #[test]
+    fn anthropic_and_bedrock_builders_retire_excess_images_on_the_outgoing_copy() {
+        use crate::media::image_header::test_images::{b64, png};
+        use crate::types::ContentPart;
+
+        let image = |w: u32, h: u32| ContentPart::ImageBase64 {
+            media: crate::types::MediaData {
+                mime_type: "image/png".into(),
+                data: b64(&png(w, h)),
+                filename: None,
+            },
+        };
+        let mut messages = vec![Message::system("sys"), Message::user("drive the app")];
+        for i in 0..21 {
+            let (w, h) = if i == 20 { (2880, 1800) } else { (1456, 816) };
+            messages.push(Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: Some(vec![crate::types::ToolCall {
+                    id: format!("call_{i}"),
+                    call_type: "function".into(),
+                    function: crate::types::FunctionCall {
+                        name: "computer_use".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: None,
+                seq: None,
+                reasoning_blocks: None,
+                reasoning_content: None,
+                reasoning_model: None,
+            });
+            messages.push(Message::tool_result_multimodal(
+                format!("call_{i}"),
+                vec![ContentPart::Text("shot".into()), image(w, h)],
+            ));
+        }
+        let before = serde_json::to_string(&messages).unwrap();
+
+        fn count_where(v: &serde_json::Value, pred: &dyn Fn(&serde_json::Value) -> bool) -> usize {
+            let here = usize::from(pred(v));
+            here + match v {
+                serde_json::Value::Object(map) => map.values().map(|v| count_where(v, pred)).sum(),
+                serde_json::Value::Array(items) => items.iter().map(|v| count_where(v, pred)).sum(),
+                _ => 0,
+            }
+        }
+        let is_stub = |v: &serde_json::Value| {
+            v.get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t.starts_with("[image retired: 1456\u{d7}816"))
+        };
+
+        let anthropic = build_anthropic_request(&anthropic_system_request(&messages, None), false);
+        let anthropic_images = count_where(&anthropic["messages"], &|v| {
+            v.get("type") == Some(&serde_json::json!("image"))
+        });
+        assert_eq!(anthropic_images, 13, "21 - one batch of 8");
+        assert_eq!(count_where(&anthropic["messages"], &is_stub), 8);
+
+        let bedrock = build_bedrock_request(&bedrock_request(&messages));
+        let bedrock_images = count_where(&bedrock["messages"], &|v| v.get("image").is_some());
+        assert_eq!(bedrock_images, 13);
+        assert_eq!(count_where(&bedrock["messages"], &is_stub), 8);
+
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            before,
+            "stored history must never be mutated by the send path"
+        );
     }
 
     /// Collect every `{"text": …}` string value anywhere in the body, so the

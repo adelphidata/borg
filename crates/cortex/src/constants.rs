@@ -299,6 +299,29 @@ pub const MAX_IMAGE_FILE_SIZE: usize = 50 * 1024 * 1024;
 /// Image compression target size (1 MB).
 pub const IMAGE_COMPRESSION_TARGET: usize = 1_048_576;
 
+// ── Outbound image ceiling (Anthropic-shaped providers) ────────────
+
+/// Image count above which Anthropic holds *every* image in the request to
+/// [`MANY_IMAGE_MAX_SIDE_PX`] per side. Not a count limit on its own.
+pub const MANY_IMAGE_THRESHOLD: usize = 20;
+
+/// Per-side pixel cap that applies to each image once a request carries more
+/// than [`MANY_IMAGE_THRESHOLD`] images.
+pub const MANY_IMAGE_MAX_SIDE_PX: u32 = 2000;
+
+/// Hard maximum number of images Anthropic accepts in one request.
+pub const MAX_IMAGES_PER_REQUEST: usize = 100;
+
+/// How many of the oldest tool-result images are retired per step when a
+/// request breaches the ceiling. Batching keeps the retired prefix stable
+/// across several turns so the prompt cache is not rewritten every call.
+pub const IMAGE_RETIRE_BATCH: usize = 8;
+
+/// How many base64 characters of an image are decoded to read its header.
+/// JPEG dimensions sit behind APP/EXIF segments that can span tens of KB;
+/// a header not found within this window counts as unreadable.
+pub const IMAGE_HEADER_B64_PREFIX_CHARS: usize = 96_000;
+
 /// Max document file size for Markdown conversion (100 MB). Conversion reads
 /// the whole file into memory and expands it into a document model, so the
 /// ceiling guards peak RSS — it is not a correctness limit.

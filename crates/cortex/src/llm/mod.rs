@@ -828,6 +828,16 @@ pub struct LlmClient {
     /// still matches is still stable. Callers that never set it (aux
     /// summarizers, title generation) just don't get the split.
     system_stable_prefix: Option<String>,
+    /// Set by callers whose request is never read back from the prompt cache
+    /// (compaction summaries, titles, classification): a single call with no
+    /// follow-up turn. Every `cache_control` marker is stripped from the body
+    /// so the request does not pay the cache-write premium (1.25x input at
+    /// the 5-minute TTL, 2x at one hour) for a write nothing reads.
+    ///
+    /// Explicit rather than inferred from the message shape: the agent loop
+    /// also sends a tool-less system + user request (an empty toolset, or
+    /// turn one of a conversation) and its next turn *does* read that prefix.
+    one_shot: bool,
     /// Optional best-effort sink for daemon cost events.
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
     /// Per-call metadata supplied by borgd.
@@ -1540,6 +1550,7 @@ impl LlmClient {
             debug_logging,
             prompt_cache_key: None,
             system_stable_prefix: None,
+            one_shot: false,
             cost_event_sink: None,
             cost_event_context: None,
             aux_concurrency: None,
@@ -1720,6 +1731,22 @@ impl LlmClient {
     pub fn with_system_stable_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.system_stable_prefix = Some(prefix.into());
         self
+    }
+
+    /// Mark this client's requests as one-shots that nothing reads back from
+    /// the prompt cache, so no `cache_control` marker is sent on them. For
+    /// callers that build a client for a single call (title generation,
+    /// classification). The agent loop never sets this.
+    pub fn with_one_shot(mut self) -> Self {
+        self.one_shot = true;
+        self
+    }
+
+    /// Set or clear the one-shot flag on a shared client; returns the prior
+    /// value so a caller can restore it. For callers handed a client they do
+    /// not own (the compaction summarizer).
+    pub fn set_one_shot(&mut self, one_shot: bool) -> bool {
+        std::mem::replace(&mut self.one_shot, one_shot)
     }
 
     /// Attach a best-effort daemon sink for per-call cost events.
@@ -3389,6 +3416,9 @@ impl LlmClient {
             self.effective_base_url().into_owned()
         };
         let mut body = transport.build_streaming_request(&request)?;
+        if self.one_shot {
+            transport::strip_cache_markers(&mut body);
+        }
         if self
             .stream_options_unsupported
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -3551,9 +3581,12 @@ impl LlmClient {
         } else {
             self.effective_base_url().into_owned()
         };
-        let body = transport
+        let mut body = transport
             .build_chat_request(&request)
             .map_err(LlmError::fatal)?;
+        if self.one_shot {
+            transport::strip_cache_markers(&mut body);
+        }
         let request_model = self.llm_config.model.clone();
         let cancel = CancellationToken::new();
         let started = Instant::now();
@@ -3878,7 +3911,11 @@ impl LlmClient {
     ) -> serde_json::Value {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
-        transport::build_anthropic_request(&request, stream)
+        let mut body = transport::build_anthropic_request(&request, stream);
+        if self.one_shot {
+            transport::strip_cache_markers(&mut body);
+        }
+        body
     }
 }
 

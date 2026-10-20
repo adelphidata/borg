@@ -316,12 +316,20 @@ fn shorter_summary_request(request: &[Message]) -> Vec<Message> {
 
 /// One summarizer call. Returns the trimmed text and whether it was cut, or
 /// the failure when the call failed or the reply is empty or a refusal.
+///
+/// Every summarizer request (first attempt and the shorter retry) is a
+/// one-shot: nothing reads its prefix back from the prompt cache, so the
+/// client is flagged for the call and restored after it — the compaction
+/// caller owns the client and may reuse it.
 async fn summarizer_attempt(
     llm: &mut LlmClient,
     request: &[Message],
     what: &str,
 ) -> Result<SummarizerReply, SummarizeFailure> {
-    let (response, truncated) = match llm.chat_streamed_checked(request).await {
+    let prior = llm.set_one_shot(true);
+    let reply = llm.chat_streamed_checked(request).await;
+    llm.set_one_shot(prior);
+    let (response, truncated) = match reply {
         Ok(reply) => reply,
         Err(e) => {
             warn!("{what} failed: {e}");
@@ -786,6 +794,79 @@ mod unusable_summary_tests {
             LlmClient::new(&config).await.expect("client builds"),
             requests,
         )
+    }
+
+    /// A Claude-via-OpenRouter client pointed at the fixture: the one
+    /// OpenAI-shaped route that carries Anthropic cache markers.
+    async fn openrouter_claude_client_for(
+        bodies: &'static [&'static str],
+    ) -> (LlmClient, Requests) {
+        let (url, requests) = serve_sse(bodies);
+        let env_var = "BORG_TEST_SUMMARIZE_OPENROUTER_KEY";
+        std::env::set_var(env_var, "sk-test");
+        let mut config = crate::config::Config::default();
+        config.llm.provider = Some("openrouter".to_string());
+        config.llm.api_key_env = env_var.to_string();
+        config.llm.model = "anthropic/claude-sonnet-4.6".to_string();
+        config.llm.base_url = Some(url);
+        config.llm.max_retries = 0;
+        (
+            LlmClient::new(&config).await.expect("client builds"),
+            requests,
+        )
+    }
+
+    fn body_of(request: &str) -> serde_json::Value {
+        let (_, body) = request.split_once("\r\n\r\n").expect("http body");
+        serde_json::from_str(body).expect("json body")
+    }
+
+    fn cache_marker_count(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| usize::from(k == "cache_control") + cache_marker_count(v))
+                .sum(),
+            serde_json::Value::Array(items) => items.iter().map(cache_marker_count).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Spec: a compaction summary is a one-shot nothing reads back, so the
+    /// summarizer's requests carry no cache marker — the first attempt and
+    /// the shorter retry alike — while the client it was handed goes back to
+    /// caching for the conversation that owns it.
+    #[tokio::test]
+    async fn summarizer_requests_carry_no_cache_markers_and_the_client_is_restored() {
+        let (mut llm, requests) = openrouter_claude_client_for(&[CUT, GOOD, GOOD]).await;
+        let history = vec![
+            Message::user("Please fix the crash in the parser module."),
+            Message::assistant("The crash is fixed in the parser module."),
+        ];
+        summarize_with_llm_v2(&history, None, &mut llm)
+            .await
+            .expect("summary");
+        // The same tool-less system + user shape from the conversation's own
+        // client keeps its markers: that prefix is read back next turn.
+        llm.chat_streamed(&[Message::system("sys"), Message::user("hi")])
+            .await
+            .expect("plain call");
+
+        let seen = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(seen.len(), 3, "cut summary, shorter retry, plain call");
+        for (i, request) in seen[..2].iter().enumerate() {
+            assert_eq!(
+                cache_marker_count(&body_of(request)),
+                0,
+                "summarizer request {i} must carry no cache_control"
+            );
+        }
+        assert!(
+            cache_marker_count(&body_of(&seen[2])) > 0,
+            "the client must cache again once the summarizer hands it back"
+        );
     }
 
     const CUT_SHORTER: &str = concat!(

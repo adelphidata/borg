@@ -119,7 +119,7 @@ async fn generate_session_title(
     let assistant_snippet = char_truncate(assistant_response, SNIPPET_CHAR_CAP);
 
     let mut llm = match LlmClient::for_auxiliary(config).await {
-        Ok(c) => c.with_prompt_cache_key(session_id),
+        Ok(c) => c.with_prompt_cache_key(session_id).with_one_shot(),
         Err(e) => {
             warn!("auto-title: aux LLM init failed: {e}");
             return None;
