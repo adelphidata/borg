@@ -5,13 +5,132 @@
 //! `crate::llm::vertex`. This file is for the AI Studio API-key endpoint at
 //! `generativelanguage.googleapis.com` only.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::transport::{Transport, TransportRequest, TransportResponse};
-use super::{LlmError, Message, Role, StreamEvent, ToolDefinition, UsageData};
+use super::{FailoverReason, LlmError, Message, Role, StreamEvent, ToolDefinition, UsageData};
 use crate::sse::SseAction;
 use crate::types::{ContentPart, FunctionCall, MessageContent, ToolCall};
+
+/// Placeholder Google documents for a replayed Gemini 3+ function call whose
+/// real `thoughtSignature` is unavailable (history produced by another model,
+/// or a signature this process never saw). Without *some* signature on every
+/// replayed `functionCall` the API answers 400 INVALID_ARGUMENT.
+pub(crate) const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// Upper bound on remembered thought signatures. Each one is a few hundred
+/// bytes to a few KB; 4096 covers far more tool calls than any live context
+/// window can replay, and the oldest fall off first.
+const THOUGHT_SIGNATURE_CAP: usize = 4096;
+
+/// Thought signatures Gemini 3+ attaches to `functionCall` parts, keyed by
+/// the synthetic call id Borg minted for the call.
+///
+/// The signature must travel back verbatim when the call is replayed in a
+/// later turn, but `ToolCall` carries only id/name/arguments and is built in
+/// every provider adapter and dozens of call sites. Rather than widen that
+/// type, the adapter keeps the signature beside the id here. The call id is
+/// what survives in the `Message` (and in the DB), so replay looks it up by
+/// id. The map is process-local: after a daemon restart a replayed call
+/// falls back to [`SKIP_THOUGHT_SIGNATURE`], which Google accepts.
+struct ThoughtSignatures {
+    order: VecDeque<String>,
+    by_call_id: HashMap<String, String>,
+}
+
+static THOUGHT_SIGNATURES: LazyLock<Mutex<ThoughtSignatures>> = LazyLock::new(|| {
+    Mutex::new(ThoughtSignatures {
+        order: VecDeque::new(),
+        by_call_id: HashMap::new(),
+    })
+});
+
+fn remember_thought_signature(call_id: &str, signature: &str) {
+    if signature.is_empty() {
+        return;
+    }
+    let mut store = THOUGHT_SIGNATURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if store
+        .by_call_id
+        .insert(call_id.to_string(), signature.to_string())
+        .is_none()
+    {
+        store.order.push_back(call_id.to_string());
+    }
+    while store.order.len() > THOUGHT_SIGNATURE_CAP {
+        if let Some(evicted) = store.order.pop_front() {
+            store.by_call_id.remove(&evicted);
+        }
+    }
+}
+
+fn thought_signature_for(call_id: &str) -> Option<String> {
+    THOUGHT_SIGNATURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .by_call_id
+        .get(call_id)
+        .cloned()
+}
+
+/// Monotonic component of [`response_nonce`]; the wall clock supplies the
+/// cross-restart part.
+static CALL_NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A short token unique to one Gemini response, mixed into every synthetic
+/// call id that response produces. Gemini mints no call ids of its own; a
+/// bare `name_index` scheme repeats every turn, and the Anthropic adapter's
+/// history repair treats a repeated id as a replayed call after a fallback.
+fn response_nonce() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let counter = CALL_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{millis:x}{counter:x}")
+}
+
+/// `(major, minor)` of a Gemini model id, or `None` for ids that carry no
+/// version (`gemini-embedding-001`, non-Gemini slugs). A compat host prefixes
+/// the vendor (`google/gemini-3-pro`), so the scan starts at `gemini-`
+/// wherever it sits. Undated `gemini-<tier>-latest` aliases always resolve
+/// to Google's newest generation and report [`GEMINI_LATEST_ALIAS_VERSION`].
+pub(crate) fn gemini_version(model: &str) -> Option<(u32, u32)> {
+    let lc = model.to_ascii_lowercase();
+    let start = lc.find("gemini-")? + "gemini-".len();
+    let rest = &lc[start..];
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let version = &rest[..digits_end];
+    if version.is_empty() {
+        return rest
+            .ends_with("-latest")
+            .then_some(GEMINI_LATEST_ALIAS_VERSION);
+    }
+    let mut it = version.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Version reported for `gemini-flash-latest`-style aliases: whatever Google
+/// serves there is the newest generation, so every ">= 3" gate must apply.
+pub(crate) const GEMINI_LATEST_ALIAS_VERSION: (u32, u32) = (u32::MAX, 0);
+
+/// Gemini 3 and every later generation: steers thinking with `thinkingLevel`,
+/// requires `id` on replayed `functionCall`/`functionResponse` parts, and
+/// validates `thoughtSignature` on replayed function calls.
+pub(crate) fn gemini_is_v3_or_newer(model: &str) -> bool {
+    gemini_version(model).is_some_and(|v| v >= (3, 0))
+}
 
 /// Default AI Studio base URL. Override via `BORG_GEMINI_BASE_URL` (for tests
 /// pointing at `wiremock`) or via `llm.base_url` for self-hosted relays.
@@ -25,10 +144,21 @@ pub(crate) const GEMINI_BASE_URL_ENV: &str = "BORG_GEMINI_BASE_URL";
 pub(crate) struct GeminiTransport;
 
 /// SSE accumulator for Gemini's `streamGenerateContent?alt=sse` endpoint.
-#[derive(Default)]
 pub(crate) struct GeminiStreamState {
     /// Accumulator for the assistant message under construction.
     pub(crate) accumulator: AssistantAccumulator,
+    /// Per-response token mixed into every synthetic call id this stream
+    /// mints (see [`response_nonce`]).
+    nonce: String,
+}
+
+impl Default for GeminiStreamState {
+    fn default() -> Self {
+        Self {
+            accumulator: AssistantAccumulator::default(),
+            nonce: response_nonce(),
+        }
+    }
 }
 
 /// Per-stream accumulator built from incremental SSE events.
@@ -41,8 +171,9 @@ pub(crate) struct AssistantAccumulator {
 }
 
 /// One in-flight function call. Gemini doesn't emit a synthetic call id, so
-/// we mint one of the form `gem_call_<name>_<index>` at finalisation time.
-/// The id stays stable for the next user turn's `functionResponse` matching.
+/// we mint one of the form `gem_call_<name>_<index>_<nonce>` at finalisation
+/// time. The id stays stable for the next user turn's `functionResponse`
+/// matching.
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct PendingFunctionCall {
@@ -148,7 +279,8 @@ impl Transport for GeminiTransport {
 /// so the unit tests can exercise it end-to-end without spawning the
 /// transport.
 fn build_gemini_request(request: &TransportRequest<'_>) -> Value {
-    let (contents, system_instruction) = build_contents_and_system(request.messages);
+    let (contents, system_instruction) =
+        build_contents_and_system(request.messages, ReplayShape::for_model(request.model));
 
     let mut body = json!({
         "contents": contents,
@@ -184,13 +316,20 @@ fn build_gemini_request(request: &TransportRequest<'_>) -> Value {
 /// `systemInstruction` string. All `Role::System` messages are concatenated
 /// (Gemini accepts only one); `Role::User`/`Assistant` map to `user`/`model`
 /// turns and `Role::Tool` results fold into a `functionResponse` user turn.
-fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String>) {
+fn build_contents_and_system(
+    messages: &[Message],
+    replay: ReplayShape,
+) -> (Vec<Value>, Option<String>) {
     let mut system_chunks: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
-    // We need the previous assistant turn's function-call names so a
-    // following `Role::Tool` can fill in `functionResponse.name` (Gemini
-    // matches function-call ↔ response by name + ordinal, not by id).
-    let mut last_assistant_call_names: Vec<String> = Vec::new();
+    // We need the previous assistant turn's function calls so a following
+    // `Role::Tool` can fill in `functionResponse.name` (and, on Gemini 3+,
+    // `id`). Pre-3 Gemini matches function-call ↔ response by name +
+    // ordinal, not by id.
+    let mut last_assistant_calls: Vec<ReplayedCall> = Vec::new();
+    // Tool *messages* answered since the last assistant turn — the ordinal
+    // fallback when a result carries no id the assistant turn knows.
+    let mut tool_results_seen: usize = 0;
     let mut pending_tool_responses: Vec<Value> = Vec::new();
 
     let flush_tool_responses = |contents: &mut Vec<Value>, pending: &mut Vec<Value>| {
@@ -220,18 +359,27 @@ fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String
             }
             Role::Assistant => {
                 flush_tool_responses(&mut contents, &mut pending_tool_responses);
-                let (parts, call_names) = message_to_model_parts(msg);
-                last_assistant_call_names = call_names;
+                let (parts, calls) = message_to_model_parts(msg, replay);
+                last_assistant_calls = calls;
+                tool_results_seen = 0;
                 if !parts.is_empty() {
                     contents.push(json!({"role": "model", "parts": parts}));
                 }
             }
             Role::Tool => {
-                // Match this tool result to the corresponding prior call by
-                // ordinal: the first tool message after an assistant turn
-                // fills slot 0, the second fills slot 1, etc.
-                let name = last_assistant_call_names
-                    .get(pending_tool_responses.len())
+                // Match this tool result to its prior call by id first: the
+                // agent persists results for rejected calls ahead of the
+                // executed ones, so result order is not call order. A result
+                // with no usable id falls back to its ordinal among the tool
+                // *messages* since the assistant turn (a multimodal result
+                // expands to several parts, so the part count is not it).
+                let by_id = msg
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| last_assistant_calls.iter().find(|c| c.id == *id));
+                let call = by_id
+                    .or_else(|| last_assistant_calls.get(tool_results_seen))
                     .cloned()
                     .unwrap_or_else(|| {
                         // No matching call — log + fall back to a synthetic
@@ -240,9 +388,13 @@ fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String
                         tracing::warn!(
                             "gemini adapter: tool result has no matching prior functionCall — using placeholder name"
                         );
-                        "unknown_tool".to_string()
+                        ReplayedCall {
+                            name: "unknown_tool".to_string(),
+                            id: msg.tool_call_id.clone().unwrap_or_default(),
+                        }
                     });
-                pending_tool_responses.extend(message_to_tool_response_parts(msg, &name));
+                tool_results_seen += 1;
+                pending_tool_responses.extend(message_to_tool_response_parts(msg, &call, replay));
             }
         }
     }
@@ -264,14 +416,51 @@ fn message_to_user_parts(msg: &Message) -> Vec<Value> {
     }
 }
 
-fn message_to_tool_response_parts(msg: &Message, name: &str) -> Vec<Value> {
-    let content_text = msg.text_content().unwrap_or("").to_string();
-    let mut parts = vec![json!({
-        "functionResponse": {
-            "name": name,
-            "response": {"content": content_text},
+/// How replayed function calls are shaped on the wire, decided once per
+/// request from the model id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayShape {
+    /// Gemini ≤ 2.x: `functionCall`/`functionResponse` carry no `id`, and the
+    /// API rejects an unknown `thoughtSignature` field.
+    Legacy,
+    /// Gemini 3+: every replayed `functionCall` carries its `id` and a
+    /// `thoughtSignature` (the real one when known, else the documented
+    /// placeholder); each `functionResponse` echoes the `id`.
+    Versioned,
+}
+
+impl ReplayShape {
+    fn for_model(model: &str) -> Self {
+        if gemini_is_v3_or_newer(model) {
+            Self::Versioned
+        } else {
+            Self::Legacy
         }
-    })];
+    }
+}
+
+/// A prior assistant function call, remembered so the matching tool result
+/// can be addressed back to it.
+#[derive(Clone, Debug)]
+struct ReplayedCall {
+    name: String,
+    id: String,
+}
+
+fn message_to_tool_response_parts(
+    msg: &Message,
+    call: &ReplayedCall,
+    replay: ReplayShape,
+) -> Vec<Value> {
+    let content_text = msg.text_content().unwrap_or("").to_string();
+    let mut function_response = json!({
+        "name": call.name,
+        "response": {"content": content_text},
+    });
+    if replay == ReplayShape::Versioned && !call.id.is_empty() {
+        function_response["id"] = json!(call.id);
+    }
+    let mut parts = vec![json!({ "functionResponse": function_response })];
 
     // Multimodal tool outputs need both the Gemini functionResponse and the
     // media parts. `video_analyze` relies on this path to make the video bytes
@@ -288,11 +477,11 @@ fn message_to_tool_response_parts(msg: &Message, name: &str) -> Vec<Value> {
     parts
 }
 
-/// Returns (parts, function_call_names_in_order). The names list lets the
-/// following `Role::Tool` messages fill in `functionResponse.name`.
-fn message_to_model_parts(msg: &Message) -> (Vec<Value>, Vec<String>) {
+/// Returns (parts, function calls in order). The call list lets the following
+/// `Role::Tool` messages fill in `functionResponse.name` (and `id`).
+fn message_to_model_parts(msg: &Message, replay: ReplayShape) -> (Vec<Value>, Vec<ReplayedCall>) {
     let mut parts: Vec<Value> = Vec::new();
-    let mut call_names: Vec<String> = Vec::new();
+    let mut calls: Vec<ReplayedCall> = Vec::new();
 
     match &msg.content {
         Some(MessageContent::Text(t)) if !t.is_empty() => {
@@ -316,17 +505,31 @@ fn message_to_model_parts(msg: &Message) -> (Vec<Value>, Vec<String>) {
                     );
                     json!({"_raw": tc.function.arguments})
                 });
-            parts.push(json!({
-                "functionCall": {
-                    "name": tc.function.name,
-                    "args": args_value,
-                }
-            }));
-            call_names.push(tc.function.name.clone());
+            let mut function_call = json!({
+                "name": tc.function.name,
+                "args": args_value,
+            });
+            let mut part = serde_json::Map::new();
+            if replay == ReplayShape::Versioned {
+                function_call["id"] = json!(tc.id);
+                // Gemini 3+ validates the thought signature on every replayed
+                // call. The real one was captured when the call was parsed;
+                // a call this process never saw (daemon restart, history from
+                // another model) gets Google's documented skip marker.
+                let signature =
+                    thought_signature_for(&tc.id).unwrap_or_else(|| SKIP_THOUGHT_SIGNATURE.into());
+                part.insert("thoughtSignature".into(), json!(signature));
+            }
+            part.insert("functionCall".into(), function_call);
+            parts.push(Value::Object(part));
+            calls.push(ReplayedCall {
+                name: tc.function.name.clone(),
+                id: tc.id.clone(),
+            });
         }
     }
 
-    (parts, call_names)
+    (parts, calls)
 }
 
 fn content_part_to_value(part: &ContentPart) -> Value {
@@ -544,41 +747,70 @@ fn max_output_tokens(configured: u32, thinking_budget: Option<i32>, thinking_on:
     configured.max(needed)
 }
 
-/// Resolve the `thinkingConfig` a model wants, paired with the explicit 2.5
-/// budget when one is known.
+/// The `thinkingConfig` a request sends, plus what it implies for the output
+/// cap.
+struct ThinkingWire {
+    /// Wire value for `generationConfig.thinkingConfig`.
+    config: Value,
+    /// Explicit 2.5 `thinkingBudget` when one is known; `None` for the opaque
+    /// `thinkingLevel` enum.
+    budget: Option<i32>,
+    /// True when the operator asked for thoughts, so `maxOutputTokens` must
+    /// leave room for them. False when the config only pins a model that
+    /// cannot stop thinking to its floor — the operator said Off, and the
+    /// configured cap stays theirs.
+    raises_cap: bool,
+}
+
+/// Lowest `thinkingLevel` every Gemini 3+ model accepts. There is no "off":
+/// with no `thinkingConfig` at all these models think at HIGH and spend the
+/// output cap on thoughts, so Off maps to this floor instead of silence.
+const GEMINI_3_THINKING_FLOOR: &str = "LOW";
+
+/// Resolve the `thinkingConfig` a model wants.
 ///
-/// `None` means this model spends no output tokens on thoughts — either
-/// thinking is off, or the family takes no `thinkingConfig` at all (1.5 and
-/// friends, which Google rejects the field on).
+/// `None` means the request carries no `thinkingConfig` — either thinking is
+/// off on a family that can turn it off (2.5), or the family takes no
+/// `thinkingConfig` at all (1.5 and friends, which Google rejects the field
+/// on). Gemini 3 and later always get one, keyed on a parsed version number
+/// rather than a `gemini-3` substring so Gemini 4 and the `-latest` aliases
+/// are not silently treated as legacy.
 ///
 /// Kept separate from [`generation_config`] because the OpenAI-compatible wire
-/// needs the same answer without the native request shape: a Gemini slug routed
-/// through OpenRouter or a compat relay bills thoughts against `max_tokens`
-/// exactly the same way, and answering that question twice is how the two paths
-/// drift apart.
-fn thinking_config(model: &str, cfg: &crate::config::LlmConfig) -> Option<(Value, Option<i32>)> {
+/// needs the same *cap* answer without the native request shape: a Gemini slug
+/// routed through OpenRouter or a compat relay bills thoughts against
+/// `max_tokens` exactly the same way, and answering that question twice is how
+/// the two paths drift apart. The thinking *level* is the one place the two
+/// wires still differ — see [`openai_compat_max_tokens`].
+fn thinking_config(model: &str, cfg: &crate::config::LlmConfig) -> Option<ThinkingWire> {
     let level = cfg.effective_thinking(model);
-    if !level.is_enabled() {
+    let version = gemini_version(model)?;
+    if version >= (3, 0) {
+        // Gemini 3+ takes an opaque `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH")
+        // — no numeric budget to read, and no way to disable it.
+        return Some(match level.gemini_3_level() {
+            Some(wire_level) => ThinkingWire {
+                config: json!({ "thinkingLevel": wire_level }),
+                budget: None,
+                raises_cap: true,
+            },
+            None => ThinkingWire {
+                config: json!({ "thinkingLevel": GEMINI_3_THINKING_FLOOR }),
+                budget: None,
+                raises_cap: false,
+            },
+        });
+    }
+    if !level.is_enabled() || version < (2, 5) {
         return None;
     }
-    // A compat host prefixes the vendor (`google/gemini-3-pro`), so match on a
-    // substring rather than the whole slug.
-    let model_lc = model.to_ascii_lowercase();
-    if model_lc.contains("gemini-3") {
-        // Gemini 3 takes an opaque `thinkingLevel` ("LOW"/"MEDIUM"/"HIGH") —
-        // no numeric budget to read.
-        let wire = level
-            .gemini_3_level()
-            .map(|s| json!({ "thinkingLevel": s }))?;
-        Some((wire, None))
-    } else if model_lc.contains("gemini-2.5") {
-        // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic).
-        let budget = level.gemini_2_5_budget();
-        let wire = budget.map(|b| json!({ "thinkingBudget": b }))?;
-        Some((wire, budget))
-    } else {
-        None
-    }
+    // Gemini 2.5 takes `thinkingBudget` (integer; -1 = dynamic).
+    let budget = level.gemini_2_5_budget()?;
+    Some(ThinkingWire {
+        config: json!({ "thinkingBudget": budget }),
+        budget: Some(budget),
+        raises_cap: true,
+    })
 }
 
 /// The output-token cap to send on the *OpenAI-compatible* wire for `model`.
@@ -589,10 +821,19 @@ fn thinking_config(model: &str, cfg: &crate::config::LlmConfig) -> Option<(Value
 /// keeps the configured 16K, thinking eats it, and the turn returns empty —
 /// the identical failure the native path already fixed. Non-Gemini models are
 /// returned untouched.
+///
+/// Known drift: the compat body steers thinking through `reasoning_effort`,
+/// which `build_openai_request` derives from the configured level alone and
+/// omits for Off. The native path pins Gemini 3+ to `thinkingLevel: LOW` on
+/// Off (those models cannot stop thinking); the compat path sends nothing, so
+/// OpenRouter runs the model at its own default level. Closing it means
+/// mapping Off to `reasoning_effort: "low"` when [`gemini_is_v3_or_newer`]
+/// holds, at the `reasoning_effort` site in the compat request builder — this
+/// adapter only owns the cap.
 pub(crate) fn openai_compat_max_tokens(model: &str, cfg: &crate::config::LlmConfig) -> u32 {
     match thinking_config(model, cfg) {
-        Some((_, budget)) => max_output_tokens(cfg.max_tokens, budget, true),
-        None => cfg.max_tokens,
+        Some(wire) if wire.raises_cap => max_output_tokens(cfg.max_tokens, wire.budget, true),
+        _ => cfg.max_tokens,
     }
 }
 
@@ -602,10 +843,10 @@ fn generation_config(request: &TransportRequest<'_>) -> Value {
     obj.insert("temperature".into(), json!(cfg.temperature));
 
     let resolved = thinking_config(request.model, cfg);
-    let thinking_budget = resolved.as_ref().and_then(|(_, budget)| *budget);
-    let thinking_on = resolved.is_some();
-    if let Some((wire, _)) = resolved {
-        obj.insert("thinkingConfig".into(), wire);
+    let thinking_budget = resolved.as_ref().and_then(|wire| wire.budget);
+    let thinking_on = resolved.as_ref().is_some_and(|wire| wire.raises_cap);
+    if let Some(wire) = resolved {
+        obj.insert("thinkingConfig".into(), wire.config);
     }
     obj.insert(
         "maxOutputTokens".into(),
@@ -656,10 +897,38 @@ fn parse_gemini_response(
         .first()
         .context("gemini response had empty `candidates`")?;
 
-    // Candidate-level safety/recitation blocks: also surface as errors.
+    // The non-streaming wire has no event channel, so a filter stop or a
+    // malformed call can only surface as an error here. Both are typed: the
+    // caller downcasts to `LlmError`, and a bare `anyhow` error would be
+    // classified `Format` — a content refusal must not bench the credential
+    // as a malformed request. `MAX_TOKENS` and `CONTINUATION` keep whatever
+    // text arrived, as every other provider's non-streaming path does.
     if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
-        if matches!(finish, "SAFETY" | "RECITATION") {
-            anyhow::bail!("gemini candidate blocked: {finish}");
+        match classify_finish_reason(finish) {
+            FinishOutcome::Filtered => {
+                return Err(anyhow::Error::new(LlmError::Fatal {
+                    source: anyhow::anyhow!("gemini candidate blocked: {finish}"),
+                    reason: FailoverReason::ContentPolicy,
+                    status: None,
+                }));
+            }
+            FinishOutcome::MalformedFunctionCall => {
+                return Err(anyhow::Error::new(LlmError::Fatal {
+                    source: anyhow::anyhow!(
+                        "gemini returned a malformed function call ({finish}); the model's tool call could not be parsed"
+                    ),
+                    reason: FailoverReason::MalformedToolCall,
+                    status: None,
+                }));
+            }
+            FinishOutcome::Stop | FinishOutcome::Truncated => {}
+            FinishOutcome::Unknown => {
+                tracing::warn!(
+                    provider,
+                    model,
+                    "gemini: unknown finishReason `{finish}` — treating as STOP"
+                );
+            }
         }
     }
 
@@ -670,9 +939,10 @@ fn parse_gemini_response(
         .cloned()
         .unwrap_or_default();
 
+    let nonce = response_nonce();
     let mut text_accum = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    for (idx, part) in parts.iter().enumerate() {
+    for part in &parts {
         if let Some(text) = part.get("text").and_then(Value::as_str) {
             text_accum.push_str(text);
         } else if let Some(fc) = part.get("functionCall") {
@@ -683,8 +953,12 @@ fn parse_gemini_response(
                 .to_string();
             let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
             let arguments = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            let id = synth_call_id(&name, tool_calls.len(), &nonce);
+            if let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) {
+                remember_thought_signature(&id, signature);
+            }
             tool_calls.push(ToolCall {
-                id: synth_call_id(&name, idx),
+                id,
                 call_type: "function".into(),
                 function: FunctionCall { name, arguments },
             });
@@ -736,9 +1010,49 @@ fn parse_gemini_response(
 
 /// Synthesize a stable id for a Gemini function call so subsequent tool
 /// results can be matched back to it. The streaming path uses the same
-/// scheme to stay consistent across streaming/non-streaming.
-fn synth_call_id(name: &str, idx: usize) -> String {
-    format!("gem_call_{name}_{idx}")
+/// scheme to stay consistent across streaming/non-streaming. `nonce` is
+/// unique per response (see [`response_nonce`]) so two turns that call the
+/// same tool never share an id.
+fn synth_call_id(name: &str, idx: usize, nonce: &str) -> String {
+    format!("gem_call_{name}_{idx}_{nonce}")
+}
+
+/// What a Gemini `finishReason` means for the turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishOutcome {
+    /// `STOP`: a complete reply.
+    Stop,
+    /// `MAX_TOKENS`, or `CONTINUATION` (a long decode cut at the per-request
+    /// cap): the output is incomplete.
+    Truncated,
+    /// A safety or policy filter stopped the candidate. The text that arrived
+    /// is kept; the stop is reported, not treated as a normal end.
+    Filtered,
+    /// `MALFORMED_FUNCTION_CALL`: the model emitted a tool call the API could
+    /// not parse. An error, never a silent empty turn.
+    MalformedFunctionCall,
+    /// Anything else: logged and treated as `STOP`.
+    Unknown,
+}
+
+/// Finish reasons that mean a filter, not the model, ended the candidate.
+const GEMINI_FILTERED_FINISH_REASONS: &[&str] = &[
+    "SAFETY",
+    "RECITATION",
+    "PROHIBITED_CONTENT",
+    "BLOCKLIST",
+    "SPII",
+    "IMAGE_SAFETY",
+];
+
+fn classify_finish_reason(reason: &str) -> FinishOutcome {
+    match reason {
+        "STOP" => FinishOutcome::Stop,
+        "MAX_TOKENS" | "CONTINUATION" => FinishOutcome::Truncated,
+        "MALFORMED_FUNCTION_CALL" => FinishOutcome::MalformedFunctionCall,
+        r if GEMINI_FILTERED_FINISH_REASONS.contains(&r) => FinishOutcome::Filtered,
+        _ => FinishOutcome::Unknown,
+    }
 }
 
 /// Parse one SSE line from `streamGenerateContent?alt=sse`. The driver in
@@ -832,7 +1146,10 @@ pub(crate) fn parse_gemini_sse_line(
                 let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let args_text = serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
                 let idx = state.accumulator.pending_function_calls.len();
-                let id = synth_call_id(&name, idx);
+                let id = synth_call_id(&name, idx, &state.nonce);
+                if let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) {
+                    remember_thought_signature(&id, signature);
+                }
                 state
                     .accumulator
                     .pending_function_calls
@@ -857,23 +1174,30 @@ pub(crate) fn parse_gemini_sse_line(
         .and_then(Value::as_str)
     {
         state.accumulator.finish_reason = Some(reason.to_string());
-        match reason {
-            "STOP" => {}
-            "MAX_TOKENS" => {
+        match classify_finish_reason(reason) {
+            FinishOutcome::Stop => {}
+            FinishOutcome::Truncated => {
                 events.push(StreamEvent::Truncated);
             }
-            "SAFETY" | "RECITATION" => {
-                // Mid-stream candidate-level block — surface and stop.
+            FinishOutcome::Filtered => {
+                // Mid-stream candidate-level block — keep the text that
+                // arrived, report the filter, and stop.
+                events.push(StreamEvent::ContentFiltered {
+                    reason: reason.to_string(),
+                });
+                done_after = true;
+            }
+            FinishOutcome::MalformedFunctionCall => {
                 events.push(StreamEvent::Error(format!(
-                    "gemini candidate blocked: {reason}"
+                    "gemini returned a malformed function call ({reason}); the model's tool call could not be parsed"
                 )));
                 done_after = true;
             }
-            other => {
+            FinishOutcome::Unknown => {
                 tracing::warn!(
                     provider,
                     model,
-                    "gemini SSE: unknown finishReason `{other}` — treating as STOP"
+                    "gemini SSE: unknown finishReason `{reason}` — treating as STOP"
                 );
             }
         }
@@ -1036,6 +1360,267 @@ mod tests {
         let fr = &tool_user_turn["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "vision_analyze");
         assert_eq!(fr["response"]["content"], "the image shows a cat");
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
+        }
+    }
+
+    /// The model-turn part carrying the replayed `functionCall`, and the
+    /// following user-turn `functionResponse`, for a one-call history.
+    fn replayed_call_and_response(model: &str, assistant: Message) -> (Value, Value) {
+        let msgs = vec![
+            Message::user("go"),
+            assistant.clone(),
+            Message::tool_result(&assistant.tool_calls.as_ref().unwrap()[0].id, "ok"),
+        ];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request_for_model(model, &msgs, &cfg));
+        let contents = body["contents"].as_array().unwrap();
+        let call_part = contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap().iter())
+            .find(|p| p.get("functionCall").is_some())
+            .expect("replayed functionCall part")
+            .clone();
+        let response = contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap().iter())
+            .find_map(|p| p.get("functionResponse"))
+            .expect("functionResponse part")
+            .clone();
+        (call_part, response)
+    }
+
+    /// Gemini 3+ rejects replayed history whose `functionCall` parts lack a
+    /// `thoughtSignature` (400 INVALID_ARGUMENT). The signature captured when
+    /// the call was parsed must travel back verbatim, and the call id must be
+    /// echoed on both the call and its response.
+    #[test]
+    fn replay_on_gemini_3_sends_the_captured_thought_signature_and_ids() {
+        for (label, parsed_call) in [
+            (
+                "non-streaming",
+                parse_gemini_response(
+                    json!({"candidates": [{"content": {"parts": [
+                        {"functionCall": {"name": "fs_read", "args": {"path": "a"}},
+                         "thoughtSignature": "sig-from-model"}
+                    ]}, "finishReason": "STOP"}]}),
+                    "gemini",
+                    "gemini-3-pro",
+                )
+                .unwrap()
+                .message
+                .tool_calls
+                .unwrap()
+                .remove(0),
+            ),
+            ("streaming", {
+                let line = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"fs_read","args":{"path":"a"}},"thoughtSignature":"sig-from-model"}]}}]}"#;
+                let (_, emitted, _) = feed(&[line]);
+                let id = emitted
+                    .iter()
+                    .find_map(|e| match e {
+                        StreamEvent::ToolCallDelta { id, .. } => id.clone(),
+                        _ => None,
+                    })
+                    .expect("tool call delta");
+                ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "fs_read".into(),
+                        arguments: "{}".into(),
+                    },
+                }
+            }),
+        ] {
+            let id = parsed_call.id.clone();
+            let (call_part, response) =
+                replayed_call_and_response("gemini-3-pro", assistant_call(&id, "fs_read"));
+            assert_eq!(
+                call_part["thoughtSignature"], "sig-from-model",
+                "{label}: the real signature must be replayed"
+            );
+            assert_eq!(call_part["functionCall"]["id"], id, "{label}");
+            assert_eq!(
+                response["id"], id,
+                "{label}: functionResponse must echo the id"
+            );
+            assert_eq!(response["name"], "fs_read", "{label}");
+        }
+    }
+
+    /// A call this process never saw (history from another model, daemon
+    /// restart) still needs *a* signature on Gemini 3+: Google documents a
+    /// placeholder that skips validation. Gemini 2.5 rejects the field, and
+    /// takes no ids, so it must receive neither.
+    #[test]
+    fn replay_without_a_signature_sends_placeholder_on_gemini_3_and_nothing_on_2_5() {
+        let cases = [
+            ("gemini-3-pro", true),
+            ("gemini-4-flash", true),
+            ("gemini-flash-latest", true),
+            ("gemini-2.5-flash", false),
+            ("gemini-2.5-pro", false),
+        ];
+        for (model, versioned) in cases {
+            let (call_part, response) =
+                replayed_call_and_response(model, assistant_call("call_from_claude", "fs_read"));
+            if versioned {
+                assert_eq!(
+                    call_part["thoughtSignature"], SKIP_THOUGHT_SIGNATURE,
+                    "{model}: an unknown signature must fall back to the placeholder"
+                );
+                assert_eq!(
+                    call_part["functionCall"]["id"], "call_from_claude",
+                    "{model}"
+                );
+                assert_eq!(response["id"], "call_from_claude", "{model}");
+            } else {
+                assert!(
+                    call_part.get("thoughtSignature").is_none(),
+                    "{model}: pre-3 models reject thoughtSignature"
+                );
+                assert!(
+                    call_part["functionCall"].get("id").is_none(),
+                    "{model}: pre-3 models take no functionCall.id"
+                );
+                assert!(
+                    response.get("id").is_none(),
+                    "{model}: pre-3 models take no functionResponse.id"
+                );
+            }
+            assert_eq!(call_part["functionCall"]["name"], "fs_read", "{model}");
+        }
+    }
+
+    fn assistant_calls(calls: &[(&str, &str)]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|(id, name)| ToolCall {
+                        id: (*id).into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: (*name).into(),
+                            arguments: "{}".into(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            timestamp: None,
+            seq: None,
+            reasoning_blocks: None,
+            reasoning_content: None,
+            reasoning_model: None,
+        }
+    }
+
+    /// Every `functionResponse` in the request, in wire order, as
+    /// `(name, id, content)`.
+    fn function_responses(body: &Value) -> Vec<(String, Option<String>, String)> {
+        body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap().iter())
+            .filter_map(|p| p.get("functionResponse"))
+            .map(|fr| {
+                (
+                    fr["name"].as_str().unwrap().to_string(),
+                    fr.get("id").and_then(Value::as_str).map(str::to_string),
+                    fr["response"]["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Tool results pair with their call by `tool_call_id`, never by
+    /// position: the agent persists rejected-call results ahead of executed
+    /// ones, and a multimodal result expands to several parts. Either would
+    /// put the wrong name — and on Gemini 3+, the wrong `id` — on the wire.
+    #[test]
+    fn tool_results_pair_with_calls_by_id_across_multimodal_and_reordered_results() {
+        let cfg = default_cfg();
+        let image = ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".into(),
+                data: "AAAA".into(),
+                filename: None,
+            },
+        };
+        let calls = &[("call_a", "vision_analyze"), ("call_b", "fs_read")];
+        let cases: [(&str, Vec<Message>); 2] = [
+            (
+                "first result multimodal",
+                vec![
+                    Message::tool_result_multimodal(
+                        "call_a",
+                        vec![ContentPart::Text("a cat".into()), image.clone()],
+                    ),
+                    Message::tool_result("call_b", "file body"),
+                ],
+            ),
+            (
+                "results arrive swapped",
+                vec![
+                    Message::tool_result("call_b", "file body"),
+                    Message::tool_result("call_a", "a cat"),
+                ],
+            ),
+        ];
+        for (label, results) in cases {
+            let mut msgs = vec![Message::user("go"), assistant_calls(calls)];
+            msgs.extend(results);
+            for model in ["gemini-3-pro", "gemini-2.5-flash"] {
+                let body = build_gemini_request(&make_request_for_model(model, &msgs, &cfg));
+                let responses = function_responses(&body);
+                assert_eq!(responses.len(), 2, "{label} / {model}: {responses:?}");
+                let versioned = gemini_is_v3_or_newer(model);
+                let expect_id = |id: &str| versioned.then(|| id.to_string());
+                let by_content: Vec<_> = responses
+                    .iter()
+                    .map(|(name, id, content)| (content.as_str(), (name.as_str(), id.clone())))
+                    .collect();
+                for (content, name, id) in [
+                    ("a cat", "vision_analyze", "call_a"),
+                    ("file body", "fs_read", "call_b"),
+                ] {
+                    let found = by_content
+                        .iter()
+                        .find(|(c, _)| *c == content)
+                        .map(|(_, pair)| pair.clone())
+                        .unwrap_or_else(|| panic!("{label} / {model}: no response for {content}"));
+                    assert_eq!(
+                        found,
+                        (name, expect_id(id)),
+                        "{label} / {model}: result `{content}` must address its own call"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1576,6 +2161,102 @@ mod tests {
         );
     }
 
+    /// The thinking gate keys on a parsed version, not a `gemini-3` substring,
+    /// so a new generation or an undated `-latest` alias is never treated as
+    /// legacy, and a compat vendor prefix does not hide the version.
+    #[test]
+    fn gemini_version_parses_generation_and_latest_aliases() {
+        let cases = [
+            ("gemini-3-pro", Some((3, 0))),
+            ("gemini-3.1-flash-preview", Some((3, 1))),
+            ("gemini-4-flash", Some((4, 0))),
+            ("google/gemini-4-flash", Some((4, 0))),
+            ("gemini-2.5-pro", Some((2, 5))),
+            ("gemini-2.0-flash", Some((2, 0))),
+            ("gemini-1.5-flash-latest", Some((1, 5))),
+            ("gemini-flash-latest", Some(GEMINI_LATEST_ALIAS_VERSION)),
+            ("gemini-pro-latest", Some(GEMINI_LATEST_ALIAS_VERSION)),
+            ("gemini-embedding-001", None),
+            ("claude-sonnet-4-5", None),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(gemini_version(model), expected, "{model}");
+        }
+        for (model, v3) in [
+            ("gemini-3-pro", true),
+            ("gemini-4-flash", true),
+            ("gemini-flash-latest", true),
+            ("gemini-2.5-pro", false),
+            ("gemini-1.5-pro", false),
+        ] {
+            assert_eq!(gemini_is_v3_or_newer(model), v3, "{model}");
+        }
+    }
+
+    /// Gemini 3+ cannot stop thinking: with no `thinkingConfig` it runs at
+    /// HIGH and spends the output cap on thoughts. Borg's default (Off) must
+    /// therefore pin the floor level, while 2.5 keeps sending nothing. The
+    /// pinned floor is not a request for thoughts, so the configured output
+    /// cap must stay as the operator set it.
+    #[test]
+    fn thinking_off_pins_the_floor_level_on_gemini_3_and_later_only() {
+        let cfg = default_cfg();
+        assert_eq!(cfg.thinking, crate::config::ThinkingLevel::Off);
+        let cases = [
+            ("gemini-3-pro", Some("LOW")),
+            ("gemini-3.1-flash-preview", Some("LOW")),
+            ("gemini-4-flash", Some("LOW")),
+            ("google/gemini-4-flash", Some("LOW")),
+            ("gemini-flash-latest", Some("LOW")),
+            ("gemini-2.5-pro", None),
+            ("gemini-2.5-flash", None),
+            ("gemini-1.5-pro", None),
+        ];
+        for (model, expected_level) in cases {
+            let body = build_gemini_request(&make_request_for_model(model, &[], &cfg));
+            let gc = &body["generationConfig"];
+            match expected_level {
+                Some(level) => {
+                    assert_eq!(gc["thinkingConfig"]["thinkingLevel"], level, "{model}");
+                    assert!(
+                        gc["thinkingConfig"].get("thinkingBudget").is_none(),
+                        "{model}: a 3+ model must never see thinkingBudget"
+                    );
+                }
+                None => assert!(
+                    gc.get("thinkingConfig").is_none(),
+                    "{model}: thinking Off must send no thinkingConfig"
+                ),
+            }
+            assert_eq!(
+                gc["maxOutputTokens"], cfg.max_tokens,
+                "{model}: Off must not raise the output cap"
+            );
+            assert_eq!(
+                openai_compat_max_tokens(model, &cfg),
+                cfg.max_tokens,
+                "{model}: the compat wire must not raise the cap either"
+            );
+        }
+    }
+
+    /// An explicit level on Gemini 4 and the `-latest` aliases takes the same
+    /// `thinkingLevel` enum as Gemini 3 and raises the cap like it does.
+    #[test]
+    fn explicit_thinking_level_reaches_gemini_4_and_latest_aliases() {
+        let mut cfg = default_cfg();
+        cfg.thinking = crate::config::ThinkingLevel::Medium;
+        for model in ["gemini-4-flash", "gemini-flash-latest", "gemini-3-pro"] {
+            let body = build_gemini_request(&make_request_for_model(model, &[], &cfg));
+            let gc = &body["generationConfig"];
+            assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "MEDIUM", "{model}");
+            assert!(
+                gc["maxOutputTokens"].as_u64().unwrap() > u64::from(cfg.max_tokens),
+                "{model}: thinking on must raise the cap"
+            );
+        }
+    }
+
     #[test]
     fn build_request_gemini_1_5_omits_thinking_config_even_when_level_set() {
         // Gemini 1.5 doesn't support `thinkingConfig` at all — sending it
@@ -1632,18 +2313,6 @@ mod tests {
         let err = match parse_gemini_response(resp, "gemini", "gemini-2.5-flash") {
             Err(e) => e,
             Ok(_) => panic!("expected safety-block error, got Ok"),
-        };
-        assert!(err.to_string().contains("SAFETY"));
-    }
-
-    #[test]
-    fn parse_response_candidate_safety_block_returns_error() {
-        let resp = json!({
-            "candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]
-        });
-        let err = match parse_gemini_response(resp, "gemini", "gemini-2.5-flash") {
-            Err(e) => e,
-            Ok(_) => panic!("expected candidate-block error, got Ok"),
         };
         assert!(err.to_string().contains("SAFETY"));
     }
@@ -1774,7 +2443,11 @@ mod tests {
                 arguments_delta,
             } => {
                 assert_eq!(*index, 0);
-                assert_eq!(id.as_deref(), Some("gem_call_vision_analyze_0"));
+                let id = id.as_deref().expect("synthetic id");
+                assert!(
+                    id.starts_with("gem_call_vision_analyze_0_"),
+                    "id must carry name, ordinal and a response nonce: {id}"
+                );
                 assert_eq!(name.as_deref(), Some("vision_analyze"));
                 // Borg's wire is a string; assert it round-trips back to {x:1}.
                 let args: Value = serde_json::from_str(arguments_delta).unwrap();
@@ -1791,7 +2464,7 @@ mod tests {
             r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"a","args":{}}}]}}]}"#,
             r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"b","args":{}}}]}}]}"#,
         ];
-        let (_, emitted, _) = feed(lines);
+        let (state, emitted, _) = feed(lines);
         let ids: Vec<&str> = emitted
             .iter()
             .filter_map(|e| match e {
@@ -1799,7 +2472,48 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ids, vec!["gem_call_a_0", "gem_call_b_1"]);
+        let nonce = &state.nonce;
+        assert_eq!(
+            ids,
+            vec![
+                format!("gem_call_a_0_{nonce}").as_str(),
+                format!("gem_call_b_1_{nonce}").as_str()
+            ],
+            "calls in one response share the nonce and differ by ordinal"
+        );
+    }
+
+    #[test]
+    fn stream_two_responses_mint_distinct_synthetic_ids_for_the_same_call() {
+        // Gemini mints no call ids. If two turns that call the same tool
+        // reuse `gem_call_<name>_0`, the Anthropic adapter's history repair
+        // treats the second as a replay of the first after a fallback and
+        // drops it. Every response must get its own nonce.
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"fs_read","args":{}}}]}}]}"#;
+        let first_id = |emitted: &[StreamEvent]| {
+            emitted
+                .iter()
+                .find_map(|e| match e {
+                    StreamEvent::ToolCallDelta { id, .. } => id.clone(),
+                    _ => None,
+                })
+                .expect("tool call delta")
+        };
+        let (_, first, _) = feed(&[line]);
+        let (_, second, _) = feed(&[line]);
+        assert_ne!(first_id(&first), first_id(&second));
+
+        let resp = || {
+            json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "fs_read", "args": {}}}
+            ]}, "finishReason": "STOP"}]})
+        };
+        let a = parse_gemini_response(resp(), "gemini", "gemini-3-pro").unwrap();
+        let b = parse_gemini_response(resp(), "gemini", "gemini-3-pro").unwrap();
+        assert_ne!(
+            a.message.tool_calls.unwrap()[0].id,
+            b.message.tool_calls.unwrap()[0].id
+        );
     }
 
     #[test]
@@ -1848,14 +2562,146 @@ mod tests {
         assert!(emitted.iter().any(|e| matches!(e, StreamEvent::Truncated)));
     }
 
+    /// Every Gemini `finishReason` maps to one stream outcome. A filter stop
+    /// must reach the agent as `ContentFiltered` (the same path OpenAI's
+    /// `content_filter` and Anthropic's `refusal` take), a malformed tool
+    /// call must be an error rather than a silent empty turn, and a
+    /// `CONTINUATION` cut is a truncation like `MAX_TOKENS`.
     #[test]
-    fn stream_finish_reason_recitation_emits_error() {
-        let line = r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"RECITATION"}]}"#;
-        let (_, emitted, done) = feed(&[line]);
-        assert!(done);
-        assert!(emitted
-            .iter()
-            .any(|e| matches!(e, StreamEvent::Error(msg) if msg.contains("RECITATION"))));
+    fn stream_finish_reasons_map_to_the_documented_outcomes() {
+        #[derive(Debug, PartialEq)]
+        enum Expect {
+            Filtered,
+            Error,
+            Truncated,
+            PlainStop,
+        }
+        let cases = [
+            ("SAFETY", Expect::Filtered),
+            ("RECITATION", Expect::Filtered),
+            ("PROHIBITED_CONTENT", Expect::Filtered),
+            ("BLOCKLIST", Expect::Filtered),
+            ("SPII", Expect::Filtered),
+            ("IMAGE_SAFETY", Expect::Filtered),
+            ("MALFORMED_FUNCTION_CALL", Expect::Error),
+            ("MAX_TOKENS", Expect::Truncated),
+            ("CONTINUATION", Expect::Truncated),
+            ("STOP", Expect::PlainStop),
+            ("SOME_FUTURE_REASON", Expect::PlainStop),
+        ];
+        for (reason, expect) in cases {
+            let line = format!(
+                r#"data: {{"candidates":[{{"content":{{"parts":[{{"text":"partial"}}]}},"finishReason":"{reason}"}}]}}"#
+            );
+            let (_, emitted, done) = feed(&[line.as_str()]);
+            let filtered = emitted.iter().find_map(|e| match e {
+                StreamEvent::ContentFiltered { reason } => Some(reason.as_str()),
+                _ => None,
+            });
+            let errored = emitted
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Error(m) if m.contains(reason)));
+            let truncated = emitted.iter().any(|e| matches!(e, StreamEvent::Truncated));
+            assert!(
+                emitted
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "partial")),
+                "{reason}: text that arrived before the stop must be kept"
+            );
+            match expect {
+                Expect::Filtered => {
+                    assert_eq!(
+                        filtered,
+                        Some(reason),
+                        "{reason} must surface as ContentFiltered"
+                    );
+                    assert!(!errored && !truncated, "{reason} is a filter, not an error");
+                    assert!(done, "{reason} must end the stream");
+                }
+                Expect::Error => {
+                    assert!(errored, "{reason} must surface as an Error event");
+                    assert!(filtered.is_none() && !truncated);
+                    assert!(done, "{reason} must end the stream");
+                }
+                Expect::Truncated => {
+                    assert!(truncated, "{reason} must surface as Truncated");
+                    assert!(filtered.is_none() && !errored);
+                }
+                Expect::PlainStop => {
+                    assert!(
+                        filtered.is_none() && !errored && !truncated,
+                        "{reason} must be a plain stop, got {emitted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The non-streaming parser has no event channel, so the same reasons
+    /// must become errors (filters, malformed calls) or keep the reply
+    /// (truncations, stop, unknown). The errors are typed: the client
+    /// downcasts to `LlmError`, and a bare error would be classified
+    /// `Format`, benching the credential for a content refusal.
+    #[test]
+    fn parse_response_finish_reasons_map_to_errors_or_replies() {
+        let cases = [
+            ("SAFETY", Some(("blocked", FailoverReason::ContentPolicy))),
+            (
+                "RECITATION",
+                Some(("blocked", FailoverReason::ContentPolicy)),
+            ),
+            (
+                "PROHIBITED_CONTENT",
+                Some(("blocked", FailoverReason::ContentPolicy)),
+            ),
+            (
+                "BLOCKLIST",
+                Some(("blocked", FailoverReason::ContentPolicy)),
+            ),
+            ("SPII", Some(("blocked", FailoverReason::ContentPolicy))),
+            (
+                "IMAGE_SAFETY",
+                Some(("blocked", FailoverReason::ContentPolicy)),
+            ),
+            (
+                "MALFORMED_FUNCTION_CALL",
+                Some(("malformed function call", FailoverReason::MalformedToolCall)),
+            ),
+            ("MAX_TOKENS", None),
+            ("CONTINUATION", None),
+            ("STOP", None),
+            ("SOME_FUTURE_REASON", None),
+        ];
+        for (reason, expect_err) in cases {
+            let resp = json!({
+                "candidates": [{"content": {"parts": [{"text": "partial"}]}, "finishReason": reason}]
+            });
+            let result = parse_gemini_response(resp, "gemini", "gemini-2.5-flash");
+            match expect_err {
+                Some((needle, failover)) => {
+                    let err = result
+                        .err()
+                        .unwrap_or_else(|| panic!("{reason} must be an error"));
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains(needle) && msg.contains(reason),
+                        "{reason}: error must name the cause, got `{msg}`"
+                    );
+                    let classified = err
+                        .downcast::<LlmError>()
+                        .unwrap_or_else(|e| panic!("{reason}: must be a typed LlmError, got {e}"));
+                    assert!(
+                        matches!(classified, LlmError::Fatal { .. }),
+                        "{reason}: a candidate verdict is not retryable"
+                    );
+                    assert_eq!(classified.reason(), failover, "{reason}");
+                }
+                None => {
+                    let parsed = result.unwrap_or_else(|e| panic!("{reason} must parse: {e}"));
+                    assert_eq!(parsed.message.text_content(), Some("partial"), "{reason}");
+                }
+            }
+        }
     }
 
     #[test]

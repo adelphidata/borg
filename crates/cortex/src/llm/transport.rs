@@ -1364,6 +1364,12 @@ pub(crate) fn build_openai_request(
         .llm_config
         .effective_thinking(request.model)
         .openai_reasoning_effort()
+        // Gemini 3+ cannot switch thinking off: with no level it thinks at
+        // HIGH and spends the output cap. The native wire pins LOW for Off
+        // (`gemini::thinking_config`); OpenRouter maps `reasoning_effort` to
+        // Gemini's `thinkingLevel`, so pin the same floor here and keep the
+        // two wires in step.
+        .or_else(|| super::gemini::gemini_is_v3_or_newer(request.model).then_some("low"))
         .map(String::from);
     // xAI rejects several JSON-schema keywords that OpenAI/Anthropic accept
     // (`minLength`, `maxLength`, `minItems`, `maxItems`, `minContains`,

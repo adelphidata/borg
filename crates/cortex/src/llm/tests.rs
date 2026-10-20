@@ -1864,6 +1864,44 @@ fn openai_build_request_per_model_override_applied() {
     assert_eq!(body["reasoning_effort"], "high");
 }
 
+/// Gemini 3+ cannot switch thinking off; the native wire pins
+/// `thinkingLevel: LOW` for Off, and the OpenAI-compat wire (OpenRouter)
+/// must pin the same floor via `reasoning_effort` or the model thinks at
+/// HIGH and spends the output cap. Pre-3 Gemini and non-Gemini models keep
+/// omitting the field.
+#[test]
+fn openai_build_request_pins_low_reasoning_for_gemini_3_when_thinking_is_off() {
+    use crate::llm::provider::Provider;
+    use crate::llm::transport::TransportRequest;
+
+    let mut cfg = LlmConfig::default();
+    cfg.thinking = crate::config::ThinkingLevel::Off;
+    let cases = [
+        ("google/gemini-3-pro", Some("low")),
+        ("google/gemini-4-flash", Some("low")),
+        ("google/gemini-2.5-pro", None),
+        ("gpt-4.1", None),
+    ];
+    for (model, expected) in cases {
+        let req = TransportRequest {
+            provider: Provider::OpenRouter,
+            model,
+            messages: &[Message::user("hi")],
+            tools: None,
+            llm_config: &cfg,
+            prompt_cache_key: None,
+            system_stable_prefix: None,
+            cost_events_enabled: false,
+        };
+        let body = crate::llm::transport::build_openai_request(&req, false).expect("should build");
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            expected,
+            "{model}"
+        );
+    }
+}
+
 #[test]
 fn openai_request_includes_reasoning_effort() {
     let request = ChatRequest {
