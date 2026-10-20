@@ -116,6 +116,30 @@ where
 }
 
 impl Agent {
+    /// Call-time counterpart of the filtering `build_tool_definitions` applies
+    /// to the advertised list: the sub-agent `tools_filter` allowlist and the
+    /// `tools.policy` profile/allow/deny layers, through the same predicate.
+    /// The `conditional_loading` relevance filter is deliberately not part of
+    /// this — a tool it hides this turn is still a legitimate call.
+    ///
+    /// `tools_filter` binds only names with a catalog group, the same rule
+    /// the policy's allow layer uses: the filter is a snapshot of the core
+    /// definitions at spawn, and deferred MCP tools (`mcp.tool_search_mode`
+    /// Auto), WASM plugins, and servers that connect later are never in it —
+    /// they are discovered through `search_tools` and dispatched by registry.
+    /// Those names stay callable (still subject to deny / `subagent_deny`);
+    /// a forked child still cannot run a core tool it was not given.
+    fn tool_available_in_session(&self, name: &str) -> bool {
+        if let Some(allowed) = &self.tools_filter {
+            if crate::tool::catalog::tool_group(name).is_some()
+                && !allowed.iter().any(|t| t == name)
+            {
+                return false;
+            }
+        }
+        crate::tool::policy::is_permitted(name, &self.config.tools.policy, self.spawn_depth > 0)
+    }
+
     /// Persist the assistant message with tool calls, partition and execute them,
     /// running shell/browser sequentially and other tools in parallel.
     ///
@@ -246,6 +270,20 @@ impl Agent {
 
             let name = &tool_call.function.name;
             let args = tool_call.function.arguments.as_str();
+
+            // Session availability is the first gate: a tool the model was
+            // never shown (operator deny list, sub-agent `toolsets`) must not
+            // run because the model named it anyway. No hook fires for it —
+            // like an invalid call, it never dispatches.
+            if !self.tool_available_in_session(name) {
+                warn!(tool.name = %name, "tool call refused: not available in this session");
+                self.skip_tool_call(
+                    &tool_call.id,
+                    &crate::tool::policy::unavailable_tool_message(name),
+                )
+                .await;
+                continue;
+            }
 
             let hook_ctx = self.hook_ctx(
                 HookPoint::BeforeToolCall,
@@ -466,6 +504,16 @@ impl Agent {
 
             let name = tool_call.function.name.clone();
             let mut args = tool_call.function.arguments.clone();
+
+            // Same session-availability gate as the sequential path, so a
+            // parallel batch cannot carry a denied tool past the policy.
+            if !self.tool_available_in_session(&name) {
+                warn!(tool.name = %name, "tool call refused: not available in this session");
+                slots.push(Slot::Skipped {
+                    reason: crate::tool::policy::unavailable_tool_message(&name),
+                });
+                continue;
+            }
 
             let hook_ctx = self.hook_ctx(
                 HookPoint::BeforeToolCall,
@@ -1278,6 +1326,206 @@ mod deadline_tests {
                 Some(Duration::from_millis(CONFIGURED)),
                 "'{bounded}' must be bounded by the wall-clock deadline"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_availability_tests {
+    //! The policy that decides what the model is *shown* must also decide
+    //! what *runs*. These drive the real pre-dispatch loops with a real
+    //! `read_file` on a temp file, so "the handler was not invoked" is
+    //! observable: the needle never reaches the tool result.
+
+    use super::super::tests::minimal_test_agent;
+    use super::*;
+    use crate::types::Role;
+
+    const NEEDLE: &str = "SECRET-NEEDLE-7f3a";
+
+    fn needle_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, NEEDLE).expect("write needle");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tool::names::READ_FILE.to_string(),
+                arguments: serde_json::json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    /// Run `calls` through the sequential or the parallel loop and return
+    /// the tool-result texts in call order plus whether any `ToolExecuting`
+    /// event (the handler-dispatch announcement) was emitted.
+    async fn run(agent: &mut Agent, calls: &[ToolCall], parallel: bool) -> (Vec<String>, bool) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let refs: Vec<&ToolCall> = calls.iter().collect();
+        if parallel {
+            agent.run_tool_group_parallel(&refs, 4, &tx, &cancel).await;
+        } else {
+            agent.run_tool_calls(&refs, &tx, &cancel).await;
+        }
+        drop(tx);
+        let mut executing = false;
+        while let Some(ev) = rx.recv().await {
+            if matches!(ev, AgentEvent::ToolExecuting { .. }) {
+                executing = true;
+            }
+        }
+        let results: Vec<String> = calls
+            .iter()
+            .map(|c| {
+                agent
+                    .history
+                    .iter()
+                    .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(&c.id))
+                    .and_then(|m| m.text_content())
+                    .unwrap_or_else(|| panic!("no tool_result for call {}", c.id))
+                    .to_string()
+            })
+            .collect();
+        (results, executing)
+    }
+
+    fn assert_refused(result: &str) {
+        assert!(
+            result.contains("`read_file` is not available in this session"),
+            "expected the unavailable-tool error, got: {result}"
+        );
+        assert!(
+            !result.contains(NEEDLE),
+            "handler ran: the file content leaked into the result: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_listed_tool_named_by_model_is_refused_and_never_runs() {
+        let (_dir, path) = needle_file();
+        let mut config = Config::default();
+        config.tools.policy.deny = vec![crate::tool::names::READ_FILE.to_string()];
+        for parallel in [false, true] {
+            let mut agent = minimal_test_agent(config.clone());
+            let calls = [read_file_call("c1", &path), read_file_call("c2", &path)];
+            let (results, executing) = run(&mut agent, &calls, parallel).await;
+            for r in &results {
+                assert_refused(r);
+            }
+            assert!(
+                !executing,
+                "parallel={parallel}: a refused call must not announce dispatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_agent_cannot_call_a_tool_outside_its_tools_filter() {
+        let (_dir, path) = needle_file();
+        let mut agent = minimal_test_agent(Config::default());
+        agent.spawn_depth = 1;
+        agent.tools_filter = Some(vec![crate::tool::names::WRITE_MEMORY.to_string()]);
+        let calls = [read_file_call("c1", &path)];
+        let (results, executing) = run(&mut agent, &calls, false).await;
+        assert_refused(&results[0]);
+        assert!(!executing);
+
+        // The same child with the tool in its allowlist runs it: the gate is
+        // the allowlist, not sub-agent status.
+        let mut agent = minimal_test_agent(Config::default());
+        agent.spawn_depth = 1;
+        agent.tools_filter = Some(vec![crate::tool::names::READ_FILE.to_string()]);
+        let (results, executing) = run(&mut agent, &calls, false).await;
+        assert!(
+            results[0].contains(NEEDLE),
+            "allowlisted tool must run: {}",
+            results[0]
+        );
+        assert!(executing);
+    }
+
+    /// `tools_filter` is a snapshot of the core definitions at spawn. With
+    /// `mcp.tool_search_mode=Auto` an MCP tool is deferred — absent from
+    /// that snapshot, discovered later through `search_tools` — so binding
+    /// the filter to every name would strip every child of all MCP, WASM
+    /// and late-connecting tools. Ungrouped names pass the filter; grouped
+    /// core tools outside it are still refused, and deny still binds.
+    #[test]
+    fn tools_filter_binds_core_tools_but_not_deferred_registry_tools() {
+        let mut agent = minimal_test_agent(Config::default());
+        agent.spawn_depth = 1;
+        agent.tools_filter = Some(vec![crate::tool::names::SEARCH_TOOLS.to_string()]);
+
+        assert!(
+            agent.tool_available_in_session("mcp_github_list_issues"),
+            "a deferred MCP tool discovered via search_tools must stay callable"
+        );
+        assert!(
+            agent.tool_available_in_session("my_wasm_plugin_tool"),
+            "an ungrouped runtime/plugin tool must stay callable"
+        );
+        assert!(
+            !agent.tool_available_in_session(crate::tool::names::RUN_SHELL),
+            "a core tool outside the filter must still be refused"
+        );
+        assert!(
+            agent.tool_available_in_session(crate::tool::names::SEARCH_TOOLS),
+            "a core tool inside the filter runs"
+        );
+
+        // An explicit deny still binds a name the filter let through.
+        agent
+            .config
+            .tools
+            .policy
+            .deny
+            .push("mcp_github_list_issues".to_string());
+        assert!(
+            !agent.tool_available_in_session("mcp_github_list_issues"),
+            "deny must still apply to ungrouped names"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_deny_is_enforced_at_call_time_for_children_only() {
+        let (_dir, path) = needle_file();
+        let mut config = Config::default();
+        config.tools.policy.subagent_deny = vec![crate::tool::names::READ_FILE.to_string()];
+        let calls = [read_file_call("c1", &path)];
+
+        let mut child = minimal_test_agent(config.clone());
+        child.spawn_depth = 1;
+        let (results, _) = run(&mut child, &calls, false).await;
+        assert_refused(&results[0]);
+
+        let mut root = minimal_test_agent(config);
+        let (results, _) = run(&mut root, &calls, false).await;
+        assert!(
+            results[0].contains(NEEDLE),
+            "subagent_deny must not bind the root agent: {}",
+            results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn permitted_tool_still_runs_on_both_paths() {
+        let (_dir, path) = needle_file();
+        for parallel in [false, true] {
+            let mut agent = minimal_test_agent(Config::default());
+            let calls = [read_file_call("c1", &path)];
+            let (results, executing) = run(&mut agent, &calls, parallel).await;
+            assert!(
+                results[0].contains(NEEDLE),
+                "parallel={parallel}: permitted read_file must return the file: {}",
+                results[0]
+            );
+            assert!(executing, "parallel={parallel}: dispatch must be announced");
         }
     }
 }

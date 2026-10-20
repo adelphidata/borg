@@ -27,6 +27,29 @@ fn pid_alive(pid: u32) -> bool {
     crate::util::process_tree::pid_is_running(pid)
 }
 
+/// Whether the daemon that wrote a lock row (`pid`, `heartbeat_at`) can
+/// still be running. A heartbeat earlier than this boot cannot have come
+/// from any process alive now, whatever `pid_alive` says about the number:
+/// after a reboot the kernel reissues PIDs from the start, and a root-owned
+/// process on the reused number answers the probe with `EPERM`, which reads
+/// as alive. Without a readable boot time the PID probe stands alone.
+///
+/// The comparison carries one refresh interval of slack
+/// ([`crate::constants::DAEMON_LOOP_INTERVAL`]): boot time is reported as
+/// wall-clock minus uptime, so an NTP step forward after boot (hosts with no
+/// RTC) moves it later than the last heartbeat a *live* daemon wrote up to
+/// one interval ago. Without the slack `doctor --repair` or the maintenance
+/// sweep could delete that live lock and bounce the daemon. A real reboot
+/// takes longer than one interval to reach the lock, so the slack costs
+/// nothing there.
+fn lock_owner_alive(pid: u32, heartbeat_at: i64, boot_time: Option<i64>) -> bool {
+    let slack = crate::constants::DAEMON_LOOP_INTERVAL.as_secs() as i64;
+    if boot_time.is_some_and(|boot| heartbeat_at < boot - slack) {
+        return false;
+    }
+    pid_alive(pid)
+}
+
 fn map_task_row(row: &libsql::Row) -> Result<ScheduledTaskRow> {
     Ok(ScheduledTaskRow {
         id: row.get::<String>(0)?,
@@ -1037,9 +1060,26 @@ impl Database {
     /// Attempt to acquire the daemon lock. Returns Ok(true) if acquired.
     /// A lock is considered stale after 300s without heartbeat refresh.
     /// Uses IMMEDIATE transaction to prevent TOCTOU races.
+    ///
+    /// Reads the host boot time so a row left by a daemon from before a
+    /// reboot is taken over at once even when its PID number is in use
+    /// again — see [`Self::acquire_daemon_lock_with_boot`].
     pub async fn acquire_daemon_lock(&self, pid: u32, now: i64) -> Result<bool> {
+        self.acquire_daemon_lock_with_boot(pid, now, crate::util::boot_time::system_boot_time())
+            .await
+    }
+
+    /// [`Self::acquire_daemon_lock`] with the boot instant supplied by the
+    /// caller. A row whose heartbeat predates `boot_time` is dead regardless
+    /// of PID liveness; `None` keeps the plain PID-liveness rule.
+    pub async fn acquire_daemon_lock_with_boot(
+        &self,
+        pid: u32,
+        now: i64,
+        boot_time: Option<i64>,
+    ) -> Result<bool> {
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
-        let result = self.acquire_daemon_lock_inner(pid, now).await;
+        let result = self.acquire_daemon_lock_inner(pid, now, boot_time).await;
         match &result {
             Ok(_) => {
                 self.conn.execute_batch("COMMIT").await?;
@@ -1055,7 +1095,12 @@ impl Database {
         result
     }
 
-    async fn acquire_daemon_lock_inner(&self, pid: u32, now: i64) -> Result<bool> {
+    async fn acquire_daemon_lock_inner(
+        &self,
+        pid: u32,
+        now: i64,
+        boot_time: Option<i64>,
+    ) -> Result<bool> {
         let existing: Option<(i64, i64)> = {
             let mut rows = self
                 .conn
@@ -1085,15 +1130,19 @@ impl Database {
                         )
                         .await?;
                     Ok(true)
-                } else if !pid_alive(existing_pid as u32) {
-                    // Prior daemon died (SIGKILL / crash) — PID gone from this
-                    // host. Couples the kernel-managed PID flock to the DB
-                    // lock: a SIGKILLed borgd would otherwise block restart
-                    // for up to 300s waiting on heartbeat staleness.
+                } else if !lock_owner_alive(existing_pid as u32, heartbeat_at, boot_time) {
+                    // Prior daemon died (SIGKILL / crash / reboot) — PID gone
+                    // from this host, or the row predates this boot. Couples
+                    // the kernel-managed PID flock to the DB lock: a
+                    // SIGKILLed borgd would otherwise block restart for up to
+                    // 300s waiting on heartbeat staleness, and a reused PID
+                    // after a reboot would block it for good.
                     tracing::info!(
                         stale_pid = existing_pid,
                         new_pid = pid,
-                        "daemon_lock: previous borgd PID is gone, taking over immediately",
+                        heartbeat_at,
+                        boot_time,
+                        "daemon_lock: previous borgd is gone, taking over immediately",
                     );
                     self.conn.execute(
                         "UPDATE daemon_lock SET pid = ?1, started_at = ?2, heartbeat_at = ?2 WHERE id = 1",
@@ -1185,11 +1234,28 @@ impl Database {
     /// (live PID, fresh heartbeat) or absent. This is the read-only detection
     /// half of the orphan-lock repair — a running daemon is never reported.
     pub async fn daemon_lock_orphan_age(&self, now: i64, grace_secs: i64) -> Result<Option<i64>> {
+        self.daemon_lock_orphan_age_with_boot(
+            now,
+            grace_secs,
+            crate::util::boot_time::system_boot_time(),
+        )
+        .await
+    }
+
+    /// [`Self::daemon_lock_orphan_age`] with the boot instant supplied by the
+    /// caller: a row whose heartbeat predates `boot_time` counts as dead even
+    /// when its PID number is alive again.
+    pub async fn daemon_lock_orphan_age_with_boot(
+        &self,
+        now: i64,
+        grace_secs: i64,
+        boot_time: Option<i64>,
+    ) -> Result<Option<i64>> {
         let Some((pid, heartbeat_at)) = self.daemon_lock_snapshot().await? else {
             return Ok(None);
         };
         let age = now - heartbeat_at;
-        if pid_alive(pid) || age <= grace_secs {
+        if lock_owner_alive(pid, heartbeat_at, boot_time) || age <= grace_secs {
             return Ok(None);
         }
         Ok(Some(age))
@@ -1201,10 +1267,27 @@ impl Database {
     /// (running PID or fresh heartbeat) is never cleared, so this is safe to
     /// run while a daemon is up. Backs the `locks.clear_orphan` remediation.
     pub async fn clear_stale_daemon_lock(&self, now: i64, grace_secs: i64) -> Result<bool> {
+        self.clear_stale_daemon_lock_with_boot(
+            now,
+            grace_secs,
+            crate::util::boot_time::system_boot_time(),
+        )
+        .await
+    }
+
+    /// [`Self::clear_stale_daemon_lock`] with the boot instant supplied by
+    /// the caller — same dead-row rule as
+    /// [`Self::daemon_lock_orphan_age_with_boot`].
+    pub async fn clear_stale_daemon_lock_with_boot(
+        &self,
+        now: i64,
+        grace_secs: i64,
+        boot_time: Option<i64>,
+    ) -> Result<bool> {
         let Some((pid, heartbeat_at)) = self.daemon_lock_snapshot().await? else {
             return Ok(false);
         };
-        if pid_alive(pid) || now - heartbeat_at <= grace_secs {
+        if lock_owner_alive(pid, heartbeat_at, boot_time) || now - heartbeat_at <= grace_secs {
             return Ok(false);
         }
         let removed = self
@@ -1627,9 +1710,11 @@ mod tests {
         // Symmetric guard: a *live* foreign PID inside the heartbeat window
         // must still block. Without this, the liveness branch could be
         // mistakenly applied to live processes and starve the real daemon.
+        // Wall-clock `now`: a 1970 heartbeat predates this boot and is dead
+        // by the reboot rule, which is not what this test is about.
         let db = test_db().await;
         let live_pid = std::process::id();
-        let now = 1_000;
+        let now = chrono::Utc::now().timestamp();
 
         assert!(db.acquire_daemon_lock(live_pid, now).await.unwrap());
 
@@ -1715,9 +1800,11 @@ mod tests {
         // A daemon that died seconds ago is still inside the heartbeat grace
         // window — clearing it would race a restart that's about to take over.
         // Detection must stay silent and repair must not remove the row.
+        // Timestamps are wall-clock so the host's boot time does not predate
+        // them; the rule under test is the grace window alone.
         let db = test_db().await;
         let dead_pid = reaped_child_pid();
-        let lock_time = 1_000;
+        let lock_time = chrono::Utc::now().timestamp();
         assert!(db.acquire_daemon_lock(dead_pid, lock_time).await.unwrap());
 
         let now = lock_time + 10; // 10s < 300s grace
@@ -1735,9 +1822,11 @@ mod tests {
         // A live daemon whose heartbeat thread merely stalled (e.g. a long GC
         // pause) must never be treated as orphaned — its PID is alive. PID 1
         // (launchd/init) is reliably alive on any Unix host.
+        // Wall-clock timestamps: a 1970 heartbeat would predate this boot
+        // and be (correctly) treated as dead, which is a different test.
         let db = test_db().await;
         let live_pid = 1u32;
-        let lock_time = 1_000;
+        let lock_time = chrono::Utc::now().timestamp();
         assert!(db.acquire_daemon_lock(live_pid, lock_time).await.unwrap());
 
         let now = lock_time + 10_000; // heartbeat very stale
@@ -1748,6 +1837,195 @@ mod tests {
             "live PID must never be reported orphaned regardless of staleness",
         );
         assert!(!db.clear_stale_daemon_lock(now, grace).await.unwrap());
+    }
+
+    // ── reboot + reused PID ──
+    //
+    // After a reboot the kernel reissues PIDs from the start, so the lock
+    // row's PID can name a live, unrelated (often root-owned, hence EPERM →
+    // "alive") process. The heartbeat predating the boot is the proof that
+    // the writer is gone. PID 1 stands in for the reused number: reliably
+    // alive on any Unix host.
+
+    #[tokio::test]
+    async fn acquire_takes_over_a_live_pid_whose_heartbeat_predates_boot() {
+        let db = test_db().await;
+        let reused_pid = 1u32;
+        let last_heartbeat = 10_000;
+        assert!(db
+            .acquire_daemon_lock_with_boot(reused_pid, last_heartbeat, None)
+            .await
+            .unwrap());
+
+        // Rebooted two minutes after the last heartbeat (past the one-interval
+        // NTP slack); a new daemon starts 30s later — far inside the 300s
+        // staleness window that used to be the only way out, where the
+        // scheduler would have reported "another daemon".
+        let boot = last_heartbeat + 120;
+        let now = boot + 30;
+        assert!(
+            db.acquire_daemon_lock_with_boot(std::process::id(), now, Some(boot))
+                .await
+                .unwrap(),
+            "a pre-boot heartbeat proves the owner is gone even when its PID is alive",
+        );
+        assert_eq!(
+            db.daemon_lock_snapshot().await.unwrap(),
+            Some((std::process::id(), now)),
+            "the new daemon must own the row",
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_respects_a_live_pid_whose_heartbeat_is_after_boot() {
+        let db = test_db().await;
+        let boot = 10_000;
+        let heartbeat = boot + 100;
+        assert!(db
+            .acquire_daemon_lock_with_boot(1, heartbeat, Some(boot))
+            .await
+            .unwrap());
+
+        assert!(
+            !db.acquire_daemon_lock_with_boot(std::process::id(), heartbeat + 30, Some(boot))
+                .await
+                .unwrap(),
+            "a daemon that heartbeated since this boot and is alive keeps its lock",
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_boot_time_keeps_the_pid_liveness_rule() {
+        let db = test_db().await;
+        let heartbeat = 10_000;
+        assert!(db
+            .acquire_daemon_lock_with_boot(1, heartbeat, None)
+            .await
+            .unwrap());
+
+        assert!(
+            !db.acquire_daemon_lock_with_boot(std::process::id(), heartbeat + 30, None)
+                .await
+                .unwrap(),
+            "with no boot time to compare, a live PID with a fresh heartbeat holds",
+        );
+        assert!(
+            db.acquire_daemon_lock_with_boot(std::process::id(), heartbeat + 400, None)
+                .await
+                .unwrap(),
+            "the 300s staleness fallback is unchanged",
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_detection_and_repair_treat_a_pre_boot_row_as_dead() {
+        let db = test_db().await;
+        let heartbeat = 10_000;
+        assert!(db
+            .acquire_daemon_lock_with_boot(1, heartbeat, None)
+            .await
+            .unwrap());
+        let boot = heartbeat + 120;
+        let now = heartbeat + 400;
+        let grace = 300;
+
+        assert_eq!(
+            db.daemon_lock_orphan_age_with_boot(now, grace, Some(boot))
+                .await
+                .unwrap(),
+            Some(400),
+            "a live reused PID must not hide a pre-boot orphan from doctor",
+        );
+        assert_eq!(
+            db.daemon_lock_orphan_age_with_boot(now, grace, None)
+                .await
+                .unwrap(),
+            None,
+            "without a boot time the live PID still shields the row",
+        );
+        assert!(
+            !db.clear_stale_daemon_lock_with_boot(now, grace, None)
+                .await
+                .unwrap(),
+            "repair without a boot time must not remove a live-PID row",
+        );
+        assert!(
+            db.clear_stale_daemon_lock_with_boot(now, grace, Some(boot))
+                .await
+                .unwrap(),
+            "repair with a boot time removes the pre-boot row",
+        );
+        assert_eq!(db.daemon_lock_snapshot().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pre_boot_row_inside_grace_is_still_not_an_orphan() {
+        // Boot time only replaces the PID probe; the grace window still
+        // protects a row that is merely young.
+        let db = test_db().await;
+        let heartbeat = 10_000;
+        assert!(db
+            .acquire_daemon_lock_with_boot(1, heartbeat, None)
+            .await
+            .unwrap());
+        let boot = heartbeat + 120;
+        assert_eq!(
+            db.daemon_lock_orphan_age_with_boot(heartbeat + 130, 300, Some(boot))
+                .await
+                .unwrap(),
+            None,
+        );
+        assert!(!db
+            .clear_stale_daemon_lock_with_boot(heartbeat + 130, 300, Some(boot))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn boot_time_inside_one_refresh_interval_of_the_heartbeat_is_not_a_reboot() {
+        // Boot time is wall-clock minus uptime. An NTP step forward after
+        // boot (no RTC) moves it later than the heartbeat a live daemon wrote
+        // moments ago; without slack, doctor/maintenance would delete the
+        // live lock and a restart would steal it. Within one refresh interval
+        // the row must still read as owned.
+        let db = test_db().await;
+        let heartbeat = 10_000;
+        assert!(db
+            .acquire_daemon_lock_with_boot(1, heartbeat, None)
+            .await
+            .unwrap());
+        let slack = crate::constants::DAEMON_LOOP_INTERVAL.as_secs() as i64;
+        let boot = heartbeat + slack; // exactly at the edge: still owned
+        let now = heartbeat + 1_000; // heartbeat stale by the 300s rule alone
+        let grace = 300;
+
+        assert!(
+            !db.acquire_daemon_lock_with_boot(std::process::id(), heartbeat + 30, Some(boot))
+                .await
+                .unwrap(),
+            "a live PID with a fresh heartbeat holds through an NTP step",
+        );
+        assert_eq!(
+            db.daemon_lock_orphan_age_with_boot(now, grace, Some(boot))
+                .await
+                .unwrap(),
+            None,
+            "a live PID inside the slack is not an orphan",
+        );
+        assert!(
+            !db.clear_stale_daemon_lock_with_boot(now, grace, Some(boot))
+                .await
+                .unwrap(),
+            "repair must not remove a live daemon's lock on an NTP step",
+        );
+
+        // One second past the slack the row is a pre-boot orphan.
+        assert_eq!(
+            db.daemon_lock_orphan_age_with_boot(now, grace, Some(boot + 1))
+                .await
+                .unwrap(),
+            Some(1_000),
+        );
     }
 
     #[tokio::test]

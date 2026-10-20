@@ -4,10 +4,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, ServerError, Status } from "nice-grpc";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { AdminDefinition } from "./gen/admin.js";
+import { AdminDefinition, SessionDetail } from "./gen/admin.js";
 import { StatusDefinition, Vitals } from "./gen/status.js";
 import { CostEvent, TelemetryDefinition } from "./gen/telemetry.js";
-import { createNodeTransport, defaultSocketPath, localAddress } from "./node.js";
+import { createNodeTransport, defaultSocketPath, localAddress, MAX_REPLY_BYTES } from "./node.js";
 import { BorgError, GrpcStatus, type StreamHandlers } from "./transport.js";
 
 /**
@@ -29,6 +29,9 @@ function stubImpl(
   }
   return { ...impl, ...overrides };
 }
+
+/** Over the 4 MiB grpc-js default, under the client's ceiling. */
+const LARGE_REPLY_BYTES = 5 * 1024 * 1024;
 
 const dir = mkdtempSync(join(tmpdir(), "borg-client-"));
 const socketPath = join(dir, "borgd.sock");
@@ -60,7 +63,17 @@ beforeAll(async () => {
     }) as never,
   );
   // Un-overridden: every unary returns an empty message, every stream ends cleanly.
-  server.add(AdminDefinition, stubImpl(AdminDefinition, {}) as never);
+  server.add(
+    AdminDefinition,
+    stubImpl(AdminDefinition, {
+      // A conversation whose single reply is over grpc-js's 4 MiB default.
+      getSession: async () =>
+        SessionDetail.fromPartial({
+          id: "long",
+          messages: [{ role: "tool", text: "x".repeat(LARGE_REPLY_BYTES) }],
+        }),
+    }) as never,
+  );
   await server.listen(`unix://${socketPath}`);
 });
 
@@ -101,6 +114,22 @@ describe("createNodeTransport", () => {
       expect(vitals.stability).toBe(88);
       expect(vitals.focus).toBe(61);
       expect(vitals.stage).toBe("Evolved");
+    } finally {
+      t.close();
+    }
+  });
+
+  it("decodes a reply larger than grpc-js's 4 MiB default", async () => {
+    // GetSession carries a whole conversation in one message. Before the
+    // channel raised its receive limit, a long one failed here as
+    // RESOURCE_EXHAUSTED and the desktop conversation view stayed empty.
+    expect(LARGE_REPLY_BYTES).toBeLessThan(MAX_REPLY_BYTES);
+    const t = transport();
+    try {
+      const detail = await t.unary<object, SessionDetail>("borg.admin.v1.Admin/GetSession", {
+        id: "long",
+      });
+      expect(detail.messages[0]?.text.length).toBe(LARGE_REPLY_BYTES);
     } finally {
       t.close();
     }

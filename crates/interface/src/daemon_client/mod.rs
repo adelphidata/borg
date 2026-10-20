@@ -94,6 +94,12 @@ fn rpc_err(op: &'static str, status: tonic::Status) -> anyhow::Error {
     }
 }
 
+/// Largest unary reply the client will decode. Mirrors the daemon's own
+/// inbound limit (`MAX_INBOUND_TURN_BYTES`, applied in `borgd::grpc`) so a
+/// message the daemon accepts on one side it can also hand back on the
+/// other; the node client (`@borg/client/node`) carries the same number.
+pub const MAX_REPLY_BYTES: usize = cortex::session_types::MAX_INBOUND_TURN_BYTES;
+
 /// Lightweight handle wrapping a tonic channel + the four primary clients.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
@@ -219,12 +225,18 @@ impl DaemonClient {
     }
 
     /// Wrap an already-connected channel.
+    ///
+    /// Every client raises tonic's 4 MiB default decode limit to
+    /// [`MAX_REPLY_BYTES`]: a `GetSession` of a long conversation or a
+    /// session export is one unary reply carrying the whole lineage, and the
+    /// default turned it into `RESOURCE_EXHAUSTED` once ~100 tool results had
+    /// accumulated.
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            session: SessionClient::new(channel.clone()),
-            admin: AdminClient::new(channel.clone()),
-            status: StatusClient::new(channel.clone()),
-            pki: PkiClient::new(channel),
+            session: SessionClient::new(channel.clone()).max_decoding_message_size(MAX_REPLY_BYTES),
+            admin: AdminClient::new(channel.clone()).max_decoding_message_size(MAX_REPLY_BYTES),
+            status: StatusClient::new(channel.clone()).max_decoding_message_size(MAX_REPLY_BYTES),
+            pki: PkiClient::new(channel).max_decoding_message_size(MAX_REPLY_BYTES),
         }
     }
 
@@ -1430,7 +1442,11 @@ mod live_session_tests {
 
     /// A host showing a conversation other than its own id — as after
     /// `/new` or `/resume`, where the host stays and the conversation moves.
-    struct Host;
+    /// `title_len` sizes the snapshot's title so a `GetState` reply can be
+    /// made larger than tonic's default 4 MiB decode limit.
+    struct Host {
+        title_len: usize,
+    }
     #[async_trait]
     impl SessionBackend for Host {
         async fn run_turn(
@@ -1448,7 +1464,7 @@ mod live_session_tests {
         fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
             Ok(SessionStateSnapshot {
                 agent_session_id: "conv-2".into(),
-                title: String::new(),
+                title: "t".repeat(self.title_len),
                 message_count: 0,
                 user_message_count: 0,
                 token_estimate: 0,
@@ -1472,13 +1488,11 @@ mod live_session_tests {
         }
     }
 
-    /// `/goal`, `/heartbeat` and `/handoff` used to send an empty session
-    /// id, and the daemon then picked the most recently updated session —
-    /// another window's conversation, or a `borg ask` run's.
-    #[tokio::test]
-    async fn live_session_id_names_the_hosts_current_conversation() {
+    /// Serve the real `Session` service over an in-process duplex pipe and
+    /// return a connected channel. One connection per server.
+    async fn serve_session(title_len: usize) -> tonic::transport::Channel {
         let registry = SessionRegistry::new();
-        registry.insert(SessionHost::new(Arc::new(Host)));
+        registry.insert(SessionHost::new(Arc::new(Host { title_len })));
         let svc = SessionSvc::new(registry, Arc::new(NoOpen));
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(
@@ -1487,7 +1501,7 @@ mod live_session_tests {
                 .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server_io))),
         );
         let mut client_io = Some(client_io);
-        let channel = tonic::transport::Endpoint::from_static("http://in-process")
+        tonic::transport::Endpoint::from_static("http://in-process")
             .connect_with_connector(tower::service_fn(move |_| {
                 let io = client_io.take();
                 async move {
@@ -1496,13 +1510,51 @@ mod live_session_tests {
                 }
             }))
             .await
-            .unwrap();
-        let mut c = DaemonClient::from_channel(channel);
+            .unwrap()
+    }
+
+    /// `/goal`, `/heartbeat` and `/handoff` used to send an empty session
+    /// id, and the daemon then picked the most recently updated session —
+    /// another window's conversation, or a `borg ask` run's.
+    #[tokio::test]
+    async fn live_session_id_names_the_hosts_current_conversation() {
+        let mut c = DaemonClient::from_channel(serve_session(0).await);
 
         assert_eq!(c.live_session_id("host-1").await, "conv-2");
         // Unknown host or no host: empty, so the daemon's own fallback applies.
         assert_eq!(c.live_session_id("no-such-host").await, "");
         assert_eq!(c.live_session_id("").await, "");
+    }
+
+    /// A long conversation's `GetSession`, an export, `borg sessions show`
+    /// and the ACP session load all come back as one unary reply. With
+    /// tonic's 4 MiB default the daemon's answer was refused on the client
+    /// as RESOURCE_EXHAUSTED once ~100 large tool results had accumulated.
+    #[tokio::test]
+    async fn client_decodes_a_reply_larger_than_tonics_default_limit() {
+        // Over the 4 MiB default, under our ceiling.
+        let title_len = 5 * 1024 * 1024;
+        assert!(title_len < super::MAX_REPLY_BYTES);
+
+        let mut c = DaemonClient::from_channel(serve_session(title_len).await);
+        let state = c
+            .get_state("host-1")
+            .await
+            .expect("a 5 MiB reply must decode through DaemonClient");
+        assert_eq!(state.title.len(), title_len);
+
+        // Negative control: the same reply through a client left at tonic's
+        // default is refused — which is what proves the limit above is what
+        // makes the first call succeed.
+        let mut bare =
+            protocols::session::session_client::SessionClient::new(serve_session(title_len).await);
+        let err = bare
+            .get_state(protocols::session::SessionStateRequest {
+                session_id: "host-1".into(),
+            })
+            .await
+            .expect_err("tonic's default limit must refuse a 5 MiB reply");
+        assert_eq!(err.code(), tonic::Code::OutOfRange, "{err}");
     }
 }
 

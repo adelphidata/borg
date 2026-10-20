@@ -4,6 +4,8 @@
 
 /// ANSI/terminal escape stripping for recalled text re-entering model context.
 pub mod ansi;
+/// Host boot instant, for telling a reused PID from a surviving process.
+pub mod boot_time;
 /// Lowercase hex encode/decode helpers.
 pub mod hex;
 /// Invisible and bidi-override Unicode detection shared by the shell policy

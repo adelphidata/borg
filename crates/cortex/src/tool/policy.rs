@@ -27,49 +27,88 @@ fn expand_entries(entries: &[String]) -> HashSet<String> {
     entries.iter().flat_map(|e| expand_entry(e)).collect()
 }
 
-/// Filter tool definitions based on profile and allow/deny policy.
-pub fn filter_tools(tools: Vec<ToolDefinition>, policy: &ToolPolicyConfig) -> Vec<ToolDefinition> {
-    let profile = ToolProfile::from_str_opt(&policy.profile).unwrap_or_default();
-    let allowed_groups = profile.groups();
+/// A [`ToolPolicyConfig`] with its `group:xxx` entries expanded once, so the
+/// same decision can be asked per advertised tool and per model-issued call
+/// without re-expanding the lists each time.
+///
+/// This is the single source of truth for "may this session use tool `X`":
+/// `build_tool_definitions` uses it to decide what the model is shown, and
+/// the pre-dispatch gates in `tool_execution` use it to refuse a call the
+/// model issues anyway (a forked child whose inherited history shows the
+/// parent calling `run_shell`, an operator deny list the model ignores).
+pub struct ResolvedPolicy {
+    allowed_groups: HashSet<ToolGroup>,
+    explicit_allow: Option<HashSet<String>>,
+    explicit_deny: HashSet<String>,
+    subagent_deny: HashSet<String>,
+}
 
-    let explicit_allow: Option<HashSet<String>> = if policy.allow.is_empty() {
-        None
-    } else {
-        Some(expand_entries(&policy.allow))
-    };
+impl ResolvedPolicy {
+    /// Expand `policy` into name sets. Unknown profiles fall back to `full`.
+    pub fn new(policy: &ToolPolicyConfig) -> Self {
+        let profile = ToolProfile::from_str_opt(&policy.profile).unwrap_or_default();
+        Self {
+            allowed_groups: profile.groups(),
+            explicit_allow: (!policy.allow.is_empty()).then(|| expand_entries(&policy.allow)),
+            explicit_deny: expand_entries(&policy.deny),
+            subagent_deny: expand_entries(&policy.subagent_deny),
+        }
+    }
 
-    let explicit_deny: HashSet<String> = expand_entries(&policy.deny);
+    /// Whether `name` is usable under this policy. `is_subagent` adds the
+    /// `subagent_deny` layer. User/MCP/plugin tools (no catalog group) pass
+    /// the profile and allow layers; only an explicit deny removes them.
+    pub fn permits(&self, name: &str, is_subagent: bool) -> bool {
+        let group = tool_group(name);
 
-    tools
-        .into_iter()
-        .filter(|td| {
-            let name = td.function.name.as_str();
-
-            // 1. Profile filtering: if tool has a known group, check membership
-            if let Some(group) = tool_group(name) {
-                if !allowed_groups.contains(&group) {
-                    return false;
-                }
-            }
-            // User tools (no group) always pass profile filtering
-
-            // 2. Explicit allow: if set, tool must be in the list
-            if let Some(ref allow_set) = explicit_allow {
-                if !allow_set.contains(name) {
-                    // User tools not in allow list are still permitted
-                    if tool_group(name).is_some() {
-                        return false;
-                    }
-                }
-            }
-
-            // 3. Deny always wins
-            if explicit_deny.contains(name) {
+        // 1. Profile filtering: if tool has a known group, check membership.
+        if let Some(group) = group {
+            if !self.allowed_groups.contains(&group) {
                 return false;
             }
+        }
 
-            true
-        })
+        // 2. Explicit allow: a catalog tool must be listed; user tools pass.
+        if let Some(allow_set) = &self.explicit_allow {
+            if group.is_some() && !allow_set.contains(name) {
+                return false;
+            }
+        }
+
+        // 3. Deny always wins.
+        if self.explicit_deny.contains(name) {
+            return false;
+        }
+
+        // 4. Sub-agents lose a further set of tools.
+        if is_subagent && self.subagent_deny.contains(name) {
+            return false;
+        }
+
+        true
+    }
+}
+
+/// One-shot form of [`ResolvedPolicy::permits`] for a single tool name.
+pub fn is_permitted(name: &str, policy: &ToolPolicyConfig, is_subagent: bool) -> bool {
+    ResolvedPolicy::new(policy).permits(name, is_subagent)
+}
+
+/// The tool result handed back to the model when it names a tool this
+/// session may not use. Addressable (`Error:` prefix, like the validation
+/// layer's synthetic results) so the model can choose another tool.
+pub fn unavailable_tool_message(name: &str) -> String {
+    format!(
+        "Error: tool `{name}` is not available in this session. Use one of the tools you were given."
+    )
+}
+
+/// Filter tool definitions based on profile and allow/deny policy.
+pub fn filter_tools(tools: Vec<ToolDefinition>, policy: &ToolPolicyConfig) -> Vec<ToolDefinition> {
+    let resolved = ResolvedPolicy::new(policy);
+    tools
+        .into_iter()
+        .filter(|td| resolved.permits(&td.function.name, false))
         .collect()
 }
 
@@ -78,14 +117,11 @@ pub fn filter_subagent_tools(
     tools: Vec<ToolDefinition>,
     policy: &ToolPolicyConfig,
 ) -> Vec<ToolDefinition> {
-    let mut filtered = filter_tools(tools, policy);
-
-    let subagent_deny: HashSet<String> = expand_entries(&policy.subagent_deny);
-    if !subagent_deny.is_empty() {
-        filtered.retain(|td| !subagent_deny.contains(td.function.name.as_str()));
-    }
-
-    filtered
+    let resolved = ResolvedPolicy::new(policy);
+    tools
+        .into_iter()
+        .filter(|td| resolved.permits(&td.function.name, true))
+        .collect()
 }
 
 #[cfg(test)]
@@ -373,5 +409,203 @@ mod tests {
         // HashSet deduplicates
         assert!(expanded.contains("write_memory"));
         assert!(expanded.contains("read_memory"));
+    }
+
+    /// The advertised-list filter and the call-time predicate must never
+    /// disagree: a tool hidden from the model must also be refused when the
+    /// model names it anyway, and a shown tool must run. Expected values are
+    /// the policy spec (profile groups, allow narrows catalog tools only,
+    /// deny wins, subagent_deny applies to children), not the implementation.
+    #[test]
+    fn is_permitted_agrees_with_filter_tools_on_every_case() {
+        struct Case {
+            profile: &'static str,
+            allow: &'static [&'static str],
+            deny: &'static [&'static str],
+            subagent_deny: &'static [&'static str],
+            name: &'static str,
+            is_subagent: bool,
+            expected: bool,
+        }
+        let cases = [
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &[],
+                name: "run_shell",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &["run_shell"],
+                subagent_deny: &[],
+                name: "run_shell",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &["group:fs"],
+                subagent_deny: &[],
+                name: "apply_patch",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "minimal",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &[],
+                name: "apply_patch",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "minimal",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &[],
+                name: "write_memory",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "minimal",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &[],
+                name: "mcp_custom_server_tool",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "full",
+                allow: &["write_memory"],
+                deny: &[],
+                subagent_deny: &[],
+                name: "run_shell",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &["write_memory"],
+                deny: &[],
+                subagent_deny: &[],
+                name: "write_memory",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "full",
+                allow: &["write_memory"],
+                deny: &[],
+                subagent_deny: &[],
+                name: "mcp_custom_server_tool",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "full",
+                allow: &["write_memory"],
+                deny: &["write_memory"],
+                subagent_deny: &[],
+                name: "write_memory",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &["mcp_custom_server_tool"],
+                subagent_deny: &[],
+                name: "mcp_custom_server_tool",
+                is_subagent: false,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &["schedule"],
+                name: "schedule",
+                is_subagent: false,
+                expected: true,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &["schedule"],
+                name: "schedule",
+                is_subagent: true,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &["group:fs"],
+                name: "apply_patch",
+                is_subagent: true,
+                expected: false,
+            },
+            Case {
+                profile: "full",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &["group:fs"],
+                name: "write_memory",
+                is_subagent: true,
+                expected: true,
+            },
+            Case {
+                profile: "no_such_profile",
+                allow: &[],
+                deny: &[],
+                subagent_deny: &[],
+                name: "browser",
+                is_subagent: false,
+                expected: true,
+            },
+        ];
+        let to_vec = |xs: &[&str]| xs.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (i, c) in cases.iter().enumerate() {
+            let policy = ToolPolicyConfig {
+                profile: c.profile.to_string(),
+                allow: to_vec(c.allow),
+                deny: to_vec(c.deny),
+                subagent_deny: to_vec(c.subagent_deny),
+            };
+            let predicate = is_permitted(c.name, &policy, c.is_subagent);
+            let tools = vec![make_tool(c.name)];
+            let shown = if c.is_subagent {
+                filter_subagent_tools(tools, &policy)
+            } else {
+                filter_tools(tools, &policy)
+            };
+            assert_eq!(
+                predicate, c.expected,
+                "case {i}: is_permitted({}, profile={}, allow={:?}, deny={:?}, subagent_deny={:?}, sub={})",
+                c.name, c.profile, c.allow, c.deny, c.subagent_deny, c.is_subagent
+            );
+            assert_eq!(
+                shown.len() == 1,
+                c.expected,
+                "case {i}: advertised list disagrees with the spec for {}",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_tool_message_is_an_addressable_error_naming_the_tool() {
+        let msg = unavailable_tool_message("run_shell");
+        assert!(msg.starts_with("Error:"), "{msg}");
+        assert!(msg.contains("`run_shell`"), "{msg}");
     }
 }

@@ -51,6 +51,16 @@ export function localAddress(
 }
 
 /**
+ * Largest unary reply the client will decode: 16 MiB, the daemon's own
+ * inbound limit (`MAX_INBOUND_TURN_BYTES` in `cortex::session_types`, which
+ * the Rust client mirrors as `MAX_REPLY_BYTES`). `GetSession` returns a whole
+ * conversation in one message; at grpc-js's 4 MiB default, a long one with
+ * large tool results failed as RESOURCE_EXHAUSTED and the desktop app showed
+ * nothing.
+ */
+export const MAX_REPLY_BYTES = 16 * 1024 * 1024;
+
+/**
  * Reconnect quickly once the daemon's socket is back.
  *
  * grpc-js backs a failed connection off 1.6× per attempt up to two minutes, a
@@ -63,6 +73,7 @@ export function localAddress(
 const SOCKET_CHANNEL_OPTIONS = {
   "grpc.initial_reconnect_backoff_ms": 250,
   "grpc.max_reconnect_backoff_ms": 2_000,
+  "grpc.max_receive_message_length": MAX_REPLY_BYTES,
 };
 
 export function createNodeTransport(options: NodeTransportOptions = {}): BorgTransport & {
