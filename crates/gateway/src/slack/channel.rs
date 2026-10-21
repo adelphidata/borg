@@ -85,100 +85,114 @@ impl NativeChannel for SlackChannel {
             return Ok(WebhookOutcome::Skip);
         }
 
-        // Ack reaction — immediate visual feedback
-        if let (Some(ref ch), Some(ref ts)) = (&inbound.channel_id, &inbound.message_id) {
-            self.client.add_reaction(ch, ts, "eyes").await;
+        // A sender the queued turn will challenge or deny gets none of the
+        // pre-turn work: no reaction, no file download, no paid STT, no
+        // history read. The plain text still goes through so the challenge
+        // itself is delivered. Placeholder URLs are dropped with the
+        // enrichment — nothing downstream can use them.
+        let may_enrich = crate::handler::sender_may_enrich(&self.config, "slack", &inbound).await;
+        if !may_enrich {
+            inbound.attachments.clear();
         }
-
-        // Download file attachments (placeholder URLs → base64 data).
-        // Voice/audio files take a side-path through the STT pipeline so
-        // the agent sees `[Voice transcript]: …` in the message text
-        // (parity with Telegram + Twilio inbound voice).
-        let transcriber = cortex::media::understanding::AudioTranscriber::from_config(&self.config);
-        let mut resolved_attachments = Vec::new();
-        let mut voice_transcripts: Vec<String> = Vec::new();
-        let mut failed_kinds: Vec<&'static str> = Vec::new();
-        for att in &inbound.attachments {
-            if att.data.starts_with("https://") {
-                match self.client.download_file(&att.data).await {
-                    Ok((bytes, content_type)) => {
-                        if content_type.starts_with("audio/") {
-                            if let Some(ref t) = transcriber {
-                                let filename = att
-                                    .filename
-                                    .clone()
-                                    .unwrap_or_else(|| "slack-voice.audio".to_string());
-                                voice_transcripts.extend(
-                                    voice::transcribe_or_warn(
-                                        t,
-                                        &bytes,
-                                        &content_type,
-                                        &filename,
-                                        "slack",
-                                    )
-                                    .await,
-                                );
-                            }
-                        }
-                        use base64::Engine;
-                        resolved_attachments.push(crate::handler::InboundAttachment {
-                            mime_type: content_type,
-                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                            filename: att.filename.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to download Slack file {}: {e}",
-                            att.filename.as_deref().unwrap_or("unknown")
-                        );
-                        failed_kinds.push(crate::message_processing::media_failure::kind_for_mime(
-                            &att.mime_type,
-                        ));
-                    }
-                }
-            } else {
-                resolved_attachments.push(att.clone());
+        if may_enrich {
+            // Ack reaction — immediate visual feedback
+            if let (Some(ref ch), Some(ref ts)) = (&inbound.channel_id, &inbound.message_id) {
+                self.client.add_reaction(ch, ts, "eyes").await;
             }
-        }
-        inbound.attachments = resolved_attachments;
-        // Surface failed downloads to the agent instead of silently dropping
-        // the attachment from the message.
-        for kind in failed_kinds {
-            crate::message_processing::media_failure::append_download_failure(
-                &mut inbound.text,
-                kind,
-            );
-        }
-        voice::append_voice_transcripts(&mut inbound.text, &voice_transcripts);
 
-        // Only inject channel history for top-level @mentions: a threaded reply
-        // already carries its own conversation context, so re-injecting full
-        // channel history would duplicate it and bloat the prompt.
-        if inbound.text.contains("<@") && inbound.thread_ts.is_none() {
-            if let Some(ref channel) = inbound.channel_id {
-                match self.client.conversations_history(channel, 10).await {
-                    Ok(history) if !history.is_empty() => {
-                        // Cap injected history so it never dominates the agent's token budget.
-                        const MAX_CONTEXT_CHARS: usize = 8000;
-                        let mut context = String::new();
-                        for m in history.iter().rev() {
-                            let line = format!("<@{}>: {}\n", m.user, m.text);
-                            if context.len() + line.len() > MAX_CONTEXT_CHARS {
-                                break;
+            // Download file attachments (placeholder URLs → base64 data).
+            // Voice/audio files take a side-path through the STT pipeline so
+            // the agent sees `[Voice transcript]: …` in the message text
+            // (parity with Telegram + Twilio inbound voice).
+            let transcriber =
+                cortex::media::understanding::AudioTranscriber::from_config(&self.config);
+            let mut resolved_attachments = Vec::new();
+            let mut voice_transcripts: Vec<String> = Vec::new();
+            let mut failed_kinds: Vec<&'static str> = Vec::new();
+            for att in &inbound.attachments {
+                if att.data.starts_with("https://") {
+                    match self.client.download_file(&att.data).await {
+                        Ok((bytes, content_type)) => {
+                            if content_type.starts_with("audio/") {
+                                if let Some(ref t) = transcriber {
+                                    let filename = att
+                                        .filename
+                                        .clone()
+                                        .unwrap_or_else(|| "slack-voice.audio".to_string());
+                                    voice_transcripts.extend(
+                                        voice::transcribe_or_warn(
+                                            t,
+                                            &bytes,
+                                            &content_type,
+                                            &filename,
+                                            "slack",
+                                        )
+                                        .await,
+                                    );
+                                }
                             }
-                            context.push_str(&line);
+                            use base64::Engine;
+                            resolved_attachments.push(crate::handler::InboundAttachment {
+                                mime_type: content_type,
+                                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                                filename: att.filename.clone(),
+                            });
                         }
-                        if !context.is_empty() {
-                            inbound.text = format!(
-                                "[Channel context]\n{context}[Current message]\n{}",
-                                inbound.text
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to download Slack file {}: {e}",
+                                att.filename.as_deref().unwrap_or("unknown")
+                            );
+                            failed_kinds.push(
+                                crate::message_processing::media_failure::kind_for_mime(
+                                    &att.mime_type,
+                                ),
                             );
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch channel history for context: {e}");
+                } else {
+                    resolved_attachments.push(att.clone());
+                }
+            }
+            inbound.attachments = resolved_attachments;
+            // Surface failed downloads to the agent instead of silently dropping
+            // the attachment from the message.
+            for kind in failed_kinds {
+                crate::message_processing::media_failure::append_download_failure(
+                    &mut inbound.text,
+                    kind,
+                );
+            }
+            voice::append_voice_transcripts(&mut inbound.text, &voice_transcripts);
+
+            // Only inject channel history for top-level @mentions: a threaded reply
+            // already carries its own conversation context, so re-injecting full
+            // channel history would duplicate it and bloat the prompt.
+            if inbound.text.contains("<@") && inbound.thread_ts.is_none() {
+                if let Some(ref channel) = inbound.channel_id {
+                    match self.client.conversations_history(channel, 10).await {
+                        Ok(history) if !history.is_empty() => {
+                            // Cap injected history so it never dominates the agent's token budget.
+                            const MAX_CONTEXT_CHARS: usize = 8000;
+                            let mut context = String::new();
+                            for m in history.iter().rev() {
+                                let line = format!("<@{}>: {}\n", m.user, m.text);
+                                if context.len() + line.len() > MAX_CONTEXT_CHARS {
+                                    break;
+                                }
+                                context.push_str(&line);
+                            }
+                            if !context.is_empty() {
+                                inbound.text = format!(
+                                    "[Channel context]\n{context}[Current message]\n{}",
+                                    inbound.text
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch channel history for context: {e}");
+                        }
                     }
                 }
             }
@@ -330,8 +344,17 @@ mod tests {
             signing_secret: Some(SECRET.to_string()),
             dedup: Arc::new(Mutex::new(EventDeduplicator::new())),
             bot_user_id: bot_user_id.map(str::to_string),
-            config: cortex::config::Config::default(),
+            config: open_policy_config(),
         }
+    }
+
+    /// Enrichment (reactions, downloads, history) only runs for an admitted
+    /// sender; these tests exercise the enrichment itself, so they open the
+    /// channel to every sender.
+    fn open_policy_config() -> cortex::config::Config {
+        let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        config
     }
 
     fn response_ctx(

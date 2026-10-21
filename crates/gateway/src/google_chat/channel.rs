@@ -49,8 +49,13 @@ impl NativeChannel for GoogleChatChannel {
         // Inbound voice transcription. The parse step embeds the
         // attachment's `resourceName` in `data`; download via the
         // `media.download` endpoint (Bearer auth) and run STT.
+        // A sender the queued turn will challenge or deny gets no download
+        // and no paid STT; the plain text still carries the challenge.
+        let may_enrich =
+            crate::handler::sender_may_enrich(&self.config, self.names()[0], &inbound).await;
         if let Some(transcriber) =
             cortex::media::understanding::AudioTranscriber::from_config(&self.config)
+                .filter(|_| may_enrich)
         {
             let mut transcripts: Vec<String> = Vec::new();
             let mut failed_kinds: Vec<&'static str> = Vec::new();
@@ -244,6 +249,7 @@ mod tests {
         // Key comes from a test-unique env var so no real credentials leak in.
         unsafe { std::env::set_var("BORG_TEST_GCHAT_STT_KEY", "test-key") };
         let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
             provider: "openai".to_string(),

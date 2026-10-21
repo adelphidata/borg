@@ -39,6 +39,18 @@ pub async fn enrich_parsed_message(
     config: &cortex::config::Config,
     parsed: &mut TelegramParsed,
 ) {
+    // A sender the queued turn will challenge or deny gets no download and
+    // no paid STT; the plain text still carries the challenge.
+    if (parsed.photo.is_some() || parsed.audio.is_some())
+        && !crate::handler::sender_may_enrich(config, "telegram", &parsed.inbound).await
+    {
+        tracing::info!(
+            sender = %parsed.inbound.sender_id,
+            "telegram: sender not approved; skipping media enrichment"
+        );
+        return;
+    }
+
     if let Some(ref photo) = parsed.photo {
         match async {
             let file_info = client.get_file(&photo.file_id).await?;
@@ -332,7 +344,8 @@ mod tests {
     async fn enrich_appends_failure_note_when_photo_download_fails() {
         // Port 9 (discard) on loopback: nothing listens, connect is refused.
         let client = api::TelegramClient::with_base("testtok", "http://127.0.0.1:9").unwrap();
-        let config = cortex::config::Config::default();
+        let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         let mut parsed = parse_body(
             r#"{
                 "update_id": 31,
@@ -400,6 +413,7 @@ mod tests {
 
         let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
         let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.echo_transcript = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
@@ -475,6 +489,7 @@ mod tests {
 
         let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
         let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
             provider: "custom".to_string(),
@@ -517,6 +532,7 @@ mod tests {
     async fn enrich_appends_download_failure_note_when_voice_fetch_fails() {
         let client = api::TelegramClient::with_base("testtok", "http://127.0.0.1:9").unwrap();
         let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
             provider: "custom".to_string(),
@@ -558,5 +574,79 @@ mod tests {
 
         let result = handle_telegram_webhook(&headers, "not json", None, &dedup).await;
         assert!(result.is_err());
+    }
+
+    /// Under the default pairing policy an unpaired sender's voice note is
+    /// neither fetched from Telegram nor sent to the transcriber: the
+    /// Bot API sees no `getFile`, the STT command leaves no trace, and the
+    /// text is untouched so the pairing challenge still goes out.
+    #[tokio::test]
+    async fn enrich_skips_download_and_stt_for_an_unpaired_sender() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A fresh data dir: nobody is approved yet.
+        let _guard = crate::test_env::borg_home_guard();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", home.path());
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottesttok/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_id": "vf1", "file_unique_id": "u2", "file_path": "voice/a.oga" }
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let marker = home.path().join("stt-ran");
+        let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
+        let mut config = cortex::config::Config::default();
+        assert_eq!(config.gateway.dm_policy, cortex::pairing::DmPolicy::Pairing);
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some(format!(
+                "touch '{}'; cat '{{audio_file}}'",
+                marker.display()
+            )),
+        }];
+
+        let mut parsed = parse_body(
+            r#"{
+                "update_id": 40,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 4040, "first_name": "Mallory", "is_bot": false },
+                    "chat": { "id": 4040, "type": "private" },
+                    "date": 1700000000,
+                    "voice": { "file_id": "vf1", "file_unique_id": "u2", "duration": 3 }
+                }
+            }"#,
+        )
+        .await;
+        let before = parsed.inbound.text.clone();
+
+        enrich_parsed_message(&client, &config, &mut parsed).await;
+        std::env::remove_var("BORG_HOME");
+
+        assert_eq!(
+            parsed.inbound.text, before,
+            "the text must pass through untouched"
+        );
+        assert!(!marker.exists(), "the STT command must not run");
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the Bot API must see no file request"
+        );
     }
 }

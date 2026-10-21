@@ -84,9 +84,12 @@ impl NativeChannel for TeamsChannel {
         };
 
         // Inbound voice transcription. Teams voice attachments come as
-        // `audio/*` content types on SharePoint URLs that require the
-        // Bot Framework OAuth token to fetch.
-        if let Some(ref atts) = activity.attachments {
+        // `audio/*` content types on Bot Framework URLs that require the
+        // OAuth token to fetch. A sender the queued turn will challenge or
+        // deny gets no download and no paid STT; the plain text still
+        // carries the challenge.
+        let may_enrich = crate::handler::sender_may_enrich(&self.config, "teams", &inbound).await;
+        if let Some(atts) = activity.attachments.as_ref().filter(|_| may_enrich) {
             if let Some(transcriber) =
                 cortex::media::understanding::AudioTranscriber::from_config(&self.config)
             {
@@ -330,6 +333,7 @@ mod tests {
         // Key comes from a test-unique env var so no real credentials leak in.
         unsafe { std::env::set_var("BORG_TEST_TEAMS_STT_KEY", "test-key") };
         let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.models = vec![cortex::config::AudioModelConfig {
             provider: "openai".to_string(),
@@ -413,6 +417,59 @@ mod tests {
             .collect();
         assert_eq!(fetches.len(), 1, "exactly the audio attachment is fetched");
         assert_eq!(fetches[0].url.path(), "/files/voice.ogg");
+    }
+
+    /// A sender the policy denies gets no attachment fetch and no STT, yet
+    /// the activity still becomes a message so the denial is delivered.
+    #[tokio::test]
+    async fn handle_webhook_skips_attachment_fetch_for_a_denied_sender() {
+        let server = MockServer::start().await;
+        mount_token(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 64]))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut config = stt_config();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        let channel = stub_channel(&server, config);
+
+        let body = serde_json::json!({
+            "id": "act-10",
+            "type": "message",
+            "from": {"id": "user-9", "name": "Mallory"},
+            "conversation": {"id": "conv-1"},
+            "recipient": {"id": "bot-1", "name": "MyBot"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "text": "hello",
+            "attachments": [{
+                "contentType": "audio/ogg",
+                "contentUrl": format!("{}/files/voice.ogg", server.uri()),
+                "name": "voice.ogg"
+            }]
+        })
+        .to_string();
+        let headers = make_signed_headers(&make_secret(), &body);
+
+        let gw_config = cortex::config::Config::default();
+        let hreg = health();
+        let ctx = WebhookContext {
+            config: &gw_config,
+            health: &hreg,
+        };
+        let outcome = channel
+            .handle_webhook(&headers, &body, &ctx)
+            .await
+            .expect("webhook");
+        let WebhookOutcome::Message { inbound, .. } = outcome else {
+            panic!("the plain message must still reach the agent path for the denial");
+        };
+        assert_eq!(inbound.text, "hello");
+        let reqs = server.received_requests().await.expect("recorded");
+        assert!(
+            !reqs.iter().any(|r| r.url.path().starts_with("/files/")),
+            "no attachment may be fetched for a denied sender"
+        );
     }
 
     #[test]

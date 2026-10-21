@@ -85,8 +85,14 @@ impl NativeChannel for TwilioChannel {
         if let (Some(audio_url), Some(audio_mime)) =
             (parsed.audio_url.clone(), parsed.audio_mime.clone())
         {
+            // A sender the queued turn will challenge or deny gets no
+            // download and no paid STT; the plain text still carries the
+            // challenge.
+            let may_enrich =
+                crate::handler::sender_may_enrich(&self.config, "twilio", &parsed.message).await;
             if let Some(transcriber) =
                 cortex::media::understanding::AudioTranscriber::from_config(&self.config)
+                    .filter(|_| may_enrich)
             {
                 match self.client.download_media(&audio_url).await {
                     Ok(bytes) => {

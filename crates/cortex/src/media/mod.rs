@@ -4,6 +4,7 @@
 pub mod core;
 pub mod image_gen;
 pub mod image_header;
+pub mod inbound;
 pub mod playback;
 pub mod provider_info;
 pub(crate) mod shell_template;

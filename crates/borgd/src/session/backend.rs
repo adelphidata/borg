@@ -34,6 +34,28 @@ enum LeaseStatus {
     Unavailable,
 }
 
+/// Turn the inline images of a user turn into content parts the provider
+/// will accept. Every surface's images pass through here, so one HEIC photo
+/// or one mislabelled upload becomes a usable image or a short text note —
+/// never a persisted message that fails this turn and every later one.
+fn inbound_image_parts(
+    images: Vec<InlineImage>,
+    max_image_bytes: usize,
+) -> Vec<cortex::types::ContentPart> {
+    use cortex::media::inbound::{normalize_inbound_image, NormalizedImage};
+    use cortex::types::ContentPart;
+    images
+        .into_iter()
+        .map(|img| {
+            match normalize_inbound_image(&img.data, &img.mime_type, img.filename, max_image_bytes)
+            {
+                NormalizedImage::Image(media) => ContentPart::ImageBase64 { media },
+                NormalizedImage::Dropped(note) => ContentPart::Text(note),
+            }
+        })
+        .collect()
+}
+
 /// Acquire the agent mutex from a sync trait method that may be invoked
 /// from an async gRPC handler (i.e. from inside the tokio runtime).
 ///
@@ -562,6 +584,7 @@ impl SessionBackend for AgentBackend {
         if bridge_attached {
             agent.set_text_file_bridge(text_file_bridge);
         }
+        let max_image_bytes = agent.config().media.max_image_bytes;
         let bridge_guard = TextFileBridgeAutoDetach::new(&mut agent, bridge_attached);
 
         let result = if images.is_empty() {
@@ -570,19 +593,28 @@ impl SessionBackend for AgentBackend {
                 .send_message_with_cancel(&text, event_tx.clone(), cancel)
                 .await
         } else {
-            use base64::Engine as _;
-            use cortex::types::{ContentPart, MediaData, Message};
-            let engine = base64::engine::general_purpose::STANDARD;
+            use cortex::types::{ContentPart, Message};
+            // Sniff, convert and shrink off the runtime: a decode of several
+            // multi-megabyte photos must not stall every other session.
+            let image_parts = match tokio::task::spawn_blocking(move || {
+                inbound_image_parts(images, max_image_bytes)
+            })
+            .await
+            {
+                Ok(parts) => parts,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        error = %e,
+                        "inbound image normalization panicked; images dropped"
+                    );
+                    vec![ContentPart::Text(
+                        "[attachment dropped: image could not be processed]".to_string(),
+                    )]
+                }
+            };
             let mut parts = vec![ContentPart::Text(text)];
-            for img in images {
-                parts.push(ContentPart::ImageBase64 {
-                    media: MediaData {
-                        mime_type: img.mime_type,
-                        data: engine.encode(&img.data),
-                        filename: img.filename,
-                    },
-                });
-            }
+            parts.extend(image_parts);
             let msg = Message::user_multimodal(parts);
             bridge_guard
                 .agent
@@ -948,5 +980,48 @@ mod tests {
             !scan.contains("AgentEvent::Error(e.to_string()"),
             "backend.rs reverted to e.to_string() — lose the context chain"
         );
+    }
+
+    /// A valid 1×1 RGBA PNG.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// The turn's image parts carry the sniffed type, not the sender's
+    /// label, and an unusable image becomes a text note in place — so the
+    /// persisted user message can never carry a part the provider rejects.
+    #[test]
+    fn inbound_image_parts_use_sniffed_type_and_note_unusable_images() {
+        use cortex::types::ContentPart;
+        let parts = inbound_image_parts(
+            vec![
+                InlineImage {
+                    mime_type: "image/heic".into(),
+                    data: TINY_PNG.to_vec(),
+                    filename: Some("IMG_0001.heic".into()),
+                },
+                InlineImage {
+                    mime_type: "image/png".into(),
+                    data: b"definitely not an image".to_vec(),
+                    filename: None,
+                },
+            ],
+            1 << 20,
+        );
+        assert_eq!(parts.len(), 2, "one part per inbound image, in order");
+        match &parts[0] {
+            ContentPart::ImageBase64 { media } => assert_eq!(media.mime_type, "image/png"),
+            other => panic!("expected an image part, got {other:?}"),
+        }
+        match &parts[1] {
+            ContentPart::Text(note) => {
+                assert_eq!(note, "[attachment dropped: unsupported image image/png]")
+            }
+            other => panic!("expected a text note, got {other:?}"),
+        }
     }
 }

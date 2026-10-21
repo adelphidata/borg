@@ -286,6 +286,16 @@ pub async fn dispatch_webhook(
             let config = ctx.config.clone();
             let health = ctx.health.clone();
 
+            // `/stop` must not queue behind the turn it is meant to stop: the
+            // per-session queue runs items serially, so a queued cancel would
+            // only run once that turn had already ended. Cancel it now, from
+            // outside the queue, after the same activation and access gates
+            // the queued path applies.
+            if crate::commands::is_cancel_command(&inbound.text) {
+                spawn_fast_cancel(channel, inbound, response_context, config, health);
+                return ok_response();
+            }
+
             // /btw side questions short-circuit the main agent path entirely:
             // they run a tool-less ephemeral turn against the existing
             // transcript and deliver the answer as a threaded reply, with no
@@ -533,6 +543,51 @@ pub async fn dispatch_webhook(
             ok_response()
         }
     }
+}
+
+/// Run the out-of-queue cancel path for one inbound `/stop` and deliver its
+/// reply. Spawned so the webhook returns at once; every failure is logged.
+fn spawn_fast_cancel(
+    channel: Arc<dyn NativeChannel>,
+    inbound: InboundMessage,
+    response_context: serde_json::Value,
+    config: Config,
+    health: Arc<RwLock<ChannelHealthRegistry>>,
+) {
+    tokio::spawn(async move {
+        let channel_name = channel.names()[0].to_string();
+        let bot_mention = channel.bot_mention();
+        let reply = match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+            Ok(db) => {
+                handler::cancel_in_flight_turn(
+                    &db,
+                    crate::session_executor::global(),
+                    &config,
+                    &channel_name,
+                    &inbound,
+                    bot_mention.as_deref(),
+                )
+                .await
+            }
+            Err(e) => Err(e.context("open database for cancel command")),
+        };
+        let reply = match reply {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(channel = %channel_name, error = %format!("{e:#}"), "cancel command failed");
+                crate::handler::format_gateway_error(&e)
+            }
+        };
+        if reply.trim().is_empty() {
+            return;
+        }
+        if let Err(e) = channel
+            .send_response(&reply, &response_context, &health)
+            .await
+        {
+            tracing::warn!(channel = %channel_name, error = %e, "failed to deliver cancel reply");
+        }
+    });
 }
 
 fn ok_response() -> WebhookResponse {
@@ -909,6 +964,74 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.0["ok"], true);
+    }
+
+    /// A `/stop` that arrives while the session's queue is busy with a long
+    /// turn is answered at once, from outside the queue. Queued, it would
+    /// only run after that turn — the one it was meant to stop — finished.
+    #[tokio::test]
+    async fn dispatch_cancel_replies_while_the_session_queue_is_busy() {
+        let _guard = crate::test_env::borg_home_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_HOME", tmp.path());
+
+        let send_count = Arc::new(AtomicU32::new(0));
+        let channel: Arc<dyn NativeChannel> = Arc::new(MockChannel {
+            name: "mock".to_string(),
+            call_count: Arc::new(AtomicU32::new(0)),
+            send_count: send_count.clone(),
+            should_skip: false,
+        });
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        let queue = SessionQueue::new(10);
+
+        // The session's consumer is held by a turn that will not end on its
+        // own within the test.
+        let turn_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_done_c = turn_done.clone();
+        assert!(
+            queue
+                .enqueue(
+                    "mock:user1:".to_string(),
+                    Box::pin(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        turn_done_c.store(true, Ordering::SeqCst);
+                    }),
+                )
+                .await
+        );
+
+        let (status, _) = dispatch_webhook(
+            &channel,
+            &HeaderMap::new(),
+            "/stop",
+            &ctx,
+            &queue,
+            crate::constants::GATEWAY_HTTP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while send_count.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::env::remove_var("BORG_HOME");
+        assert_eq!(
+            send_count.load(Ordering::SeqCst),
+            1,
+            "the cancel acknowledgement must be delivered without waiting for the turn"
+        );
+        assert!(
+            !turn_done.load(Ordering::SeqCst),
+            "the slow turn must still be running when the cancel reply goes out"
+        );
     }
 
     #[tokio::test]

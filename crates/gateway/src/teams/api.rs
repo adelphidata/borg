@@ -17,6 +17,48 @@ const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
 /// Known valid Microsoft service URL host suffixes for SSRF protection.
 const ALLOWED_HOST_SUFFIXES: &[&str] = &[".botframework.com", ".teams.microsoft.com", ".skype.com"];
 
+/// Exact Microsoft hosts that carry no allowed suffix. `smba.trafficmanager.net`
+/// is the `serviceUrl` host every Teams activity arrives with; the suffix
+/// `.trafficmanager.net` itself is far too broad (any Azure Traffic Manager
+/// profile), so only this one host is pinned.
+const ALLOWED_HOSTS: &[&str] = &["smba.trafficmanager.net"];
+
+/// True when `host` is a Microsoft Bot Framework host: an exact entry in
+/// [`ALLOWED_HOSTS`] or under one of [`ALLOWED_HOST_SUFFIXES`].
+fn is_microsoft_host(host: &str) -> bool {
+    ALLOWED_HOSTS.contains(&host)
+        || ALLOWED_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+}
+
+/// Most redirects one attachment download follows.
+const MAX_ATTACHMENT_REDIRECTS: usize = 3;
+
+/// Token-scope guard for attachment downloads: true when the Bot Framework
+/// bearer token may go to `url`.
+///
+/// Production (`test_base` is `None`): `https` on the default port and a
+/// Microsoft host — an exact entry in [`ALLOWED_HOSTS`] or a host under one
+/// of [`ALLOWED_HOST_SUFFIXES`] (see [`is_microsoft_host`]). The suffixes
+/// carry a leading dot, so `evil-botframework.com` and
+/// `botframework.com.evil.example` both fail. Under a test base: only that
+/// base's scheme, host and port.
+fn is_allowed_attachment_url(url: &reqwest::Url, test_base: Option<&reqwest::Url>) -> bool {
+    match test_base {
+        None => {
+            url.scheme() == "https"
+                && url.port_or_known_default() == Some(443)
+                && url.host_str().is_some_and(is_microsoft_host)
+        }
+        Some(base) => {
+            url.scheme() == base.scheme()
+                && url.host_str() == base.host_str()
+                && url.port_or_known_default() == base.port_or_known_default()
+        }
+    }
+}
+
 /// Cached OAuth2 token with expiry tracking.
 struct CachedToken {
     access_token: String,
@@ -26,6 +68,9 @@ struct CachedToken {
 /// A client for the Microsoft Bot Framework / Teams API.
 pub struct TeamsClient {
     client: Client,
+    /// Client for attachment downloads. It follows no redirect by itself, so
+    /// `download_attachment` can check each hop before the token goes there.
+    download_client: Client,
     app_id: String,
     app_secret: String,
     /// OAuth2 token endpoint. Production uses `TOKEN_ENDPOINT`; tests point
@@ -35,6 +80,10 @@ pub struct TeamsClient {
     /// Microsoft-host SSRF allowlist. Test-only stub clients relax this so
     /// they can target a loopback server.
     enforce_service_allowlist: bool,
+    /// `None` in production (attachment downloads pinned to
+    /// [`ALLOWED_HOST_SUFFIXES`]). A test stub pins downloads to the origin of
+    /// its loopback token endpoint instead.
+    attachment_test_base: Option<reqwest::Url>,
     token_cache: RwLock<Option<CachedToken>>,
 }
 
@@ -60,16 +109,28 @@ impl TeamsClient {
         token_endpoint: &str,
         enforce_service_allowlist: bool,
     ) -> Result<Self> {
+        let attachment_test_base = if enforce_service_allowlist {
+            None
+        } else {
+            Some(reqwest::Url::parse(token_endpoint).context("Invalid Teams token endpoint")?)
+        };
+        let download_client = Client::builder()
+            .timeout(GATEWAY_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("Failed to build Teams attachment download HTTP client")?;
         Ok(Self {
             client: crate::resilience::http_retry::build_channel_client(
                 "Teams",
                 GATEWAY_HTTP_TIMEOUT,
                 None,
             )?,
+            download_client,
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             token_endpoint: token_endpoint.to_string(),
             enforce_service_allowlist,
+            attachment_test_base,
             token_cache: RwLock::new(None),
         })
     }
@@ -150,19 +211,51 @@ impl TeamsClient {
         Ok(access_token)
     }
 
-    /// Download an attachment from a Bot Framework / SharePoint content
-    /// URL. Voice messages on Teams arrive as audio attachments; this
-    /// method fetches the bytes for downstream STT. Uses the cached
-    /// OAuth2 access token for authentication.
+    /// Download an attachment from a Bot Framework content URL. Voice
+    /// messages on Teams arrive as audio attachments; this method fetches
+    /// the bytes for downstream STT. Uses the cached OAuth2 access token
+    /// for authentication.
+    ///
+    /// The content URL is attacker-chosen JSON, so the token only goes to a
+    /// Microsoft host over HTTPS. Redirects are followed by hand: each hop is
+    /// checked against the same pin before the token goes there, and the
+    /// chain is capped. A foreign host gets no request at all.
     pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>> {
+        let mut current = reqwest::Url::parse(url).context("Invalid Teams attachment URL")?;
+        let mut redirects = 0usize;
+        let test_base = self.attachment_test_base.as_ref();
+        if !is_allowed_attachment_url(&current, test_base) {
+            bail!("Refusing to download Teams attachment from non-Microsoft host");
+        }
         let token = self.get_token().await?;
-        let resp = self
-            .client
-            .get(url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-            .context("teams: download attachment")?;
+        let resp = loop {
+            if !is_allowed_attachment_url(&current, test_base) {
+                bail!("Refusing to follow Teams attachment redirect to non-Microsoft host");
+            }
+            let resp = self
+                .download_client
+                .get(current.clone())
+                .bearer_auth(&token)
+                .send()
+                .await
+                .context("teams: download attachment")?;
+            if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                break resp;
+            }
+            redirects += 1;
+            if redirects > MAX_ATTACHMENT_REDIRECTS {
+                bail!("Too many Teams attachment redirects");
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("Teams attachment redirect has no Location header")?
+                .to_str()
+                .context("Teams attachment redirect Location is not valid text")?;
+            current = current
+                .join(location)
+                .context("Teams attachment redirect Location is not a valid URL")?;
+        };
         if !resp.status().is_success() {
             anyhow::bail!("teams attachment download returned HTTP {}", resp.status());
         }
@@ -413,11 +506,7 @@ fn validate_service_url(url: &str) -> Result<()> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("Service URL has no host: {url}"))?;
 
-    let is_allowed = ALLOWED_HOST_SUFFIXES
-        .iter()
-        .any(|suffix| host.ends_with(suffix));
-
-    if !is_allowed {
+    if !is_microsoft_host(host) {
         bail!("Service URL host not allowed: {host}");
     }
 
@@ -487,6 +576,21 @@ mod tests {
         assert!(validate_service_url("https://smba.skype.com/teams/").is_ok());
     }
 
+    /// Real Teams activities carry `https://smba.trafficmanager.net/<region>/`
+    /// as their `serviceUrl`; it has no allowed suffix, so it is pinned as an
+    /// exact host. Sibling Traffic Manager profiles stay refused.
+    #[test]
+    fn validate_service_url_accepts_the_exact_teams_traffic_manager_host_only() {
+        assert!(validate_service_url("https://smba.trafficmanager.net/amer/").is_ok());
+        for host in [
+            "evil.trafficmanager.net",
+            "smba.trafficmanager.net.evil.example",
+        ] {
+            let result = validate_service_url(&format!("https://{host}/amer/"));
+            assert!(result.is_err(), "{host} must be refused");
+        }
+    }
+
     #[test]
     fn validate_service_url_rejects_http() {
         let result = validate_service_url("http://smba.trafficmanager.net.botframework.com/");
@@ -505,6 +609,30 @@ mod tests {
     fn validate_service_url_rejects_invalid_url() {
         let result = validate_service_url("not-a-url");
         assert!(result.is_err());
+    }
+
+    /// The bearer token may only travel to a Microsoft host over HTTPS on
+    /// the default port. Look-alike hosts, plain HTTP and odd ports all fail
+    /// the production pin.
+    #[test]
+    fn attachment_url_pin_accepts_only_https_microsoft_hosts() {
+        let cases: &[(&str, bool)] = &[
+            ("https://smba.skype.com/v1/objects/abc/views/audio", true),
+            ("https://us-api.asm.skype.com/v1/objects/abc", true),
+            ("https://api.botframework.com/v3/attachments/abc", true),
+            ("https://api.teams.microsoft.com/files/abc", true),
+            ("http://smba.skype.com/v1/objects/abc", false),
+            ("https://smba.skype.com:8443/v1/objects/abc", false),
+            ("https://evil.example.com/voice.ogg", false),
+            ("https://skype.com.evil.example/voice.ogg", false),
+            ("https://evil-botframework.com/voice.ogg", false),
+            ("https://contoso.sharepoint.com/voice.ogg", false),
+            ("https://127.0.0.1/voice.ogg", false),
+        ];
+        for (url, allowed) in cases {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert_eq!(is_allowed_attachment_url(&parsed, None), *allowed, "{url}");
+        }
     }
 
     #[test]
@@ -750,6 +878,93 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(bytes, vec![7u8, 0, 9, 250]);
+        }
+
+        /// A content URL on a host outside the pin gets no request at all —
+        /// not even an unauthenticated one — and the download fails.
+        #[tokio::test]
+        async fn download_attachment_refuses_foreign_host_without_sending_token() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            let foreign = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8]))
+                .expect(0)
+                .mount(&foreign)
+                .await;
+
+            let err = client_for(&server)
+                .download_attachment(&format!("{}/files/voice.ogg", foreign.uri()))
+                .await
+                .expect_err("foreign host must be refused");
+            assert!(
+                err.to_string().contains("non-Microsoft host"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                foreign.received_requests().await.unwrap().is_empty(),
+                "the foreign host must receive no request"
+            );
+        }
+
+        /// A redirect from the pinned host to a foreign one is not followed:
+        /// the token never reaches the redirect target.
+        #[tokio::test]
+        async fn download_attachment_refuses_redirect_to_foreign_host() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            let foreign = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8]))
+                .expect(0)
+                .mount(&foreign)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/files/voice.ogg"))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("{}/steal", foreign.uri())),
+                )
+                .mount(&server)
+                .await;
+
+            let err = client_for(&server)
+                .download_attachment(&format!("{}/files/voice.ogg", server.uri()))
+                .await
+                .expect_err("foreign redirect must fail");
+            assert!(
+                err.to_string().contains("redirect to non-Microsoft host"),
+                "unexpected error: {err}"
+            );
+            assert!(foreign.received_requests().await.unwrap().is_empty());
+        }
+
+        /// A redirect that stays on the pinned host is followed with the
+        /// token still attached.
+        #[tokio::test]
+        async fn download_attachment_follows_same_host_redirect_with_token() {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/files/voice.ogg"))
+                .respond_with(
+                    ResponseTemplate::new(302).insert_header("location", "/cdn/voice.ogg"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/cdn/voice.ogg"))
+                .and(header("authorization", BEARER))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![4u8, 2]))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let bytes = client_for(&server)
+                .download_attachment(&format!("{}/files/voice.ogg", server.uri()))
+                .await
+                .unwrap();
+            assert_eq!(bytes, vec![4u8, 2]);
         }
 
         #[tokio::test]

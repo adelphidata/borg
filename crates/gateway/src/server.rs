@@ -581,7 +581,11 @@ impl GatewayServer {
         let poll_tts = inits.tts_synth.clone();
         let poll_request_timeout = Duration::from_millis(self.config.gateway.request_timeout_ms);
 
-        let callback: crate::telegram::polling::PollCallback = Arc::new(move |parsed, chat_id| {
+        // The polling loop only enqueues (see `queued_poll_callback`); this
+        // handler runs per chat, in order, off the loop — so one long turn
+        // stalls neither `getUpdates` nor any other chat, and a client-split
+        // paste reaches the agent merged.
+        let handler: crate::telegram::chat_queue::MessageHandler = Arc::new(move |queued| {
             let poll_tts = poll_tts.clone();
             let config = poll_config.clone();
             let health = poll_health.clone();
@@ -589,16 +593,11 @@ impl GatewayServer {
             let bot_mention = poll_bot_username.as_deref().map(|u| format!("@{u}"));
             let request_timeout = poll_request_timeout;
             Box::pin(async move {
-                let mut parsed = parsed;
+                let (mut parsed, chat_id, thread_id, reply_to) = queued.into_parsed();
                 crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
                 let inbound = parsed.inbound;
 
                 let typing = crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id);
-
-                let thread_id: Option<i64> =
-                    inbound.thread_id.as_deref().and_then(|id| id.parse().ok());
-                let reply_to: Option<i64> =
-                    inbound.message_id.as_deref().and_then(|id| id.parse().ok());
 
                 let agent_result = tokio::time::timeout(
                     request_timeout,
@@ -688,6 +687,9 @@ impl GatewayServer {
                 }
             })
         });
+        let callback = crate::telegram::chat_queue::queued_poll_callback(Arc::new(
+            crate::telegram::chat_queue::ChatQueue::new(handler),
+        ));
 
         let polling_client = tg_client.clone();
         crate::supervised_loop::spawn_supervised_loop(

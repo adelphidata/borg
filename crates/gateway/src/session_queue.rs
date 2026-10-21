@@ -42,14 +42,25 @@ pub type WorkFn = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct SessionQueue {
     senders: Arc<Mutex<HashMap<String, mpsc::Sender<WorkFn>>>>,
     semaphore: Arc<Semaphore>,
+    /// Most live consumers one sender may hold at once.
+    max_sessions_per_sender: usize,
 }
 
 impl SessionQueue {
     /// Build a queue capped at `max_concurrent` simultaneously-executing agent turns.
     pub fn new(max_concurrent: usize) -> Self {
+        Self::with_sender_limit(max_concurrent, MAX_SESSIONS_PER_SENDER)
+    }
+
+    /// [`SessionQueue::new`] with a custom per-sender consumer cap. The
+    /// webhook default assumes a few threads per sender; a transport whose
+    /// key is per sender *per group* (Signal) needs room for every group the
+    /// sender is in, or a chatty member of many groups is silently dropped.
+    pub fn with_sender_limit(max_concurrent: usize, max_sessions_per_sender: usize) -> Self {
         Self {
             senders: Arc::new(Mutex::new(HashMap::new())),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_sessions_per_sender: max_sessions_per_sender.max(1),
         }
     }
 
@@ -122,9 +133,10 @@ impl SessionQueue {
                 .keys()
                 .filter(|k| sender_segment(k) == Some(sender_id))
                 .count();
-            if sender_count >= MAX_SESSIONS_PER_SENDER {
+            if sender_count >= self.max_sessions_per_sender {
                 warn!(
-                    "Sender '{sender_id}' at session limit ({MAX_SESSIONS_PER_SENDER}), dropping work for '{session_key}'"
+                    "Sender '{sender_id}' at session limit ({}), dropping work for '{session_key}'",
+                    self.max_sessions_per_sender
                 );
                 return false;
             }
@@ -320,6 +332,41 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let final_order = observed.lock().await.clone();
         assert_eq!(final_order, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// A queue built with a larger per-sender cap keeps accepting one
+    /// sender's keys past the webhook default, and still stops at its own
+    /// cap — Signal keys per sender per group and must not go silent on a
+    /// member of many groups.
+    #[tokio::test]
+    async fn with_sender_limit_raises_the_per_sender_cap() {
+        let cap = MAX_SESSIONS_PER_SENDER + 5;
+        let queue = SessionQueue::with_sender_limit(10, cap);
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        for i in 0..cap {
+            let g = gate.clone();
+            let accepted = queue
+                .enqueue(
+                    format!("signal:alice:{i}"),
+                    Box::pin(async move {
+                        g.notified().await;
+                    }),
+                )
+                .await;
+            assert!(
+                accepted,
+                "conversation #{i} for alice must be accepted under a cap of {cap}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let past_cap = queue
+            .enqueue(format!("signal:alice:{cap}"), Box::pin(async {}))
+            .await;
+        assert!(!past_cap, "the raised cap is still a cap");
+
+        gate.notify_waiters();
     }
 
     #[tokio::test]

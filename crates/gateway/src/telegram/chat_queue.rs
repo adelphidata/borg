@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+use super::parse::{TelegramAudioRef, TelegramInputKind, TelegramParsed, TelegramPhotoRef};
+
 const IDLE_TIMEOUT: Duration = Duration::from_secs(cortex::constants::SESSION_IDLE_TIMEOUT_SECS);
 const QUEUE_CAPACITY: usize = cortex::constants::SESSION_QUEUE_CAPACITY;
 const MAX_ACTIVE_CHATS: usize = cortex::constants::MAX_ACTIVE_SESSIONS;
@@ -66,10 +68,83 @@ pub struct QueuedMessage {
     pub chat_id: i64,
     /// Parsed inbound message payload.
     pub inbound: crate::handler::InboundMessage,
+    /// Audio/voice reference still to be downloaded and transcribed. Media
+    /// enrichment runs inside the queue, off the polling loop, so the
+    /// reference travels with the message.
+    pub audio: Option<TelegramAudioRef>,
+    /// Photo reference still to be downloaded into an image attachment.
+    pub photo: Option<TelegramPhotoRef>,
+    /// What kind of input the update carried (drives voice replies).
+    pub input_kind: TelegramInputKind,
     /// Optional thread/topic ID for forum-style chats.
     pub thread_id: Option<i64>,
     /// Optional message ID for reply threading.
     pub message_id: Option<i64>,
+}
+
+impl QueuedMessage {
+    /// Build the queue entry for one parsed update on `chat_id`.
+    pub fn from_parsed(parsed: TelegramParsed, chat_id: i64) -> Self {
+        let thread_id = parsed
+            .inbound
+            .thread_id
+            .as_deref()
+            .and_then(|id| id.parse().ok());
+        let message_id = parsed
+            .inbound
+            .message_id
+            .as_deref()
+            .and_then(|id| id.parse().ok());
+        Self {
+            chat_id,
+            inbound: parsed.inbound,
+            audio: parsed.audio,
+            photo: parsed.photo,
+            input_kind: parsed.input_kind,
+            thread_id,
+            message_id,
+        }
+    }
+
+    /// Reassemble the parsed update so the media enrichment step can run
+    /// on it inside the queue.
+    pub fn into_parsed(self) -> (TelegramParsed, i64, Option<i64>, Option<i64>) {
+        (
+            TelegramParsed {
+                inbound: self.inbound,
+                audio: self.audio,
+                photo: self.photo,
+                input_kind: self.input_kind,
+            },
+            self.chat_id,
+            self.thread_id,
+            self.message_id,
+        )
+    }
+}
+
+/// A [`PollCallback`](super::polling::PollCallback) that only enqueues: the
+/// polling loop returns to `getUpdates` at once and the queue's per-chat
+/// consumer runs enrichment, the agent turn and delivery in order. One slow
+/// chat no longer stalls every other chat, and a client-split paste is
+/// merged before the handler sees it.
+pub fn queued_poll_callback(queue: Arc<ChatQueue>) -> super::polling::PollCallback {
+    Arc::new(move |parsed, chat_id| {
+        let queue = queue.clone();
+        Box::pin(async move {
+            // `/stop` must not wait behind the turn it is meant to stop: it
+            // runs beside the chat's queue, where the handler's cancel path
+            // reaches the running turn at once.
+            if crate::commands::is_cancel_command(&parsed.inbound.text) {
+                let handler = queue.handler.clone();
+                tokio::spawn(handler(QueuedMessage::from_parsed(parsed, chat_id)));
+                return;
+            }
+            queue
+                .enqueue(QueuedMessage::from_parsed(parsed, chat_id))
+                .await;
+        })
+    })
 }
 
 /// Handler function type for processing queued messages.
@@ -97,21 +172,41 @@ impl ChatQueue {
     /// Spawns a new consumer task if this is the first message for the chat.
     pub async fn enqueue(&self, msg: QueuedMessage) {
         let chat_id = msg.chat_id;
-        let mut senders = self.senders.lock().await;
 
-        // Try to send to existing queue
-        let msg = if let Some(tx) = senders.get(&chat_id) {
-            match tx.send(msg).await {
+        // Fast path: send to the live consumer with the map lock released.
+        // The channel is bounded, so a flooding chat parks *this* send until
+        // its consumer catches up; holding the lock across it would park the
+        // polling callback and every other chat's enqueue with it.
+        let existing_tx = {
+            let senders = self.senders.lock().await;
+            senders.get(&chat_id).cloned()
+        };
+        let msg = match existing_tx {
+            Some(tx) => match tx.send(msg).await {
                 Ok(()) => return,
                 Err(e) => {
-                    // Channel closed — consumer exited, remove stale sender
-                    senders.remove(&chat_id);
+                    // Channel closed — consumer exited, remove the stale
+                    // sender and fall through to spawn a fresh one.
+                    self.senders.lock().await.remove(&chat_id);
                     e.0
                 }
-            }
-        } else {
-            msg
+            },
+            None => msg,
         };
+
+        let mut senders = self.senders.lock().await;
+        // Another enqueue may have spawned the consumer while the lock was
+        // released; hand the message to it rather than racing a second one.
+        if let Some(tx) = senders.get(&chat_id).cloned() {
+            drop(senders);
+            if let Err(e) = tx.send(msg).await {
+                warn!(
+                    "Chat {chat_id} consumer exited while a message was being enqueued; message dropped: {}",
+                    e.0.inbound.text.chars().take(40).collect::<String>()
+                );
+            }
+            return;
+        }
 
         // Reject if at max capacity to prevent memory exhaustion
         if senders.len() >= MAX_ACTIVE_CHATS {
@@ -274,6 +369,9 @@ mod tests {
         QueuedMessage {
             chat_id: 1,
             inbound: make_inbound(text),
+            audio: None,
+            photo: None,
+            input_kind: TelegramInputKind::Text,
             thread_id: None,
             message_id: None,
         }
@@ -355,6 +453,9 @@ mod tests {
                 .enqueue(QueuedMessage {
                     chat_id: 1,
                     inbound: make_inbound(&format!("msg {i}")),
+                    audio: None,
+                    photo: None,
+                    input_kind: TelegramInputKind::Text,
                     thread_id: None,
                     message_id: None,
                 })
@@ -385,6 +486,9 @@ mod tests {
                 .enqueue(QueuedMessage {
                     chat_id: 1,
                     inbound: make_inbound(&format!("msg-{i}")),
+                    audio: None,
+                    photo: None,
+                    input_kind: TelegramInputKind::Text,
                     thread_id: None,
                     message_id: None,
                 })
@@ -425,6 +529,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 1,
                 inbound: make_inbound("slow"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -433,6 +540,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 2,
                 inbound: make_inbound("fast"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -463,6 +573,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 99,
                 inbound: make_inbound("first"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -479,6 +592,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 99,
                 inbound: make_inbound("second"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -510,6 +626,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 1,
                 inbound: make_inbound("from chat 1"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -518,6 +637,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 2,
                 inbound: make_inbound("from chat 2"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -565,6 +687,9 @@ mod tests {
                 .enqueue(QueuedMessage {
                     chat_id: 1,
                     inbound: make_inbound(&text),
+                    audio: None,
+                    photo: None,
+                    input_kind: TelegramInputKind::Text,
                     thread_id: None,
                     message_id: None,
                 })
@@ -599,6 +724,9 @@ mod tests {
                 .enqueue(QueuedMessage {
                     chat_id: 1,
                     inbound: make_inbound(text),
+                    audio: None,
+                    photo: None,
+                    input_kind: TelegramInputKind::Text,
                     thread_id: None,
                     message_id: None,
                 })
@@ -629,6 +757,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 1,
                 inbound: inbound_from("42", &head),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -637,6 +768,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 1,
                 inbound: inbound_from("99", "hello from someone else"),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -664,6 +798,9 @@ mod tests {
             .enqueue(QueuedMessage {
                 chat_id: 1,
                 inbound: make_inbound(&text),
+                audio: None,
+                photo: None,
+                input_kind: TelegramInputKind::Text,
                 thread_id: None,
                 message_id: None,
             })
@@ -695,6 +832,9 @@ mod tests {
                 .enqueue(QueuedMessage {
                     chat_id: 1,
                     inbound: make_inbound(text),
+                    audio: None,
+                    photo: None,
+                    input_kind: TelegramInputKind::Text,
                     thread_id: None,
                     message_id: None,
                 })
@@ -706,5 +846,235 @@ mod tests {
         let seen = seen.lock().await;
         assert_eq!(seen.len(), 1, "all three fragments belong to one message");
         assert_eq!(seen[0], format!("{a}{b}{c}"));
+    }
+
+    fn parsed_from(sender: &str, text: &str) -> TelegramParsed {
+        TelegramParsed {
+            inbound: inbound_from(sender, text),
+            audio: None,
+            photo: None,
+            input_kind: TelegramInputKind::Text,
+        }
+    }
+
+    /// The handler that records every chat's completion, with a slow chat 1.
+    fn chat_recording_handler(
+        seen: Arc<Mutex<Vec<(i64, String)>>>,
+        slow_chat: i64,
+        delay: Duration,
+    ) -> MessageHandler {
+        Arc::new(move |msg: QueuedMessage| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                if msg.chat_id == slow_chat {
+                    tokio::time::sleep(delay).await;
+                }
+                seen.lock().await.push((msg.chat_id, msg.inbound.text));
+            })
+        })
+    }
+
+    /// The polling loop must be back at `getUpdates` while a turn runs: the
+    /// wired callback returns as soon as the message is queued, and a slow
+    /// turn in chat 1 does not delay chat 2's message.
+    #[tokio::test]
+    async fn queued_callback_returns_at_once_and_isolates_chats() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback = queued_poll_callback(Arc::new(ChatQueue::new(chat_recording_handler(
+            seen.clone(),
+            1,
+            Duration::from_millis(400),
+        ))));
+
+        let started = tokio::time::Instant::now();
+        callback(parsed_from("42", "slow chat"), 1).await;
+        callback(parsed_from("43", "fast chat"), 2).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "enqueueing must not wait for the handler, took {:?}",
+            started.elapsed()
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *seen.lock().await,
+            vec![(2, "fast chat".to_string())],
+            "chat 2 must be handled while chat 1's turn is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(seen.lock().await.len(), 2, "chat 1 must still complete");
+    }
+
+    /// Messages in one chat keep their arrival order through the queue.
+    #[tokio::test]
+    async fn queued_callback_keeps_same_chat_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback = queued_poll_callback(Arc::new(ChatQueue::new(chat_recording_handler(
+            seen.clone(),
+            7,
+            Duration::from_millis(20),
+        ))));
+
+        for text in ["first", "second", "third"] {
+            callback(parsed_from("42", text), 7).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let texts: Vec<String> = seen.lock().await.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(texts, ["first", "second", "third"]);
+    }
+
+    /// A client-split paste arriving through the polling callback is merged
+    /// before the handler runs — the merge only helps when the queue is
+    /// actually in the path.
+    #[tokio::test]
+    async fn queued_callback_merges_a_split_paste() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback = queued_poll_callback(Arc::new(ChatQueue::new(chat_recording_handler(
+            seen.clone(),
+            0,
+            Duration::ZERO,
+        ))));
+
+        let head = "h".repeat(SPLIT_CHUNK_THRESHOLD);
+        let tail = "the rest";
+        callback(parsed_from("42", &head), 1).await;
+        callback(parsed_from("42", tail), 1).await;
+
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW + Duration::from_millis(300)).await;
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1, "both fragments belong to one message");
+        assert_eq!(seen[0].1, format!("{head}{tail}"));
+    }
+
+    /// `/stop` runs beside the chat queue, not behind it: with a slow turn
+    /// holding the chat, the cancel is handled while that turn still runs.
+    #[tokio::test]
+    async fn queued_callback_runs_a_cancel_command_without_waiting_for_the_chat() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let handler: MessageHandler = Arc::new(move |msg: QueuedMessage| {
+            let seen = seen_c.clone();
+            Box::pin(async move {
+                if !crate::commands::is_cancel_command(&msg.inbound.text) {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                seen.lock().await.push(msg.inbound.text);
+            })
+        });
+        let callback = queued_poll_callback(Arc::new(ChatQueue::new(handler)));
+
+        callback(parsed_from("42", "long question"), 1).await;
+        callback(parsed_from("42", "/stop"), 1).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            *seen.lock().await,
+            vec!["/stop".to_string()],
+            "the cancel must be handled while the chat's turn is still running"
+        );
+    }
+
+    /// A photo whose caption was split by the client arrives as a near-cap
+    /// fragment plus a continuation. Through the wired callback the handler
+    /// must see one message with the full caption, the photo reference
+    /// still attached and the thread/reply ids it needs for delivery —
+    /// enrichment runs inside the queue, so a reference lost here is a
+    /// photo the agent never sees.
+    #[tokio::test]
+    async fn queued_callback_keeps_media_refs_and_ids_through_the_merge() {
+        type Handled = (TelegramParsed, i64, Option<i64>, Option<i64>);
+        let seen: Arc<Mutex<Vec<Handled>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let handler: MessageHandler = Arc::new(move |msg: QueuedMessage| {
+            let seen = seen_c.clone();
+            Box::pin(async move {
+                seen.lock().await.push(msg.into_parsed());
+            })
+        });
+        let callback = queued_poll_callback(Arc::new(ChatQueue::new(handler)));
+
+        let head = "c".repeat(SPLIT_CHUNK_THRESHOLD);
+        let mut first = parsed_from("42", &head);
+        first.inbound.thread_id = Some("12".into());
+        first.inbound.message_id = Some("34".into());
+        first.photo = Some(TelegramPhotoRef {
+            file_id: "f1".into(),
+            filename: "photo.jpg".into(),
+        });
+        first.input_kind = TelegramInputKind::Other;
+        let mut second = parsed_from("42", " end of caption");
+        second.inbound.thread_id = Some("12".into());
+
+        callback(first, 5).await;
+        callback(second, 5).await;
+        tokio::time::sleep(CHUNK_COALESCE_WINDOW + Duration::from_millis(300)).await;
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1, "both fragments belong to one message");
+        let (parsed, chat_id, thread_id, message_id) = &seen[0];
+        assert_eq!(parsed.inbound.text, format!("{head} end of caption"));
+        assert_eq!(
+            parsed.photo.as_ref().map(|p| p.file_id.as_str()),
+            Some("f1"),
+            "the photo reference must reach the handler for enrichment"
+        );
+        assert_eq!(parsed.input_kind, TelegramInputKind::Other);
+        assert_eq!(
+            (*chat_id, *thread_id, *message_id),
+            (5, Some(12), Some(34)),
+            "delivery ids come from the first fragment"
+        );
+    }
+
+    /// A chat whose bounded queue is full must not stall other chats: the
+    /// flooding send parks only its own caller, never the map lock, so a
+    /// second chat's enqueue still completes at once.
+    #[tokio::test]
+    async fn full_chat_queue_does_not_block_another_chats_enqueue() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (release_c, seen_c) = (release.clone(), seen.clone());
+        let handler: MessageHandler = Arc::new(move |msg: QueuedMessage| {
+            let (release, seen) = (release_c.clone(), seen_c.clone());
+            Box::pin(async move {
+                if msg.chat_id == 1 {
+                    // Holds chat 1's consumer so its channel fills up.
+                    release.notified().await;
+                }
+                seen.lock().await.push(msg.chat_id);
+            })
+        });
+        let queue = Arc::new(ChatQueue::new(handler));
+
+        // One in the handler, QUEUE_CAPACITY in the channel, one more that
+        // parks in `send` until the consumer drains.
+        let flooder = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                for _ in 0..(QUEUE_CAPACITY + 2) {
+                    queue.enqueue(queued("flood")).await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!flooder.is_finished(), "chat 1's last send must be parked");
+
+        let mut other = queued("other chat");
+        other.chat_id = 2;
+        tokio::time::timeout(Duration::from_millis(200), queue.enqueue(other))
+            .await
+            .expect("chat 2's enqueue must not wait behind chat 1's full queue");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *seen.lock().await,
+            vec![2],
+            "chat 2 is handled while chat 1 is parked"
+        );
+
+        release.notify_waiters();
+        for _ in 0..(QUEUE_CAPACITY + 2) {
+            release.notify_one();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), flooder).await;
     }
 }

@@ -340,21 +340,187 @@ pub async fn invoke_agent_with_auto_reply(
 ///
 /// Returns the `AccessCheckResult` from the pairing subsystem.
 async fn check_sender_access_control(
+    db: &Database,
     config: &Config,
     channel_name: &str,
     sender_id: &str,
 ) -> Result<cortex::pairing::AccessCheckResult> {
-    let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
-        .await
-        .context("Failed to open database for pairing check")?;
     cortex::pairing::check_sender_access(
-        &db,
+        db,
         config,
         channel_name,
         sender_id,
         config.user.agent_name.as_deref(),
     )
     .await
+}
+
+/// Read-only gate for the work a channel does *before* the queued turn
+/// runs its access check: attachment downloads, paid speech-to-text,
+/// reactions, history reads. Those must not run for a sender the turn is
+/// about to challenge or deny, so the sender's audio never reaches a third
+/// party and Borg never pays for a stranger's transcript.
+///
+/// Unlike [`enforce_access_control`] this writes nothing: no challenge is
+/// minted, no attempt counted. `Open` admits everyone, `Disabled` nobody,
+/// `Pairing` only an already-approved sender. Binding overrides apply
+/// through the resolved route, matching the queued check.
+pub(crate) async fn sender_may_enrich(
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+) -> bool {
+    let route = crate::channel::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
+    match cortex::pairing::resolve_dm_policy(&route.config, channel_name) {
+        cortex::pairing::DmPolicy::Open => true,
+        cortex::pairing::DmPolicy::Disabled => false,
+        cortex::pairing::DmPolicy::Pairing => {
+            match Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).await {
+                Ok(db) => {
+                    sender_may_enrich_with_db(&db, &route.config, channel_name, &inbound.sender_id)
+                        .await
+                }
+                Err(e) => {
+                    warn!(
+                        channel = %channel_name,
+                        error = %e,
+                        "could not open database for the pre-enrichment access check; skipping enrichment"
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// [`sender_may_enrich`] against a caller-supplied database. Fails closed:
+/// a lookup error skips enrichment (the queued check reports the error).
+pub(crate) async fn sender_may_enrich_with_db(
+    db: &Database,
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+) -> bool {
+    match cortex::pairing::resolve_dm_policy(config, channel_name) {
+        cortex::pairing::DmPolicy::Open => true,
+        cortex::pairing::DmPolicy::Disabled => false,
+        cortex::pairing::DmPolicy::Pairing => {
+            match db.is_sender_approved(channel_name, sender_id).await {
+                Ok(approved) => approved,
+                Err(e) => {
+                    warn!(
+                        channel = %channel_name,
+                        error = %e,
+                        "pre-enrichment approval lookup failed; skipping enrichment"
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Cancel the turn in flight for `inbound`'s session without queueing behind
+/// it. The queued path only sees a `/stop` once the running turn ends (or the
+/// request timeout fires), which is exactly when it is useless.
+///
+/// Mirrors the queued path's gates in order — activation, then the full
+/// access check (a challenge or denial is returned as the reply instead) —
+/// then resolves the same session id the turn runs under and cancels it on
+/// `executor`. Returns the reply to deliver; an empty reply means "say
+/// nothing" (not activated, or a throttled challenge).
+pub(crate) async fn cancel_in_flight_turn(
+    db: &Database,
+    executor: Option<&crate::session_executor::SessionExecutorHandle>,
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> Result<String> {
+    let route = crate::channel::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
+    let config = &route.config;
+    let pre_addressed = inbound
+        .metadata
+        .get("addressed_to_bot")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let (should_respond, _) = check_activation(
+        &inbound.text,
+        inbound.peer_kind.as_deref(),
+        &route,
+        config,
+        bot_identifier,
+        pre_addressed,
+    );
+    if !should_respond {
+        return Ok(String::new());
+    }
+    if let Some((early, _)) =
+        enforce_access_control_with_db(db, config, channel_name, &inbound.sender_id).await?
+    {
+        return Ok(early);
+    }
+
+    let session_key = build_session_key(inbound, &route.binding_id);
+    let session_id = db
+        .resolve_channel_session(channel_name, &session_key)
+        .await
+        .context("Failed to resolve channel session")?;
+    if let Err(e) = db
+        .log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "inbound",
+            Some(&inbound.text),
+            None,
+            Some(&session_id),
+        )
+        .await
+    {
+        warn!("Failed to log inbound cancel for channel '{channel_name}': {e}");
+    }
+    let cancelled = match executor {
+        Some(exec) => exec.cancel(&session_id).await,
+        None => {
+            warn!("cancel command received but no SessionExecutor is installed");
+            false
+        }
+    };
+    info!(
+        channel = %channel_name,
+        session_id = %session_id,
+        cancelled,
+        "cancel command handled ahead of the session queue"
+    );
+    let response = if cancelled {
+        "Cancelled.".to_string()
+    } else {
+        "Nothing to cancel.".to_string()
+    };
+    if let Err(e) = db
+        .log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "outbound",
+            Some(&response),
+            None,
+            Some(&session_id),
+        )
+        .await
+    {
+        debug!("Failed to log cancel response: {e}");
+    }
+    Ok(response)
 }
 
 /// Result of session resolution and command handling.
@@ -840,7 +1006,20 @@ async fn enforce_access_control(
     channel_name: &str,
     sender_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let access = check_sender_access_control(config, channel_name, sender_id).await?;
+    let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+        .await
+        .context("Failed to open database for pairing check")?;
+    enforce_access_control_with_db(&db, config, channel_name, sender_id).await
+}
+
+/// [`enforce_access_control`] against a caller-supplied database.
+async fn enforce_access_control_with_db(
+    db: &Database,
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+) -> Result<Option<(String, String)>> {
+    let access = check_sender_access_control(db, config, channel_name, sender_id).await?;
     match access {
         cortex::pairing::AccessCheckResult::Allowed => Ok(None),
         cortex::pairing::AccessCheckResult::Challenge { message, .. } => {
@@ -2457,5 +2636,150 @@ secret_env = "GW_TEST_WEBHOOK_SECRET"
             );
         }
         std::env::remove_var("BORG_HOME");
+    }
+
+    /// The pre-enrichment gate is read-only and policy-driven: `Open` admits
+    /// anyone, `Disabled` nobody, and `Pairing` only a sender already in
+    /// `approved_senders`. It must mint no challenge and count no attempt,
+    /// otherwise the real check later would see a stale pending request.
+    #[tokio::test]
+    async fn sender_may_enrich_follows_policy_and_approval_without_writing() {
+        let db = cortex::db::Database::test_db().await;
+        let mut config = Config::default();
+
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        assert!(sender_may_enrich_with_db(&db, &config, "telegram", "stranger").await);
+
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        assert!(!sender_may_enrich_with_db(&db, &config, "telegram", "stranger").await);
+
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
+        assert!(
+            !sender_may_enrich_with_db(&db, &config, "telegram", "stranger").await,
+            "an unpaired sender must not trigger downloads or paid STT"
+        );
+        assert!(
+            db.find_pending_for_sender("telegram", "stranger")
+                .await
+                .unwrap()
+                .is_none(),
+            "the gate must not mint a pairing request"
+        );
+
+        let code =
+            match cortex::pairing::check_sender_access(&db, &config, "telegram", "friend", None)
+                .await
+                .unwrap()
+            {
+                cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
+                other => panic!("expected Challenge, got {other:?}"),
+            };
+        db.approve_pairing("telegram", &code).await.unwrap();
+        assert!(
+            sender_may_enrich_with_db(&db, &config, "telegram", "friend").await,
+            "an approved sender keeps full enrichment"
+        );
+    }
+
+    /// `/stop` from an allowed sender cancels the session the queued turn
+    /// runs under — the id resolved from the same session key — and answers
+    /// with the cancel acknowledgement, without going through the queue.
+    #[tokio::test]
+    async fn cancel_in_flight_turn_cancels_the_resolved_session() {
+        use crate::session_executor::{InboundTurn, SessionExecutor, SessionExecutorHandle};
+        use async_trait::async_trait;
+
+        struct RecordingExec(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl SessionExecutor for RecordingExec {
+            async fn start_turn(
+                &self,
+                _t: InboundTurn,
+            ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+                anyhow::bail!("not used")
+            }
+            async fn cancel(&self, id: &str) -> bool {
+                self.0.lock().unwrap().push(id.to_string());
+                true
+            }
+            async fn cancel_all(&self) -> usize {
+                0
+            }
+            async fn active_turns(&self) -> usize {
+                0
+            }
+        }
+
+        let db = cortex::db::Database::test_db().await;
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        let exec = Arc::new(RecordingExec(std::sync::Mutex::new(Vec::new())));
+        let handle: SessionExecutorHandle = exec.clone();
+        let msg = inbound_with_text("stopper", "/stop");
+
+        let reply = cancel_in_flight_turn(&db, Some(&handle), &config, "telegram", &msg, None)
+            .await
+            .unwrap();
+        assert_eq!(reply, "Cancelled.");
+
+        let expected = db
+            .resolve_channel_session("telegram", &build_session_key(&msg, DEFAULT_BINDING_ID))
+            .await
+            .unwrap();
+        assert_eq!(
+            *exec.0.lock().unwrap(),
+            vec![expected],
+            "the cancel must target the session id the queued turn runs under"
+        );
+    }
+
+    /// An unpaired sender's `/stop` cancels nothing: the access check runs
+    /// first and its challenge is the only reply.
+    #[tokio::test]
+    async fn cancel_in_flight_turn_refuses_unpaired_sender() {
+        use crate::session_executor::{InboundTurn, SessionExecutor, SessionExecutorHandle};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FlagExec(AtomicBool);
+
+        #[async_trait]
+        impl SessionExecutor for FlagExec {
+            async fn start_turn(
+                &self,
+                _t: InboundTurn,
+            ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+                anyhow::bail!("not used")
+            }
+            async fn cancel(&self, _id: &str) -> bool {
+                self.0.store(true, Ordering::SeqCst);
+                true
+            }
+            async fn cancel_all(&self) -> usize {
+                0
+            }
+            async fn active_turns(&self) -> usize {
+                0
+            }
+        }
+
+        let db = cortex::db::Database::test_db().await;
+        let config = Config::default(); // Pairing
+        let exec = Arc::new(FlagExec(AtomicBool::new(false)));
+        let handle: SessionExecutorHandle = exec.clone();
+        let msg = inbound_with_text("unpaired-stopper", "/stop");
+
+        let reply = cancel_in_flight_turn(&db, Some(&handle), &config, "telegram", &msg, None)
+            .await
+            .unwrap();
+        assert!(
+            reply.contains("unpaired-stopper") && !reply.contains("Cancelled"),
+            "the reply must be the pairing challenge, got: {reply}"
+        );
+        assert!(
+            !exec.0.load(Ordering::SeqCst),
+            "an unpaired sender must not be able to cancel a turn"
+        );
     }
 }

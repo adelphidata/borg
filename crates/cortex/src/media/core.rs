@@ -128,7 +128,7 @@ pub fn compress_image(
         validate_base64(base64_data).ok_or_else(|| anyhow::anyhow!("invalid base64 data"))?;
     let raw_bytes = engine.decode(&validated)?;
 
-    let (bytes, _effective_mime) = if is_heic(mime_type) {
+    let (bytes, effective_mime) = if is_heic(mime_type) {
         match convert_heic_to_jpeg(&raw_bytes) {
             Ok(jpeg_bytes) => (jpeg_bytes, "image/jpeg".to_string()),
             Err(e) => {
@@ -140,8 +140,13 @@ pub fn compress_image(
         (raw_bytes, mime_type.to_string())
     };
 
-    // If already small enough, return as-is
+    // If already small enough, return as-is. A converted HEIC is returned
+    // as the JPEG it became — handing back the original container here
+    // would undo the conversion.
     if bytes.len() <= max_bytes {
+        if effective_mime != mime_type {
+            return Ok((engine.encode(&bytes), effective_mime));
+        }
         return Ok((base64_data.to_string(), mime_type.to_string()));
     }
 

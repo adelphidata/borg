@@ -11,6 +11,7 @@ use super::parse::{enrich_attachments, parse_envelope};
 use super::types::{Attachment, SignalEnvelope};
 use crate::handler::InboundMessage;
 use crate::message_processing::voice;
+use crate::session_queue::SessionQueue;
 
 use cortex::config::Config;
 use cortex::constants;
@@ -36,6 +37,13 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 /// Maximum SSE buffer size before we drop and reconnect (1 MB).
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Live conversation consumers one Signal sender may hold. The queue key is
+/// per sender *per group*, so this must cover every group a member posts in
+/// within the idle window — the webhook default (a few threads per sender)
+/// would silently drop a chatty member of many groups. Still bounded so a
+/// hostile sender cannot grow the map without limit.
+const MAX_CONVERSATIONS_PER_SENDER: usize = 256;
+
 /// Callback invoked for each parsed inbound message from the SSE stream.
 /// Arguments: (inbound message, recipient string for replies, optional group_id).
 pub type SseCallback = Arc<
@@ -60,6 +68,14 @@ pub async fn run_sse_loop(
 ) {
     let mut consecutive_errors: u32 = 0;
     let mut dedup = MessageDeduplicator::new();
+    // Attachment download, STT and the agent turn run per conversation, in
+    // order, off this loop: a long turn in one chat must not hold the
+    // stream (and every other chat) until it ends.
+    let queue = Arc::new(SessionQueue::with_sender_limit(
+        config.gateway.max_concurrent.max(1),
+        MAX_CONVERSATIONS_PER_SENDER,
+    ));
+    let config = Arc::new(config);
 
     loop {
         if shutdown.is_cancelled() {
@@ -176,56 +192,41 @@ pub async fn run_sse_loop(
                             if dedup.seen(&inbound.sender_id, ts) {
                                 continue;
                             }
-                            // Download attachments via signal-cli; if any are
-                            // audio AND STT is configured, transcribe and
-                            // prepend `[Voice transcript]: …` to the message
-                            // text — parity with Telegram inbound voice.
-                            if !raw_attachments.is_empty() {
-                                enrich_attachments(
-                                    &mut inbound,
-                                    &raw_attachments,
-                                    &client,
-                                    MAX_ATTACHMENT_BYTES,
+                            // `/stop` must not wait behind the turn it is
+                            // meant to stop: it runs beside the conversation's
+                            // queue, where the handler's cancel path reaches
+                            // the running turn at once.
+                            if crate::commands::is_cancel_command(&inbound.text) {
+                                tokio::spawn(callback(inbound, recipient, group_id));
+                                continue;
+                            }
+                            let key = conversation_key(&recipient, group_id.as_deref());
+                            let client = client.clone();
+                            let config = config.clone();
+                            let callback = callback.clone();
+                            let enqueued = queue
+                                .enqueue(
+                                    key.clone(),
+                                    Box::pin(async move {
+                                        if !raw_attachments.is_empty() {
+                                            enrich_inbound(
+                                                &mut inbound,
+                                                &raw_attachments,
+                                                &client,
+                                                &config,
+                                            )
+                                            .await;
+                                        }
+                                        callback(inbound, recipient, group_id).await;
+                                    }),
                                 )
                                 .await;
-                                if let Some(transcriber) =
-                                    cortex::media::understanding::AudioTranscriber::from_config(
-                                        &config,
-                                    )
-                                {
-                                    let mut transcripts: Vec<String> = Vec::new();
-                                    for att in &inbound.attachments {
-                                        if !att.mime_type.starts_with("audio/") {
-                                            continue;
-                                        }
-                                        use base64::Engine;
-                                        let Ok(bytes) = base64::engine::general_purpose::STANDARD
-                                            .decode(&att.data)
-                                        else {
-                                            continue;
-                                        };
-                                        let fname = att
-                                            .filename
-                                            .clone()
-                                            .unwrap_or_else(|| "signal-voice.audio".to_string());
-                                        transcripts.extend(
-                                            voice::transcribe_or_warn(
-                                                &transcriber,
-                                                &bytes,
-                                                &att.mime_type,
-                                                &fname,
-                                                "signal",
-                                            )
-                                            .await,
-                                        );
-                                    }
-                                    voice::append_voice_transcripts(
-                                        &mut inbound.text,
-                                        &transcripts,
-                                    );
-                                }
+                            if !enqueued {
+                                warn!(
+                                    conversation = %key,
+                                    "Signal inbound dropped: conversation queue at capacity"
+                                );
                             }
-                            callback(inbound, recipient, group_id).await;
                         }
                     }
                 } else if let Some(data) = line.strip_prefix("data:") {
@@ -237,6 +238,60 @@ pub async fn run_sse_loop(
 
         consecutive_errors = errors_after_disconnect(consecutive_errors, connected_at.elapsed());
     }
+}
+
+/// Per-conversation queue key: one consumer per sender per group (`recipient`
+/// is the sender id, so two members of the same group do not share a
+/// consumer), and one per sender for direct chats. Shaped
+/// `channel:sender:sub` so the queue's per-sender cap can find the sender
+/// segment.
+fn conversation_key(recipient: &str, group_id: Option<&str>) -> String {
+    format!("signal:{recipient}:{}", group_id.unwrap_or(""))
+}
+
+/// Download attachments via signal-cli; if any are audio AND STT is
+/// configured, transcribe and append `[Voice transcript]: …` to the message
+/// text — parity with Telegram inbound voice.
+///
+/// Runs nothing for a sender the queued turn will challenge or deny: their
+/// audio never reaches a third party and no paid transcript is bought
+/// before the pairing challenge. The plain text still goes through.
+async fn enrich_inbound(
+    inbound: &mut InboundMessage,
+    raw_attachments: &[Attachment],
+    client: &SignalClient,
+    config: &Config,
+) {
+    if !crate::handler::sender_may_enrich(config, "signal", inbound).await {
+        info!(
+            sender = %inbound.sender_id,
+            "signal: sender not approved; skipping attachment download and transcription"
+        );
+        return;
+    }
+    enrich_attachments(inbound, raw_attachments, client, MAX_ATTACHMENT_BYTES).await;
+    let Some(transcriber) = cortex::media::understanding::AudioTranscriber::from_config(config)
+    else {
+        return;
+    };
+    let mut transcripts: Vec<String> = Vec::new();
+    for att in &inbound.attachments {
+        if !att.mime_type.starts_with("audio/") {
+            continue;
+        }
+        use base64::Engine;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) else {
+            continue;
+        };
+        let fname = att
+            .filename
+            .clone()
+            .unwrap_or_else(|| "signal-voice.audio".to_string());
+        transcripts.extend(
+            voice::transcribe_or_warn(&transcriber, &bytes, &att.mime_type, &fname, "signal").await,
+        );
+    }
+    voice::append_voice_transcripts(&mut inbound.text, &transcripts);
 }
 
 /// Error count to carry into the next reconnect after a stream ends.
@@ -605,6 +660,7 @@ mod tests {
         });
 
         let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
         config.audio.enabled = true;
         config.audio.min_file_size = 1;
         config.audio.models = vec![cortex::config::AudioModelConfig {
@@ -662,5 +718,233 @@ mod tests {
             "the audio attachment must be transcribed into the text: {}",
             inbound.text
         );
+    }
+
+    /// Serve one SSE stream that emits every envelope in `frames` at once and
+    /// then stays open, plus a fixed attachment body for any attachment id.
+    /// Returns the daemon's base address and a counter of attachment fetches.
+    async fn serve_sse(
+        frames: Vec<serde_json::Value>,
+    ) -> (String, Arc<std::sync::atomic::AtomicU32>) {
+        use axum::routing::get;
+        let fetches = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let body: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+        let events = move || {
+            let body = body.clone();
+            async move {
+                let stream = futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(body))
+                })
+                .chain(futures::stream::pending());
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }
+        };
+        let fetch_counter = fetches.clone();
+        let app = axum::Router::new()
+            .route("/api/v1/events", get(events))
+            .route(
+                "/api/v1/attachments/{id}",
+                get(move || {
+                    let fetch_counter = fetch_counter.clone();
+                    async move {
+                        fetch_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        vec![7u8; 2048]
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), fetches)
+    }
+
+    fn envelope(source: &str, ts: i64, message: &str, audio: bool) -> serde_json::Value {
+        let mut data_message = serde_json::json!({ "timestamp": ts, "message": message });
+        if audio {
+            data_message["attachments"] = serde_json::json!([{
+                "id": format!("att-{ts}"),
+                "contentType": "audio/ogg",
+                "filename": "note.ogg"
+            }]);
+        }
+        serde_json::json!({
+            "envelope": {
+                "source": source,
+                "timestamp": ts,
+                "dataMessage": data_message,
+            }
+        })
+    }
+
+    /// Two senders on one stream: a slow turn for the first must not delay
+    /// the second's message, and the stream itself must keep being read.
+    #[tokio::test]
+    async fn sse_conversations_run_independently_off_the_stream_loop() {
+        let (base, _fetches) = serve_sse(vec![
+            envelope("+15550000001", 1_723_000_000_001, "slow one", false),
+            envelope("+15550000002", 1_723_000_000_002, "fast one", false),
+        ])
+        .await;
+
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+
+        let done: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(vec![]));
+        let done_c = done.clone();
+        let callback: SseCallback = Arc::new(move |msg, _recipient, _group| {
+            let done = done_c.clone();
+            Box::pin(async move {
+                if msg.text == "slow one" {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                done.lock().await.push(msg.text);
+            })
+        });
+
+        let client = Arc::new(SignalClient::new(&base, "+15550001111").unwrap());
+        let shutdown = CancellationToken::new();
+        let loop_task = tokio::spawn(run_sse_loop(client, callback, shutdown.clone(), config));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while done.lock().await.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first = done.lock().await.clone();
+        assert_eq!(
+            first,
+            vec!["fast one".to_string()],
+            "the second sender must be served while the first turn is still running"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while done.lock().await.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            done.lock().await.len(),
+            2,
+            "the slow turn must still complete"
+        );
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+    }
+
+    /// `/stop` runs beside the conversation queue, not behind it: with a
+    /// slow turn holding the sender's conversation, the cancel reaches the
+    /// callback while that turn still runs.
+    #[tokio::test]
+    async fn sse_cancel_command_bypasses_the_conversation_queue() {
+        let (base, _fetches) = serve_sse(vec![
+            envelope("+15550000001", 1_723_000_000_001, "slow one", false),
+            envelope("+15550000001", 1_723_000_000_002, "/stop", false),
+        ])
+        .await;
+
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+
+        let done: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(vec![]));
+        let done_c = done.clone();
+        let callback: SseCallback = Arc::new(move |msg, _recipient, _group| {
+            let done = done_c.clone();
+            Box::pin(async move {
+                if msg.text == "slow one" {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                done.lock().await.push(msg.text);
+            })
+        });
+
+        let client = Arc::new(SignalClient::new(&base, "+15550001111").unwrap());
+        let shutdown = CancellationToken::new();
+        let loop_task = tokio::spawn(run_sse_loop(client, callback, shutdown.clone(), config));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while done.lock().await.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first = done.lock().await.clone();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+        assert_eq!(
+            first,
+            vec!["/stop".to_string()],
+            "the cancel must be handled while the sender's turn is still running"
+        );
+    }
+
+    /// A sender the turn will deny gets no attachment download and no STT:
+    /// the daemon sees no attachment fetch, the transcriber never runs, and
+    /// the plain text still reaches the callback so the denial is delivered.
+    #[tokio::test]
+    async fn sse_unapproved_sender_gets_no_download_or_transcription() {
+        let (base, fetches) = serve_sse(vec![envelope(
+            "+15557778888",
+            1_723_000_000_000,
+            "voice note",
+            true,
+        )])
+        .await;
+
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("stt-ran");
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        config.audio.enabled = true;
+        config.audio.min_file_size = 1;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".into(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: Some(10_000),
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some(format!(
+                ": {{audio_file}} && touch '{}' && printf 'stub transcript'",
+                marker_file.display()
+            )),
+        }];
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let callback: SseCallback = Arc::new(move |msg, _recipient, _group| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(msg);
+            })
+        });
+
+        let client = Arc::new(SignalClient::new(&base, "+15550001111").unwrap());
+        let shutdown = CancellationToken::new();
+        let loop_task = tokio::spawn(run_sse_loop(client, callback, shutdown.clone(), config));
+
+        let inbound = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the plain message must still reach the callback")
+            .unwrap();
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+
+        assert!(
+            inbound.text.starts_with("voice note") && !inbound.text.contains("stub transcript"),
+            "the text passes through without a transcript: {}",
+            inbound.text
+        );
+        assert!(
+            inbound.attachments.is_empty(),
+            "no attachment may be downloaded for an unapproved sender"
+        );
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the daemon must see no attachment fetch"
+        );
+        assert!(!marker_file.exists(), "the STT command must not run");
     }
 }
