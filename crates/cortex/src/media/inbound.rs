@@ -169,10 +169,10 @@ mod tests {
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
-    fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+    fn ftyp(brand: [u8; 4]) -> Vec<u8> {
         let mut bytes = vec![0x00, 0x00, 0x00, 0x18];
         bytes.extend_from_slice(b"ftyp");
-        bytes.extend_from_slice(brand);
+        bytes.extend_from_slice(&brand);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         bytes.extend_from_slice(b"mif1heic");
         bytes.extend_from_slice(&[0u8; 64]);
@@ -183,9 +183,9 @@ mod tests {
     /// brand tells them apart, and the generic sniff got it wrong.
     #[test]
     fn sniff_reads_the_heic_brand_before_the_generic_mp4_rule() {
-        assert_eq!(sniff_image_mime(&ftyp(b"heic")), Some("image/heic"));
-        assert_eq!(sniff_image_mime(&ftyp(b"mif1")), Some("image/heif"));
-        assert_eq!(sniff_image_mime(&ftyp(b"isom")), Some("video/mp4"));
+        assert_eq!(sniff_image_mime(&ftyp(*b"heic")), Some("image/heic"));
+        assert_eq!(sniff_image_mime(&ftyp(*b"mif1")), Some("image/heif"));
+        assert_eq!(sniff_image_mime(&ftyp(*b"isom")), Some("video/mp4"));
         assert_eq!(sniff_image_mime(TINY_PNG), Some("image/png"));
         assert_eq!(sniff_image_mime(b"not an image at all"), None);
     }
@@ -270,7 +270,7 @@ mod tests {
     /// and not failed.
     #[test]
     fn undecodable_heic_container_is_dropped_under_its_real_type() {
-        let out = normalize_inbound_image(&ftyp(b"heic"), "image/heic", None, 1 << 20);
+        let out = normalize_inbound_image(&ftyp(*b"heic"), "image/heic", None, 1 << 20);
         assert_eq!(
             out,
             NormalizedImage::Dropped("[attachment dropped: unsupported image image/heic]".into())
