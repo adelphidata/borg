@@ -186,8 +186,16 @@ impl ChatQueue {
                 Ok(()) => return,
                 Err(e) => {
                     // Channel closed — consumer exited, remove the stale
-                    // sender and fall through to spawn a fresh one.
-                    self.senders.lock().await.remove(&chat_id);
+                    // sender and fall through to spawn a fresh one. Only
+                    // the sender we just tried is removed: another enqueue
+                    // may already have installed a live replacement.
+                    let mut senders = self.senders.lock().await;
+                    if senders
+                        .get(&chat_id)
+                        .is_some_and(|cur| cur.same_channel(&tx))
+                    {
+                        senders.remove(&chat_id);
+                    }
                     e.0
                 }
             },
@@ -228,14 +236,23 @@ impl ChatQueue {
             return;
         }
 
+        let tx_for_cleanup = tx.clone();
         senders.insert(chat_id, tx);
 
         tokio::spawn(async move {
             chat_consumer(chat_id, rx, handler).await;
 
-            // Clean up when consumer exits
+            // Clean up when consumer exits — but only our own sender. An
+            // enqueue that saw the closed channel may already have spawned
+            // a replacement consumer; removing its sender would let a
+            // third one start and run two turns for one chat at once.
             let mut senders = cleanup_senders.lock().await;
-            senders.remove(&chat_id);
+            if senders
+                .get(&chat_id)
+                .is_some_and(|cur| cur.same_channel(&tx_for_cleanup))
+            {
+                senders.remove(&chat_id);
+            }
             info!("Chat queue for {chat_id} cleaned up after idle timeout");
         });
     }
