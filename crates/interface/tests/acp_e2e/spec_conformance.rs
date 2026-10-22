@@ -95,6 +95,7 @@ async fn every_emitted_frame_validates_against_official_acp_schema() {
                     tool_call_id: "call-1".into(),
                     name: "run_shell".into(),
                     result: "file-a".into(),
+                    images: Vec::new(),
                 })
                 .await;
             let _ = tx

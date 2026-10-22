@@ -209,6 +209,16 @@ export interface ToolResult {
   toolCallId: string;
   name: string;
   result: string;
+  /**
+   * Previews of images the tool returned (a computer_use screenshot), sized
+   * for the transcript. The model's copy travels in the tool-result message.
+   */
+  images: ToolResultImage[];
+}
+
+export interface ToolResultImage {
+  mimeType: string;
+  dataBase64: string;
 }
 
 export interface ShellConfirmation {
@@ -3136,7 +3146,7 @@ export const ToolExecuting: MessageFns<ToolExecuting> = {
 };
 
 function createBaseToolResult(): ToolResult {
-  return { toolCallId: "", name: "", result: "" };
+  return { toolCallId: "", name: "", result: "", images: [] };
 }
 
 export const ToolResult: MessageFns<ToolResult> = {
@@ -3149,6 +3159,9 @@ export const ToolResult: MessageFns<ToolResult> = {
     }
     if (message.result !== "") {
       writer.uint32(26).string(message.result);
+    }
+    for (const v of message.images) {
+      ToolResultImage.encode(v!, writer.uint32(34).fork()).join();
     }
     return writer;
   },
@@ -3184,6 +3197,14 @@ export const ToolResult: MessageFns<ToolResult> = {
           message.result = reader.string();
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.images.push(ToolResultImage.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3202,6 +3223,9 @@ export const ToolResult: MessageFns<ToolResult> = {
         : "",
       name: isSet(object.name) ? globalThis.String(object.name) : "",
       result: isSet(object.result) ? globalThis.String(object.result) : "",
+      images: globalThis.Array.isArray(object?.images)
+        ? object.images.map((e: any) => ToolResultImage.fromJSON(e))
+        : [],
     };
   },
 
@@ -3216,6 +3240,9 @@ export const ToolResult: MessageFns<ToolResult> = {
     if (message.result !== "") {
       obj.result = message.result;
     }
+    if (message.images?.length) {
+      obj.images = message.images.map((e) => ToolResultImage.toJSON(e));
+    }
     return obj;
   },
 
@@ -3227,6 +3254,91 @@ export const ToolResult: MessageFns<ToolResult> = {
     message.toolCallId = object.toolCallId ?? "";
     message.name = object.name ?? "";
     message.result = object.result ?? "";
+    message.images = object.images?.map((e) => ToolResultImage.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseToolResultImage(): ToolResultImage {
+  return { mimeType: "", dataBase64: "" };
+}
+
+export const ToolResultImage: MessageFns<ToolResultImage> = {
+  encode(message: ToolResultImage, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mimeType !== "") {
+      writer.uint32(10).string(message.mimeType);
+    }
+    if (message.dataBase64 !== "") {
+      writer.uint32(18).string(message.dataBase64);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ToolResultImage {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseToolResultImage();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.mimeType = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.dataBase64 = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ToolResultImage {
+    return {
+      mimeType: isSet(object.mimeType)
+        ? globalThis.String(object.mimeType)
+        : isSet(object.mime_type)
+        ? globalThis.String(object.mime_type)
+        : "",
+      dataBase64: isSet(object.dataBase64)
+        ? globalThis.String(object.dataBase64)
+        : isSet(object.data_base64)
+        ? globalThis.String(object.data_base64)
+        : "",
+    };
+  },
+
+  toJSON(message: ToolResultImage): unknown {
+    const obj: any = {};
+    if (message.mimeType !== "") {
+      obj.mimeType = message.mimeType;
+    }
+    if (message.dataBase64 !== "") {
+      obj.dataBase64 = message.dataBase64;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<ToolResultImage>, I>>(base?: I): ToolResultImage {
+    return ToolResultImage.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<ToolResultImage>, I>>(object: I): ToolResultImage {
+    const message = createBaseToolResultImage();
+    message.mimeType = object.mimeType ?? "";
+    message.dataBase64 = object.dataBase64 ?? "";
     return message;
   },
 };

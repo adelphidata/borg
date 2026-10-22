@@ -132,6 +132,18 @@ export function ToolCell({ cell }: { cell: Cell & { kind: "tool" } }) {
       {expanded && (
         <div className="px-4 pb-3">
           {open && <ArgsView name={cell.name} args={args} raw={cell.args} />}
+          {cell.images && cell.images.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {cell.images.map((image, i) => (
+                <img
+                  key={i}
+                  src={`data:${image.mimeType};base64,${image.dataBase64}`}
+                  alt={`${cell.name} result image ${i + 1}`}
+                  className="max-h-[320px] max-w-full rounded-md border border-line2 object-contain"
+                />
+              ))}
+            </div>
+          )}
           {output !== "" && (
             <pre
               className={`m-0 max-h-[300px] overflow-auto text-[11.5px] leading-[1.5] whitespace-pre-wrap select-text ${

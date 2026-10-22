@@ -109,6 +109,7 @@ async fn tool_lifecycle_preserves_stable_tool_call_id() {
             tool_call_id: "call-abc".into(),
             name: "read_file".into(),
             result: "final result".into(),
+            images: Vec::new(),
         },
         AgentEvent::TurnComplete,
     ])
@@ -190,6 +191,7 @@ async fn tool_output_delta_marks_stderr_stream_separately() {
             tool_call_id: "x".into(),
             name: "run_shell".into(),
             result: "done".into(),
+            images: Vec::new(),
         },
         AgentEvent::TurnComplete,
     ])

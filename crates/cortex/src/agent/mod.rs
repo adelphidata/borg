@@ -112,6 +112,15 @@ enum IterationOutcome {
     ToolCallsExecuted,
 }
 
+/// A preview image attached to a [`AgentEvent::ToolResult`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultImage {
+    /// MIME type of `data` (JPEG after preview compression, PNG when it already fit).
+    pub mime_type: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
 /// Events emitted by the agent loop during a conversation turn.
 pub enum AgentEvent {
     /// Incremental text token from the LLM.
@@ -135,6 +144,11 @@ pub enum AgentEvent {
         name: String,
         /// Tool output text.
         result: String,
+        /// Small previews of any images the tool returned (a screenshot from
+        /// `computer_use`, an MCP image), for the operator's transcript. The
+        /// model gets the originals through the tool-result message; these
+        /// are capped so the per-session event ring stays small.
+        images: Vec<ToolResultImage>,
     },
     /// Request confirmation from the user for a shell command. Send `true` to approve.
     ShellConfirmation {

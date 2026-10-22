@@ -68,10 +68,18 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::A
             tool_call_id,
             name,
             result,
+            images,
         } => Kind::ToolResult(pb::ToolResult {
             tool_call_id,
             name,
             result,
+            images: images
+                .into_iter()
+                .map(|i| pb::ToolResultImage {
+                    mime_type: i.mime_type,
+                    data_base64: i.data,
+                })
+                .collect(),
         }),
         CoreEvent::ShellConfirmation { command, respond } => {
             let prompt_id = prompts.register(PendingPrompt::Shell(respond));
@@ -184,6 +192,14 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             tool_call_id: t.tool_call_id,
             name: t.name,
             result: t.result,
+            images: t
+                .images
+                .into_iter()
+                .map(|i| cortex::agent::ToolResultImage {
+                    mime_type: i.mime_type,
+                    data: i.data_base64,
+                })
+                .collect(),
         },
         Kind::ToolOutputDelta(t) => CoreEvent::ToolOutputDelta {
             tool_call_id: t.tool_call_id,
@@ -417,6 +433,7 @@ mod tests {
                     tool_call_id: "id".into(),
                     name: "n".into(),
                     result: "r".into(),
+                    images: vec![],
                 }),
             ),
             (

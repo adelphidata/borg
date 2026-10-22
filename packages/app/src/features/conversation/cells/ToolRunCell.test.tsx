@@ -26,6 +26,20 @@ describe("ToolRunCell", () => {
     expect(screen.getByText("3")).toBeTruthy();
   });
 
+  it("shows a screenshot the tool returned once the run is opened", () => {
+    const shot = {
+      ...tool("a", "x", "computer_use"),
+      images: [{ mimeType: "image/jpeg", dataBase64: "AAAA" }],
+    };
+    render(<ToolRunCell tools={[shot, tool("b", "src/two.ts")]} live={false} />);
+    expect(screen.queryByRole("img")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    // The call row opens on its own click; the image is its body.
+    fireEvent.click(screen.getByRole("button", { name: /computer_use/i }));
+    const img = screen.getByRole("img") as HTMLImageElement;
+    expect(img.src).toBe("data:image/jpeg;base64,AAAA");
+  });
+
   it("keeps the tool output out of the transcript until asked", () => {
     render(<ToolRunCell tools={RUN} live={false} />);
     expect(screen.queryByText(/contents of/)).toBeNull();

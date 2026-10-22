@@ -18,45 +18,98 @@ driver is spawned.
 brew install cua-driver
 ```
 
-Confirm with `cua-driver --version`; the agent searches `PATH` by default.
-If the binary lives elsewhere, point `computer_use.driver_path` at it:
+Confirm with `cua-driver --version`; the agent searches `PATH` and the usual
+install directories by default (see "Driver lookup"). If the binary lives
+elsewhere, point `computer_use.driver_path` at it:
 
 ```sh
 borg settings set computer_use.driver_path /opt/cua/bin/cua-driver
 ```
 
+## How it reaches the model
+
+`computer_use` lives in the `desktop` tool group (`tool/catalog.rs`). With
+`tools.conditional_loading` on (the default) a tool group is advertised only
+when the user's message carries one of its keyword hints or the group was
+used in the last few turns. The desktop hints are the tool's own name,
+"screenshot", "screen", "desktop", "window", "click", "mouse", "keyboard",
+"type into", "gui", a few common app names, and "cua". A request that names
+none of them (for example "fix the bug in main.rs") does not pay for the
+schema. To see what a turn advertised, run the daemon with
+`RUST_LOG=cortex::agent::prompt_assembly=debug` and read the
+`conditional tool loading` line.
+
+The tool description tells the model that this tool, not shell
+`screencapture`/`osascript` and not `browser`, is how it looks at or drives
+native apps; the `browser` description says it sees web pages only.
+
+## Driver lookup
+
+`computer_use.driver_path` wins when set. Otherwise the daemon searches
+`PATH`, then `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and
+`~/.cargo/bin`. The fallback matters for a daemon the desktop app starts
+from the Dock: that process inherits the login session's minimal `PATH`,
+which has neither Homebrew nor `~/.local/bin` on it.
+
 ## Actions
+
+Every action takes `action`; the other arguments depend on it. The driver is
+window-oriented and works in the background: it never raises a window.
 
 ### Read-only (plan-mode safe)
 
-| Action      | Args                            | Returns                                          |
-| ----------- | ------------------------------- | ------------------------------------------------ |
-| `capture`   | optional `pid`, `window_id`     | `Multimodal { text, parts: [Text, ImageBase64] }` |
-| `list_apps` | (none)                          | `Text` — one `Name (pid=N)` per line              |
-| `wait`      | required `duration_ms`          | `Text` — `waited <N>ms`                          |
+| Action         | Args                                                     | Returns |
+| -------------- | -------------------------------------------------------- | ------- |
+| `capture`      | optional `app` (name substring, or `screen`/`desktop`), `window_id`, `pid`, `mode` (`som` default, `vision`, `ax`) | text + image (`ax`: text only) |
+| `list_apps`    | (none)                                                   | running apps with pids |
+| `list_windows` | optional `pid`                                           | on-screen windows with `window_id` and `pid` |
+| `focus_app`    | required `app`                                           | the resolved `pid` + `window_id`; no raise |
+| `wait`         | required `duration_ms`                                   | `waited <N>ms` |
 
-`wait` is capped at 5 minutes (300 000 ms) so a runaway loop can't pin the
-worker indefinitely.
+`capture` with no ids resolves the frontmost window matching `app`, or the
+frontmost window overall, and reports the resolved `pid` + `window_id` so the
+next action can target them. `app="screen"` resolves to the shell window
+(Finder or the Dock, matched by whole app name); the driver captures one
+window at a time, so when no shell window is listed the error says to
+capture the windows you need by `app` instead. In `som` mode the reply
+carries the accessibility tree with `[N]` indexes for `element_index`.
+`wait` is capped at 5 minutes (300 000 ms).
 
 ### Mutating (blocked in plan mode)
 
-| Action          | Args                                  | Returns          |
-| --------------- | ------------------------------------- | ---------------- |
-| `click`         | required `x`, `y`                     | `Text` confirmation |
-| `double_click`  | required `x`, `y`                     | `Text` |
-| `right_click`   | required `x`, `y`                     | `Text` |
-| `middle_click`  | required `x`, `y`                     | `Text` |
-| `drag`          | required `x`, `y`, `to_x`, `to_y`     | `Text` |
-| `scroll`        | required `x`, `y`, `delta_x`, `delta_y` | `Text` |
-| `type`          | required `text`                       | `Text` |
-| `key`           | one of `key` (string) or `keys` (array) | `Text` |
-| `set_value`     | required `element_index`, `value`     | `Text` |
-| `focus_app`     | required `target`; optional `raise_window` (default `true`) | `Text` — `raised` or `backgrounded` |
+All of these require `pid`. An `element_index` additionally requires
+`window_id`, the key of the driver's element cache.
 
-`focus_app(raise_window: false)` is the opt-in "drive in the background"
-path — input routes to the target app without stealing focus from the
-user's frontmost window. Default `true` keeps the safer-by-visibility
-behaviour where the user can see what the agent is doing.
+| Action          | Args                                                            |
+| --------------- | --------------------------------------------------------------- |
+| `click`, `double_click`, `right_click`, `middle_click` | `x`,`y` or `element_index`+`window_id`; optional `modifiers` (pixel path only) |
+| `drag`          | `x`, `y`, `to_x`, `to_y`; optional `modifiers`                  |
+| `scroll`        | `delta_x`, `delta_y` (sign = direction, magnitude = 1–50 keystrokes); optional `element_index`+`window_id` |
+| `type`          | `text`; optional `element_index`+`window_id` to focus first     |
+| `key`           | `key` (single key) or `keys` (hotkey array)                     |
+| `set_value`     | `element_index`, `window_id`, `value`                            |
+
+Pass `capture_after: true` on a mutating action to get a fresh capture in
+the same reply.
+
+## What the operator sees
+
+Every `ToolResult` event carries previews of the images the tool returned
+(`ToolResultImage`, JPEG, at most 96 KiB each, at most four per call). The
+web and desktop transcripts show them inside the expanded tool row, and the
+row's subtitle names the action and its target ("click [4]",
+"capture Calculator"). The model receives the full-resolution image through
+the tool-result message; the preview exists so the transcript stays light
+and the per-session event ring (1 024 events) does not fill with screenshots.
+Previews ride the live event stream only: the persisted tool message holds
+the text, so a conversation reopened from history shows the row without its
+picture, the same way the model itself no longer holds the pixels after a
+daemon restart.
+
+A text-only main model gets a text summary and a note that pixels were
+dropped (`downgrade_for_non_vision_model`). `Provider::supports_vision`
+knows the OpenRouter ids by vendor prefix, so a `deepseek/*` model is treated
+as text-only up front instead of after a rejected request.
 
 ## Denylist
 

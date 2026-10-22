@@ -98,6 +98,7 @@ pub(super) fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Va
             tool_call_id,
             name: _,
             result,
+            ..
         } => Some(json!({
             "sessionId": session_id,
             "update": {

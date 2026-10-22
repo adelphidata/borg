@@ -752,6 +752,7 @@ mod tests {
                     tool_call_id: "call_1".into(),
                     name: "read_file".into(),
                     result: "done".into(),
+                    images: Vec::new(),
                 },
                 AgentEvent::PlanUpdated {
                     steps: vec![PlanStep {
@@ -956,6 +957,7 @@ mod tests {
             tool_call_id: "c1".into(),
             name: "run_shell".into(),
             result: "final".into(),
+            images: Vec::new(),
         };
         let completed = streams.update_for(&result, "s").expect("update");
         assert_eq!(completed["update"]["status"], "completed");
@@ -992,6 +994,7 @@ mod tests {
             tool_call_id: id.into(),
             name: "run_shell".into(),
             result: "done".into(),
+            images: Vec::new(),
         }
     }
 

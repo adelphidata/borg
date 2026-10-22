@@ -1455,6 +1455,7 @@ fn a_tool_call_after_new_or_resume_does_not_index_past_the_transcript() {
             tool_call_id: "t1".into(),
             name: "memory_search".into(),
             result: "none".into(),
+            images: Vec::new(),
         });
         assert!(app.cells_emitted <= app.cells.len(), "{cmd}");
     }
@@ -2331,6 +2332,7 @@ fn tool_result_clears_details_so_turn_doesnt_look_stuck_on_old_tool() {
         tool_call_id: "call-1".into(),
         name: "run_shell".into(),
         result: "file1\nfile2".into(),
+        images: Vec::new(),
     });
     // After a tool result, header returns to a neutral "Working" state
     // until the next event decides what comes next (more reasoning /

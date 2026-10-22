@@ -932,17 +932,52 @@ async fn capture_internal(args: &ComputerUseArgs, driver: &dyn Driver) -> Result
     capture(&probe, driver).await
 }
 
+/// Where a `cua-driver` install lands when it is not on the daemon's `PATH`.
+/// A daemon the desktop app starts from the Dock inherits the login
+/// session's minimal `PATH`, which has neither Homebrew nor `~/.local/bin`
+/// on it, so a driver the terminal finds would otherwise be "not found".
+const DRIVER_FALLBACK_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+const DRIVER_FALLBACK_HOME_DIRS: &[&str] = &[".local/bin", ".cargo/bin"];
+
+/// The driver binary: the operator's explicit path, else `PATH`, else the
+/// well-known install directories. `None` when nothing is there.
+fn locate_driver(
+    configured: &str,
+    on_path: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    if let Some(p) = on_path {
+        return Some(p.to_string_lossy().to_string());
+    }
+    let system = DRIVER_FALLBACK_DIRS
+        .iter()
+        .map(|d| std::path::Path::new(d).join("cua-driver"));
+    let user = home.into_iter().flat_map(|home| {
+        DRIVER_FALLBACK_HOME_DIRS
+            .iter()
+            .map(move |d| home.join(d).join("cua-driver"))
+    });
+    system
+        .chain(user)
+        .find(|c| is_file(c))
+        .map(|c| c.to_string_lossy().to_string())
+}
+
 fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
-    let binary = if config.computer_use.driver_path.is_empty() {
-        // `which` semantics — fail fast with a clear message if the operator
-        // hasn't installed cua-driver. We don't `command -v` shell out
-        // because that hits the policy layer and we'd lose the specific error.
-        which::which("cua-driver")
-            .map(|p| p.to_string_lossy().to_string())
-            .context("`cua-driver` not found on PATH. Install it (`brew install cua-driver` on macOS) or set computer_use.driver_path in `/settings`.")?
-    } else {
-        config.computer_use.driver_path.clone()
-    };
+    // `which` semantics — fail fast with a clear message if the operator
+    // hasn't installed cua-driver. We don't `command -v` shell out
+    // because that hits the policy layer and we'd lose the specific error.
+    let binary = locate_driver(
+        &config.computer_use.driver_path,
+        which::which("cua-driver").ok(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        std::path::Path::is_file,
+    )
+    .context("`cua-driver` not found on PATH or in /opt/homebrew/bin, /usr/local/bin, ~/.local/bin. Install it (`brew install cua-driver` on macOS) or set computer_use.driver_path in `/settings`.")?;
     Ok(Arc::new(CuaDriver::new(
         binary,
         config.computer_use.driver_timeout(),
@@ -2372,6 +2407,39 @@ mod tests {
                 "sentinel '{sentinel}' must resolve Finder's desktop window"
             );
         }
+    }
+
+    #[test]
+    fn locate_driver_prefers_config_then_path_then_known_dirs() {
+        use std::path::{Path, PathBuf};
+        let none = |_: &Path| false;
+        assert_eq!(
+            locate_driver(
+                "/x/cua-driver",
+                Some(PathBuf::from("/p/cua-driver")),
+                None,
+                none
+            ),
+            Some("/x/cua-driver".into())
+        );
+        assert_eq!(
+            locate_driver("", Some(PathBuf::from("/p/cua-driver")), None, none),
+            Some("/p/cua-driver".into())
+        );
+        // A Dock-launched daemon has no Homebrew on PATH; the install still
+        // resolves. `~/.local/bin` is where the standalone installer lands.
+        let home = PathBuf::from("/Users/op");
+        let in_local_bin = |p: &Path| p == Path::new("/Users/op/.local/bin/cua-driver");
+        assert_eq!(
+            locate_driver("", None, Some(home.clone()), in_local_bin),
+            Some("/Users/op/.local/bin/cua-driver".into())
+        );
+        let in_brew = |p: &Path| p == Path::new("/opt/homebrew/bin/cua-driver");
+        assert_eq!(
+            locate_driver("", None, Some(home.clone()), in_brew),
+            Some("/opt/homebrew/bin/cua-driver".into())
+        );
+        assert_eq!(locate_driver("", None, Some(home), none), None);
     }
 
     #[tokio::test]

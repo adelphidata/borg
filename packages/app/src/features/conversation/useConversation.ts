@@ -41,6 +41,12 @@ export interface Attachment {
  * side turns it into a log. It reaches the user through the row's hover title,
  * which is the one question the screen genuinely withholds an answer to.
  */
+/** One preview image on a tool cell. */
+export interface ToolImage {
+  mimeType: string;
+  dataBase64: string;
+}
+
 export type Cell = CellBody & { at?: number };
 
 /**
@@ -86,6 +92,8 @@ type CellBody =
       output: string;
       done: boolean;
       stderr: boolean;
+      /** Previews of images the tool returned, such as a desktop screenshot. */
+      images?: ToolImage[];
     }
   | {
       kind: "usage";
@@ -275,8 +283,16 @@ export function reduceEvent(
     }));
   }
   if (event.toolResult) {
-    const { toolCallId, result } = event.toolResult;
-    return patchTool(base, toolCallId, (c) => ({ ...c, output: result, done: true }));
+    const { toolCallId, result, images } = event.toolResult;
+    const previews = images
+      .filter((i) => i.dataBase64 !== "")
+      .map((i) => ({ mimeType: i.mimeType, dataBase64: i.dataBase64 }));
+    return patchTool(base, toolCallId, (c) => ({
+      ...c,
+      output: result,
+      done: true,
+      ...(previews.length ? { images: previews } : {}),
+    }));
   }
   if (event.usage) {
     const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = event.usage;

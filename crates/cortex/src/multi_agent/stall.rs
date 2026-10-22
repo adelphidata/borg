@@ -362,6 +362,7 @@ mod tests {
             tool_call_id: "c1".to_string(),
             name: "run_shell".to_string(),
             result: "done".to_string(),
+            images: Vec::new(),
         });
         assert_eq!(w.on_tick(), TickOutcome::Quiet);
     }
@@ -434,6 +435,7 @@ mod tests {
             tool_call_id: id.to_string(),
             name: "run_shell".to_string(),
             result: "done".to_string(),
+            images: Vec::new(),
         }
     }
 

@@ -146,9 +146,31 @@ describe("reduceEvent — tools", () => {
     const cells = fold([
       { toolExecuting: { toolCallId: "t1", name: "fs_read", argsJson: "{}" } },
       { toolOutputDelta: { toolCallId: "t1", name: "fs_read", delta: "partial", isStderr: false } },
-      { toolResult: { toolCallId: "t1", name: "fs_read", result: "final" } },
+      { toolResult: { toolCallId: "t1", name: "fs_read", result: "final", images: [] } },
     ]);
     expect(cells[0]).toMatchObject({ output: "final", done: true });
+  });
+
+  it("keeps the preview images a tool result carries", () => {
+    const cells = fold([
+      { toolExecuting: { toolCallId: "t1", name: "computer_use", argsJson: "{}" } },
+      {
+        toolResult: {
+          toolCallId: "t1",
+          name: "computer_use",
+          result: "captured",
+          images: [
+            { mimeType: "image/jpeg", dataBase64: "AAAA" },
+            { mimeType: "image/png", dataBase64: "" },
+          ],
+        },
+      },
+    ]);
+    // The empty one is noise, not a picture.
+    expect(cells[0]).toMatchObject({
+      done: true,
+      images: [{ mimeType: "image/jpeg", dataBase64: "AAAA" }],
+    });
   });
 
   it("ignores output for a call it never saw start", () => {
@@ -161,12 +183,12 @@ describe("reduceEvent — tools", () => {
   it("routes output to the newest open call when a provider reuses an id", () => {
     const cells = fold([
       { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
-      { toolResult: { toolCallId: "t1", name: "run_shell", result: "first done" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "first done", images: [] } },
       { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
       {
         toolOutputDelta: { toolCallId: "t1", name: "run_shell", delta: "second…", isStderr: false },
       },
-      { toolResult: { toolCallId: "t1", name: "run_shell", result: "second done" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "second done", images: [] } },
     ]);
     expect(cells).toMatchObject([
       { output: "first done", done: true },
@@ -177,8 +199,8 @@ describe("reduceEvent — tools", () => {
   it("drops a result for a call that already has one", () => {
     const cells = fold([
       { toolExecuting: { toolCallId: "t1", name: "run_shell", argsJson: "{}" } },
-      { toolResult: { toolCallId: "t1", name: "run_shell", result: "done" } },
-      { toolResult: { toolCallId: "t1", name: "run_shell", result: "again" } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "done", images: [] } },
+      { toolResult: { toolCallId: "t1", name: "run_shell", result: "again", images: [] } },
     ]);
     expect(cells).toMatchObject([{ output: "done" }]);
   });

@@ -223,6 +223,14 @@ pub(crate) fn convert_pb_event(
             tool_call_id: t.tool_call_id,
             name: t.name,
             result: t.result,
+            images: t
+                .images
+                .into_iter()
+                .map(|i| cortex::agent::ToolResultImage {
+                    mime_type: i.mime_type,
+                    data: i.data_base64,
+                })
+                .collect(),
         },
         Kind::ShellConfirmation(s) => {
             let (respond_tx, respond_rx) = oneshot::channel::<bool>();

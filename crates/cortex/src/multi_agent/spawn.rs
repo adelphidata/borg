@@ -746,7 +746,12 @@ fn run_sub_agent(
                                 }
                             }
                         }
-                        Some(AgentEvent::ToolResult { tool_call_id, name, result }) => {
+                        Some(AgentEvent::ToolResult {
+                            tool_call_id,
+                            name,
+                            result,
+                            ..
+                        }) => {
                             // Display-only: under parallel tool fan-out the
                             // first result clears the field while a sibling
                             // is still running; the next ToolExecuting

@@ -215,6 +215,7 @@ impl Agent {
                     tool_call_id: inv.id.clone(),
                     name: inv.name.clone(),
                     result: body.clone(),
+                    images: Vec::new(),
                 })
                 .await;
             head_batch.push(Message::tool_result(&inv.id, &body));
@@ -450,11 +451,16 @@ impl Agent {
             &xml,
         )
         .await;
+        let images = match &extra_parts {
+            Some(parts) => preview_images(parts).await,
+            None => Vec::new(),
+        };
         let _ = event_tx
             .send(AgentEvent::ToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 name: name.to_string(),
                 result: redacted,
+                images,
             })
             .await;
         if let Some(parts) = extra_parts {
@@ -699,6 +705,7 @@ impl Agent {
                                 tool_call_id: tool_call.id.clone(),
                                 name: name.clone(),
                                 result: "[tool call failed — worker panicked]".to_string(),
+                                images: Vec::new(),
                             })
                             .await;
                         result_batch.push(Message::tool_result(
@@ -1685,5 +1692,60 @@ mod mcp_cancel_tests {
             .expect("the server must be told the call was abandoned");
         });
         crate::mcp_clients::testing::reset_all();
+/// Largest preview the transcript is sent per image. A full-resolution
+/// screenshot is several hundred kilobytes of base64; the event ring keeps a
+/// thousand events per session, so previews stay an order of magnitude smaller.
+const TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 96 * 1024;
+
+/// How many images one tool result may preview. A capture plus its
+/// `capture_after` follow-up is two; nothing legitimate needs more.
+const TOOL_RESULT_PREVIEW_MAX_IMAGES: usize = 4;
+
+/// Preview copies of the images in a tool result, for the operator's
+/// transcript. Compression is CPU-bound, so it runs off the runtime; an
+/// image that will not decode is skipped rather than failing the tool.
+async fn preview_images(parts: &[ContentPart]) -> Vec<crate::agent::ToolResultImage> {
+    let sources: Vec<(String, String)> = parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::ImageBase64 { media } => {
+                Some((media.mime_type.clone(), media.data.clone()))
+            }
+            _ => None,
+        })
+        .take(TOOL_RESULT_PREVIEW_MAX_IMAGES)
+        .collect();
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let compressed = tokio::task::spawn_blocking(move || {
+        sources
+            .into_iter()
+            .filter_map(|(mime, data)| {
+                match crate::media::core::compress_image(
+                    &data,
+                    &mime,
+                    TOOL_RESULT_PREVIEW_MAX_BYTES,
+                ) {
+                    Ok((data, mime_type)) => {
+                        Some(crate::agent::ToolResultImage { mime_type, data })
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "tool result image skipped from the transcript preview: {e}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match compressed {
+        Ok(images) => images,
+        Err(e) => {
+            tracing::warn!("tool result preview task failed: {e}");
+            Vec::new()
+        }
     }
 }

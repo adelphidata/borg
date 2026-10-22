@@ -520,6 +520,7 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
                     tool_call_id: "call-1".into(),
                     name: "run_shell".into(),
                     result: result.into(),
+                    images: Vec::new(),
                 })
                 .await;
             let _ = tx.send(CoreEvent::TurnComplete).await;

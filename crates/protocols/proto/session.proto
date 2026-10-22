@@ -256,6 +256,13 @@ message ToolResult {
   string tool_call_id = 1;
   string name = 2;
   string result = 3;
+  // Previews of images the tool returned (a computer_use screenshot), sized
+  // for the transcript. The model's copy travels in the tool-result message.
+  repeated ToolResultImage images = 4;
+}
+message ToolResultImage {
+  string mime_type = 1;
+  string data_base64 = 2;
 }
 message ShellConfirmation {
   string command = 1;
