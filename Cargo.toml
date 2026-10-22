@@ -75,7 +75,7 @@ pdf-extract = "0.12"
 anydoc = "0.1.8"
 shellexpand = "3"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 axum = "0.8"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
