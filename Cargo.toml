@@ -87,7 +87,7 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace", "metrics", "logs"] }
 opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "logs", "grpc-tonic"] }
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-http = "0.32"
+opentelemetry-http = "0.33"
 http = "1"
 tracing-opentelemetry = "0.33"
 chromiumoxide = { version = "0.9", default-features = false }
