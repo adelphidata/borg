@@ -1014,11 +1014,12 @@ async fn list_window_entries(driver: &dyn Driver) -> Result<Vec<WindowEntry>> {
 const SCREEN_CAPTURE_SENTINELS: &[&str] =
     &["screen", "desktop", "fullscreen", "full screen", "all"];
 
-/// App/title fragments that identify the desktop/shell window on each platform.
+/// App names that own the desktop/shell window on each platform, compared
+/// whole and case-insensitively. A substring match once resolved `desktop`
+/// to a "Docker Desktop" window and captured that instead.
 /// macOS: Finder owns the desktop, the Dock is the shell.
 const DESKTOP_WINDOW_NAMES: &[&str] = &[
     "finder",
-    "desktop",
     "dock", // macOS desktop / shell
     "progman",
     "workerw",
@@ -1054,12 +1055,13 @@ fn pick_window<'a>(
                     .iter()
                     .find(|e| {
                         let app = e.app.to_lowercase();
-                        DESKTOP_WINDOW_NAMES.iter().any(|n| app.contains(n))
+                        DESKTOP_WINDOW_NAMES.iter().any(|n| app == *n)
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "computer_use.{action} found no desktop/shell window to represent \
-                             '{query}'. On-screen apps: {}",
+                             '{query}'. The driver captures one window at a time, so capture \
+                             the windows you need by `app` instead. On-screen apps: {}",
                             entries
                                 .iter()
                                 .map(|e| e.app.as_str())
@@ -2370,6 +2372,28 @@ mod tests {
                 "sentinel '{sentinel}' must resolve Finder's desktop window"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn capture_screen_sentinel_ignores_apps_that_merely_contain_desktop() {
+        // Live regression: `app="screen"` captured a "Docker Desktop" window
+        // because the shell match was a substring test on the app name.
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(
+                "✅ Found 2 window(s)\n\
+                 - Docker Desktop (pid 37967) \"Containers\" [window_id: 278]\n\
+                 - Code (pid 2446) \"SKILL.md\" [window_id: 1923]"
+                    .into(),
+            )],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.app = Some("screen".into());
+        let err = handle_with_driver(&args, &driver).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no desktop/shell window"),
+            "got: {err}"
+        );
+        assert_eq!(driver.calls.lock().unwrap().len(), 1, "no capture may run");
     }
 
     #[tokio::test]
