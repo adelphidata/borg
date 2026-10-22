@@ -715,6 +715,8 @@ export function useConversation(target: string | undefined): Conversation {
   const agentSessionId = useRef("");
   /** The title as of the last finished turn; the open's own title until then. */
   const [title, setTitle] = useState<string>();
+  /** The model the last turn ran on, which the picker may have changed since the open. */
+  const [model, setModel] = useState<string>();
   /** True between the user pressing stop and the turn reporting that it ended. */
   const stopRequested = useRef(false);
   /**
@@ -784,6 +786,7 @@ export function useConversation(target: string | undefined): Conversation {
         if (forGeneration !== generation.current) return;
         if (live.agentSessionId) agentSessionId.current = live.agentSessionId;
         if (live.title) setTitle(live.title);
+        if (live.llmModel) setModel(live.llmModel);
       })
       .catch((error: unknown) => console.warn("reading the conversation title failed", error));
   };
@@ -817,6 +820,7 @@ export function useConversation(target: string | undefined): Conversation {
       setStreamError(undefined);
       setContext(undefined);
       setTitle(undefined);
+      setModel(undefined);
       setGone(false);
       stopTurnClock();
       generation.current += 1;
@@ -1261,13 +1265,20 @@ export function useConversation(target: string | undefined): Conversation {
     if (sessionId && !busy) refreshContext();
   }, [sessionId, busy, refreshContext]);
 
-  // The title the last turn left behind outranks the one the open fetched.
+  // The title and model the last turn left behind outrank what the open fetched.
   const titled = useMemo(
     () =>
-      opened.state === "ready" && title !== undefined
-        ? { ...opened, data: { ...opened.data, title } }
+      opened.state === "ready" && (title !== undefined || model !== undefined)
+        ? {
+            ...opened,
+            data: {
+              ...opened.data,
+              title: title ?? opened.data.title,
+              model: model ?? opened.data.model,
+            },
+          }
         : opened,
-    [opened, title],
+    [opened, title, model],
   );
 
   return {

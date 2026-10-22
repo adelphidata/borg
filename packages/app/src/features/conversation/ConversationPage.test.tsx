@@ -99,6 +99,19 @@ describe("ConversationPage", () => {
     expect(screen.getByText("claude-opus-5")).toBeTruthy();
   });
 
+  it("shows the model the last turn ran on, not the one the open found", async () => {
+    // The picker can change the model between turns; the heading followed
+    // the open's answer and said the old one until a reload.
+    let model = "claude-opus-5";
+    const daemon = fakeDaemon({ ...OPEN, GetState: () => ({ ...OPEN.GetState, llmModel: model }) });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("claude-opus-5")).toBeTruthy());
+    model = "deepseek/deepseek-v3.2";
+    emit(daemon, { preparing: {} as never });
+    emit(daemon, { turnComplete: {} as never });
+    await waitFor(() => expect(screen.getByText("deepseek/deepseek-v3.2")).toBeTruthy());
+  });
+
   it("invites a first message rather than showing a blank page", async () => {
     mount(fakeDaemon(OPEN));
     await waitFor(() =>

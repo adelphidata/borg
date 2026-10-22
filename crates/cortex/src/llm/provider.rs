@@ -513,8 +513,17 @@ impl Provider {
                     && !m.contains("embedding")
             }
             Provider::Gemini => true,
-            // For OpenRouter, default to true; let the underlying model reject if unsupported
-            Provider::OpenRouter => true,
+            // OpenRouter ids carry the vendor as a prefix, so the vendor's own
+            // rule applies where one exists. A text-only model that is sent an
+            // image costs a rejected round trip and then a silent retry without
+            // it; a tool that knows up front can say so instead. Unknown vendors
+            // keep the permissive default.
+            Provider::OpenRouter => match m.split_once('/') {
+                Some(("deepseek", rest)) => Provider::DeepSeek.supports_vision(rest),
+                Some(("anthropic", rest)) => Provider::Anthropic.supports_vision(rest),
+                Some(("openai", rest)) => Provider::OpenAi.supports_vision(rest),
+                _ => true,
+            },
             // DeepSeek: only VL models support vision
             Provider::DeepSeek => m.contains("vl"),
             // Groq: only known vision models
@@ -1275,6 +1284,20 @@ mod tests {
         assert!(Provider::DeepSeek.supports_vision("deepseek-vl-7b"));
         assert!(!Provider::DeepSeek.supports_vision("deepseek-chat"));
         assert!(!Provider::DeepSeek.supports_vision("deepseek-reasoner"));
+    }
+
+    #[test]
+    fn openrouter_defers_to_the_vendor_rule() {
+        // The onboarding default is a text-only DeepSeek model; a screenshot
+        // sent to it is a wasted round trip.
+        assert!(!Provider::OpenRouter.supports_vision("deepseek/deepseek-v4-flash"));
+        assert!(!Provider::OpenRouter.supports_vision("deepseek/deepseek-chat"));
+        assert!(Provider::OpenRouter.supports_vision("anthropic/claude-sonnet-4.5"));
+        assert!(Provider::OpenRouter.supports_vision("openai/gpt-5.4"));
+        assert!(!Provider::OpenRouter.supports_vision("openai/text-embedding-3-small"));
+        // Unknown vendors keep the permissive default.
+        assert!(Provider::OpenRouter.supports_vision("z-ai/glm-5.2"));
+        assert!(Provider::OpenRouter.supports_vision("no-slash-model"));
     }
 
     #[test]
