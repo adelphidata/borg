@@ -36,7 +36,7 @@ uuid = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
-sha1 = "0.10"
+sha1 = "0.11"
 serde_urlencoded = "0.7"
 base64 = { workspace = true }
 ed25519-dalek = { version = "2", features = ["std"] }
