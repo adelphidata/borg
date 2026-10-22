@@ -55,6 +55,13 @@ describe("summarize", () => {
     expect(summarize({ action: "list_windows" })).toBe("list_windows");
   });
 
+  it("keeps naming the target of other action-shaped tools", () => {
+    // Regression: the desktop branch once swallowed a browser row's URL.
+    expect(summarize({ action: "navigate", url: "https://x" })).toBe("navigate https://x");
+    expect(summarize({ action: "call", to: "+15550100" })).toBe("call +15550100");
+    expect(summarize({ action: "analyze", path: "clip.mp4" })).toBe("analyze clip.mp4");
+  });
+
   it("has nothing to say about an argumentless call", () => {
     expect(summarize({})).toBeNull();
     expect(summarize(null)).toBeNull();

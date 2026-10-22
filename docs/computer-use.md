@@ -95,7 +95,8 @@ the same reply.
 ## What the operator sees
 
 Every `ToolResult` event carries previews of the images the tool returned
-(`ToolResultImage`, JPEG, at most 96 KiB each, at most four per call). The
+(`ToolResultImage`: at most 96 KiB each, re-encoded as JPEG when the
+original is larger, at most four per call, raster types only). The
 web and desktop transcripts show them inside the expanded tool row, and the
 row's subtitle names the action and its target ("click [4]",
 "capture Calculator"). The model receives the full-resolution image through

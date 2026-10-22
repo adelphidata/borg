@@ -19,6 +19,46 @@ const BUFFER_CAPACITY: usize = 1024;
 /// `Lagged` error, which the consumer translates into a buffer replay.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Most bytes of tool-result preview images the ring keeps per session.
+/// A screenshot-driven turn can push a preview on every call; without a
+/// cap, 1k events of ~128 KiB each would pin hundreds of megabytes per
+/// session. Past the budget the oldest previews are dropped (the event
+/// stays, so replay ordering is untouched); a reconnecting client then
+/// sees those rows without their picture, which is how history reads too.
+const IMAGE_BYTE_BUDGET: usize = 24 * 1024 * 1024;
+
+/// Bytes of preview image an event carries.
+fn image_bytes(event: &ProtoEvent) -> usize {
+    match &event.kind {
+        Some(protocols::session::agent_event::Kind::ToolResult(t)) => {
+            t.images.iter().map(|i| i.data_base64.len()).sum()
+        }
+        _ => 0,
+    }
+}
+
+/// Drop preview images from the oldest events until the ring's image bytes
+/// fit the budget.
+fn enforce_image_budget(ring: &mut VecDeque<ProtoEvent>) {
+    let mut total: usize = ring.iter().map(image_bytes).sum();
+    if total <= IMAGE_BYTE_BUDGET {
+        return;
+    }
+    for event in ring.iter_mut() {
+        if total <= IMAGE_BYTE_BUDGET {
+            break;
+        }
+        let bytes = image_bytes(event);
+        if bytes == 0 {
+            continue;
+        }
+        if let Some(protocols::session::agent_event::Kind::ToolResult(t)) = &mut event.kind {
+            t.images.clear();
+        }
+        total -= bytes;
+    }
+}
+
 /// Append-and-fan-out store for proto events on a single session.
 pub struct SequencedBuffer {
     /// Most-recent-first event_seq counter. `0` means "no events emitted yet".
@@ -62,6 +102,7 @@ impl SequencedBuffer {
                 ring.pop_front();
             }
             ring.push_back(event.clone());
+            enforce_image_budget(&mut ring);
         }
         // send() returns Err only when there are no live receivers — that's
         // not a failure mode, it just means nobody's listening yet.
@@ -111,7 +152,47 @@ impl Default for SequencedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocols::session::{agent_event::Kind, TextDelta};
+    use protocols::session::{agent_event::Kind, TextDelta, ToolResult, ToolResultImage};
+
+    fn shot(id: &str, bytes: usize) -> ProtoEvent {
+        ProtoEvent {
+            event_seq: 0,
+            kind: Some(Kind::ToolResult(ToolResult {
+                tool_call_id: id.into(),
+                name: "computer_use".into(),
+                result: "captured".into(),
+                images: vec![ToolResultImage {
+                    mime_type: "image/jpeg".into(),
+                    data_base64: "A".repeat(bytes),
+                }],
+            })),
+        }
+    }
+
+    #[test]
+    fn oldest_previews_are_dropped_past_the_image_budget() {
+        let buf = SequencedBuffer::new();
+        let each = IMAGE_BYTE_BUDGET / 4;
+        for i in 0..6 {
+            buf.push(shot(&format!("c{i}"), each));
+        }
+        let events = buf.replay_since(0);
+        assert_eq!(events.len(), 6, "events themselves are never dropped");
+        let kept: Vec<bool> = events.iter().map(|e| image_bytes(e) > 0).collect();
+        // Six quarter-budget previews: the two oldest lose their picture.
+        assert_eq!(kept, vec![false, false, true, true, true, true]);
+        let total: usize = events.iter().map(image_bytes).sum();
+        assert!(total <= IMAGE_BYTE_BUDGET);
+    }
+
+    #[test]
+    fn image_budget_ignores_events_without_previews() {
+        let buf = SequencedBuffer::new();
+        buf.push(delta("hello"));
+        buf.push(shot("c1", 10));
+        let events = buf.replay_since(0);
+        assert_eq!(events.iter().map(image_bytes).sum::<usize>(), 10);
+    }
 
     fn delta(s: &str) -> ProtoEvent {
         ProtoEvent {

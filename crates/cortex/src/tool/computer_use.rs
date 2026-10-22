@@ -971,9 +971,15 @@ fn build_driver(config: &Config) -> Result<Arc<dyn Driver>> {
     // `which` semantics — fail fast with a clear message if the operator
     // hasn't installed cua-driver. We don't `command -v` shell out
     // because that hits the policy layer and we'd lose the specific error.
+    let configured = &config.computer_use.driver_path;
+    let on_path = if configured.is_empty() {
+        which::which("cua-driver").ok()
+    } else {
+        None
+    };
     let binary = locate_driver(
-        &config.computer_use.driver_path,
-        which::which("cua-driver").ok(),
+        configured,
+        on_path,
         std::env::var_os("HOME").map(std::path::PathBuf::from),
         std::path::Path::is_file,
     )

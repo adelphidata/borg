@@ -1223,6 +1223,122 @@ pub(super) async fn dispatch_parallel_safe_tool(
     }
 }
 
+/// Largest preview the transcript is sent per image. A full-resolution
+/// screenshot is several hundred kilobytes of base64; the event ring keeps a
+/// thousand events per session, so previews stay an order of magnitude smaller.
+const TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 96 * 1024;
+
+/// How many images one tool result may preview. A capture plus its
+/// `capture_after` follow-up is two; nothing legitimate needs more.
+const TOOL_RESULT_PREVIEW_MAX_IMAGES: usize = 4;
+
+/// Image types the transcript will render. The bytes come from an external
+/// driver or MCP server; anything else (an SVG, a declared-but-wrong type)
+/// is left out rather than handed to an `<img>` as a data URI.
+const TOOL_RESULT_PREVIEW_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Preview copies of the images in a tool result, for the operator's
+/// transcript. Compression is CPU-bound, so it runs off the runtime; an
+/// image that will not decode is skipped rather than failing the tool.
+async fn preview_images(parts: &[ContentPart]) -> Vec<crate::agent::ToolResultImage> {
+    let sources: Vec<(String, String)> = parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::ImageBase64 { media }
+                if TOOL_RESULT_PREVIEW_MIMES.contains(&media.mime_type.as_str()) =>
+            {
+                Some((media.mime_type.clone(), media.data.clone()))
+            }
+            _ => None,
+        })
+        .take(TOOL_RESULT_PREVIEW_MAX_IMAGES)
+        .collect();
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let compressed = tokio::task::spawn_blocking(move || {
+        sources
+            .into_iter()
+            .filter_map(|(mime, data)| {
+                match crate::media::core::compress_image(
+                    &data,
+                    &mime,
+                    TOOL_RESULT_PREVIEW_MAX_BYTES,
+                ) {
+                    Ok((data, mime_type)) => {
+                        Some(crate::agent::ToolResultImage { mime_type, data })
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "tool result image skipped from the transcript preview: {e}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match compressed {
+        Ok(images) => images,
+        Err(e) => {
+            tracing::warn!("tool result preview task failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::types::MediaData;
+
+    fn part(mime: &str, png: &[u8]) -> ContentPart {
+        use base64::Engine as _;
+        ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: mime.into(),
+                data: base64::engine::general_purpose::STANDARD.encode(png),
+                filename: None,
+            },
+        }
+    }
+
+    fn png() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(16, 16, image::Rgba([10, 20, 30, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn previews_keep_raster_images_and_drop_the_rest() {
+        let parts = vec![
+            ContentPart::Text("summary".into()),
+            part("image/png", &png()),
+            part("image/svg+xml", b"<svg onload=alert(1)/>"),
+            part("image/png", b"not a png"),
+        ];
+        let images = preview_images(&parts).await;
+        // The small PNG fits the cap and passes through as PNG; the SVG is
+        // refused by type; the broken PNG is skipped by the compressor's
+        // decode when over the cap, or passed through when under it — here
+        // it is tiny, so it survives as bytes the browser will reject.
+        assert!(images.iter().all(|i| i.mime_type == "image/png"));
+        assert!(images.len() <= 2 && !images.is_empty());
+        assert!(!images.iter().any(|i| i.mime_type.contains("svg")));
+    }
+
+    #[tokio::test]
+    async fn previews_are_capped_in_count() {
+        let parts: Vec<ContentPart> = (0..6).map(|_| part("image/png", &png())).collect();
+        assert_eq!(
+            preview_images(&parts).await.len(),
+            TOOL_RESULT_PREVIEW_MAX_IMAGES
+        );
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
@@ -1692,60 +1808,5 @@ mod mcp_cancel_tests {
             .expect("the server must be told the call was abandoned");
         });
         crate::mcp_clients::testing::reset_all();
-/// Largest preview the transcript is sent per image. A full-resolution
-/// screenshot is several hundred kilobytes of base64; the event ring keeps a
-/// thousand events per session, so previews stay an order of magnitude smaller.
-const TOOL_RESULT_PREVIEW_MAX_BYTES: usize = 96 * 1024;
-
-/// How many images one tool result may preview. A capture plus its
-/// `capture_after` follow-up is two; nothing legitimate needs more.
-const TOOL_RESULT_PREVIEW_MAX_IMAGES: usize = 4;
-
-/// Preview copies of the images in a tool result, for the operator's
-/// transcript. Compression is CPU-bound, so it runs off the runtime; an
-/// image that will not decode is skipped rather than failing the tool.
-async fn preview_images(parts: &[ContentPart]) -> Vec<crate::agent::ToolResultImage> {
-    let sources: Vec<(String, String)> = parts
-        .iter()
-        .filter_map(|p| match p {
-            ContentPart::ImageBase64 { media } => {
-                Some((media.mime_type.clone(), media.data.clone()))
-            }
-            _ => None,
-        })
-        .take(TOOL_RESULT_PREVIEW_MAX_IMAGES)
-        .collect();
-    if sources.is_empty() {
-        return Vec::new();
-    }
-    let compressed = tokio::task::spawn_blocking(move || {
-        sources
-            .into_iter()
-            .filter_map(|(mime, data)| {
-                match crate::media::core::compress_image(
-                    &data,
-                    &mime,
-                    TOOL_RESULT_PREVIEW_MAX_BYTES,
-                ) {
-                    Ok((data, mime_type)) => {
-                        Some(crate::agent::ToolResultImage { mime_type, data })
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "tool result image skipped from the transcript preview: {e}"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await;
-    match compressed {
-        Ok(images) => images,
-        Err(e) => {
-            tracing::warn!("tool result preview task failed: {e}");
-            Vec::new()
-        }
     }
 }

@@ -200,12 +200,9 @@ impl ToolGroup {
                 "type into",
                 "macos app",
                 "mac app",
-                "the app",
                 "finder",
                 "textedit",
                 "calculator",
-                "gui",
-                "cua",
             ],
             Self::Integration => &[
                 "email", "gmail", "calendar", "notion", "linear", "slack", "discord",
@@ -808,16 +805,19 @@ mod tests {
             );
         }
         // And it must still be dropped when nothing points at the desktop.
-        let filtered = filter_tools_by_relevance(
-            make_test_tools(),
+        // Hints are substring matches, so words that merely contain one
+        // ("guide", "evacuate", "the application") must not count.
+        for message in [
             "fix the bug in main.rs",
-            &recent,
-            &profile_groups,
-        );
-        assert!(
-            !filtered.iter().any(|t| t.function.name == "computer_use"),
-            "computer_use must stay conditional for an unrelated request"
-        );
+            "update the guide in README.md and evacuate the application cache",
+        ] {
+            let filtered =
+                filter_tools_by_relevance(make_test_tools(), message, &recent, &profile_groups);
+            assert!(
+                !filtered.iter().any(|t| t.function.name == "computer_use"),
+                "computer_use must stay conditional for {message:?}"
+            );
+        }
     }
 
     /// Every tool name constant in tool_names must appear in the catalog

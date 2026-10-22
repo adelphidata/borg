@@ -47,7 +47,9 @@ export function summarize(args: Record<string, unknown> | null): string | null {
   // was pointed at. Without this every computer_use row is a bare tool name.
   if (typeof args.action === "string" && args.action.trim() !== "") {
     const parts = [args.action];
-    for (const field of ["app", "text", "value", "key"]) {
+    // Whatever the action was pointed at: a browser navigate names its URL,
+    // a call its number, a desktop action its app or the text it typed.
+    for (const field of ["url", "to", "path", "app", "text", "value", "key"]) {
       const value = args[field];
       if (typeof value === "string" && value.trim() !== "") {
         parts.push(value);
