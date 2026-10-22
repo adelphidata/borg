@@ -44,7 +44,7 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
     (tool_names::LIST_DIR, "List directory contents"),
     (tool_names::WEB_FETCH, "Fetch URL content"),
     (tool_names::WEB_SEARCH, "Search the web"),
-    (tool_names::BROWSER, "Control headless Chrome browser"),
+    (tool_names::BROWSER, "Control headless Chrome browser (web pages only, not the desktop)"),
     (
         tool_names::SCHEDULE,
         "Manage scheduled jobs: prompt tasks and cron commands",
@@ -73,7 +73,7 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
     ),
     (
         tool_names::COMPUTER_USE,
-        "macOS host UI automation: screen capture, click/type/scroll, app focus",
+        "Host macOS desktop: screenshot, click, type, scroll in native apps (not web pages)",
     ),
     (
         tool_names::GET_GOAL,
@@ -161,7 +161,7 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
             tool_names::BROWSER,
-            "Control a headless Chrome browser. Actions: navigate, click, type, screenshot, snapshot, get_text, get_images, evaluate_js, hover, select, press, drag, fill, upload, scroll, back, forward, wait, resize, new_tab, list_tabs, switch_tab, close_tab, get_console_logs, close. Use 'snapshot' first to enumerate interactive elements as `@e<N>` refs, then pass `ref: \"@e5\"` to click/type instead of inventing a CSS selector.",
+            "Control a headless Chrome browser for web pages only — it cannot see or touch the host desktop or native apps (use `computer_use` for those). Actions: navigate, click, type, screenshot, snapshot, get_text, get_images, evaluate_js, hover, select, press, drag, fill, upload, scroll, back, forward, wait, resize, new_tab, list_tabs, switch_tab, close_tab, get_console_logs, close. Use 'snapshot' first to enumerate interactive elements as `@e<N>` refs, then pass `ref: \"@e5\"` to click/type instead of inventing a CSS selector.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -310,7 +310,7 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     if config.computer_use.enabled {
         defs.push(ToolDefinition::new(
             tool_names::COMPUTER_USE,
-            "Drive the host macOS GUI via cua-driver. The driver is window-oriented and works in the background — it never raises a window to the foreground. Readonly: `capture` grabs one window — pass `app` (an app-name substring, e.g. \"Finder\") to auto-resolve the frontmost matching window, or omit it to capture the frontmost window overall, or pass an explicit `window_id`; capture reports the resolved `pid`+`window_id` so follow-up actions can target it. default `mode: \"som\"` returns a screenshot with a numbered overlay (then target with `element_index`), `mode: \"vision\"` is plain pixels, `mode: \"ax\"` returns the text-only accessibility tree. `focus_app` selects an app by `app` name and reports its `pid`+`window_id` for background driving (it does not raise the window — the driver never steals focus). `list_apps` returns running applications with pids; `list_windows` returns windows with window_ids; `wait` blocks for duration_ms. Mutating (all need `pid`): `click`/`double_click`/`right_click`/`middle_click` at (x,y) OR by `element_index`+`window_id` from a prior SOM capture — pass `modifiers` (e.g. [\"cmd\"], [\"shift\"]) to hold keys during a pixel-addressed click; `drag` from (x,y) to (to_x,to_y), also honouring `modifiers` (option-drag duplicates, shift-drag constrains); `scroll` by (delta_x,delta_y) intent (translated to a cardinal direction + keystroke count; optionally focus an `element_index`+`window_id`); `type` literal text; `key` a single key via `key` or a hotkey combo via `keys`; `set_value` writes directly to a focused AX text field (requires `window_id`+`element_index`; preferred for forms — bypasses typing entirely). Pass `capture_after: true` on a mutating action to receive a follow-up screenshot in the same envelope. Denylist refuses logout/lock/force-quit hotkeys and catastrophic typed commands before touching the driver.",
+            "Drive the host macOS desktop: native apps, windows, menus, dialogs — anything on the user's screen that is not a web page. Use this (never shell `screencapture`/`osascript`, never `browser`) when the user asks to see, screenshot, click, or type into an app on their Mac. The driver is window-oriented and works in the background — it never raises a window to the foreground. Readonly: `capture` grabs one window — pass `app` (an app-name substring, e.g. \"Finder\") to auto-resolve the frontmost matching window, or omit it to capture the frontmost window overall, or pass an explicit `window_id`; capture reports the resolved `pid`+`window_id` so follow-up actions can target it. default `mode: \"som\"` returns a screenshot with a numbered overlay (then target with `element_index`), `mode: \"vision\"` is plain pixels, `mode: \"ax\"` returns the text-only accessibility tree. `focus_app` selects an app by `app` name and reports its `pid`+`window_id` for background driving (it does not raise the window — the driver never steals focus). `list_apps` returns running applications with pids; `list_windows` returns windows with window_ids; `wait` blocks for duration_ms. Mutating (all need `pid`): `click`/`double_click`/`right_click`/`middle_click` at (x,y) OR by `element_index`+`window_id` from a prior SOM capture — pass `modifiers` (e.g. [\"cmd\"], [\"shift\"]) to hold keys during a pixel-addressed click; `drag` from (x,y) to (to_x,to_y), also honouring `modifiers` (option-drag duplicates, shift-drag constrains); `scroll` by (delta_x,delta_y) intent (translated to a cardinal direction + keystroke count; optionally focus an `element_index`+`window_id`); `type` literal text; `key` a single key via `key` or a hotkey combo via `keys`; `set_value` writes directly to a focused AX text field (requires `window_id`+`element_index`; preferred for forms — bypasses typing entirely). Pass `capture_after: true` on a mutating action to receive a follow-up screenshot in the same envelope. Denylist refuses logout/lock/force-quit hotkeys and catastrophic typed commands before touching the driver.",
             serde_json::json!({
                 "type": "object",
                 "properties": {

@@ -831,11 +831,21 @@ Rules:
                 crate::tool::catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
                     .unwrap_or_default();
             let profile_groups = profile.groups();
+            let before = tools.len();
             tools = crate::tool::catalog::filter_tools_by_relevance(
                 tools,
                 user_message,
                 &self.recent_tool_names,
                 &profile_groups,
+            );
+            // The one place to learn why a tool the operator expected never
+            // reached the model: a dropped tool looks identical to a model
+            // that chose not to call it.
+            tracing::debug!(
+                before,
+                after = tools.len(),
+                tools = ?tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
+                "conditional tool loading"
             );
         }
 

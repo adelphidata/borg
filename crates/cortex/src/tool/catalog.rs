@@ -26,6 +26,8 @@ pub enum ToolGroup {
     Scheduling,
     /// Image generation tools.
     Media,
+    /// Host desktop control (screen capture, click, type) via `computer_use`.
+    Desktop,
     /// Third-party service integrations (Gmail, Notion, etc.).
     Integration,
     /// Multi-agent orchestration tools.
@@ -68,7 +70,8 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     (crate::tool::names::TEXT_TO_SPEECH, ToolGroup::Media),
     (crate::tool::names::VISION_ANALYZE, ToolGroup::Media),
     (crate::tool::names::VIDEO_ANALYZE, ToolGroup::Media),
-    (crate::tool::names::COMPUTER_USE, ToolGroup::Media),
+    // Desktop
+    (crate::tool::names::COMPUTER_USE, ToolGroup::Desktop),
     // Integration (skill-driven; not dispatched by the agent loop directly)
     (crate::tool::names::GMAIL, ToolGroup::Integration),
     (crate::tool::names::GOOGLE_CALENDAR, ToolGroup::Integration),
@@ -98,6 +101,7 @@ impl ToolGroup {
             "ui" => Some(Self::Ui),
             "scheduling" => Some(Self::Scheduling),
             "media" => Some(Self::Media),
+            "desktop" => Some(Self::Desktop),
             "integration" => Some(Self::Integration),
             "agents" => Some(Self::Agents),
             "goals" => Some(Self::Goals),
@@ -116,6 +120,7 @@ impl ToolGroup {
             Self::Ui => "UI",
             Self::Scheduling => "Scheduling",
             Self::Media => "Media",
+            Self::Desktop => "Desktop",
             Self::Integration => "Integration",
             Self::Agents => "Agents",
             Self::Goals => "Goals",
@@ -174,6 +179,33 @@ impl ToolGroup {
                 "draw",
                 "photo",
                 "illustration",
+            ],
+            // The tool's own name in both spellings, the nouns a person uses
+            // for the host screen, and the verbs of driving a GUI. "click"
+            // and "screenshot" overlap with `Ui` on purpose: a request to
+            // click something may mean either surface, and advertising both
+            // costs a few hundred tokens while dropping the right one costs
+            // the whole task.
+            Self::Desktop => &[
+                "computer use",
+                "computer_use",
+                "computer-use",
+                "screenshot",
+                "screen",
+                "desktop",
+                "window",
+                "click",
+                "mouse",
+                "keyboard",
+                "type into",
+                "macos app",
+                "mac app",
+                "the app",
+                "finder",
+                "textedit",
+                "calculator",
+                "gui",
+                "cua",
             ],
             Self::Integration => &[
                 "email", "gmail", "calendar", "notion", "linear", "slack", "discord",
@@ -293,6 +325,7 @@ impl ToolProfile {
                 ToolGroup::Discovery,
                 ToolGroup::Web,
                 ToolGroup::Media,
+                ToolGroup::Desktop,
                 ToolGroup::Scheduling,
             ]
             .into_iter()
@@ -314,6 +347,7 @@ impl ToolProfile {
                 ToolGroup::Ui,
                 ToolGroup::Scheduling,
                 ToolGroup::Media,
+                ToolGroup::Desktop,
                 ToolGroup::Integration,
                 ToolGroup::Agents,
             ]
@@ -333,6 +367,7 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
     ToolGroup::Ui,
     ToolGroup::Scheduling,
     ToolGroup::Media,
+    ToolGroup::Desktop,
     ToolGroup::Integration,
     ToolGroup::Agents,
     ToolGroup::Goals,
@@ -452,6 +487,7 @@ mod tests {
             ToolGroup::Ui,
             ToolGroup::Scheduling,
             ToolGroup::Media,
+            ToolGroup::Desktop,
             ToolGroup::Integration,
             ToolGroup::Agents,
         ];
@@ -481,14 +517,15 @@ mod tests {
         assert!(groups.contains(&ToolGroup::Discovery));
         assert!(groups.contains(&ToolGroup::Web));
         assert!(groups.contains(&ToolGroup::Media));
+        assert!(groups.contains(&ToolGroup::Desktop));
         assert!(groups.contains(&ToolGroup::Scheduling));
-        assert_eq!(groups.len(), 7);
+        assert_eq!(groups.len(), 8);
     }
 
     #[test]
-    fn profile_full_includes_all_10_groups() {
+    fn profile_full_includes_all_11_groups() {
         let groups = ToolProfile::Full.groups();
-        assert_eq!(groups.len(), 10);
+        assert_eq!(groups.len(), 11);
     }
 
     #[test]
@@ -547,6 +584,7 @@ mod tests {
             ToolGroup::Ui,
             ToolGroup::Scheduling,
             ToolGroup::Media,
+            ToolGroup::Desktop,
             ToolGroup::Integration,
             ToolGroup::Agents,
         ];
@@ -568,7 +606,7 @@ mod tests {
 
     #[test]
     fn all_groups_constant_has_all_variants() {
-        assert_eq!(ALL_GROUPS.len(), 11);
+        assert_eq!(ALL_GROUPS.len(), 12);
         assert!(ALL_GROUPS.contains(&ToolGroup::Memory));
         assert!(ALL_GROUPS.contains(&ToolGroup::Fs));
         assert!(ALL_GROUPS.contains(&ToolGroup::Runtime));
@@ -577,6 +615,7 @@ mod tests {
         assert!(ALL_GROUPS.contains(&ToolGroup::Ui));
         assert!(ALL_GROUPS.contains(&ToolGroup::Scheduling));
         assert!(ALL_GROUPS.contains(&ToolGroup::Media));
+        assert!(ALL_GROUPS.contains(&ToolGroup::Desktop));
         assert!(ALL_GROUPS.contains(&ToolGroup::Integration));
         assert!(ALL_GROUPS.contains(&ToolGroup::Agents));
         assert!(ALL_GROUPS.contains(&ToolGroup::Goals));
@@ -623,6 +662,7 @@ mod tests {
         assert!(!ToolGroup::Ui.is_core());
         assert!(!ToolGroup::Scheduling.is_core());
         assert!(!ToolGroup::Media.is_core());
+        assert!(!ToolGroup::Desktop.is_core());
         assert!(!ToolGroup::Integration.is_core());
         assert!(!ToolGroup::Agents.is_core());
         assert!(ToolGroup::Goals.is_core());
@@ -741,7 +781,43 @@ mod tests {
             ToolDefinition::new("generate_image", "Generate image", schema.clone()),
             ToolDefinition::new("gmail", "Gmail", schema.clone()),
             ToolDefinition::new("spawn_agent", "Spawn agent", schema.clone()),
+            ToolDefinition::new("computer_use", "Computer use", schema.clone()),
         ]
+    }
+
+    /// The regression this group exists for: a request for a screenshot of
+    /// a desktop window used to drop `computer_use` because the tool lived
+    /// under `Media`, whose hints are all about image generation. The model
+    /// then fell back to shell `screencapture` and never saw the tool.
+    #[test]
+    fn filter_tools_keeps_computer_use_for_desktop_requests() {
+        let profile_groups = ToolProfile::Full.groups();
+        let recent = HashSet::new();
+        for message in [
+            "Use computer use to take a screenshot of the terminal window and tell me what it shows.",
+            "Click the Save button in TextEdit",
+            "What is on my screen right now?",
+            "open Calculator and type 2+2",
+        ] {
+            let filtered =
+                filter_tools_by_relevance(make_test_tools(), message, &recent, &profile_groups);
+            let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+            assert!(
+                names.contains(&"computer_use"),
+                "computer_use must survive relevance filtering for {message:?}: {names:?}"
+            );
+        }
+        // And it must still be dropped when nothing points at the desktop.
+        let filtered = filter_tools_by_relevance(
+            make_test_tools(),
+            "fix the bug in main.rs",
+            &recent,
+            &profile_groups,
+        );
+        assert!(
+            !filtered.iter().any(|t| t.function.name == "computer_use"),
+            "computer_use must stay conditional for an unrelated request"
+        );
     }
 
     /// Every tool name constant in tool_names must appear in the catalog
