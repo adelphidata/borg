@@ -18,6 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// OS error codes that mean the disk, not the tick, is the problem.
+#[cfg(unix)]
+const STORAGE_ERRNOS: &[i32] = &[libc::ENOSPC, libc::EDQUOT, libc::EROFS];
+#[cfg(not(unix))]
+const STORAGE_ERRNOS: &[i32] = &[libc::ENOSPC, libc::EROFS];
+
 /// Callback the dispatcher invokes for each claimed task. The cli's
 /// `service::spawn_task_execution` gets passed in here.
 pub type TaskSpawn = Arc<
@@ -223,7 +229,7 @@ pub(crate) fn classify_tick_failure(e: &anyhow::Error) -> TickFailure {
         .chain()
         .filter_map(|c| c.downcast_ref::<std::io::Error>())
         .filter_map(std::io::Error::raw_os_error)
-        .any(|errno| errno == libc::ENOSPC || errno == libc::EDQUOT || errno == libc::EROFS);
+        .any(|errno| STORAGE_ERRNOS.contains(&errno));
     if storage_errno {
         return TickFailure::HealthySkip(TickFailureClass::StorageExhausted);
     }

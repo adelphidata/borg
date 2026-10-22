@@ -46,8 +46,12 @@ impl KeychainStore {
         Self
     }
 
-    fn entry(account: &str) -> Result<keyring::Entry, PkiError> {
-        keyring::Entry::new(SERVICE, account)
+    fn entry(account: &str) -> Result<keyring_core::Entry, PkiError> {
+        // Registers the platform store on first use; the result is only a
+        // hint, since a store installed directly (the mock in tests, or a
+        // host without a Secret Service) is what the entry resolves against.
+        let _ = keyring::Entry::store_status();
+        keyring_core::Entry::new(SERVICE, account)
             .map_err(|e| PkiError::Keychain(format!("entry({account}): {e}")))
     }
 }
@@ -63,7 +67,7 @@ impl KekStore for KeychainStore {
     fn get(&self, account: &str) -> Result<Vec<u8>, PkiError> {
         let entry = Self::entry(account)?;
         entry.get_secret().map_err(|e| match e {
-            keyring::Error::NoEntry => PkiError::NotFound(account.to_string()),
+            keyring_core::Error::NoEntry => PkiError::NotFound(account.to_string()),
             other => PkiError::Keychain(format!("get_secret({account}): {other}")),
         })
     }
@@ -72,7 +76,7 @@ impl KekStore for KeychainStore {
         let entry = Self::entry(account)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(PkiError::Keychain(format!("delete({account}): {e}"))),
         }
     }
@@ -419,9 +423,8 @@ mod tests {
     /// always absent) so the test never touches the real OS keychain.
     #[test]
     fn keychain_store_maps_missing_entry_to_notfound() {
-        // Registering the platform store first makes `keyring::Entry::new`
-        // skip its lazy registration, so the mock installed next is the store
-        // the entry resolves against.
+        // Trigger the platform registration first so it cannot replace the
+        // mock installed next (on a host without a keychain it simply fails).
         let _ = keyring::Entry::store_status();
         keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
         let store = KeychainStore::new();
