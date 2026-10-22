@@ -36,7 +36,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use gateway::slack::dedup::EventDeduplicator;
 use gateway::slack::echo::EchoCache;
 use gateway::slack::{handle_slack_webhook, SlackWebhookResult};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::sync::Mutex;
 

@@ -12,15 +12,18 @@
     "gen": "buf generate"
   },
   "devDependencies": {
-    "@bufbuild/buf": "^1.50.0",
+    "@bufbuild/buf": "^1.75.0",
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/vitest-runner": "^10.0.0",
-    "@vitest/coverage-v8": "4.1.11",
-    "prettier": "^3.9.6",
-    "ts-proto": "^2.6.1",
+    "@vitest/coverage-v8": "5.0.5",
+    "prettier": "^3.9.10",
+    "ts-proto": "^2.18.1",
     "typescript": "^7.0.2"
   },
   "trustedDependencies": [
     "electron"
-  ]
+  ],
+  "overrides": {
+    "qs": "^6.16.1"
+  }
 }

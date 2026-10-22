@@ -1,8 +1,9 @@
 //! gRPC schema and client/server stubs for the borgd daemon.
 //!
-//! This crate is generated from `proto/*.proto` via `tonic-build` at compile
-//! time. Re-export the generated modules under stable paths so downstream
-//! crates (`borgd`, `borg` CLI) don't depend on tonic-build's naming.
+//! This crate is generated from `proto/*.proto` via `tonic-prost-build` at
+//! compile time. Re-export the generated modules under stable paths so
+//! downstream crates (`borgd`, `borg` CLI) don't depend on the generator's
+//! naming.
 
 #![warn(missing_docs)]
 

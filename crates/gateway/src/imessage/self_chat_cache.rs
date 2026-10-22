@@ -76,7 +76,7 @@ fn hash_text(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     let result = hasher.finalize();
-    format!("{result:x}")[..16].to_string()
+    hex::encode(result)[..16].to_string()
 }
 
 #[cfg(test)]

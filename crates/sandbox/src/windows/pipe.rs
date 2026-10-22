@@ -26,9 +26,10 @@
 use std::io;
 use std::ptr;
 
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, ERROR_BROKEN_PIPE, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
+    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, FALSE, HANDLE, HANDLE_FLAG_INHERIT,
     INVALID_HANDLE_VALUE, TRUE,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::config::Config;
@@ -56,7 +56,7 @@ pub fn get_or_create_hmac_key() -> Result<Vec<u8>> {
 }
 
 fn generate_random_key() -> Vec<u8> {
-    use rand::RngCore;
+    use rand::Rng;
     let mut key = vec![0u8; KEY_LEN];
     rand::rng().fill_bytes(&mut key);
     key

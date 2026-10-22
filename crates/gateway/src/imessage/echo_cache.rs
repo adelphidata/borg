@@ -72,7 +72,7 @@ fn text_hash(text: &str) -> String {
     hasher.update(normalized.as_bytes());
     let result = hasher.finalize();
     // Use first 16 hex chars as prefix
-    format!("{result:x}")[..16].to_string()
+    hex::encode(result)[..16].to_string()
 }
 
 #[cfg(test)]

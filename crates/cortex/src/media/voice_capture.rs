@@ -593,7 +593,7 @@ fn recorder_actor(shared: Arc<RecorderShared>, cmd_rx: std::sync::mpsc::Receiver
             return;
         }
     };
-    let device_rate = supported.sample_rate().0;
+    let device_rate = supported.sample_rate();
     let device_channels = supported.channels();
     let sample_format = supported.sample_format();
     let stream_cfg: cpal::StreamConfig = supported.into();
@@ -605,7 +605,7 @@ fn recorder_actor(shared: Arc<RecorderShared>, cmd_rx: std::sync::mpsc::Receiver
 
     let stream_result = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_cfg,
+            stream_cfg,
             move |data: &[f32], _: &_| {
                 let mono = downmix_and_resample_f32(data, device_channels, resample_ratio);
                 process_chunk(&shared_cb, &mono);
@@ -614,7 +614,7 @@ fn recorder_actor(shared: Arc<RecorderShared>, cmd_rx: std::sync::mpsc::Receiver
             None,
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_cfg,
+            stream_cfg,
             move |data: &[i16], _: &_| {
                 let mono = downmix_and_resample_i16(data, device_channels, resample_ratio);
                 process_chunk(&shared_cb, &mono);
@@ -623,7 +623,7 @@ fn recorder_actor(shared: Arc<RecorderShared>, cmd_rx: std::sync::mpsc::Receiver
             None,
         ),
         cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_cfg,
+            stream_cfg,
             move |data: &[u16], _: &_| {
                 let mono: Vec<i16> = data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
                 let mono = resample_i16(&mono, device_channels, resample_ratio);

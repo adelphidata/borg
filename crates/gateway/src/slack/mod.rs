@@ -124,7 +124,7 @@ pub async fn handle_slack_webhook(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::sync::Arc;
 

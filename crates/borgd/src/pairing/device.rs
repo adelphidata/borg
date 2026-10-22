@@ -191,7 +191,7 @@ pub async fn run_pairing_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let nonce4 = read_frame(&mut stream).await.context("read nonce4")?;
     let ct4 = read_frame(&mut stream).await.context("read ct4")?;
     let pt4 = aead
-        .decrypt(Nonce::from_slice(&nonce4), ct4.as_ref())
+        .decrypt(&parse_nonce(&nonce4)?, ct4.as_ref())
         .map_err(|e| anyhow!("decrypt client hello: {e:?}"))?;
     let hello: ClientHello = serde_json::from_slice(&pt4).context("parse client hello")?;
 
@@ -256,7 +256,7 @@ pub async fn run_pairing_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     let reply_pt = serde_json::to_vec(&reply)?;
     let nonce5 = random_nonce();
     let ct5 = aead
-        .encrypt(Nonce::from_slice(&nonce5), reply_pt.as_ref())
+        .encrypt(&Nonce::from(nonce5), reply_pt.as_ref())
         .map_err(|e| anyhow!("encrypt reply: {e:?}"))?;
     write_frame(&mut stream, &nonce5).await?;
     write_frame(&mut stream, &ct5).await?;
@@ -275,7 +275,8 @@ impl ClientPubBytes {
 
 fn parse_client_pub(pem: &str) -> Result<ClientPubBytes> {
     let kp = rcgen::KeyPair::from_pem(pem).context("parse client pubkey pem")?;
-    Ok(ClientPubBytes(kp.public_key_der()))
+    use rcgen::PublicKeyData;
+    Ok(ClientPubBytes(kp.subject_public_key_info()))
 }
 
 fn derive_aead(shared: &[u8]) -> Result<ChaCha20Poly1305> {
@@ -283,11 +284,16 @@ fn derive_aead(shared: &[u8]) -> Result<ChaCha20Poly1305> {
     let mut okm = [0u8; 32];
     hk.expand(b"aead-key", &mut okm)
         .map_err(|e| anyhow!("hkdf expand: {e}"))?;
-    Ok(ChaCha20Poly1305::new(Key::from_slice(&okm)))
+    Ok(ChaCha20Poly1305::new(&Key::from(okm)))
+}
+
+/// A wire nonce must be exactly 12 bytes; anything else is a framing error.
+fn parse_nonce(bytes: &[u8]) -> Result<Nonce> {
+    Nonce::try_from(bytes).map_err(|_| anyhow!("nonce must be 12 bytes, got {}", bytes.len()))
 }
 
 fn random_nonce() -> [u8; 12] {
-    use rand::RngCore;
+    use rand::Rng;
     let mut n = [0u8; 12];
     rand::rng().fill_bytes(&mut n);
     n
@@ -367,7 +373,7 @@ pub mod client {
         let pt = serde_json::to_vec(&hello)?;
         let nonce = random_nonce();
         let ct = aead
-            .encrypt(Nonce::from_slice(&nonce), pt.as_ref())
+            .encrypt(&Nonce::from(nonce), pt.as_ref())
             .map_err(|e| anyhow!("encrypt hello: {e:?}"))?;
         write_frame(&mut stream, &nonce).await?;
         write_frame(&mut stream, &ct).await?;
@@ -375,7 +381,7 @@ pub mod client {
         let nonce5 = read_frame(&mut stream).await?;
         let ct5 = read_frame(&mut stream).await?;
         let pt5 = aead
-            .decrypt(Nonce::from_slice(&nonce5), ct5.as_ref())
+            .decrypt(&parse_nonce(&nonce5)?, ct5.as_ref())
             .map_err(|e| anyhow!("decrypt reply: {e:?}"))?;
         let reply: DaemonReply = serde_json::from_slice(&pt5)?;
 
@@ -391,7 +397,7 @@ pub mod client {
 /// Mint a fresh 8-char base32 pairing code (Crockford-flavored alphabet, no
 /// confusable chars).
 pub fn mint_pairing_code() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
     let mut rng = rand::rng();
     (0..9)

@@ -3037,7 +3037,7 @@ description = "Script fallback"
         let body = "command=%2Fborg&text=hi&user_id=U1&channel_id=C1";
         let ts = chrono::Utc::now().timestamp().to_string();
         let sig = {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
             let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
             mac.update(format!("v0:{ts}:{body}").as_bytes());
@@ -3086,7 +3086,7 @@ description = "Script fallback"
             let body = "command=%2Fborg&text=hi&user_id=U1&channel_id=C1";
             let ts = chrono::Utc::now().timestamp().to_string();
             let sig = {
-                use hmac::{Hmac, Mac};
+                use hmac::{Hmac, KeyInit, Mac};
                 use sha2::Sha256;
                 let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
                 mac.update(format!("v0:{ts}:{body}").as_bytes());
@@ -3138,7 +3138,7 @@ description = "Script fallback"
             let body = format!("command=%2Fborg&text=hi&user_id=U1&channel_id={channel}");
             let ts = chrono::Utc::now().timestamp().to_string();
             let sig = {
-                use hmac::{Hmac, Mac};
+                use hmac::{Hmac, KeyInit, Mac};
                 use sha2::Sha256;
                 let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
                 mac.update(format!("v0:{ts}:{body}").as_bytes());

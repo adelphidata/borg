@@ -333,7 +333,7 @@ pub fn bytes_to_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
 pub fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::util::hex::hex_encode(&hasher.finalize())
 }
 
 /// Blended score combining similarity and recency.

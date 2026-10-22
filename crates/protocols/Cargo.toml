@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 tokio = { workspace = true }
@@ -19,7 +20,7 @@ futures-util = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 rand = { workspace = true }
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -30,4 +31,4 @@ windows-sys = { version = "0.59", features = [
 tempfile = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }

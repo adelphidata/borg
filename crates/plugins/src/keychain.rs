@@ -126,7 +126,19 @@ pub(crate) fn build_macos_store_command(
 /// release wrote through `cmdkey`, so entries already on disk read back and
 /// `cmdkey /list` and `/delete` still find what this writes.
 pub fn windows_entry(service: &str, account: &str) -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new_with_target(&windows_target(service, account), service, account)
+    // `store_status` performs the one-time platform store registration that
+    // `keyring::Entry::new` would otherwise do; the modifier constructor lives
+    // on the core entry type only.
+    if let Err(e) = keyring::Entry::store_status() {
+        return Err(keyring::Error::Invalid(
+            "credential store".to_string(),
+            format!("Windows Credential Manager unavailable: {e}"),
+        ));
+    }
+    let target = windows_target(service, account);
+    let modifiers = std::collections::HashMap::from([("target", target.as_str())]);
+    let inner = keyring_core::Entry::new_with_modifiers(service, account, &modifiers)?;
+    Ok(keyring::Entry { inner })
 }
 
 fn windows_target(service: &str, account: &str) -> String {

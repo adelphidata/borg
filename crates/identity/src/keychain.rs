@@ -13,7 +13,7 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -327,7 +327,7 @@ const SCRYPT_P: u32 = 1;
 /// regardless, but paying the cost there too is harmless — a one-time boot
 /// cost).
 fn derive_key_v2(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
-    let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32)
+    let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: scrypt params: {e}")))?;
     let mut stretched = [0u8; 32];
     scrypt::scrypt(passphrase, salt, &params, &mut stretched)
@@ -338,7 +338,7 @@ fn derive_key_v2(passphrase: &[u8], salt: &[u8]) -> Result<Key, PkiError> {
     let mut okm = [0u8; 32];
     hk.expand(b"borg-kek-v2", &mut okm)
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: hkdf: {e}")))?;
-    Ok(*Key::from_slice(&okm))
+    Ok(Key::from(okm))
 }
 
 /// Derive the envelope key, refusing any version but the current one.
@@ -361,7 +361,7 @@ fn encrypt_map(map: &HashMap<String, Vec<u8>>, passphrase: &[u8]) -> Result<Vec<
     let key = derive_key(KEK_FILE_VERSION, passphrase, &salt)?;
     let cipher = ChaCha20Poly1305::new(&key);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
+        .encrypt(&Nonce::from(nonce_bytes), plaintext.as_ref())
         .map_err(|e| PkiError::Keychain(format!("FileKekStore: encrypt: {e}")))?;
     let b64 = base64::engine::general_purpose::STANDARD;
     let env = EncryptedKekFile {
@@ -395,8 +395,10 @@ fn decrypt_map(blob: &[u8], passphrase: &[u8]) -> Result<HashMap<String, Vec<u8>
     }
     let key = derive_key(env.version, passphrase, &salt)?;
     let cipher = ChaCha20Poly1305::new(&key);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|e| PkiError::Keychain(format!("FileKekStore: nonce: {e}")))?;
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext.as_ref())
         // Wrong passphrase, tampered ciphertext, or version skew all land
         // here. We deliberately do NOT include the underlying message so
         // we don't echo cipher state into logs.
@@ -417,7 +419,11 @@ mod tests {
     /// always absent) so the test never touches the real OS keychain.
     #[test]
     fn keychain_store_maps_missing_entry_to_notfound() {
-        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        // Registering the platform store first makes `keyring::Entry::new`
+        // skip its lazy registration, so the mock installed next is the store
+        // the entry resolves against.
+        let _ = keyring::Entry::store_status();
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
         let store = KeychainStore::new();
         let account = "borg-test-kek-missing";
         match store.get(account) {

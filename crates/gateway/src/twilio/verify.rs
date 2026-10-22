@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::http::HeaderMap;
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;

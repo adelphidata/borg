@@ -1150,7 +1150,7 @@ impl Database {
             }
             tracing::warn!("integrity: stored hmac_salt is corrupted, regenerating");
         }
-        use rand::Rng;
+        use rand::RngExt;
         let mut salt = vec![0u8; 32];
         rand::rng().fill(&mut salt[..]);
         let hex: String = salt.iter().fold(String::new(), |mut s, b| {
@@ -1168,7 +1168,7 @@ impl Database {
     /// Uses HMAC-SHA256(key=salt, data=domain) as a simple KDF.
     #[allow(clippy::expect_used)]
     pub fn derive_hmac_key(&self, domain: &[u8]) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
         let mut mac =

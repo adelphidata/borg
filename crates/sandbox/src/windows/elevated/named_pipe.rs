@@ -48,7 +48,7 @@ pub const PIPE_NONCE_BYTES: usize = 12;
 /// `server_pid` is for diagnostic readability only; the nonce is the
 /// real entropy. Same-PID re-use is fine because the nonce is fresh.
 pub fn pipe_name(server_pid: u32) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let mut nonce = [0u8; PIPE_NONCE_BYTES];
     for b in nonce.iter_mut() {

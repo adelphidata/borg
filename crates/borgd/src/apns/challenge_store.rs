@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
+use rand::Rng;
 
 /// 5 minutes — Apple's recommended upper bound for App Attest challenge
 /// freshness. Shorter doesn't materially improve security but does break

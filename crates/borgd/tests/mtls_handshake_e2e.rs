@@ -49,17 +49,14 @@ struct ServerHandle {
     _shutdown: oneshot::Sender<()>,
 }
 
-/// Pin the rustls process-level `CryptoProvider` to `ring`, matching what
-/// production borgd installs in `auth::tls`. Without this the handshake panics
-/// with "could not automatically determine the process-level CryptoProvider"
-/// because both `ring` and `aws-lc-rs` are present in the dependency tree.
-/// Idempotent + thread-safe so the parallel tests can all call it.
+/// Pin the rustls process-level `CryptoProvider` to `ring`, the same call
+/// production borgd makes first thing in `main`. Without it the handshake
+/// panics with "could not automatically determine the process-level
+/// CryptoProvider" because both `ring` and `aws-lc-rs` are present in the
+/// dependency tree. Idempotent + thread-safe so the parallel tests can all
+/// call it.
 fn ensure_crypto_provider() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+    borgd::auth::tls::install_crypto_provider();
 }
 
 /// Spin up a minimal mTLS-protected `PkiServer` on an ephemeral TCP port using

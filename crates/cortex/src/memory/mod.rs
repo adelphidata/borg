@@ -303,7 +303,7 @@ pub async fn write_memory_db(
 /// [`write_memory_db_if_unchanged`] as its precondition.
 pub fn memory_content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(content.as_bytes()))
+    crate::util::hex::hex_encode(&Sha256::digest(content.as_bytes()))
 }
 
 /// Overwrite a memory entry whose new `content` was derived from a read

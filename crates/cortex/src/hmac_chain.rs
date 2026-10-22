@@ -3,7 +3,7 @@
 //! Provides a generic HMAC builder, chain verification, per-hour rate limiting,
 //! and periodic checkpointing. Used by vitals, bond, and evolution systems.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 

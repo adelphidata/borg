@@ -7,7 +7,7 @@
 //! 1350-line `impl CredentialPool` block forces every reader of that block
 //! to scroll past pure helpers to follow the resolver flow.
 
-use rand::RngCore;
+use rand::Rng;
 
 /// Hard ceiling for any cooldown duration — defends against absurd provider
 /// hints like `retry_after: 999999999` (yes, it happens).

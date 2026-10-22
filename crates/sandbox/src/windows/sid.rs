@@ -24,7 +24,7 @@ mod win {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
-    use rand::Rng;
+    use rand::RngExt;
     use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows_sys::Win32::Security::PSID;
@@ -157,7 +157,7 @@ mod win {
                 )))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                use rand::Rng;
+                use rand::RngExt;
                 let mut rng = rand::rng();
                 for b in buf.iter_mut() {
                     *b = rng.random();

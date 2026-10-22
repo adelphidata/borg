@@ -177,7 +177,7 @@ fn write_name_file(path: &Path, name: &str) -> io::Result<()> {
 }
 
 fn nonce_hex() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let bytes: [u8; 12] = rand::rng().random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -71,7 +71,7 @@ pub async fn verify_integrity(
 pub fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    crate::util::hex::hex_encode(&hasher.finalize())
 }
 
 /// Resolve the full filesystem path for a relative template path.

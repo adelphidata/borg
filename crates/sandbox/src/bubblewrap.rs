@@ -598,6 +598,7 @@ mod tests {
     /// `sleep` and `sh` concurrently, so PATH can never be replaced), and a
     /// host with a real `bwrap` further down would otherwise satisfy the
     /// "nothing acceptable" case.
+    #[cfg(unix)]
     const FAKE_HELPER: &str = "borg-test-sandbox-helper";
 
     #[cfg(unix)]

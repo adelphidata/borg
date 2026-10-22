@@ -1,6 +1,6 @@
 //! Runtime resource limiting: wall-clock epoch timer and memory-growth caps.
 
-use anyhow::Result;
+use wasmtime::Result;
 
 /// Wall-clock timeout enforcer backed by wasmtime's epoch interruption.
 ///

@@ -127,7 +127,7 @@ pub fn create_isolated() -> io::Result<OwnedDesktop> {
 /// `hex` crate for a six-byte helper; this is the same primitive used
 /// in `sid::generate_random_cap_sid_string`.
 fn random_hex(n: usize) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     (0..n)
         .map(|_| {

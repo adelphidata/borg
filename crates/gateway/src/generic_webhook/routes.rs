@@ -180,7 +180,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use cortex::db::Database;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::sync::Mutex;
     use tower::ServiceExt;

@@ -52,8 +52,10 @@ pub mod violation;
 /// Windows API calls live under `cfg(target_os = "windows")` submodules.
 pub mod windows;
 
-/// Test-only serialisation of process-wide environment mutation.
-#[cfg(test)]
+/// Test-only serialisation of process-wide environment mutation. Every
+/// test that mutates the environment spawns a unix child, so the lock is
+/// unix-only too.
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     /// Held by every test that changes `PATH` (or reads it expecting a
     /// stable value across an await), since the test binary runs tests on

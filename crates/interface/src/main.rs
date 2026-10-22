@@ -433,6 +433,8 @@ enum BackupCmd {
 const RUNTIME_STACK_SIZE: usize = borgd::runtime::WORKER_STACK_SIZE;
 
 fn main() -> Result<()> {
+    borgd::auth::tls::install_crypto_provider();
+
     // Windows sandbox trampoline. Intercepted before tokio + clap so a
     // policy violation that re-execs `borg.exe __windows-sandbox-spawn ...`
     // cannot accidentally spin up the agent, open the audit DB, or honor

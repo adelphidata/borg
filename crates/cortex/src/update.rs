@@ -420,7 +420,7 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
             }
             hasher.update(&buf[..n]);
         }
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = crate::util::hex::hex_encode(&hasher.finalize());
         if actual != expected {
             bail!("Checksum verification failed:\n  expected: {expected}\n  got:      {actual}");
         }

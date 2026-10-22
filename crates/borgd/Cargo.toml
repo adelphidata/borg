@@ -62,7 +62,7 @@ base64 = { workspace = true }
 # LAN discovery — `mdns-sd` is pure-Rust (no system avahi/bonjour link)
 # and runs on macOS + Linux without extra deps. `hostname` resolves the
 # local hostname for both mDNS announcement and SAN auto-expansion.
-mdns-sd = "0.11"
+mdns-sd = "0.21"
 hostname = "0.4"
 which = { workspace = true }
 

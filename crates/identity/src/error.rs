@@ -66,8 +66,9 @@ mod tests {
         // rcgen::Error has no public constructor, so trigger a real one by
         // parsing a malformed CA PEM.
         let bogus_pem = "-----BEGIN CERTIFICATE-----\nnot valid\n-----END CERTIFICATE-----\n";
-        let rcgen_err = rcgen::CertificateParams::from_ca_cert_pem(bogus_pem)
-            .expect_err("malformed PEM must fail");
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let rcgen_err =
+            rcgen::Issuer::from_ca_cert_pem(bogus_pem, key).expect_err("malformed PEM must fail");
         let converted: PkiError = rcgen_err.into();
         assert!(
             matches!(converted, PkiError::Cert(_)),

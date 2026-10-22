@@ -44,7 +44,7 @@ use std::io;
 /// The password is held in memory only long enough to call `NetUserAdd`
 /// and is sealed via DPAPI at rest by the installer; it is never logged.
 pub fn generate_account_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const LOWER: &[u8] = b"abcdefghijkmnpqrstuvwxyz";
     const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
     const DIGIT: &[u8] = b"23456789";

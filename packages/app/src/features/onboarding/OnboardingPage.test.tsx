@@ -76,6 +76,7 @@ describe("OnboardingPage with nothing on the machine", () => {
     await waitFor(() => expect(screen.getByText("DeepSeek V4 Flash")).toBeTruthy());
     expect(screen.queryByText("Claude Opus 5")).toBeNull();
     fireEvent.click(screen.getByText("Change"));
+    await waitFor(() => expect(screen.getByText("Claude Opus 5")).toBeTruthy());
     fireEvent.click(screen.getByText("Claude Opus 5"));
     fireEvent.change(screen.getByPlaceholderText("OpenRouter API key"), {
       target: { value: "k" },

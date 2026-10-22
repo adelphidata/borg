@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tracing::warn;
 
 use crate::config::loop_guard::LoopGuardConfig;

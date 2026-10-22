@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rand::rngs::OsRng;
-use rand::TryRngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -8,7 +8,7 @@ use crate::constants;
 use crate::db::Database;
 
 /// Number of words in a pairing phrase. 6 words sampled uniformly from the
-/// 2048-word BIP-39 English wordlist via `OsRng` → ~66 bits of entropy per
+/// 2048-word BIP-39 English wordlist via `SysRng` → ~66 bits of entropy per
 /// code.
 const PHRASE_WORDS: usize = 6;
 
@@ -129,7 +129,7 @@ pub enum AccessCheckResult {
 /// Generate a 6-word pairing phrase from the BIP-39 English wordlist using
 /// a cryptographically secure RNG. Output is hyphen-joined lowercase.
 ///
-/// `expect` on `try_fill_bytes` is intentional: if `OsRng` fails, the
+/// `expect` on `try_fill_bytes` is intentional: if `SysRng` fails, the
 /// process has no usable entropy source and there is no safe degraded
 /// behavior — emitting a deterministic pairing code would be worse than
 /// crashing. The workspace `expect_used` lint is overridden locally rather
@@ -138,7 +138,7 @@ pub enum AccessCheckResult {
 fn generate_phrase() -> String {
     let wordlist = bip39::Language::English.word_list();
     let n = wordlist.len() as u32; // 2048
-    let mut rng = OsRng;
+    let mut rng = SysRng;
     (0..PHRASE_WORDS)
         .map(|_| {
             // Reject-sample to avoid modulo bias against the top of u32's
@@ -148,7 +148,7 @@ fn generate_phrase() -> String {
             loop {
                 let mut buf = [0u8; 4];
                 rng.try_fill_bytes(&mut buf)
-                    .expect("OsRng must succeed for pairing code generation");
+                    .expect("SysRng must succeed for pairing code generation");
                 let v = u32::from_le_bytes(buf);
                 if v < bound {
                     return wordlist[(v % n) as usize];

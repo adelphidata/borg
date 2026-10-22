@@ -66,14 +66,18 @@ pub fn build_engine() -> Result<wasmtime::Engine> {
     // Disable DWARF — smaller modules, no source-path/symbol leakage from a
     // signed package back into host logs.
     config.debug_info(false);
-    wasmtime::Engine::new(&config).context("build wasmtime engine")
+    wasmtime::Engine::new(&config)
+        .map_err(anyhow::Error::from)
+        .context("build wasmtime engine")
 }
 
 /// JIT-compile `wasm` against `engine`. The caller MUST have already cleared
 /// the install gauntlet (`verify_package` / `verify_installed_hmac`) — this
 /// function only compiles, it does NOT re-check signatures or HMAC seals.
 pub fn compile_module(engine: &wasmtime::Engine, wasm: &[u8]) -> Result<wasmtime::Module> {
-    wasmtime::Module::new(engine, wasm).context("compile wasm module")
+    wasmtime::Module::new(engine, wasm)
+        .map_err(anyhow::Error::from)
+        .context("compile wasm module")
 }
 
 /// Execute one verified WASM tool, routing capability imports through the
@@ -153,9 +157,11 @@ pub fn execute_tool_prepared(
         .context("WASM plugin missing exported memory")?;
     let alloc = instance
         .get_typed_func::<i32, i32>(&mut store, ABI_EXPORT_ALLOC)
+        .map_err(anyhow::Error::from)
         .context("WASM plugin missing alloc export")?;
     let call = instance
         .get_typed_func::<(i32, i32), i64>(&mut store, ABI_EXPORT_CALL)
+        .map_err(anyhow::Error::from)
         .context("WASM plugin missing borg_tool_call export")?;
 
     // Inject the dispatched tool name under the reserved key so plugins with

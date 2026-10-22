@@ -3,6 +3,17 @@
 use anyhow::{anyhow, Result};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
+/// Pin the process-level rustls `CryptoProvider` to `ring`.
+///
+/// Both `ring` and `aws-lc-rs` sit in the dependency tree (reqwest 0.13 pulls
+/// aws-lc-rs through a transitive default feature), so rustls cannot pick a
+/// provider on its own: `ClientConfig::builder()` and `ServerConfig::builder()`
+/// panic, and reqwest would otherwise fall back to aws-lc-rs. Call this once
+/// at process start, before any TLS client or server is built. Idempotent.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Server-side TLS material needed to build the daemon's gRPC `ServerTlsConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerCertMaterial {
@@ -54,12 +65,10 @@ mod tests {
         }
     }
 
-    /// Install the `ring` crypto provider for this process so that building a
-    /// real `tonic` TLS acceptor (which parses the PEMs) doesn't trip the
-    /// "ambiguous CryptoProvider" panic — both `ring` and `aws-lc-rs` are in
-    /// the dependency tree, so the default can't be auto-detected. Idempotent.
+    /// Building a real `tonic` TLS acceptor parses the PEMs, which needs the
+    /// process provider that production installs at startup.
     fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        install_crypto_provider();
     }
 
     #[test]

@@ -39,7 +39,7 @@ mod tests {
     }
 
     fn compute_signature(secret_b64: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let secret_bytes = base64::engine::general_purpose::STANDARD
             .decode(secret_b64)

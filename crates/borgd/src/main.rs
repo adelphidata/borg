@@ -30,6 +30,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    borgd::auth::tls::install_crypto_provider();
+
     // MCP stdio watchdog trampoline (Unix): a re-exec of this binary to
     // supervise a stdio MCP server and reap it if the daemon dies ungracefully
     // (SIGKILL/crash). Handled before clap AND before the tokio runtime is

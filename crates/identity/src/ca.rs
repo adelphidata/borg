@@ -93,21 +93,19 @@ pub fn generate_root_ca(common_name: &str) -> Result<RootCa, PkiError> {
     })
 }
 
-/// Rebuild the issuer `Certificate` from its stored PEMs.
+/// Rebuild the signing issuer from its stored PEMs.
 ///
-/// `self_signed` here does NOT mint a new CA — rcgen requires a live
-/// `Certificate` value to sign with, and re-self-signing the parsed params with
-/// the original key reproduces the existing root deterministically.
+/// The issuer carries the parsed root's distinguished name, key identifier
+/// method, and key usages alongside the signing key, so certs issued from
+/// it chain to the existing root deterministically.
 fn load_issuer(
     root_cert_pem: &str,
     root_key_pkcs8_pem: &str,
-) -> Result<(rcgen::Certificate, KeyPair), PkiError> {
+) -> Result<rcgen::Issuer<'static, KeyPair>, PkiError> {
     let issuer_key =
         KeyPair::from_pem(root_key_pkcs8_pem).map_err(|e| PkiError::KeyGen(e.to_string()))?;
-    let issuer_params = CertificateParams::from_ca_cert_pem(root_cert_pem)
-        .map_err(|e| PkiError::Parse(e.to_string()))?;
-    let issuer_cert = issuer_params.self_signed(&issuer_key)?;
-    Ok((issuer_cert, issuer_key))
+    rcgen::Issuer::from_ca_cert_pem(root_cert_pem, issuer_key)
+        .map_err(|e| PkiError::Parse(e.to_string()))
 }
 
 /// Issue a server cert signed by the supplied root CA.
@@ -116,13 +114,13 @@ pub fn issue_server_cert(
     root_key_pkcs8_pem: &str,
     params_in: &ServerCertParams<'_>,
 ) -> Result<(IssuedCert, String), PkiError> {
-    let (issuer_cert, issuer_key) = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
+    let issuer = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
 
     let mut params = CertificateParams::default();
     params.distinguished_name = name(params_in.common_name);
     let mut sans: Vec<SanType> = Vec::with_capacity(params_in.san_dns.len());
     for dns in params_in.san_dns {
-        let ia5 = rcgen::Ia5String::try_from(dns.clone())
+        let ia5 = rcgen::string::Ia5String::try_from(dns.clone())
             .map_err(|e| PkiError::Cert(format!("san dns {dns}: {e}")))?;
         sans.push(SanType::DnsName(ia5));
     }
@@ -143,7 +141,7 @@ pub fn issue_server_cert(
         KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|e| PkiError::KeyGen(e.to_string()))?;
     let not_before = params.not_before.unix_timestamp();
     let not_after = params.not_after.unix_timestamp();
-    let cert = params.signed_by(&key, &issuer_cert, &issuer_key)?;
+    let cert = params.signed_by(&key, &issuer)?;
 
     Ok((
         IssuedCert {
@@ -162,7 +160,7 @@ pub fn issue_client_cert(
     root_key_pkcs8_pem: &str,
     params_in: &ClientCertParams<'_>,
 ) -> Result<IssuedCert, PkiError> {
-    let (issuer_cert, issuer_key) = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
+    let issuer = load_issuer(root_cert_pem, root_key_pkcs8_pem)?;
 
     let client_pubkey = KeyPair::from_pem(params_in.client_public_key_pem)
         .map_err(|e| PkiError::KeyGen(format!("client pubkey parse: {e}")))?;
@@ -170,7 +168,7 @@ pub fn issue_client_cert(
     let mut params = CertificateParams::default();
     params.distinguished_name = name(params_in.device_label);
     let san_uri = format!("borg-device:{}", params_in.device_id);
-    let san_ia5 = rcgen::Ia5String::try_from(san_uri.clone())
+    let san_ia5 = rcgen::string::Ia5String::try_from(san_uri.clone())
         .map_err(|e| PkiError::Cert(format!("san uri {san_uri}: {e}")))?;
     params.subject_alt_names = vec![SanType::URI(san_ia5)];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -181,7 +179,7 @@ pub fn issue_client_cert(
 
     let not_before = params.not_before.unix_timestamp();
     let not_after = params.not_after.unix_timestamp();
-    let cert = params.signed_by(&client_pubkey, &issuer_cert, &issuer_key)?;
+    let cert = params.signed_by(&client_pubkey, &issuer)?;
 
     Ok(IssuedCert {
         cert_pem: cert.pem(),
@@ -278,8 +276,7 @@ mod tests {
         assert!(ca.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(ca.key_pkcs8_pem.contains("PRIVATE KEY"));
         let key = KeyPair::from_pem(&ca.key_pkcs8_pem).expect("reparse");
-        let params = CertificateParams::from_ca_cert_pem(&ca.cert_pem).expect("ca params");
-        let _re = params.self_signed(&key).expect("re-issue");
+        let _issuer = rcgen::Issuer::from_ca_cert_pem(&ca.cert_pem, key).expect("ca params");
         // A root CA must be self-signed: its signature verifies under its own key.
         assert_chains_to(&ca.cert_der, &ca.cert_der);
         let meta = parse_cert_metadata(&ca.cert_der).expect("parse");

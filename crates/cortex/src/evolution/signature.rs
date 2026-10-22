@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     fn fresh_key() -> SigningKey {
-        use rand::Rng;
+        use rand::RngExt;
         let mut seed = [0u8; 32];
         rand::rng().fill(&mut seed[..]);
         SigningKey::from_bytes(&seed)

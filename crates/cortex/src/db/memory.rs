@@ -455,7 +455,7 @@ impl Database {
     /// transaction to keep the entry row and its index entries consistent.
     pub async fn upsert_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let hash = crate::util::hex::hex_encode(&Sha256::digest(content.as_bytes()));
         let now = chrono::Utc::now().timestamp();
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<()> = async {
@@ -499,7 +499,7 @@ impl Database {
         content: &str,
     ) -> Result<bool> {
         use sha2::{Digest, Sha256};
-        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let hash = crate::util::hex::hex_encode(&Sha256::digest(content.as_bytes()));
         let now = chrono::Utc::now().timestamp();
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result: anyhow::Result<bool> = async {
@@ -651,7 +651,7 @@ impl Database {
                 }
                 None => content.to_string(),
             };
-            let hash = format!("{:x}", Sha256::digest(new_content.as_bytes()));
+            let hash = crate::util::hex::hex_encode(&Sha256::digest(new_content.as_bytes()));
             self.conn.execute(
                 "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)

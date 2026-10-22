@@ -51,7 +51,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     fn compute_signature(secret: &str, timestamp: &str, body: &str) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let sig_basestring = format!("v0:{timestamp}:{body}");
         let mut mac =

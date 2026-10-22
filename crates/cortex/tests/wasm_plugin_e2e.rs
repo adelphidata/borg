@@ -131,7 +131,7 @@ fn write_signed_package_with(
     let wasm_sha = {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(wasm);
-        format!("{digest:x}")
+        cortex::util::hex::hex_encode(&digest)
     };
     let manifest = WasmPluginManifest {
         schema_version: "borg.plugin.v1".to_string(),

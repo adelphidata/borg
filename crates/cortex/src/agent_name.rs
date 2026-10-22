@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE, SETUP_FILE};
 

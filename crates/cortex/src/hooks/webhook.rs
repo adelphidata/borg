@@ -396,7 +396,7 @@ async fn deliver(client: &reqwest::Client, delivery: &Delivery) {
 /// reproduce the prefix.
 #[allow(clippy::expect_used)]
 fn sign_body(secret: &[u8], body: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key size");
     mac.update(body);
     crate::util::hex::hex_encode(&mac.finalize().into_bytes())
@@ -538,7 +538,7 @@ mod tests {
         // agreeing with whatever the implementation happens to do. A framed or
         // salted MAC must fail this.
         let expected = {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"top-secret").unwrap();
             mac.update(&req.body);
             format!(

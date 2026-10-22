@@ -23,7 +23,7 @@ which = { workspace = true }
 libsql = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
 subtle = "2.6"
 regex = { workspace = true }
 axum = { workspace = true }
@@ -36,10 +36,10 @@ uuid = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
-sha1 = "0.10"
+sha1 = "0.11"
 serde_urlencoded = "0.7"
 base64 = { workspace = true }
-ed25519-dalek = { version = "2", features = ["std"] }
+ed25519-dalek = { workspace = true }
 url = "2"
 scraper = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }

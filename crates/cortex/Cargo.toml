@@ -11,7 +11,7 @@ coding = { path = "../coding" }
 sandbox = { path = "../sandbox" }
 plugins = { path = "../plugins" }
 mcp = { path = "../mcp" }
-lru = "0.18"
+lru = "0.19"
 tokio = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 url = { workspace = true }
@@ -66,11 +66,11 @@ tar = { workspace = true }
 zstd = { workspace = true }
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
-bip39 = "2"
+bip39 = "3"
 iana-time-zone = "0.1"
 nucleo-matcher = "0.3"
 portable-pty = "0.9"
-cpal = "0.15"
+cpal = "0.18"
 hound = "3.5"
 # Edge TTS — Microsoft's free TTS endpoint (used by as the default
 # provider). Adds WSS + tungstenite + rustls but no API key required.
@@ -133,6 +133,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 libc = { workspace = true }
 wiremock = "0.6"
 libsql = { workspace = true }
-wasm-encoder = "0.244"
+wasm-encoder = "0.262"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry = { workspace = true, features = ["testing"] }

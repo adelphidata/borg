@@ -909,7 +909,7 @@ fn catalog_cache_key(
     manifest: &ServerManifest,
     hmac_key: &[u8],
 ) -> Option<String> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let mcp::manifest::Transport::Stdio { command, args, env } = &manifest.transport else {

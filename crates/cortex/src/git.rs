@@ -903,9 +903,8 @@ pub async fn workspace_fingerprint(cwd: &Path) -> Option<String> {
         sha2::Digest::update(&mut hasher, meta.len().to_le_bytes());
         sha2::Digest::update(&mut hasher, modified_nanos.to_le_bytes());
     }
-    Some(format!(
-        "{:x}",
-        <sha2::Sha256 as sha2::Digest>::finalize(hasher)
+    Some(crate::util::hex::hex_encode(
+        &<sha2::Sha256 as sha2::Digest>::finalize(hasher),
     ))
 }
 

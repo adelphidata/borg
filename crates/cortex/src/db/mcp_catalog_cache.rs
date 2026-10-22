@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use libsql::params;
-use rand::RngCore;
+use rand::Rng;
 
 use super::Database;
 

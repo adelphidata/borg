@@ -20,17 +20,18 @@ hmac = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
 keyring = { workspace = true }
+keyring-core = { workspace = true }
 ed25519-dalek = { workspace = true }
 wasmparser = { workspace = true }
 wasmtime = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-wasm-encoder = "0.244"
+wasm-encoder = "0.262"
 # Watchdog timeout for wasmtime-driven tests. Without this, a hung
 # test (e.g. an EpochTimer drop racing with the ticker thread) blocks
 # `cargo test` indefinitely instead of failing the offending test.
-ntest = "0.9"
+ntest = "0.10"
 
 [lints]
 workspace = true

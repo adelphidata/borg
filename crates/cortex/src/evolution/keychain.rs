@@ -18,12 +18,12 @@ use crate::constants::{
 };
 use crate::util::hex::{hex_decode, hex_encode};
 
-/// Generate a fresh Ed25519 signing key. Uses `rand::rng().fill()` (rand 0.9
-/// CSPRNG) and feeds the bytes to `SigningKey::from_bytes` rather than
-/// `SigningKey::generate`, because `ed25519-dalek` v2 still depends on
-/// `rand_core` 0.6 and does not interop with `rand` 0.9's OsRng directly.
+/// Generate a fresh Ed25519 signing key. Fills the seed from the thread-local
+/// CSPRNG and feeds it to `SigningKey::from_bytes` rather than calling
+/// `SigningKey::generate`, so the key material never depends on which
+/// `rand_core` generation `ed25519-dalek` links against.
 fn generate_signing_key() -> SigningKey {
-    use rand::Rng;
+    use rand::RngExt;
     let mut seed = [0u8; SECRET_KEY_LENGTH];
     rand::rng().fill(&mut seed[..]);
     SigningKey::from_bytes(&seed)
