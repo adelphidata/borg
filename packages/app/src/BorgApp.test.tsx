@@ -121,6 +121,17 @@ describe("BorgApp shell", () => {
     await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());
   });
 
+  it("starts another new conversation from one that already began at new", async () => {
+    const { daemon } = mount();
+    await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());
+    const opens = () => daemon.calls.filter((c) => c.method === "Open").length;
+    act(() => screen.getByText("+ New").click());
+    await waitFor(() => expect(opens()).toBe(2));
+    // The route is the same as the one on screen; it must still open afresh.
+    act(() => screen.getByText("+ New").click());
+    await waitFor(() => expect(opens()).toBe(3));
+  });
+
   it("archives a conversation from the sidebar", async () => {
     const daemon = fakeDaemon({ ...BASE, SetSessionArchived: {} });
     mount(daemon);

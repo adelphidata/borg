@@ -42,6 +42,19 @@ describe("summarize", () => {
     expect(summarize({ name: "n", path: "p" })).toBe("p");
   });
 
+  it("reads a desktop action as its verb and target", () => {
+    expect(summarize({ action: "capture", app: "Calculator", mode: "som" })).toBe(
+      "capture Calculator",
+    );
+    expect(summarize({ action: "click", pid: 1, window_id: 2, element_index: 4 })).toBe(
+      "click [4]",
+    );
+    expect(summarize({ action: "click", pid: 1, x: 10, y: 20 })).toBe("click (10, 20)");
+    expect(summarize({ action: "type", pid: 1, text: "hello" })).toBe("type hello");
+    expect(summarize({ action: "key", pid: 1, keys: ["cmd", "n"] })).toBe("key cmd+n");
+    expect(summarize({ action: "list_windows" })).toBe("list_windows");
+  });
+
   it("has nothing to say about an argumentless call", () => {
     expect(summarize({})).toBeNull();
     expect(summarize(null)).toBeNull();

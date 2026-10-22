@@ -43,6 +43,24 @@ export function patchOf(args: Record<string, unknown> | null): string | null {
 /** A one-line gist of the call, so a collapsed row still says what it did. */
 export function summarize(args: Record<string, unknown> | null): string | null {
   if (!args) return null;
+  // A desktop action reads as "click Calculator [4]": the verb, then what it
+  // was pointed at. Without this every computer_use row is a bare tool name.
+  if (typeof args.action === "string" && args.action.trim() !== "") {
+    const parts = [args.action];
+    for (const field of ["app", "text", "value", "key"]) {
+      const value = args[field];
+      if (typeof value === "string" && value.trim() !== "") {
+        parts.push(value);
+        break;
+      }
+    }
+    if (Array.isArray(args.keys)) parts.push(args.keys.join("+"));
+    if (typeof args.element_index === "number") parts.push(`[${args.element_index}]`);
+    else if (typeof args.x === "number" && typeof args.y === "number") {
+      parts.push(`(${args.x}, ${args.y})`);
+    }
+    return parts.join(" ");
+  }
   // Whichever identifying field this tool happens to use.
   for (const field of ["path", "file_path", "command", "query", "url", "pattern", "name"]) {
     const value = args[field];

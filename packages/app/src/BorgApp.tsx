@@ -294,7 +294,11 @@ function Shell({ platform }: { platform: Platform }) {
             {routes.map((r) => (
               <Route key={r.id} path={r.path} element={<r.page />} />
             ))}
-            <Route path="/c/:sessionId" element={<ConversationPage />} />
+            {/* Keyed on the navigation, not the path: "+ New" from a
+                conversation that itself began at `/c/new` lands on the same
+                route, and without a remount the page keeps the session it
+                already has. */}
+            <Route path="/c/:sessionId" element={<ConversationPage key={location.key} />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
