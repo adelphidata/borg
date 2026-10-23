@@ -137,6 +137,12 @@ describe("VoiceSettingsPage", () => {
     fireEvent.change(prompt, { target: { value: "Borg, Adelphi" } });
     fireEvent.blur(prompt);
     await waitFor(() => expect(saved(daemon, "audio.prompt")).toEqual(["Borg, Adelphi"]));
+    const temperature = screen.getByLabelText("Temperature");
+    fireEvent.change(temperature, { target: { value: "0.2" } });
+    fireEvent.blur(temperature);
+    await waitFor(() => expect(saved(daemon, "audio.temperature")).toEqual(["0.2"]));
+    // Beam size only means something to the on-device decoder.
+    expect(screen.queryByLabelText("Beam size")).toBeNull();
     fireEvent.click(screen.getByRole("switch", { name: /Send right away/ }));
     await waitFor(() => expect(saved(daemon, "voice.dictation_auto_send")).toEqual(["true"]));
   });

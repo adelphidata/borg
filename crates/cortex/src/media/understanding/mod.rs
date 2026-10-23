@@ -47,6 +47,9 @@ pub struct AudioTranscriber {
     default_language: Option<String>,
     /// `audio.prompt`: the vocabulary hint every request carries.
     prompt: Option<String>,
+    /// `audio.temperature` and `audio.beam_size`: how the decoder searches.
+    temperature: f64,
+    beam_size: u32,
     default_timeout: Duration,
 }
 
@@ -78,6 +81,8 @@ impl AudioTranscriber {
             min_file_size: audio.min_file_size,
             default_language: audio.language.clone(),
             prompt: audio.prompt.clone().filter(|p| !p.trim().is_empty()),
+            temperature: audio.temperature.clamp(0.0, 1.0),
+            beam_size: audio.beam_size.max(1),
             default_timeout: Duration::from_millis(audio.timeout_ms),
         })
     }
@@ -151,6 +156,8 @@ impl AudioTranscriber {
                 model: entry.model.clone(),
                 language: lang,
                 prompt: self.prompt.clone(),
+                temperature: self.temperature,
+                beam_size: self.beam_size,
                 timeout,
             };
 
@@ -456,6 +463,8 @@ mod tests {
             min_file_size: 1024,
             default_language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: 5,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 100]; // < 1024
@@ -474,6 +483,8 @@ mod tests {
             min_file_size: 10,
             default_language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: 5,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 2000]; // > 1000
@@ -544,6 +555,8 @@ mod tests {
             min_file_size: 1,
             default_language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: 5,
             default_timeout: Duration::from_secs(5),
         };
 
@@ -609,6 +622,8 @@ mod tests {
             min_file_size: 1,
             default_language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: 5,
             default_timeout: Duration::from_secs(5),
         };
 

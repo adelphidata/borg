@@ -379,10 +379,23 @@ pub struct AudioConfig {
     /// "bork".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Decoding temperature, 0.0–1.0. Zero is deterministic and is what
+    /// every Whisper-shaped provider defaults to; a little above zero helps
+    /// a model that keeps repeating itself on poor audio.
+    #[serde(default)]
+    pub temperature: f64,
+    /// Beam width for the on-device decoder (`local`). 1 is greedy and
+    /// fastest; whisper.cpp's own default is 5. Cloud providers ignore it.
+    #[serde(default = "default_beam_size")]
+    pub beam_size: u32,
     /// Default timeout in milliseconds.
     pub timeout_ms: u64,
     /// Echo transcript back to the sender.
     pub echo_transcript: bool,
+}
+
+fn default_beam_size() -> u32 {
+    5
 }
 
 impl Default for AudioConfig {
@@ -394,6 +407,8 @@ impl Default for AudioConfig {
             min_file_size: 1024,
             language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: default_beam_size(),
             timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }

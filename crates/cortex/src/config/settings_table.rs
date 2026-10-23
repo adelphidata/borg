@@ -320,6 +320,8 @@ define_settings! {
         "audio.min_file_size" => audio.min_file_size, parsed(u64);
         "audio.language" => audio.language, opt_string;
         "audio.prompt" => audio.prompt, opt_string;
+        "audio.temperature" => audio.temperature, range(f64, 0.0_f64, 1.0);
+        "audio.beam_size" => audio.beam_size, parsed(u32);
         "audio.timeout_ms" => audio.timeout_ms, parsed(u64);
         "audio.echo_transcript" => audio.echo_transcript, parsed(bool);
 

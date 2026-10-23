@@ -2,9 +2,13 @@ import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { chordOf, isMacPlatform } from "../../lib/keybinds";
 import { usePlatform } from "../../lib/platform";
 import { hasDeviceVoice, useSpeaker, useSpeechSource } from "../../lib/speech";
-import { readLocalVoiceChoice, useVoicePrefs, writeLocalVoiceChoice } from "../../lib/voice";
+import {
+  readLocalVoiceChoice,
+  readyProvider,
+  useVoicePrefs,
+  writeLocalVoiceChoice,
+} from "../../lib/voice";
 import { MODIFIER_CODES, parseShortcut, shortcutLabel } from "../conversation/dictation";
-import { readyProvider } from "../conversation/VoiceInputButton";
 import {
   BackLink,
   DETAIL_COL,
@@ -592,6 +596,22 @@ function DictationSection({
                 placeholder="Borg, Adelphi, Kubernetes"
                 onCommit={(v) => save("audio.prompt", v)}
               />
+              <TextSetting
+                label="Temperature"
+                hint="0 is exact and is right for nearly everyone. Nudge it up (0.2) only if the transcriber keeps repeating itself on poor audio."
+                value={value("audio.temperature")}
+                placeholder="0"
+                onCommit={(v) => save("audio.temperature", v.trim() === "" ? "0" : v.trim())}
+              />
+              {row?.provider === "local" && (
+                <TextSetting
+                  label="Beam size"
+                  hint="How many candidate transcripts the on-device decoder keeps. 1 is fastest; 5 is the usual trade-off."
+                  value={value("audio.beam_size")}
+                  placeholder="5"
+                  onCommit={(v) => save("audio.beam_size", v.trim() === "" ? "5" : v.trim())}
+                />
+              )}
               <Switch
                 label="Sounds"
                 desc="A short tick when recording starts and stops."

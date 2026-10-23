@@ -27,6 +27,11 @@ pub(super) struct TranscriptionRequest<'a> {
     /// Names and phrases the recording is likely to contain. Whisper-shaped
     /// providers take it as `prompt`; the rest ignore it.
     pub prompt: Option<String>,
+    /// Decoding temperature; 0.0 is the provider default and is not sent.
+    pub temperature: f64,
+    /// Beam width for the on-device decoder; cloud providers ignore it.
+    #[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
+    pub beam_size: u32,
     pub timeout: Duration,
 }
 
@@ -65,6 +70,11 @@ impl TranscriptionProvider for WhisperProvider {
         }
         if let Some(ref prompt) = req.prompt {
             form = form.text("prompt", prompt.clone());
+        }
+        // Zero is every provider's own default; sending it would only trip
+        // the endpoints that reject the field.
+        if req.temperature > 0.0 {
+            form = form.text("temperature", req.temperature.to_string());
         }
 
         let resp = self
@@ -214,11 +224,23 @@ impl TranscriptionProvider for LocalWhisperProvider {
         let threads = self.threads;
         let audio = req.audio_bytes.to_vec();
         let language = req.language.clone();
+        let prompt = req.prompt.clone();
+        let decode = LocalDecode {
+            temperature: req.temperature as f32,
+            beam_size: req.beam_size,
+        };
 
         // whisper-rs is purely synchronous + heavy — push it to spawn_blocking
         // so a 5-second transcription doesn't stall the tokio dispatcher.
         tokio::task::spawn_blocking(move || {
-            local_whisper_transcribe(&model_path, &audio, language.as_deref(), threads)
+            local_whisper_transcribe(
+                &model_path,
+                &audio,
+                language.as_deref(),
+                prompt.as_deref(),
+                decode,
+                threads,
+            )
         })
         .await
         .context("local whisper task panicked")?
@@ -229,11 +251,21 @@ impl TranscriptionProvider for LocalWhisperProvider {
     }
 }
 
+/// How the on-device decoder searches: `audio.temperature` and `audio.beam_size`.
+#[cfg(feature = "local-stt")]
+#[derive(Clone, Copy)]
+struct LocalDecode {
+    temperature: f32,
+    beam_size: u32,
+}
+
 #[cfg(feature = "local-stt")]
 fn local_whisper_transcribe(
     model_path: &std::path::Path,
     audio_bytes: &[u8],
     language: Option<&str>,
+    prompt: Option<&str>,
+    decode: LocalDecode,
     threads: i32,
 ) -> Result<String> {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -272,13 +304,26 @@ fn local_whisper_transcribe(
     )
     .context("whisper: load model")?;
     let mut state = ctx.create_state().context("whisper: create state")?;
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // Beam width 1 is greedy, which is also the cheapest path on a laptop.
+    let strategy = if decode.beam_size > 1 {
+        SamplingStrategy::BeamSearch {
+            beam_size: decode.beam_size as i32,
+            patience: -1.0,
+        }
+    } else {
+        SamplingStrategy::Greedy { best_of: 1 }
+    };
+    let mut params = FullParams::new(strategy);
     params.set_n_threads(threads.max(1));
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    params.set_temperature(decode.temperature.clamp(0.0, 1.0));
     if let Some(lang) = language {
         params.set_language(Some(lang));
+    }
+    if let Some(prompt) = prompt {
+        params.set_initial_prompt(prompt);
     }
 
     state
@@ -890,6 +935,8 @@ mod tests {
             model: None,
             language: None,
             prompt: None,
+            temperature: 0.0,
+            beam_size: 5,
             timeout: Duration::from_secs(5),
         }
     }
@@ -977,6 +1024,61 @@ mod tests {
         let mut req = make_request(b"audio-bytes");
         req.prompt = Some("Borg, Adelphi".to_string());
         provider.transcribe(&req).await.expect("mocked success");
+    }
+
+    #[tokio::test]
+    async fn whisper_provider_sends_temperature_only_when_set() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .and(body_string_contains("name=\"temperature\""))
+            .and(body_string_contains("0.2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "warm"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = WhisperProvider {
+            client: Client::new(),
+            api_key: "sk-mock-key".to_string(),
+            base_url: server.uri(),
+            default_model: "whisper-1".to_string(),
+            provider_name: "openai".to_string(),
+        };
+        let mut req = make_request(b"audio-bytes");
+        req.temperature = 0.2;
+        assert_eq!(
+            provider.transcribe(&req).await.expect("mocked success"),
+            "warm"
+        );
+
+        // The default stays off the wire: a provider that rejects the field
+        // must still work out of the box.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .and(body_string_contains("name=\"temperature\""))
+            .respond_with(ResponseTemplate::new(400).set_body_string("no temperature here"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "cold"})),
+            )
+            .mount(&server)
+            .await;
+        let provider = WhisperProvider {
+            base_url: server.uri(),
+            ..provider
+        };
+        let req = make_request(b"audio-bytes");
+        assert_eq!(
+            provider.transcribe(&req).await.expect("mocked success"),
+            "cold"
+        );
     }
 
     #[tokio::test]
