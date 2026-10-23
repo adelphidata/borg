@@ -117,6 +117,12 @@ describe("Sidebar recents", () => {
     expect(screen.getAllByRole("img")).toHaveLength(3);
   });
 
+  it("puts the mark after the title, at the end of the row", () => {
+    renderSidebar({ recents: [{ id: "b", title: "unread one", activity: "unread" }] });
+    // The accessible name follows document order, so this pins the layout too.
+    expect(screen.getByRole("button", { name: /^unread one\s*Unread reply$/ })).toBeTruthy();
+  });
+
   it("reaches the older conversations the capped list leaves out", () => {
     const props = renderSidebar();
     fireEvent.click(screen.getByText("Show all…"));

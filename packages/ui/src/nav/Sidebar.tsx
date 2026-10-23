@@ -245,10 +245,12 @@ function RecentRow({
       <button
         type="button"
         onClick={onOpen}
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 border-0 bg-transparent py-[7px] pr-0 pl-3 text-left text-[length:inherit] leading-[inherit] text-inherit [font-family:inherit]"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 border-0 bg-transparent py-[7px] pr-0 pl-3 text-left text-[length:inherit] leading-[inherit] text-inherit [font-family:inherit]"
       >
-        {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
         <Truncated className="min-w-0 flex-1">{item.title}</Truncated>
+        {/* The mark trails the title: the titles stay in one aligned column,
+            and a clipped title ends before the mark rather than hiding it. */}
+        {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
       </button>
       <button
         type="button"
