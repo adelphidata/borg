@@ -56,6 +56,21 @@ describe("useAutoGrow", () => {
     contentHeight(900);
     const { container } = render(<Box value="a lot" max={200} />);
     expect(container.querySelector("textarea")!.style.height).toBe("200px");
+    expect(container.querySelector("textarea")!.style.overflowY).toBe("auto");
+  });
+
+  it("offers no scrollbar while the box is as tall as its text", () => {
+    // Under the cap a fraction of a pixel would otherwise show a scrollbar in
+    // an empty box.
+    contentHeight(40);
+    const { container, rerender } = render(<Box value="" max={200} />);
+    expect(container.querySelector("textarea")!.style.overflowY).toBe("hidden");
+    contentHeight(900);
+    rerender(<Box value="now a lot" max={200} />);
+    expect(container.querySelector("textarea")!.style.overflowY).toBe("auto");
+    contentHeight(40);
+    rerender(<Box value="" max={200} />);
+    expect(container.querySelector("textarea")!.style.overflowY).toBe("hidden");
   });
 
   it("re-measures when the text changes", () => {

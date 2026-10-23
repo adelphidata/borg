@@ -41,5 +41,11 @@ export function useAutoGrow(value: string, maxPx: number) {
 function fit(el: HTMLTextAreaElement, maxPx: number) {
   // Collapse first: scrollHeight only shrinks if the box is not already tall.
   el.style.height = "auto";
-  el.style.height = `${Math.min(el.scrollHeight, maxPx)}px`;
+  const wanted = el.scrollHeight;
+  el.style.height = `${Math.min(wanted, maxPx)}px`;
+  // Under the cap the box is exactly as tall as its text, so there is nothing
+  // to scroll — but `scrollHeight` is an integer and the text's height is
+  // not, and that fraction of a pixel is enough for a scrollbar to appear in
+  // an empty box. Scrolling is only offered once the cap holds the text back.
+  el.style.overflowY = wanted > maxPx ? "auto" : "hidden";
 }
