@@ -91,15 +91,110 @@ describe("VoiceSettingsPage", () => {
     mount([entry("audio.enabled", "false"), entry("tts.enabled", "false")]);
     const listen = await screen.findByRole("switch", { name: /Talk to Borg/ });
     expect(listen.getAttribute("aria-checked")).toBe("false");
-    expect(screen.getByRole("switch", { name: /Let Borg speak/ })).toBeTruthy();
-    // Only the phone section has a provider picker while both switches are off.
+    expect(
+      screen.getByRole("switch", { name: /Read replies aloud/ }).getAttribute("aria-checked"),
+    ).toBe("false");
+    // Only the phone section has a provider picker while voice input is off;
+    // spoken replies default to the device's own voice.
     expect(screen.getAllByLabelText("Provider")).toHaveLength(1);
+    expect((screen.getByLabelText("Voice") as HTMLSelectElement).value).toBe("");
+    expect(screen.queryByLabelText("Shortcut")).toBeNull();
   });
 
-  it("turns a capability on through its setting", async () => {
+  it("turning voice input on picks a provider the saved keys already serve", async () => {
     const { daemon } = mount([entry("audio.enabled", "false")]);
     fireEvent.click(await screen.findByRole("switch", { name: /Talk to Borg/ }));
     await waitFor(() => expect(saved(daemon, "audio.enabled")).toEqual(["true"]));
+    // OpenAI is the one transcription provider with a key on file.
+    expect(JSON.parse(saved(daemon, "audio.models")[0]!)).toEqual([{ provider: "openai" }]);
+  });
+
+  it("keeps the chain that is already there when turning voice input on", async () => {
+    const chain = JSON.stringify([{ provider: "elevenlabs" }]);
+    const { daemon } = mount([entry("audio.enabled", "false"), entry("audio.models", chain)]);
+    fireEvent.click(await screen.findByRole("switch", { name: /Talk to Borg/ }));
+    await waitFor(() => expect(saved(daemon, "audio.enabled")).toEqual(["true"]));
+    expect(saved(daemon, "audio.models")).toEqual([]);
+  });
+
+  it("shows the everyday dictation choices and folds the rest under More options", async () => {
+    const { daemon } = mount([
+      entry("audio.enabled", "true"),
+      entry("audio.models", JSON.stringify([{ provider: "openai" }])),
+      entry("voice.hold_to_record", "true"),
+      entry("voice.dictation_auto_send", "false"),
+    ]);
+    expect(await screen.findByLabelText("Language")).toBeTruthy();
+    expect(screen.getByLabelText("Shortcut")).toBeTruthy();
+    expect(screen.getByRole("switch", { name: /Hold to talk/ }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+    expect(screen.getAllByRole("status")[0]!.textContent).toMatch(/Ready/);
+    // Power-user knobs stay out of the way until asked for.
+    expect(screen.queryByLabelText("Words Borg should know")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /More options/ }));
+    const prompt = screen.getByLabelText("Words Borg should know");
+    fireEvent.change(prompt, { target: { value: "Borg, Adelphi" } });
+    fireEvent.blur(prompt);
+    await waitFor(() => expect(saved(daemon, "audio.prompt")).toEqual(["Borg, Adelphi"]));
+    fireEvent.click(screen.getByRole("switch", { name: /Send right away/ }));
+    await waitFor(() => expect(saved(daemon, "voice.dictation_auto_send")).toEqual(["true"]));
+  });
+
+  it("the background listener is a desktop-only option", async () => {
+    const entries = [
+      entry("audio.enabled", "true"),
+      entry("audio.models", JSON.stringify([{ provider: "openai" }])),
+    ];
+    const web = renderApp(<VoiceSettingsPage />, {
+      daemon: fakeDaemon({ GetSettings: { entries }, GetVoiceCatalog: CATALOG, SetSetting: {} }),
+      kind: "web",
+      wrapper: (children) => (
+        <ThemeProvider>
+          <SettingsProvider>{children}</SettingsProvider>
+        </ThemeProvider>
+      ),
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }));
+    expect(screen.queryByRole("switch", { name: /Listen from the background/ })).toBeNull();
+    web.unmount();
+    mount(entries);
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }));
+    expect(screen.getByRole("switch", { name: /Listen from the background/ })).toBeTruthy();
+  });
+
+  it("records a key combination for the shortcut, and a lone modifier on its release", async () => {
+    const { daemon } = mount([
+      entry("audio.enabled", "true"),
+      entry("audio.models", JSON.stringify([{ provider: "openai" }])),
+      entry("voice.dictation_shortcut", "mod+shift+space"),
+    ]);
+    const field = (await screen.findByLabelText("Shortcut")) as HTMLInputElement;
+    expect(field.value).toBe("Ctrl+Shift+Space");
+    fireEvent.focus(field);
+    expect(field.value).toBe("Listening…");
+    fireEvent.keyDown(field, { key: "d", code: "KeyD", ctrlKey: true, altKey: true });
+    await waitFor(() => expect(saved(daemon, "voice.dictation_shortcut")).toEqual(["mod+alt+d"]));
+
+    fireEvent.focus(field);
+    fireEvent.keyDown(field, { key: "Alt", code: "AltRight" });
+    // Still held: nothing saved yet, a letter could still follow.
+    expect(saved(daemon, "voice.dictation_shortcut")).toHaveLength(1);
+    fireEvent.keyUp(field, { key: "Alt", code: "AltRight" });
+    await waitFor(() =>
+      expect(saved(daemon, "voice.dictation_shortcut")).toEqual(["mod+alt+d", "altright"]),
+    );
+
+    // A bare letter would swallow typing, so it is refused and Escape backs out.
+    fireEvent.focus(field);
+    fireEvent.keyDown(field, { key: "x", code: "KeyX" });
+    expect(field.value).toBe("Listening…");
+    fireEvent.keyDown(field, { key: "Escape", code: "Escape" });
+    expect(field.value).toBe("Ctrl+Shift+Space");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    await waitFor(() => expect(saved(daemon, "voice.dictation_shortcut")).toHaveLength(3));
+    expect(saved(daemon, "voice.dictation_shortcut")[2]).toBe("");
   });
 
   it("switching provider starts a fresh first row and keeps the fallbacks", async () => {
@@ -119,12 +214,35 @@ describe("VoiceSettingsPage", () => {
     ]);
   });
 
+  it("picking a provider voice turns daemon speech on; the device voice turns it off", async () => {
+    const { daemon } = mount([entry("tts.enabled", "false")]);
+    const voice = (await screen.findByLabelText("Voice")) as HTMLSelectElement;
+    fireEvent.change(voice, { target: { value: "elevenlabs" } });
+    await waitFor(() => expect(saved(daemon, "tts.enabled")).toEqual(["true"]));
+    expect(JSON.parse(saved(daemon, "tts.models")[0]!)).toEqual([{ provider: "elevenlabs" }]);
+
+    daemon.answer("GetSettings", {
+      entries: [
+        entry("tts.enabled", "true"),
+        entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }])),
+      ],
+    });
+    fireEvent.change(voice, { target: { value: "" } });
+    await waitFor(() => expect(saved(daemon, "tts.enabled")).toEqual(["true", "false"]));
+  });
+
+  it("turns spoken replies on through their setting", async () => {
+    const { daemon } = mount([entry("voice.auto_tts", "false")]);
+    fireEvent.click(await screen.findByRole("switch", { name: /Read replies aloud/ }));
+    await waitFor(() => expect(saved(daemon, "voice.auto_tts")).toEqual(["true"]));
+  });
+
   it("shows the provider's own default voice as the placeholder and saves an override", async () => {
     const { daemon } = mount([
       entry("tts.enabled", "true"),
       entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }])),
     ]);
-    const voice = (await screen.findByLabelText("Voice")) as HTMLInputElement;
+    const voice = (await screen.findByLabelText("Voice id")) as HTMLInputElement;
     expect(voice.placeholder).toBe("adam");
     fireEvent.change(voice, { target: { value: "rachel" } });
     fireEvent.blur(voice);
@@ -133,7 +251,7 @@ describe("VoiceSettingsPage", () => {
         JSON.stringify([{ provider: "elevenlabs", voice: "rachel" }]),
       ]),
     );
-    expect(screen.getByRole("status").textContent).toMatch(/Not ready yet/);
+    expect(screen.getAllByRole("status")[0]!.textContent).toMatch(/Not ready yet/);
   });
 
   it("saves a key to the provider's credential slot and asks the catalog again", async () => {
@@ -163,7 +281,7 @@ describe("VoiceSettingsPage", () => {
       entry("tts.enabled", "true"),
       entry("tts.models", JSON.stringify([{ provider: "edge" }])),
     ]);
-    await screen.findByLabelText("Voice");
+    await screen.findByLabelText("Voice id");
     expect(screen.queryByLabelText(/API key/)).toBeNull();
   });
 
@@ -201,7 +319,7 @@ describe("VoiceSettingsPage", () => {
       entry("tts.enabled", "true"),
       entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }])),
     ]);
-    const voice = await screen.findByLabelText("Voice");
+    const voice = await screen.findByLabelText("Voice id");
     fireEvent.change(voice, { target: { value: "rachel" } });
     fireEvent.keyDown(voice, { key: "Enter" });
     fireEvent.blur(voice);
@@ -213,7 +331,8 @@ describe("VoiceSettingsPage", () => {
       entry("tts.enabled", "true"),
       entry("tts.models", JSON.stringify([{ provider: "elevenlabs" }, { provider: "edge" }])),
     ]);
-    const voice = await screen.findByLabelText("Voice");
+    const voice = await screen.findByLabelText("Voice id");
+    fireEvent.click(screen.getByRole("button", { name: /More options/ }));
     const model = screen.getByLabelText("Model");
     fireEvent.change(voice, { target: { value: "rachel" } });
     fireEvent.blur(voice);
@@ -246,7 +365,8 @@ describe("VoiceSettingsPage", () => {
     ]);
     let release: () => void = () => {};
     daemon.answer("SetSetting", () => new Promise((resolve) => (release = () => resolve({}))));
-    const voice = await screen.findByLabelText("Voice");
+    const voice = await screen.findByLabelText("Voice id");
+    fireEvent.click(screen.getByRole("button", { name: /More options/ }));
     const model = screen.getByLabelText("Model");
     fireEvent.change(voice, { target: { value: "rachel" } });
     fireEvent.blur(voice);
