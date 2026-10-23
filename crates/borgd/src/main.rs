@@ -51,6 +51,11 @@ fn main() -> Result<()> {
     #[cfg(not(unix))]
     let nofile_result: Option<std::io::Result<u64>> = None;
 
+    // Before the runtime spawns a thread: skills probe `$PATH` for their
+    // binaries, and launchd hands the daemon one without Homebrew's.
+    #[cfg(unix)]
+    borgd::runtime::extend_path();
+
     // The agent loop runs on a worker thread; its deep poll chain (large tool
     // futures like the browser handler + every `#[instrument]` layer) overflows
     // tokio's 2 MiB default worker stack, and a stack overflow `abort()`s the

@@ -1,43 +1,126 @@
 //! Skill and MCP-server management RPC bodies for the admin service.
 //!
 //! Skills: the catalog is the loader's full view (disabled and unavailable
-//! rows included), reads come from disk or the embedded bundle, and writes go
-//! through `cortex::skills::store` so the name and placement rules are the
-//! CLI's. MCP servers: rows live in the `mcp.servers` setting via
+//! rows included, each with what it still needs on this machine), reads come
+//! from disk or the embedded bundle, and writes go through
+//! `cortex::skills::store` so the name and placement rules are the CLI's.
+//! Setup is two writes: install a missing binary with the package manager a
+//! built-in skill names, or save a value for an env var a skill declares. MCP servers: rows live in the `mcp.servers` setting via
 //! `cortex::config::mcp_store`; a write notifies the config watcher, which
 //! reconciles the live registry in the background, because a reload waits
 //! on each new server's handshake and a save must not hang for a server
 //! that never answers.
 
 use std::collections::HashMap;
+use std::process::Stdio;
+use std::time::Duration;
 
 use super::*;
 use cortex::config::mcp_store;
+use cortex::config::CredentialValue;
 use cortex::config::{HttpAuthSpec, McpServerConfig, TransportSpec};
-use cortex::skills::{Skill, SkillSource, DEFAULT_ENABLED_SKILLS, MANDATORY_SKILLS};
+use cortex::security::secrets_resolve::SecretRef;
+use cortex::skills::{
+    InstallCommand, InstallSpec, PackageManager, Skill, SkillNeed, SkillSource,
+    DEFAULT_ENABLED_SKILLS, MANDATORY_SKILLS,
+};
 use protocols::admin::{
     McpServerEntry, McpServerList, McpServerPut, McpServerRef, McpServerSpec, McpServerTestResult,
-    SkillCatalog, SkillCatalogEntry, SkillDetail, SkillEnabledMutation, SkillPut, SkillRef,
+    SkillCatalog, SkillCatalogEntry, SkillDetail, SkillEnabledMutation, SkillNeedOption, SkillPut,
+    SkillRef, SkillSecret, SkillToolInstall,
 };
 
 // ── Skills ──────────────────────────────────────────────────────────────────
 
+/// A loaded skill and what it still needs on this machine.
+struct CatalogSkill {
+    skill: Skill,
+    needs: Vec<SkillNeed>,
+}
+
 /// Load every skill the loader knows about, off the runtime's worker threads:
 /// it walks the skills directory and probes `$PATH` for each declared binary.
-async fn load_catalog() -> Result<Vec<Skill>, TStatus> {
+async fn load_catalog() -> Result<Vec<CatalogSkill>, TStatus> {
     let config = cortex::config::Config::load_from_db()
         .await
         .map_err(map_internal("skills config load"))?;
     tokio::task::spawn_blocking(move || {
         let resolved = config.resolve_credentials();
-        cortex::skills::load_all_skills(&resolved, &config.skills, None)
+        let skills = cortex::skills::load_all_skills(&resolved, &config.skills, None)?;
+        anyhow::Ok(
+            skills
+                .into_iter()
+                .map(|skill| {
+                    let needs = skill.needs(&resolved);
+                    CatalogSkill { skill, needs }
+                })
+                .collect(),
+        )
     })
     .await
     .map_err(map_internal("skills load panicked"))?
     .map_err(map_internal("skills load"))
 }
 
-fn catalog_entry(skill: &Skill) -> SkillCatalogEntry {
+async fn find_skill(name: &str) -> Result<CatalogSkill, TStatus> {
+    load_catalog()
+        .await?
+        .into_iter()
+        .find(|s| s.skill.manifest.name == name)
+        .ok_or_else(|| TStatus::not_found(format!("no skill named `{name}`")))
+}
+
+/// The install command Borg may run for `tool`: one the skill's frontmatter
+/// names for this machine, from a package manager that needs no password.
+/// Only a built-in skill's: a project skill arrives with a `git pull`, and
+/// its frontmatter must not pick what Borg installs.
+fn runnable_install(skill: &Skill, tool: &str) -> Option<InstallCommand> {
+    if !matches!(skill.source, SkillSource::BuiltIn) {
+        return None;
+    }
+    skill
+        .manifest
+        .install
+        .get(tool)
+        .and_then(InstallSpec::command)
+        .filter(InstallCommand::unattended)
+}
+
+fn need_entry(skill: &Skill, need: &SkillNeed) -> protocols::admin::SkillNeed {
+    let named = |name: &String| SkillNeedOption {
+        name: name.clone(),
+        ..Default::default()
+    };
+    let (kind, options) = match need {
+        SkillNeed::Bin(tools) => (
+            "bin",
+            tools
+                .iter()
+                .map(|tool| {
+                    let spec = skill.manifest.install.get(tool);
+                    SkillNeedOption {
+                        name: tool.clone(),
+                        install: spec
+                            .and_then(InstallSpec::command)
+                            .map(|c| c.display())
+                            .unwrap_or_default(),
+                        installable: runnable_install(skill, tool).is_some(),
+                        url: spec.and_then(|s| s.url.clone()).unwrap_or_default(),
+                    }
+                })
+                .collect(),
+        ),
+        SkillNeed::Env(var) => ("env", vec![named(var)]),
+        SkillNeed::Os(systems) => ("os", systems.iter().map(named).collect()),
+    };
+    protocols::admin::SkillNeed {
+        kind: kind.to_string(),
+        options,
+    }
+}
+
+fn catalog_entry(entry: &CatalogSkill) -> SkillCatalogEntry {
+    let skill = &entry.skill;
     let name = skill.manifest.name.as_str();
     SkillCatalogEntry {
         name: name.to_string(),
@@ -53,6 +136,7 @@ fn catalog_entry(skill: &Skill) -> SkillCatalogEntry {
         mandatory: MANDATORY_SKILLS.contains(&name),
         category: skill.category().to_string(),
         default_enabled: DEFAULT_ENABLED_SKILLS.contains(&name),
+        needs: entry.needs.iter().map(|n| need_entry(skill, n)).collect(),
     }
 }
 
@@ -64,12 +148,9 @@ fn require_name(name: &str) -> Result<(), TStatus> {
 }
 
 async fn skill_detail(name: &str) -> Result<SkillDetail, TStatus> {
-    let skills = load_catalog().await?;
-    let skill = skills
-        .iter()
-        .find(|s| s.manifest.name == name)
-        .ok_or_else(|| TStatus::not_found(format!("no skill named `{name}`")))?;
-    let entry = catalog_entry(skill);
+    let found = find_skill(name).await?;
+    let entry = catalog_entry(&found);
+    let skill = &found.skill;
     let owned = name.to_string();
     // A built-in has no file of its own, and a project skill lives under the
     // project, not the user root — a lookup there would find nothing or an
@@ -102,7 +183,7 @@ pub(super) async fn list_skill_catalog(
     let mut skills: Vec<SkillCatalogEntry> = load_catalog()
         .await?
         .iter()
-        .filter(|s| !s.is_hidden())
+        .filter(|s| !s.skill.is_hidden())
         .map(catalog_entry)
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -216,10 +297,7 @@ pub(super) async fn set_skill_enabled(
     require_name(&name)?;
     // Validate the skill exists so a typo'd name never lands a
     // `skills.entries.<typo>.enabled` row that rides forward forever.
-    let skills = load_catalog().await?;
-    if !skills.iter().any(|s| s.manifest.name == name) {
-        return Err(TStatus::not_found(format!("no skill named `{name}`")));
-    }
+    find_skill(&name).await?;
     if !enabled && MANDATORY_SKILLS.contains(&name.as_str()) {
         return Err(TStatus::failed_precondition(format!(
             "`{name}` is always on: it teaches a tool that is always present"
@@ -231,6 +309,140 @@ pub(super) async fn set_skill_enabled(
         .set(&key, &enabled.to_string())
         .await
         .map_err(|e| TStatus::invalid_argument(format!("set `{key}` failed: {e}")))?;
+    notify_runtime_config_reload(&svc.config_notify_tx).await;
+    Ok(Response::new(skill_detail(&name).await?))
+}
+
+/// The longest an install may run. A first `brew install` of something with
+/// a deep dependency tree (ffmpeg) takes minutes; past this it is stuck.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The last lines of an installer's output: where the reason for a failure is.
+fn output_tail(output: &std::process::Output) -> String {
+    let text = if output.stderr.iter().any(|b| !b.is_ascii_whitespace()) {
+        String::from_utf8_lossy(&output.stderr)
+    } else {
+        String::from_utf8_lossy(&output.stdout)
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(6)..].join("\n")
+}
+
+async fn run_install(command: InstallCommand) -> Result<(), TStatus> {
+    let shown = command.display();
+    let (program, args) = command.argv();
+    let Ok(path) = which::which(program) else {
+        return Err(TStatus::failed_precondition(match command.manager {
+            PackageManager::Brew => {
+                "Homebrew is not installed. Get it from https://brew.sh, then try again."
+                    .to_string()
+            }
+            _ => format!(
+                "`{program}` is not installed. Install Node.js from https://nodejs.org, then try again."
+            ),
+        }));
+    };
+    let mut cmd = tokio::process::Command::new(path);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A Homebrew self-update can take longer than the install itself.
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .env("NONINTERACTIVE", "1")
+        .kill_on_drop(true);
+    // Its own task, so a client that stops waiting does not kill a
+    // half-done install; only the timeout does.
+    let run = tokio::spawn(async move {
+        let child = cmd.spawn()?;
+        match tokio::time::timeout(INSTALL_TIMEOUT, child.wait_with_output()).await {
+            Ok(output) => output.map(Some),
+            Err(_) => Ok(None),
+        }
+    });
+    let output = run
+        .await
+        .map_err(map_internal("install panicked"))?
+        .map_err(|e| TStatus::internal(format!("could not start `{shown}`: {e}")))?
+        .ok_or_else(|| {
+            TStatus::deadline_exceeded(format!("`{shown}` did not finish in 15 minutes"))
+        })?;
+    if !output.status.success() {
+        return Err(TStatus::aborted(format!(
+            "`{shown}` failed:\n{}",
+            output_tail(&output)
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn install_skill_tool(
+    svc: &AdminSvc,
+    req: Request<SkillToolInstall>,
+) -> Result<Response<SkillDetail>, TStatus> {
+    let SkillToolInstall { skill: name, tool } = req.into_inner();
+    require_name(&name)?;
+    let found = find_skill(&name).await?;
+    let missing = found
+        .needs
+        .iter()
+        .any(|n| matches!(n, SkillNeed::Bin(tools) if tools.contains(&tool)));
+    if !missing {
+        // Already on PATH (or never needed): nothing to run.
+        return Ok(Response::new(skill_detail(&name).await?));
+    }
+    let command = runnable_install(&found.skill, &tool).ok_or_else(|| {
+        TStatus::failed_precondition(format!(
+            "Borg cannot install `{tool}` for `{name}` on its own. Install it yourself, then check again."
+        ))
+    })?;
+    run_install(command).await?;
+    // Live sessions cache which skills are usable; the watcher tick clears it.
+    notify_runtime_config_reload(&svc.config_notify_tx).await;
+    Ok(Response::new(skill_detail(&name).await?))
+}
+
+pub(super) async fn set_skill_secret(
+    svc: &AdminSvc,
+    req: Request<SkillSecret>,
+) -> Result<Response<SkillDetail>, TStatus> {
+    let SkillSecret {
+        skill: name,
+        name: var,
+        value,
+    } = req.into_inner();
+    require_name(&name)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(TStatus::invalid_argument("a value is required"));
+    }
+    let found = find_skill(&name).await?;
+    // Only a variable the skill declares: the store feeds `run_shell`'s
+    // environment, and a name no skill asked for (PATH, LD_PRELOAD) has no
+    // business there.
+    if !found.skill.manifest.requires.env.contains(&var) {
+        return Err(TStatus::invalid_argument(format!(
+            "`{name}` does not use `{var}`"
+        )));
+    }
+    let resolver = open_settings_resolver().await?;
+    let mut credentials = resolver
+        .resolve()
+        .await
+        .map_err(map_internal("settings resolve"))?
+        .credentials;
+    credentials.insert(
+        var,
+        CredentialValue::Ref(SecretRef::Literal {
+            value: value.to_string(),
+        }),
+    );
+    let json = serde_json::to_string(&credentials).map_err(map_internal("credentials encode"))?;
+    resolver
+        .set("credentials", &json)
+        .await
+        .map_err(map_internal("credentials save"))?;
     notify_runtime_config_reload(&svc.config_notify_tx).await;
     Ok(Response::new(skill_detail(&name).await?))
 }

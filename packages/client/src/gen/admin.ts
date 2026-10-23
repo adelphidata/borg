@@ -732,6 +732,37 @@ export interface SkillCatalogEntry {
    * "default" from "the user turned this on".
    */
   defaultEnabled: boolean;
+  /**
+   * What it still needs before it can run on this machine, probed on every
+   * read. Empty when nothing is missing.
+   */
+  needs: SkillNeed[];
+}
+
+/** One requirement a skill is still waiting on. */
+export interface SkillNeed {
+  /**
+   * "bin": any one of `options` on PATH. "env": the variable named by the
+   * one option. "os": runs only on the systems the options name.
+   */
+  kind: string;
+  options: SkillNeedOption[];
+}
+
+export interface SkillNeedOption {
+  name: string;
+  /**
+   * The install command for this machine ("brew install himalaya"), when
+   * the skill names one.
+   */
+  install: string;
+  /**
+   * `InstallSkillTool` can run `install`: a built-in skill's brew or npm
+   * package.
+   */
+  installable: boolean;
+  /** A page with install steps, when the skill names one. */
+  url: string;
 }
 
 export interface SkillCatalog {
@@ -759,6 +790,19 @@ export interface SkillDetail {
 export interface SkillPut {
   name: string;
   content: string;
+}
+
+export interface SkillToolInstall {
+  skill: string;
+  /** The binary, as a "bin" need's option names it. */
+  tool: string;
+}
+
+export interface SkillSecret {
+  skill: string;
+  /** The variable, as an "env" need names it. */
+  name: string;
+  value: string;
 }
 
 export interface SkillEnabledMutation {
@@ -9638,6 +9682,7 @@ function createBaseSkillCatalogEntry(): SkillCatalogEntry {
     mandatory: false,
     category: "",
     defaultEnabled: false,
+    needs: [],
   };
 }
 
@@ -9666,6 +9711,9 @@ export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
     }
     if (message.defaultEnabled !== false) {
       writer.uint32(64).bool(message.defaultEnabled);
+    }
+    for (const v of message.needs) {
+      SkillNeed.encode(v!, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -9747,6 +9795,14 @@ export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
             message.defaultEnabled = reader.bool();
             continue;
           }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.needs.push(SkillNeed.decode(reader, reader.uint32()));
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -9773,6 +9829,7 @@ export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
         : isSet(object.default_enabled)
         ? globalThis.Boolean(object.default_enabled)
         : false,
+      needs: globalThis.Array.isArray(object?.needs) ? object.needs.map((e: any) => SkillNeed.fromJSON(e)) : [],
     };
   },
 
@@ -9802,6 +9859,9 @@ export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
     if (message.defaultEnabled !== false) {
       obj.defaultEnabled = message.defaultEnabled;
     }
+    if (message.needs?.length) {
+      obj.needs = message.needs.map((e) => SkillNeed.toJSON(e));
+    }
     return obj;
   },
 
@@ -9818,6 +9878,211 @@ export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
     message.mandatory = object.mandatory ?? false;
     message.category = object.category ?? "";
     message.defaultEnabled = object.defaultEnabled ?? false;
+    message.needs = object.needs?.map((e) => SkillNeed.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSkillNeed(): SkillNeed {
+  return { kind: "", options: [] };
+}
+
+export const SkillNeed: MessageFns<SkillNeed> = {
+  encode(message: SkillNeed, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.kind !== "") {
+      writer.uint32(10).string(message.kind);
+    }
+    for (const v of message.options) {
+      SkillNeedOption.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillNeed {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillNeed();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.kind = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.options.push(SkillNeedOption.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillNeed {
+    return {
+      kind: isSet(object.kind) ? globalThis.String(object.kind) : "",
+      options: globalThis.Array.isArray(object?.options)
+        ? object.options.map((e: any) => SkillNeedOption.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SkillNeed): unknown {
+    const obj: any = {};
+    if (message.kind !== "") {
+      obj.kind = message.kind;
+    }
+    if (message.options?.length) {
+      obj.options = message.options.map((e) => SkillNeedOption.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillNeed>, I>>(base?: I): SkillNeed {
+    return SkillNeed.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillNeed>, I>>(object: I): SkillNeed {
+    const message = createBaseSkillNeed();
+    message.kind = object.kind ?? "";
+    message.options = object.options?.map((e) => SkillNeedOption.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSkillNeedOption(): SkillNeedOption {
+  return { name: "", install: "", installable: false, url: "" };
+}
+
+export const SkillNeedOption: MessageFns<SkillNeedOption> = {
+  encode(message: SkillNeedOption, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.install !== "") {
+      writer.uint32(18).string(message.install);
+    }
+    if (message.installable !== false) {
+      writer.uint32(24).bool(message.installable);
+    }
+    if (message.url !== "") {
+      writer.uint32(34).string(message.url);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillNeedOption {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillNeedOption();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.install = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.installable = reader.bool();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.url = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillNeedOption {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      install: isSet(object.install) ? globalThis.String(object.install) : "",
+      installable: isSet(object.installable) ? globalThis.Boolean(object.installable) : false,
+      url: isSet(object.url) ? globalThis.String(object.url) : "",
+    };
+  },
+
+  toJSON(message: SkillNeedOption): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.install !== "") {
+      obj.install = message.install;
+    }
+    if (message.installable !== false) {
+      obj.installable = message.installable;
+    }
+    if (message.url !== "") {
+      obj.url = message.url;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillNeedOption>, I>>(base?: I): SkillNeedOption {
+    return SkillNeedOption.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillNeedOption>, I>>(object: I): SkillNeedOption {
+    const message = createBaseSkillNeedOption();
+    message.name = object.name ?? "";
+    message.install = object.install ?? "";
+    message.installable = object.installable ?? false;
+    message.url = object.url ?? "";
     return message;
   },
 };
@@ -10144,6 +10409,192 @@ export const SkillPut: MessageFns<SkillPut> = {
     const message = createBaseSkillPut();
     message.name = object.name ?? "";
     message.content = object.content ?? "";
+    return message;
+  },
+};
+
+function createBaseSkillToolInstall(): SkillToolInstall {
+  return { skill: "", tool: "" };
+}
+
+export const SkillToolInstall: MessageFns<SkillToolInstall> = {
+  encode(message: SkillToolInstall, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.skill !== "") {
+      writer.uint32(10).string(message.skill);
+    }
+    if (message.tool !== "") {
+      writer.uint32(18).string(message.tool);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillToolInstall {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillToolInstall();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.skill = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.tool = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillToolInstall {
+    return {
+      skill: isSet(object.skill) ? globalThis.String(object.skill) : "",
+      tool: isSet(object.tool) ? globalThis.String(object.tool) : "",
+    };
+  },
+
+  toJSON(message: SkillToolInstall): unknown {
+    const obj: any = {};
+    if (message.skill !== "") {
+      obj.skill = message.skill;
+    }
+    if (message.tool !== "") {
+      obj.tool = message.tool;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillToolInstall>, I>>(base?: I): SkillToolInstall {
+    return SkillToolInstall.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillToolInstall>, I>>(object: I): SkillToolInstall {
+    const message = createBaseSkillToolInstall();
+    message.skill = object.skill ?? "";
+    message.tool = object.tool ?? "";
+    return message;
+  },
+};
+
+function createBaseSkillSecret(): SkillSecret {
+  return { skill: "", name: "", value: "" };
+}
+
+export const SkillSecret: MessageFns<SkillSecret> = {
+  encode(message: SkillSecret, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.skill !== "") {
+      writer.uint32(10).string(message.skill);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.value !== "") {
+      writer.uint32(26).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillSecret {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillSecret();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.skill = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.value = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillSecret {
+    return {
+      skill: isSet(object.skill) ? globalThis.String(object.skill) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: SkillSecret): unknown {
+    const obj: any = {};
+    if (message.skill !== "") {
+      obj.skill = message.skill;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillSecret>, I>>(base?: I): SkillSecret {
+    return SkillSecret.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillSecret>, I>>(object: I): SkillSecret {
+    const message = createBaseSkillSecret();
+    message.skill = object.skill ?? "";
+    message.name = object.name ?? "";
+    message.value = object.value ?? "";
     return message;
   },
 };
@@ -17584,6 +18035,31 @@ export const AdminDefinition = {
     setSkillEnabled: {
       name: "SetSkillEnabled",
       requestType: SkillEnabledMutation as typeof SkillEnabledMutation,
+      requestStream: false,
+      responseType: SkillDetail as typeof SkillDetail,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Put a binary a built-in skill needs on this machine with the package
+     * manager its frontmatter names (brew or npm; never apt, which needs a
+     * sudo password). Slow: a brew install can take minutes.
+     */
+    installSkillTool: {
+      name: "InstallSkillTool",
+      requestType: SkillToolInstall as typeof SkillToolInstall,
+      requestStream: false,
+      responseType: SkillDetail as typeof SkillDetail,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Save a value for an environment variable a skill declares in
+     * `requires.env`, into the `credentials` setting.
+     */
+    setSkillSecret: {
+      name: "SetSkillSecret",
+      requestType: SkillSecret as typeof SkillSecret,
       requestStream: false,
       responseType: SkillDetail as typeof SkillDetail,
       responseStream: false,

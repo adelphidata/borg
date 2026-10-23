@@ -63,6 +63,13 @@ service Admin {
   rpc PutSkill(SkillPut) returns (SkillDetail);
   rpc DeleteSkill(SkillRef) returns (Empty);
   rpc SetSkillEnabled(SkillEnabledMutation) returns (SkillDetail);
+  // Put a binary a built-in skill needs on this machine with the package
+  // manager its frontmatter names (brew or npm; never apt, which needs a
+  // sudo password). Slow: a brew install can take minutes.
+  rpc InstallSkillTool(SkillToolInstall) returns (SkillDetail);
+  // Save a value for an environment variable a skill declares in
+  // `requires.env`, into the `credentials` setting.
+  rpc SetSkillSecret(SkillSecret) returns (SkillDetail);
 
   // MCP servers Borg connects to as a client. Writes land in the
   // `mcp.servers` setting and the live registry is reloaded in the
@@ -783,6 +790,27 @@ message SkillCatalogEntry {
   // Enabled by default when no per-skill setting exists; lets a client tell
   // "default" from "the user turned this on".
   bool default_enabled = 8;
+  // What it still needs before it can run on this machine, probed on every
+  // read. Empty when nothing is missing.
+  repeated SkillNeed needs = 9;
+}
+// One requirement a skill is still waiting on.
+message SkillNeed {
+  // "bin": any one of `options` on PATH. "env": the variable named by the
+  // one option. "os": runs only on the systems the options name.
+  string kind = 1;
+  repeated SkillNeedOption options = 2;
+}
+message SkillNeedOption {
+  string name = 1;
+  // The install command for this machine ("brew install himalaya"), when
+  // the skill names one.
+  string install = 2;
+  // `InstallSkillTool` can run `install`: a built-in skill's brew or npm
+  // package.
+  bool installable = 3;
+  // A page with install steps, when the skill names one.
+  string url = 4;
 }
 message SkillCatalog { repeated SkillCatalogEntry skills = 1; }
 message SkillRef { string name = 1; }
@@ -798,6 +826,17 @@ message SkillDetail {
 message SkillPut {
   string name = 1;
   string content = 2;
+}
+message SkillToolInstall {
+  string skill = 1;
+  // The binary, as a "bin" need's option names it.
+  string tool = 2;
+}
+message SkillSecret {
+  string skill = 1;
+  // The variable, as an "env" need names it.
+  string name = 2;
+  string value = 3;
 }
 message SkillEnabledMutation {
   string name = 1;

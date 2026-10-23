@@ -75,9 +75,91 @@ pub fn raise_nofile_limit() -> std::io::Result<libc::rlim_t> {
     Ok(target)
 }
 
+/// Where package managers put the tools skills run. A daemon started by
+/// launchd, or by the desktop app opened from the Dock, gets
+/// `/usr/bin:/bin:/usr/sbin:/sbin` and sees none of them: Homebrew on Apple
+/// silicon, Intel and Linux, then the per-user bin most installers use.
+#[cfg(unix)]
+fn tool_dirs(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    if let Some(home) = home {
+        dirs.push(home.join(".local/bin"));
+    }
+    dirs
+}
+
+/// `path` with each of `extra` it lacks appended, so the launcher's own order
+/// still wins. `None` when nothing is missing.
+#[cfg(unix)]
+pub fn path_with(
+    path: Option<&std::ffi::OsStr>,
+    extra: &[std::path::PathBuf],
+) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<std::path::PathBuf> = path
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let before = dirs.len();
+    for dir in extra {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    if dirs.len() == before {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
+}
+
+/// Append the tool directories present on this machine to `PATH`, so a skill
+/// whose binary Homebrew installed is found however the daemon was started.
+/// Call before any thread starts: `set_var` is not thread-safe.
+#[cfg(unix)]
+pub fn extend_path() {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let extra: Vec<_> = tool_dirs(home.as_deref())
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .collect();
+    if let Some(path) = path_with(std::env::var_os("PATH").as_deref(), &extra) {
+        std::env::set_var("PATH", path);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_with_appends_only_the_missing_dirs_after_the_launchers_own() {
+        use std::path::PathBuf;
+        let brew = PathBuf::from("/opt/homebrew/bin");
+        let local = PathBuf::from("/usr/local/bin");
+        let launchd = std::ffi::OsStr::new("/usr/bin:/bin:/usr/local/bin");
+        assert_eq!(
+            path_with(Some(launchd), &[brew.clone(), local.clone()]),
+            Some("/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin".into())
+        );
+        // Nothing to add is no write at all.
+        assert_eq!(path_with(Some(launchd), &[local]), None);
+        // An unset PATH still gets the tools.
+        assert_eq!(path_with(None, &[brew]), Some("/opt/homebrew/bin".into()));
+    }
+
+    #[test]
+    fn tool_dirs_cover_homebrew_and_the_users_own_bin() {
+        let dirs = tool_dirs(Some(std::path::Path::new("/home/me")));
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/home/me/.local/bin"] {
+            assert!(dirs.contains(&dir.into()), "missing {dir}");
+        }
+    }
 
     fn nofile() -> libc::rlimit {
         let mut limit = libc::rlimit {

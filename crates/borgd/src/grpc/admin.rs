@@ -930,6 +930,20 @@ impl Admin for AdminSvc {
         extensions::set_skill_enabled(self, req).await
     }
 
+    async fn install_skill_tool(
+        &self,
+        req: Request<protocols::admin::SkillToolInstall>,
+    ) -> Result<Response<protocols::admin::SkillDetail>, TStatus> {
+        extensions::install_skill_tool(self, req).await
+    }
+
+    async fn set_skill_secret(
+        &self,
+        req: Request<protocols::admin::SkillSecret>,
+    ) -> Result<Response<protocols::admin::SkillDetail>, TStatus> {
+        extensions::set_skill_secret(self, req).await
+    }
+
     async fn list_mcp_servers(
         &self,
         req: Request<Empty>,

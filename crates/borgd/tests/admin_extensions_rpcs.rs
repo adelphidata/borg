@@ -20,6 +20,7 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     Empty, McpServerPut, McpServerRef, McpServerSpec, SkillEnabledMutation, SkillPut, SkillRef,
+    SkillSecret, SkillToolInstall,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -492,6 +493,122 @@ async fn skill_rpcs_catalog_create_read_toggle_and_delete() {
     let err = admin
         .get_skill(SkillRef {
             name: "my-release-notes".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn skill_setup_rpcs_name_each_need_and_fill_the_ones_borg_may() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let mut admin = AdminClient::new(channel(&h.socket).await);
+
+    let content = "---\nname: needs-setup\ndescription: Needs a tool.\nrequires:\n  bins: [\"no_such_tool_setup_xyz\"]\ninstall:\n  no_such_tool_setup_xyz:\n    brew: no-such-tool\n    url: \"https://example.com/tool\"\n---\n\nSteps.\n";
+    let entry = admin
+        .put_skill(SkillPut {
+            name: "needs-setup".into(),
+            content: content.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap();
+    // The need comes back with how to meet it.
+    assert!(entry.enabled && !entry.available);
+    assert_eq!(entry.needs.len(), 1);
+    assert_eq!(entry.needs[0].kind, "bin");
+    let tool = &entry.needs[0].options[0];
+    assert_eq!(tool.name, "no_such_tool_setup_xyz");
+    assert_eq!(tool.install, "brew install no-such-tool");
+    assert_eq!(tool.url, "https://example.com/tool");
+    // A skill of yours does not get to pick what Borg installs.
+    assert!(!tool.installable);
+    let err = admin
+        .install_skill_tool(SkillToolInstall {
+            skill: "needs-setup".into(),
+            tool: "no_such_tool_setup_xyz".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+
+    // A built-in's key: listed as an env need until a value is saved.
+    let env_needs = |entry: &protocols::admin::SkillCatalogEntry| -> Vec<String> {
+        entry
+            .needs
+            .iter()
+            .filter(|n| n.kind == "env")
+            .map(|n| n.options[0].name.clone())
+            .collect()
+    };
+    let linear = admin
+        .get_skill(SkillRef {
+            name: "linear".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap();
+    assert_eq!(env_needs(&linear), ["LINEAR_API_KEY"]);
+    // A secret goes only to a variable the skill declares, and never empty.
+    for (name, value) in [("PATH", "/tmp/evil"), ("LINEAR_API_KEY", "   ")] {
+        let err = admin
+            .set_skill_secret(SkillSecret {
+                skill: "linear".into(),
+                name: name.into(),
+                value: value.into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+    }
+    let saved = admin
+        .set_skill_secret(SkillSecret {
+            skill: "linear".into(),
+            name: "LINEAR_API_KEY".into(),
+            value: " lin-123 ".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap();
+    assert!(env_needs(&saved).is_empty(), "{:?}", saved.needs);
+    // It lands where `run_shell` reads credentials from, trimmed.
+    let config = cortex::settings::SettingsResolver::load()
+        .await
+        .unwrap()
+        .resolve()
+        .await
+        .unwrap();
+    assert_eq!(
+        config
+            .resolve_credentials()
+            .get("LINEAR_API_KEY")
+            .map(String::as_str),
+        Some("lin-123")
+    );
+
+    // A built-in whose tool is already on PATH has nothing to install.
+    let git = admin
+        .install_skill_tool(SkillToolInstall {
+            skill: "git".into(),
+            tool: "git".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(git.entry.unwrap().needs.is_empty());
+    let err = admin
+        .install_skill_tool(SkillToolInstall {
+            skill: "no-such-skill".into(),
+            tool: "x".into(),
         })
         .await
         .unwrap_err();
