@@ -309,7 +309,7 @@ function catalogOptions(
   provider: string,
 ): SettingOption[] {
   if (kind === "provider") {
-    return status.providers.map((p) => ({ value: p.id, label: p.label, desc: p.blurb }));
+    return status.providers.map((p) => ({ value: p.id, label: p.label }));
   }
   return modelsOf(status.providers, provider).map((m) => ({
     value: m.id,
