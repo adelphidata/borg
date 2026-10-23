@@ -191,6 +191,16 @@ describe("Sidebar collapse", () => {
     expect(screen.getByLabelText("Collapse sidebar").getAttribute("aria-expanded")).toBe("true");
   });
 
+  it("wears the Borg head as its brand mark, open or folded", () => {
+    for (const collapsed of [false, true]) {
+      renderSidebar({ collapsed, onToggleCollapsed: () => {} });
+      // Decorative: open, the agent's name sits beside it.
+      const head = screen.getByRole("presentation") as HTMLImageElement;
+      expect(head.getAttribute("src")).toContain("borg-head");
+      cleanup();
+    }
+  });
+
   it("points the chevron toward what clicking it will do", () => {
     // Expanded, the chevron is flipped to point at the collapse direction;
     // collapsed, it points back out. Same glyph, state carried by rotation.

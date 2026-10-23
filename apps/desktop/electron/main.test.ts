@@ -270,6 +270,15 @@ describe("main process launch", () => {
     expect(spies.registerUpdater).toHaveBeenLastCalledWith({ enabled: true });
   });
 
+  it("gives the dock the Borg icon in dev, and leaves a packaged bundle's own alone", async () => {
+    restores.push(await launch({ dev: true, platform: "darwin" }));
+    expect(stub.appState.dockIcon).toBe(path.join(APP_ROOT, "build", "icon.png"));
+    restores.pop()?.();
+
+    restores.push(await launch({ packaged: true, platform: "darwin" }));
+    expect(stub.appState.dockIcon).toBeNull();
+  });
+
   it("quits instead of fighting an instance that already holds the socket", async () => {
     restores.push(await launch({ singleInstanceLock: false }));
     expect(stub.appState.quit).toBe(1);

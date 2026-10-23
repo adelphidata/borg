@@ -35,6 +35,8 @@ interface SharedState {
     name: string;
     paths: Record<string, string>;
     badge: number;
+    /** Image last handed to `app.dock.setIcon`, if any. */
+    dockIcon: string | null;
     listeners: Map<string, ((...args: unknown[]) => void)[]>;
     appPath: string;
     packaged: boolean;
@@ -80,6 +82,7 @@ const shared: SharedState = ((globalThis as Record<string, unknown>).__borgElect
     name: "Borg",
     paths: { userData: "/tmp/borg-userdata" },
     badge: 0,
+    dockIcon: null,
     listeners: new Map(),
     appPath: "/repo/apps/desktop",
     packaged: false,
@@ -335,6 +338,11 @@ export const app = {
   },
   getPath: (key: string) => appState.paths[key] ?? `/tmp/${key}`,
   getAppPath: () => appState.appPath,
+  dock: {
+    setIcon: vi.fn((image: string) => {
+      appState.dockIcon = image;
+    }),
+  },
   setBadgeCount: vi.fn((count: number) => {
     appState.badge = count;
     return true;
@@ -463,6 +471,7 @@ export function resetElectron() {
   notifications.length = 0;
   notificationState.supported = true;
   appState.badge = 0;
+  appState.dockIcon = null;
   appState.listeners.clear();
   appState.packaged = false;
   appState.singleInstanceLock = true;

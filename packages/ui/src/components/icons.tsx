@@ -52,17 +52,26 @@ function lucide(Icon: LucideIcon, fallback: number, strokeWidth = STROKE) {
   return WrappedIcon;
 }
 
-/** Borg reticle logo. `full` adds the cross ticks used in the app header. */
-export function LogoIcon({ size, full = false, ...props }: IconProps & { full?: boolean }) {
-  const s = size ?? 20;
+// A URL rather than an import, so no package needs an image module type: each
+// app's Vite build emits the file and rewrites the path.
+const HEAD_SRC = new URL("../assets/borg-head.webp", import.meta.url).href;
+/** The cut-out is 384×264. */
+const HEAD_ASPECT = 264 / 384;
+
+/**
+ * Borg's face, the brand mark. Decorative: wherever it shows, the name next to
+ * it or the greeting under it already says who this is.
+ */
+export function BorgHead({ width, className }: { width: number; className?: string }) {
   return (
-    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" {...props}>
-      <circle cx="12" cy="12" r="10.2" stroke={NEON} strokeWidth={full ? 1.3 : 1.6} />
-      <circle cx="12" cy="12" r="3.4" fill={NEON} />
-      {full && (
-        <path d="M12 0v4.2M12 19.8V24M0 12h4.2M19.8 12H24" stroke={NEON} strokeWidth={1.3} />
-      )}
-    </svg>
+    <img
+      src={HEAD_SRC}
+      alt=""
+      width={width}
+      height={Math.round(width * HEAD_ASPECT)}
+      draggable={false}
+      className={className}
+    />
   );
 }
 

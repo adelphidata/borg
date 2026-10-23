@@ -205,6 +205,9 @@ if (!app.requestSingleInstanceLock()) {
       quickEntry.dispose();
     });
 
+    // A packaged app takes its icon from the bundle. In dev the dock would show
+    // Electron's own, so borrow the one electron-builder packages.
+    if (!app.isPackaged) app.dock?.setIcon(path.join(appRoot, "build", "icon.png"));
     installApplicationMenu();
     createWindow();
     app.on("activate", showMainWindow);

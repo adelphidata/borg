@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { isSubmitEnter } from "../lib/imeKey";
 import { useIsMobile } from "../lib/useIsMobile";
-import { LogoIcon } from "./icons";
+import { BorgHead } from "./icons";
 
 interface PageChromeProps {
   /** Desktop header title */
@@ -124,7 +124,7 @@ export function PageChrome({
       )}
       {isMobile && mobileBrandHeader && (
         <header className="flex flex-none items-center gap-2.5 border-b border-line2 px-[22px] pt-[calc(10px+env(safe-area-inset-top))] pb-3.5">
-          <LogoIcon size={17} />
+          <BorgHead width={24} />
           <span className="text-[12.5px] leading-none font-semibold tracking-[0.2em] text-ink">
             BORG
           </span>

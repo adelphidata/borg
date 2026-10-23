@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pill, isSubmitEnter } from "@borg/ui";
+import { BorgHead, Pill, isSubmitEnter } from "@borg/ui";
 import { InlineNameField } from "../../components/NameField";
 import { AGENT_NAME_KEY, DEFAULT_AGENT_NAME, rerollName } from "../../lib/agentName";
 import { useMutation } from "../../lib/useDaemon";
@@ -45,6 +45,7 @@ function Card({ children }: { children: React.ReactNode }) {
   return (
     <main className="flex h-full items-center justify-center bg-surface [-webkit-app-region:drag]">
       <div className="flex min-h-[400px] w-[520px] max-w-[calc(100vw-48px)] flex-col justify-end px-[38px] pt-[34px] pb-[30px] [-webkit-app-region:no-drag]">
+        <BorgHead width={112} className="mb-6 self-start" />
         {children}
       </div>
     </main>

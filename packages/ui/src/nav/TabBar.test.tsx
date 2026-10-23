@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TabBar } from "./TabBar";
-import { LogoIcon } from "../components/icons";
+import { ChatIcon } from "../components/icons";
 import type { AppRoute } from "../types";
 
 const page = () => null;
@@ -13,7 +13,7 @@ const ROUTES: AppRoute[] = [
     path: "/",
     label: "Conversation",
     tabLabel: "Talk",
-    icon: LogoIcon,
+    icon: ChatIcon,
     page,
     section: "primary",
   },
@@ -22,7 +22,7 @@ const ROUTES: AppRoute[] = [
     path: "/sessions",
     label: "Conversations",
     tabLabel: "History",
-    icon: LogoIcon,
+    icon: ChatIcon,
     page,
     section: "primary",
   },
@@ -31,7 +31,7 @@ const ROUTES: AppRoute[] = [
     path: "/settings/:id",
     label: "Setting",
     tabLabel: "Setting",
-    icon: LogoIcon,
+    icon: ChatIcon,
     page,
     section: "secondary",
     nav: { tabBar: false },

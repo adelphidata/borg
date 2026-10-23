@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { LogoIcon, SendIcon, isSubmitEnter } from "@borg/ui";
+import { BorgHead, SendIcon, isSubmitEnter } from "@borg/ui";
 import { asBorgError, useBorg } from "../../lib/useDaemon";
 import { useNative } from "../../lib/platform";
 
@@ -58,7 +58,7 @@ export function QuickEntryPage() {
   return (
     <div className="flex h-full flex-col justify-center rounded-[14px] border border-line bg-surface2 px-4 py-3 shadow-(--frameShadow)">
       <div className="flex items-center gap-3">
-        <LogoIcon size={20} />
+        <BorgHead width={28} />
         <textarea
           ref={input}
           rows={1}

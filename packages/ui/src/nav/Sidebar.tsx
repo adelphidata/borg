@@ -2,8 +2,8 @@ import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import {
   ArchiveIcon,
+  BorgHead,
   ChevronIcon,
-  LogoIcon,
   MoonIcon,
   NewChatIcon,
   PinIcon,
@@ -401,7 +401,7 @@ export function Sidebar({
   if (collapsed) {
     return (
       <aside className="flex w-[52px] flex-none flex-col items-center border-r border-line2 bg-surface2 px-2 pt-[18px] pb-4">
-        <LogoIcon size={20} />
+        <BorgHead width={32} />
         <div className="pt-4">{toggle}</div>
         <div className="flex-1" />
         {update && <UpdateItem update={update} collapsed onInstall={onInstallUpdate} />}
@@ -412,7 +412,7 @@ export function Sidebar({
   return (
     <aside className="flex w-[236px] flex-none flex-col border-r border-line2 bg-surface2 px-[14px] pt-[18px] pb-4">
       <div className="flex items-center gap-[11px] px-2 pt-0.5 pb-5">
-        <LogoIcon size={20} />
+        <BorgHead width={32} />
         <span
           title={agentName}
           className="min-w-0 flex-1 truncate text-[13.5px] leading-[1.2] font-semibold tracking-[-0.01em] text-ink"

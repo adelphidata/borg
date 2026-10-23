@@ -160,6 +160,15 @@ describe("OnboardingPage naming the agent", () => {
     await waitFor(() => expect(["Borgzilla", "Borg Vader"]).toContain(nameInput().value));
   });
 
+  it("shows the Borg head over the greeting, as decoration only", async () => {
+    mount({ GetSetupStatus: setupStatus() });
+    await waitFor(() => expect(nameInput()).toBeTruthy());
+    // The greeting already says who is talking; a screen reader skips the face.
+    const head = screen.getByRole("presentation") as HTMLImageElement;
+    expect(head.getAttribute("src")).toContain("borg-head");
+    expect(head.getAttribute("alt")).toBe("");
+  });
+
   it("keeps the name the daemon already has", async () => {
     mount({ GetSetupStatus: setupStatus({ agentName: "Clint Eastborg" }) });
     await waitFor(() => expect(nameInput().value).toBe("Clint Eastborg"));
