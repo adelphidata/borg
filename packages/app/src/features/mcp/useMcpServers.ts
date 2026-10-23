@@ -135,7 +135,11 @@ export function emptySpec(transport: Transport = "stdio"): admin.McpServerSpec {
 export interface McpServers {
   query: QueryResult<admin.McpServerList>;
   /** Create (or with `overwrite`, replace) a server from a spec. */
-  save: (name: string, spec: admin.McpServerSpec, overwrite: boolean) => Promise<unknown>;
+  save: (
+    name: string,
+    spec: admin.McpServerSpec,
+    overwrite: boolean,
+  ) => Promise<admin.McpServerEntry | undefined>;
   /** Create a server from one of the daemon's templates. */
   addPreset: (name: string, preset: string, fsRoot?: string) => Promise<unknown>;
   remove: (name: string) => Promise<unknown>;

@@ -234,14 +234,9 @@ pub async fn probe_server(
     let discovered = session.list_tools().await.context("tools/list failed")?;
     let tools = discovered.tools.iter().map(|t| t.name.clone()).collect();
     // The session has no graceful shutdown yet; dropping the actor closes the
-    // transport. A short yield caps the linger so an unresponsive peer cannot
-    // hold the caller.
+    // transport. One yield lets that close run before the caller moves on.
     drop(session);
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        tokio::task::yield_now(),
-    )
-    .await;
+    tokio::task::yield_now().await;
     Ok(ProbeReport {
         server_info: discovered.server_info,
         tools,

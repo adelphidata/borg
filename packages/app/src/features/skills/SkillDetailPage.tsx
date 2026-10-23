@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   BackLink,
@@ -57,7 +57,8 @@ function NewSkill({ from }: { from: string | undefined }) {
 
   const save = () => {
     const id = name.trim();
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)) {
+    // `/skills/new` is this page, so a skill called "new" could never be opened.
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id) || id === "new") {
       setLocalError("Name it with letters, digits, dashes or underscores, nothing else.");
       return;
     }
@@ -147,9 +148,17 @@ function Existing({
   const [saving, setSaving] = useState(false);
   const [confirm, setConfirm] = useState(false);
 
+  // Keyed on the content alone: clearing `dirty` after a save must not pull
+  // the text that was just replaced back into the editor while the detail
+  // is still being re-read.
+  const dirtyRef = useRef(false);
+  const markDirty = (next: boolean) => {
+    dirtyRef.current = next;
+    setDirty(next);
+  };
   useEffect(() => {
-    if (!dirty) setContent(detail.content);
-  }, [detail.content, dirty]);
+    if (!dirtyRef.current) setContent(detail.content);
+  }, [detail.content]);
 
   const save = () => {
     const declared = frontmatterName(content);
@@ -164,7 +173,9 @@ function Existing({
     void skills
       .save(entry.name, content)
       .then((saved) => {
-        if (saved) setDirty(false);
+        if (!saved) return;
+        setContent(saved.content);
+        markDirty(false);
       })
       .finally(() => setSaving(false));
   };
@@ -205,7 +216,7 @@ function Existing({
               value={content}
               onChange={(e) => {
                 setContent(e.target.value);
-                setDirty(true);
+                markDirty(true);
               }}
             />
             {detail.path && (
@@ -222,7 +233,7 @@ function Existing({
                   square
                   onClick={() => {
                     setContent(detail.content);
-                    setDirty(false);
+                    markDirty(false);
                     setLocalError(undefined);
                     skills.resetError();
                   }}

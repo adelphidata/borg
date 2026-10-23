@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   BackLink,
@@ -81,10 +81,17 @@ function Detail({
   const enabled = entry.spec?.enabled ?? true;
 
   // A refetch that lands while nothing is being edited brings the stored
-  // row back into the form; typed changes are never thrown away.
+  // row back into the form; typed changes are never thrown away. Keyed on
+  // the entry alone: clearing `dirty` after a save must not pull the row
+  // that was just replaced back into the form while the refetch is in flight.
+  const dirtyRef = useRef(false);
+  const markDirty = (next: boolean) => {
+    dirtyRef.current = next;
+    setDirty(next);
+  };
   useEffect(() => {
-    if (!dirty) setDraft(draftOf(entry.name, entry.spec));
-  }, [entry, dirty]);
+    if (!dirtyRef.current) setDraft(draftOf(entry.name, entry.spec));
+  }, [entry]);
 
   const save = () => {
     const built = specOf(draft, enabled);
@@ -97,7 +104,11 @@ function Detail({
     void servers
       .save(entry.name, built.spec, true)
       .then((stored) => {
-        if (stored !== undefined) setDirty(false);
+        if (stored === undefined) return;
+        // The daemon's answer is the row as stored; show that until the
+        // list catches up.
+        setDraft(draftOf(entry.name, stored.spec));
+        markDirty(false);
       })
       .finally(() => setSaving(false));
   };
@@ -134,7 +145,7 @@ function Detail({
           nameLocked
           onChange={(next) => {
             setDraft(next);
-            setDirty(true);
+            markDirty(true);
           }}
         />
         {(localError || servers.error) && (
@@ -151,7 +162,7 @@ function Detail({
               square
               onClick={() => {
                 setDraft(draftOf(entry.name, entry.spec));
-                setDirty(false);
+                markDirty(false);
                 setLocalError(undefined);
                 servers.resetError();
               }}

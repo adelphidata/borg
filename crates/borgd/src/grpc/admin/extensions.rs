@@ -190,6 +190,13 @@ pub(super) async fn delete_skill(
                 store_status(e)
             }
         })?;
+    // The skill's switch goes with it: left behind, the row would ride
+    // forward forever and pre-set the switch of a future skill of this name.
+    if let Ok(resolver) = open_settings_resolver().await {
+        let _ = resolver
+            .unset(&format!("skills.entries.{name}.enabled"))
+            .await;
+    }
     notify_runtime_config_reload(&svc.config_notify_tx).await;
     Ok(Response::new(Empty {}))
 }
