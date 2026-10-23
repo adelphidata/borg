@@ -161,8 +161,8 @@ function Shell({ platform }: { platform: Platform }) {
       id: s.id,
       title: rowTitle(s.title, Number(s.messageCount), s.id),
       activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
-    }));
       pinned: s.pinned || undefined,
+    }));
   // Pinned conversations lead, and every one of them shows: pinning is how a
   // conversation stays in reach once newer ones would push it off the list.
   const pinnedRows = listed.filter((r) => r.pinned);
@@ -308,7 +308,6 @@ function Shell({ platform }: { platform: Platform }) {
           // can do, not advertise capability it does not have here.
           actions={[
             {
-            {
               id: "pin",
               label: menuPinned ? "Unpin" : "Pin",
               icon: menuPinned ? <UnpinIcon size={13} /> : <PinIcon size={13} />,
@@ -316,6 +315,7 @@ function Shell({ platform }: { platform: Platform }) {
                 if (recentMenu) void pinSession.run({ id: recentMenu.id, pinned: !menuPinned });
               },
             },
+            {
               id: "archive",
               label: "Archive",
               icon: <ArchiveIcon size={13} />,
