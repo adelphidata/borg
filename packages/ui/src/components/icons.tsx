@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  CircleArrowUp,
   Copy,
   GitBranch,
   ListTree,
@@ -68,6 +69,7 @@ export const GearIcon = lucide(Settings, 16);
 export const ChevronIcon = lucide(ChevronRight, 13, 2);
 export const ChevronDownIcon = lucide(ChevronDown, 13, 2);
 export const CopyIcon = lucide(Copy, 14);
+export const UpdateIcon = lucide(CircleArrowUp, 16);
 export const SearchIcon = lucide(Search, 15);
 export const PlusIcon = lucide(Plus, 15);
 export const CloseIcon = lucide(X, 15);

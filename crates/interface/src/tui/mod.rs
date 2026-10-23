@@ -327,6 +327,18 @@ pub async fn run(
         match cortex::update::perform_update(false).await {
             Ok(result) => {
                 println!("{}", format_install_outcome(&result));
+                // Nothing is connected yet, so the daemon can be bounced here
+                // without pulling a socket out from under a live session.
+                if let cortex::update::DaemonUpdate::Installed(_) = &result.daemon {
+                    println!("Restarting the daemon...");
+                    match crate::borgd_launcher::restart_service().await {
+                        Ok(()) => println!("Daemon restarted on {}.", result.latest_version),
+                        Err(e) => {
+                            tracing::warn!("daemon restart after update failed: {e:#}");
+                            println!("Could not restart the daemon ({e}). Run `borg restart`.");
+                        }
+                    }
+                }
                 return Ok(None);
             }
             Err(e) => {
@@ -935,7 +947,16 @@ fn format_install_outcome(result: &cortex::update::UpdateResult) -> String {
             format!("Already up to date ({})", result.current_version)
         }
         cortex::update::UpdateStatus::Updated { from, to } => {
-            format!("Updated borg: {from} → {to}\nPlease restart borg to use the new version.")
+            let restart = match &result.daemon {
+                cortex::update::DaemonUpdate::Installed(_) => {
+                    "Quit, run `borg restart`, then start borg again to use the new version."
+                }
+                _ => "Restart borg to use the new version.",
+            };
+            format!(
+                "Updated borg: {from} → {to}\n{}\n{restart}",
+                result.daemon.describe()
+            )
         }
     }
 }
@@ -2541,6 +2562,7 @@ mod tests {
             current_version: "0.5.0".into(),
             latest_version: "0.5.0".into(),
             status: cortex::update::UpdateStatus::AlreadyUpToDate,
+            daemon: cortex::update::DaemonUpdate::NotShipped,
         };
         assert_eq!(
             format_install_outcome(&result),
@@ -2557,12 +2579,53 @@ mod tests {
                 from: "0.5.0".into(),
                 to: "0.6.0".into(),
             },
+            daemon: cortex::update::DaemonUpdate::NotShipped,
         };
         let msg = format_install_outcome(&result);
         assert!(msg.contains("0.5.0 → 0.6.0"), "{msg}");
         assert!(
-            msg.contains("restart"),
+            msg.contains("Restart borg"),
             "user must be told to restart: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_install_outcome_updated_daemon_names_borg_restart() {
+        // The daemon on disk is new but the running one is not; the message
+        // has to send the user through `borg restart`, not just a relaunch.
+        let result = cortex::update::UpdateResult {
+            current_version: "0.5.0".into(),
+            latest_version: "0.6.0".into(),
+            status: cortex::update::UpdateStatus::Updated {
+                from: "0.5.0".into(),
+                to: "0.6.0".into(),
+            },
+            daemon: cortex::update::DaemonUpdate::Installed("/usr/local/bin/borgd".into()),
+        };
+        let msg = format_install_outcome(&result);
+        assert!(
+            msg.contains("Updated borgd at /usr/local/bin/borgd"),
+            "{msg}"
+        );
+        assert!(msg.contains("`borg restart`"), "{msg}");
+    }
+
+    #[test]
+    fn format_install_outcome_reports_daemon_failure_without_hiding_borg_update() {
+        let result = cortex::update::UpdateResult {
+            current_version: "0.5.0".into(),
+            latest_version: "0.6.0".into(),
+            status: cortex::update::UpdateStatus::Updated {
+                from: "0.5.0".into(),
+                to: "0.6.0".into(),
+            },
+            daemon: cortex::update::DaemonUpdate::Failed("permission denied".into()),
+        };
+        let msg = format_install_outcome(&result);
+        assert!(msg.contains("0.5.0 → 0.6.0"), "{msg}");
+        assert!(
+            msg.contains("borgd was not updated: permission denied"),
+            "{msg}"
         );
     }
 

@@ -11,6 +11,7 @@ const autoUpdater = vi.hoisted(() => {
     autoInstallOnAppQuit: false,
     checkForUpdates: vi.fn(async () => ({})),
     quitAndInstall: vi.fn(),
+    setFeedURL: vi.fn(),
     on(event: string, listener: (...args: unknown[]) => void) {
       listeners.set(event, [...(listeners.get(event) ?? []), listener]);
       return this;
@@ -26,7 +27,7 @@ vi.mock("electron-updater", () => ({ autoUpdater }));
 
 const { handlers, invoke, makeWindow, resetElectron, windows } =
   await import("./test/electron-stub");
-const { registerUpdater } = await import("./updater");
+const { githubToken, registerUpdater } = await import("./updater");
 
 let win: ReturnType<typeof makeWindow>;
 
@@ -35,6 +36,8 @@ beforeEach(() => {
   autoUpdater.removeAllListeners();
   autoUpdater.checkForUpdates.mockReset().mockResolvedValue({});
   autoUpdater.quitAndInstall.mockReset();
+  autoUpdater.setFeedURL.mockReset();
+  vi.unstubAllEnvs();
   vi.useFakeTimers();
   win = makeWindow();
   windows.push(win);
@@ -49,7 +52,37 @@ const statuses = () =>
     .filter((s) => s.channel === CHANNELS.updateStatus)
     .map((s) => s.args[0] as WireUpdateStatus);
 
+describe("githubToken", () => {
+  it("reads either name, trimmed, and ignores blanks", () => {
+    expect(githubToken({})).toBeUndefined();
+    expect(githubToken({ GH_TOKEN: "  " })).toBeUndefined();
+    expect(githubToken({ GITHUB_TOKEN: " ghp_x " })).toBe("ghp_x");
+    expect(githubToken({ GH_TOKEN: "a", GITHUB_TOKEN: "b" })).toBe("a");
+  });
+});
+
 describe("registerUpdater", () => {
+  it("reads the public feed when no token is set", () => {
+    const updater = registerUpdater({ enabled: true });
+    expect(autoUpdater.setFeedURL).not.toHaveBeenCalled();
+    updater.dispose();
+  });
+
+  it("switches the same feed to its authenticated form when a token is set", () => {
+    // A private repo answers the anonymous feed with a 404; the token is the
+    // only way the packaged app can read the release at all.
+    vi.stubEnv("GH_TOKEN", "ghp_test");
+    const updater = registerUpdater({ enabled: true });
+    expect(autoUpdater.setFeedURL).toHaveBeenCalledWith({
+      provider: "github",
+      owner: "adelphidata",
+      repo: "borg",
+      private: true,
+      token: "ghp_test",
+    });
+    updater.dispose();
+  });
+
   it("never installs behind the user's back", () => {
     // Downloading quietly is fine; restarting mid-turn is not.
     const updater = registerUpdater({ enabled: true });

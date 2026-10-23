@@ -265,3 +265,59 @@ describe("Sidebar theme switch", () => {
     expect(screen.queryByLabelText(/Switch to/)).toBeNull();
   });
 });
+
+describe("Sidebar update", () => {
+  it("says nothing when there is no update", () => {
+    renderSidebar();
+    expect(screen.queryByText(/Update available|Restart to update/)).toBeNull();
+  });
+
+  it("reports the download as status, not as a control", () => {
+    renderSidebar({ update: { state: "downloading", version: "0.5.0", percent: 41.6 } });
+    const status = screen.getByRole("status");
+    expect(status.getAttribute("aria-label")).toBe("Update available: Downloading Borg 0.5.0… 42%");
+    expect(screen.getByText("Update available")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /update/i })).toBeNull();
+  });
+
+  it("offers the restart once the build is on disk", () => {
+    const onInstallUpdate = vi.fn();
+    renderSidebar({ update: { state: "ready", version: "0.5.0" }, onInstallUpdate });
+
+    fireEvent.click(screen.getByRole("button", { name: "Restart to update: Borg 0.5.0 is ready" }));
+    expect(onInstallUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("survives a build that reports no version", () => {
+    renderSidebar({ update: { state: "ready" } });
+    expect(screen.getByText("a new version of Borg is ready")).toBeTruthy();
+  });
+
+  it("stays on the rail when the sidebar is collapsed", () => {
+    // An update that only shows while the nav is wide is one the user never
+    // hears about; the rail keeps the restart in reach.
+    const onInstallUpdate = vi.fn();
+    renderSidebar({
+      collapsed: true,
+      onToggleCollapsed: () => {},
+      update: { state: "ready", version: "0.5.0" },
+      onInstallUpdate,
+    });
+
+    const button = screen.getByRole("button", { name: "Restart to update: Borg 0.5.0 is ready" });
+    expect(button.getAttribute("title")).toBe("Restart to update: Borg 0.5.0 is ready");
+    fireEvent.click(button);
+    expect(onInstallUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("shows the download on the rail too, without a control", () => {
+    renderSidebar({
+      collapsed: true,
+      onToggleCollapsed: () => {},
+      update: { state: "available", version: "0.5.0" },
+    });
+    expect(screen.getByRole("status").getAttribute("title")).toBe(
+      "Update available: Downloading Borg 0.5.0…",
+    );
+  });
+});

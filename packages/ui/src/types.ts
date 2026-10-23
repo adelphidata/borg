@@ -55,3 +55,19 @@ export interface NavUser {
   name: string;
   initials: string;
 }
+
+/**
+ * A newer Borg on its way in, shown at the foot of the sidebar.
+ *
+ * Absent means nothing to say: no update, or a surface that cannot update
+ * itself. The sidebar never shows "checking" or "up to date" — those are
+ * answers to a question the user did not ask.
+ */
+export interface SidebarUpdate {
+  /** `available` and `downloading` are the download in flight; `ready` waits on a restart. */
+  state: "available" | "downloading" | "ready";
+  /** The version on its way, when the feed named one. */
+  version?: string;
+  /** Download progress, 0–100, while `state` is "downloading". */
+  percent?: number;
+}

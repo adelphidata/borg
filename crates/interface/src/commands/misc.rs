@@ -158,10 +158,24 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
         }
         cortex::update::UpdateResult {
             status: cortex::update::UpdateStatus::Updated { from, to },
+            daemon,
             ..
         } => {
             println!("Updated borg: {from} → {to}");
-            println!("Restart borg to use the new version.");
+            println!("{}", daemon.describe());
+            // The daemon keeps running the old code until it is restarted; a
+            // client on the new version talking to it is what the update was
+            // meant to prevent.
+            if let cortex::update::DaemonUpdate::Installed(_) = daemon {
+                println!("Restarting the daemon...");
+                match crate::borgd_launcher::restart_service().await {
+                    Ok(()) => println!("Daemon restarted on {to}."),
+                    Err(e) => {
+                        tracing::warn!("daemon restart after update failed: {e:#}");
+                        println!("Could not restart the daemon ({e}). Run `borg restart`.");
+                    }
+                }
+            }
         }
     }
     Ok(())

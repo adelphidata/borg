@@ -111,6 +111,7 @@ borg ask "What's the weather in Tokyo?"
 Send a single message, get a response, and exit.
 
 Flags:
+
 - `--json` / `-j` — output response as JSON
 
 ### System service
@@ -123,40 +124,40 @@ borg service status     # check service status
 
 ### All CLI commands
 
-| Command | Description |
-|---------|-------------|
-| `borg` / `borg start` | Interactive TUI with auto-gateway (default) |
-| `borg ask "message"` | One-shot query |
-| `borg init` | Interactive onboarding wizard |
-| `borg doctor` | Run diagnostics |
-| `borg status` | Show agent vitals and status |
-| `borg bond` | Show bond status and trust metrics |
-| `borg poke` | Trigger immediate heartbeat check-in |
-| `borg cancel` | Cancel the in-progress agent turn |
-| `borg tasks list/create/run/runs/status/pause/resume/delete` | Manage scheduled tasks |
-| `borg cron …` | Manage cron jobs (shell commands on a schedule) |
-| `borg pairing list/approve/revoke/approved` | Manage sender access |
-| `borg settings get/set/unset` | Manage settings |
-| `borg logs` | Show conversation history |
-| `borg usage` | Token usage and cost breakdown |
-| `borg add <name>` | Set up an integration's credentials |
-| `borg remove <name>` | Remove an integration's credentials |
-| `borg plugins` | List available integrations |
-| `borg providers …` | Manage LLM providers (BYO endpoints, rate-card refresh) |
-| `borg client-token …` | Manage bearer tokens for OpenAI-compat HTTP / MCP HTTP |
-| `borg webhook …` | Manage signed webhook definitions for `/v1/webhook/{name}` |
-| `borg mcp list/add/add-preset/remove/enable/disable/test` | Manage external MCP servers; bare `borg mcp` runs Borg as a read-only MCP server over stdio |
-| `borg pair` / `borg revoke` | Pair / revoke a remote device over the mTLS bootstrap socket |
-| `borg audit` | Verify integrity of the audit chain |
-| `borg backup` / `borg restore` | Create / verify / restore a `BORG_HOME` backup tarball |
-| `borg export <session>` | Export a session to JSON, CSV, or TXT |
-| `borg away [message]` | Enable auto-reply |
-| `borg available` | Disable auto-reply |
-| `borg stop` / `borg restart` | Daemon lifecycle |
-| `borg service install/uninstall/status` | System service management |
-| `borg migrate` | Import settings from a supported upstream agent |
-| `borg update` | Update borg to the latest released version (`--prerelease`/`-p` for experimental builds, `--check`/`-c` to dry-run) |
-| `borg uninstall` | Delete all Borg data |
+| Command                                                      | Description                                                                                                                                                                                                                     |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `borg` / `borg start`                                        | Interactive TUI with auto-gateway (default)                                                                                                                                                                                     |
+| `borg ask "message"`                                         | One-shot query                                                                                                                                                                                                                  |
+| `borg init`                                                  | Interactive onboarding wizard                                                                                                                                                                                                   |
+| `borg doctor`                                                | Run diagnostics                                                                                                                                                                                                                 |
+| `borg status`                                                | Show agent vitals and status                                                                                                                                                                                                    |
+| `borg bond`                                                  | Show bond status and trust metrics                                                                                                                                                                                              |
+| `borg poke`                                                  | Trigger immediate heartbeat check-in                                                                                                                                                                                            |
+| `borg cancel`                                                | Cancel the in-progress agent turn                                                                                                                                                                                               |
+| `borg tasks list/create/run/runs/status/pause/resume/delete` | Manage scheduled tasks                                                                                                                                                                                                          |
+| `borg cron …`                                                | Manage cron jobs (shell commands on a schedule)                                                                                                                                                                                 |
+| `borg pairing list/approve/revoke/approved`                  | Manage sender access                                                                                                                                                                                                            |
+| `borg settings get/set/unset`                                | Manage settings                                                                                                                                                                                                                 |
+| `borg logs`                                                  | Show conversation history                                                                                                                                                                                                       |
+| `borg usage`                                                 | Token usage and cost breakdown                                                                                                                                                                                                  |
+| `borg add <name>`                                            | Set up an integration's credentials                                                                                                                                                                                             |
+| `borg remove <name>`                                         | Remove an integration's credentials                                                                                                                                                                                             |
+| `borg plugins`                                               | List available integrations                                                                                                                                                                                                     |
+| `borg providers …`                                           | Manage LLM providers (BYO endpoints, rate-card refresh)                                                                                                                                                                         |
+| `borg client-token …`                                        | Manage bearer tokens for OpenAI-compat HTTP / MCP HTTP                                                                                                                                                                          |
+| `borg webhook …`                                             | Manage signed webhook definitions for `/v1/webhook/{name}`                                                                                                                                                                      |
+| `borg mcp list/add/add-preset/remove/enable/disable/test`    | Manage external MCP servers; bare `borg mcp` runs Borg as a read-only MCP server over stdio                                                                                                                                     |
+| `borg pair` / `borg revoke`                                  | Pair / revoke a remote device over the mTLS bootstrap socket                                                                                                                                                                    |
+| `borg audit`                                                 | Verify integrity of the audit chain                                                                                                                                                                                             |
+| `borg backup` / `borg restore`                               | Create / verify / restore a `BORG_HOME` backup tarball                                                                                                                                                                          |
+| `borg export <session>`                                      | Export a session to JSON, CSV, or TXT                                                                                                                                                                                           |
+| `borg away [message]`                                        | Enable auto-reply                                                                                                                                                                                                               |
+| `borg available`                                             | Disable auto-reply                                                                                                                                                                                                              |
+| `borg stop` / `borg restart`                                 | Daemon lifecycle                                                                                                                                                                                                                |
+| `borg service install/uninstall/status`                      | System service management                                                                                                                                                                                                       |
+| `borg migrate`                                               | Import settings from a supported upstream agent                                                                                                                                                                                 |
+| `borg update`                                                | Update `borg` and `borgd` to the latest GitHub release and restart the daemon (`--prerelease`/`-p` for experimental builds, `--check`/`-c` to dry-run). Reads `GITHUB_TOKEN`/`GH_TOKEN` when set, which a private repo requires |
+| `borg uninstall`                                             | Delete all Borg data                                                                                                                                                                                                            |
 
 ## Running fully local (no cloud keys)
 

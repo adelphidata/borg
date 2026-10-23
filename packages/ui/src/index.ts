@@ -6,7 +6,7 @@
  * `apps/desktop` and `apps/web` render the same components from here.
  */
 
-export type { AppRoute, BannerAlert, NavUser, RecentItem } from "./types";
+export type { AppRoute, BannerAlert, NavUser, RecentItem, SidebarUpdate } from "./types";
 
 export { isImeKey, isSubmitEnter, type ComposableKeyEvent } from "./lib/imeKey";
 export { AlertBanner } from "./components/AlertBanner";

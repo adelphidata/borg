@@ -50,8 +50,8 @@ import { useSessionActivityFeed } from "./features/sessions/useSessionActivity";
 import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { VoiceSettingsPage } from "./features/settings/VoiceSettingsPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
-import { UpdatePill } from "./components/UpdatePill";
 import { useAgentName } from "./lib/agentName";
+import { sidebarUpdate, useUpdater } from "./lib/updater";
 import { SettingsProvider, useSettings } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useBorg, useMutation, useQuery } from "./lib/useDaemon";
@@ -94,6 +94,7 @@ function Shell({ platform }: { platform: Platform }) {
   usePauseAnimationsWhenHidden();
   const { theme, toggleTheme } = useTheme();
   const agentName = useAgentName();
+  const updater = useUpdater();
   const navigate = useNavigate();
   const location = useLocation();
   // Re-fetched on every navigation so fresh conversations and cleared
@@ -270,6 +271,8 @@ function Shell({ platform }: { platform: Platform }) {
             unreadCount={unreadCount}
             theme={theme}
             onToggleTheme={toggleTheme}
+            update={sidebarUpdate(updater.status)}
+            onInstallUpdate={updater.install}
           />
         )}
         <Menu
@@ -313,7 +316,6 @@ function Shell({ platform }: { platform: Platform }) {
       </div>
       {isMobile && <TabBar routes={navRoutes} />}
       <CommandPalette />
-      <UpdatePill />
       {/* One slot for the whole shell: every reversible action anywhere in the
           product offers its way back here. */}
       <Toast

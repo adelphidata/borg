@@ -15,6 +15,28 @@ import { CHANNELS, type WireUpdateStatus } from "./channels";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Where the builds live. Mirrors the `publish` block in electron-builder.yml,
+ * which is what the packaged app reads by default; this copy exists only so a
+ * token can switch the same feed to its authenticated form.
+ */
+const FEED = { provider: "github", owner: "adelphidata", repo: "borg" } as const;
+
+/**
+ * A GitHub token from the environment, if the user set one.
+ *
+ * The anonymous feed is a 404 while the repo is private. With a token the
+ * updater reads the release through the API instead, which works on a private
+ * repo and on a public one. Same two names `borg update` reads.
+ */
+export function githubToken(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  for (const name of ["GH_TOKEN", "GITHUB_TOKEN"]) {
+    const value = env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
 function broadcast(status: WireUpdateStatus): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send(CHANNELS.updateStatus, status);
@@ -28,6 +50,9 @@ export function registerUpdater(options: { enabled: boolean }): { dispose(): voi
   // The renderer drives the restart, so never quit out from under a live turn.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+
+  const token = githubToken();
+  if (token) autoUpdater.setFeedURL({ ...FEED, private: true, token });
 
   autoUpdater.on("checking-for-update", () => broadcast({ state: "checking" }));
   autoUpdater.on("update-available", (info) =>

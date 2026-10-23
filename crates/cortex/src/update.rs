@@ -46,11 +46,20 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// File name of the `borg` binary inside a release archive and on disk.
+const BORG_FILE_NAME: &str = if cfg!(windows) { "borg.exe" } else { "borg" };
+/// File name of the daemon binary that ships beside `borg` in every archive.
+pub const BORGD_FILE_NAME: &str = if cfg!(windows) { "borgd.exe" } else { "borgd" };
+
 /// Map std::env::consts to the asset naming convention used in GitHub Releases.
+///
+/// The release workflow packs Windows as a zip and everything else as a
+/// gzipped tar; the names here must match its `asset` matrix.
 pub fn platform_asset_name() -> Result<String> {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
+    let (os, ext) = match std::env::consts::OS {
+        "macos" => ("darwin", "tar.gz"),
+        "linux" => ("linux", "tar.gz"),
+        "windows" => ("windows", "zip"),
         o => bail!("Unsupported OS: {o}"),
     };
     let arch = match std::env::consts::ARCH {
@@ -58,7 +67,7 @@ pub fn platform_asset_name() -> Result<String> {
         "x86_64" => "x86_64",
         a => bail!("Unsupported architecture: {a}"),
     };
-    Ok(format!("borg-{os}-{arch}.tar.gz"))
+    Ok(format!("borg-{os}-{arch}.{ext}"))
 }
 
 /// Metadata for a GitHub release.
@@ -77,8 +86,37 @@ pub struct ReleaseInfo {
 pub struct ReleaseAsset {
     /// Filename of the asset (e.g. "borg-darwin-arm64.tar.gz").
     pub name: String,
-    /// Direct download URL.
+    /// Direct download URL. Anonymous, so it only works on a public repo.
     pub browser_download_url: String,
+    /// The asset's API URL. With a token and `Accept: application/octet-stream`
+    /// it serves the file from a private repo, where the direct URL is a 404.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// A GitHub token from the environment, if the user set one.
+///
+/// Needed while the repo is private, and welcome on a public one: anonymous
+/// API calls share one small rate limit per address. The same two names
+/// electron-updater reads, so one export covers the desktop app too.
+fn github_token() -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
+/// A request with the token attached, when there is one.
+fn github_request(client: &reqwest::Client, url: &str, accept: &str) -> reqwest::RequestBuilder {
+    let request = client
+        .get(url)
+        .header("Accept", accept)
+        .header("User-Agent", "borg-updater");
+    match github_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 /// Outcome of an update check or operation.
@@ -94,6 +132,41 @@ pub enum UpdateStatus {
     },
 }
 
+/// What happened to the daemon binary while `borg` was being replaced.
+///
+/// `borg` and `borgd` ship in one archive and must not drift: a client on the
+/// new version talking to a daemon on the old one is the bug every release
+/// note would have to warn about. The daemon install is reported on its own
+/// because a failure there must not undo the `borg` install that already
+/// succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonUpdate {
+    /// `borgd` was written to this path. The running daemon still has the old
+    /// code until it is restarted.
+    Installed(std::path::PathBuf),
+    /// The archive carried no daemon binary; nothing to do.
+    NotShipped,
+    /// The daemon could not be replaced. `borg` itself is already updated.
+    Failed(String),
+}
+
+impl DaemonUpdate {
+    /// One line for the user, after "Updated borg: a → b".
+    pub fn describe(&self) -> String {
+        match self {
+            DaemonUpdate::Installed(path) => format!("Updated borgd at {}.", path.display()),
+            DaemonUpdate::NotShipped => {
+                "The release carried no borgd; the daemon is unchanged.".into()
+            }
+            DaemonUpdate::Failed(reason) => {
+                format!(
+                    "borgd was not updated: {reason}\nInstall it by hand from the release archive."
+                )
+            }
+        }
+    }
+}
+
 /// Result of a self-update operation.
 pub struct UpdateResult {
     /// Version that was installed before the update.
@@ -102,6 +175,8 @@ pub struct UpdateResult {
     pub latest_version: String,
     /// Whether the update was applied or skipped.
     pub status: UpdateStatus,
+    /// What happened to `borgd`. `NotShipped` when nothing was installed.
+    pub daemon: DaemonUpdate,
 }
 
 /// Fetch the latest release from GitHub. If `dev` is true, includes pre-releases.
@@ -201,10 +276,7 @@ async fn get_github_json<T: DeserializeOwned>(
     url: &str,
     resource: &str,
 ) -> Result<T> {
-    let response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "borg-updater")
+    let response = github_request(client, url, "application/vnd.github+json")
         .send()
         .await
         .with_context(|| format!("Failed to fetch {resource}"))?;
@@ -286,16 +358,49 @@ fn parse_rate_limit_reset(raw: &str) -> Option<String> {
 /// Extracted from `perform_update` so the security guard is unit-testable
 /// without standing up a network mock.
 pub fn select_asset_url<'a>(release: &'a ReleaseInfo, asset_name: &str) -> Result<&'a str> {
-    let url = release
+    let asset = select_asset(release, asset_name)?;
+    Ok(download_url(asset, github_token().is_some()))
+}
+
+fn select_asset<'a>(release: &'a ReleaseInfo, asset_name: &str) -> Result<&'a ReleaseAsset> {
+    let asset = release
         .assets
         .iter()
         .find(|a| a.name == asset_name)
-        .map(|a| a.browser_download_url.as_str())
-        .with_context(|| format!("No release asset found for {asset_name}"))?;
-    if !url.starts_with("https://") {
-        bail!("Refusing to download from non-HTTPS URL: {url}");
+        .with_context(|| format!("No release asset named {asset_name}"))?;
+    for url in [&asset.browser_download_url, &asset.url] {
+        if !url.is_empty() && !url.starts_with("https://") {
+            bail!("Refusing non-HTTPS download URL for {asset_name}: {url}");
+        }
     }
-    Ok(url)
+    Ok(asset)
+}
+
+/// Which of the asset's two URLs to fetch.
+///
+/// The direct link is anonymous and the only one a public repo needs. With a
+/// token, the API link is used instead: on a private repo the direct link is a
+/// 404 even when authenticated, and the API link works on both.
+fn download_url(asset: &ReleaseAsset, authenticated: bool) -> &str {
+    if authenticated && !asset.url.is_empty() {
+        &asset.url
+    } else {
+        &asset.browser_download_url
+    }
+}
+
+/// Fetch one release file. The API link only serves the file itself when
+/// asked for an octet stream; without that header it answers with JSON.
+async fn download_asset(client: &reqwest::Client, url: &str, what: &str) -> Result<bytes::Bytes> {
+    github_request(client, url, "application/octet-stream")
+        .send()
+        .await
+        .with_context(|| format!("Failed to download {what}"))?
+        .error_for_status()
+        .with_context(|| format!("Failed to download {what}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("Failed to read {what}"))
 }
 
 /// Compare two semver strings. Returns true if `latest` is newer than `current`.
@@ -362,6 +467,7 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
             current_version: current,
             latest_version: latest,
             status: UpdateStatus::AlreadyUpToDate,
+            daemon: DaemonUpdate::NotShipped,
         });
     }
 
@@ -370,43 +476,28 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
     let asset_name = platform_asset_name()?;
     let asset_url = select_asset_url(&release, &asset_name)?;
 
-    let checksums_url = release
-        .assets
-        .iter()
-        .find(|a| a.name == "checksums.txt")
-        .map(|a| &a.browser_download_url);
+    let checksums_url = select_asset(&release, "checksums.txt")
+        .ok()
+        .map(|a| download_url(a, github_token().is_some()).to_string());
 
     // Release archives are tens of megabytes, so this is the long profile —
     // the ordinary 30s cap would abort a healthy download on a slow link.
     let client = crate::http::downloads();
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
-    // Download the tarball
+    // Download the archive
     let archive_path = tmp_dir.path().join(&asset_name);
-    let bytes = client
-        .get(asset_url)
-        .header("User-Agent", "borg-updater")
-        .send()
-        .await
-        .context("Failed to download release")?
-        .error_for_status()?
-        .bytes()
-        .await
-        .context("Failed to read release bytes")?;
+    let bytes = download_asset(client, asset_url, "release").await?;
     std::fs::write(&archive_path, &bytes).context("Failed to write archive")?;
 
     // Verify checksum if available
     if let Some(checksums_url) = checksums_url {
-        let checksums_text = client
-            .get(checksums_url)
-            .header("User-Agent", "borg-updater")
-            .send()
-            .await
-            .context("Failed to download checksums")?
-            .error_for_status()?
-            .text()
-            .await
-            .context("Failed to read checksums")?;
+        let checksums_text = String::from_utf8(
+            download_asset(client, &checksums_url, "checksums")
+                .await?
+                .to_vec(),
+        )
+        .context("checksums.txt is not UTF-8")?;
 
         let expected = parse_checksum(&checksums_text, &asset_name)
             .with_context(|| format!("Asset {asset_name} not found in checksums.txt"))?;
@@ -428,14 +519,16 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
         tracing::warn!("No checksums.txt in release — skipping integrity verification");
     }
 
-    // Extract tarball
+    // Extract the archive. `tar xf` sniffs the format, so the same call opens
+    // the gzipped tar on macOS/Linux and the zip on Windows (bsdtar ships
+    // with Windows 10 and later).
     let extract_dir = tmp_dir.path().join("extract");
     std::fs::create_dir_all(&extract_dir)?;
     let archive_str = archive_path
         .to_str()
         .context("Archive path contains non-UTF8 characters")?;
     let status = std::process::Command::new("tar")
-        .args(["xzf", archive_str])
+        .args(["xf", archive_str])
         .current_dir(&extract_dir)
         // Archive comes from a file argument, never stdin.
         .stdin(std::process::Stdio::null())
@@ -446,9 +539,9 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
     }
 
     // Find the extracted binary
-    let new_binary = extract_dir.join("borg");
+    let new_binary = extract_dir.join(BORG_FILE_NAME);
     if !new_binary.exists() {
-        bail!("Extracted archive does not contain 'borg' binary");
+        bail!("Extracted archive does not contain '{BORG_FILE_NAME}' binary");
     }
 
     // Replace the current binary
@@ -457,29 +550,25 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
     let current_exe = current_exe
         .canonicalize()
         .unwrap_or_else(|_| current_exe.clone());
-    let backup = current_exe.with_extension("old");
+    install_binary(&new_binary, &current_exe)?;
 
-    std::fs::rename(&current_exe, &backup)
-        .with_context(|| format!("Failed to rename current binary to {}", backup.display()))?;
-
-    if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
-        // Best-effort rollback: if restore also fails the operator's binary is
-        // already at `backup` — surface the original copy error so they can recover.
-        let _ = std::fs::rename(&backup, &current_exe);
-        return Err(e).context("Failed to install new binary");
-    }
-
-    // Set executable permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&current_exe, perms)
-            .context("Failed to set executable permissions")?;
-    }
-
-    // Clean up backup
-    let _ = std::fs::remove_file(&backup);
+    // Then the daemon, next to it. A failure here is reported, not raised:
+    // `borg` is already on the new version and rolling that back would leave
+    // the user worse off than a daemon one restart behind.
+    let new_daemon = extract_dir.join(BORGD_FILE_NAME);
+    let daemon = if new_daemon.exists() {
+        let target = daemon_install_target(&current_exe);
+        match install_binary(&new_daemon, &target) {
+            Ok(()) => DaemonUpdate::Installed(target),
+            Err(e) => {
+                tracing::warn!("daemon update failed: {e:#}");
+                DaemonUpdate::Failed(format!("{e:#}"))
+            }
+        }
+    } else {
+        tracing::warn!("Release archive carries no {BORGD_FILE_NAME}; daemon left as is");
+        DaemonUpdate::NotShipped
+    };
 
     Ok(UpdateResult {
         current_version: from_version.clone(),
@@ -488,7 +577,62 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
             from: from_version,
             to: latest,
         },
+        daemon,
     })
+}
+
+/// Where the new `borgd` goes, given where `borg` lives.
+///
+/// Mirrors the launcher's lookup: a daemon beside `borg` wins over one on
+/// PATH, so an existing sibling is replaced in place. With no sibling, a
+/// daemon found on PATH is the one a service unit points at, so it is
+/// replaced there. A fresh install lands beside `borg`, where the launcher
+/// looks first.
+fn daemon_install_target(borg_exe: &std::path::Path) -> std::path::PathBuf {
+    let sibling = borg_exe.with_file_name(BORGD_FILE_NAME);
+    if sibling.exists() {
+        return sibling;
+    }
+    match which::which(BORGD_FILE_NAME) {
+        Ok(on_path) => on_path.canonicalize().unwrap_or(on_path),
+        Err(_) => sibling,
+    }
+}
+
+/// Swap `target` for `new_binary`: the old file is renamed aside (a running
+/// executable can be renamed but not overwritten, on every platform), the new
+/// one is copied into place, and the backup is removed. A failed copy restores
+/// the backup so the user is never left without a binary.
+fn install_binary(new_binary: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let backup = target.with_extension("old");
+    // A previous update on Windows cannot delete the file it is running from,
+    // so the backup it left behind is cleared now, before the rename needs
+    // the name.
+    let _ = std::fs::remove_file(&backup);
+
+    if target.exists() {
+        std::fs::rename(target, &backup)
+            .with_context(|| format!("Failed to rename current binary to {}", backup.display()))?;
+    }
+
+    if let Err(e) = std::fs::copy(new_binary, target) {
+        // Best-effort rollback: if restore also fails the operator's binary is
+        // already at `backup` — surface the original copy error so they can recover.
+        let _ = std::fs::rename(&backup, target);
+        return Err(e).with_context(|| format!("Failed to install {}", target.display()));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(target, perms).context("Failed to set executable permissions")?;
+    }
+
+    // Clean up backup. Fails on Windows while the old binary is still the
+    // running one; the next install clears it.
+    let _ = std::fs::remove_file(&backup);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -520,13 +664,20 @@ mod tests {
     fn test_platform_asset_name() {
         let name = platform_asset_name().unwrap();
         assert!(name.starts_with("borg-"));
-        assert!(name.ends_with(".tar.gz"));
+        if cfg!(windows) {
+            assert!(name.ends_with(".zip"));
+        } else {
+            assert!(name.ends_with(".tar.gz"));
+        }
 
         #[cfg(target_os = "macos")]
         assert!(name.contains("darwin"));
 
         #[cfg(target_os = "linux")]
         assert!(name.contains("linux"));
+
+        #[cfg(target_os = "windows")]
+        assert!(name.contains("windows"));
 
         #[cfg(target_arch = "aarch64")]
         assert!(name.contains("arm64"));
@@ -588,6 +739,7 @@ fedcba987654  checksums.txt
             "borg-darwin-x86_64.tar.gz",
             "borg-linux-arm64.tar.gz",
             "borg-linux-x86_64.tar.gz",
+            "borg-windows-x86_64.zip",
         ];
         assert!(
             valid_names.contains(&name.as_str()),
@@ -625,6 +777,7 @@ fedcba987654  checksums.txt
             assets: vec![ReleaseAsset {
                 name: asset_name.into(),
                 browser_download_url: url.into(),
+                url: String::new(),
             }],
         }
     }
@@ -706,6 +859,7 @@ fedcba987654  checksums.txt
                 .map(|i| ReleaseAsset {
                     name: format!("asset-{i}.tar.gz"),
                     browser_download_url: format!("https://example.com/asset-{i}.tar.gz"),
+                    url: String::new(),
                 })
                 .collect(),
         }
@@ -794,5 +948,137 @@ fedcba987654  checksums.txt
         assert!(msg.contains("rate limit exceeded"), "{msg}");
         assert!(msg.contains("remaining 0"), "{msg}");
         assert!(msg.contains("resets at"), "{msg}");
+    }
+
+    #[test]
+    fn install_binary_replaces_target_and_drops_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("borg");
+        let fresh = dir.path().join("fresh");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&fresh, b"new").unwrap();
+
+        install_binary(&fresh, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!dir.path().join("borg.old").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "installed binary must be executable");
+        }
+    }
+
+    #[test]
+    fn install_binary_creates_missing_target() {
+        // A first-time daemon install beside borg: nothing to rename aside.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("borgd");
+        let fresh = dir.path().join("fresh");
+        std::fs::write(&fresh, b"daemon").unwrap();
+
+        install_binary(&fresh, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"daemon");
+    }
+
+    #[test]
+    fn install_binary_clears_stale_backup_first() {
+        // Windows cannot delete the binary it is running from, so a backup
+        // from the previous update is still there when the next one starts.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("borg");
+        let fresh = dir.path().join("fresh");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(dir.path().join("borg.old"), b"older").unwrap();
+        std::fs::write(&fresh, b"new").unwrap();
+
+        install_binary(&fresh, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!dir.path().join("borg.old").exists());
+    }
+
+    #[test]
+    fn install_binary_restores_target_when_copy_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("borg");
+        std::fs::write(&target, b"old").unwrap();
+        let missing = dir.path().join("does-not-exist");
+
+        let err = install_binary(&missing, &target).unwrap_err();
+
+        assert!(format!("{err:#}").contains("Failed to install"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(!dir.path().join("borg.old").exists());
+    }
+
+    #[test]
+    fn daemon_install_target_prefers_existing_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let borg = dir.path().join(BORG_FILE_NAME);
+        let sibling = dir.path().join(BORGD_FILE_NAME);
+        std::fs::write(&borg, b"").unwrap();
+        std::fs::write(&sibling, b"").unwrap();
+
+        assert_eq!(daemon_install_target(&borg), sibling);
+    }
+
+    #[test]
+    fn daemon_install_target_falls_back_to_sibling_when_none_on_path() {
+        // The launcher looks beside `borg` before PATH, so a fresh daemon
+        // beside it is the one that gets run.
+        let dir = tempfile::tempdir().unwrap();
+        let borg = dir.path().join(BORG_FILE_NAME);
+        std::fs::write(&borg, b"").unwrap();
+        if which::which(BORGD_FILE_NAME).is_ok() {
+            // A developer machine with borgd on PATH takes the other branch.
+            return;
+        }
+
+        assert_eq!(
+            daemon_install_target(&borg),
+            dir.path().join(BORGD_FILE_NAME)
+        );
+    }
+
+    #[test]
+    fn download_url_prefers_api_link_only_when_authenticated() {
+        let asset = ReleaseAsset {
+            name: "borg-darwin-arm64.tar.gz".into(),
+            browser_download_url: "https://github.com/x/y/releases/download/v1/a.tar.gz".into(),
+            url: "https://api.github.com/repos/x/y/releases/assets/1".into(),
+        };
+        assert_eq!(download_url(&asset, false), asset.browser_download_url);
+        assert_eq!(download_url(&asset, true), asset.url);
+
+        // An older feed shape with no API link falls back to the direct one.
+        let direct_only = ReleaseAsset {
+            url: String::new(),
+            ..asset
+        };
+        assert_eq!(
+            download_url(&direct_only, true),
+            direct_only.browser_download_url
+        );
+    }
+
+    #[test]
+    fn select_asset_rejects_non_https_api_link() {
+        let mut r = release_with(
+            "borg-darwin-arm64.tar.gz",
+            "https://example.com/borg-darwin-arm64.tar.gz",
+        );
+        r.assets[0].url = "http://api.example.com/assets/1".into();
+        assert!(select_asset(&r, "borg-darwin-arm64.tar.gz").is_err());
+    }
+
+    #[test]
+    fn release_asset_parses_without_api_url() {
+        let asset: ReleaseAsset =
+            serde_json::from_str(r#"{"name":"a","browser_download_url":"https://example.com/a"}"#)
+                .unwrap();
+        assert_eq!(asset.url, "");
     }
 }

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Pill } from "@borg/ui";
-import { useNative } from "../lib/platform";
-import { useKeybind } from "../lib/keybinds";
-import { showNotice } from "../lib/notice";
-import type { UpdateStatus } from "../lib/native";
+import type { SidebarUpdate } from "@borg/ui";
+import { useNative } from "./platform";
+import { useKeybind } from "./keybinds";
+import { showNotice } from "./notice";
+import type { UpdateStatus } from "./native";
 
 /**
  * Why a check failed, in words a person can act on. The updater's own message
@@ -19,20 +19,34 @@ export function checkFailureReason(message: string | undefined): string {
 }
 
 /**
- * The only thing an update is allowed to do to the user.
+ * The part of the updater's status the sidebar shows, or nothing.
  *
- * No modal, no forced restart, no progress bar competing with the transcript.
- * The download happens silently and this appears once a build is ready, in the
- * corner, until it is convenient. Everything else about updating is invisible.
- *
- * The one exception is a check the user asked for. A menu item that does
- * nothing visible reads as broken, so that check answers — up to date, or why
- * it could not tell — through the shell's notice. Automatic checks stay silent.
+ * Idle, checking and a failed automatic check all map to nothing: the sidebar
+ * speaks only when there is a build on its way, and says so until the user
+ * restarts into it.
  */
-export function UpdatePill() {
+export function sidebarUpdate(status: UpdateStatus): SidebarUpdate | undefined {
+  switch (status.state) {
+    case "available":
+    case "downloading":
+    case "ready":
+      return { state: status.state, version: status.version, percent: status.percent };
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Follows the native shell's auto-updater.
+ *
+ * Automatic checks stay silent. A check the user asked for, through the menu
+ * item or its chord, answers — up to date, or why it could not tell — through
+ * the shell's notice, because a menu item that does nothing visible reads as
+ * broken. A build that was found needs no notice: the sidebar shows it.
+ */
+export function useUpdater(): { status: UpdateStatus; install: () => void } {
   const native = useNative();
   const [status, setStatus] = useState<UpdateStatus>({ state: "idle" });
-  const [dismissed, setDismissed] = useState(false);
   /** True from the user's request until the updater has answered it. */
   const asked = useRef(false);
   /**
@@ -58,37 +72,17 @@ export function UpdatePill() {
             : "Couldn't check for updates.";
           showNotice(`${what} ${checkFailureReason(next.message)}`);
         } else if (next.state === "ready") {
-          // The pill below is the answer.
+          // The sidebar is the answer.
           asked.current = false;
         }
       }),
     [native],
   );
   useKeybind("check-for-updates", () => {
-    setDismissed(false);
     asked.current = true;
     found.current = false;
     native.updates.check();
   });
 
-  if (status.state !== "ready" || dismissed) return null;
-
-  return (
-    <div className="pointer-events-auto fixed right-5 bottom-5 z-40 flex items-center gap-2.5 rounded-[11px] border border-line bg-surface2 py-2 pr-2 pl-3.5 shadow-(--frameShadow)">
-      <span className="text-[12.5px] leading-none text-ink2">
-        Borg {status.version ?? ""} is ready
-      </span>
-      <Pill square variant="primary" onClick={() => native.updates.install()}>
-        Restart
-      </Pill>
-      <button
-        type="button"
-        aria-label="Dismiss"
-        onClick={() => setDismissed(true)}
-        className="cursor-pointer border-0 bg-transparent px-1 text-[13px] leading-none text-ink3 hover:text-ink"
-      >
-        ×
-      </button>
-    </div>
-  );
+  return { status, install: native.updates.install };
 }
