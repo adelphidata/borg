@@ -1662,6 +1662,10 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     // `InteractiveInputUnavailable` (silently logged) rather than surfacing a
     // misleading "nothing to report" notice.
     let mut interactive_input = false;
+    // Set when the agentic turn ended on an agent error with no reply (spent
+    // monthly budget, provider down, …). The run is a failure: booking it as
+    // `zero_info` hid a spent budget behind "nothing to report" for weeks.
+    let mut agent_error = None;
     let (result_text, followup) = match (go_agentic, ctx.executor.as_ref()) {
         (true, Some(executor)) => {
             // Agentic remediation: full agent loop (tools + the per-session
@@ -1683,6 +1687,10 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                     interactive_input = true;
                     String::new()
                 }
+                crate::heartbeat::CollectOutcome::Failed(error) => {
+                    agent_error = Some(error);
+                    String::new()
+                }
             };
             let followup = crate::heartbeat::handle_remediation_goal(config).await;
             (text, followup)
@@ -1699,7 +1707,8 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                 "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
                  # Heartbeat\nYou are running a proactive heartbeat check-in. \
                  If nothing actionable changed, respond with exactly `{SILENT_SENTINEL}` \
-                 on its own line to suppress delivery."
+                 on its own line to suppress delivery. {nudges_rule}",
+                nudges_rule = cortex::constants::HEARTBEAT_NUDGES_RULE,
             );
             let messages = vec![
                 cortex::types::Message::system(system),
@@ -1763,6 +1772,12 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     };
 
     if !force_deliver {
+        if let Some(error) = agent_error {
+            let err_str = redact_for_run(None, task_id, &error).into_owned();
+            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name).await;
+            publish_failed_event(started_unix, &err_str);
+            return;
+        }
         if interactive_input {
             record_heartbeat_silent(
                 *run_id,

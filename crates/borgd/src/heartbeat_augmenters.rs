@@ -33,7 +33,9 @@
 //!    ```
 //!    The returned string is a *directive to the model*, not a literal
 //!    message to the user — the agent rewrites it in its own voice. Keep
-//!    it to 2–3 sentences and tell the model when to stay quiet.
+//!    it to 2–3 sentences. Do not tell the model when to stay quiet: the
+//!    heartbeat protocol makes it relay every due nudge, and `cooldown_secs`
+//!    is what keeps a nudge from repeating.
 //!
 //! 2. Append an entry to [`AUGMENTERS`]:
 //!    ```ignore
@@ -210,8 +212,7 @@ from this computer (the Borg app or the terminal). This tick, briefly and \
 warmly suggest setting one up so you can message them on the go. Tell them \
 to run `borg plugins` in a terminal (or `/plugins` in the TUI) to browse \
 and install integrations. Native options: telegram, slack, discord, teams, \
-google-chat, twilio. Keep it to 2-3 sentences — don't lecture, and don't \
-repeat yourself if you've already raised this recently.";
+google-chat, twilio. Keep it to 2-3 sentences — don't lecture.";
 
 /// Critical host security issues — runs a subset of `borg doctor` checks
 /// (firewall, risky ports, SSH config) and nudges only when issues are found.
@@ -512,8 +513,7 @@ fn identity_nudge(path: &str) -> String {
          Playful), top priority area (Work / Personal / Both), and their name \
          with a one-line personality sketch. When they answer, call \
          `write_memory` with scope=`global` name=`IDENTITY` to persist a \
-         personalized identity filled from the template structure. Don't \
-         re-raise this if you've already asked recently."
+         personalized identity filled from the template structure."
     )
 }
 

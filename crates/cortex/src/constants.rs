@@ -435,6 +435,15 @@ pub const SILENT_REPLY_TOKEN: &str = "<SILENT>";
 /// Token the agent emits to acknowledge a heartbeat poll with nothing to report.
 pub const HEARTBEAT_OK_TOKEN: &str = "HEARTBEAT_OK";
 
+/// How a heartbeat turn treats its `<proactive_nudges>` block. Shared by the
+/// agentic heartbeat protocol and the tool-less check-in, so neither lane
+/// acks a tick that carries a due nudge. The augmenter cooldowns decide when
+/// a nudge is due; the model must not second-guess them from history.
+pub const HEARTBEAT_NUDGES_RULE: &str = "A heartbeat tick that carries a <proactive_nudges> \
+block always needs attention: Borg sends a nudge only when it is due, so relay every item to \
+the owner in your own words, even if an earlier tick carried the same nudge. Never answer it \
+with HEARTBEAT_OK or a silence marker.";
+
 // ── Typing indicator ──────────────────────────────────────────────
 
 /// Maximum duration (seconds) before auto-stopping a typing indicator.

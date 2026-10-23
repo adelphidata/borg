@@ -55,6 +55,11 @@ pub(crate) enum CollectOutcome {
     /// immediately so the bus sees a terminal event inside the
     /// smorgasborg eval's 90s budget.
     InteractivePromptRequested(String),
+    /// The turn ended with an `AgentEvent::Error` and no reply text — the
+    /// agent refused or could not run (spent budget, provider down, …).
+    /// Carries the first error. Kept apart from an empty `Completed` so the
+    /// run books as failed, not as a check-in with nothing to report.
+    Failed(String),
 }
 
 /// Drive the heartbeat agent's event channel until the turn ends, the
@@ -68,6 +73,7 @@ pub(crate) async fn collect_heartbeat_response(
 ) -> CollectOutcome {
     let deadline = Instant::now() + timeout;
     let mut response = String::new();
+    let mut error = None;
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -82,9 +88,17 @@ pub(crate) async fn collect_heartbeat_response(
                 drain_briefly(&mut event_rx).await;
                 return CollectOutcome::Timeout;
             }
-            Ok(None) => return CollectOutcome::Completed(response),
+            Ok(None) => {
+                return match error {
+                    Some(e) if response.trim().is_empty() => CollectOutcome::Failed(e),
+                    _ => CollectOutcome::Completed(response),
+                };
+            }
             Ok(Some(AgentEvent::TextDelta(delta))) => {
                 response.push_str(&delta);
+            }
+            Ok(Some(AgentEvent::Error(e))) => {
+                error.get_or_insert(e);
             }
             // The attempt that sent this text failed; the full response
             // comes again.
@@ -567,6 +581,7 @@ pub async fn execute_heartbeat_turn(
                 error: format!("heartbeat turn exceeded {timeout_secs}s timeout"),
             };
         }
+        CollectOutcome::Failed(error) => return HeartbeatResult::Failed { error },
         CollectOutcome::InteractivePromptRequested(detail) => {
             // The agent decided it needs to ask the user something
             // (`request_user_input`) or wants shell confirmation. A heartbeat
@@ -762,7 +777,7 @@ pub(crate) async fn run_scheduled_remediation_turn(
         }
         Err(e) => {
             tracing::warn!("Heartbeat remediation: start_turn failed: {e}");
-            CollectOutcome::Completed(String::new())
+            CollectOutcome::Failed(format!("agent error: {e}"))
         }
     }
 }
@@ -1506,6 +1521,46 @@ mod tests {
         let outcome = collect_heartbeat_response(rx, cancel.clone(), Duration::from_secs(5)).await;
         assert_eq!(outcome, CollectOutcome::Completed("hello".into()));
         assert!(!cancel.is_cancelled());
+    }
+
+    /// Spec: a turn the agent refused (here, the monthly token budget is
+    /// spent) failed. It is not a check-in with nothing to say.
+    #[tokio::test]
+    async fn collect_heartbeat_response_reports_an_agent_error_with_no_reply_as_failed() {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        for event in [
+            AgentEvent::Error("Monthly token budget exceeded (1013994/1000000).".into()),
+            AgentEvent::TurnComplete,
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let outcome =
+            collect_heartbeat_response(rx, CancellationToken::new(), Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            CollectOutcome::Failed("Monthly token budget exceeded (1013994/1000000).".into())
+        );
+    }
+
+    /// Spec: a reply the agent already wrote still goes out when a later
+    /// step of the turn fails.
+    #[tokio::test]
+    async fn collect_heartbeat_response_keeps_the_reply_when_an_error_follows_it() {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        for event in [
+            AgentEvent::TextDelta("Your firewall is off.".into()),
+            AgentEvent::Error("Max iterations (25) reached".into()),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let outcome =
+            collect_heartbeat_response(rx, CancellationToken::new(), Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            CollectOutcome::Completed("Your firewall is off.".into())
+        );
     }
 
     #[test]

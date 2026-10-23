@@ -742,9 +742,11 @@ pub(super) fn build_heartbeat_protocol(config: &crate::config::Config) -> String
         Heartbeat interval: {interval}. \
         If you receive a heartbeat poll (*heartbeat tick*) and there is nothing that needs attention, reply exactly:\n\
         {ok_token}\n\
+        {nudges_rule}\n\
         If something needs attention, do NOT include \"{ok_token}\"; reply with the alert text instead.\n\
         {remediation}\
-        </heartbeat_protocol>\n"
+        </heartbeat_protocol>\n",
+        nudges_rule = constants::HEARTBEAT_NUDGES_RULE,
     )
 }
 
@@ -864,6 +866,25 @@ mod heartbeat_protocol_tests {
         // The base ack protocol is always present in every variant.
         for variant in [&on, &off] {
             assert!(variant.contains("<heartbeat_protocol>"));
+        }
+    }
+
+    /// Regression: a tick that carried a due nudge was acked with
+    /// `HEARTBEAT_OK`, because the protocol only said "reply HEARTBEAT_OK when
+    /// nothing needs attention" and a suggestion did not read as attention.
+    /// Every variant must tell the agent a nudged tick is never acked.
+    #[test]
+    fn a_tick_with_proactive_nudges_is_never_acked() {
+        let mut cfg = Config::default();
+        for (goals, remediation) in [(true, true), (true, false), (false, false)] {
+            cfg.goals.enabled = goals;
+            cfg.heartbeat.remediation_enabled = remediation;
+            let protocol = build_heartbeat_protocol(&cfg);
+            let rule = protocol
+                .lines()
+                .find(|l| l.contains("<proactive_nudges>"))
+                .unwrap_or_else(|| panic!("no nudge rule in: {protocol}"));
+            assert!(rule.contains("Never answer it with HEARTBEAT_OK"), "{rule}");
         }
     }
 }
