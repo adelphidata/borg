@@ -27,7 +27,33 @@
 
 /** Which part of the stack failed, in the words the card puts on screen. */
 export type FailureLayer =
-  "disk" | "permissions" | "rate-limit" | "billing" | "auth" | "model" | "connection" | "unknown";
+  | "disk"
+  | "permissions"
+  | "budget"
+  | "rate-limit"
+  | "billing"
+  | "auth"
+  | "model"
+  | "connection"
+  | "unknown";
+
+/**
+ * The one setting that would fix this failure.
+ *
+ * Telling someone to "increase budget.monthly_token_limit in /settings" sends
+ * them through two screens and a five-hundred-row list to type one number.
+ * When the daemon names the key, the card can open that setting directly, and
+ * when it also knows a sensible new value, change it in place.
+ */
+export interface SettingFix {
+  key: string;
+  /** A value the card can offer to write as-is. Absent = link to the setting only. */
+  suggested?: string;
+  /** The button that writes `suggested`, by outcome ("Raise limit"). */
+  action?: string;
+  /** What the card says once the new value is saved. */
+  done?: (value: string) => string;
+}
 
 export interface Failure {
   layer: FailureLayer;
@@ -40,6 +66,8 @@ export interface Failure {
   retryable: boolean;
   /** True when the fix is a setting, so the card can offer the way there. */
   settings: boolean;
+  /** The exact setting, when the error names it. */
+  fix?: SettingFix;
 }
 
 interface Rule {
@@ -53,9 +81,11 @@ interface Rule {
    */
   unless?: RegExp;
   title: string;
-  message: string;
+  /** Static text, or built from the raw error when it carries numbers worth keeping. */
+  message: string | ((raw: string) => string);
   retryable: boolean;
   settings?: boolean;
+  fix?: (raw: string) => SettingFix | undefined;
 }
 
 const RATE_LIMIT_TITLE = "The model provider is throttling Borg";
@@ -64,6 +94,49 @@ const RATE_LIMIT_MESSAGE = `${RATE_LIMIT_WHAT} Wait a moment, then try again.`;
 const BILLING_TITLE = "The model provider needs paying";
 const BILLING_MESSAGE =
   "The provider refused the request for billing reasons. Add credit with the provider, or switch Borg to another one in Settings.";
+
+const MONTHLY_TOKEN_LIMIT = "budget.monthly_token_limit";
+
+/** `(1013994/1000000)` from the daemon's budget refusal. */
+function budgetUsage(raw: string): { used: string; limit: string } | undefined {
+  const match = /\((\d+)\s*\/\s*(\d+)\)/.exec(raw);
+  return match ? { used: match[1]!, limit: match[2]! } : undefined;
+}
+
+/**
+ * The limit to offer: double the old one, doubled again until it clears what
+ * is already spent. A raise that lands below the month's usage would refuse
+ * the very next message.
+ */
+export function nextLimit(used: number, limit: number): string {
+  let next = Math.max(limit, 1) * 2;
+  while (next <= used) next *= 2;
+  return String(next);
+}
+
+/** `1000000` → `1,000,000`, for numbers quoted back to the user. */
+function groupDigits(digits: string): string {
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * A setting key the daemon's text points at: `borg settings set llm.base_url`,
+ * `/settings llm.model`, or "Increase budget.x in /settings". Anchored on
+ * those phrases, because a bare dotted word is as often a file (`hooks.json`).
+ */
+const NAMED_KEY = [
+  /(?:borg settings set|\/settings)\s+`?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)/,
+  /`?([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)`?\s+in\s+\/settings/,
+];
+
+/** The setting an error names, if it names one. */
+export function namedSetting(raw: string): string | undefined {
+  for (const re of NAMED_KEY) {
+    const match = re.exec(raw);
+    if (match) return match[1];
+  }
+  return undefined;
+}
 
 /**
  * First match wins, so the order is the priority.
@@ -125,6 +198,32 @@ const RULES: readonly Rule[] = [
     message:
       "The operating system refused the write. Check the permissions on the path — Borg's own data lives in ~/.borg — then try again.",
     retryable: false,
+  },
+  {
+    // Borg's own monthly cap, not the provider's. It leads the provider rules
+    // because nothing at the provider is wrong, and its fix is one number.
+    layer: "budget",
+    pattern: /monthly token budget exceeded/,
+    title: "Borg reached its monthly token limit",
+    message: (raw) => {
+      const usage = budgetUsage(raw);
+      const what = usage
+        ? `Borg has used ${groupDigits(usage.used)} of its ${groupDigits(usage.limit)} tokens this month.`
+        : "Borg has used all of its tokens for this month.";
+      return `${what} Raise the limit to keep going.`;
+    },
+    retryable: false,
+    settings: true,
+    fix: (raw) => {
+      const usage = budgetUsage(raw);
+      return {
+        key: MONTHLY_TOKEN_LIMIT,
+        suggested: usage ? nextLimit(Number(usage.used), Number(usage.limit)) : undefined,
+        action: "Raise limit",
+        done: (value) =>
+          value === "0" ? "Limit removed." : `Limit raised to ${groupDigits(value)}.`,
+      };
+    },
   },
   {
     layer: "rate-limit",
@@ -205,17 +304,29 @@ export function retryHint(raw: string): string | undefined {
 /** Sorts a failure into its layer. */
 export function classifyFailure(error: { message: string } | undefined): Failure | undefined {
   if (!error) return undefined;
-  const haystack = error.message.toLowerCase();
+  const raw = error.message;
+  const haystack = raw.toLowerCase();
   const rule = RULES.find((r) => r.pattern.test(haystack) && !r.unless?.test(haystack));
+  const key = namedSetting(raw);
+  const named: SettingFix | undefined = key ? { key } : undefined;
   if (!rule) {
-    return { layer: "unknown", message: error.message, retryable: true, settings: false };
+    return {
+      layer: "unknown",
+      message: raw,
+      retryable: true,
+      settings: named !== undefined,
+      ...(named ? { fix: named } : {}),
+    };
   }
-  const hint = rule.layer === "rate-limit" ? retryHint(error.message) : undefined;
+  const hint = rule.layer === "rate-limit" ? retryHint(raw) : undefined;
+  const message = typeof rule.message === "function" ? rule.message(raw) : rule.message;
+  const fix = rule.fix?.(raw) ?? (rule.settings ? named : undefined);
   return {
     layer: rule.layer,
     title: rule.title,
-    message: hint ? `${RATE_LIMIT_WHAT} ${hint}` : rule.message,
+    message: hint ? `${RATE_LIMIT_WHAT} ${hint}` : message,
     retryable: rule.retryable,
     settings: rule.settings ?? false,
+    ...(fix ? { fix } : {}),
   };
 }

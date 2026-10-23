@@ -1,7 +1,77 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Pill } from "@borg/ui";
-import { classifyFailure } from "./sendFailure";
+import { Pill, isSubmitEnter } from "@borg/ui";
+import { useOptionalSettings } from "../../lib/settings";
+import { groupDigits, ungroupDigits } from "../settings/settingValue";
+import { classifyFailure, type SettingFix } from "./sendFailure";
+
+/** Where a setting's own editor lives. */
+const settingPath = (key: string) => `/settings/key/${encodeURIComponent(key)}`;
+
+/**
+ * Changes the one setting a failure names, without leaving the conversation.
+ *
+ * The value is prefilled with the daemon's best guess and stays editable, so
+ * the common case is one click and the careful case is one field. Once the
+ * write lands, the card says so and hands back the retry it withheld — the
+ * request that failed now has a reason to succeed.
+ */
+function InlineFix({
+  fix,
+  suggested,
+  onRetry,
+}: {
+  fix: SettingFix;
+  suggested: string;
+  onRetry?: () => void;
+}) {
+  const settings = useOptionalSettings();
+  const [draft, setDraft] = useState(groupDigits(suggested));
+  const [saved, setSaved] = useState<string>();
+  if (!settings) return null;
+  const { save, saving, saveError } = settings;
+
+  const commit = async () => {
+    if (saving) return;
+    const value = ungroupDigits(draft);
+    if (await save(fix.key, value)) setSaved(value);
+  };
+
+  if (saved !== undefined) {
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <span className="text-ink">{fix.done?.(saved) ?? "Saved."}</span>
+        {onRetry ? (
+          <Pill variant="primary" square onClick={onRetry}>
+            Try again
+          </Pill>
+        ) : (
+          <span>Send your message again.</span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          aria-label={fix.key}
+          inputMode="numeric"
+          spellCheck={false}
+          className="w-[150px] rounded-lg border border-field bg-surface2 px-3 py-2 text-[12.5px] leading-none text-ink tabular-nums outline-none focus:border-focus"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => isSubmitEnter(e) && void commit()}
+        />
+        <Pill variant="primary" square onClick={() => void commit()}>
+          {saving ? "Saving…" : (fix.action ?? "Save")}
+        </Pill>
+      </div>
+      {saveError && <div className="text-alert">{saveError.message}</div>}
+    </div>
+  );
+}
 
 /**
  * A failed turn, told as a layer and a next action.
@@ -34,6 +104,7 @@ export function FailureCard({
   live?: boolean;
 }) {
   const navigate = useNavigate();
+  const settings = useOptionalSettings();
   // Keyed by the message it was copied from. The live card never unmounts, so a
   // plain boolean would leave the next, different failure already reading
   // "Copied" — a receipt for something the user has not done.
@@ -41,6 +112,15 @@ export function FailureCard({
   const failure = classifyFailure(error);
   if (!failure || !error) return null;
   const copied = copyResult?.of === error.message ? copyResult.state : false;
+  const fix = failure.fix;
+  // A key only earns a deep link when this daemon has it; a stale name in an
+  // old error would open "That setting doesn't exist".
+  const known =
+    fix !== undefined &&
+    settings?.settings.state === "ready" &&
+    settings.settings.data.has(fix.key);
+  const inlineFix = known && fix.suggested !== undefined ? fix : undefined;
+  const deepLink = known ? settingPath(fix.key) : undefined;
 
   const copy = () => {
     const clipboard = navigator.clipboard;
@@ -68,6 +148,9 @@ export function FailureCard({
         <div className="pb-1 text-[12.5px] leading-[1.4] font-medium text-ink">{failure.title}</div>
       )}
       {failure.message}
+      {inlineFix && (
+        <InlineFix fix={inlineFix} suggested={inlineFix.suggested!} onRetry={onRetry} />
+      )}
       <div className="mt-3 flex flex-wrap gap-2">
         {/* Retry leads only where a repeat could work; elsewhere the fix does. */}
         {failure.retryable && onRetry && (
@@ -75,9 +158,9 @@ export function FailureCard({
             Try again
           </Pill>
         )}
-        {failure.settings && (
-          <Pill square onClick={() => navigate("/settings")}>
-            Open settings
+        {failure.settings && !inlineFix && (
+          <Pill square onClick={() => navigate(deepLink ?? "/settings")}>
+            {deepLink ? "Open this setting" : "Open settings"}
           </Pill>
         )}
         <Pill square onClick={copy}>

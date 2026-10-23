@@ -60,6 +60,7 @@ export {
 } from "./components/icons";
 export type { IconProps } from "./components/icons";
 export {
+  CONVERSATION_COL,
   DETAIL_COL,
   SECTION_LABEL,
   SECTION_LABEL_TEXT,

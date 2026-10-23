@@ -31,6 +31,40 @@ describe("TranscriptCell — user turns", () => {
     expect(screen.getByText("ship it")).toBeTruthy();
   });
 
+  const TICK =
+    "*heartbeat tick*\n\n<proactive_nudges>\n- Application Firewall is off\n  - run: `sudo socketfilterfw --setglobalstate on`\n- One scheduled task failed\n</proactive_nudges>";
+
+  it("draws a heartbeat tick as a check-in, not a bubble with tags in it", () => {
+    const { container } = renderCell({ kind: "user", text: TICK, at: Date.now() });
+    expect(screen.getByText("Heartbeat check-in")).toBeTruthy();
+    expect(container.textContent).not.toContain("<proactive_nudges>");
+    expect(container.textContent).not.toContain("*heartbeat tick*");
+    // The user did not write it, so it offers no edit-and-resend.
+    expect(screen.queryByLabelText("Edit and resend")).toBeNull();
+  });
+
+  it("folds the nudges behind their name and count, formatted when opened", () => {
+    const { container } = renderCell({ kind: "user", text: TICK });
+    const section = container.querySelector("details")!;
+    expect(section.open).toBe(false);
+    expect(section.querySelector("summary")!.textContent).toBe("Proactive nudges · 2");
+    // Laid out as the nested list it is, with the command as code.
+    expect(section.querySelectorAll("ul").length).toBe(2);
+    expect(section.querySelector("code")!.textContent).toBe(
+      "sudo socketfilterfw --setglobalstate on",
+    );
+  });
+
+  it("keeps a typed message with an attached block in the user's bubble", () => {
+    const { container } = renderCell({
+      kind: "user",
+      text: "check this\n\n<preprocessed_context>\n- disk 91% full\n</preprocessed_context>",
+    });
+    expect(screen.getByText("check this")).toBeTruthy();
+    expect(screen.getByLabelText("Edit and resend")).toBeTruthy();
+    expect(container.querySelector("summary")!.textContent).toBe("Preprocessed context · 1");
+  });
+
   it("counts images and names documents, none of whose bytes it still holds", () => {
     renderCell({
       kind: "user",

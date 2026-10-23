@@ -1,15 +1,16 @@
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Brackets, isSubmitEnter, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
 import type { Cell, SentAttachment } from "../useConversation";
 import { classifyStatus } from "../../agents/useAgentTree";
 import { focusComposer } from "../composerFocus";
 import { FailureCard } from "../FailureCard";
-import { useAutoGrow } from "../useAutoGrow";
+import { useAutoGrow } from "../../../lib/useAutoGrow";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
 import { formatClock, formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
 import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
+import { parseUserTurn, type AttachedBlock } from "../userTurn";
 
 /** Assistant reply in the bracketed-card style. */
 function ReplyCard({ kicker, children }: { kicker: string; children: React.ReactNode }) {
@@ -201,6 +202,72 @@ function EditBox({
  * has no way to splice a turn in the middle — so the button says so before it
  * does it.
  */
+/**
+ * One block Borg attached for the model, folded behind its name and size.
+ *
+ * Closed by default: it is the brief the model read, not a message to the
+ * user, and the reply right after it is where the answer is. Open, it reads as
+ * the formatted list it already is rather than as tagged source.
+ */
+function AttachedSection({ block }: { block: AttachedBlock }) {
+  return (
+    <details className="group/attached mt-2.5 first:mt-0">
+      <summary className="cursor-pointer text-[12px] leading-[1.4] text-ink3 select-none hover:text-ink2">
+        {block.label}
+        {block.items > 0 && <span className="tabular-nums"> · {block.items}</span>}
+      </summary>
+      <div className="mt-2 border-l border-line2 pl-3.5 text-[13px] leading-[1.55] text-ink2 select-text">
+        <Markdown>{block.body}</Markdown>
+      </div>
+    </details>
+  );
+}
+
+/**
+ * A turn Borg wrote into the user's role: a heartbeat check-in or a session
+ * greeting. Drawn as a quiet event across the column, not a bubble on the
+ * user's side, because the user did not say it.
+ */
+function SystemTurnCell({
+  label,
+  text,
+  blocks,
+  at,
+}: {
+  label: string;
+  text: string;
+  blocks: AttachedBlock[];
+  at: number | undefined;
+}) {
+  return (
+    <div className="rounded-xl border border-dashed border-line2 px-[18px] py-3">
+      <div className="flex items-baseline gap-2">
+        <span className={`${KICKER} mb-0 flex-1`}>{label}</span>
+        {at !== undefined && (
+          <time
+            dateTime={new Date(at).toISOString()}
+            className="text-[11px] leading-none text-ink3 tabular-nums"
+          >
+            {formatClock(at)}
+          </time>
+        )}
+      </div>
+      {text !== "" && (
+        <div className="mt-2.5 text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
+          {text}
+        </div>
+      )}
+      {blocks.length > 0 && (
+        <div className="mt-2">
+          {blocks.map((b, i) => (
+            <AttachedSection key={`${b.tag}-${i}`} block={b} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function UserCell({
   cell,
   onEdit,
@@ -210,6 +277,7 @@ function UserCell({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(cell.text);
+  const turn = useMemo(() => parseUserTurn(cell.text), [cell.text]);
   const resend = () => {
     if (draft.trim() === "") return;
     setEditing(false);
@@ -240,6 +308,12 @@ function UserCell({
     );
   }
 
+  if (turn.system) {
+    return (
+      <SystemTurnCell label={turn.system} text={turn.text} blocks={turn.blocks} at={cell.at} />
+    );
+  }
+
   return (
     <div className="group flex items-start justify-end gap-1.5">
       {onEdit && (
@@ -258,7 +332,14 @@ function UserCell({
       <div className="max-w-[78%]">
         <div className="rounded-[13px] rounded-br-[4px] border border-line2 bg-surface3 px-4 py-[11px] text-[13.5px] leading-[1.45] whitespace-pre-wrap text-ink select-text">
           {/* A turn that was only its attachments has no text to make room for. */}
-          {cell.text !== "" && <div>{cell.text}</div>}
+          {turn.text !== "" && <div>{turn.text}</div>}
+          {turn.blocks.length > 0 && (
+            <div className={`whitespace-normal ${turn.text !== "" ? "mt-2.5" : ""}`}>
+              {turn.blocks.map((b, i) => (
+                <AttachedSection key={`${b.tag}-${i}`} block={b} />
+              ))}
+            </div>
+          )}
           {cell.attachments && cell.attachments.length > 0 && (
             <AttachmentLine attachments={cell.attachments} />
           )}

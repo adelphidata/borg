@@ -247,6 +247,27 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("path").textContent).toBe("/settings/voice");
   });
 
+  it("shows counts with grouped digits and lists by size, not as raw JSON", async () => {
+    mount(
+      fakeDaemon({
+        ...DAEMON,
+        GetSettings: {
+          entries: [
+            ...REGISTRY,
+            entry("agents.child_timeout_ms", "120000"),
+            entry("agents.allowed_roles", '["worker","reviewer"]'),
+          ],
+        },
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
+    act(() => screen.getByText("Advanced").click());
+    act(() => screen.getByText("Agents & Goals").click());
+    expect(screen.getByTitle("agents.child_timeout_ms").textContent).toContain("120,000");
+    expect(screen.getByTitle("agents.allowed_roles").textContent).toContain("2 items");
+    expect(screen.getByTitle("agents.allowed_roles").textContent).not.toContain("worker");
+  });
+
   it("remembers open folds for the tab across a remount", async () => {
     const first = mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());

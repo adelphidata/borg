@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatClock, formatElapsed } from "./format";
+import { formatClock, formatCost, formatElapsed } from "./format";
 
 describe("formatClock", () => {
   const time = (d: Date) => d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
@@ -55,5 +55,19 @@ describe("formatElapsed", () => {
 
   it("shows nothing negative when the clock disagrees with itself", () => {
     expect(formatElapsed(-500)).toBe("0.0s");
+  });
+});
+
+describe("formatCost", () => {
+  it("shows extra precision below a cent, so real spend never reads as zero", () => {
+    expect(formatCost(0.0023)).toBe("$0.0023");
+  });
+
+  it("uses ordinary currency formatting at and above a cent", () => {
+    expect(formatCost(1.5)).toBe("$1.50");
+  });
+
+  it("shows a plain zero when there really was no spend", () => {
+    expect(formatCost(0)).toBe("$0.00");
   });
 });

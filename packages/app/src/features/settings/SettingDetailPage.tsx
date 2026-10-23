@@ -26,7 +26,9 @@ import {
   useSetupStatus,
   type SetupStatus,
 } from "../onboarding/useSetupStatus";
+import { useAutoGrow } from "../../lib/useAutoGrow";
 import { findBasicSetting, optionLabel, type BasicSetting, type SettingOption } from "./catalog";
+import { compactJson, groupDigits, prettyJson, ungroupDigits, valueShape } from "./settingValue";
 
 /** The row that opens the free-text editor under a catalog picker. */
 const SOMETHING_ELSE = "__something_else__";
@@ -149,6 +151,134 @@ function ValueEditor({
         {onReset && <Pill onClick={() => !saving && onReset()}>Reset to default</Pill>}
       </div>
     </div>
+  );
+}
+
+/** Tall enough for a dozen-entry list; past it the box scrolls. */
+const JSON_MAX_PX = 420;
+
+/**
+ * A JSON list or object, laid out one entry per line.
+ *
+ * On one line, `security.blocked_paths` ran off the edge of the field after
+ * the fourth path, and nobody can edit what they cannot see. Monospace keeps
+ * the quotes upright and the indentation honest. A draft that does not parse
+ * is stopped here, in plain words, instead of reaching the daemon as a string
+ * it rejects with a parser trace.
+ */
+function JsonEditor({
+  label,
+  initial,
+  saving,
+  onSave,
+  onReset,
+}: {
+  label: string;
+  /** Already pretty-printed. */
+  initial: string;
+  saving: boolean;
+  /** Receives the compact form the daemon stores. */
+  onSave: (value: string) => void;
+  onReset?: () => void;
+}) {
+  const [draft, setDraft] = useState(initial);
+  const [invalid, setInvalid] = useState<string>();
+  useEffect(() => {
+    setDraft(initial);
+    setInvalid(undefined);
+  }, [initial]);
+  const ref = useAutoGrow(draft, JSON_MAX_PX);
+
+  const commit = () => {
+    if (saving) return;
+    const out = compactJson(draft);
+    if ("error" in out) {
+      setInvalid(out.error);
+      return;
+    }
+    onSave(out.value);
+  };
+
+  return (
+    <div className="flex flex-col gap-3.5">
+      <textarea
+        ref={ref}
+        aria-label={label}
+        aria-invalid={invalid ? true : undefined}
+        spellCheck={false}
+        value={draft}
+        className={`w-full resize-none overflow-y-auto rounded-[10px] border bg-surface2 px-4 py-3 font-mono text-[12.5px] leading-[1.6] text-ink outline-none [tab-size:2] focus:border-focus ${
+          invalid ? "border-alert" : "border-field"
+        }`}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setInvalid(undefined);
+        }}
+        // Enter is a new line here. The modifier saves, as in any code box.
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && isSubmitEnter(e)) {
+            e.preventDefault();
+            commit();
+          }
+        }}
+      />
+      {invalid && (
+        <div role="alert" className="text-[12.5px] leading-[1.45] text-alert">
+          {invalid}
+        </div>
+      )}
+      <div className="flex items-center gap-[9px]">
+        <Pill variant="primary" onClick={commit}>
+          {saving ? "Saving…" : "Save"}
+        </Pill>
+        {onReset && <Pill onClick={() => !saving && onReset()}>Reset to default</Pill>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The editor for a raw registry key, picked by what the value looks like.
+ *
+ * A count reads with its thousands grouped and saves without them; a list or
+ * object gets the multi-line JSON box; everything else is the plain field.
+ */
+function ShapedValueEditor({
+  label,
+  settingKey,
+  initial,
+  saving,
+  onSave,
+  onReset,
+}: {
+  label: string;
+  settingKey: string;
+  initial: string;
+  saving: boolean;
+  onSave: (value: string) => void;
+  onReset?: () => void;
+}) {
+  const shape = valueShape(settingKey, initial);
+  if (shape.kind === "json") {
+    return (
+      <JsonEditor
+        label={label}
+        initial={prettyJson(shape.parsed)}
+        saving={saving}
+        onSave={onSave}
+        onReset={onReset}
+      />
+    );
+  }
+  const integer = shape.kind === "integer";
+  return (
+    <ValueEditor
+      label={label}
+      initial={integer ? groupDigits(initial) : initial}
+      saving={saving}
+      onSave={(v) => onSave(integer ? ungroupDigits(v) : v)}
+      onReset={onReset}
+    />
   );
 }
 
@@ -282,11 +412,6 @@ function CatalogDetail({
           </Link>
         </div>
       )}
-      <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
-        {editing
-          ? "Saved to the daemon. Invalid values are rejected with the reason above."
-          : "Changes apply straight away. Nothing to save."}
-      </div>
     </>
   );
 }
@@ -360,9 +485,6 @@ function AppearanceDetail() {
           if (picked !== preference) setPreference(picked as ThemePreference);
         }}
       />
-      <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
-        Changes apply straight away. Nothing to save.
-      </div>
     </DetailShell>
   );
 }
@@ -442,19 +564,15 @@ export function SettingDetailPage() {
                   onPick={(v) => v !== entry.value && void save(entry.key, v)}
                 />
               ) : (
-                <ValueEditor
+                <ShapedValueEditor
                   label={title}
+                  settingKey={entry.key}
                   initial={entry.value}
                   saving={saving}
                   onSave={(v) => void save(entry.key, v)}
                   onReset={entry.overridden ? () => void clear(entry.key) : undefined}
                 />
               )}
-              <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
-                {basic?.options
-                  ? "Changes apply straight away. Nothing to save."
-                  : "Saved to the daemon. Invalid values are rejected with the reason above."}
-              </div>
             </>
           );
         }}

@@ -212,6 +212,104 @@ describe("SettingDetailPage for a free-text value", () => {
   });
 });
 
+describe("SettingDetailPage for a count", () => {
+  const COUNT = [entry("llm.request_timeout_ms", "120000", "db")];
+
+  it("shows the thousands grouped and saves the plain number", async () => {
+    const daemon = fakeDaemon({ GetSettings: { entries: COUNT }, SetSetting: {} });
+    mount("/settings/key/llm.request_timeout_ms", daemon);
+    await waitFor(() => expect(screen.getByDisplayValue("120,000")).toBeTruthy());
+
+    fireEvent.change(screen.getByDisplayValue("120,000"), { target: { value: "1,500,000" } });
+    click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "llm.request_timeout_ms",
+        value: "1500000",
+      }),
+    );
+  });
+});
+
+describe("SettingDetailPage for a JSON value", () => {
+  const JSON_REGISTRY = [
+    entry("security.blocked_paths", '[".ssh",".aws"]', "db"),
+    entry("security.action_limits", '{"tool_calls_warn":200,"tool_calls_block":500}'),
+  ];
+  const box = () => screen.getByLabelText(/security\./) as HTMLTextAreaElement;
+  const daemonWith = (extra = {}) =>
+    fakeDaemon({ GetSettings: { entries: JSON_REGISTRY }, ...extra });
+
+  it("lays a list out one entry per line in a multi-line box", async () => {
+    mount("/settings/key/security.blocked_paths", daemonWith());
+    await waitFor(() => expect(box().value).toBe('[\n  ".ssh",\n  ".aws"\n]'));
+    expect(box().tagName).toBe("TEXTAREA");
+  });
+
+  it("pretty-prints an object too", async () => {
+    mount("/settings/key/security.action_limits", daemonWith());
+    await waitFor(() => expect(box().value).toContain('\n  "tool_calls_warn": 200,'));
+  });
+
+  it("saves the compact form the daemon stores", async () => {
+    const daemon = daemonWith({ SetSetting: {} });
+    mount("/settings/key/security.blocked_paths", daemon);
+    await waitFor(() => expect(box().value).toContain(".ssh"));
+
+    fireEvent.change(box(), { target: { value: '[\n  ".ssh",\n  ".kube"\n]' } });
+    click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "security.blocked_paths",
+        value: '[".ssh",".kube"]',
+      }),
+    );
+  });
+
+  it("stops a draft that does not parse before it reaches the daemon", async () => {
+    const daemon = daemonWith({ SetSetting: {} });
+    mount("/settings/key/security.blocked_paths", daemon);
+    await waitFor(() => expect(box().value).toContain(".ssh"));
+
+    fireEvent.change(box(), { target: { value: '[".ssh",' } });
+    click(screen.getByText("Save"));
+    expect(screen.getByRole("alert").textContent).toMatch(/not valid JSON/);
+    expect(box().getAttribute("aria-invalid")).toBe("true");
+    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
+
+    // Typing again clears the complaint.
+    fireEvent.change(box(), { target: { value: '[".ssh"]' } });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps Enter as a new line and saves on Cmd or Ctrl+Enter", async () => {
+    const daemon = daemonWith({ SetSetting: {} });
+    mount("/settings/key/security.blocked_paths", daemon);
+    await waitFor(() => expect(box().value).toContain(".ssh"));
+
+    fireEvent.keyDown(box(), { key: "Enter" });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
+
+    fireEvent.keyDown(box(), { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(true));
+  });
+
+  it("resets an overridden list to its default", async () => {
+    const daemon = daemonWith({ UnsetSetting: {} });
+    mount("/settings/key/security.blocked_paths", daemon);
+    await waitFor(() => expect(screen.getByText("Reset to default")).toBeTruthy());
+    click(screen.getByText("Reset to default"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UnsetSetting")?.request).toEqual({
+        key: "security.blocked_paths",
+      }),
+    );
+  });
+});
+
 describe("SettingDetailPage edge cases", () => {
   it("says so for a route segment that names no setting", () => {
     mount("/settings/nonsense");
@@ -388,7 +486,6 @@ describe("appearance, which never reaches the daemon", () => {
   it("applies a theme change immediately and stores it locally", async () => {
     const daemon = fakeDaemon({ GetSettings: { entries: REGISTRY } });
     mount("/settings/appearance", daemon);
-    expect(screen.getByText("Changes apply straight away. Nothing to save.")).toBeTruthy();
 
     click(screen.getByText("Light"));
     await waitFor(() => expect(localStorage.getItem(STORAGE_KEYS.theme)).toBe("light"));

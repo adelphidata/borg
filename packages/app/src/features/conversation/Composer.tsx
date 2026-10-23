@@ -3,6 +3,7 @@ import {
   AttachIcon,
   CloseIcon,
   CompletionList,
+  CONVERSATION_COL,
   isSubmitEnter,
   Pill,
   rowDomId,
@@ -12,7 +13,7 @@ import {
 import { useKeybind } from "../../lib/keybinds";
 import { rank } from "../palette/score";
 import { useCommands } from "../palette/useCommands";
-import { useAutoGrow } from "./useAutoGrow";
+import { useAutoGrow } from "../../lib/useAutoGrow";
 import { collectAttachments } from "./attachments";
 import { focusComposer, registerComposer } from "./composerFocus";
 import { appendPastedText, composerOwnsPaste, pastedTextFile } from "./documentPaste";
@@ -604,8 +605,8 @@ export function Composer({
   };
 
   return (
-    <div className={`flex-none ${isMobile ? "px-[18px] pt-3.5 pb-3" : "px-[30px] pt-4 pb-[26px]"}`}>
-      <div className={`mx-auto max-w-[660px] ${isMobile ? "px-[22px]" : ""}`}>
+    <div className={`flex-none ${isMobile ? "px-[18px] pt-3.5 pb-3" : "px-[40px] pt-4 pb-[26px]"}`}>
+      <div className={`mx-auto ${CONVERSATION_COL} ${isMobile ? "px-[22px]" : ""}`}>
         {error && <div className="mb-2 px-1 text-[11.5px] leading-[1.5] text-alert">{error}</div>}
 
         {/* Where the held text waits. Same chip vocabulary as an attachment,

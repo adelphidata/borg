@@ -23,6 +23,13 @@ export const SECTION_LABEL = `${SECTION_LABEL_TEXT} mb-3.5`;
 export const TEXT_FIELD =
   "rounded-[10px] border border-field bg-surface2 px-4 py-3 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3 focus:border-focus";
 
+/**
+ * The conversation column: transcript, the strip under it, and the composer
+ * share one width so the input lines up with what it answers. Wide enough to
+ * use a desktop window, capped so a line of prose stays readable.
+ */
+export const CONVERSATION_COL = "max-w-[880px]";
+
 /** Narrow column used by the connection + setting detail pages. */
 export const DETAIL_COL = "flex max-w-[620px] flex-col gap-7";
 

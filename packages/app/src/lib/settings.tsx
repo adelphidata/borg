@@ -92,3 +92,12 @@ export function useSettings(): SettingsContextValue {
   if (!ctx) throw new Error("useSettings must be used within SettingsProvider");
   return ctx;
 }
+
+/**
+ * The settings context where one may not exist. A card that renders both
+ * inside the app and in isolation (a transcript cell in a test, a failure
+ * reported before the provider mounts) uses this to degrade, not throw.
+ */
+export function useOptionalSettings(): SettingsContextValue | null {
+  return useContext(SettingsContext);
+}
