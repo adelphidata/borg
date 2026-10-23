@@ -64,6 +64,20 @@ pub struct VoiceConfig {
     /// arms a single-shot recorder on keydown and transcribes on keyup.
     /// Format is `<modifier>-<key>` lowercase, e.g. `ctrl-b`, `alt-v`.
     pub record_key: String,
+    /// The app's dictation key, in the web chord syntax (`mod+shift+space`).
+    /// A lone modifier code (`altright`) means hold that key to talk.
+    pub dictation_shortcut: String,
+    /// Hold the shortcut to record and release to stop; a quick tap still
+    /// toggles. `false` makes every press a toggle.
+    pub hold_to_record: bool,
+    /// Send a dictated message as soon as it is transcribed, instead of
+    /// leaving it in the composer for review.
+    pub dictation_auto_send: bool,
+    /// Also copy each transcript to the clipboard.
+    pub copy_transcript: bool,
+    /// Desktop only: the dictation shortcut also works while another app is
+    /// in front, and brings Borg forward to listen.
+    pub background_shortcut: bool,
 }
 
 impl Default for VoiceConfig {
@@ -81,6 +95,11 @@ impl Default for VoiceConfig {
             beep_enabled: true,
             auto_submit: true,
             record_key: "ctrl-b".to_string(),
+            dictation_shortcut: "mod+shift+space".to_string(),
+            hold_to_record: true,
+            dictation_auto_send: false,
+            copy_transcript: false,
+            background_shortcut: false,
         }
     }
 }
@@ -109,6 +128,12 @@ mod tests {
         assert!(!cfg.enabled);
         // the keybinding is part of the parity contract.
         assert_eq!(cfg.record_key, "ctrl-b");
+        // The app's dictation defaults: review before sending, hold or tap.
+        assert_eq!(cfg.dictation_shortcut, "mod+shift+space");
+        assert!(cfg.hold_to_record);
+        assert!(!cfg.dictation_auto_send);
+        assert!(!cfg.copy_transcript);
+        assert!(!cfg.background_shortcut);
     }
 
     #[test]

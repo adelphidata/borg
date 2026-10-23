@@ -24,6 +24,9 @@ pub(super) struct TranscriptionRequest<'a> {
     pub filename: String,
     pub model: Option<String>,
     pub language: Option<String>,
+    /// Names and phrases the recording is likely to contain. Whisper-shaped
+    /// providers take it as `prompt`; the rest ignore it.
+    pub prompt: Option<String>,
     pub timeout: Duration,
 }
 
@@ -59,6 +62,9 @@ impl TranscriptionProvider for WhisperProvider {
 
         if let Some(ref lang) = req.language {
             form = form.text("language", lang.clone());
+        }
+        if let Some(ref prompt) = req.prompt {
+            form = form.text("prompt", prompt.clone());
         }
 
         let resp = self
@@ -883,6 +889,7 @@ mod tests {
             filename: "clip.wav".to_string(),
             model: None,
             language: None,
+            prompt: None,
             timeout: Duration::from_secs(5),
         }
     }
@@ -943,6 +950,33 @@ mod tests {
             .await
             .expect("mocked success");
         assert_eq!(transcript, "hello from mock");
+    }
+
+    #[tokio::test]
+    async fn whisper_provider_sends_the_vocabulary_hint_as_prompt() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/audio/transcriptions"))
+            .and(body_string_contains("name=\"prompt\""))
+            .and(body_string_contains("Borg, Adelphi"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "ok"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = WhisperProvider {
+            client: Client::new(),
+            api_key: "sk-mock-key".to_string(),
+            base_url: server.uri(),
+            default_model: "whisper-1".to_string(),
+            provider_name: "openai".to_string(),
+        };
+        let mut req = make_request(b"audio-bytes");
+        req.prompt = Some("Borg, Adelphi".to_string());
+        provider.transcribe(&req).await.expect("mocked success");
     }
 
     #[tokio::test]

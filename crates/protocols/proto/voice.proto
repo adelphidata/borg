@@ -12,6 +12,9 @@ service Voice {
   rpc GetVoiceCatalog(Empty) returns (VoiceCatalog);
   // Turn a short recording into text with the configured transcription chain.
   rpc Transcribe(TranscribeRequest) returns (TranscribeResponse);
+  // Turn a reply into audio with the configured speech chain, so the UI can
+  // read it aloud.
+  rpc Synthesize(SynthesizeRequest) returns (SynthesizeResponse);
 }
 
 message Empty {}
@@ -68,4 +71,17 @@ message TranscribeRequest {
 
 message TranscribeResponse {
   string text = 1;
+}
+
+message SynthesizeRequest {
+  // Markdown is fine; it is stripped before synthesis.
+  string text = 1;
+  // Optional voice id for the primary provider; empty uses the configured one.
+  string voice = 2;
+}
+
+message SynthesizeResponse {
+  bytes audio = 1;
+  // e.g. "audio/mpeg".
+  string mime_type = 2;
 }

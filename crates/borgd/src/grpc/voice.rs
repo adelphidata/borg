@@ -11,7 +11,8 @@ use cortex::media::understanding::AudioTranscriber;
 use cortex::telephony::{PhoneDialer, TelephonyProviderDef};
 use protocols::voice::voice_server::Voice;
 use protocols::voice::{
-    Empty, PhoneProvider, TranscribeRequest, TranscribeResponse, VoiceCatalog, VoiceProvider,
+    Empty, PhoneProvider, SynthesizeRequest, SynthesizeResponse, TranscribeRequest,
+    TranscribeResponse, VoiceCatalog, VoiceProvider,
 };
 use tonic::{Request, Response, Status as TStatus};
 
@@ -104,6 +105,47 @@ impl Voice for VoiceSvc {
         transcribe_with(&config, req.into_inner())
             .await
             .map(Response::new)
+    }
+
+    async fn synthesize(
+        &self,
+        req: Request<SynthesizeRequest>,
+    ) -> Result<Response<SynthesizeResponse>, TStatus> {
+        let config = load_config().await?;
+        synthesize_with(&config, req.into_inner())
+            .await
+            .map(Response::new)
+    }
+}
+
+/// `Synthesize` against an already-loaded config. The reply is prepared the
+/// way every other spoken reply is: markdown stripped, then cut at the
+/// configured length rather than refused.
+async fn synthesize_with(
+    config: &Config,
+    req: SynthesizeRequest,
+) -> Result<SynthesizeResponse, TStatus> {
+    let Some(synth) = TtsSynthesizer::from_config(config) else {
+        return Err(TStatus::failed_precondition(
+            "Spoken replies are off. Pick a voice under Settings → Advanced → Voice & phone.",
+        ));
+    };
+    let text = cortex::media::tts::prepare_for_tts(&req.text, config.tts.max_text_length);
+    if text.trim().is_empty() {
+        return Err(TStatus::invalid_argument("Nothing to read aloud."));
+    }
+    let voice = Some(req.voice.as_str()).filter(|v| !v.is_empty());
+    match synth.synthesize(&text, voice, None).await {
+        Ok((audio, format, _)) => Ok(SynthesizeResponse {
+            audio,
+            mime_type: format.mime_type().to_string(),
+        }),
+        Err(e) => {
+            tracing::warn!("voice synthesis failed: {e:#}");
+            Err(TStatus::unavailable(format!(
+                "Could not read that aloud: {e}"
+            )))
+        }
     }
 }
 
@@ -213,6 +255,79 @@ mod tests {
         assert_eq!(file_name_for("audio/wav"), "recording.wav");
         assert_eq!(file_name_for("audio/mp4"), "recording.m4a");
         assert_eq!(file_name_for(""), "recording.webm");
+    }
+
+    #[tokio::test]
+    async fn synthesize_with_speech_off_names_the_setting() {
+        let err = synthesize_with(
+            &Config::default(),
+            SynthesizeRequest {
+                text: "hello".into(),
+                voice: String::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("Spoken replies are off"));
+    }
+
+    #[tokio::test]
+    async fn synthesize_strips_markdown_and_returns_the_chain_audio() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            // The stars are gone and the words are not: the provider hears
+            // prose, never markdown.
+            .and(body_string_contains("Read this aloud"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![1u8, 2, 3])
+                    .insert_header("content-type", "audio/mpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rows = [
+            ("tts.enabled".to_string(), "true".to_string()),
+            (
+                "tts.models".to_string(),
+                serde_json::json!([{"provider": "openai", "base_url": server.uri(),
+                                     "api_key_env": "BORGD_VOICE_TEST_UNSET"}])
+                .to_string(),
+            ),
+            (
+                "credentials.openai".to_string(),
+                r#"{"type":"literal","value":"sk"}"#.to_string(),
+            ),
+        ];
+        let config = Config::from_setting_rows(rows);
+        let out = synthesize_with(
+            &config,
+            SynthesizeRequest {
+                text: "**Read** this _aloud_".into(),
+                voice: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.audio, vec![1, 2, 3]);
+        assert_eq!(out.mime_type, "audio/mpeg");
+
+        let empty = synthesize_with(
+            &config,
+            SynthesizeRequest {
+                text: "```
+```"
+                .into(),
+                voice: String::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
     }
 
     fn recording() -> TranscribeRequest {

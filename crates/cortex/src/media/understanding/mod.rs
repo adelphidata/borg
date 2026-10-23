@@ -45,6 +45,8 @@ pub struct AudioTranscriber {
     max_file_size: u64,
     min_file_size: u64,
     default_language: Option<String>,
+    /// `audio.prompt`: the vocabulary hint every request carries.
+    prompt: Option<String>,
     default_timeout: Duration,
 }
 
@@ -75,6 +77,7 @@ impl AudioTranscriber {
             max_file_size: audio.max_file_size,
             min_file_size: audio.min_file_size,
             default_language: audio.language.clone(),
+            prompt: audio.prompt.clone().filter(|p| !p.trim().is_empty()),
             default_timeout: Duration::from_millis(audio.timeout_ms),
         })
     }
@@ -147,6 +150,7 @@ impl AudioTranscriber {
                 filename: filename.to_string(),
                 model: entry.model.clone(),
                 language: lang,
+                prompt: self.prompt.clone(),
                 timeout,
             };
 
@@ -451,6 +455,7 @@ mod tests {
             max_file_size: 20 * 1024 * 1024,
             min_file_size: 1024,
             default_language: None,
+            prompt: None,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 100]; // < 1024
@@ -468,6 +473,7 @@ mod tests {
             max_file_size: 1000,
             min_file_size: 10,
             default_language: None,
+            prompt: None,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 2000]; // > 1000
@@ -537,6 +543,7 @@ mod tests {
             max_file_size: 20 * 1024 * 1024,
             min_file_size: 1,
             default_language: None,
+            prompt: None,
             default_timeout: Duration::from_secs(5),
         };
 
@@ -601,6 +608,7 @@ mod tests {
             max_file_size: 1024,
             min_file_size: 1,
             default_language: None,
+            prompt: None,
             default_timeout: Duration::from_secs(5),
         };
 

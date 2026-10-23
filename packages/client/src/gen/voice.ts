@@ -74,6 +74,19 @@ export interface TranscribeResponse {
   text: string;
 }
 
+export interface SynthesizeRequest {
+  /** Markdown is fine; it is stripped before synthesis. */
+  text: string;
+  /** Optional voice id for the primary provider; empty uses the configured one. */
+  voice: string;
+}
+
+export interface SynthesizeResponse {
+  audio: Uint8Array;
+  /** e.g. "audio/mpeg". */
+  mimeType: string;
+}
+
 function createBaseEmpty(): Empty {
   return {};
 }
@@ -847,6 +860,180 @@ export const TranscribeResponse: MessageFns<TranscribeResponse> = {
   },
 };
 
+function createBaseSynthesizeRequest(): SynthesizeRequest {
+  return { text: "", voice: "" };
+}
+
+export const SynthesizeRequest: MessageFns<SynthesizeRequest> = {
+  encode(message: SynthesizeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.text !== "") {
+      writer.uint32(10).string(message.text);
+    }
+    if (message.voice !== "") {
+      writer.uint32(18).string(message.voice);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SynthesizeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSynthesizeRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.text = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.voice = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SynthesizeRequest {
+    return {
+      text: isSet(object.text) ? globalThis.String(object.text) : "",
+      voice: isSet(object.voice) ? globalThis.String(object.voice) : "",
+    };
+  },
+
+  toJSON(message: SynthesizeRequest): unknown {
+    const obj: any = {};
+    if (message.text !== "") {
+      obj.text = message.text;
+    }
+    if (message.voice !== "") {
+      obj.voice = message.voice;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SynthesizeRequest>, I>>(base?: I): SynthesizeRequest {
+    return SynthesizeRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SynthesizeRequest>, I>>(object: I): SynthesizeRequest {
+    const message = createBaseSynthesizeRequest();
+    message.text = object.text ?? "";
+    message.voice = object.voice ?? "";
+    return message;
+  },
+};
+
+function createBaseSynthesizeResponse(): SynthesizeResponse {
+  return { audio: new Uint8Array(0), mimeType: "" };
+}
+
+export const SynthesizeResponse: MessageFns<SynthesizeResponse> = {
+  encode(message: SynthesizeResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.audio.length !== 0) {
+      writer.uint32(10).bytes(message.audio);
+    }
+    if (message.mimeType !== "") {
+      writer.uint32(18).string(message.mimeType);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SynthesizeResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSynthesizeResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.audio = reader.bytes();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.mimeType = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SynthesizeResponse {
+    return {
+      audio: isSet(object.audio) ? bytesFromBase64(object.audio) : new Uint8Array(0),
+      mimeType: isSet(object.mimeType)
+        ? globalThis.String(object.mimeType)
+        : isSet(object.mime_type)
+        ? globalThis.String(object.mime_type)
+        : "",
+    };
+  },
+
+  toJSON(message: SynthesizeResponse): unknown {
+    const obj: any = {};
+    if (message.audio.length !== 0) {
+      obj.audio = base64FromBytes(message.audio);
+    }
+    if (message.mimeType !== "") {
+      obj.mimeType = message.mimeType;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SynthesizeResponse>, I>>(base?: I): SynthesizeResponse {
+    return SynthesizeResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SynthesizeResponse>, I>>(object: I): SynthesizeResponse {
+    const message = createBaseSynthesizeResponse();
+    message.audio = object.audio ?? new Uint8Array(0);
+    message.mimeType = object.mimeType ?? "";
+    return message;
+  },
+};
+
 /**
  * Voice and phone: the swappable providers for speech, transcription and
  * calls, plus the transcription the UI's microphone needs. Configuration
@@ -874,6 +1061,18 @@ export const VoiceDefinition = {
       requestType: TranscribeRequest as typeof TranscribeRequest,
       requestStream: false,
       responseType: TranscribeResponse as typeof TranscribeResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Turn a reply into audio with the configured speech chain, so the UI can
+     * read it aloud.
+     */
+    synthesize: {
+      name: "Synthesize",
+      requestType: SynthesizeRequest as typeof SynthesizeRequest,
+      requestStream: false,
+      responseType: SynthesizeResponse as typeof SynthesizeResponse,
       responseStream: false,
       options: {},
     },

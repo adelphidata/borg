@@ -192,6 +192,11 @@ define_settings! {
         "voice.no_speech_limit" => voice.no_speech_limit, parsed(u8);
         "voice.sample_rate_hz" => voice.sample_rate_hz, parsed(u32);
         "voice.record_key" => voice.record_key, string;
+        "voice.dictation_shortcut" => voice.dictation_shortcut, string;
+        "voice.hold_to_record" => voice.hold_to_record, parsed(bool);
+        "voice.dictation_auto_send" => voice.dictation_auto_send, parsed(bool);
+        "voice.copy_transcript" => voice.copy_transcript, parsed(bool);
+        "voice.background_shortcut" => voice.background_shortcut, parsed(bool);
 
         // ── Telephony ──
         "telephony.provider" => telephony.provider, string;
@@ -314,6 +319,7 @@ define_settings! {
         "audio.max_file_size" => audio.max_file_size, parsed(u64);
         "audio.min_file_size" => audio.min_file_size, parsed(u64);
         "audio.language" => audio.language, opt_string;
+        "audio.prompt" => audio.prompt, opt_string;
         "audio.timeout_ms" => audio.timeout_ms, parsed(u64);
         "audio.echo_transcript" => audio.echo_transcript, parsed(bool);
 

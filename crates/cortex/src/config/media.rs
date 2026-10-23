@@ -374,6 +374,11 @@ pub struct AudioConfig {
     /// Global language hint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Names, jargon and spellings the speaker tends to use. Sent as the
+    /// decoding prompt to Whisper-shaped providers so "Borg" is not heard as
+    /// "bork".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// Default timeout in milliseconds.
     pub timeout_ms: u64,
     /// Echo transcript back to the sender.
@@ -388,6 +393,7 @@ impl Default for AudioConfig {
             max_file_size: 20 * 1024 * 1024,
             min_file_size: 1024,
             language: None,
+            prompt: None,
             timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }
