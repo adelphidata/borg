@@ -131,8 +131,14 @@ function ValueEditor({
   onReset?: () => void;
 }) {
   const [draft, setDraft] = useState(initial);
-  // A save refreshes the snapshot; follow the new effective value.
-  useEffect(() => setDraft(initial), [initial]);
+  // A save refreshes the snapshot; follow the new effective value. Synced
+  // during render, not in an effect: an effect runs after paint, and a
+  // keystroke landing in that window would be overwritten by the seed.
+  const [seeded, setSeeded] = useState(initial);
+  if (initial !== seeded) {
+    setSeeded(initial);
+    setDraft(initial);
+  }
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -187,10 +193,13 @@ function JsonEditor({
 }) {
   const [draft, setDraft] = useState(initial);
   const [invalid, setInvalid] = useState<string>();
-  useEffect(() => {
+  // Synced during render for the same reason as ValueEditor.
+  const [seeded, setSeeded] = useState(initial);
+  if (initial !== seeded) {
+    setSeeded(initial);
     setDraft(initial);
     setInvalid(undefined);
-  }, [initial]);
+  }
   const ref = useAutoGrow(draft, JSON_MAX_PX);
 
   const commit = () => {
@@ -435,8 +444,13 @@ function NameDetail({ entry }: { entry: { key: string; value: string; overridden
   const pool = setup.state === "ready" ? setup.data.agentNames : [];
   const current = entry.value.trim() || DEFAULT_AGENT_NAME;
   const [draft, setDraft] = useState(current);
-  // A save refreshes the snapshot; follow the new name.
-  useEffect(() => setDraft(current), [current]);
+  // A save refreshes the snapshot; follow the new name. Synced during
+  // render so a keystroke before the first effect could run is kept.
+  const [seeded, setSeeded] = useState(current);
+  if (current !== seeded) {
+    setSeeded(current);
+    setDraft(current);
+  }
   const next = draft.trim();
   const dirty = next !== "" && next !== current;
   const commit = () => dirty && !saving && void save(entry.key, next);
