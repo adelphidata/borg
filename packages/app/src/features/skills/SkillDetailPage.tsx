@@ -111,9 +111,6 @@ function NewSkill({ from }: { from: string | undefined }) {
             setContent(e.target.value);
           }}
         />
-        <div className="mt-1.5 px-1 text-[11px] leading-[1.4] text-ink3">
-          The lines between the dashes describe the skill; the rest is what Borg reads.
-        </div>
       </div>
       {(localError || skills.error) && (
         <div role="alert" className={ERROR_BOX}>
@@ -259,8 +256,8 @@ function Existing({
               </Pill>
               <span className="text-[11.5px] leading-[1.4] text-ink3">
                 {entry.source === "builtin"
-                  ? "Built-in skills cannot be edited in place; a copy under a new name can."
-                  : "This skill lives in the project checkout; edit it there."}
+                  ? "Built-ins are read-only."
+                  : "Edit it in the project."}
               </span>
             </div>
           </>

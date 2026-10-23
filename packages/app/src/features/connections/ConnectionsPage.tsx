@@ -227,8 +227,7 @@ export function ConnectionsPage() {
                     )
                   ) : (
                     <div className="text-[14.5px] leading-[1.62] text-pretty text-ink2">
-                      Nothing is connected yet. Add a model provider below, or import a sign-in from
-                      a tool you already use.
+                      Nothing connected yet.
                     </div>
                   )}
                   <AddGrid data={data} open={open} />

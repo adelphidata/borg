@@ -259,12 +259,6 @@ export function SessionsPage() {
                     ? `Archived · matches “${sessions.search.trim()}”`
                     : "Archived"}
                 </button>
-                {showArchived && sessions.archived.length > 0 && (
-                  <div className="mb-1 px-3 text-[11px] leading-[1.4] text-ink3">
-                    Opening one brings it back — Borg un-archives a conversation the moment it is
-                    written to.
-                  </div>
-                )}
                 {showArchived &&
                   (sessions.archived.length === 0 ? (
                     <div className="px-3 py-2 text-[11.5px] leading-[1.5] text-ink3">

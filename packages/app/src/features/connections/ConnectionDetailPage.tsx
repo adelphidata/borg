@@ -145,7 +145,6 @@ function ProviderDetail({
           <div className={SECTION_LABEL}>Key in use</div>
           <div className="text-[13px] leading-[1.55] text-pretty text-ink2">
             Borg is using the key it found in <span className="break-all text-ink">{foundAt}</span>.
-            Nothing to add — save a key below only to use a different one.
           </div>
         </section>
       )}
@@ -220,9 +219,6 @@ function ProviderDetail({
           <Pill variant="primary" onClick={submitKey}>
             {saveKey.pending ? "Saving…" : "Save"}
           </Pill>
-        </div>
-        <div className="mt-3 text-[12px] leading-[1.5] text-ink3">
-          The key goes straight to the daemon and is never shown again.
         </div>
       </section>
     </>

@@ -157,11 +157,6 @@ export function McpServerForm({
           autoFocus={!nameLocked}
           onChange={(e) => set("name", e.target.value)}
         />
-        {!nameLocked && (
-          <div className={HINT}>
-            Letters, digits, dashes and underscores. It prefixes every tool.
-          </div>
-        )}
       </div>
 
       <div className="flex flex-wrap gap-2" role="group" aria-label="How Borg reaches it">
@@ -190,9 +185,6 @@ export function McpServerForm({
             value={draft.commandLine}
             onChange={(e) => set("commandLine", e.target.value)}
           />
-          <div className={HINT}>
-            The program and its arguments, as you would type them in a terminal.
-          </div>
         </div>
       )}
 
@@ -339,7 +331,6 @@ export function McpServerForm({
               </div>
             ))}
           </div>
-          <div className={HINT}>Blank fields keep the daemon's defaults.</div>
         </div>
       )}
     </div>

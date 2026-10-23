@@ -104,12 +104,13 @@ function TextSetting({
 
 function Switch({
   label,
-  desc,
+  warning,
   on,
   onChange,
 }: {
   label: string;
-  desc: string;
+  /** Shown only when the switch cannot do its job as set. */
+  warning?: string;
   on: boolean;
   onChange: (on: boolean) => void;
 }) {
@@ -123,7 +124,7 @@ function Switch({
     >
       <div className="min-w-0 flex-1">
         <div className="text-[13.5px] leading-[1.3] font-medium text-ink">{label}</div>
-        <div className="mt-[3px] text-[12px] leading-[1.45] text-ink3">{desc}</div>
+        {warning && <div className="mt-[3px] text-[12px] leading-[1.45] text-alert">{warning}</div>}
       </div>
       {/* Track and knob hold 3:1 against the card and each other in both
           themes (WCAG 1.4.11): the field/focus tokens, and a knob in the
@@ -196,7 +197,7 @@ function KeyField({ provider, onSaved }: { provider: VoiceProvider; onSaved: () 
       label={provider.keyLabel}
       hint={
         <>
-          {provider.hasKey ? "A key is set. Paste a new one to replace it." : "No key yet."}
+          {!provider.hasKey && "No key yet."}
           {provider.keyUrl && (
             <>
               {" "}
@@ -340,8 +341,8 @@ function ShortcutField({ value, onCommit }: { value: string; onCommit: (v: strin
       label="Shortcut"
       hint={
         listening
-          ? "Press a key combination, one modifier key on its own (like Right ⌥), or a side button on your mouse. Esc cancels."
-          : "Press it to start talking, hold it to talk until you let go."
+          ? "Press a key combination, a modifier key alone, or a mouse side button. Esc cancels."
+          : undefined
       }
     >
       {(id) => (
@@ -397,11 +398,6 @@ function MicrophoneField() {
   return (
     <SelectSetting
       label="Microphone"
-      hint={
-        named.length === 0
-          ? "Names appear after the microphone has been used once."
-          : "Kept on this device."
-      }
       value={chosen}
       options={options}
       onPick={(v) => {
@@ -432,7 +428,6 @@ function DeviceVoiceField() {
   return (
     <SelectSetting
       label="Which voice"
-      hint="Kept on this device."
       value={chosen}
       options={options}
       onPick={(v) => {
@@ -533,12 +528,7 @@ function DictationSection({
     <section>
       <div className={SECTION_LABEL}>Voice input</div>
       <div className={CARD}>
-        <Switch
-          label="Talk to Borg"
-          desc="A microphone next to the message box turns your voice into text, and Borg understands voice notes."
-          on={enabled}
-          onChange={(on) => void turnOn(on)}
-        />
+        <Switch label="Talk to Borg" on={enabled} onChange={(on) => void turnOn(on)} />
         {enabled && (
           <>
             <ProviderSelect
@@ -551,7 +541,7 @@ function DictationSection({
             {provider?.requiresCommand && (
               <TextSetting
                 label="Command"
-                hint="Runs on this machine. Put {audio_file} where the recording's path goes; the command prints the text."
+                hint="{audio_file} is the recording; print the text."
                 value={row?.command ?? ""}
                 onCommit={(v) => setField("command", v)}
               />
@@ -577,13 +567,11 @@ function DictationSection({
             />
             <Switch
               label="Hold to talk"
-              desc="Hold the shortcut to record and let go to finish. A quick tap keeps recording until the next tap."
               on={prefs.holdToRecord}
               onChange={(on) => void save("voice.hold_to_record", String(on))}
             />
             <Switch
               label="Send right away"
-              desc="Off: the words land in the message box for you to check. On: they are sent as soon as they are recognised."
               on={prefs.autoSend}
               onChange={(on) => void save("voice.dictation_auto_send", String(on))}
             />
@@ -599,14 +587,12 @@ function DictationSection({
               )}
               <TextSetting
                 label="Words Borg should know"
-                hint="Names, products and jargon you say often, separated by commas. Helps the transcriber spell them right."
                 value={value("audio.prompt")}
                 placeholder="Borg, Adelphi, Kubernetes"
                 onCommit={(v) => save("audio.prompt", v)}
               />
               <TextSetting
                 label="Temperature"
-                hint="0 is exact and is right for nearly everyone. Nudge it up (0.2) only if the transcriber keeps repeating itself on poor audio."
                 value={value("audio.temperature")}
                 placeholder="0"
                 onCommit={(v) => save("audio.temperature", v.trim() === "" ? "0" : v.trim())}
@@ -615,14 +601,12 @@ function DictationSection({
                 <>
                   <TextSetting
                     label="Beam size"
-                    hint="How many candidate transcripts the on-device decoder keeps. 1 is fastest; 5 is the usual trade-off."
                     value={value("audio.beam_size")}
                     placeholder="5"
                     onCommit={(v) => save("audio.beam_size", v.trim() === "" ? "5" : v.trim())}
                   />
                   <TextSetting
                     label="Silence threshold"
-                    hint="How sure the on-device decoder must be that a stretch is silence before it drops it, 0 to 1. Raise it if quiet words go missing."
                     value={value("audio.no_speech_threshold")}
                     placeholder="0.6"
                     onCommit={(v) =>
@@ -631,7 +615,6 @@ function DictationSection({
                   />
                   <Switch
                     label="Timestamps"
-                    desc="One line per spoken segment, each with its start and end time."
                     on={value("audio.timestamps") === "true"}
                     onChange={(on) => void save("audio.timestamps", String(on))}
                   />
@@ -639,19 +622,16 @@ function DictationSection({
               )}
               <Switch
                 label="Sounds"
-                desc="A short tick when recording starts and stops."
                 on={prefs.beep}
                 onChange={(on) => void save("voice.beep_enabled", String(on))}
               />
               <Switch
                 label="Copy to clipboard"
-                desc="Keep each transcript on the clipboard too, for pasting elsewhere."
                 on={prefs.copyTranscript}
                 onChange={(on) => void save("voice.copy_transcript", String(on))}
               />
               <Switch
                 label="Keep recordings"
-                desc="Saves a copy of each recording with its transcript, in a folder on this computer."
                 on={value("audio.keep_recordings") === "true"}
                 onChange={(on) => void save("audio.keep_recordings", String(on))}
               />
@@ -659,7 +639,6 @@ function DictationSection({
                 <>
                   <TextSetting
                     label="Keep for (days)"
-                    hint="Older recordings are removed. 0 keeps them forever."
                     value={value("audio.keep_recordings_days")}
                     placeholder="30"
                     onCommit={(v) =>
@@ -668,7 +647,6 @@ function DictationSection({
                   />
                   <TextSetting
                     label="Folder"
-                    hint="Leave empty for the recordings folder under Borg's data directory."
                     value={value("audio.recordings_dir")}
                     placeholder="~/.borg/recordings"
                     onCommit={(v) => save("audio.recordings_dir", v.trim())}
@@ -677,17 +655,14 @@ function DictationSection({
               )}
               <Switch
                 label="Space between Asian and Latin text"
-                desc="Puts one space between Chinese, Japanese or Korean words and the Latin letters or numbers beside them."
                 on={value("audio.cjk_spacing") === "true"}
                 onChange={(on) => void save("audio.cjk_spacing", String(on))}
               />
               {kind === "desktop" && (
                 <Switch
                   label="Listen from the background"
-                  desc={
-                    shortcut?.kind === "chord"
-                      ? "The shortcut also works while another app is in front: Borg comes forward and starts listening."
-                      : "Needs a key combination with a modifier; a single held key cannot reach Borg from another app."
+                  warning={
+                    shortcut?.kind === "chord" ? undefined : "Needs a shortcut with a modifier key."
                   }
                   on={prefs.backgroundShortcut}
                   onChange={(on) => void save("voice.background_shortcut", String(on))}
@@ -743,19 +718,12 @@ function SpeechSection({
       <div className={CARD}>
         <Switch
           label="Read replies aloud"
-          desc="Borg reads each reply as it finishes. The speaker on any reply reads it on demand either way."
           on={prefs.autoSpeak}
           onChange={(on) => void save("voice.auto_tts", String(on))}
         />
         <Field
           label="Voice"
-          hint={
-            viaProvider
-              ? "Also used for voice replies on your messaging channels."
-              : device
-                ? "Free and works offline. Pick a provider for a more natural voice."
-                : "This device has no built-in voice; pick a provider."
-          }
+          hint={!viaProvider && !device ? "This device has no built-in voice." : undefined}
         >
           {(id) => (
             <select
@@ -789,7 +757,7 @@ function SpeechSection({
         {provider?.requiresCommand && (
           <TextSetting
             label="Command"
-            hint="Runs on this machine. It reads the reply from {text_file} and writes the audio to {output_path}."
+            hint="Read {text_file}, write audio to {output_path}."
             value={row?.command ?? ""}
             onCommit={(v) => setField("command", v)}
           />
@@ -850,10 +818,6 @@ function PhoneSection({ catalog, refetch }: { catalog: VoiceCatalog; refetch: ()
     <section>
       <div className={SECTION_LABEL}>Phone calls</div>
       <div className={CARD}>
-        <div className="text-[12.5px] leading-[1.5] text-ink2">
-          Let Borg place calls for you: read out a message, or hand the call to a voice agent that
-          talks for you and reports back.
-        </div>
         <ProviderSelect
           label="Provider"
           providers={catalog.phone.flatMap((p) => (p.provider ? [p.provider] : []))}
@@ -880,18 +844,14 @@ function PhoneSection({ catalog, refetch }: { catalog: VoiceCatalog; refetch: ()
             {phone.usesAgentId && (
               <TextSetting
                 label={phone.agentRequired ? "Agent id" : "Agent id (optional)"}
-                hint={
-                  phone.agentRequired
-                    ? "The agent that runs the call. Its prompt gets the task as {{task}}."
-                    : "Leave empty to give each call's task to a fresh agent. A saved agent gets it as {{task}}."
-                }
+                hint="The agent's prompt gets the task as {{task}}."
                 value={value("telephony.agent_id")}
                 onCommit={(v) => save("telephony.agent_id", v)}
               />
             )}
             <TextSetting
               label="Numbers Borg may call"
-              hint="Comma-separated numbers or prefixes with country code, like +1415. Empty allows any number."
+              hint="Comma-separated, with country code, like +1415."
               value={value("telephony.allowed_numbers")}
               placeholder="Any number"
               onCommit={(v) => save("telephony.allowed_numbers", v)}
@@ -932,10 +892,6 @@ export function VoiceSettingsPage() {
             <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] text-ink">
               Voice & phone
             </h2>
-            <div className="mt-2 text-[13.5px] leading-[1.55] text-ink2">
-              Talk to Borg, hear it answer, and let it make calls. Pick any provider for each;
-              switch whenever you like.
-            </div>
           </div>
           {saveError && (
             <div className="rounded-[10px] border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">

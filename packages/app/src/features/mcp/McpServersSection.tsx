@@ -21,19 +21,20 @@ function NewServer({
   presets,
   taken,
   servers,
+  onClose,
 }: {
   presets: string[];
   taken: Set<string>;
   servers: McpServers;
+  onClose: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<McpDraft>(() => draftOf("", undefined));
   const [localError, setLocalError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [presetName, setPresetName] = useState<string>();
 
   const close = () => {
-    setOpen(false);
+    onClose();
     setDraft(draftOf("", undefined));
     setLocalError(undefined);
     // A refusal belongs to the attempt that was just given up on.
@@ -60,65 +61,50 @@ function NewServer({
   const available = presets.filter((p) => !taken.has(p));
 
   return (
-    <section className="mb-6 flex flex-col gap-3">
-      {!open && (
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-[10px] border border-line border-dashed bg-transparent py-3 text-[12.5px] leading-none text-ink3 hover:border-neon hover:text-ink2"
-        >
-          <PlusIcon size={14} /> Add an MCP server
-        </button>
-      )}
-      {open && (
-        <div className="flex flex-col gap-4 rounded-[10px] border border-line bg-surface2 p-4">
-          <McpServerForm draft={draft} onChange={setDraft} />
-          {localError && (
-            <div role="alert" className={ERROR_LINE}>
-              {localError}
-            </div>
-          )}
-          <div className="flex justify-end gap-2">
-            <Pill square onClick={close}>
-              Cancel
-            </Pill>
-            <Pill
-              square
-              variant="primary"
-              disabled={saving || draft.name.trim() === ""}
-              onClick={submit}
-            >
-              {saving ? "Adding…" : "Add server"}
-            </Pill>
-          </div>
-        </div>
-      )}
+    <div className="mb-4 flex flex-col gap-4 rounded-[10px] border border-line bg-surface2 p-4">
       {available.length > 0 && (
-        <div>
-          <div className={SECTION_LABEL}>Or start from a template</div>
-          <div className="flex flex-wrap gap-2">
-            {available.map((p) => (
-              <Pill
-                key={p}
-                disabled={presetName !== undefined}
-                title={PRESET_BLURB[p]}
-                onClick={() => {
-                  setPresetName(p);
-                  // The template's id is its name; a second copy needs a new
-                  // name, and that is an edit on the detail page.
-                  void servers.addPreset(p, p).finally(() => setPresetName(undefined));
-                }}
-              >
-                {presetName === p ? "Adding…" : p}
-                {PRESET_BLURB[p] && (
-                  <span className="ml-1.5 font-normal text-ink3">· {PRESET_BLURB[p]}</span>
-                )}
-              </Pill>
-            ))}
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[12px] leading-none text-ink3">Quick add</span>
+          {available.map((p) => (
+            <Pill
+              key={p}
+              disabled={presetName !== undefined}
+              title={PRESET_BLURB[p]}
+              onClick={() => {
+                setPresetName(p);
+                // The template's id is its name; a second copy needs a new
+                // name, and that is an edit on the detail page.
+                void servers
+                  .addPreset(p, p)
+                  .then((stored) => stored !== undefined && close())
+                  .finally(() => setPresetName(undefined));
+              }}
+            >
+              {presetName === p ? "Adding…" : p}
+            </Pill>
+          ))}
         </div>
       )}
-    </section>
+      <McpServerForm draft={draft} onChange={setDraft} />
+      {localError && (
+        <div role="alert" className={ERROR_LINE}>
+          {localError}
+        </div>
+      )}
+      <div className="flex justify-end gap-2">
+        <Pill square onClick={close}>
+          Cancel
+        </Pill>
+        <Pill
+          square
+          variant="primary"
+          disabled={saving || draft.name.trim() === ""}
+          onClick={submit}
+        >
+          {saving ? "Adding…" : "Add server"}
+        </Pill>
+      </div>
+    </div>
   );
 }
 
@@ -169,51 +155,46 @@ function ServerRow({
   );
 }
 
-/**
- * MCP servers — tools Borg borrows from other programs. One section of the
- * Connections page: what is configured and whether it answers, a row opens
- * the full editor, and adding one takes a name and a command or URL.
- */
+/** MCP servers: tools Borg borrows from other programs. One section of Connections. */
 export function McpServersSection() {
   const location = useLocation();
   const navigate = useNavigate();
   const servers = useMcpServers([location.key]);
   const [confirm, setConfirm] = useState<string>();
-
-  const connected =
-    servers.query.state === "ready"
-      ? servers.query.data.servers.filter((s) => s.state === "connected").length
-      : undefined;
+  const [adding, setAdding] = useState(false);
 
   return (
     <section>
-      <div className={SECTION_LABEL}>
-        MCP servers
-        {connected !== undefined && (
-          <span className="ml-2 font-normal normal-case tracking-normal text-ink3">
-            {connected} connected
-          </span>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className={`${SECTION_LABEL} mb-0`}>MCP servers</div>
+        {!adding && (
+          <Pill square onClick={() => setAdding(true)}>
+            <span className="flex items-center gap-1.5">
+              <PlusIcon size={13} /> Add server
+            </span>
+          </Pill>
         )}
       </div>
       <DaemonState query={servers.query} label="your MCP servers">
         {(data) => (
           <>
-            {!data.mcpEnabled && (
-              <div className="mb-5 flex flex-wrap items-center gap-3 rounded-[10px] border border-line bg-surface2 px-4 py-3">
-                <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink2">
-                  MCP is turned off, so none of these servers connect.
-                </div>
+            {!data.mcpEnabled && data.servers.length > 0 && (
+              <div className="mb-3 flex items-center gap-3 text-[12.5px] leading-[1.45] text-ink2">
+                <span className="min-w-0 flex-1">MCP is off.</span>
                 <Pill square variant="primary" onClick={() => void servers.setMcpEnabled(true)}>
-                  Turn on MCP
+                  Turn on
                 </Pill>
               </div>
             )}
 
-            <NewServer
-              presets={data.presets}
-              taken={new Set(data.servers.map((s) => s.name))}
-              servers={servers}
-            />
+            {adding && (
+              <NewServer
+                presets={data.presets}
+                taken={new Set(data.servers.map((s) => s.name))}
+                servers={servers}
+                onClose={() => setAdding(false)}
+              />
+            )}
 
             {servers.error && (
               <div role="alert" className={`mb-3 ${ERROR_LINE}`}>
@@ -222,10 +203,8 @@ export function McpServersSection() {
             )}
 
             <div className="flex flex-col gap-2">
-              {data.servers.length === 0 && (
-                <div className="py-4 text-center text-[13.5px] leading-[1.6] text-ink3">
-                  No MCP servers yet.
-                </div>
+              {data.servers.length === 0 && !adding && (
+                <div className="text-[13px] leading-[1.6] text-ink3">None yet.</div>
               )}
               {data.servers.map((entry) =>
                 confirm === entry.name ? (
@@ -234,7 +213,7 @@ export function McpServersSection() {
                     className="flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
                   >
                     <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
-                      Remove {entry.name}? Its tools disappear from every conversation.
+                      Remove {entry.name}?
                     </div>
                     <Pill square onClick={() => setConfirm(undefined)}>
                       Keep
@@ -262,12 +241,6 @@ export function McpServersSection() {
                 ),
               )}
             </div>
-            {data.mcpEnabled && data.servers.length > 0 && (
-              <div className="mt-4 text-[11.5px] leading-[1.5] text-ink3">
-                A new or changed server starts in the background. This list refreshes when you come
-                back to it.
-              </div>
-            )}
           </>
         )}
       </DaemonState>

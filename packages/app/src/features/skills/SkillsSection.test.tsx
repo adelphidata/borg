@@ -94,7 +94,6 @@ describe("SkillsSection", () => {
     await waitFor(() => expect(screen.getByText("release-notes")).toBeTruthy());
     const labels = screen.getAllByText(/^(Your skills|Built in)$/).map((e) => e.textContent);
     expect(labels).toEqual(["Your skills", "Built in"]);
-    expect(screen.getByText("3 of 4 on")).toBeTruthy();
     expect(
       (
         screen.getByRole("switch", { name: "Enable release-notes" }) as HTMLButtonElement
@@ -109,10 +108,11 @@ describe("SkillsSection", () => {
     expect(screen.queryByLabelText("Delete git")).toBeNull();
   });
 
-  it("invites a first skill when there are none of yours", async () => {
+  it("shows only the built-ins when there are none of yours", async () => {
     const daemon = fakeDaemon(catalog([skill()]));
     mount(daemon);
-    await waitFor(() => expect(screen.getByText(/You have not written a skill yet/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Built in")).toBeTruthy());
+    expect(screen.queryByText("Your skills")).toBeNull();
   });
 
   it("turns a skill off and on through the daemon", async () => {

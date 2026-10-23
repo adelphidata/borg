@@ -98,7 +98,7 @@ function Group({
               className="my-1 flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
             >
               <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
-                Delete {skill.name}? Its folder and everything in it goes.
+                Delete {skill.name}?
               </div>
               <Pill square onClick={() => setConfirm(undefined)}>
                 Keep
@@ -143,19 +143,10 @@ export function SkillsSection() {
   const skills = useSkills([location.key]);
   const [confirm, setConfirm] = useState<string>();
 
-  const on = skills.query.state === "ready" ? skills.query.data.filter((s) => s.enabled).length : 0;
-
   return (
     <section>
       <div className="mb-3 flex items-center justify-between gap-3">
-        <div className={`${SECTION_LABEL} mb-0`}>
-          Skills
-          {skills.query.state === "ready" && (
-            <span className="ml-2 font-normal normal-case tracking-normal text-ink3">
-              {on} of {skills.query.data.length} on
-            </span>
-          )}
-        </div>
+        <div className={`${SECTION_LABEL} mb-0`}>Skills</div>
         <Pill square onClick={() => navigate("/connections/skills/new")}>
           <span className="flex items-center gap-1.5">
             <PlusIcon size={13} /> New skill
@@ -175,12 +166,6 @@ export function SkillsSection() {
           const builtin = list.filter((s) => s.source === "builtin");
           return (
             <>
-              {mine.length === 0 && (
-                <div className="mb-5 rounded-[10px] border border-line border-dashed px-4 py-5 text-center text-[12.5px] leading-[1.6] text-ink3">
-                  You have not written a skill yet. A skill is a short playbook Borg reads before a
-                  task it matches.
-                </div>
-              )}
               <Group
                 label="Your skills"
                 skills={mine}

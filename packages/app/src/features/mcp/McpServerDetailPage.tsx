@@ -32,9 +32,6 @@ function TestPanel({ name }: { name: string }) {
           <Pill square disabled={test.pending} onClick={() => void test.run(undefined)}>
             {test.pending ? "Connecting…" : "Test connection"}
           </Pill>
-          <span className="text-[11.5px] leading-[1.4] text-ink3">
-            Connects once, lists its tools, and disconnects.
-          </span>
         </div>
         {test.error && <div className={ERROR_BOX}>{test.error.message}</div>}
         {result && !result.ok && <div className={ERROR_BOX}>{result.error}</div>}

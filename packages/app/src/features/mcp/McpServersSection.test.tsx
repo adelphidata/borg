@@ -57,16 +57,18 @@ describe("McpServersSection listing", () => {
     expect(screen.getByText("Sign-in failed")).toBeTruthy();
     // A row switched off says so, whatever the registry last reported.
     expect(screen.getAllByText("Off")).toHaveLength(1);
-    expect(screen.getByText("1 connected")).toBeTruthy();
   });
 
   it("says the list is empty, and hides a template once a server has its name", async () => {
     const daemon = fakeDaemon(listing([entry({ name: "github" })]));
     mount(daemon);
     await waitFor(() => expect(screen.getByText("github")).toBeTruthy());
-    expect(screen.queryByText("No MCP servers yet.")).toBeNull();
-    expect(screen.queryByRole("button", { name: /^github\s*·/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /^time\s*·/ })).toBeTruthy();
+    expect(screen.queryByText("None yet.")).toBeNull();
+    // Templates live inside the add form, not on the page.
+    expect(screen.queryByRole("button", { name: "time" })).toBeNull();
+    click(screen.getByText("Add server"));
+    expect(screen.queryByRole("button", { name: "github" })).toBeNull();
+    expect(screen.getByRole("button", { name: "time" })).toBeTruthy();
   });
 
   it("explains when MCP is off and turns it on in one click", async () => {
@@ -75,10 +77,10 @@ describe("McpServersSection listing", () => {
       SetSetting: {},
     });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText(/MCP is turned off/)).toBeTruthy());
-    // The row explains too, instead of claiming a connection that cannot exist.
+    await waitFor(() => expect(screen.getByText("MCP is off.")).toBeTruthy());
+    // The row says so too, instead of claiming a connection that cannot exist.
     expect(screen.getByText("MCP is off")).toBeTruthy();
-    click(screen.getByText("Turn on MCP"));
+    click(screen.getByText("Turn on"));
     await waitFor(() =>
       expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
         key: "mcp.enabled",
@@ -100,8 +102,8 @@ describe("McpServersSection writes", () => {
   it("adds a server from the form with the spec the daemon expects", async () => {
     const daemon = fakeDaemon({ ...listing([]), PutMcpServer: entry({ name: "gh" }) });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("No MCP servers yet.")).toBeTruthy());
-    click(screen.getByText("Add an MCP server"));
+    await waitFor(() => expect(screen.getByText("None yet.")).toBeTruthy());
+    click(screen.getByText("Add server"));
     type(screen.getByLabelText("Name"), "gh");
     type(screen.getByLabelText("Command"), "npx -y @modelcontextprotocol/server-github");
     click(screen.getByText("Add server"));
@@ -131,8 +133,8 @@ describe("McpServersSection writes", () => {
       PutMcpServer: new BorgError(INVALID_ARGUMENT as never, "server id must match"),
     });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("Add an MCP server")).toBeTruthy());
-    click(screen.getByText("Add an MCP server"));
+    await waitFor(() => expect(screen.getByText("Add server")).toBeTruthy());
+    click(screen.getByText("Add server"));
     type(screen.getByLabelText("Name"), "bad name");
     type(screen.getByLabelText("Command"), "uvx t");
     click(screen.getByText("Add server"));
@@ -143,8 +145,8 @@ describe("McpServersSection writes", () => {
   it("checks the form before asking the daemon", async () => {
     const daemon = fakeDaemon(listing([]));
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("Add an MCP server")).toBeTruthy());
-    click(screen.getByText("Add an MCP server"));
+    await waitFor(() => expect(screen.getByText("Add server")).toBeTruthy());
+    click(screen.getByText("Add server"));
     type(screen.getByLabelText("Name"), "x");
     click(screen.getByText("Add server"));
     expect(screen.getByRole("alert").textContent).toMatch(/Enter the command/);
@@ -154,8 +156,9 @@ describe("McpServersSection writes", () => {
   it("adds a template by name, as a preset rather than a spec", async () => {
     const daemon = fakeDaemon({ ...listing([]), PutMcpServer: entry() });
     mount(daemon);
-    await waitFor(() => expect(screen.getByRole("button", { name: /^time\s*·/ })).toBeTruthy());
-    click(screen.getByRole("button", { name: /^time\s*·/ }));
+    await waitFor(() => expect(screen.getByText("Add server")).toBeTruthy());
+    click(screen.getByText("Add server"));
+    click(screen.getByRole("button", { name: "time" }));
     await waitFor(() =>
       expect(daemon.calls.find((c) => c.method === "PutMcpServer")?.request).toMatchObject({
         name: "time",
@@ -310,7 +313,7 @@ describe("McpServerDetailPage", () => {
     await waitFor(() =>
       expect(daemon.calls.some((c) => c.method === "RemoveMcpServer")).toBe(true),
     );
-    await waitFor(() => expect(screen.getByText("Add an MCP server")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Add server")).toBeTruthy());
   });
 
   it("says when there is no such server", async () => {
