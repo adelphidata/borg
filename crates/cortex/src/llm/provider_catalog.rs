@@ -110,7 +110,7 @@ pub const ONBOARDABLE: &[ProviderChoice] = &[
     },
     ProviderChoice {
         id: "claude-cli",
-        label: "Claude Code",
+        label: "Claude Code CLI",
         blurb: "Your Claude subscription, through the claude command already signed in here.",
         key_url: None,
         featured: false,
@@ -140,14 +140,14 @@ pub const ONBOARDABLE: &[ProviderChoice] = &[
 pub const SETTINGS_ONLY: &[ProviderChoice] = &[
     ProviderChoice {
         id: "claude-code-oauth",
-        label: "Claude Code sign-in",
+        label: "Claude Code",
         blurb: "The sign-in Claude Code saved on this machine, imported.",
         key_url: None,
         featured: false,
     },
     ProviderChoice {
         id: "codex-oauth",
-        label: "Codex sign-in",
+        label: "Codex",
         blurb: "The ChatGPT sign-in Codex saved on this machine, imported.",
         key_url: None,
         featured: false,

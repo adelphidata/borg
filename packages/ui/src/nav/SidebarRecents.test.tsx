@@ -157,6 +157,19 @@ describe("Sidebar recents", () => {
     expect(props.onNewConversation).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a fresh conversation from the row above the nav", () => {
+    const props = renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
+    expect(props.onNewConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the Recent compose icon out of sight until hover or focus", () => {
+    renderSidebar();
+    const compose = screen.getByRole("button", { name: "New conversation" });
+    expect(compose.classList.contains("hover-reveal")).toBe(true);
+    expect(compose.parentElement?.classList.contains("group")).toBe(true);
+  });
+
   // Keyboard reach. A `div` with an onClick is invisible to Tab, so a person
   // who does not use a mouse could see the list and never open anything in
   // it. Both controls are native buttons: the browser turns Enter and Space

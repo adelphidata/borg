@@ -75,11 +75,7 @@ const toast = () => screen.getAllByRole("status").find((el) => !el.getAttribute(
 describe("BorgApp shell", () => {
   it("opens on the conversation with the navigation around it", async () => {
     mount();
-    await waitFor(() =>
-      // By role: the page keeps the same word as its title until the first
-      // turn loads, so plain text matching is ambiguous for a moment.
-      expect(screen.getByRole("link", { name: "Conversation" })).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByRole("link", { name: "Chats" })).toBeTruthy());
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
   });
 
@@ -507,11 +503,7 @@ describe("BorgApp shell", () => {
   it("sends an unknown route back to the conversation", async () => {
     window.location.hash = "#/nowhere";
     mount();
-    await waitFor(() =>
-      // By role: the page keeps the same word as its title until the first
-      // turn loads, so plain text matching is ambiguous for a moment.
-      expect(screen.getByRole("link", { name: "Conversation" })).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByRole("link", { name: "Chats" })).toBeTruthy());
   });
 
   it("reserves a drag strip only where the window has no title bar", async () => {
@@ -532,7 +524,7 @@ describe("BorgApp gates", () => {
     mount(daemon);
     await waitFor(() => expect(screen.queryByText("Ship the daemon")).toBeNull());
     // The wizard owns the screen; the shell is not mounted behind it.
-    expect(screen.queryByText("Conversation")).toBeNull();
+    expect(screen.queryByText("Chats")).toBeNull();
   });
 
   it("renders the shell when the daemon cannot answer, so its pages explain", async () => {
@@ -542,11 +534,7 @@ describe("BorgApp gates", () => {
       GetOnboardingState: new BorgError(GrpcStatus.Unavailable, "daemon down"),
     });
     mount(daemon);
-    await waitFor(() =>
-      // By role: the page keeps the same word as its title until the first
-      // turn loads, so plain text matching is ambiguous for a moment.
-      expect(screen.getByRole("link", { name: "Conversation" })).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByRole("link", { name: "Chats" })).toBeTruthy());
   });
 
   it("is the quick-entry panel and nothing else at the quick-entry route", async () => {
@@ -555,7 +543,7 @@ describe("BorgApp gates", () => {
     const daemon = fakeDaemon(BASE);
     mount(daemon);
     expect(screen.getByPlaceholderText("Ask Borg anything")).toBeTruthy();
-    expect(screen.queryByText("Conversation")).toBeNull();
+    expect(screen.queryByText("Chats")).toBeNull();
     expect(daemon.calls.some((c) => c.method === "GetOnboardingState")).toBe(false);
   });
 });

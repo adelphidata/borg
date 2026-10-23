@@ -423,14 +423,25 @@ export function Sidebar({
       </div>
 
       <Rule />
+      {/* Dressed as a nav row so it reads as the first stop in the list, not
+          as a toolbar control floating above it. */}
+      <button
+        type="button"
+        onClick={onNewConversation}
+        className="mb-[3px] flex cursor-pointer items-center gap-[11px] rounded-[7px] border-0 bg-transparent px-[11px] py-[9px] text-left text-[13.5px] leading-none font-medium tracking-[-0.01em] text-ink2 transition-[background,color] duration-150 [font-family:inherit] hover:bg-surface3 hover:text-ink"
+      >
+        <PlusIcon size={16} />
+        New
+      </button>
       <NavSection routes={routes} section="primary" />
       <Rule className="my-4" />
       <NavSection routes={routes} section="secondary" />
       <Rule className="mt-4 mb-3.5" />
 
       {/* The right inset, padding and icon size match a row's hover actions,
-          so the compose icon sits in the same column as the archive icons. */}
-      <div className="flex items-center pr-1.5 pb-2 pl-2">
+          so the compose icon sits in the same column as the archive icons. It
+          waits for hover like they do: the New row above is the visible way in. */}
+      <div className="group flex items-center pr-1.5 pb-2 pl-2">
         <span className="flex-1 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
           Recent
         </span>
@@ -439,7 +450,7 @@ export function Sidebar({
           onClick={onNewConversation}
           aria-label="New conversation"
           title="New conversation"
-          className="-my-1 flex cursor-pointer items-center rounded border-0 bg-transparent p-[3px] text-ink3 hover:bg-surface3 hover:text-ink"
+          className="hover-reveal -my-1 flex cursor-pointer items-center rounded border-0 bg-transparent p-[3px] text-ink3 hover:bg-surface3 hover:text-ink"
         >
           <NewChatIcon size={14} />
         </button>

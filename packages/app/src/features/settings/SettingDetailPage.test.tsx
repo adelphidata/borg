@@ -604,8 +604,8 @@ const row = (id: string, label: string, over: Record<string, unknown> = {}) => (
 const CATALOG = [
   ...SETUP_CATALOG,
   row("bedrock", "AWS Bedrock", { firstRun: true, defaultModel: "claude-opus-5" }),
-  row("claude-cli", "Claude Code", { firstRun: true, defaultModel: "opus" }),
-  row("codex-oauth", "Codex sign-in", { needsApiKey: true, defaultModel: "gpt-5" }),
+  row("claude-cli", "Claude Code CLI", { firstRun: true, defaultModel: "opus" }),
+  row("codex-oauth", "Codex", { needsApiKey: true, defaultModel: "gpt-5" }),
   row("custom", "Custom endpoint", { needsApiKey: true }),
 ];
 

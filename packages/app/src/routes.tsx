@@ -20,7 +20,7 @@ export const routes: AppRoute[] = [
   {
     id: "conversation",
     path: "/",
-    label: "Conversation",
+    label: "Chats",
     tabLabel: "Chat",
     icon: ChatIcon,
     page: ConversationPage,
