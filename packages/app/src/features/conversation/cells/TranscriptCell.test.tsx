@@ -361,8 +361,11 @@ describe("TranscriptCell — a turn's usage", () => {
     expect(tip().hidden).toBe(true);
     act(() => mark().focus());
     expect(tip().hidden).toBe(false);
-    fireEvent.keyDown(mark(), { key: "Escape" });
+    // Claimed while the tip is open, so the window's Escape binding cannot
+    // also stop a running turn; let through once there is nothing to close.
+    expect(fireEvent.keyDown(mark(), { key: "Escape" })).toBe(false);
     expect(tip().hidden).toBe(true);
+    expect(fireEvent.keyDown(mark(), { key: "Escape" })).toBe(true);
   });
 
   it("keeps the row's date tip off the mark", () => {

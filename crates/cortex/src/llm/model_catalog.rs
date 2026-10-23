@@ -611,20 +611,44 @@ mod tests {
         }
     }
 
-    /// The recommended pick the product decided on. Pinned so a catalog edit
-    /// that moves it is a deliberate, reviewed change rather than a side effect
-    /// of reordering a list.
+    /// The recommended pick the product decided on: each provider's strongest
+    /// model that Borg's transport can serve. Pinned so a catalog edit that
+    /// moves it is a deliberate, reviewed change rather than a side effect of
+    /// reordering a list. OpenAI's pro model is stronger but answers only on
+    /// an API the direct OpenAI client does not speak, so it is listed, not
+    /// recommended.
     #[test]
-    fn deepseek_v4_flash_is_the_recommended_default() {
+    fn the_recommended_default_is_the_strongest_servable_model() {
         let floor = embedded_manifest();
-        assert_eq!(
-            floor.default_model("openrouter").as_deref(),
-            Some("deepseek/deepseek-v4-flash")
-        );
-        assert_eq!(
-            floor.default_model("deepseek").as_deref(),
-            Some("deepseek-v4-flash")
-        );
+        for (provider, expected) in [
+            ("anthropic", "claude-fable-5"),
+            ("openrouter", "anthropic/claude-opus-5"),
+            ("openai", "gpt-5.5"),
+            ("azure-openai", "gpt-5.5"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("gemini", "gemini-3-pro"),
+        ] {
+            assert_eq!(
+                floor.default_model(provider).as_deref(),
+                Some(expected),
+                "{provider}"
+            );
+        }
+    }
+
+    /// Lists run strongest and newest first, and the recommended pick is the
+    /// strongest, so it leads its list. A default further down means either
+    /// the order or the pick drifted.
+    #[test]
+    fn every_embedded_default_leads_its_list() {
+        for (provider, block) in &embedded().providers {
+            let first = block.models.first().expect("validated lists are non-empty");
+            assert!(
+                first.default,
+                "provider `{provider}` leads with `{}`, not its default",
+                first.id
+            );
+        }
     }
 
     /// A default must actually be in its own provider's list — otherwise
@@ -854,8 +878,8 @@ mod tests {
             !got.is_empty(),
             "embedded openrouter list must be non-empty"
         );
-        assert_eq!(got[0].0, "deepseek/deepseek-v4-flash");
-        assert_eq!(got[0].1, "DeepSeek V4 Flash (recommended)");
+        assert_eq!(got[0].0, "anthropic/claude-opus-5");
+        assert_eq!(got[0].1, "Claude Opus 5 (recommended)");
         let entries = floor.curated_entries("openrouter");
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         let curated_ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
@@ -880,8 +904,8 @@ mod tests {
             .into_iter()
             .map(|e| e.id)
             .collect();
-        assert_eq!(ids.first().map(String::as_str), Some("claude-opus-5"));
-        for expected in ["claude-sonnet-5", "claude-haiku-4-5"] {
+        assert_eq!(ids.first().map(String::as_str), Some("claude-fable-5"));
+        for expected in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"] {
             assert!(
                 ids.iter().any(|i| i == expected),
                 "anthropic list is missing {expected}: {ids:?}"

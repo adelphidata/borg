@@ -98,15 +98,25 @@ export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dis
   let warnedFor = "";
   const claim = () => {
     if (held || dictationHotkey === "") return;
-    held = globalShortcut.register(dictationHotkey, () => {
-      const win = mainWindow();
-      if (!win || win.isDestroyed()) return;
-      raise(win);
-      win.webContents.send(CHANNELS.menuCommand, "dictate");
-    });
+    // A chord Electron cannot read as an accelerator (an Option chord on a
+    // Mac types a symbol such as `∂`) throws rather than returning false.
+    // This runs on every blur of the main window, where a throw would be an
+    // uncaught error in the main process, so it counts as a key not held.
+    let problem = "is already taken";
+    try {
+      held = globalShortcut.register(dictationHotkey, () => {
+        const win = mainWindow();
+        if (!win || win.isDestroyed()) return;
+        raise(win);
+        win.webContents.send(CHANNELS.menuCommand, "dictate");
+      });
+    } catch {
+      held = false;
+      problem = "cannot be registered";
+    }
     if (!held && warnedFor !== dictationHotkey) {
       warnedFor = dictationHotkey;
-      console.warn(`[borg] dictation hotkey ${dictationHotkey} is already taken`);
+      console.warn(`[borg] dictation hotkey ${dictationHotkey} ${problem}`);
     }
   };
   const letGo = () => {

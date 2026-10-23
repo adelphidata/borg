@@ -7,6 +7,7 @@ const {
   app,
   appState,
   emitApp,
+  globalShortcut,
   handlers,
   invoke,
   makeWindow,
@@ -413,6 +414,23 @@ describe("registerNativeIpc", () => {
       emitApp("browser-window-focus", {}, win);
       emitApp("browser-window-blur", {}, win);
       expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it("treats a key Electron cannot parse as not held, rather than throwing on blur", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const register = vi.spyOn(globalShortcut, "register").mockImplementation(() => {
+        throw new TypeError("conversion failure from CmdOrCtrl+Alt+∂");
+      });
+      const win = makeWindow();
+      windows.push(win);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "CmdOrCtrl+Alt+∂");
+      emitApp("browser-window-focus", {}, win);
+      expect(() => emitApp("browser-window-blur", {}, win)).not.toThrow();
+      expect(shortcutState.registered.size).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(1);
+      register.mockRestore();
       warn.mockRestore();
     });
 

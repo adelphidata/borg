@@ -111,7 +111,13 @@ function UsageInfo({ label, reveal }: { label: string; reveal: boolean }) {
         aria-describedby={id}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
-        onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape" || !open) return;
+          // Claimed, so the window's Escape binding does not also stop a turn
+          // that is running while an earlier reply's tip is open.
+          e.preventDefault();
+          setOpen(false);
+        }}
         className="flex cursor-default items-center rounded-sm border-0 bg-transparent p-0 text-ink3 hover:text-ink2"
       >
         <InfoIcon size={12} />

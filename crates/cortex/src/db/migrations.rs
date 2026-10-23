@@ -8,6 +8,15 @@ use crate::constants::{
     PRE_RUN_DEFAULT_TIMEOUT_MS, SCHEDULED_TASK_DEFAULT_TIMEOUT_MS, SEEDED_WORKFLOW_TIMEOUT_MS,
 };
 
+/// The stamp every bundled rate-card row is first seeded at
+/// (2025-04-19T00:00:00Z).
+const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800;
+
+/// The stamp a revised bundled price is appended at (2026-10-23T00:00:00Z).
+/// Move it forward with the next change to `bundled_rate_card_entries`, so a
+/// call made before that change still replays at the price it was billed at.
+const BUNDLED_REPRICED_AT: i64 = 1_792_713_600;
+
 impl Database {
     /// The whole schema, in one step. Borg has no released DBs, so there is
     /// nothing to upgrade *from* — `SCHEMA_SQL` is the single source of truth
@@ -259,7 +268,6 @@ impl Database {
     }
 
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
-        const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
         let stmt = self
             .conn
             .prepare(
@@ -284,6 +292,77 @@ impl Database {
             ))
             .await?;
         }
+        for entry in crate::pricing::bundled_rate_card_entries() {
+            self.reprice_bundled_rate_card(entry).await?;
+        }
+        Ok(())
+    }
+
+    /// Append `entry`'s price when the newest row for its model is a bundled
+    /// row at another price.
+    ///
+    /// The seed above is `INSERT OR IGNORE`, so a database seeded before a
+    /// price changed keeps the old bundled row and the budget would go on
+    /// billing at it. Appending rather than rewriting keeps a replay of an
+    /// older call at the price it was billed at. A row added by hand (`borg
+    /// providers add`) is newest by its own stamp and stays in force.
+    async fn reprice_bundled_rate_card(
+        &self,
+        entry: &crate::pricing::BundledRateCardEntry,
+    ) -> Result<()> {
+        use crate::budgets::Usd;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT effective_at, prompt_per_mtok_usd, completion_per_mtok_usd, source
+                 FROM provider_rate_cards
+                 WHERE provider_id = ?1 AND model = ?2
+                 ORDER BY effective_at DESC
+                 LIMIT 1",
+                params!(entry.provider_id, entry.model),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(());
+        };
+        let newest_at = row.get::<i64>(0)?;
+        // Compared as amounts, so "2.0" and "2.00" are one price. A stored
+        // value that does not parse counts as a different price.
+        let same = |stored: String, bundled: &str| {
+            Usd::parse(&stored)
+                .ok()
+                .is_some_and(|s| Usd::parse(bundled).ok() == Some(s))
+        };
+        let current = same(row.get::<String>(1)?, entry.prompt_per_mtok_usd)
+            && same(row.get::<String>(2)?, entry.completion_per_mtok_usd);
+        let bundled = row.get::<String>(3)? == "bundled";
+        drop(rows);
+        if current || !bundled {
+            return Ok(());
+        }
+        // Never at or before the row it replaces, even when a later repricing
+        // forgets to move `BUNDLED_REPRICED_AT` forward.
+        let at = BUNDLED_REPRICED_AT.max(newest_at + 1);
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO provider_rate_cards
+                 (provider_id, model, effective_at, prompt_per_mtok_usd,
+                  completion_per_mtok_usd, cached_per_mtok_usd, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'bundled')",
+                params!(
+                    entry.provider_id,
+                    entry.model,
+                    at,
+                    entry.prompt_per_mtok_usd,
+                    entry.completion_per_mtok_usd,
+                ),
+            )
+            .await?;
+        tracing::info!(
+            provider = entry.provider_id,
+            model = entry.model,
+            "appended the revised bundled rate card"
+        );
         Ok(())
     }
 
@@ -1696,6 +1775,86 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// Rewind one bundled row to an older price, as a database seeded before
+    /// the repricing holds it.
+    async fn seed_old_sonnet_5_card(db: &Database) {
+        db.conn
+            .execute(
+                "UPDATE provider_rate_cards
+                 SET prompt_per_mtok_usd = '3.00', completion_per_mtok_usd = '15.00'
+                 WHERE provider_id = 'anthropic' AND model = 'claude-sonnet-5'",
+                (),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reseeding_appends_a_bundled_price_that_changed() {
+        use crate::budgets::{RateCard, Usd};
+        let db = Database::test_db().await;
+        seed_old_sonnet_5_card(&db).await;
+
+        db.seed_bundled_rate_cards().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let row = RateCard::lookup(&db, "anthropic", "claude-sonnet-5", now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.prompt_per_mtok, Usd::parse("2.00").unwrap());
+        assert_eq!(row.completion_per_mtok, Usd::parse("10.00").unwrap());
+        // A call made before the repricing still replays at its old price.
+        let before = RateCard::lookup(&db, "anthropic", "claude-sonnet-5", BUNDLED_REPRICED_AT - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.prompt_per_mtok, Usd::parse("3.00").unwrap());
+
+        // Once current, a second seed adds nothing.
+        let after_first = sonnet_5_card_rows(&db).await;
+        db.seed_bundled_rate_cards().await.unwrap();
+        assert_eq!(sonnet_5_card_rows(&db).await, after_first);
+    }
+
+    async fn sonnet_5_card_rows(db: &Database) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM provider_rate_cards WHERE model = 'claude-sonnet-5'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reseeding_leaves_a_hand_added_rate_card_in_force() {
+        use crate::budgets::{RateCard, Usd};
+        let db = Database::test_db().await;
+        seed_old_sonnet_5_card(&db).await;
+        RateCard::append(
+            &db,
+            "anthropic",
+            "claude-sonnet-5",
+            BUNDLED_REPRICED_AT + 10,
+            Usd::parse("7.00").unwrap(),
+            Usd::parse("21.00").unwrap(),
+            None,
+            "manual",
+        )
+        .await
+        .unwrap();
+
+        db.seed_bundled_rate_cards().await.unwrap();
+        let row = RateCard::lookup(&db, "anthropic", "claude-sonnet-5", i64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.prompt_per_mtok, Usd::parse("7.00").unwrap());
+        assert_eq!(row.source, "manual");
     }
 
     #[tokio::test]
