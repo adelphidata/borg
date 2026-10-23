@@ -54,6 +54,8 @@ export {
   SendIcon,
   ShieldIcon,
   ShuffleIcon,
+  SpeakerIcon,
+  StopIcon,
   SunIcon,
   TrashIcon,
   UsageIcon,

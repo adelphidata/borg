@@ -1,6 +1,16 @@
 import { memo, useMemo, useState } from "react";
-import { Brackets, isSubmitEnter, Markdown, PencilIcon, Pill, StatusDot } from "@borg/ui";
+import {
+  Brackets,
+  isSubmitEnter,
+  Markdown,
+  PencilIcon,
+  Pill,
+  SpeakerIcon,
+  StatusDot,
+  StopIcon,
+} from "@borg/ui";
 import type { Cell, SentAttachment } from "../useConversation";
+import { useSpeaker } from "../../../lib/speech";
 import { classifyStatus } from "../../agents/useAgentTree";
 import { focusComposer } from "../composerFocus";
 import { FailureCard } from "../FailureCard";
@@ -13,13 +23,66 @@ import { ToolCell } from "./ToolCell";
 import { parseUserTurn, type AttachedBlock } from "../userTurn";
 
 /** Assistant reply in the bracketed-card style. */
-function ReplyCard({ kicker, children }: { kicker: string; children: React.ReactNode }) {
+function ReplyCard({
+  kicker,
+  action,
+  children,
+}: {
+  kicker: string;
+  /** A control in the card's top-right corner, shown on hover. */
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
-    <div className="relative rounded-xl border border-line bg-surface2 p-5 pb-[18px] shadow-(--plateGlow)">
+    <div className="group relative rounded-xl border border-line bg-surface2 p-5 pb-[18px] shadow-(--plateGlow)">
       <Brackets card />
       <div className={KICKER}>{kicker}</div>
+      {action && <div className="absolute top-3 right-3">{action}</div>}
       {children}
     </div>
+  );
+}
+
+/**
+ * The id a reply is spoken under. Cells carry no id of their own; the send
+ * time is unique per reply and stable once the turn has ended, which is the
+ * only time anyone reads one aloud.
+ */
+export function replyId(cell: Cell & { kind: "assistant" }): string {
+  return `reply:${cell.at ?? 0}:${cell.text.length}`;
+}
+
+/**
+ * Reads a reply aloud, or stops it. Hidden until hover, like the edit pencil;
+ * absent entirely where nothing on this device or in the daemon can speak.
+ */
+function SpeakButton({ cell }: { cell: Cell & { kind: "assistant" } }) {
+  const [problem, setProblem] = useState<string>();
+  const speaker = useSpeaker(setProblem);
+  if (!speaker.canSpeak) return null;
+  const id = replyId(cell);
+  const active = speaker.state?.id === id;
+  const loading = active && speaker.state?.phase === "loading";
+  return (
+    <span className="flex items-center gap-2">
+      {problem && <span className="text-[11px] leading-none text-alert">{problem}</span>}
+      <button
+        type="button"
+        aria-label={active ? "Stop reading" : "Read aloud"}
+        aria-pressed={active}
+        aria-busy={loading}
+        title={active ? "Stop" : "Read aloud"}
+        onClick={() => {
+          setProblem(undefined);
+          speaker.speak(id, cell.text);
+        }}
+        className={`flex h-6 w-6 cursor-pointer items-center justify-center rounded border-0 bg-transparent ${
+          active ? "text-neon-ink" : "text-ink3 hover-reveal hover:text-ink"
+        } ${loading ? "animate-pulse" : ""}`}
+      >
+        {active ? <StopIcon size={12} /> : <SpeakerIcon size={14} />}
+      </button>
+    </span>
   );
 }
 
@@ -400,7 +463,7 @@ function renderCell(
     case "assistant":
       return (
         <div>
-          <ReplyCard kicker="Borg">
+          <ReplyCard kicker="Borg" action={<SpeakButton cell={cell} />}>
             <Markdown>{cell.text}</Markdown>
           </ReplyCard>
           {cell.at !== undefined && <SentAt at={cell.at} />}

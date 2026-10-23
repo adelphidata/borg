@@ -21,8 +21,10 @@ import {
   Settings,
   ShieldCheck,
   Shuffle,
+  Square,
   Sun,
   Trash2,
+  Volume2,
   Wallet,
   X,
   type LucideIcon,
@@ -80,6 +82,8 @@ export const AgentsIcon = lucide(ListTree, 16);
 export const SunIcon = lucide(Sun, 15);
 export const MoonIcon = lucide(Moon, 15);
 export const ShuffleIcon = lucide(Shuffle, 15);
+export const SpeakerIcon = lucide(Volume2, 15);
+export const StopIcon = lucide(Square, 13, 2);
 
 export function SendIcon({ size, ...props }: IconProps) {
   return (
