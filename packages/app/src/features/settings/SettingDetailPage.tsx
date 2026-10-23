@@ -483,9 +483,6 @@ function NameDetail({ entry }: { entry: { key: string; value: string; overridden
           )}
         </div>
       </div>
-      <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
-        Shown in the sidebar and written into Borg’s memory files.
-      </div>
     </>
   );
 }
