@@ -193,7 +193,9 @@ function Detail({
               square
               variant="danger"
               onClick={() =>
-                void servers.remove(entry.name).then((r) => r !== undefined && navigate("/mcp"))
+                void servers
+                  .remove(entry.name)
+                  .then((r) => r !== undefined && navigate("/connections"))
               }
             >
               Remove
@@ -212,10 +214,10 @@ export function McpServerDetailPage() {
   const servers = useMcpServers([name]);
 
   return (
-    <PageChrome title="MCP Servers">
+    <PageChrome title="Connections">
       <div className={scrollCol(isMobile, "px-[38px] py-[34px]")}>
         <div className={DETAIL_COL}>
-          <BackLink to="/mcp" label="MCP Servers" />
+          <BackLink to="/connections" label="Connections" />
           <DaemonState query={servers.query} label="this server">
             {(data) => {
               const entry = data.servers.find((s) => s.name === name);

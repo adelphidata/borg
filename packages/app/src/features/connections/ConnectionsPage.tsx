@@ -11,6 +11,8 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useMutation } from "../../lib/useDaemon";
+import { McpServersSection } from "../mcp/McpServersSection";
+import { SkillsSection } from "../skills/SkillsSection";
 import type { admin } from "@borg/client";
 import {
   PAIR_SOURCES,
@@ -235,6 +237,10 @@ export function ConnectionsPage() {
               );
             }}
           </DaemonState>
+          {/* Tools and playbooks Borg reaches for sit with the services it
+              talks to: one page for everything it is hooked up to. */}
+          <McpServersSection />
+          <SkillsSection />
         </div>
       </div>
     </PageChrome>

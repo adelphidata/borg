@@ -1,17 +1,6 @@
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import {
-  MobileTitle,
-  PageChrome,
-  Pill,
-  PlusIcon,
-  SECTION_LABEL,
-  SETTINGS_SCROLL_DESKTOP_PADDING,
-  StatusDot,
-  TrashIcon,
-  scrollCol,
-  useIsMobile,
-} from "@borg/ui";
+import { Pill, PlusIcon, SECTION_LABEL, StatusDot, TrashIcon } from "@borg/ui";
 import type { admin } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
 import { Switch } from "../../components/Switch";
@@ -181,14 +170,11 @@ function ServerRow({
 }
 
 /**
- * MCP servers — tools Borg borrows from other programs.
- *
- * The list shows what is configured and whether it answers; a row opens the
- * full editor. Adding one takes a name and a command or URL; the templates
- * cover the common servers with one click.
+ * MCP servers — tools Borg borrows from other programs. One section of the
+ * Connections page: what is configured and whether it answers, a row opens
+ * the full editor, and adding one takes a name and a command or URL.
  */
-export function McpServersPage() {
-  const isMobile = useIsMobile();
+export function McpServersSection() {
   const location = useLocation();
   const navigate = useNavigate();
   const servers = useMcpServers([location.key]);
@@ -197,95 +183,94 @@ export function McpServersPage() {
   const connected =
     servers.query.state === "ready"
       ? servers.query.data.servers.filter((s) => s.state === "connected").length
-      : 0;
+      : undefined;
 
   return (
-    <PageChrome
-      title="MCP Servers"
-      meta={servers.query.state === "ready" ? `${connected} connected` : undefined}
-    >
-      <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
-        <div className="flex max-w-[720px] flex-col">
-          <MobileTitle className="mb-4">MCP Servers</MobileTitle>
+    <section>
+      <div className={SECTION_LABEL}>
+        MCP servers
+        {connected !== undefined && (
+          <span className="ml-2 font-normal normal-case tracking-normal text-ink3">
+            {connected} connected
+          </span>
+        )}
+      </div>
+      <DaemonState query={servers.query} label="your MCP servers">
+        {(data) => (
+          <>
+            {!data.mcpEnabled && (
+              <div className="mb-5 flex flex-wrap items-center gap-3 rounded-[10px] border border-line bg-surface2 px-4 py-3">
+                <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink2">
+                  MCP is turned off, so none of these servers connect.
+                </div>
+                <Pill square variant="primary" onClick={() => void servers.setMcpEnabled(true)}>
+                  Turn on MCP
+                </Pill>
+              </div>
+            )}
 
-          <DaemonState query={servers.query} label="your MCP servers">
-            {(data) => (
-              <>
-                {!data.mcpEnabled && (
-                  <div className="mb-5 flex flex-wrap items-center gap-3 rounded-[10px] border border-line bg-surface2 px-4 py-3">
-                    <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink2">
-                      MCP is turned off, so none of these servers connect.
+            <NewServer
+              presets={data.presets}
+              taken={new Set(data.servers.map((s) => s.name))}
+              servers={servers}
+            />
+
+            {servers.error && (
+              <div role="alert" className={`mb-3 ${ERROR_LINE}`}>
+                {servers.error}
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2">
+              {data.servers.length === 0 && (
+                <div className="py-4 text-center text-[13.5px] leading-[1.6] text-ink3">
+                  No MCP servers yet.
+                </div>
+              )}
+              {data.servers.map((entry) =>
+                confirm === entry.name ? (
+                  <div
+                    key={entry.name}
+                    className="flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
+                  >
+                    <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
+                      Remove {entry.name}? Its tools disappear from every conversation.
                     </div>
-                    <Pill square variant="primary" onClick={() => void servers.setMcpEnabled(true)}>
-                      Turn on MCP
+                    <Pill square onClick={() => setConfirm(undefined)}>
+                      Keep
+                    </Pill>
+                    <Pill
+                      square
+                      variant="danger"
+                      onClick={() => {
+                        setConfirm(undefined);
+                        void servers.remove(entry.name);
+                      }}
+                    >
+                      Remove
                     </Pill>
                   </div>
-                )}
-
-                <NewServer
-                  presets={data.presets}
-                  taken={new Set(data.servers.map((s) => s.name))}
-                  servers={servers}
-                />
-
-                {servers.error && (
-                  <div role="alert" className={`mb-3 ${ERROR_LINE}`}>
-                    {servers.error}
-                  </div>
-                )}
-
-                <div className="flex flex-col gap-2">
-                  {data.servers.length === 0 && (
-                    <div className="pt-6 text-center text-[13.5px] leading-[1.6] text-ink3">
-                      No MCP servers yet.
-                    </div>
-                  )}
-                  {data.servers.map((entry) =>
-                    confirm === entry.name ? (
-                      <div
-                        key={entry.name}
-                        className="flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
-                      >
-                        <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
-                          Remove {entry.name}? Its tools disappear from every conversation.
-                        </div>
-                        <Pill square onClick={() => setConfirm(undefined)}>
-                          Keep
-                        </Pill>
-                        <Pill
-                          square
-                          variant="danger"
-                          onClick={() => {
-                            setConfirm(undefined);
-                            void servers.remove(entry.name);
-                          }}
-                        >
-                          Remove
-                        </Pill>
-                      </div>
-                    ) : (
-                      <ServerRow
-                        key={entry.name}
-                        entry={entry}
-                        mcpEnabled={data.mcpEnabled}
-                        onOpen={() => navigate(`/mcp/${encodeURIComponent(entry.name)}`)}
-                        onToggle={(enabled) => void servers.setEnabled(entry, enabled)}
-                        onDelete={() => setConfirm(entry.name)}
-                      />
-                    ),
-                  )}
-                </div>
-                {data.mcpEnabled && data.servers.length > 0 && (
-                  <div className="mt-6 text-[11.5px] leading-[1.5] text-ink3">
-                    A new or changed server starts in the background. This list refreshes when you
-                    come back to it.
-                  </div>
-                )}
-              </>
+                ) : (
+                  <ServerRow
+                    key={entry.name}
+                    entry={entry}
+                    mcpEnabled={data.mcpEnabled}
+                    onOpen={() => navigate(`/connections/mcp/${encodeURIComponent(entry.name)}`)}
+                    onToggle={(enabled) => void servers.setEnabled(entry, enabled)}
+                    onDelete={() => setConfirm(entry.name)}
+                  />
+                ),
+              )}
+            </div>
+            {data.mcpEnabled && data.servers.length > 0 && (
+              <div className="mt-4 text-[11.5px] leading-[1.5] text-ink3">
+                A new or changed server starts in the background. This list refreshes when you come
+                back to it.
+              </div>
             )}
-          </DaemonState>
-        </div>
-      </div>
-    </PageChrome>
+          </>
+        )}
+      </DaemonState>
+    </section>
   );
 }

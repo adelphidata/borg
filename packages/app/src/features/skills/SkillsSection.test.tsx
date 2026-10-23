@@ -3,7 +3,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
-import { SkillsPage } from "./SkillsPage";
+import { SkillsSection } from "./SkillsSection";
 import { SkillDetailPage } from "./SkillDetailPage";
 import { frontmatterName, skillTemplate, withFrontmatterName } from "./useSkills";
 
@@ -40,11 +40,11 @@ const detail = (
   GetSkill: { entry, content, path },
 });
 
-function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/skills") {
+function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/connections") {
   return renderApp(
     <Routes>
-      <Route path="/skills" element={<SkillsPage />} />
-      <Route path="/skills/:name" element={<SkillDetailPage />} />
+      <Route path="/connections" element={<SkillsSection />} />
+      <Route path="/connections/skills/:name" element={<SkillDetailPage />} />
     </Routes>,
     { daemon, route },
   );
@@ -80,7 +80,7 @@ describe("skill helpers", () => {
   });
 });
 
-describe("SkillsPage", () => {
+describe("SkillsSection", () => {
   it("lists yours before the built-ins, with the switch state and notes", async () => {
     const daemon = fakeDaemon(
       catalog([
@@ -172,7 +172,7 @@ describe("SkillsPage", () => {
     click(screen.getByRole("button", { name: /^release-notes/ }));
     await waitFor(() => expect(screen.getByLabelText("SKILL.md")).toBeTruthy());
     // The back link, not the page title.
-    click(screen.getAllByText("Skills").find((el) => el.tagName === "SPAN")!);
+    click(screen.getAllByText("Connections").find((el) => el.tagName === "SPAN")!);
     await waitFor(() => expect(screen.getByText("New skill")).toBeTruthy());
     click(screen.getByText("New skill"));
     await waitFor(() => expect(screen.getByText("Create skill")).toBeTruthy());
@@ -186,7 +186,7 @@ describe("SkillDetailPage for a skill of yours", () => {
       ...detail(mine()),
       PutSkill: { entry: mine(), content: CONTENT, path: "" },
     });
-    mount(daemon, "/skills/release-notes");
+    mount(daemon, "/connections/skills/release-notes");
     await waitFor(() => expect(screen.getByLabelText("SKILL.md")).toBeTruthy());
     expect(screen.getByText("/home/me/.borg/skills/release-notes/SKILL.md")).toBeTruthy();
     expect(screen.getByText("Yours")).toBeTruthy();
@@ -204,7 +204,7 @@ describe("SkillDetailPage for a skill of yours", () => {
 
   it("refuses to save a file whose frontmatter renames the skill", async () => {
     const daemon = fakeDaemon({ ...catalog([mine()]), ...detail(mine()) });
-    mount(daemon, "/skills/release-notes");
+    mount(daemon, "/connections/skills/release-notes");
     await waitFor(() => expect(screen.getByLabelText("SKILL.md")).toBeTruthy());
     type(screen.getByLabelText("SKILL.md"), CONTENT.replace("release-notes", "other"));
     click(screen.getByText("Save changes"));
@@ -216,7 +216,7 @@ describe("SkillDetailPage for a skill of yours", () => {
 
   it("deletes after confirmation and returns to the list", async () => {
     const daemon = fakeDaemon({ ...catalog([mine()]), ...detail(mine()), DeleteSkill: {} });
-    mount(daemon, "/skills/release-notes");
+    mount(daemon, "/connections/skills/release-notes");
     await waitFor(() => expect(screen.getByText("Delete this skill")).toBeTruthy());
     click(screen.getByText("Delete this skill"));
     click(screen.getByRole("button", { name: "Delete" }));
@@ -231,7 +231,7 @@ describe("SkillDetailPage for a built-in", () => {
       ...catalog([skill()]),
       ...detail(skill(), "---\nname: git\n---\nUse git.", ""),
     });
-    mount(daemon, "/skills/git");
+    mount(daemon, "/connections/skills/git");
     await waitFor(() => expect(screen.getByText("Copy to a new skill")).toBeTruthy());
     expect(screen.queryByLabelText("SKILL.md")).toBeNull();
     expect(screen.queryByText("Delete this skill")).toBeNull();
@@ -255,7 +255,7 @@ describe("SkillDetailPage for a new skill", () => {
       PutSkill: { entry: mine({ name: "notes" }), content: skillTemplate("notes"), path: "/p" },
       ...detail(mine({ name: "notes" }), skillTemplate("notes"), "/p"),
     });
-    mount(daemon, "/skills/new");
+    mount(daemon, "/connections/skills/new");
     await waitFor(() => expect(screen.getByText("New skill")).toBeTruthy());
     const create = screen.getByText("Create skill") as HTMLButtonElement;
     expect(create.disabled).toBe(true);
@@ -275,7 +275,7 @@ describe("SkillDetailPage for a new skill", () => {
 
   it("refuses a bad name or a mismatched frontmatter before the daemon is asked", async () => {
     const daemon = fakeDaemon(catalog([]));
-    mount(daemon, "/skills/new");
+    mount(daemon, "/connections/skills/new");
     await waitFor(() => expect(screen.getByLabelText("Name")).toBeTruthy());
     // Nothing to copy from, so nothing is fetched.
     expect(daemon.calls.some((c) => c.method === "GetSkill")).toBe(false);
@@ -300,7 +300,7 @@ describe("SkillDetailPage for a new skill", () => {
         "SKILL.md must start with YAML frontmatter",
       ),
     });
-    mount(daemon, "/skills/new");
+    mount(daemon, "/connections/skills/new");
     await waitFor(() => expect(screen.getByLabelText("Name")).toBeTruthy());
     type(screen.getByLabelText("Name"), "x");
     type(screen.getByLabelText("SKILL.md"), "just prose");

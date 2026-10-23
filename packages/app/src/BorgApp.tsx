@@ -304,9 +304,10 @@ function Shell({ platform }: { platform: Platform }) {
                 route, and without a remount the page keeps the session it
                 already has. */}
             <Route path="/c/:sessionId" element={<ConversationPage key={location.key} />} />
+            {/* The two static segments outrank the generic kind/name route. */}
+            <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
+            <Route path="/connections/skills/:name" element={<SkillDetailPage />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
-            <Route path="/mcp/:name" element={<McpServerDetailPage />} />
-            <Route path="/skills/:name" element={<SkillDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
             <Route path="/settings/:id" element={<SettingDetailPage />} />

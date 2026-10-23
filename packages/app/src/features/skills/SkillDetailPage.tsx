@@ -57,7 +57,7 @@ function NewSkill({ from }: { from: string | undefined }) {
 
   const save = () => {
     const id = name.trim();
-    // `/skills/new` is this page, so a skill called "new" could never be opened.
+    // `/connections/skills/new` is this page, so a skill called "new" could never be opened.
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id) || id === "new") {
       setLocalError("Name it with letters, digits, dashes or underscores, nothing else.");
       return;
@@ -74,7 +74,7 @@ function NewSkill({ from }: { from: string | undefined }) {
     void skills
       .save(id, content)
       .then((saved) => {
-        if (saved) navigate(`/skills/${encodeURIComponent(id)}`, { replace: true });
+        if (saved) navigate(`/connections/skills/${encodeURIComponent(id)}`, { replace: true });
       })
       .finally(() => setSaving(false));
   };
@@ -124,7 +124,7 @@ function NewSkill({ from }: { from: string | undefined }) {
         <Pill square variant="primary" disabled={saving || name.trim() === ""} onClick={save}>
           {saving ? "Saving…" : "Create skill"}
         </Pill>
-        <Pill square onClick={() => navigate("/skills")}>
+        <Pill square onClick={() => navigate("/connections")}>
           Cancel
         </Pill>
       </div>
@@ -251,7 +251,9 @@ function Existing({
             <div className="mt-3 flex flex-wrap items-center gap-3">
               <Pill
                 square
-                onClick={() => navigate(`/skills/new?from=${encodeURIComponent(entry.name)}`)}
+                onClick={() =>
+                  navigate(`/connections/skills/new?from=${encodeURIComponent(entry.name)}`)
+                }
               >
                 Copy to a new skill
               </Pill>
@@ -289,7 +291,9 @@ function Existing({
                 square
                 variant="danger"
                 onClick={() =>
-                  void skills.remove(entry.name).then((r) => r !== undefined && navigate("/skills"))
+                  void skills
+                    .remove(entry.name)
+                    .then((r) => r !== undefined && navigate("/connections"))
                 }
               >
                 Delete
@@ -318,7 +322,7 @@ function ExistingSkill({ name }: { name: string }) {
   );
 }
 
-/** `/skills/new` creates a user skill; `/skills/:name` shows or edits one. */
+/** `/connections/skills/new` creates a user skill; `/connections/skills/:name` shows or edits one. */
 export function SkillDetailPage() {
   const isMobile = useIsMobile();
   const { name = "" } = useParams();
@@ -326,10 +330,10 @@ export function SkillDetailPage() {
   const isNew = name === "new";
 
   return (
-    <PageChrome title="Skills">
+    <PageChrome title="Connections">
       <div className={scrollCol(isMobile, "px-[38px] py-[34px]")}>
         <div className={DETAIL_COL}>
-          <BackLink to="/skills" label="Skills" />
+          <BackLink to="/connections" label="Connections" />
           {isNew ? (
             <NewSkill from={params.get("from") ?? undefined} />
           ) : (

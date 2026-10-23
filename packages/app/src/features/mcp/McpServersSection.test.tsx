@@ -3,7 +3,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
-import { McpServersPage } from "./McpServersPage";
+import { McpServersSection } from "./McpServersSection";
 import { McpServerDetailPage } from "./McpServerDetailPage";
 import { emptySpec } from "./useMcpServers";
 
@@ -25,11 +25,11 @@ const listing = (servers: unknown[], over: Record<string, unknown> = {}) => ({
   },
 });
 
-function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/mcp") {
+function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/connections") {
   return renderApp(
     <Routes>
-      <Route path="/mcp" element={<McpServersPage />} />
-      <Route path="/mcp/:name" element={<McpServerDetailPage />} />
+      <Route path="/connections" element={<McpServersSection />} />
+      <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
     </Routes>,
     { daemon, route },
   );
@@ -38,7 +38,7 @@ function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/mcp") {
 const click = (el: HTMLElement) => act(() => el.click());
 const type = (el: HTMLElement, value: string) => fireEvent.change(el, { target: { value } });
 
-describe("McpServersPage listing", () => {
+describe("McpServersSection listing", () => {
   it("says what each server is, whether it answers, and how many tools it brought", async () => {
     const daemon = fakeDaemon(
       listing([
@@ -96,7 +96,7 @@ describe("McpServersPage listing", () => {
   });
 });
 
-describe("McpServersPage writes", () => {
+describe("McpServersSection writes", () => {
   it("adds a server from the form with the spec the daemon expects", async () => {
     const daemon = fakeDaemon({ ...listing([]), PutMcpServer: entry({ name: "gh" }) });
     mount(daemon);
@@ -221,7 +221,7 @@ describe("McpServersPage writes", () => {
 describe("McpServerDetailPage", () => {
   it("shows the stored connection and saves an edit as an overwrite", async () => {
     const daemon = fakeDaemon({ ...listing([entry()]), PutMcpServer: entry() });
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByText("Connected · 2 tools")).toBeTruthy());
     const command = screen.getByLabelText("Command") as HTMLInputElement;
     expect(command.value).toBe("uvx mcp-server-time");
@@ -244,7 +244,7 @@ describe("McpServerDetailPage", () => {
 
   it("discards an edit without asking the daemon", async () => {
     const daemon = fakeDaemon(listing([entry()]));
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByLabelText("Command")).toBeTruthy());
     type(screen.getByLabelText("Command"), "changed");
     click(screen.getByText("Discard"));
@@ -256,7 +256,7 @@ describe("McpServerDetailPage", () => {
 
   it("refuses a bad edit locally", async () => {
     const daemon = fakeDaemon(listing([entry()]));
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByLabelText("Command")).toBeTruthy());
     type(screen.getByLabelText("Command"), "");
     click(screen.getByText("Save changes"));
@@ -273,7 +273,7 @@ describe("McpServerDetailPage", () => {
         tools: ["get_time", "convert"],
       },
     });
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByText("Test connection")).toBeTruthy());
     click(screen.getByText("Test connection"));
     await waitFor(() =>
@@ -295,7 +295,7 @@ describe("McpServerDetailPage", () => {
         tools: [],
       },
     });
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByText("Test connection")).toBeTruthy());
     click(screen.getByText("Test connection"));
     await waitFor(() => expect(screen.getByText(/handshake timed out/)).toBeTruthy());
@@ -303,7 +303,7 @@ describe("McpServerDetailPage", () => {
 
   it("removes the server and goes back to the list", async () => {
     const daemon = fakeDaemon({ ...listing([entry()]), RemoveMcpServer: {} });
-    mount(daemon, "/mcp/time");
+    mount(daemon, "/connections/mcp/time");
     await waitFor(() => expect(screen.getByText("Remove this server")).toBeTruthy());
     click(screen.getByText("Remove this server"));
     click(screen.getByRole("button", { name: "Remove" }));
@@ -315,7 +315,7 @@ describe("McpServerDetailPage", () => {
 
   it("says when there is no such server", async () => {
     const daemon = fakeDaemon(listing([]));
-    mount(daemon, "/mcp/ghost");
+    mount(daemon, "/connections/mcp/ghost");
     await waitFor(() => expect(screen.getByText(/no server called ghost/)).toBeTruthy());
   });
 });
