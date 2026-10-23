@@ -51,6 +51,10 @@ export function stopSpeaking(): void {
   const p = playing;
   playing = undefined;
   if (p?.kind === "audio") {
+    // Emptying `src` makes the element fire `error`; that is us stopping it,
+    // not a failure to report against the reply.
+    p.el.onended = null;
+    p.el.onerror = null;
     p.el.pause();
     p.el.src = "";
     URL.revokeObjectURL(p.url);
@@ -148,6 +152,8 @@ async function speakThroughDaemon(
   };
   el.onended = done;
   el.onerror = () => {
+    // A stop or a newer reply already took over; nothing to report.
+    if (gen !== generation) return;
     done();
     onError("Could not play the reply.");
   };
@@ -187,7 +193,10 @@ export function useSpeaker(onError?: (message: string) => void): Speaker {
     () => daemonReady,
   );
   const canSpeak = viaDaemon || hasDeviceVoice();
-  const report = onError ?? (() => {});
+  // `onError` is a fresh arrow per render; the ref keeps `speak` stable
+  // while a failure still reaches the latest one.
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
 
   const speak = useCallback(
     (id: string, markdown: string) => {
@@ -198,11 +207,12 @@ export function useSpeaker(onError?: (message: string) => void): Speaker {
       stopSpeaking();
       const text = speakableText(markdown);
       if (text === "") return;
+      const report = (message: string) => onErrorRef.current?.(message);
+      // The daemon strips markdown itself, and keeps the structure it needs
+      // to split sentences; the device voice gets the plain prose.
       if (viaDaemon && client) void speakThroughDaemon(client, id, markdown, report);
       else if (hasDeviceVoice()) speakOnDevice(id, text, report);
     },
-    // `report` is a fresh arrow per render; the latest is fine to capture.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [viaDaemon],
   );
 

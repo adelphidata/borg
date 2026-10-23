@@ -92,7 +92,8 @@ export function voicePrefsOf(settings: Map<string, DaemonSetting> | undefined): 
     return v === undefined ? fallback : v === "true";
   };
   return {
-    shortcut: get("voice.dictation_shortcut") || VOICE_DEFAULTS.shortcut,
+    // `??`, not `||`: a shortcut saved as "" means no key, not the default.
+    shortcut: get("voice.dictation_shortcut") ?? VOICE_DEFAULTS.shortcut,
     holdToRecord: bool("voice.hold_to_record", VOICE_DEFAULTS.holdToRecord),
     autoSend: bool("voice.dictation_auto_send", VOICE_DEFAULTS.autoSend),
     copyTranscript: bool("voice.copy_transcript", VOICE_DEFAULTS.copyTranscript),

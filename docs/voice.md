@@ -77,36 +77,9 @@ one press (when a saved key can transcribe) or points to Settings. Once ready:
 The microphone and the device voice are kept in the browser's local storage,
 not in the daemon, because they name hardware on this machine.
 
-### Compared with OpenSuperWhisper
-
-The dictation feature set was checked against OpenSuperWhisper's preferences
-(`OpenSuperWhisper/Utils/AppPreferences.swift`), which has 24 user-facing
-fields. Twenty-two have an equivalent here:
-
-| OpenSuperWhisper                                       | Borg                                                                                                  |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| selectedEngine, selectedModelPath                      | `audio.models` provider and model                                                                     |
-| whisperLanguage                                        | `audio.language`                                                                                      |
-| initialPrompt                                          | `audio.prompt`                                                                                        |
-| temperature                                            | `audio.temperature`                                                                                   |
-| beamSize, useBeamSearch                                | `audio.beam_size`                                                                                     |
-| noSpeechThreshold                                      | `audio.no_speech_threshold`                                                                           |
-| showTimestamps                                         | `audio.timestamps`                                                                                    |
-| useAsianAutocorrect                                    | `audio.cjk_spacing` (the spacing rule; the reference also normalises punctuation)                     |
-| autoDeleteRecordings                                   | `audio.keep_recordings` + `audio.keep_recordings_days` (off by default, so nothing is kept to delete) |
-| history directory                                      | `audio.recordings_dir`                                                                                |
-| suppressBlankAudio                                     | an empty transcript is dropped with a notice                                                          |
-| addSpaceAfterSentence                                  | spoken words join the draft with one space                                                            |
-| autoCopyToClipboard                                    | `voice.copy_transcript`                                                                               |
-| autoPasteTranscription                                 | words land in the box, or `voice.dictation_auto_send`                                                 |
-| key combination, modifierOnlyHotkey, mouseButtonHotkey | `voice.dictation_shortcut`                                                                            |
-| holdToRecord with one-tap toggle                       | `voice.hold_to_record`                                                                                |
-| playSoundOnRecordStart                                 | `voice.beep_enabled`                                                                                  |
-| escCancelWithoutConfirmation                           | Escape cancels a recording                                                                            |
-| selectedMicrophone                                     | Microphone                                                                                            |
-
-Not carried over: debugMode (a log toggle) and startHiddenInMenuBar (the
-reference is a menu-bar app; Borg's desktop app opens a window).
+Kept recordings are pruned by name: only files stamped
+`YYYY-MM-DD_HH-MM-SS.mmm` are ever removed, so `audio.recordings_dir` can
+point at a folder that holds other things. A leading `~` is expanded.
 
 ## Keys
 

@@ -94,7 +94,7 @@ fn stdio_spec(command: &str, args: &[&str]) -> McpServerSpec {
         enabled: true,
         transport: "stdio".into(),
         command: command.into(),
-        args: args.iter().map(|s| s.to_string()).collect(),
+        args: args.iter().map(ToString::to_string).collect(),
         env: HashMap::from([("A".to_string(), "1".to_string())]),
         ..Default::default()
     }

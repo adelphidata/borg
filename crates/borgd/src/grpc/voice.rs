@@ -151,20 +151,32 @@ async fn synthesize_with(
 
 /// A copy of the recording and its transcript, when Settings asks for one.
 /// A failure to write is logged, never surfaced: the transcript already
-/// reached the user.
-fn keep_recording(config: &Config, audio: &[u8], file_name: &str, text: &str) {
-    let kept = super::recordings::recordings_dir(config).and_then(|dir| {
+/// reached the user. The writes and the prune scan are disk work, so they
+/// run off the runtime's worker threads.
+async fn keep_recording(config: &Config, audio: Vec<u8>, file_name: &'static str, text: String) {
+    let dir = match super::recordings::recordings_dir(config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("could not keep the dictation recording: {e:#}");
+            return;
+        }
+    };
+    let keep_days = config.audio.keep_recordings_days;
+    let kept = tokio::task::spawn_blocking(move || {
         super::recordings::keep(
             &dir,
             chrono::Utc::now(),
-            audio,
+            &audio,
             file_name,
-            text,
-            config.audio.keep_recordings_days,
+            &text,
+            keep_days,
         )
-    });
-    if let Err(e) = kept {
-        tracing::warn!("could not keep the dictation recording: {e:#}");
+    })
+    .await;
+    match kept {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("could not keep the dictation recording: {e:#}"),
+        Err(e) => tracing::warn!("could not keep the dictation recording: {e}"),
     }
 }
 
@@ -184,14 +196,15 @@ async fn transcribe_with(
         req.mime_type.as_str()
     };
     let language = Some(req.language.as_str()).filter(|l| !l.is_empty());
+    let file_name = file_name_for(mime);
     match transcriber
-        .transcribe(&req.audio, mime, file_name_for(mime), language)
+        .transcribe(&req.audio, mime, file_name, language)
         .await
     {
         Ok((text, _)) => {
             let text = text.trim().to_string();
             if config.audio.keep_recordings {
-                keep_recording(config, &req.audio, file_name_for(mime), &text);
+                keep_recording(config, req.audio, file_name, text.clone()).await;
             }
             Ok(TranscribeResponse { text })
         }

@@ -71,13 +71,18 @@ async fn skill_detail(name: &str) -> Result<SkillDetail, TStatus> {
         .ok_or_else(|| TStatus::not_found(format!("no skill named `{name}`")))?;
     let entry = catalog_entry(skill);
     let owned = name.to_string();
+    // A built-in has no file of its own, and a project skill lives under the
+    // project, not the user root — a lookup there would find nothing or an
+    // unrelated user skill of the same name. The path is only meaningful for
+    // a skill the user can open in an editor.
+    let is_user = matches!(skill.source, SkillSource::User);
     let (content, path) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let content = cortex::skills::skill_source(&owned)?.unwrap_or_default();
         let path = match cortex::skills::skills_dir() {
-            Ok(root) => cortex::skills::user_skill_dir(&root, &owned)
+            Ok(root) if is_user => cortex::skills::user_skill_dir(&root, &owned)
                 .map(|d| d.join("SKILL.md").display().to_string())
                 .unwrap_or_default(),
-            Err(_) => String::new(),
+            _ => String::new(),
         };
         Ok((content, path))
     })
@@ -87,13 +92,7 @@ async fn skill_detail(name: &str) -> Result<SkillDetail, TStatus> {
     Ok(SkillDetail {
         entry: Some(entry),
         content,
-        // A built-in has no file of its own; the path is only meaningful for
-        // a skill the user can open in an editor.
-        path: if matches!(skill.source, SkillSource::BuiltIn) {
-            String::new()
-        } else {
-            path
-        },
+        path,
     })
 }
 
@@ -137,8 +136,16 @@ pub(super) async fn put_skill(
     if content.trim().is_empty() {
         return Err(TStatus::invalid_argument("SKILL.md content is required"));
     }
-    let root = cortex::skills::skills_dir().map_err(map_internal("skills dir"))?;
-    let is_new = cortex::skills::user_skill_dir(&root, &name).is_none();
+    // Finding the row reads every user SKILL.md: disk work, off the runtime.
+    let probe_name = name.clone();
+    let (root, is_new) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let root = cortex::skills::skills_dir()?;
+        let is_new = cortex::skills::user_skill_dir(&root, &probe_name).is_none();
+        Ok((root, is_new))
+    })
+    .await
+    .map_err(map_internal("skills dir panicked"))?
+    .map_err(map_internal("skills dir"))?;
     // The loader keeps a user skill off until it is switched on. Someone who
     // just wrote one here wants it read, so a new skill starts on; an edit
     // leaves whatever switch position it already had. The switch is written

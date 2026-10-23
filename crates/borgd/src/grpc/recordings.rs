@@ -12,9 +12,32 @@ use std::time::{Duration, SystemTime};
 /// Borg's data directory.
 pub fn recordings_dir(config: &Config) -> anyhow::Result<PathBuf> {
     match config.audio.recordings_dir.as_deref().map(str::trim) {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        // Settings suggests `~/.borg/recordings`; a shell would expand that.
+        Some(dir) if !dir.is_empty() => {
+            Ok(PathBuf::from(cortex::util::unix_ext::expand_tilde(dir)))
+        }
         _ => Ok(Config::data_dir()?.join("recordings")),
     }
+}
+
+/// The file stem this module writes: `YYYY-MM-DD_HH-MM-SS.mmm`.
+const STAMP_FORMAT: &str = "%Y-%m-%d_%H-%M-%S%.3f";
+
+/// Whether `name` is a file this module wrote. The folder may be one the
+/// user already keeps other things in; only our own stamps are ever pruned.
+fn is_kept_recording(name: &str) -> bool {
+    let Some(stem) = Path::new(name).file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    const SHAPE: &[u8] = b"0000-00-00_00-00-00.000";
+    stem.len() == SHAPE.len()
+        && stem.bytes().zip(SHAPE).all(|(c, want)| {
+            if *want == b'0' {
+                c.is_ascii_digit()
+            } else {
+                c == *want
+            }
+        })
 }
 
 /// Writes `<stamp>.<ext>` and `<stamp>.txt` into `dir`, then prunes what is
@@ -32,7 +55,7 @@ pub fn keep(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("webm");
-    let stamp = now.format("%Y-%m-%d_%H-%M-%S%.3f").to_string();
+    let stamp = now.format(STAMP_FORMAT).to_string();
     let audio_path = dir.join(format!("{stamp}.{ext}"));
     std::fs::write(&audio_path, audio)?;
     std::fs::write(dir.join(format!("{stamp}.txt")), transcript)?;
@@ -40,8 +63,10 @@ pub fn keep(
     Ok(audio_path)
 }
 
-/// Removes files in `dir` whose modification time is older than `keep_days`.
-/// Subfolders and files that cannot be read are left alone.
+/// Removes recordings in `dir` whose modification time is older than
+/// `keep_days`. Only files named by [`keep`] go: the folder may be one the
+/// user pointed at, and nothing else in it is ours to delete. Subfolders
+/// and files that cannot be read are left alone.
 pub fn prune(dir: &Path, keep_days: u32) -> anyhow::Result<()> {
     if keep_days == 0 {
         return Ok(());
@@ -49,6 +74,9 @@ pub fn prune(dir: &Path, keep_days: u32) -> anyhow::Result<()> {
     let cutoff = SystemTime::now() - Duration::from_secs(u64::from(keep_days) * 86_400);
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
+        if !entry.file_name().to_str().is_some_and(is_kept_recording) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_file() {
             continue;
@@ -84,21 +112,27 @@ mod tests {
     #[test]
     fn prune_drops_only_files_older_than_the_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("old.webm");
-        let fresh = tmp.path().join("fresh.webm");
+        let old = tmp.path().join("2026-09-01_08-00-00.000.webm");
+        let fresh = tmp.path().join("2026-10-23_08-00-00.000.webm");
+        // Something the user keeps in the same folder, older than the window.
+        let theirs = tmp.path().join("notes.webm");
         std::fs::write(&old, b"x").unwrap();
         std::fs::write(&fresh, b"x").unwrap();
+        std::fs::write(&theirs, b"x").unwrap();
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         let forty_days_ago = SystemTime::now() - Duration::from_secs(40 * 86_400);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(forty_days_ago))
-            .unwrap();
+        for path in [&old, &theirs] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(forty_days_ago))
+                .unwrap();
+        }
         prune(tmp.path(), 30).unwrap();
         assert!(!old.exists());
         assert!(fresh.exists());
+        assert!(theirs.exists(), "only our own recordings are pruned");
         assert!(tmp.path().join("sub").is_dir());
         // 0 keeps everything, however old.
         std::fs::write(&old, b"x").unwrap();
@@ -126,5 +160,21 @@ mod tests {
         let blank =
             Config::from_setting_rows([("audio.recordings_dir".to_string(), String::new())]);
         assert!(recordings_dir(&blank).unwrap().ends_with("recordings"));
+        let tilde = Config::from_setting_rows([(
+            "audio.recordings_dir".to_string(),
+            "~/notes".to_string(),
+        )]);
+        let expanded = recordings_dir(&tilde).unwrap();
+        assert!(!expanded.starts_with("~"), "{}", expanded.display());
+        assert!(expanded.ends_with("notes"));
+    }
+
+    #[test]
+    fn only_our_own_stamps_count_as_recordings() {
+        assert!(is_kept_recording("2026-10-23_12-00-00.250.wav"));
+        assert!(is_kept_recording("2026-10-23_12-00-00.250.txt"));
+        assert!(!is_kept_recording("notes.webm"));
+        assert!(!is_kept_recording("2026-10-23.wav"));
+        assert!(!is_kept_recording("2026-10-23_12-00-00.25x.wav"));
     }
 }
