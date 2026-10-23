@@ -6,6 +6,9 @@ import { DaemonState } from "../../components/DaemonState";
 import { formatElapsed } from "../../lib/format";
 import { useKeybind } from "../../lib/keybinds";
 import { usePlatform } from "../../lib/platform";
+import { useAutoSpeak, useSpeechSource } from "../../lib/speech";
+import { useVoicePrefs } from "../../lib/voice";
+import { replyId } from "./cells";
 import { useTick } from "../../lib/useTick";
 import { markSessionSeen } from "../sessions/unreadStore";
 import { Composer } from "./Composer";
@@ -59,6 +62,7 @@ export function ConversationPage() {
     steer,
     cancel,
     respond,
+    rename,
     editAndResend,
     compact,
     fork,
@@ -215,6 +219,21 @@ export function ConversationPage() {
   );
   useKeybind("toggle-activity", () => setActivityOpen((v) => !v));
 
+  // Spoken replies: the speaker learns where sound comes from here, once for
+  // every read-aloud button in the transcript; auto-speak reads the reply
+  // that just finished.
+  useSpeechSource();
+  const voice = useVoicePrefs();
+  const lastReply = useMemo(() => {
+    for (let i = cells.length - 1; i >= 0; i -= 1) {
+      const cell = cells[i]!;
+      if (cell.kind === "user") return undefined;
+      if (cell.kind === "assistant") return { id: replyId(cell), text: cell.text };
+    }
+    return undefined;
+  }, [cells]);
+  useAutoSpeak(voice.autoSpeak, busy, lastReply);
+
   // Search over the mounted transcript. The revision is what tells it to
   // re-derive: every streamed token replaces text nodes its ranges point into.
   // A turn settling counts too — token appends mutate the last cell in place,
@@ -277,6 +296,7 @@ export function ConversationPage() {
     <PageChrome
       title={title}
       meta={meta}
+      onRename={opened.state === "ready" ? rename : undefined}
       mobileBrandHeader
       headerActions={
         <button

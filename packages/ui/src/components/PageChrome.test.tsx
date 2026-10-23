@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { installMatchMedia } from "../test/matchMedia";
 import { MobileTitle } from "./MobileTitle";
 import { PageChrome } from "./PageChrome";
@@ -41,6 +41,77 @@ describe("PageChrome", () => {
     );
     // No meta, no slot: an empty styled span would still take header space.
     expect(bare.container.querySelector(".text-ink3")).toBeNull();
+  });
+
+  it("lets a double-click or Enter on the title rename it, and Escape back out", async () => {
+    breakpoint.set(false);
+    const onRename = vi.fn().mockResolvedValue(true);
+    render(
+      <PageChrome title="Ship it" onRename={onRename}>
+        <p>body</p>
+      </PageChrome>,
+    );
+    const title = screen.getByRole("heading", { level: 1, name: "Ship it" });
+    expect(title.getAttribute("title")).toBe("Double-click to rename");
+    fireEvent.doubleClick(title);
+    const field = screen.getByRole("textbox", { name: "Conversation name" }) as HTMLInputElement;
+    expect(field.value).toBe("Ship it");
+    fireEvent.change(field, { target: { value: "Ship it today" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(onRename).toHaveBeenCalledWith("Ship it today");
+    await act(async () => {});
+    expect(screen.queryByRole("textbox")).toBeNull();
+
+    // The keyboard reaches it too.
+    fireEvent.keyDown(screen.getByRole("heading", { level: 1 }), { key: "Enter" });
+    const again = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.change(again, { target: { value: "Dropped" } });
+    fireEvent.keyDown(again, { key: "Escape" });
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(onRename).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rename to the same or an empty name, and stays open on a refusal", async () => {
+    breakpoint.set(false);
+    const onRename = vi.fn().mockResolvedValue(false);
+    render(
+      <PageChrome title="Ship it" onRename={onRename}>
+        <p>body</p>
+      </PageChrome>,
+    );
+    fireEvent.doubleClick(screen.getByRole("heading", { level: 1 }));
+    const field = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.change(field, { target: { value: "   " } });
+    fireEvent.blur(field);
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox")).toBeNull();
+
+    fireEvent.doubleClick(screen.getByRole("heading", { level: 1 }));
+    const same = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.keyDown(same, { key: "Enter" });
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox")).toBeNull();
+
+    fireEvent.doubleClick(screen.getByRole("heading", { level: 1 }));
+    const refused = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.change(refused, { target: { value: "New" } });
+    fireEvent.keyDown(refused, { key: "Enter" });
+    await act(async () => {});
+    expect(onRename).toHaveBeenCalledWith("New");
+    expect(screen.getByRole("textbox", { name: "Conversation name" })).toBeTruthy();
+  });
+
+  it("shows a plain heading when nothing can rename it", () => {
+    breakpoint.set(false);
+    render(
+      <PageChrome title="Usage">
+        <p>body</p>
+      </PageChrome>,
+    );
+    const title = screen.getByRole("heading", { level: 1, name: "Usage" });
+    fireEvent.doubleClick(title);
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(title.getAttribute("tabindex")).toBeNull();
   });
 
   it("drops the desktop header at phone width but keeps the page's heading", () => {

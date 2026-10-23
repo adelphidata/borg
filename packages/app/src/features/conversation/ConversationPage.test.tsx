@@ -6,6 +6,7 @@ import { ThemeProvider } from "@borg/ui";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { SettingsProvider } from "../../lib/settings";
 import { dispatchKeybind } from "../../lib/keybinds";
+import { sessionsVersion } from "../sessions/sessionsVersion";
 import { ConversationPage } from "./ConversationPage";
 
 const OPEN = {
@@ -97,6 +98,44 @@ describe("ConversationPage", () => {
     mount(fakeDaemon(OPEN));
     await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());
     expect(screen.getByText("claude-opus-5")).toBeTruthy();
+  });
+
+  it("renames the conversation from a double-click on its title", async () => {
+    const daemon = fakeDaemon({ ...OPEN, SetSessionTitle: {} });
+    const before = sessionsVersion();
+    mount(daemon);
+    const title = await screen.findByRole("heading", { level: 1, name: "Ship it" });
+    fireEvent.doubleClick(title);
+    const field = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.change(field, { target: { value: "  Ship it today " } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSessionTitle")?.request).toEqual({
+        id: "agent-1",
+        title: "Ship it today",
+      }),
+    );
+    expect(await screen.findByRole("heading", { level: 1, name: "Ship it today" })).toBeTruthy();
+    // The sidebar list is told to refresh.
+    expect(sessionsVersion()).toBe(before + 1);
+  });
+
+  it("keeps the field open when the rename fails", async () => {
+    const daemon = fakeDaemon({
+      ...OPEN,
+      SetSessionTitle: new BorgError(GrpcStatus.Unavailable, "daemon down"),
+    });
+    mount(daemon);
+    fireEvent.doubleClick(await screen.findByRole("heading", { level: 1, name: "Ship it" }));
+    const field = screen.getByRole("textbox", { name: "Conversation name" });
+    fireEvent.change(field, { target: { value: "Nope" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() =>
+      expect(daemon.calls.some((c) => c.method === "SetSessionTitle")).toBe(true),
+    );
+    await act(async () => {});
+    expect(screen.getByRole("textbox", { name: "Conversation name" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 1, name: "Nope" })).toBeNull();
   });
 
   it("shows the model the last turn ran on, not the one the open found", async () => {

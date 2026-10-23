@@ -13,6 +13,7 @@ import { splitAttachments } from "./attachments";
 import { draftKeyFor, moveDraft } from "./draftStore";
 import { awaitingInput as awaitingInputOf, retirePrompts } from "./queuedTurn";
 import { createTurnClock } from "./turnClock";
+import { sessionsChanged } from "../sessions/sessionsVersion";
 
 /** An image riding along with a turn. */
 export interface Attachment {
@@ -674,6 +675,8 @@ export interface Conversation {
    */
   editAndResend: (nthUserMessage: number, text: string) => void;
   /** Summarizes older turns to reclaim context. */
+  /** Gives the conversation a new name. False when it did not save. */
+  rename: (title: string) => Promise<boolean>;
   compact: () => Promise<unknown>;
   /** Branches this conversation; resolves with the new session's id. */
   fork: () => Promise<string | undefined>;
@@ -1281,6 +1284,25 @@ export function useConversation(target: string | undefined): Conversation {
     if (sessionId && !busy) refreshContext();
   }, [sessionId, busy, refreshContext]);
 
+  // Renaming is the one edit the title takes from the user; the sidebar lists
+  // the same titles from a query of its own, so the shared counter renews it.
+  const renameMutation = useMutation(
+    (borg, vars: { id: string; title: string }) => borg.admin.setSessionTitle(vars),
+    { onSuccess: () => sessionsChanged() },
+  );
+  const rename = useCallback(
+    async (next: string): Promise<boolean> => {
+      const id =
+        agentSessionId.current || (opened.state === "ready" ? opened.data.agentSessionId : "");
+      const title = next.trim();
+      if (!id || title === "") return false;
+      const ok = (await renameMutation.run({ id, title })) !== undefined;
+      if (ok) setTitle(title);
+      return ok;
+    },
+    [renameMutation.run, opened],
+  );
+
   // The title and model the last turn left behind outrank what the open fetched.
   const titled = useMemo(
     () =>
@@ -1316,6 +1338,7 @@ export function useConversation(target: string | undefined): Conversation {
     cancel,
     respond,
     editAndResend,
+    rename,
     compact: () => compactMutation.run(undefined),
     fork: () => forkMutation.run(undefined).then((r) => r?.forkedAgentSessionId),
     // Never hand back a meter belonging to a session that is no longer shown.
