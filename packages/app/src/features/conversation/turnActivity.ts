@@ -87,10 +87,10 @@ export const BUSY_VERBS = [
 /**
  * The verb for a turn, chosen from when it started.
  *
- * Derived rather than drawn from `Math.random` on render: the same turn always
- * gets the same verb, so a re-render or a remount mid-turn cannot swap it.
- * Millisecond start times differ between turns, so consecutive turns still
- * read differently.
+ * Derived rather than drawn from `Math.random` on render, so a re-render
+ * cannot swap it. A remount or reopen mid-turn re-arms the clock at that
+ * moment, so the verb can change there. Millisecond start times differ between
+ * turns, so consecutive turns usually read differently.
  */
 export function busyVerb(turnStartedAt: number | undefined): string {
   const seed = Math.abs(Math.floor(turnStartedAt ?? 0));

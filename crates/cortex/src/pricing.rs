@@ -23,6 +23,10 @@ fn normalize_model(model: &str) -> &str {
         "google/",
         "deepseek/",
         "x-ai/",
+        // The other spellings the xAI provider accepts for its own ids.
+        "xai/",
+        "x.ai/",
+        "grok/",
         "meta-llama/",
         "mistralai/",
     ];
@@ -277,7 +281,7 @@ pub struct BundledRateCardEntry {
 
 /// Bundled rate card seeded by the schema. One row per
 /// `(provider_id, model)` pair we have pricing for. Anthropic, OpenAI,
-/// Gemini, and DeepSeek native; OpenRouter intentionally excluded (its
+/// Gemini, xAI, and DeepSeek native; OpenRouter intentionally excluded (its
 /// per-route surcharge is not encoded here) — users add an OpenRouter
 /// rate card via `borg providers add` if they want it priced.
 pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
@@ -482,6 +486,26 @@ pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
             model: "gemini-2.5-flash",
             prompt_per_mtok_usd: "0.30",
             completion_per_mtok_usd: "2.50",
+        },
+        // xAI. The curated picks; without a row the budget never sees Grok
+        // spend.
+        BundledRateCardEntry {
+            provider_id: "xai",
+            model: "grok-4",
+            prompt_per_mtok_usd: "3.00",
+            completion_per_mtok_usd: "15.00",
+        },
+        BundledRateCardEntry {
+            provider_id: "xai",
+            model: "grok-4-fast-reasoning",
+            prompt_per_mtok_usd: "0.20",
+            completion_per_mtok_usd: "0.50",
+        },
+        BundledRateCardEntry {
+            provider_id: "xai",
+            model: "grok-4-fast-non-reasoning",
+            prompt_per_mtok_usd: "0.20",
+            completion_per_mtok_usd: "0.50",
         },
         // DeepSeek, at its peak-hour rates. The legacy names bill as Flash.
         BundledRateCardEntry {
@@ -720,6 +744,8 @@ mod tests {
         assert_eq!(normalize_model("openai/gpt-4o"), "gpt-4o");
         assert_eq!(normalize_model("google/gemini-2.5-pro"), "gemini-2.5-pro");
         assert_eq!(normalize_model("x-ai/grok-4.20"), "grok-4.20");
+        assert_eq!(normalize_model("xai/grok-4.20"), "grok-4.20");
+        assert_eq!(normalize_model("grok/grok-4"), "grok-4");
         assert_eq!(normalize_model("gpt-4o"), "gpt-4o");
     }
 

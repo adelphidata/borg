@@ -149,8 +149,8 @@ describe("createActivityHold", () => {
 
 describe("busyVerb", () => {
   it("keeps one verb for the whole of a turn", () => {
-    // Re-renders and remounts read the same start time, so the line cannot
-    // swap words halfway through a wait.
+    // Re-renders read the same start time, so the line cannot swap words
+    // halfway through a wait.
     expect(busyVerb(1_729_700_000_123)).toBe(busyVerb(1_729_700_000_123));
   });
 

@@ -14,14 +14,13 @@ struct ModelRate {
     ///
     /// Unlike Anthropic — whose `input_tokens` excludes cached tokens —
     /// OpenAI-compatible providers report `prompt_tokens` **inclusive** of
-    /// cached tokens. So a cached read is currently billed at the full input
-    /// rate here, over-stating cost by the provider's cache discount.
+    /// cached tokens, so `estimate_cost_usd` splits the cached slice out and
+    /// bills it here.
     ///
-    /// `None` preserves that behavior rather than guessing a rate: this is a
-    /// billing path, and a fabricated discount is worse than a known
-    /// over-estimate. Populate per model from the provider's published pricing
-    /// (see the `update-model-catalog` skill) and the discount applies
-    /// automatically — `estimate_cost_usd` already honors it, and
+    /// `None` bills cached reads at the full input rate rather than guessing a
+    /// discount: this is a billing path, and a fabricated discount is worse
+    /// than a known over-estimate. Populate it from the provider's published
+    /// pricing (see the `update-model-catalog` skill);
     /// `cached_read_rate_is_honored_when_present` pins the arithmetic.
     cached_input_per_mtok: Option<&'static str>,
 }
@@ -1091,6 +1090,60 @@ mod tests {
             CacheTtl::FiveMin
         )
         .is_none());
+    }
+
+    /// `crate::pricing` (the Usage page) carries the same rates by hand,
+    /// long-context tiers included. Pin the two together so a price edit in
+    /// one table cannot leave the other behind. Probed on both sides of every
+    /// long-context line.
+    #[test]
+    fn cost_event_rates_agree_with_the_usage_estimate_table() {
+        const PROMPTS: &[u64] = &[
+            1_000, 100_000, 100_001, 199_999, 200_000, 200_001, 272_000, 272_001, 1_000_000,
+        ];
+        let mut drift = Vec::new();
+        let mut check = |model: &str, prompt: u64, event: Option<String>| {
+            let event: f64 = event
+                .unwrap_or_else(|| panic!("{model} must price"))
+                .parse()
+                .unwrap();
+            match crate::pricing::estimate_cost(model, prompt, 1_000) {
+                // Each `Usd` component rounds to the micro-dollar.
+                Some(usage) if (usage - event).abs() <= 2e-6 => {}
+                usage => drift.push(format!(
+                    "{model} @ {prompt}: event {event}, usage {usage:?}"
+                )),
+            }
+        };
+        for (provider, table) in [
+            (Provider::OpenAi, &*OPENAI_RATES),
+            (Provider::Gemini, &*GEMINI_RATES),
+            (Provider::XAi, &*XAI_RATES),
+        ] {
+            for model in table.keys() {
+                for &prompt in PROMPTS {
+                    check(
+                        model,
+                        prompt,
+                        estimate_cost_usd(provider, model, prompt, 1_000, 0),
+                    );
+                }
+            }
+        }
+        for model in ANTHROPIC_RATES.keys() {
+            for &prompt in PROMPTS {
+                check(
+                    model,
+                    prompt,
+                    estimate_anthropic_cost_usd(model, prompt, 1_000, 0, 0, CacheTtl::Auto),
+                );
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "the two price tables disagree:\n  {}",
+            drift.join("\n  ")
+        );
     }
 
     #[test]

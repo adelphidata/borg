@@ -110,6 +110,16 @@ async fn make_test_openai_client() -> LlmClient {
     LlmClient::new(&config).await.unwrap()
 }
 
+async fn make_test_xai_client() -> LlmClient {
+    let env_var = "BORG_TEST_XAI_LLM";
+    std::env::set_var(env_var, "xai-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("xai".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "grok-4".to_string();
+    LlmClient::new(&config).await.unwrap()
+}
+
 async fn make_test_openrouter_client(cost_events: bool) -> LlmClient {
     let env_var = "BORG_TEST_OPENROUTER_LLM";
     std::env::set_var(env_var, "sk-test");
@@ -870,6 +880,37 @@ async fn openai_cost_event_uses_static_price_table() {
     assert_eq!(events[0].cost_usd.as_deref(), Some("0.006"));
     assert!(events[0].cost_usd_present);
     assert_eq!(events[0].cost_source, "table_openai");
+}
+
+/// xAI has its own rate table; a Grok call must price from it rather than
+/// fall through to `unknown`.
+#[tokio::test]
+async fn xai_cost_event_uses_static_price_table() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_xai_client()
+        .await
+        .with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "xai".to_string(),
+        model: "grok-4".to_string(),
+        provider_cost_usd: None,
+        response_id: None,
+        upstream: None,
+    };
+
+    client.emit_cost_event_best_effort("req-xai", Some(&usage), "grok-4");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    // 1,000 × $3/M + 500 × $15/M = 0.003 + 0.0075.
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0.0105"));
+    assert!(events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "table_xai");
 }
 
 #[tokio::test]
