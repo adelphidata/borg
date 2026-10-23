@@ -2,11 +2,9 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Pill, isSubmitEnter } from "@borg/ui";
 import { useOptionalSettings } from "../../lib/settings";
+import { settingPath } from "../settings/catalog";
 import { groupDigits, ungroupDigits } from "../settings/settingValue";
 import { classifyFailure, type SettingFix } from "./sendFailure";
-
-/** Where a setting's own editor lives. */
-const settingPath = (key: string) => `/settings/key/${encodeURIComponent(key)}`;
 
 /**
  * Changes the one setting a failure names, without leaving the conversation.
@@ -19,22 +17,36 @@ const settingPath = (key: string) => `/settings/key/${encodeURIComponent(key)}`;
 function InlineFix({
   fix,
   suggested,
+  label,
+  saved,
+  onSaved,
   onRetry,
 }: {
   fix: SettingFix;
   suggested: string;
+  /** The field's accessible name: the setting's name, not its dotted key. */
+  label: string;
+  /**
+   * The value this card wrote, once it has. Held by the card rather than here,
+   * so the snapshot refresh that follows a save cannot take the receipt away.
+   */
+  saved: string | undefined;
+  onSaved: (value: string) => void;
   onRetry?: () => void;
 }) {
   const settings = useOptionalSettings();
-  const [draft, setDraft] = useState(groupDigits(suggested));
-  const [saved, setSaved] = useState<string>();
+  const [draft, setDraft] = useState(() => groupDigits(suggested));
+  // The context's pending flag and error belong to whichever write ran last,
+  // anywhere in the app. This field only claims them for a write it started.
+  const [attempted, setAttempted] = useState(false);
   if (!settings) return null;
   const { save, saving, saveError } = settings;
 
   const commit = async () => {
     if (saving) return;
     const value = ungroupDigits(draft);
-    if (await save(fix.key, value)) setSaved(value);
+    setAttempted(true);
+    if (await save(fix.key, value)) onSaved(value);
   };
 
   if (saved !== undefined) {
@@ -56,7 +68,7 @@ function InlineFix({
     <div className="mt-3 flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
         <input
-          aria-label={fix.key}
+          aria-label={label}
           inputMode="numeric"
           spellCheck={false}
           className="w-[150px] rounded-lg border border-field bg-surface2 px-3 py-2 text-[12.5px] leading-none text-ink tabular-nums outline-none focus:border-focus"
@@ -65,10 +77,10 @@ function InlineFix({
           onKeyDown={(e) => isSubmitEnter(e) && void commit()}
         />
         <Pill variant="primary" square onClick={() => void commit()}>
-          {saving ? "Saving…" : (fix.action ?? "Save")}
+          {saving && attempted ? "Saving…" : (fix.action ?? "Save")}
         </Pill>
       </div>
-      {saveError && <div className="text-alert">{saveError.message}</div>}
+      {attempted && saveError && <div className="text-alert">{saveError.message}</div>}
     </div>
   );
 }
@@ -109,18 +121,30 @@ export function FailureCard({
   // plain boolean would leave the next, different failure already reading
   // "Copied" — a receipt for something the user has not done.
   const [copyResult, setCopyResult] = useState<{ of: string; state: true | "failed" }>();
+  // Keyed the same way, and held here rather than in the field: once the save
+  // lands, the setting no longer holds the value this card failed under, and
+  // the receipt (with the retry it hands back) must outlive the offer.
+  const [fixed, setFixed] = useState<{ of: string; value: string }>();
   const failure = classifyFailure(error);
   if (!failure || !error) return null;
   const copied = copyResult?.of === error.message ? copyResult.state : false;
+  const saved = fixed?.of === error.message ? fixed.value : undefined;
   const fix = failure.fix;
   // A key only earns a deep link when this daemon has it; a stale name in an
   // old error would open "That setting doesn't exist".
-  const known =
-    fix !== undefined &&
-    settings?.settings.state === "ready" &&
-    settings.settings.data.has(fix.key);
-  const inlineFix = known && fix.suggested !== undefined ? fix : undefined;
-  const deepLink = known ? settingPath(fix.key) : undefined;
+  const entry =
+    fix !== undefined && settings?.settings.state === "ready"
+      ? settings.settings.data.get(fix.key)
+      : undefined;
+  // A settled card's numbers trail the setting once it has moved on, and
+  // writing them then would undo a later raise. Only a card whose setting still
+  // holds the value it failed under, or that made the write itself, offers it.
+  const current = fix?.was === undefined || entry?.value.trim() === fix.was;
+  const suggested =
+    fix !== undefined && entry !== undefined && (current || saved !== undefined)
+      ? fix.suggested
+      : undefined;
+  const deepLink = entry !== undefined ? settingPath(entry.key) : undefined;
 
   const copy = () => {
     const clipboard = navigator.clipboard;
@@ -148,8 +172,17 @@ export function FailureCard({
         <div className="pb-1 text-[12.5px] leading-[1.4] font-medium text-ink">{failure.title}</div>
       )}
       {failure.message}
-      {inlineFix && (
-        <InlineFix fix={inlineFix} suggested={inlineFix.suggested!} onRetry={onRetry} />
+      {fix && entry && suggested !== undefined && (
+        <InlineFix
+          // A new failure in the live slot starts from its own suggestion.
+          key={error.message}
+          fix={fix}
+          suggested={suggested}
+          label={entry.label || entry.key}
+          saved={saved}
+          onSaved={(value) => setFixed({ of: error.message, value })}
+          onRetry={onRetry}
+        />
       )}
       <div className="mt-3 flex flex-wrap gap-2">
         {/* Retry leads only where a repeat could work; elsewhere the fix does. */}
@@ -158,7 +191,7 @@ export function FailureCard({
             Try again
           </Pill>
         )}
-        {failure.settings && !inlineFix && (
+        {failure.settings && suggested === undefined && (
           <Pill square onClick={() => navigate(deepLink ?? "/settings")}>
             {deepLink ? "Open this setting" : "Open settings"}
           </Pill>

@@ -9,7 +9,7 @@
 
 import { THEME_PREFERENCES, type ThemePreference } from "@borg/ui";
 import type { DaemonSetting } from "../../lib/settings";
-import { APPEARANCE_LABELS } from "../settings/catalog";
+import { APPEARANCE_LABELS, settingPath } from "../settings/catalog";
 import type { Command } from "./score";
 import { byRecency } from "./skillRecency";
 
@@ -98,7 +98,7 @@ function settingCommand(setting: DaemonSetting, ctx: CommandContext): Command {
     label: setting.label,
     hint: setting.group,
     keywords: setting.key.replace(/[._]/g, " "),
-    run: () => ctx.navigate(`/settings/key/${encodeURIComponent(setting.key)}`),
+    run: () => ctx.navigate(settingPath(setting.key)),
   };
 }
 
@@ -171,7 +171,7 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
           hint: "Advanced",
           keywords: setting.key.replace(/[._]/g, " "),
           tier: ADVANCED_TIER,
-          run: () => ctx.navigate(`/settings/key/${encodeURIComponent(setting.key)}`),
+          run: () => ctx.navigate(settingPath(setting.key)),
         }))
     : [];
 

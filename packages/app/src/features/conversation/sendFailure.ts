@@ -25,6 +25,8 @@
  * tell the user their model was unavailable.
  */
 
+import { groupDigits } from "../settings/settingValue";
+
 /** Which part of the stack failed, in the words the card puts on screen. */
 export type FailureLayer =
   | "disk"
@@ -49,6 +51,12 @@ export interface SettingFix {
   key: string;
   /** A value the card can offer to write as-is. Absent = link to the setting only. */
   suggested?: string;
+  /**
+   * The setting's value when the error was raised, when the error says. A card
+   * whose setting has moved on since stops offering `suggested`: a settled
+   * card's numbers trail the setting, and writing them would undo a later raise.
+   */
+  was?: string;
   /** The button that writes `suggested`, by outcome ("Raise limit"). */
   action?: string;
   /** What the card says once the new value is saved. */
@@ -112,11 +120,6 @@ export function nextLimit(used: number, limit: number): string {
   let next = Math.max(limit, 1) * 2;
   while (next <= used) next *= 2;
   return String(next);
-}
-
-/** `1000000` → `1,000,000`, for numbers quoted back to the user. */
-function groupDigits(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 /**
@@ -219,6 +222,7 @@ const RULES: readonly Rule[] = [
       return {
         key: MONTHLY_TOKEN_LIMIT,
         suggested: usage ? nextLimit(Number(usage.used), Number(usage.limit)) : undefined,
+        was: usage?.limit,
         action: "Raise limit",
         done: (value) =>
           value === "0" ? "Limit removed." : `Limit raised to ${groupDigits(value)}.`,

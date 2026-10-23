@@ -38,20 +38,36 @@ const SYSTEM_MARKERS: readonly (readonly [string, string])[] = [
 /**
  * A snake_case tag on its own line, its body, and the matching close on its
  * own line. Anchored to whole lines so an inline `<b>` someone typed, or a tag
- * quoted mid-sentence, stays text.
+ * quoted mid-sentence, stays text. The open tag may carry attributes: the
+ * heartbeat's pre-run output arrives as
+ * `<preprocessed_context source="pre_run" exit_code="0">`, ahead of the marker.
  */
-const BLOCK = /^<([a-z][a-z0-9_]*)>[ \t]*\n([\s\S]*?)\n?<\/\1>[ \t]*$/gm;
+const BLOCK = /^<([a-z][a-z0-9_]*)(?:[ \t][^>\n]*)?>[ \t]*\n([\s\S]*?)\n?<\/\1>[ \t]*$/gm;
 
 function labelOf(tag: string): string {
   const words = tag.replaceAll("_", " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/**
+ * Whether a block in a turn folds away. In a turn Borg wrote, every block is a
+ * brief. In one the user typed, only Borg's own multi-word snake_case briefs
+ * are (`preprocessed_context`): a `<template>` or `<div>` they pasted is part
+ * of what they said, and hiding it behind a fold would lose their message.
+ */
+function folds(tag: string, system: boolean): boolean {
+  return system || tag.includes("_");
+}
+
 /** Splits a user turn into its message, its kind, and its attached blocks. */
 export function parseUserTurn(raw: string): UserTurn {
+  // Briefs can lead the marker (the heartbeat's pre-run output does), so the
+  // marker is looked for with every block set aside.
+  const marker = SYSTEM_MARKERS.find(([m]) => raw.replace(BLOCK, "").trim().startsWith(m));
   const blocks: AttachedBlock[] = [];
   const rest = raw
-    .replace(BLOCK, (_match, tag: string, body: string) => {
+    .replace(BLOCK, (match: string, tag: string, body: string) => {
+      if (!folds(tag, marker !== undefined)) return match;
       blocks.push({
         tag,
         label: labelOf(tag),
@@ -61,7 +77,6 @@ export function parseUserTurn(raw: string): UserTurn {
       return "";
     })
     .trim();
-  const marker = SYSTEM_MARKERS.find(([m]) => rest.startsWith(m));
   if (!marker) return { text: rest, blocks };
   return { system: marker[1], text: rest.slice(marker[0].length).trim(), blocks };
 }
