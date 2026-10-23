@@ -1,11 +1,22 @@
-import { ChatIcon, GearIcon, PlugIcon, ScheduleIcon, ShieldIcon, UsageIcon } from "@borg/ui";
+import {
+  ChatIcon,
+  GearIcon,
+  PlugIcon,
+  ScheduleIcon,
+  ServerIcon,
+  ShieldIcon,
+  SparklesIcon,
+  UsageIcon,
+} from "@borg/ui";
 import type { AppRoute } from "@borg/ui";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionsPage } from "./features/connections/ConnectionsPage";
 import { HealthPage } from "./features/health/HealthPage";
+import { McpServersPage } from "./features/mcp/McpServersPage";
 import { SchedulesPage } from "./features/schedules/SchedulesPage";
 import { SessionsPage } from "./features/sessions/SessionsPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
+import { SkillsPage } from "./features/skills/SkillsPage";
 import { UsagePage } from "./features/usage/UsagePage";
 
 // `AppRoute` is defined in `@borg/ui` because Sidebar and TabBar render it.
@@ -58,6 +69,28 @@ export const routes: AppRoute[] = [
     section: "primary",
     // Five tabs is the ceiling on a phone. Both of these stay off the tab bar
     // and are reached from More, or from the palette on a keyboard.
+    nav: { tabBar: false },
+  },
+  {
+    id: "mcp",
+    path: "/mcp",
+    label: "MCP Servers",
+    tabLabel: "MCP",
+    icon: ServerIcon,
+    page: McpServersPage,
+    // Below the divider with the other things a fresh install never needs
+    // on day one; the conversation, its connections and schedules stay first.
+    section: "secondary",
+    nav: { tabBar: false },
+  },
+  {
+    id: "skills",
+    path: "/skills",
+    label: "Skills",
+    tabLabel: "Skills",
+    icon: SparklesIcon,
+    page: SkillsPage,
+    section: "secondary",
     nav: { tabBar: false },
   },
   {

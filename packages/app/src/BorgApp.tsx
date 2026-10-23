@@ -23,6 +23,8 @@ import {
   subscribeDrafts,
 } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
+import { McpServerDetailPage } from "./features/mcp/McpServerDetailPage";
+import { SkillDetailPage } from "./features/skills/SkillDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
 import { BootGate } from "./features/boot/BootGate";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
@@ -300,6 +302,8 @@ function Shell({ platform }: { platform: Platform }) {
                 already has. */}
             <Route path="/c/:sessionId" element={<ConversationPage key={location.key} />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
+            <Route path="/mcp/:name" element={<McpServerDetailPage />} />
+            <Route path="/skills/:name" element={<SkillDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
             <Route path="/settings/:id" element={<SettingDetailPage />} />

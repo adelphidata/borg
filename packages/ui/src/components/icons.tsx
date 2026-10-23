@@ -18,9 +18,11 @@ import {
   Plug,
   Plus,
   Search,
+  Server,
   Settings,
   ShieldCheck,
   Shuffle,
+  Sparkles,
   Square,
   Sun,
   Trash2,
@@ -82,6 +84,8 @@ export const AgentsIcon = lucide(ListTree, 16);
 export const SunIcon = lucide(Sun, 15);
 export const MoonIcon = lucide(Moon, 15);
 export const ShuffleIcon = lucide(Shuffle, 15);
+export const ServerIcon = lucide(Server, 16);
+export const SparklesIcon = lucide(Sparkles, 16);
 export const SpeakerIcon = lucide(Volume2, 15);
 export const StopIcon = lucide(Square, 13, 2);
 
