@@ -149,6 +149,25 @@ async fn synthesize_with(
     }
 }
 
+/// A copy of the recording and its transcript, when Settings asks for one.
+/// A failure to write is logged, never surfaced: the transcript already
+/// reached the user.
+fn keep_recording(config: &Config, audio: &[u8], file_name: &str, text: &str) {
+    let kept = super::recordings::recordings_dir(config).and_then(|dir| {
+        super::recordings::keep(
+            &dir,
+            chrono::Utc::now(),
+            audio,
+            file_name,
+            text,
+            config.audio.keep_recordings_days,
+        )
+    });
+    if let Err(e) = kept {
+        tracing::warn!("could not keep the dictation recording: {e:#}");
+    }
+}
+
 /// `Transcribe` against an already-loaded config.
 async fn transcribe_with(
     config: &Config,
@@ -169,9 +188,13 @@ async fn transcribe_with(
         .transcribe(&req.audio, mime, file_name_for(mime), language)
         .await
     {
-        Ok((text, _)) => Ok(TranscribeResponse {
-            text: text.trim().to_string(),
-        }),
+        Ok((text, _)) => {
+            let text = text.trim().to_string();
+            if config.audio.keep_recordings {
+                keep_recording(config, &req.audio, file_name_for(mime), &text);
+            }
+            Ok(TranscribeResponse { text })
+        }
         Err(e) => {
             tracing::warn!("voice transcription failed: {e:#}");
             Err(TStatus::unavailable(format!(
@@ -378,5 +401,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "hi there");
+    }
+
+    #[tokio::test]
+    async fn transcribe_keeps_the_recording_when_asked() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "kept"})),
+            )
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        let rows = [
+            ("audio.enabled".to_string(), "true".to_string()),
+            (
+                "audio.models".to_string(),
+                serde_json::json!([{"provider": "openai", "base_url": server.uri(),
+                                     "api_key_env": "BORGD_VOICE_TEST_UNSET"}])
+                .to_string(),
+            ),
+            (
+                "credentials.openai".to_string(),
+                r#"{"type":"literal","value":"sk"}"#.to_string(),
+            ),
+            ("audio.keep_recordings".to_string(), "true".to_string()),
+            (
+                "audio.recordings_dir".to_string(),
+                folder.to_string_lossy().into_owned(),
+            ),
+        ];
+        let out = transcribe_with(&Config::from_setting_rows(rows), recording())
+            .await
+            .unwrap();
+        assert_eq!(out.text, "kept");
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names[0].ends_with(".txt") && names[1].ends_with(".webm"),
+            "{names:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join(&names[0])).unwrap(),
+            "kept"
+        );
     }
 }

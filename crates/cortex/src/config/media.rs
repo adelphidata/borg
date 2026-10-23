@@ -400,6 +400,15 @@ pub struct AudioConfig {
     /// letters or digits next to it, as mixed-script writing prefers.
     #[serde(default)]
     pub cjk_spacing: bool,
+    /// Keep a copy of each dictated recording, with its transcript beside it.
+    #[serde(default)]
+    pub keep_recordings: bool,
+    /// How many days a kept recording stays before it is removed; 0 keeps forever.
+    #[serde(default = "default_keep_recordings_days")]
+    pub keep_recordings_days: u32,
+    /// Where kept recordings go. Unset means `recordings/` under Borg's data dir.
+    #[serde(default)]
+    pub recordings_dir: Option<String>,
     /// Default timeout in milliseconds.
     pub timeout_ms: u64,
     /// Echo transcript back to the sender.
@@ -412,6 +421,10 @@ fn default_beam_size() -> u32 {
 
 fn default_no_speech_threshold() -> f64 {
     0.6
+}
+
+fn default_keep_recordings_days() -> u32 {
+    30
 }
 
 impl Default for AudioConfig {
@@ -428,6 +441,9 @@ impl Default for AudioConfig {
             no_speech_threshold: default_no_speech_threshold(),
             timestamps: false,
             cjk_spacing: false,
+            keep_recordings: false,
+            keep_recordings_days: default_keep_recordings_days(),
+            recordings_dir: None,
             timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }

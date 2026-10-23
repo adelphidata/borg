@@ -650,6 +650,32 @@ function DictationSection({
                 onChange={(on) => void save("voice.copy_transcript", String(on))}
               />
               <Switch
+                label="Keep recordings"
+                desc="Saves a copy of each recording with its transcript, in a folder on this computer."
+                on={value("audio.keep_recordings") === "true"}
+                onChange={(on) => void save("audio.keep_recordings", String(on))}
+              />
+              {value("audio.keep_recordings") === "true" && (
+                <>
+                  <TextSetting
+                    label="Keep for (days)"
+                    hint="Older recordings are removed. 0 keeps them forever."
+                    value={value("audio.keep_recordings_days")}
+                    placeholder="30"
+                    onCommit={(v) =>
+                      save("audio.keep_recordings_days", v.trim() === "" ? "30" : v.trim())
+                    }
+                  />
+                  <TextSetting
+                    label="Folder"
+                    hint="Leave empty for the recordings folder under Borg's data directory."
+                    value={value("audio.recordings_dir")}
+                    placeholder="~/.borg/recordings"
+                    onCommit={(v) => save("audio.recordings_dir", v.trim())}
+                  />
+                </>
+              )}
+              <Switch
                 label="Space between Asian and Latin text"
                 desc="Puts one space between Chinese, Japanese or Korean words and the Latin letters or numbers beside them."
                 on={value("audio.cjk_spacing") === "true"}

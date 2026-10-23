@@ -146,8 +146,29 @@ describe("VoiceSettingsPage", () => {
     expect(screen.queryByRole("switch", { name: /Timestamps/ })).toBeNull();
     fireEvent.click(screen.getByRole("switch", { name: /Space between Asian and Latin text/ }));
     await waitFor(() => expect(saved(daemon, "audio.cjk_spacing")).toEqual(["true"]));
+    // Keeping recordings shows its window and folder only once it is on.
+    expect(screen.queryByLabelText("Keep for (days)")).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: /Keep recordings/ }));
+    await waitFor(() => expect(saved(daemon, "audio.keep_recordings")).toEqual(["true"]));
     fireEvent.click(screen.getByRole("switch", { name: /Send right away/ }));
     await waitFor(() => expect(saved(daemon, "voice.dictation_auto_send")).toEqual(["true"]));
+  });
+
+  it("kept recordings expose their window and folder", async () => {
+    const { daemon } = mount([
+      entry("audio.enabled", "true"),
+      entry("audio.keep_recordings", "true"),
+      entry("audio.keep_recordings_days", "30"),
+    ]);
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }));
+    const days = await screen.findByLabelText("Keep for (days)");
+    fireEvent.change(days, { target: { value: "7" } });
+    fireEvent.blur(days);
+    await waitFor(() => expect(saved(daemon, "audio.keep_recordings_days")).toEqual(["7"]));
+    const folder = screen.getByLabelText("Folder");
+    fireEvent.change(folder, { target: { value: " /Volumes/notes " } });
+    fireEvent.blur(folder);
+    await waitFor(() => expect(saved(daemon, "audio.recordings_dir")).toEqual(["/Volumes/notes"]));
   });
 
   it("shows the on-device decoder's knobs only for the local provider", async () => {

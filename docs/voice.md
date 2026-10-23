@@ -54,22 +54,25 @@ one press (when a saved key can transcribe) or points to Settings. Once ready:
 
 ### Settings
 
-| Setting                     | Default           | Where                                               | What it does                                                                         |
-| --------------------------- | ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `voice.dictation_shortcut`  | `mod+shift+space` | Shortcut                                            | A key combination, a lone modifier (`altright`), or a mouse side button (`mouse4`)   |
-| `voice.hold_to_record`      | `true`            | Hold to talk                                        | Hold to record and release to finish; a quick tap keeps recording until the next tap |
-| `voice.dictation_auto_send` | `false`           | Send right away                                     | Send the words as soon as they are recognised                                        |
-| `audio.language`            | unset             | Language                                            | Hint for the transcriber                                                             |
-| `audio.prompt`              | unset             | More options → Words Borg should know               | Names and jargon, sent as the Whisper prompt                                         |
-| `audio.temperature`         | `0`               | More options → Temperature                          | Decoding temperature for Whisper-shaped providers and the on-device decoder          |
-| `audio.beam_size`           | `5`               | More options → Beam size (local only)               | Beam width for whisper.cpp                                                           |
-| `audio.no_speech_threshold` | `0.6`             | More options → Silence threshold (local only)       | How sure whisper.cpp must be before dropping a stretch as silence                    |
-| `audio.timestamps`          | `false`           | More options → Timestamps (local only)              | One line per segment, led by its `[m:ss.cc → m:ss.cc]` span                          |
-| `audio.cjk_spacing`         | `false`           | More options → Space between Asian and Latin text   | One space between CJK text and the Latin letters or digits beside it                 |
-| `voice.beep_enabled`        | `true`            | More options → Sounds                               | A tick when recording starts and stops                                               |
-| `voice.copy_transcript`     | `false`           | More options → Copy to clipboard                    | Keep each transcript on the clipboard                                                |
-| `voice.background_shortcut` | `false`           | More options → Listen from the background (desktop) | The chord also works from another app: Borg comes forward and starts listening       |
-| `voice.auto_tts`            | `false`           | Read replies aloud                                  | Speak each reply as it finishes                                                      |
+| Setting                      | Default           | Where                                               | What it does                                                                         |
+| ---------------------------- | ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `voice.dictation_shortcut`   | `mod+shift+space` | Shortcut                                            | A key combination, a lone modifier (`altright`), or a mouse side button (`mouse4`)   |
+| `voice.hold_to_record`       | `true`            | Hold to talk                                        | Hold to record and release to finish; a quick tap keeps recording until the next tap |
+| `voice.dictation_auto_send`  | `false`           | Send right away                                     | Send the words as soon as they are recognised                                        |
+| `audio.language`             | unset             | Language                                            | Hint for the transcriber                                                             |
+| `audio.prompt`               | unset             | More options → Words Borg should know               | Names and jargon, sent as the Whisper prompt                                         |
+| `audio.temperature`          | `0`               | More options → Temperature                          | Decoding temperature for Whisper-shaped providers and the on-device decoder          |
+| `audio.beam_size`            | `5`               | More options → Beam size (local only)               | Beam width for whisper.cpp                                                           |
+| `audio.no_speech_threshold`  | `0.6`             | More options → Silence threshold (local only)       | How sure whisper.cpp must be before dropping a stretch as silence                    |
+| `audio.timestamps`           | `false`           | More options → Timestamps (local only)              | One line per segment, led by its `[m:ss.cc → m:ss.cc]` span                          |
+| `audio.cjk_spacing`          | `false`           | More options → Space between Asian and Latin text   | One space between CJK text and the Latin letters or digits beside it                 |
+| `audio.keep_recordings`      | `false`           | More options → Keep recordings                      | A copy of each recording and its transcript, in a folder on this computer            |
+| `audio.keep_recordings_days` | `30`              | More options → Keep for (days)                      | Older kept recordings are removed; 0 keeps them forever                              |
+| `audio.recordings_dir`       | unset             | More options → Folder                               | Where kept recordings go; unset means `recordings/` under Borg's data directory      |
+| `voice.beep_enabled`         | `true`            | More options → Sounds                               | A tick when recording starts and stops                                               |
+| `voice.copy_transcript`      | `false`           | More options → Copy to clipboard                    | Keep each transcript on the clipboard                                                |
+| `voice.background_shortcut`  | `false`           | More options → Listen from the background (desktop) | The chord also works from another app: Borg comes forward and starts listening       |
+| `voice.auto_tts`             | `false`           | Read replies aloud                                  | Speak each reply as it finishes                                                      |
 
 The microphone and the device voice are kept in the browser's local storage,
 not in the daemon, because they name hardware on this machine.
@@ -78,31 +81,32 @@ not in the daemon, because they name hardware on this machine.
 
 The dictation feature set was checked against OpenSuperWhisper's preferences
 (`OpenSuperWhisper/Utils/AppPreferences.swift`), which has 24 user-facing
-fields. Twenty have an equivalent here:
+fields. Twenty-two have an equivalent here:
 
-| OpenSuperWhisper                                       | Borg                                                                              |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| selectedEngine, selectedModelPath                      | `audio.models` provider and model                                                 |
-| whisperLanguage                                        | `audio.language`                                                                  |
-| initialPrompt                                          | `audio.prompt`                                                                    |
-| temperature                                            | `audio.temperature`                                                               |
-| beamSize, useBeamSearch                                | `audio.beam_size`                                                                 |
-| noSpeechThreshold                                      | `audio.no_speech_threshold`                                                       |
-| showTimestamps                                         | `audio.timestamps`                                                                |
-| useAsianAutocorrect                                    | `audio.cjk_spacing` (the spacing rule; the reference also normalises punctuation) |
-| suppressBlankAudio                                     | an empty transcript is dropped with a notice                                      |
-| addSpaceAfterSentence                                  | spoken words join the draft with one space                                        |
-| autoCopyToClipboard                                    | `voice.copy_transcript`                                                           |
-| autoPasteTranscription                                 | words land in the box, or `voice.dictation_auto_send`                             |
-| key combination, modifierOnlyHotkey, mouseButtonHotkey | `voice.dictation_shortcut`                                                        |
-| holdToRecord with one-tap toggle                       | `voice.hold_to_record`                                                            |
-| playSoundOnRecordStart                                 | `voice.beep_enabled`                                                              |
-| escCancelWithoutConfirmation                           | Escape cancels a recording                                                        |
-| selectedMicrophone                                     | Microphone                                                                        |
+| OpenSuperWhisper                                       | Borg                                                                                                  |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| selectedEngine, selectedModelPath                      | `audio.models` provider and model                                                                     |
+| whisperLanguage                                        | `audio.language`                                                                                      |
+| initialPrompt                                          | `audio.prompt`                                                                                        |
+| temperature                                            | `audio.temperature`                                                                                   |
+| beamSize, useBeamSearch                                | `audio.beam_size`                                                                                     |
+| noSpeechThreshold                                      | `audio.no_speech_threshold`                                                                           |
+| showTimestamps                                         | `audio.timestamps`                                                                                    |
+| useAsianAutocorrect                                    | `audio.cjk_spacing` (the spacing rule; the reference also normalises punctuation)                     |
+| autoDeleteRecordings                                   | `audio.keep_recordings` + `audio.keep_recordings_days` (off by default, so nothing is kept to delete) |
+| history directory                                      | `audio.recordings_dir`                                                                                |
+| suppressBlankAudio                                     | an empty transcript is dropped with a notice                                                          |
+| addSpaceAfterSentence                                  | spoken words join the draft with one space                                                            |
+| autoCopyToClipboard                                    | `voice.copy_transcript`                                                                               |
+| autoPasteTranscription                                 | words land in the box, or `voice.dictation_auto_send`                                                 |
+| key combination, modifierOnlyHotkey, mouseButtonHotkey | `voice.dictation_shortcut`                                                                            |
+| holdToRecord with one-tap toggle                       | `voice.hold_to_record`                                                                                |
+| playSoundOnRecordStart                                 | `voice.beep_enabled`                                                                                  |
+| escCancelWithoutConfirmation                           | Escape cancels a recording                                                                            |
+| selectedMicrophone                                     | Microphone                                                                                            |
 
-Not carried over: debugMode, and the three that belong to a menu-bar app that
-stores recordings on disk (startHiddenInMenuBar, autoDeleteRecordings, the
-history directory). Borg keeps no recordings.
+Not carried over: debugMode (a log toggle) and startHiddenInMenuBar (the
+reference is a menu-bar app; Borg's desktop app opens a window).
 
 ## Keys
 

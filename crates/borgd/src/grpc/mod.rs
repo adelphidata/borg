@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod capability;
+pub mod recordings;
 pub mod session;
 pub mod status;
 pub mod telemetry;

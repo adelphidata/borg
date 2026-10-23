@@ -325,6 +325,9 @@ define_settings! {
         "audio.no_speech_threshold" => audio.no_speech_threshold, range(f64, 0.0_f64, 1.0);
         "audio.timestamps" => audio.timestamps, parsed(bool);
         "audio.cjk_spacing" => audio.cjk_spacing, parsed(bool);
+        "audio.keep_recordings" => audio.keep_recordings, parsed(bool);
+        "audio.keep_recordings_days" => audio.keep_recordings_days, parsed(u32);
+        "audio.recordings_dir" => audio.recordings_dir, opt_string;
         "audio.timeout_ms" => audio.timeout_ms, parsed(u64);
         "audio.echo_transcript" => audio.echo_transcript, parsed(bool);
 
