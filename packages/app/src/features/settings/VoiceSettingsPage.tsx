@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { chordOf, isMacPlatform } from "../../lib/keybinds";
+import { QUICK_ENTRY_CHORD } from "../../lib/chords";
 import { usePlatform } from "../../lib/platform";
 import { hasDeviceVoice, useSpeaker, useSpeechSource } from "../../lib/speech";
 import {
@@ -292,7 +293,16 @@ function SelectSetting({
  * The dictation key. Shown as words; "Change" listens for the next press —
  * a chord with a modifier, or a single modifier held on its own.
  */
-function ShortcutField({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+function ShortcutField({
+  value,
+  warning,
+  onCommit,
+}: {
+  value: string;
+  /** Shown when the key is set but cannot reach dictation. */
+  warning?: string;
+  onCommit: (v: string) => void;
+}) {
   const isMac = isMacPlatform();
   const [listening, setListening] = useState(false);
   /** A modifier pressed alone, pending its release. */
@@ -340,9 +350,11 @@ function ShortcutField({ value, onCommit }: { value: string; onCommit: (v: strin
     <Field
       label="Shortcut"
       hint={
-        listening
-          ? "Press a key combination, a modifier key alone, or a mouse side button. Esc cancels."
-          : undefined
+        listening ? (
+          "Press a key combination, a modifier key alone, or a mouse side button. Esc cancels."
+        ) : warning ? (
+          <span className="text-alert">{warning}</span>
+        ) : undefined
       }
     >
       {(id) => (
@@ -563,6 +575,11 @@ function DictationSection({
             />
             <ShortcutField
               value={prefs.shortcut}
+              warning={
+                kind === "desktop" && prefs.shortcut === QUICK_ENTRY_CHORD
+                  ? "Quick entry already uses this key."
+                  : undefined
+              }
               onCommit={(v) => void save("voice.dictation_shortcut", v)}
             />
             <Switch

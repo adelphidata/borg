@@ -15,6 +15,13 @@
  */
 export const QUICK_ENTRY_HASH = "#/quick";
 
+/**
+ * The desktop app's system-wide key for the quick-entry panel. It lives here
+ * so the settings page can warn when the dictation key is set to the same
+ * chord: the panel holds it system-wide, so dictation would never see it.
+ */
+export const QUICK_ENTRY_CHORD = "mod+shift+space";
+
 export const CHORDS: Readonly<Record<string, string>> = {
   "command-palette": "mod+k",
   "new-conversation": "mod+n",

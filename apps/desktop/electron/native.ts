@@ -84,31 +84,58 @@ export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dis
   });
 
   // One system-wide dictation key at a time. The renderer owns the choice and
-  // sends the whole accelerator, so this stays a plain register/unregister.
-  // A key another app holds simply fails to register; the in-window shortcut
-  // still works, so that is a warning and not a failure.
+  // sends the whole accelerator. A key another app holds simply fails to
+  // register; the in-window shortcut still works, so that is a warning and
+  // not a failure.
+  //
+  // The key is let go while the main window has focus. A system-wide key is
+  // taken before the page sees it, so the page's own listener would get no
+  // keydown and no keyup, and hold-to-talk would turn into a toggle in the
+  // one window where the user is most likely to hold it. Focus leaving the
+  // window claims it back.
   let dictationHotkey = "";
-  const dropDictationHotkey = () => {
-    if (dictationHotkey !== "") globalShortcut.unregister(dictationHotkey);
-    dictationHotkey = "";
-  };
-  ipcMain.handle(CHANNELS.dictationHotkey, (_event, accelerator: string) => {
-    if (accelerator === dictationHotkey) return;
-    dropDictationHotkey();
-    if (accelerator === "") return;
-    const taken = globalShortcut.register(accelerator, () => {
+  let held = false;
+  let warnedFor = "";
+  const claim = () => {
+    if (held || dictationHotkey === "") return;
+    held = globalShortcut.register(dictationHotkey, () => {
       const win = mainWindow();
       if (!win || win.isDestroyed()) return;
       raise(win);
       win.webContents.send(CHANNELS.menuCommand, "dictate");
     });
-    if (taken) dictationHotkey = accelerator;
-    else console.warn(`[borg] dictation hotkey ${accelerator} is already taken`);
+    if (!held && warnedFor !== dictationHotkey) {
+      warnedFor = dictationHotkey;
+      console.warn(`[borg] dictation hotkey ${dictationHotkey} is already taken`);
+    }
+  };
+  const letGo = () => {
+    if (held) globalShortcut.unregister(dictationHotkey);
+    held = false;
+  };
+  const isMain = (win: BrowserWindow) => win === mainWindow();
+  const onFocus = (_event: unknown, win: BrowserWindow) => {
+    if (isMain(win)) letGo();
+  };
+  const onBlur = (_event: unknown, win: BrowserWindow) => {
+    if (isMain(win)) claim();
+  };
+  app.on("browser-window-focus", onFocus);
+  app.on("browser-window-blur", onBlur);
+  ipcMain.handle(CHANNELS.dictationHotkey, (_event, accelerator: string) => {
+    if (accelerator === dictationHotkey) return;
+    letGo();
+    dictationHotkey = accelerator;
+    const win = mainWindow();
+    // Set from the settings page, the window has focus: wait for it to leave.
+    if (!win || BrowserWindow.getFocusedWindow() !== win) claim();
   });
 
   return {
     dispose() {
-      dropDictationHotkey();
+      letGo();
+      app.removeListener("browser-window-focus", onFocus);
+      app.removeListener("browser-window-blur", onBlur);
       ipcMain.removeHandler(CHANNELS.dictationHotkey);
       for (const notification of live.values()) notification.close();
       live.clear();

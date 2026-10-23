@@ -56,7 +56,7 @@ one press (when a saved key can transcribe) or points to Settings. Once ready:
 
 | Setting                      | Default           | Where                                               | What it does                                                                         |
 | ---------------------------- | ----------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `voice.dictation_shortcut`   | `mod+shift+space` | Shortcut                                            | A key combination, a lone modifier (`altright`), or a mouse side button (`mouse4`)   |
+| `voice.dictation_shortcut`   | `mod+shift+d`     | Shortcut                                            | A key combination, a lone modifier (`altright`), or a mouse side button (`mouse4`)   |
 | `voice.hold_to_record`       | `true`            | Hold to talk                                        | Hold to record and release to finish; a quick tap keeps recording until the next tap |
 | `voice.dictation_auto_send`  | `false`           | Send right away                                     | Send the words as soon as they are recognised                                        |
 | `audio.language`             | unset             | Language                                            | Hint for the transcriber                                                             |
@@ -76,6 +76,12 @@ one press (when a saved key can transcribe) or points to Settings. Once ready:
 
 The microphone and the device voice are kept in the browser's local storage,
 not in the daemon, because they name hardware on this machine.
+
+On desktop, `mod+shift+space` belongs to the quick-entry panel, which holds it
+system-wide; the Shortcut field warns when dictation is set to it. A database
+that still stores that first default is moved to `mod+shift+d` once, on
+upgrade. With the background listener on, the desktop app lets go of the key
+while its own window has focus, so holding it there still means hold-to-talk.
 
 Kept recordings are pruned by name: only files stamped
 `YYYY-MM-DD_HH-MM-SS.mmm` are ever removed, so `audio.recordings_dir` can

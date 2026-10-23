@@ -100,8 +100,8 @@ const chord = (type: "keydown" | "keyup", extra: KeyboardEventInit = {}) =>
   fireEvent(
     window,
     new KeyboardEvent(type, {
-      key: " ",
-      code: "Space",
+      key: "D",
+      code: "KeyD",
       ctrlKey: true,
       shiftKey: true,
       bubbles: true,
@@ -205,7 +205,7 @@ describe("VoiceInputButton", () => {
     expect(track.stop).toHaveBeenCalled();
     expect(onError).toHaveBeenLastCalledWith(undefined);
     await waitFor(() => expect(mic.getAttribute("aria-pressed")).toBe("false"));
-    expect(mic.getAttribute("title")).toBe("Speak instead of typing (Ctrl+Shift+Space)");
+    expect(mic.getAttribute("title")).toBe("Speak instead of typing (Ctrl+Shift+D)");
     expect(screen.queryByRole("status")).toBeNull();
   });
 
@@ -357,7 +357,7 @@ describe("VoiceInputButton", () => {
       wrapper: (children) => <SettingsProvider>{children}</SettingsProvider>,
     });
     await findMic();
-    await waitFor(() => expect(native.dictationHotkeys).toContain("CmdOrCtrl+Shift+Space"));
+    await waitFor(() => expect(native.dictationHotkeys).toContain("CmdOrCtrl+Shift+D"));
     unmount();
     expect(native.dictationHotkeys[native.dictationHotkeys.length - 1]).toBe("");
   });

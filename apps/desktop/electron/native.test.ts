@@ -6,6 +6,7 @@ vi.mock("electron", () => import("./test/electron-stub"));
 const {
   app,
   appState,
+  emitApp,
   handlers,
   invoke,
   makeWindow,
@@ -348,6 +349,70 @@ describe("registerNativeIpc", () => {
       // Nothing was held, so dispose has nothing to release.
       native.dispose();
       expect(shortcutState.registered.size).toBe(0);
+      warn.mockRestore();
+    });
+
+    it("lets the key go while the main window has focus, so the page sees the press", () => {
+      const win = makeWindow();
+      windows.push(win);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      expect(shortcutState.registered.has("Alt+D")).toBe(true);
+
+      emitApp("browser-window-focus", {}, win);
+      expect(shortcutState.registered.size).toBe(0);
+      emitApp("browser-window-blur", {}, win);
+      expect(shortcutState.registered.has("Alt+D")).toBe(true);
+    });
+
+    it("keeps the key while another window, such as quick entry, has focus", () => {
+      const win = makeWindow();
+      const panel = makeWindow();
+      windows.push(win, panel);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      emitApp("browser-window-focus", {}, panel);
+      expect(shortcutState.registered.has("Alt+D")).toBe(true);
+    });
+
+    it("set while the main window has focus, waits for focus to leave", () => {
+      const win = makeWindow();
+      windows.push(win);
+      setFocused(win);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      expect(shortcutState.registered.size).toBe(0);
+      setFocused(null);
+      emitApp("browser-window-blur", {}, win);
+      expect(shortcutState.registered.has("Alt+D")).toBe(true);
+    });
+
+    it("cleared while focused stays cleared when focus leaves, and dispose stops listening", () => {
+      const win = makeWindow();
+      windows.push(win);
+      const native = registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      emitApp("browser-window-focus", {}, win);
+      invoke(CHANNELS.dictationHotkey, {}, "");
+      emitApp("browser-window-blur", {}, win);
+      expect(shortcutState.registered.size).toBe(0);
+
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+V");
+      native.dispose();
+      emitApp("browser-window-blur", {}, win);
+      expect(shortcutState.registered.size).toBe(0);
+    });
+
+    it("warns once about a taken key, not on every blur", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      shortcutState.available = false;
+      const win = makeWindow();
+      windows.push(win);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      emitApp("browser-window-focus", {}, win);
+      emitApp("browser-window-blur", {}, win);
+      expect(warn).toHaveBeenCalledTimes(1);
       warn.mockRestore();
     });
 

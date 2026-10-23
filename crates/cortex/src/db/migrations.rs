@@ -194,6 +194,31 @@ impl Database {
         Ok(())
     }
 
+    /// Move the dictation key off `mod+shift+space`, its first default.
+    ///
+    /// The desktop app's quick-entry panel holds that chord system-wide, so
+    /// the dictation key never reached the window and "Listen from the
+    /// background" could not register it. Every database seeded with the old
+    /// default stores it, so a new compiled default alone would change
+    /// nothing for them. Gated on its own marker for the reason given on
+    /// [`Self::migrate_v4`]: after this runs once, `mod+shift+space` is a
+    /// choice the user made on purpose and must survive a stamp regression.
+    pub(super) async fn migrate_v6(&self) -> Result<()> {
+        const KEY: &str = "voice.dictation_shortcut";
+        const OLD_DEFAULT: &str = "mod+shift+space";
+        const DONE_MARKER: &str = "dictation_shortcut_off_quick_entry";
+        if self.get_meta(DONE_MARKER).await?.is_some() {
+            return Ok(());
+        }
+        if self.get_setting(KEY).await?.as_deref() == Some(OLD_DEFAULT) {
+            let new_default = crate::config::VoiceConfig::default().dictation_shortcut;
+            self.set_setting(KEY, &new_default).await?;
+            tracing::info!(to = %new_default, "moved the dictation key off the quick-entry chord");
+        }
+        self.set_meta(DONE_MARKER, "1").await?;
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -1608,6 +1633,69 @@ mod tests {
         let before_second = db.get_setting("mcp.servers").await.unwrap();
         db.migrate_v4().await.unwrap();
         assert_eq!(db.get_setting("mcp.servers").await.unwrap(), before_second);
+    }
+
+    #[tokio::test]
+    async fn migrate_v6_moves_the_old_dictation_default_once() {
+        let db = Database::test_db().await;
+        db.delete_meta("dictation_shortcut_off_quick_entry")
+            .await
+            .unwrap();
+        db.set_setting("voice.dictation_shortcut", "mod+shift+space")
+            .await
+            .unwrap();
+
+        db.migrate_v6().await.unwrap();
+        assert_eq!(
+            db.get_setting("voice.dictation_shortcut")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(
+                crate::config::VoiceConfig::default()
+                    .dictation_shortcut
+                    .as_str()
+            )
+        );
+
+        // Chosen again on purpose, then an older binary restamps the shared
+        // database and every migration runs again: the choice must stay.
+        db.set_setting("voice.dictation_shortcut", "mod+shift+space")
+            .await
+            .unwrap();
+        db.set_meta("schema_version", "5").await.unwrap();
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            db.get_setting("voice.dictation_shortcut")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("mod+shift+space")
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_v6_leaves_a_chosen_dictation_key_alone() {
+        let db = Database::test_db().await;
+        db.delete_meta("dictation_shortcut_off_quick_entry")
+            .await
+            .unwrap();
+        db.set_setting("voice.dictation_shortcut", "altright")
+            .await
+            .unwrap();
+        db.migrate_v6().await.unwrap();
+        assert_eq!(
+            db.get_setting("voice.dictation_shortcut")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("altright")
+        );
+        assert!(db
+            .get_meta("dictation_shortcut_off_quick_entry")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

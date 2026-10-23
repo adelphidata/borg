@@ -219,6 +219,40 @@ describe("VoiceSettingsPage", () => {
     expect(screen.getByRole("switch", { name: /Listen from the background/ })).toBeTruthy();
   });
 
+  it("warns on desktop when the shortcut is the quick-entry key", async () => {
+    const entries = [
+      entry("audio.enabled", "true"),
+      entry("audio.models", JSON.stringify([{ provider: "openai" }])),
+      entry("voice.dictation_shortcut", "mod+shift+space"),
+    ];
+    // The web app has no quick-entry panel, so the key is free there.
+    const web = renderApp(<VoiceSettingsPage />, {
+      daemon: fakeDaemon({ GetSettings: { entries }, GetVoiceCatalog: CATALOG, SetSetting: {} }),
+      kind: "web",
+      wrapper: (children) => (
+        <ThemeProvider>
+          <SettingsProvider>{children}</SettingsProvider>
+        </ThemeProvider>
+      ),
+    });
+    expect(await screen.findByLabelText("Shortcut")).toBeTruthy();
+    expect(screen.queryByText("Quick entry already uses this key.")).toBeNull();
+    web.unmount();
+
+    mount(entries);
+    expect(await screen.findByText("Quick entry already uses this key.")).toBeTruthy();
+  });
+
+  it("gives no warning for the default shortcut on desktop", async () => {
+    mount([
+      entry("audio.enabled", "true"),
+      entry("audio.models", JSON.stringify([{ provider: "openai" }])),
+    ]);
+    const field = (await screen.findByLabelText("Shortcut")) as HTMLInputElement;
+    expect(field.value).toBe("Ctrl+Shift+D");
+    expect(screen.queryByText("Quick entry already uses this key.")).toBeNull();
+  });
+
   it("records a key combination for the shortcut, and a lone modifier on its release", async () => {
     const { daemon } = mount([
       entry("audio.enabled", "true"),

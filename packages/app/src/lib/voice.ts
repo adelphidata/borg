@@ -58,7 +58,7 @@ export function readyProvider(providers: VoiceProvider[]): VoiceProvider | undef
 
 /** The daemon's compiled defaults, repeated here for the moment before the snapshot lands. */
 export const VOICE_DEFAULTS = {
-  shortcut: "mod+shift+space",
+  shortcut: "mod+shift+d",
   holdToRecord: true,
   autoSend: false,
   copyTranscript: false,

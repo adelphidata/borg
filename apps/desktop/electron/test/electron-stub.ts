@@ -345,6 +345,12 @@ export const app = {
   once: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
     appState.listeners.set(event, [...(appState.listeners.get(event) ?? []), listener]);
   }),
+  removeListener: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
+    appState.listeners.set(
+      event,
+      (appState.listeners.get(event) ?? []).filter((l) => l !== listener),
+    );
+  }),
   requestSingleInstanceLock: vi.fn(() => appState.singleInstanceLock),
   whenReady: vi.fn(async () => {}),
   quit: vi.fn(() => {

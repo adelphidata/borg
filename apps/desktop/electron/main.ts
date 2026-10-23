@@ -1,4 +1,5 @@
 import { app, BrowserWindow, shell } from "electron";
+import { QUICK_ENTRY_CHORD, acceleratorForChord } from "@borg/app/chords";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerBoot } from "./boot";
@@ -21,7 +22,7 @@ const indexHtml = path.join(appRoot, "dist", "index.html");
 const preloadJs = path.join(appRoot, "dist-electron", "preload.js");
 
 /** Summons the quick-entry panel from anywhere in the OS. */
-const QUICK_ENTRY_HOTKEY = "CmdOrCtrl+Shift+Space";
+const QUICK_ENTRY_HOTKEY = acceleratorForChord(QUICK_ENTRY_CHORD);
 
 let mainWindow: BrowserWindow | null = null;
 /** Set once a quit is under way, when a renderer that goes away is expected. */

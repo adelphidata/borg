@@ -64,7 +64,9 @@ pub struct VoiceConfig {
     /// arms a single-shot recorder on keydown and transcribes on keyup.
     /// Format is `<modifier>-<key>` lowercase, e.g. `ctrl-b`, `alt-v`.
     pub record_key: String,
-    /// The app's dictation key, in the web chord syntax (`mod+shift+space`).
+    /// The app's dictation key, in the web chord syntax (`mod+shift+d`).
+    /// Not `mod+shift+space`: the desktop app's quick-entry panel holds that
+    /// key system-wide, so dictation would never see it there.
     /// A lone modifier code (`altright`) means hold that key to talk.
     pub dictation_shortcut: String,
     /// Hold the shortcut to record and release to stop; a quick tap still
@@ -95,7 +97,7 @@ impl Default for VoiceConfig {
             beep_enabled: true,
             auto_submit: true,
             record_key: "ctrl-b".to_string(),
-            dictation_shortcut: "mod+shift+space".to_string(),
+            dictation_shortcut: "mod+shift+d".to_string(),
             hold_to_record: true,
             dictation_auto_send: false,
             copy_transcript: false,
@@ -129,7 +131,7 @@ mod tests {
         // the keybinding is part of the parity contract.
         assert_eq!(cfg.record_key, "ctrl-b");
         // The app's dictation defaults: review before sending, hold or tap.
-        assert_eq!(cfg.dictation_shortcut, "mod+shift+space");
+        assert_eq!(cfg.dictation_shortcut, "mod+shift+d");
         assert!(cfg.hold_to_record);
         assert!(!cfg.dictation_auto_send);
         assert!(!cfg.copy_transcript);
