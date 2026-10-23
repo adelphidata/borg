@@ -1028,6 +1028,7 @@ impl Database {
         };
         if !read_only {
             db.run_migrations().await?;
+            db.sync_bundled_rate_cards().await?;
             // INSERT OR IGNORE preserves existing user overrides; idempotent.
             db.ensure_all_settings().await?;
             db.hmac_salt = db.get_or_create_hmac_salt().await?;

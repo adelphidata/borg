@@ -273,6 +273,23 @@ impl Database {
         Ok(false)
     }
 
+    /// Bring the bundled rate cards up to this binary's price list, on every
+    /// writable open, the way `ensure_all_settings` does for settings.
+    ///
+    /// The seed and the reprice also run inside `migrate_v1`, but that runs
+    /// only when the stamp changes. A price change that ships with no schema
+    /// change, or a database stamped current by a build from before the price
+    /// change, would otherwise keep billing at the old price and never get the
+    /// new models' rows. Both steps are safe to repeat: the seed is `INSERT OR
+    /// IGNORE`, and a reprice appends only when the newest row for a model is
+    /// a bundled row at another price.
+    pub(super) async fn sync_bundled_rate_cards(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result = self.seed_bundled_rate_cards().await;
+        self.finish_immediate_tx(result, "bundled rate cards sync")
+            .await
+    }
+
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
         let stmt = self
             .conn
@@ -1821,6 +1838,45 @@ mod tests {
         let after_first = sonnet_5_card_rows(&db).await;
         db.seed_bundled_rate_cards().await.unwrap();
         assert_eq!(sonnet_5_card_rows(&db).await, after_first);
+    }
+
+    /// A database already stamped current, by a build from before a price
+    /// change, never runs `migrate_v1` again: the open itself must reprice.
+    #[tokio::test]
+    async fn reopening_a_current_database_reprices_its_bundled_cards() {
+        use crate::budgets::{RateCard, Usd};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        {
+            let db = Database::open_at(&path).await.unwrap();
+            seed_old_sonnet_5_card(&db).await;
+            db.conn
+                .execute(
+                    "DELETE FROM provider_rate_cards WHERE model = 'claude-haiku-5-5'",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                db.schema_version().await.unwrap(),
+                Database::CURRENT_VERSION
+            );
+        }
+
+        let db = Database::open_at(&path).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let row = RateCard::lookup(&db, "anthropic", "claude-sonnet-5", now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.prompt_per_mtok, Usd::parse("2.00").unwrap());
+        assert!(
+            RateCard::lookup(&db, "anthropic", "claude-haiku-5-5", now)
+                .await
+                .unwrap()
+                .is_some(),
+            "a model added after the stamp must still get its row"
+        );
     }
 
     async fn sonnet_5_card_rows(db: &Database) -> i64 {
