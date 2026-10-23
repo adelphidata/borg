@@ -1,10 +1,69 @@
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Pill, PlusIcon, SECTION_LABEL, TrashIcon } from "@borg/ui";
+import { Pill, PlusIcon, STORAGE_KEYS, TrashIcon } from "@borg/ui";
 import type { admin } from "@borg/client";
+import { CategoryCard, CategoryFold, FoldBadge } from "../../components/CategoryFold";
 import { DaemonState } from "../../components/DaemonState";
+import { PageGroup } from "../../components/PageGroup";
 import { Switch } from "../../components/Switch";
-import { useSkills, type Skills } from "./useSkills";
+import { needsNote } from "./SkillSetup";
+import { SOURCE_WORDS, useSkills, type Skills } from "./useSkills";
+
+interface SkillCategory {
+  id: string;
+  name: string;
+}
+
+/** Built-in skill categories in screen order: the everyday basics first. */
+const SKILL_CATEGORIES: SkillCategory[] = [
+  { id: "core", name: "Core" },
+  { id: "utilities", name: "Utilities" },
+  { id: "payments", name: "Payments" },
+  { id: "developer", name: "Developer" },
+  { id: "productivity", name: "Productivity" },
+];
+
+/** Last: every skill you or a project added, and any built-in no category above takes. */
+const CUSTOM: SkillCategory = { id: "custom", name: "Custom" };
+
+function categoryOf(skill: admin.SkillCatalogEntry): SkillCategory {
+  if (skill.source !== "builtin") return CUSTOM;
+  const id = skill.category.trim().toLowerCase();
+  return SKILL_CATEGORIES.find((c) => c.id === id) ?? CUSTOM;
+}
+
+interface SkillGroup {
+  category: SkillCategory;
+  skills: admin.SkillCatalogEntry[];
+}
+
+/** The catalog folded by category, in screen order; empty categories drop out. */
+function groupSkills(list: admin.SkillCatalogEntry[]): SkillGroup[] {
+  return [...SKILL_CATEGORIES, CUSTOM].flatMap((category) => {
+    const skills = list.filter((s) => categoryOf(s) === category);
+    return skills.length > 0 ? [{ category, skills }] : [];
+  });
+}
+
+/** The open folds, kept for the tab so a trip into one skill comes back to them. */
+function readFolds(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(
+      globalThis.sessionStorage?.getItem(STORAGE_KEYS.skillFolds) ?? "[]",
+    );
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeFolds(ids: string[]): void {
+  try {
+    globalThis.sessionStorage?.setItem(STORAGE_KEYS.skillFolds, JSON.stringify(ids));
+  } catch {
+    // Losing the folds on the way back is a small cost; failing the click is not.
+  }
+}
 
 function SkillRow({
   skill,
@@ -17,11 +76,9 @@ function SkillRow({
   onToggle: (enabled: boolean) => void;
   onDelete?: () => void;
 }) {
-  const note = skill.mandatory
-    ? "Always on"
-    : skill.enabled && !skill.available
-      ? "On, but something it needs is missing"
-      : undefined;
+  const note = skill.mandatory ? "Always on" : skill.enabled ? needsNote(skill.needs) : undefined;
+  // The fold already names the category; a tag only marks one that is not built in.
+  const source = skill.source === "builtin" ? undefined : SOURCE_WORDS[skill.source];
   return (
     <div className="group flex items-center gap-3 border-b border-line2 py-3 last:border-0">
       <button
@@ -31,9 +88,9 @@ function SkillRow({
       >
         <div className="flex items-center gap-2">
           <span className="truncate text-[13.5px] leading-[1.35] text-ink">{skill.name}</span>
-          {skill.category && (
+          {source && (
             <span className="rounded-md border border-line2 px-1.5 py-0.5 text-[9.5px] leading-none tracking-[0.08em] uppercase text-ink3">
-              {skill.category}
+              {source}
             </span>
           )}
         </div>
@@ -70,90 +127,118 @@ function SkillRow({
   );
 }
 
-function Group({
-  label,
-  skills,
-  mine,
+function SkillFold({
+  group,
+  open,
+  onToggle,
   all,
   confirm,
   setConfirm,
 }: {
-  label: string;
-  skills: admin.SkillCatalogEntry[];
-  mine: boolean;
+  group: SkillGroup;
+  open: boolean;
+  onToggle: () => void;
   all: Skills;
   confirm: string | undefined;
   setConfirm: (name: string | undefined) => void;
 }) {
   const navigate = useNavigate();
-  if (skills.length === 0) return null;
+  const { category, skills } = group;
+  const on = skills.filter((s) => s.enabled).length;
+  // A folded row hides what it needs, so the fold says how many do.
+  const missing = skills.filter((s) => s.enabled && s.needs.length > 0).length;
   return (
-    <div className="mb-5">
-      <div className="mb-1 text-[11.5px] leading-[1.4] text-ink3">{label}</div>
-      <div className="flex flex-col">
-        {skills.map((skill) =>
-          confirm === skill.name ? (
-            <div
-              key={skill.name}
-              className="my-1 flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
-            >
-              <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
-                Delete {skill.name}?
-              </div>
-              <Pill square onClick={() => setConfirm(undefined)}>
-                Keep
-              </Pill>
-              <Pill
-                square
-                variant="danger"
-                onClick={() => {
-                  setConfirm(undefined);
-                  void all.remove(skill.name);
-                }}
-              >
-                Delete
-              </Pill>
+    <CategoryFold
+      id={`skills-${category.id}`}
+      name={category.name}
+      badges={
+        (missing > 0 || on > 0) && (
+          <>
+            {missing > 0 && (
+              <FoldBadge tone="alert">
+                {missing} {missing === 1 ? "needs" : "need"} setup
+              </FoldBadge>
+            )}
+            {on > 0 && <FoldBadge>{on} on</FoldBadge>}
+          </>
+        )
+      }
+      total={skills.length}
+      open={open}
+      onToggle={onToggle}
+      bodyClassName="px-4"
+    >
+      {skills.map((skill) =>
+        confirm === skill.name ? (
+          <div
+            key={skill.name}
+            className="my-2 flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
+          >
+            <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
+              Delete {skill.name}?
             </div>
-          ) : (
-            <SkillRow
-              key={skill.name}
-              skill={skill}
-              onOpen={() => navigate(`/connections/skills/${encodeURIComponent(skill.name)}`)}
-              onToggle={(enabled) => void all.setEnabled(skill.name, enabled)}
-              onDelete={mine && skill.source === "user" ? () => setConfirm(skill.name) : undefined}
-            />
-          ),
-        )}
-      </div>
-    </div>
+            <Pill square onClick={() => setConfirm(undefined)}>
+              Keep
+            </Pill>
+            <Pill
+              square
+              variant="danger"
+              onClick={() => {
+                setConfirm(undefined);
+                void all.remove(skill.name);
+              }}
+            >
+              Delete
+            </Pill>
+          </div>
+        ) : (
+          <SkillRow
+            key={skill.name}
+            skill={skill}
+            onOpen={() => navigate(`/connections/skills/${encodeURIComponent(skill.name)}`)}
+            onToggle={(enabled) => void all.setEnabled(skill.name, enabled)}
+            onDelete={skill.source === "user" ? () => setConfirm(skill.name) : undefined}
+          />
+        ),
+      )}
+    </CategoryFold>
   );
 }
 
 /**
- * The skills catalog as a list of switches. One section of the Connections
- * page.
+ * The skills catalog as a list of switches folded by category the way
+ * Advanced settings are: Core first, then the narrower kits, then Custom.
+ * One section of the Connections page.
  *
- * Yours come first because they are the ones you can change. Built-ins can
- * be turned off, but not edited: the embedded copy always wins, so the
- * detail page offers a copy under a new name instead.
+ * A skill of yours sits under Custom with a tag that says so, and is the
+ * only kind the list can delete. Built-ins can be turned off, but not
+ * edited: the embedded copy always wins, so the detail page offers a copy
+ * under a new name instead.
  */
 export function SkillsSection() {
   const location = useLocation();
   const navigate = useNavigate();
   const skills = useSkills([location.key]);
   const [confirm, setConfirm] = useState<string>();
+  const [open, setOpen] = useState(readFolds);
+
+  const toggle = (id: string) => {
+    const next = open.includes(id) ? open.filter((c) => c !== id) : [...open, id];
+    writeFolds(next);
+    setOpen(next);
+  };
 
   return (
-    <section>
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className={`${SECTION_LABEL} mb-0`}>Skills</div>
+    <PageGroup
+      title="Skills"
+      action={
         <Pill square onClick={() => navigate("/connections/skills/new")}>
           <span className="flex items-center gap-1.5">
             <PlusIcon size={13} /> New skill
           </span>
         </Pill>
-      </div>
-
+      }
+    >
       {skills.error && (
         <div role="alert" className="mb-3 text-[11.5px] leading-[1.4] text-alert">
           {skills.error}
@@ -162,30 +247,26 @@ export function SkillsSection() {
 
       <DaemonState query={skills.query} label="your skills">
         {(list) => {
-          const mine = list.filter((s) => s.source !== "builtin");
-          const builtin = list.filter((s) => s.source === "builtin");
+          const groups = groupSkills(list);
           return (
-            <>
-              <Group
-                label="Your skills"
-                skills={mine}
-                mine
-                all={skills}
-                confirm={confirm}
-                setConfirm={setConfirm}
-              />
-              <Group
-                label="Built in"
-                skills={builtin}
-                mine={false}
-                all={skills}
-                confirm={confirm}
-                setConfirm={setConfirm}
-              />
-            </>
+            groups.length > 0 && (
+              <CategoryCard>
+                {groups.map((g) => (
+                  <SkillFold
+                    key={g.category.id}
+                    group={g}
+                    open={open.includes(g.category.id)}
+                    onToggle={() => toggle(g.category.id)}
+                    all={skills}
+                    confirm={confirm}
+                    setConfirm={setConfirm}
+                  />
+                ))}
+              </CategoryCard>
+            )
           );
         }}
       </DaemonState>
-    </section>
+    </PageGroup>
   );
 }

@@ -6,5 +6,6 @@
   "skillRecency": "borg.skillRecency",
   "unread": "borg.unread.v2",
   "sidebarCollapsed": "borg.sidebarCollapsed",
-  "settingsAdvanced": "borg.settingsAdvanced"
+  "settingsAdvanced": "borg.settingsAdvanced",
+  "skillFolds": "borg.skillFolds"
 }

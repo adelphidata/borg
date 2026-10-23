@@ -1,6 +1,13 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronIcon, STORAGE_KEYS } from "@borg/ui";
+import {
+  CategoryCard,
+  CategoryFold,
+  Chevron,
+  FoldBadge,
+  ROW_BUTTON,
+} from "../../components/CategoryFold";
 import type { DaemonSetting } from "../../lib/settings";
 import {
   ADVANCED_CATEGORIES,
@@ -12,18 +19,16 @@ import {
 } from "./catalog";
 import { summarizeValue } from "./settingValue";
 
-/** `localeCompare` builds a collator per call; ~500 rows makes that measurable. */
-const BY_NAME = new Intl.Collator();
-
-const ROW_BUTTON =
-  "flex w-full cursor-pointer items-center border-0 bg-transparent text-left font-[inherit]";
-
 /**
  * One row of the settings list. The curated rows and the Advanced toggle share
  * it, so Advanced reads as the list's last row rather than a heading of its own.
  */
 export const SETTING_ROW = `${ROW_BUTTON} gap-[18px] border-b border-line2 px-0.5 py-4`;
-export const SETTING_NAME = "min-w-0 flex-1 truncate text-[14px] leading-[1.3] font-medium text-ink";
+export const SETTING_NAME =
+  "min-w-0 flex-1 truncate text-[14px] leading-[1.3] font-medium text-ink";
+
+/** `localeCompare` builds a collator per call; ~500 rows makes that measurable. */
+const BY_NAME = new Intl.Collator();
 
 /** One run of keys sharing a prefix; `prefix` is "" for undotted keys. */
 interface AdvancedSection {
@@ -109,17 +114,7 @@ function writeFolds(state: FoldState): void {
   }
 }
 
-function Chevron({ open }: { open: boolean }) {
-  return (
-    <span
-      className={`flex flex-none transition-transform duration-[180ms] ${open ? "[transform:rotate(90deg)]" : ""}`}
-    >
-      <ChevronIcon size={13} className={open ? "text-neon" : "text-ink3"} />
-    </span>
-  );
-}
-
-function CategoryFold({
+function AdvancedFold({
   group,
   open,
   onToggle,
@@ -130,85 +125,65 @@ function CategoryFold({
 }) {
   const navigate = useNavigate();
   const { category, sections, total, changed } = group;
-  const bodyId = `advanced-${category.id}`;
   // One run needs no heading: the category already names it.
   const labelled = sections.length > 1;
 
   return (
-    <section className="border-b border-line2 last:border-b-0">
-      <button
-        type="button"
-        aria-expanded={open}
-        // Only while the body is in the DOM; a dangling id reference is worse than none.
-        aria-controls={open ? bodyId : undefined}
-        className={`${ROW_BUTTON} gap-4 px-4 py-3.5 transition-[background] duration-150 hover:bg-surface3 ${
-          open ? "bg-surface3" : ""
-        }`}
-        onClick={onToggle}
-      >
-        <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[1.3] font-medium text-ink">
-          {category.name}
-        </span>
-        {changed > 0 && (
-          <span className="flex-none rounded-full bg-nav-on-bg px-2 py-[3px] text-[10.5px] leading-none font-medium text-neon-ink">
-            {changed} changed
+    <CategoryFold
+      id={`advanced-${category.id}`}
+      name={category.name}
+      badges={changed > 0 && <FoldBadge>{changed} changed</FoldBadge>}
+      total={total}
+      open={open}
+      onToggle={onToggle}
+      bodyClassName="px-1.5 pt-1 pb-1.5"
+    >
+      {category.page && (
+        <button
+          type="button"
+          className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
+          onClick={() => navigate(category.page!.path)}
+        >
+          <span className="min-w-0 truncate text-[12.5px] leading-[1.3] font-medium text-ink">
+            {category.page.name}
           </span>
-        )}
-        <span className="w-7 flex-none text-right text-[12px] leading-none text-ink3 tabular-nums">
-          {total}
-        </span>
-        <Chevron open={open} />
-      </button>
-      {open && (
-        <div id={bodyId} className="border-t border-line2 bg-surface px-1.5 pt-1 pb-1.5">
-          {category.page && (
-            <button
-              type="button"
-              className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
-              onClick={() => navigate(category.page!.path)}
-            >
-              <span className="min-w-0 truncate text-[12.5px] leading-[1.3] font-medium text-ink">
-                {category.page.name}
-              </span>
-              <ChevronIcon size={12} className="flex-none text-ink3" />
-            </button>
-          )}
-          {sections.map((section) => (
-            <div key={section.prefix || "_"}>
-              {labelled && section.prefix !== "" && (
-                <div className="px-3 pt-3 pb-1.5 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
-                  {section.prefix.replaceAll("_", " ")}
-                </div>
-              )}
-              {section.rows.map((r) => {
-                const shown = summarizeValue(r.key, r.value, r.kind);
-                return (
-                  <button
-                    type="button"
-                    key={r.key}
-                    title={r.key}
-                    aria-label={`${r.key} ${r.value === "" ? "unset" : shown}`}
-                    className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
-                    onClick={() => navigate(settingPath(r.key))}
-                  >
-                    <span className="min-w-0 truncate text-[12.5px] leading-[1.3] text-ink2">
-                      {section.prefix === "" ? r.key : r.key.slice(section.prefix.length + 1)}
-                    </span>
-                    <span
-                      className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium tabular-nums ${
-                        r.overridden ? "text-neon-ink" : "text-ink3"
-                      }`}
-                    >
-                      {shown}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
+          <ChevronIcon size={12} className="flex-none text-ink3" />
+        </button>
       )}
-    </section>
+      {sections.map((section) => (
+        <div key={section.prefix || "_"}>
+          {labelled && section.prefix !== "" && (
+            <div className="px-3 pt-3 pb-1.5 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
+              {section.prefix.replaceAll("_", " ")}
+            </div>
+          )}
+          {section.rows.map((r) => {
+            const shown = summarizeValue(r.key, r.value, r.kind);
+            return (
+              <button
+                type="button"
+                key={r.key}
+                title={r.key}
+                aria-label={`${r.key} ${r.value === "" ? "unset" : shown}`}
+                className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
+                onClick={() => navigate(settingPath(r.key))}
+              >
+                <span className="min-w-0 truncate text-[12.5px] leading-[1.3] text-ink2">
+                  {section.prefix === "" ? r.key : r.key.slice(section.prefix.length + 1)}
+                </span>
+                <span
+                  className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium tabular-nums ${
+                    r.overridden ? "text-neon-ink" : "text-ink3"
+                  }`}
+                >
+                  {shown}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </CategoryFold>
   );
 }
 
@@ -254,16 +229,16 @@ export function AdvancedSettings({
 
       {folds.open && (
         <div className="pt-4">
-          <div className="overflow-hidden rounded-[12px] border border-line2 bg-surface2">
+          <CategoryCard>
             {groups.map((g) => (
-              <CategoryFold
+              <AdvancedFold
                 key={g.category.id}
                 group={g}
                 open={folds.categories.includes(g.category.id)}
                 onToggle={() => toggleCategory(g.category.id)}
               />
             ))}
-          </div>
+          </CategoryCard>
         </div>
       )}
     </>

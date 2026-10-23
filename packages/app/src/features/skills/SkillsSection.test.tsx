@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it } from "vitest";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
@@ -14,8 +14,9 @@ const skill = (over: Record<string, unknown> = {}) => ({
   enabled: true,
   available: true,
   mandatory: false,
-  category: "development",
+  category: "developer",
   defaultEnabled: true,
+  needs: [],
   ...over,
 });
 
@@ -52,6 +53,10 @@ function mount(daemon: ReturnType<typeof fakeDaemon>, route = "/connections") {
 
 const click = (el: HTMLElement) => act(() => el.click());
 const type = (el: HTMLElement, value: string) => fireEvent.change(el, { target: { value } });
+const fold = (name: string) => screen.getByRole("button", { name: new RegExp(`^${name}`) });
+
+// Open folds outlive a page in sessionStorage; each test starts with none.
+beforeEach(() => sessionStorage.clear());
 
 describe("skill helpers", () => {
   it("reads the frontmatter name and only that", () => {
@@ -81,38 +86,93 @@ describe("skill helpers", () => {
 });
 
 describe("SkillsSection", () => {
-  it("lists yours before the built-ins, with the switch state and notes", async () => {
+  it("folds the skills by category: Core first, then the listed order, then Custom", async () => {
     const daemon = fakeDaemon(
       catalog([
-        skill(),
-        skill({ name: "scheduler", mandatory: true }),
-        skill({ name: "aws", enabled: true, available: false }),
-        mine({ enabled: false }),
+        skill({ name: "git" }),
+        skill({ name: "stripe-link", category: "payments" }),
+        // Case does not split a category.
+        skill({ name: "browser", category: "Core" }),
+        skill({ name: "notes", category: "utilities" }),
+        skill({ name: "linear", category: "productivity" }),
+        // A built-in no listed category takes lands in Custom.
+        skill({ name: "zap", category: "zeta-tools" }),
+        // A skill you added is custom whatever category it names.
+        mine({ category: "developer" }),
+        mine({ name: "from-repo", source: "project" }),
       ]),
     );
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("release-notes")).toBeTruthy());
-    const labels = screen.getAllByText(/^(Your skills|Built in)$/).map((e) => e.textContent);
-    expect(labels).toEqual(["Your skills", "Built in"]);
-    expect(
-      (
-        screen.getByRole("switch", { name: "Enable release-notes" }) as HTMLButtonElement
-      ).getAttribute("aria-checked"),
-    ).toBe("false");
+    await waitFor(() => expect(fold("Core")).toBeTruthy());
+    const order = screen
+      .getAllByRole("button", { expanded: false })
+      .map(
+        (b) =>
+          /^(Core|Utilities|Payments|Developer|Productivity|Custom)/.exec(b.textContent ?? "")?.[1],
+      );
+    expect(order).toEqual(["Core", "Utilities", "Payments", "Developer", "Productivity", "Custom"]);
+    expect(fold("Developer").textContent).toMatch(/1$/);
+    expect(fold("Custom").textContent).toMatch(/3$/);
+    // Folded until asked: no switch shows before a category opens.
+    expect(screen.queryByRole("switch")).toBeNull();
+    click(fold("Custom"));
+    expect(fold("Custom").getAttribute("aria-expanded")).toBe("true");
+    for (const name of ["zap", "release-notes", "from-repo"]) {
+      expect(screen.getByRole("switch", { name: `Enable ${name}` })).toBeTruthy();
+    }
+    expect(screen.queryByRole("switch", { name: "Enable git" })).toBeNull();
+    // Only a skill that is not built in carries a tag, and it says where it came from.
+    expect(screen.getByText("Yours")).toBeTruthy();
+    expect(screen.getByText("From this project")).toBeTruthy();
+  });
+
+  it("counts what is on and what needs setup, then opens to the switches and notes", async () => {
+    const daemon = fakeDaemon(
+      catalog([
+        skill({ name: "browser", category: "core" }),
+        skill({ name: "scheduler", category: "core", mandatory: true }),
+        skill({
+          name: "aws",
+          category: "core",
+          available: false,
+          needs: [
+            { kind: "bin", options: [{ name: "aws" }] },
+            { kind: "env", options: [{ name: "AWS_PROFILE" }] },
+          ],
+        }),
+        // A skill that is off waits on nothing yet: it is not "needs setup".
+        skill({
+          name: "calendar",
+          category: "core",
+          enabled: false,
+          available: false,
+          needs: [{ kind: "bin", options: [{ name: "icalBuddy" }, { name: "gcalcli" }] }],
+        }),
+        skill({ name: "weather", category: "utilities", enabled: false, available: false }),
+      ]),
+    );
+    mount(daemon);
+    await waitFor(() => expect(fold("Core")).toBeTruthy());
+    // The fold hides each row's note, so the fold itself says what needs a look.
+    expect(within(fold("Core")).getByText("3 on")).toBeTruthy();
+    expect(within(fold("Core")).getByText("1 needs setup")).toBeTruthy();
+    expect(fold("Core").textContent).toMatch(/4$/);
+    // Nothing on, nothing to flag.
+    expect(fold("Utilities").textContent).not.toMatch(/ on|setup/);
+
+    click(fold("Core"));
     const always = screen.getByRole("switch", { name: "Enable scheduler" }) as HTMLButtonElement;
     expect(always.disabled).toBe(true);
     expect(screen.getByText("Always on")).toBeTruthy();
-    expect(screen.getByText(/something it needs is missing/)).toBeTruthy();
-    // Only a skill of yours can be deleted from the list.
-    expect(screen.getByLabelText("Delete release-notes")).toBeTruthy();
-    expect(screen.queryByLabelText("Delete git")).toBeNull();
-  });
+    // The row names what is missing instead of only saying something is.
+    expect(screen.getByText("Needs aws and AWS_PROFILE")).toBeTruthy();
+    expect(screen.queryByText(/icalBuddy/)).toBeNull();
+    expect(
+      screen.getByRole("switch", { name: "Enable calendar" }).getAttribute("aria-checked"),
+    ).toBe("false");
 
-  it("shows only the built-ins when there are none of yours", async () => {
-    const daemon = fakeDaemon(catalog([skill()]));
-    mount(daemon);
-    await waitFor(() => expect(screen.getByText("Built in")).toBeTruthy());
-    expect(screen.queryByText("Your skills")).toBeNull();
+    // Only a skill of yours can be deleted from the list.
+    expect(screen.queryByLabelText("Delete browser")).toBeNull();
   });
 
   it("turns a skill off and on through the daemon", async () => {
@@ -121,7 +181,8 @@ describe("SkillsSection", () => {
       SetSkillEnabled: { entry: skill({ enabled: false }), content: "", path: "" },
     });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("git")).toBeTruthy());
+    await waitFor(() => expect(fold("Developer")).toBeTruthy());
+    click(fold("Developer"));
     click(screen.getByRole("switch", { name: "Enable git" }));
     await waitFor(() =>
       expect(daemon.calls.find((c) => c.method === "SetSkillEnabled")?.request).toEqual({
@@ -134,7 +195,8 @@ describe("SkillsSection", () => {
   it("asks before deleting and deletes on confirmation", async () => {
     const daemon = fakeDaemon({ ...catalog([mine()]), DeleteSkill: {} });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("release-notes")).toBeTruthy());
+    await waitFor(() => expect(fold("Custom")).toBeTruthy());
+    click(fold("Custom"));
     click(screen.getByLabelText("Delete release-notes"));
     expect(screen.getByText(/Delete release-notes\?/)).toBeTruthy();
     click(screen.getByText("Keep"));
@@ -154,7 +216,8 @@ describe("SkillsSection", () => {
       SetSkillEnabled: new BorgError(GrpcStatus.Internal, "settings table is locked"),
     });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("git")).toBeTruthy());
+    await waitFor(() => expect(fold("Developer")).toBeTruthy());
+    click(fold("Developer"));
     click(screen.getByRole("switch", { name: "Enable git" }));
     await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/locked/));
   });
@@ -165,15 +228,18 @@ describe("SkillsSection", () => {
     await waitFor(() => expect(screen.getByText("Could not load your skills.")).toBeTruthy());
   });
 
-  it("opens a row's detail page and the new-skill page", async () => {
-    const daemon = fakeDaemon({ ...catalog([mine()]), ...detail(mine()) });
+  it("opens a row's detail page, comes back to the same folds, and opens the new-skill page", async () => {
+    const daemon = fakeDaemon({ ...catalog([mine(), skill()]), ...detail(mine()) });
     mount(daemon);
-    await waitFor(() => expect(screen.getByText("release-notes")).toBeTruthy());
+    await waitFor(() => expect(fold("Custom")).toBeTruthy());
+    click(fold("Custom"));
     click(screen.getByRole("button", { name: /^release-notes/ }));
     await waitFor(() => expect(screen.getByLabelText("SKILL.md")).toBeTruthy());
     // The back link, not the page title.
     click(screen.getAllByText("Connections").find((el) => el.tagName === "SPAN")!);
     await waitFor(() => expect(screen.getByText("New skill")).toBeTruthy());
+    await waitFor(() => expect(fold("Custom").getAttribute("aria-expanded")).toBe("true"));
+    expect(fold("Developer").getAttribute("aria-expanded")).toBe("false");
     click(screen.getByText("New skill"));
     await waitFor(() => expect(screen.getByText("Create skill")).toBeTruthy());
   });
@@ -221,7 +287,7 @@ describe("SkillDetailPage for a skill of yours", () => {
     click(screen.getByText("Delete this skill"));
     click(screen.getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(daemon.calls.some((c) => c.method === "DeleteSkill")).toBe(true));
-    await waitFor(() => expect(screen.getByText("Your skills")).toBeTruthy());
+    await waitFor(() => expect(fold("Custom")).toBeTruthy());
   });
 });
 
@@ -235,7 +301,7 @@ describe("SkillDetailPage for a built-in", () => {
     await waitFor(() => expect(screen.getByText("Copy to a new skill")).toBeTruthy());
     expect(screen.queryByLabelText("SKILL.md")).toBeNull();
     expect(screen.queryByText("Delete this skill")).toBeNull();
-    expect(screen.getByText("Built in · development")).toBeTruthy();
+    expect(screen.getByText("Built in · developer")).toBeTruthy();
     click(screen.getByText("Copy to a new skill"));
     await waitFor(() => expect(screen.getByText("Copy of git")).toBeTruthy());
     // The copy's frontmatter follows the new name as it is typed.

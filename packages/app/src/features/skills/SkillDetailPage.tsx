@@ -13,6 +13,7 @@ import {
 import type { admin } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
 import { Switch } from "../../components/Switch";
+import { SkillSetup } from "./SkillSetup";
 import {
   SOURCE_WORDS,
   frontmatterName,
@@ -189,8 +190,8 @@ function Existing({
             {SOURCE_WORDS[entry.source] ?? entry.source}
             {entry.category && <> · {entry.category}</>}
             {entry.mandatory && <> · always on</>}
-            {!entry.mandatory && entry.enabled && !entry.available && (
-              <span className="text-alert"> · something it needs is missing</span>
+            {entry.enabled && entry.needs.length > 0 && (
+              <span className="text-alert"> · needs setup</span>
             )}
           </div>
         </div>
@@ -201,6 +202,10 @@ function Existing({
           disabled={entry.mandatory}
         />
       </div>
+
+      {entry.needs.length > 0 && (
+        <SkillSetup entry={entry} onChange={() => skills.query.refetch()} />
+      )}
 
       <section>
         <div className={SECTION_LABEL}>SKILL.md</div>
