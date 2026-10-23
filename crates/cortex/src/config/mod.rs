@@ -9,6 +9,7 @@ pub mod llm;
 pub mod loop_guard;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_store;
 pub mod mcp_supply_chain;
 pub mod media;
 pub mod process_registry;

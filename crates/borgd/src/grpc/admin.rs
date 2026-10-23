@@ -875,6 +875,69 @@ impl Admin for AdminSvc {
         }))
     }
 
+    async fn list_skill_catalog(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<protocols::admin::SkillCatalog>, TStatus> {
+        extensions::list_skill_catalog(req).await
+    }
+
+    async fn get_skill(
+        &self,
+        req: Request<protocols::admin::SkillRef>,
+    ) -> Result<Response<protocols::admin::SkillDetail>, TStatus> {
+        extensions::get_skill(req).await
+    }
+
+    async fn put_skill(
+        &self,
+        req: Request<protocols::admin::SkillPut>,
+    ) -> Result<Response<protocols::admin::SkillDetail>, TStatus> {
+        extensions::put_skill(self, req).await
+    }
+
+    async fn delete_skill(
+        &self,
+        req: Request<protocols::admin::SkillRef>,
+    ) -> Result<Response<Empty>, TStatus> {
+        extensions::delete_skill(self, req).await
+    }
+
+    async fn set_skill_enabled(
+        &self,
+        req: Request<protocols::admin::SkillEnabledMutation>,
+    ) -> Result<Response<protocols::admin::SkillDetail>, TStatus> {
+        extensions::set_skill_enabled(self, req).await
+    }
+
+    async fn list_mcp_servers(
+        &self,
+        req: Request<Empty>,
+    ) -> Result<Response<protocols::admin::McpServerList>, TStatus> {
+        extensions::list_mcp_servers(req).await
+    }
+
+    async fn put_mcp_server(
+        &self,
+        req: Request<protocols::admin::McpServerPut>,
+    ) -> Result<Response<protocols::admin::McpServerEntry>, TStatus> {
+        extensions::put_mcp_server(self, req).await
+    }
+
+    async fn remove_mcp_server(
+        &self,
+        req: Request<protocols::admin::McpServerRef>,
+    ) -> Result<Response<Empty>, TStatus> {
+        extensions::remove_mcp_server(self, req).await
+    }
+
+    async fn test_mcp_server(
+        &self,
+        req: Request<protocols::admin::McpServerRef>,
+    ) -> Result<Response<protocols::admin::McpServerTestResult>, TStatus> {
+        extensions::test_mcp_server(req).await
+    }
+
     async fn send_approval_greeting(
         &self,
         req: Request<ApprovalGreetingRequest>,
@@ -1674,6 +1737,7 @@ impl Admin for AdminSvc {
 mod agents;
 mod browser;
 mod credentials;
+mod extensions;
 mod goals;
 mod handoff;
 mod helpers;

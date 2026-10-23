@@ -14,19 +14,15 @@
 //! a freshly-added server without restarting the daemon.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
+use cortex::config::mcp_store::{
+    persist_server, preset_server_config, remove_server, set_server_enabled, validate_auth_headers,
+    validate_http_url, validate_server_id,
+};
 use cortex::config::{Config, HttpAuthSpec, McpServerConfig, TransportSpec};
-use cortex::db::Database;
-use mcp::manifest::{ServerManifest, ToolFilter};
-use mcp::transport::http::HttpPolicy;
-use serde::{Deserialize, Serialize};
-
-/// Settings key for the per-server JSON map (mirrors `define_settings!`
-/// registration in `cortex/src/config/settings_table.rs`).
-const SERVERS_KEY: &str = "mcp.servers";
+use mcp::manifest::ToolFilter;
 
 /// Argument shared by `remove` / `enable` / `disable` / `test`.
 #[derive(Args)]
@@ -187,7 +183,7 @@ pub(crate) async fn list() -> Result<()> {
 
 /// `borg mcp add <id> [--stdio|--http|--sse] …`.
 pub(crate) async fn add(args: AddArgs) -> Result<()> {
-    validate_id(&args.id)?;
+    validate_server_id(&args.id)?;
     let transport = build_transport(&args)?;
     let server = McpServerConfig {
         enabled: true,
@@ -213,8 +209,8 @@ pub(crate) async fn add(args: AddArgs) -> Result<()> {
 
 /// `borg mcp add-preset <id> --preset <name>`.
 pub(crate) async fn add_preset(args: AddPresetArgs) -> Result<()> {
-    validate_id(&args.id)?;
-    let server = preset_to_config(&args.preset, args.fs_root.as_deref())?;
+    validate_server_id(&args.id)?;
+    let server = preset_server_config(&args.preset, args.fs_root.as_deref())?;
     persist_server(&args.id, server, args.force).await?;
     println!(
         "Added MCP server `{}` from preset `{}`.",
@@ -231,27 +227,14 @@ pub(crate) async fn add_preset(args: AddPresetArgs) -> Result<()> {
 
 /// `borg mcp remove <id>`.
 pub(crate) async fn remove(args: IdArgs) -> Result<()> {
-    mutate_servers(|map| {
-        if map.remove(&args.id).is_none() {
-            bail!("no MCP server named `{}`", args.id);
-        }
-        Ok(())
-    })
-    .await?;
+    remove_server(&args.id).await?;
     println!("Removed MCP server `{}`.", args.id);
     Ok(())
 }
 
 /// `borg mcp enable|disable <id>`.
 pub(crate) async fn enable(args: IdArgs, want_enabled: bool) -> Result<()> {
-    mutate_servers(|map| {
-        let entry = map
-            .get_mut(&args.id)
-            .ok_or_else(|| anyhow!("no MCP server named `{}`", args.id))?;
-        entry.enabled = want_enabled;
-        Ok(())
-    })
-    .await?;
+    set_server_enabled(&args.id, want_enabled).await?;
     println!(
         "{} MCP server `{}`.",
         if want_enabled { "Enabled" } else { "Disabled" },
@@ -278,50 +261,17 @@ pub(crate) async fn test(args: IdArgs) -> Result<()> {
         .servers
         .get(&args.id)
         .ok_or_else(|| anyhow!("no MCP server named `{}` — try `borg mcp list`", args.id))?;
-    let manifest: ServerManifest = server_cfg.resolve_to_manifest(&args.id, &cfg)?;
-    let policy = HttpPolicy {
-        allow_plaintext_http: cfg.mcp.allow_plaintext_http,
-        allow_local_network: cfg.mcp.allow_local_network,
-    };
-    let transport = mcp::transport::open(&manifest, policy)
-        .await
-        .context("transport open failed")?;
-    let mut session = mcp::session::SessionActor::new(&manifest, transport);
-    tokio::time::timeout(manifest.connect_timeout, session.handshake())
-        .await
-        .map_err(|_| anyhow!("handshake timed out after {:?}", manifest.connect_timeout))?
-        .context("handshake failed")?;
-    let discovered = session.list_tools().await.context("tools/list failed")?;
+    let report = cortex::config::mcp_store::probe_server(&args.id, server_cfg, &cfg).await?;
     // Print after tools/list so the operator never sees a stale "connected:"
     // banner followed by a downstream error — the printed status reflects
     // what the agent will actually be able to do.
     println!("connected: {}", args.id);
-    if let Some(info) = discovered.server_info.as_deref() {
+    if let Some(info) = report.server_info.as_deref() {
         println!("server:    {info}");
     }
-    println!("tools:     {}", discovered.tools.len());
-    for t in &discovered.tools {
-        println!("  - {}", t.name);
-    }
-    // Session does not yet expose a graceful shutdown; dropping the actor
-    // closes the underlying transport. The `let _ = timeout(yield_now)` is
-    // a best-effort cleanup (analogous to terminal-Drop
-    // and temp-file removal) — capping the linger so an unresponsive peer
-    // cannot hang the CLI.
-    drop(session);
-    let _ = tokio::time::timeout(Duration::from_millis(200), tokio::task::yield_now()).await;
-    Ok(())
-}
-
-fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.len() > 64 {
-        bail!("server id must be 1..=64 chars");
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("server id must match [a-zA-Z0-9_-]+");
+    println!("tools:     {}", report.tools.len());
+    for t in &report.tools {
+        println!("  - {t}");
     }
     Ok(())
 }
@@ -355,24 +305,13 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
     };
     // Reject obvious mistakes early — neither path nor stdio command, but
     // also no URL scheme.
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        bail!("URL must start with http:// or https://");
-    }
+    validate_http_url(&url)?;
     // Refuse a conflicting `--auth bearer:…` + `--header Authorization=…`
     // combination outright. Silently dropping one would mask a real
     // operator mistake (e.g. they pasted a Basic credentials string into
     // a header thinking that's how they authenticate). The operator must
     // pick which is authoritative.
-    if matches!(&auth, HttpAuthSpec::Bearer { .. })
-        && headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("authorization"))
-    {
-        bail!(
-            "--auth and --header Authorization=… are both set; --auth is authoritative — \
-             drop the explicit Authorization header to resolve the ambiguity"
-        );
-    }
+    validate_auth_headers(&auth, &headers)?;
     let client_cert = args.client_cert.clone();
     let client_key = args.client_key.clone();
     let ca_cert = args.ca_cert.clone();
@@ -397,95 +336,6 @@ fn build_transport(args: &AddArgs) -> Result<TransportSpec> {
     })
 }
 
-async fn persist_server(id: &str, server: McpServerConfig, force: bool) -> Result<()> {
-    mutate_servers(|map| {
-        if map.contains_key(id) && !force {
-            bail!("MCP server `{id}` already exists — pass --force to overwrite");
-        }
-        map.insert(id.to_string(), server.clone());
-        Ok(())
-    })
-    .await
-}
-
-/// Optimistic-CAS read-modify-write on the `mcp.servers` JSON setting.
-///
-/// libsql's WAL mode allows concurrent writers (borgd's settings writer +
-/// standalone `borg` CLI processes). A naive read-then-write
-/// can lose entries when two `borg mcp add` invocations interleave — both
-/// read the same prior JSON, both insert, the later `set_setting` wins, and
-/// the earlier entry is silently dropped.
-///
-/// We avoid that by snapshotting `PRAGMA data_version` before the read; if
-/// it has advanced by write time we re-read and re-apply the closure. The
-/// closure runs at most `MAX_RETRIES` times — far more than any realistic
-/// contention burst on settings — and refuses with a clear error if the
-/// database is genuinely write-saturated (operator can retry by hand).
-async fn mutate_servers<F>(mutator: F) -> Result<()>
-where
-    F: Fn(&mut HashMap<String, McpServerConfig>) -> Result<()>,
-{
-    /// Retry budget. Settings writes are infrequent and from the operator's
-    /// CLI; if we lose CAS this many times in a row something pathological
-    /// is happening.
-    const MAX_RETRIES: u32 = 8;
-
-    let db = Database::open().await.context("open db")?;
-    for attempt in 0..MAX_RETRIES {
-        let v0 = db
-            .data_version()
-            .await
-            .context("read PRAGMA data_version (pre)")?;
-        let current_raw = db
-            .get_setting(SERVERS_KEY)
-            .await
-            .context("read mcp.servers")?
-            .unwrap_or_else(|| "{}".to_string());
-        let mut map: HashMap<String, McpServerConfig> = serde_json::from_str(&current_raw)
-            .unwrap_or_else(|_| {
-                // Round-trip recovery: a malformed setting shouldn't trap
-                // the operator. Surface a warning and start from empty
-                // rather than silently dropping their last entry — the
-                // upcoming write will overwrite whatever was there.
-                tracing::warn!(
-                    value = %current_raw,
-                    "mcp.servers is not valid JSON; treating as empty"
-                );
-                HashMap::new()
-            });
-        mutator(&mut map)?;
-        let next = serde_json::to_string(&map).context("serialize mcp.servers")?;
-        // Re-check the version before committing. If anyone wrote between
-        // our read and now, our snapshot is stale — retry with the latest
-        // state. This is a soft CAS: it narrows the race window but doesn't
-        // close it perfectly. The libsql crate doesn't expose `BEGIN
-        // IMMEDIATE` from this surface; a future helper on `Database`
-        // should wrap the whole compound operation in one transaction.
-        let v1 = db
-            .data_version()
-            .await
-            .context("read PRAGMA data_version (post)")?;
-        if v1 != v0 {
-            tracing::debug!(
-                attempt,
-                v0,
-                v1,
-                "mcp.servers changed under read; retrying CAS"
-            );
-            continue;
-        }
-        db.set_setting(SERVERS_KEY, &next)
-            .await
-            .context("write mcp.servers")?;
-        return Ok(());
-    }
-    bail!(
-        "mcp.servers CAS retried {MAX_RETRIES} times without converging — \
-         the database appears to be under sustained concurrent write pressure; \
-         retry the command"
-    )
-}
-
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -496,202 +346,9 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Catalog of operator-friendly MCP server presets. These are *templates* —
-/// adding one writes a row, it does NOT auto-install anything. The first
-/// time the server actually runs it pulls the underlying binary via
-/// `npx`/`uvx`, so operators control the install moment.
-///
-/// Keep the list short. These four cover the whole transport matrix while
-/// keeping the mental overhead of picking a preset low:
-///
-/// - `time` exercises stdio with no secrets (smoke test).
-/// - `filesystem` exercises stdio with a scoped path argument.
-/// - `github` exercises stdio with a `${SECRET:…}` credential.
-/// - `notion` exercises remote HTTP (operator must add OAuth headers).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Preset {
-    transport: TransportSpec,
-    rate_limit_per_minute: u32,
-    rate_limit_burst: u32,
-}
-
-fn preset_to_config(name: &str, fs_root: Option<&str>) -> Result<McpServerConfig> {
-    let p = match name {
-        "time" => Preset {
-            transport: TransportSpec::Stdio {
-                command: "uvx".into(),
-                args: vec!["mcp-server-time".into()],
-                env: HashMap::new(),
-            },
-            rate_limit_per_minute: 60,
-            rate_limit_burst: 10,
-        },
-        "filesystem" => {
-            let root = fs_root
-                .map(str::to_string)
-                .or_else(|| {
-                    dirs::home_dir()
-                        .map(|h| h.join(".borg").join("mcp").join("fs-scope"))
-                        .and_then(|p| p.to_str().map(str::to_string))
-                })
-                .ok_or_else(|| {
-                    anyhow!("filesystem preset needs --fs-root <path> (could not derive default)")
-                })?;
-            // Refuse $HOME-as-root: `mcp-server-filesystem` recursively
-            // exposes whatever it's given. Borg's `blocked_paths` will still
-            // filter sensitive subpaths at the tool boundary, but it's much
-            // safer to scope the server to a dedicated subtree.
-            if let Some(home) = dirs::home_dir() {
-                if std::path::Path::new(&root) == home {
-                    bail!(
-                        "filesystem preset refuses $HOME as the root — pick a subdirectory \
-                         (e.g. ~/.borg/mcp/fs-scope) to limit blast radius"
-                    );
-                }
-            }
-            Preset {
-                transport: TransportSpec::Stdio {
-                    command: "npx".into(),
-                    args: vec![
-                        "-y".into(),
-                        "@modelcontextprotocol/server-filesystem".into(),
-                        root,
-                    ],
-                    env: HashMap::new(),
-                },
-                rate_limit_per_minute: 120,
-                rate_limit_burst: 20,
-            }
-        }
-        "github" => Preset {
-            transport: TransportSpec::Stdio {
-                command: "npx".into(),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
-                env: HashMap::from([(
-                    "GITHUB_PERSONAL_ACCESS_TOKEN".into(),
-                    "${SECRET:github_pat}".into(),
-                )]),
-            },
-            rate_limit_per_minute: 60,
-            rate_limit_burst: 10,
-        },
-        "notion" => Preset {
-            transport: TransportSpec::Http {
-                url: "https://mcp.notion.com/mcp".into(),
-                headers: HashMap::new(),
-                auth: HttpAuthSpec::None,
-                client_cert: None,
-                client_key: None,
-                ca_cert: None,
-            },
-            rate_limit_per_minute: 60,
-            rate_limit_burst: 10,
-        },
-        other => bail!("unknown preset `{other}` — choose: time, filesystem, github, notion"),
-    };
-    Ok(McpServerConfig {
-        enabled: true,
-        transport: p.transport,
-        connect_timeout_ms: 60_000,
-        call_timeout_ms: 120_000,
-        rate_limit_per_minute: p.rate_limit_per_minute,
-        rate_limit_burst: p.rate_limit_burst,
-        tools: ToolFilter::default(),
-        cache_tools: true,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn id_validation_rejects_empty_and_bad_chars() {
-        // The id becomes a URL-like prefix on every tool name (`mcp_<id>_…`)
-        // and is concatenated into log/audit fields. Anything outside the
-        // safe alphabet would either break the tool-name parser downstream
-        // or open an injection vector into structured logs.
-        assert!(validate_id("ok-1").is_ok());
-        assert!(validate_id("ok_2").is_ok());
-        assert!(validate_id("").is_err());
-        assert!(validate_id("with space").is_err());
-        assert!(validate_id("with/slash").is_err());
-        assert!(validate_id("$danger").is_err());
-        assert!(validate_id(&"a".repeat(65)).is_err());
-    }
-
-    #[test]
-    fn preset_time_uses_stdio_uvx() {
-        // Smoke-test preset: stdio, no env, no secrets — proves the
-        // transport plumbing without auth complexity. If a future refactor
-        // changes the command or transport shape, this test pins the
-        // contract that the smoke preset stays credential-free.
-        let cfg = preset_to_config("time", None).unwrap();
-        match &cfg.transport {
-            TransportSpec::Stdio { command, args, env } => {
-                assert_eq!(command, "uvx");
-                assert_eq!(args, &vec!["mcp-server-time".to_string()]);
-                assert!(env.is_empty(), "smoke preset must not require env vars");
-            }
-            other => panic!("expected stdio, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn preset_filesystem_refuses_home_root() {
-        // Spec invariant: a misconfigured filesystem server can hand the LLM
-        // arbitrary read/write under $HOME. The preset refuses that even
-        // when an operator passes it explicitly. Borg's blocked_paths still
-        // backstops at the tool boundary, but rejecting up front is much
-        // less rope to hang oneself with.
-        let home = dirs::home_dir().expect("home dir");
-        let err = preset_to_config("filesystem", home.to_str()).unwrap_err();
-        assert!(
-            err.to_string().contains("refuses $HOME"),
-            "expected explicit refusal, got: {err}"
-        );
-    }
-
-    #[test]
-    fn preset_github_uses_secret_placeholder_not_inline_token() {
-        // Spec invariant: presets never inline a literal token. They emit
-        // `${SECRET:NAME}` so the credential resolver pulls from the
-        // keychain at connect time. Catches the regression where a future
-        // edit accidentally bakes a placeholder default like "ghp_xxx".
-        let cfg = preset_to_config("github", None).unwrap();
-        match &cfg.transport {
-            TransportSpec::Stdio { env, .. } => {
-                let tok = env
-                    .get("GITHUB_PERSONAL_ACCESS_TOKEN")
-                    .expect("token env var");
-                assert!(
-                    tok.contains("${SECRET:"),
-                    "preset must use a secret placeholder, got literal: {tok}"
-                );
-            }
-            _ => panic!("github preset must be stdio"),
-        }
-    }
-
-    #[test]
-    fn preset_notion_is_https_only() {
-        // Spec invariant: remote presets ship https URLs. With
-        // allow_plaintext_http=false (the default), shipping a plain-http
-        // preset would refuse to connect — and silently shipping http://
-        // would invite operators to flip the global flag, weakening every
-        // other server.
-        let cfg = preset_to_config("notion", None).unwrap();
-        match &cfg.transport {
-            TransportSpec::Http { url, .. } => assert!(url.starts_with("https://")),
-            _ => panic!("notion preset must be HTTP"),
-        }
-    }
-
-    #[test]
-    fn unknown_preset_errors() {
-        let err = preset_to_config("not-a-real-preset", None).unwrap_err();
-        assert!(err.to_string().contains("unknown preset"));
-    }
 
     #[test]
     fn build_transport_rejects_no_choice() {
@@ -777,7 +434,7 @@ mod tests {
         let err = build_transport(&args).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("--auth") && msg.contains("Authorization"),
+            msg.contains("bearer") && msg.contains("Authorization"),
             "error must name both knobs to help the operator: {msg}"
         );
     }

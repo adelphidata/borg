@@ -51,6 +51,24 @@ service Admin {
   // requirement rules.
   rpc ListSkills(Empty) returns (SkillList);
 
+  // Skill management. `ListSkillCatalog` is the operator's view: every skill
+  // the loader knows, including disabled and unavailable ones, so a client
+  // can offer the switch. Writes land under `~/.borg/skills/<name>/SKILL.md`
+  // and the per-skill `skills.entries.<name>.enabled` setting.
+  rpc ListSkillCatalog(Empty) returns (SkillCatalog);
+  rpc GetSkill(SkillRef) returns (SkillDetail);
+  rpc PutSkill(SkillPut) returns (SkillDetail);
+  rpc DeleteSkill(SkillRef) returns (Empty);
+  rpc SetSkillEnabled(SkillEnabledMutation) returns (SkillDetail);
+
+  // MCP servers Borg connects to as a client. Writes land in the
+  // `mcp.servers` setting and the live registry is reloaded in the
+  // background; `ListMcpServers` joins config with the registry's view.
+  rpc ListMcpServers(Empty) returns (McpServerList);
+  rpc PutMcpServer(McpServerPut) returns (McpServerEntry);
+  rpc RemoveMcpServer(McpServerRef) returns (Empty);
+  rpc TestMcpServer(McpServerRef) returns (McpServerTestResult);
+
   // Pairing requests + approved senders.
   rpc ListPairingRequests(PairingFilter) returns (PairingRequestList);
   rpc ApprovePairing(PairingApproval) returns (Empty);
@@ -740,6 +758,111 @@ message SkillEntry {
   bool builtin = 3;
 }
 message SkillList { repeated SkillEntry skills = 1; }
+
+// One skill as the operator's catalog shows it — every skill the loader
+// knows, not only the ones the agent will load this run.
+message SkillCatalogEntry {
+  string name = 1;
+  string description = 2;
+  // "builtin" | "user" | "project".
+  string source = 3;
+  // Enabled by config (or by default). A disabled skill is never loaded.
+  bool enabled = 4;
+  // Enabled and its declared binaries / env vars are present.
+  bool available = 5;
+  // Always loaded; the switch is not offered.
+  bool mandatory = 6;
+  string category = 7;
+  // Enabled by default when no per-skill setting exists; lets a client tell
+  // "default" from "the user turned this on".
+  bool default_enabled = 8;
+}
+message SkillCatalog { repeated SkillCatalogEntry skills = 1; }
+message SkillRef { string name = 1; }
+message SkillDetail {
+  SkillCatalogEntry entry = 1;
+  // The raw SKILL.md: frontmatter plus body.
+  string content = 2;
+  // Where it lives on disk; empty for a built-in.
+  string path = 3;
+}
+// Create or replace a user skill. `content` is the whole SKILL.md and its
+// frontmatter `name` must match `name`.
+message SkillPut {
+  string name = 1;
+  string content = 2;
+}
+message SkillEnabledMutation {
+  string name = 1;
+  bool enabled = 2;
+}
+
+// MCP servers (Borg as client).
+message McpServerRef { string name = 1; }
+
+// Operator-editable shape of one `mcp.servers` row. Tool include/exclude
+// lists stay on the CLI; a put keeps whatever the row already had.
+message McpServerSpec {
+  bool enabled = 1;
+  // "stdio" | "http" | "sse".
+  string transport = 2;
+  // stdio: executable plus argv, with extra env for the child.
+  string command = 3;
+  repeated string args = 4;
+  map<string, string> env = 5;
+  // http / sse: endpoint, headers, and an optional bearer token. Values may
+  // carry `${SECRET:NAME}` placeholders resolved at connect time.
+  string url = 6;
+  map<string, string> headers = 7;
+  string bearer_token = 8;
+  string client_cert = 9;
+  string client_key = 10;
+  string ca_cert = 11;
+  // Zero means "keep the daemon default".
+  uint64 connect_timeout_ms = 12;
+  uint64 call_timeout_ms = 13;
+  uint32 rate_limit_per_minute = 14;
+  uint32 rate_limit_burst = 15;
+  uint32 max_tools = 16;
+}
+
+message McpServerEntry {
+  string name = 1;
+  McpServerSpec spec = 2;
+  // Lifecycle label from the live registry: "connected" | "starting" |
+  // "reconnecting" | "auth-failed" | "degraded" | "not-started" |
+  // "disabled" | "live-disabled".
+  string state = 3;
+  uint32 tool_count = 4;
+  // Human-readable summary: the command line, or the URL.
+  string detail = 5;
+}
+
+message McpServerList {
+  repeated McpServerEntry servers = 1;
+  // The global `mcp.enabled` switch. When false nothing connects.
+  bool mcp_enabled = 2;
+  // Preset names `PutMcpServer.preset` accepts.
+  repeated string presets = 3;
+}
+
+// Create or replace a server. Either `spec` or `preset` (with an optional
+// `fs_root` for the filesystem preset). Replacing requires `overwrite`.
+message McpServerPut {
+  string name = 1;
+  McpServerSpec spec = 2;
+  string preset = 3;
+  string fs_root = 4;
+  bool overwrite = 5;
+}
+
+// One-shot connect + tools/list, without touching the live registry.
+message McpServerTestResult {
+  bool ok = 1;
+  string error = 2;
+  string server_info = 3;
+  repeated string tools = 4;
+}
 
 // Pairing.
 message PairingFilter { string channel_name = 1; } // empty = all

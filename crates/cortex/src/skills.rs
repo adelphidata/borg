@@ -21,6 +21,12 @@ pub use loader::{
 #[cfg(test)]
 use loader::{is_skill_disabled, load_builtin_skill};
 
+mod store;
+pub use store::{
+    delete_user_skill, delete_user_skill_in, skill_source, user_skill_dir,
+    validate_user_skill_name, write_user_skill, write_user_skill_in, MAX_SKILL_NAME_LEN,
+};
+
 mod context;
 #[cfg(test)]
 use context::skill_relevance_score;

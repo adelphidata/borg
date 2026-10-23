@@ -706,6 +706,150 @@ export interface SkillList {
   skills: SkillEntry[];
 }
 
+/**
+ * One skill as the operator's catalog shows it — every skill the loader
+ * knows, not only the ones the agent will load this run.
+ */
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  /** "builtin" | "user" | "project". */
+  source: string;
+  /** Enabled by config (or by default). A disabled skill is never loaded. */
+  enabled: boolean;
+  /** Enabled and its declared binaries / env vars are present. */
+  available: boolean;
+  /** Always loaded; the switch is not offered. */
+  mandatory: boolean;
+  category: string;
+  /**
+   * Enabled by default when no per-skill setting exists; lets a client tell
+   * "default" from "the user turned this on".
+   */
+  defaultEnabled: boolean;
+}
+
+export interface SkillCatalog {
+  skills: SkillCatalogEntry[];
+}
+
+export interface SkillRef {
+  name: string;
+}
+
+export interface SkillDetail {
+  entry?:
+    | SkillCatalogEntry
+    | undefined;
+  /** The raw SKILL.md: frontmatter plus body. */
+  content: string;
+  /** Where it lives on disk; empty for a built-in. */
+  path: string;
+}
+
+/**
+ * Create or replace a user skill. `content` is the whole SKILL.md and its
+ * frontmatter `name` must match `name`.
+ */
+export interface SkillPut {
+  name: string;
+  content: string;
+}
+
+export interface SkillEnabledMutation {
+  name: string;
+  enabled: boolean;
+}
+
+/** MCP servers (Borg as client). */
+export interface McpServerRef {
+  name: string;
+}
+
+/**
+ * Operator-editable shape of one `mcp.servers` row. Tool include/exclude
+ * lists stay on the CLI; a put keeps whatever the row already had.
+ */
+export interface McpServerSpec {
+  enabled: boolean;
+  /** "stdio" | "http" | "sse". */
+  transport: string;
+  /** stdio: executable plus argv, with extra env for the child. */
+  command: string;
+  args: string[];
+  env: { [key: string]: string };
+  /**
+   * http / sse: endpoint, headers, and an optional bearer token. Values may
+   * carry `${SECRET:NAME}` placeholders resolved at connect time.
+   */
+  url: string;
+  headers: { [key: string]: string };
+  bearerToken: string;
+  clientCert: string;
+  clientKey: string;
+  caCert: string;
+  /** Zero means "keep the daemon default". */
+  connectTimeoutMs: number;
+  callTimeoutMs: number;
+  rateLimitPerMinute: number;
+  rateLimitBurst: number;
+  maxTools: number;
+}
+
+export interface McpServerSpec_EnvEntry {
+  key: string;
+  value: string;
+}
+
+export interface McpServerSpec_HeadersEntry {
+  key: string;
+  value: string;
+}
+
+export interface McpServerEntry {
+  name: string;
+  spec?:
+    | McpServerSpec
+    | undefined;
+  /**
+   * Lifecycle label from the live registry: "connected" | "starting" |
+   * "reconnecting" | "auth-failed" | "degraded" | "not-started" |
+   * "disabled" | "live-disabled".
+   */
+  state: string;
+  toolCount: number;
+  /** Human-readable summary: the command line, or the URL. */
+  detail: string;
+}
+
+export interface McpServerList {
+  servers: McpServerEntry[];
+  /** The global `mcp.enabled` switch. When false nothing connects. */
+  mcpEnabled: boolean;
+  /** Preset names `PutMcpServer.preset` accepts. */
+  presets: string[];
+}
+
+/**
+ * Create or replace a server. Either `spec` or `preset` (with an optional
+ * `fs_root` for the filesystem preset). Replacing requires `overwrite`.
+ */
+export interface McpServerPut {
+  name: string;
+  spec?: McpServerSpec | undefined;
+  preset: string;
+  fsRoot: string;
+  overwrite: boolean;
+}
+
+/** One-shot connect + tools/list, without touching the live registry. */
+export interface McpServerTestResult {
+  ok: boolean;
+  error: string;
+  serverInfo: string;
+  tools: string[];
+}
+
 /** Pairing. */
 export interface PairingFilter {
   channelName: string;
@@ -9394,6 +9538,1776 @@ export const SkillList: MessageFns<SkillList> = {
   },
 };
 
+function createBaseSkillCatalogEntry(): SkillCatalogEntry {
+  return {
+    name: "",
+    description: "",
+    source: "",
+    enabled: false,
+    available: false,
+    mandatory: false,
+    category: "",
+    defaultEnabled: false,
+  };
+}
+
+export const SkillCatalogEntry: MessageFns<SkillCatalogEntry> = {
+  encode(message: SkillCatalogEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.description !== "") {
+      writer.uint32(18).string(message.description);
+    }
+    if (message.source !== "") {
+      writer.uint32(26).string(message.source);
+    }
+    if (message.enabled !== false) {
+      writer.uint32(32).bool(message.enabled);
+    }
+    if (message.available !== false) {
+      writer.uint32(40).bool(message.available);
+    }
+    if (message.mandatory !== false) {
+      writer.uint32(48).bool(message.mandatory);
+    }
+    if (message.category !== "") {
+      writer.uint32(58).string(message.category);
+    }
+    if (message.defaultEnabled !== false) {
+      writer.uint32(64).bool(message.defaultEnabled);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillCatalogEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillCatalogEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.description = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.source = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.enabled = reader.bool();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.available = reader.bool();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.mandatory = reader.bool();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.category = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.defaultEnabled = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillCatalogEntry {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      description: isSet(object.description) ? globalThis.String(object.description) : "",
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      enabled: isSet(object.enabled) ? globalThis.Boolean(object.enabled) : false,
+      available: isSet(object.available) ? globalThis.Boolean(object.available) : false,
+      mandatory: isSet(object.mandatory) ? globalThis.Boolean(object.mandatory) : false,
+      category: isSet(object.category) ? globalThis.String(object.category) : "",
+      defaultEnabled: isSet(object.defaultEnabled)
+        ? globalThis.Boolean(object.defaultEnabled)
+        : isSet(object.default_enabled)
+        ? globalThis.Boolean(object.default_enabled)
+        : false,
+    };
+  },
+
+  toJSON(message: SkillCatalogEntry): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.description !== "") {
+      obj.description = message.description;
+    }
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.enabled !== false) {
+      obj.enabled = message.enabled;
+    }
+    if (message.available !== false) {
+      obj.available = message.available;
+    }
+    if (message.mandatory !== false) {
+      obj.mandatory = message.mandatory;
+    }
+    if (message.category !== "") {
+      obj.category = message.category;
+    }
+    if (message.defaultEnabled !== false) {
+      obj.defaultEnabled = message.defaultEnabled;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillCatalogEntry>, I>>(base?: I): SkillCatalogEntry {
+    return SkillCatalogEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillCatalogEntry>, I>>(object: I): SkillCatalogEntry {
+    const message = createBaseSkillCatalogEntry();
+    message.name = object.name ?? "";
+    message.description = object.description ?? "";
+    message.source = object.source ?? "";
+    message.enabled = object.enabled ?? false;
+    message.available = object.available ?? false;
+    message.mandatory = object.mandatory ?? false;
+    message.category = object.category ?? "";
+    message.defaultEnabled = object.defaultEnabled ?? false;
+    return message;
+  },
+};
+
+function createBaseSkillCatalog(): SkillCatalog {
+  return { skills: [] };
+}
+
+export const SkillCatalog: MessageFns<SkillCatalog> = {
+  encode(message: SkillCatalog, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.skills) {
+      SkillCatalogEntry.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillCatalog {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillCatalog();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.skills.push(SkillCatalogEntry.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillCatalog {
+    return {
+      skills: globalThis.Array.isArray(object?.skills)
+        ? object.skills.map((e: any) => SkillCatalogEntry.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SkillCatalog): unknown {
+    const obj: any = {};
+    if (message.skills?.length) {
+      obj.skills = message.skills.map((e) => SkillCatalogEntry.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillCatalog>, I>>(base?: I): SkillCatalog {
+    return SkillCatalog.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillCatalog>, I>>(object: I): SkillCatalog {
+    const message = createBaseSkillCatalog();
+    message.skills = object.skills?.map((e) => SkillCatalogEntry.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSkillRef(): SkillRef {
+  return { name: "" };
+}
+
+export const SkillRef: MessageFns<SkillRef> = {
+  encode(message: SkillRef, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillRef {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillRef();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillRef {
+    return { name: isSet(object.name) ? globalThis.String(object.name) : "" };
+  },
+
+  toJSON(message: SkillRef): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillRef>, I>>(base?: I): SkillRef {
+    return SkillRef.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillRef>, I>>(object: I): SkillRef {
+    const message = createBaseSkillRef();
+    message.name = object.name ?? "";
+    return message;
+  },
+};
+
+function createBaseSkillDetail(): SkillDetail {
+  return { entry: undefined, content: "", path: "" };
+}
+
+export const SkillDetail: MessageFns<SkillDetail> = {
+  encode(message: SkillDetail, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.entry !== undefined) {
+      SkillCatalogEntry.encode(message.entry, writer.uint32(10).fork()).join();
+    }
+    if (message.content !== "") {
+      writer.uint32(18).string(message.content);
+    }
+    if (message.path !== "") {
+      writer.uint32(26).string(message.path);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillDetail {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillDetail();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.entry = SkillCatalogEntry.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.content = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.path = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillDetail {
+    return {
+      entry: isSet(object.entry) ? SkillCatalogEntry.fromJSON(object.entry) : undefined,
+      content: isSet(object.content) ? globalThis.String(object.content) : "",
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+    };
+  },
+
+  toJSON(message: SkillDetail): unknown {
+    const obj: any = {};
+    if (message.entry !== undefined) {
+      obj.entry = SkillCatalogEntry.toJSON(message.entry);
+    }
+    if (message.content !== "") {
+      obj.content = message.content;
+    }
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillDetail>, I>>(base?: I): SkillDetail {
+    return SkillDetail.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillDetail>, I>>(object: I): SkillDetail {
+    const message = createBaseSkillDetail();
+    message.entry = (object.entry !== undefined && object.entry !== null)
+      ? SkillCatalogEntry.fromPartial(object.entry)
+      : undefined;
+    message.content = object.content ?? "";
+    message.path = object.path ?? "";
+    return message;
+  },
+};
+
+function createBaseSkillPut(): SkillPut {
+  return { name: "", content: "" };
+}
+
+export const SkillPut: MessageFns<SkillPut> = {
+  encode(message: SkillPut, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.content !== "") {
+      writer.uint32(18).string(message.content);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillPut {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillPut();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.content = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillPut {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      content: isSet(object.content) ? globalThis.String(object.content) : "",
+    };
+  },
+
+  toJSON(message: SkillPut): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.content !== "") {
+      obj.content = message.content;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillPut>, I>>(base?: I): SkillPut {
+    return SkillPut.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillPut>, I>>(object: I): SkillPut {
+    const message = createBaseSkillPut();
+    message.name = object.name ?? "";
+    message.content = object.content ?? "";
+    return message;
+  },
+};
+
+function createBaseSkillEnabledMutation(): SkillEnabledMutation {
+  return { name: "", enabled: false };
+}
+
+export const SkillEnabledMutation: MessageFns<SkillEnabledMutation> = {
+  encode(message: SkillEnabledMutation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.enabled !== false) {
+      writer.uint32(16).bool(message.enabled);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SkillEnabledMutation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSkillEnabledMutation();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.enabled = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SkillEnabledMutation {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      enabled: isSet(object.enabled) ? globalThis.Boolean(object.enabled) : false,
+    };
+  },
+
+  toJSON(message: SkillEnabledMutation): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.enabled !== false) {
+      obj.enabled = message.enabled;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SkillEnabledMutation>, I>>(base?: I): SkillEnabledMutation {
+    return SkillEnabledMutation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SkillEnabledMutation>, I>>(object: I): SkillEnabledMutation {
+    const message = createBaseSkillEnabledMutation();
+    message.name = object.name ?? "";
+    message.enabled = object.enabled ?? false;
+    return message;
+  },
+};
+
+function createBaseMcpServerRef(): McpServerRef {
+  return { name: "" };
+}
+
+export const McpServerRef: MessageFns<McpServerRef> = {
+  encode(message: McpServerRef, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerRef {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerRef();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerRef {
+    return { name: isSet(object.name) ? globalThis.String(object.name) : "" };
+  },
+
+  toJSON(message: McpServerRef): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerRef>, I>>(base?: I): McpServerRef {
+    return McpServerRef.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerRef>, I>>(object: I): McpServerRef {
+    const message = createBaseMcpServerRef();
+    message.name = object.name ?? "";
+    return message;
+  },
+};
+
+function createBaseMcpServerSpec(): McpServerSpec {
+  return {
+    enabled: false,
+    transport: "",
+    command: "",
+    args: [],
+    env: {},
+    url: "",
+    headers: {},
+    bearerToken: "",
+    clientCert: "",
+    clientKey: "",
+    caCert: "",
+    connectTimeoutMs: 0,
+    callTimeoutMs: 0,
+    rateLimitPerMinute: 0,
+    rateLimitBurst: 0,
+    maxTools: 0,
+  };
+}
+
+export const McpServerSpec: MessageFns<McpServerSpec> = {
+  encode(message: McpServerSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.enabled !== false) {
+      writer.uint32(8).bool(message.enabled);
+    }
+    if (message.transport !== "") {
+      writer.uint32(18).string(message.transport);
+    }
+    if (message.command !== "") {
+      writer.uint32(26).string(message.command);
+    }
+    for (const v of message.args) {
+      writer.uint32(34).string(v!);
+    }
+    globalThis.Object.entries(message.env).forEach(([key, value]: [string, string]) => {
+      McpServerSpec_EnvEntry.encode({ key: key as any, value }, writer.uint32(42).fork()).join();
+    });
+    if (message.url !== "") {
+      writer.uint32(50).string(message.url);
+    }
+    globalThis.Object.entries(message.headers).forEach(([key, value]: [string, string]) => {
+      McpServerSpec_HeadersEntry.encode({ key: key as any, value }, writer.uint32(58).fork()).join();
+    });
+    if (message.bearerToken !== "") {
+      writer.uint32(66).string(message.bearerToken);
+    }
+    if (message.clientCert !== "") {
+      writer.uint32(74).string(message.clientCert);
+    }
+    if (message.clientKey !== "") {
+      writer.uint32(82).string(message.clientKey);
+    }
+    if (message.caCert !== "") {
+      writer.uint32(90).string(message.caCert);
+    }
+    if (message.connectTimeoutMs !== 0) {
+      writer.uint32(96).uint64(message.connectTimeoutMs);
+    }
+    if (message.callTimeoutMs !== 0) {
+      writer.uint32(104).uint64(message.callTimeoutMs);
+    }
+    if (message.rateLimitPerMinute !== 0) {
+      writer.uint32(112).uint32(message.rateLimitPerMinute);
+    }
+    if (message.rateLimitBurst !== 0) {
+      writer.uint32(120).uint32(message.rateLimitBurst);
+    }
+    if (message.maxTools !== 0) {
+      writer.uint32(128).uint32(message.maxTools);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerSpec {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerSpec();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.enabled = reader.bool();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.transport = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.command = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.args.push(reader.string());
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            const entry5 = McpServerSpec_EnvEntry.decode(reader, reader.uint32());
+            if (entry5.value !== undefined) {
+              message.env[entry5.key] = entry5.value;
+            }
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.url = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            const entry7 = McpServerSpec_HeadersEntry.decode(reader, reader.uint32());
+            if (entry7.value !== undefined) {
+              message.headers[entry7.key] = entry7.value;
+            }
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.bearerToken = reader.string();
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.clientCert = reader.string();
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.clientKey = reader.string();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.caCert = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 96) {
+              break;
+            }
+
+            message.connectTimeoutMs = longToNumber(reader.uint64());
+            continue;
+          }
+          case 13: {
+            if (tag !== 104) {
+              break;
+            }
+
+            message.callTimeoutMs = longToNumber(reader.uint64());
+            continue;
+          }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.rateLimitPerMinute = reader.uint32();
+            continue;
+          }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.rateLimitBurst = reader.uint32();
+            continue;
+          }
+          case 16: {
+            if (tag !== 128) {
+              break;
+            }
+
+            message.maxTools = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerSpec {
+    return {
+      enabled: isSet(object.enabled) ? globalThis.Boolean(object.enabled) : false,
+      transport: isSet(object.transport) ? globalThis.String(object.transport) : "",
+      command: isSet(object.command) ? globalThis.String(object.command) : "",
+      args: globalThis.Array.isArray(object?.args) ? object.args.map((e: any) => globalThis.String(e)) : [],
+      env: isObject(object.env)
+        ? (globalThis.Object.entries(object.env) as [string, any][]).reduce(
+          (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+            globalThis.Object.defineProperty(acc, key, {
+              value: globalThis.String(value),
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            });
+            return acc;
+          },
+          {},
+        )
+        : {},
+      url: isSet(object.url) ? globalThis.String(object.url) : "",
+      headers: isObject(object.headers)
+        ? (globalThis.Object.entries(object.headers) as [string, any][]).reduce(
+          (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+            globalThis.Object.defineProperty(acc, key, {
+              value: globalThis.String(value),
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            });
+            return acc;
+          },
+          {},
+        )
+        : {},
+      bearerToken: isSet(object.bearerToken)
+        ? globalThis.String(object.bearerToken)
+        : isSet(object.bearer_token)
+        ? globalThis.String(object.bearer_token)
+        : "",
+      clientCert: isSet(object.clientCert)
+        ? globalThis.String(object.clientCert)
+        : isSet(object.client_cert)
+        ? globalThis.String(object.client_cert)
+        : "",
+      clientKey: isSet(object.clientKey)
+        ? globalThis.String(object.clientKey)
+        : isSet(object.client_key)
+        ? globalThis.String(object.client_key)
+        : "",
+      caCert: isSet(object.caCert)
+        ? globalThis.String(object.caCert)
+        : isSet(object.ca_cert)
+        ? globalThis.String(object.ca_cert)
+        : "",
+      connectTimeoutMs: isSet(object.connectTimeoutMs)
+        ? globalThis.Number(object.connectTimeoutMs)
+        : isSet(object.connect_timeout_ms)
+        ? globalThis.Number(object.connect_timeout_ms)
+        : 0,
+      callTimeoutMs: isSet(object.callTimeoutMs)
+        ? globalThis.Number(object.callTimeoutMs)
+        : isSet(object.call_timeout_ms)
+        ? globalThis.Number(object.call_timeout_ms)
+        : 0,
+      rateLimitPerMinute: isSet(object.rateLimitPerMinute)
+        ? globalThis.Number(object.rateLimitPerMinute)
+        : isSet(object.rate_limit_per_minute)
+        ? globalThis.Number(object.rate_limit_per_minute)
+        : 0,
+      rateLimitBurst: isSet(object.rateLimitBurst)
+        ? globalThis.Number(object.rateLimitBurst)
+        : isSet(object.rate_limit_burst)
+        ? globalThis.Number(object.rate_limit_burst)
+        : 0,
+      maxTools: isSet(object.maxTools)
+        ? globalThis.Number(object.maxTools)
+        : isSet(object.max_tools)
+        ? globalThis.Number(object.max_tools)
+        : 0,
+    };
+  },
+
+  toJSON(message: McpServerSpec): unknown {
+    const obj: any = {};
+    if (message.enabled !== false) {
+      obj.enabled = message.enabled;
+    }
+    if (message.transport !== "") {
+      obj.transport = message.transport;
+    }
+    if (message.command !== "") {
+      obj.command = message.command;
+    }
+    if (message.args?.length) {
+      obj.args = message.args;
+    }
+    if (message.env) {
+      const entries = globalThis.Object.entries(message.env) as [string, string][];
+      if (entries.length > 0) {
+        obj.env = {};
+        entries.forEach(([k, v]) => {
+          obj.env[k] = v;
+        });
+      }
+    }
+    if (message.url !== "") {
+      obj.url = message.url;
+    }
+    if (message.headers) {
+      const entries = globalThis.Object.entries(message.headers) as [string, string][];
+      if (entries.length > 0) {
+        obj.headers = {};
+        entries.forEach(([k, v]) => {
+          obj.headers[k] = v;
+        });
+      }
+    }
+    if (message.bearerToken !== "") {
+      obj.bearerToken = message.bearerToken;
+    }
+    if (message.clientCert !== "") {
+      obj.clientCert = message.clientCert;
+    }
+    if (message.clientKey !== "") {
+      obj.clientKey = message.clientKey;
+    }
+    if (message.caCert !== "") {
+      obj.caCert = message.caCert;
+    }
+    if (message.connectTimeoutMs !== 0) {
+      obj.connectTimeoutMs = Math.round(message.connectTimeoutMs);
+    }
+    if (message.callTimeoutMs !== 0) {
+      obj.callTimeoutMs = Math.round(message.callTimeoutMs);
+    }
+    if (message.rateLimitPerMinute !== 0) {
+      obj.rateLimitPerMinute = Math.round(message.rateLimitPerMinute);
+    }
+    if (message.rateLimitBurst !== 0) {
+      obj.rateLimitBurst = Math.round(message.rateLimitBurst);
+    }
+    if (message.maxTools !== 0) {
+      obj.maxTools = Math.round(message.maxTools);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerSpec>, I>>(base?: I): McpServerSpec {
+    return McpServerSpec.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerSpec>, I>>(object: I): McpServerSpec {
+    const message = createBaseMcpServerSpec();
+    message.enabled = object.enabled ?? false;
+    message.transport = object.transport ?? "";
+    message.command = object.command ?? "";
+    message.args = object.args?.map((e) => e) || [];
+    message.env = (globalThis.Object.entries(object.env ?? {}) as [string, string][]).reduce(
+      (acc: { [key: string]: string }, [key, value]: [string, string]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.String(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    message.url = object.url ?? "";
+    message.headers = (globalThis.Object.entries(object.headers ?? {}) as [string, string][]).reduce(
+      (acc: { [key: string]: string }, [key, value]: [string, string]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.String(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    message.bearerToken = object.bearerToken ?? "";
+    message.clientCert = object.clientCert ?? "";
+    message.clientKey = object.clientKey ?? "";
+    message.caCert = object.caCert ?? "";
+    message.connectTimeoutMs = object.connectTimeoutMs ?? 0;
+    message.callTimeoutMs = object.callTimeoutMs ?? 0;
+    message.rateLimitPerMinute = object.rateLimitPerMinute ?? 0;
+    message.rateLimitBurst = object.rateLimitBurst ?? 0;
+    message.maxTools = object.maxTools ?? 0;
+    return message;
+  },
+};
+
+function createBaseMcpServerSpec_EnvEntry(): McpServerSpec_EnvEntry {
+  return { key: "", value: "" };
+}
+
+export const McpServerSpec_EnvEntry: MessageFns<McpServerSpec_EnvEntry> = {
+  encode(message: McpServerSpec_EnvEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerSpec_EnvEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerSpec_EnvEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerSpec_EnvEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: McpServerSpec_EnvEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerSpec_EnvEntry>, I>>(base?: I): McpServerSpec_EnvEntry {
+    return McpServerSpec_EnvEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerSpec_EnvEntry>, I>>(object: I): McpServerSpec_EnvEntry {
+    const message = createBaseMcpServerSpec_EnvEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseMcpServerSpec_HeadersEntry(): McpServerSpec_HeadersEntry {
+  return { key: "", value: "" };
+}
+
+export const McpServerSpec_HeadersEntry: MessageFns<McpServerSpec_HeadersEntry> = {
+  encode(message: McpServerSpec_HeadersEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerSpec_HeadersEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerSpec_HeadersEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.value = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerSpec_HeadersEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: McpServerSpec_HeadersEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerSpec_HeadersEntry>, I>>(base?: I): McpServerSpec_HeadersEntry {
+    return McpServerSpec_HeadersEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerSpec_HeadersEntry>, I>>(object: I): McpServerSpec_HeadersEntry {
+    const message = createBaseMcpServerSpec_HeadersEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseMcpServerEntry(): McpServerEntry {
+  return { name: "", spec: undefined, state: "", toolCount: 0, detail: "" };
+}
+
+export const McpServerEntry: MessageFns<McpServerEntry> = {
+  encode(message: McpServerEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.spec !== undefined) {
+      McpServerSpec.encode(message.spec, writer.uint32(18).fork()).join();
+    }
+    if (message.state !== "") {
+      writer.uint32(26).string(message.state);
+    }
+    if (message.toolCount !== 0) {
+      writer.uint32(32).uint32(message.toolCount);
+    }
+    if (message.detail !== "") {
+      writer.uint32(42).string(message.detail);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerEntry();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.spec = McpServerSpec.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.state = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.toolCount = reader.uint32();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.detail = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerEntry {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      spec: isSet(object.spec) ? McpServerSpec.fromJSON(object.spec) : undefined,
+      state: isSet(object.state) ? globalThis.String(object.state) : "",
+      toolCount: isSet(object.toolCount)
+        ? globalThis.Number(object.toolCount)
+        : isSet(object.tool_count)
+        ? globalThis.Number(object.tool_count)
+        : 0,
+      detail: isSet(object.detail) ? globalThis.String(object.detail) : "",
+    };
+  },
+
+  toJSON(message: McpServerEntry): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.spec !== undefined) {
+      obj.spec = McpServerSpec.toJSON(message.spec);
+    }
+    if (message.state !== "") {
+      obj.state = message.state;
+    }
+    if (message.toolCount !== 0) {
+      obj.toolCount = Math.round(message.toolCount);
+    }
+    if (message.detail !== "") {
+      obj.detail = message.detail;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerEntry>, I>>(base?: I): McpServerEntry {
+    return McpServerEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerEntry>, I>>(object: I): McpServerEntry {
+    const message = createBaseMcpServerEntry();
+    message.name = object.name ?? "";
+    message.spec = (object.spec !== undefined && object.spec !== null)
+      ? McpServerSpec.fromPartial(object.spec)
+      : undefined;
+    message.state = object.state ?? "";
+    message.toolCount = object.toolCount ?? 0;
+    message.detail = object.detail ?? "";
+    return message;
+  },
+};
+
+function createBaseMcpServerList(): McpServerList {
+  return { servers: [], mcpEnabled: false, presets: [] };
+}
+
+export const McpServerList: MessageFns<McpServerList> = {
+  encode(message: McpServerList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.servers) {
+      McpServerEntry.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.mcpEnabled !== false) {
+      writer.uint32(16).bool(message.mcpEnabled);
+    }
+    for (const v of message.presets) {
+      writer.uint32(26).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.servers.push(McpServerEntry.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.mcpEnabled = reader.bool();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.presets.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerList {
+    return {
+      servers: globalThis.Array.isArray(object?.servers)
+        ? object.servers.map((e: any) => McpServerEntry.fromJSON(e))
+        : [],
+      mcpEnabled: isSet(object.mcpEnabled)
+        ? globalThis.Boolean(object.mcpEnabled)
+        : isSet(object.mcp_enabled)
+        ? globalThis.Boolean(object.mcp_enabled)
+        : false,
+      presets: globalThis.Array.isArray(object?.presets) ? object.presets.map((e: any) => globalThis.String(e)) : [],
+    };
+  },
+
+  toJSON(message: McpServerList): unknown {
+    const obj: any = {};
+    if (message.servers?.length) {
+      obj.servers = message.servers.map((e) => McpServerEntry.toJSON(e));
+    }
+    if (message.mcpEnabled !== false) {
+      obj.mcpEnabled = message.mcpEnabled;
+    }
+    if (message.presets?.length) {
+      obj.presets = message.presets;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerList>, I>>(base?: I): McpServerList {
+    return McpServerList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerList>, I>>(object: I): McpServerList {
+    const message = createBaseMcpServerList();
+    message.servers = object.servers?.map((e) => McpServerEntry.fromPartial(e)) || [];
+    message.mcpEnabled = object.mcpEnabled ?? false;
+    message.presets = object.presets?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseMcpServerPut(): McpServerPut {
+  return { name: "", spec: undefined, preset: "", fsRoot: "", overwrite: false };
+}
+
+export const McpServerPut: MessageFns<McpServerPut> = {
+  encode(message: McpServerPut, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.name !== "") {
+      writer.uint32(10).string(message.name);
+    }
+    if (message.spec !== undefined) {
+      McpServerSpec.encode(message.spec, writer.uint32(18).fork()).join();
+    }
+    if (message.preset !== "") {
+      writer.uint32(26).string(message.preset);
+    }
+    if (message.fsRoot !== "") {
+      writer.uint32(34).string(message.fsRoot);
+    }
+    if (message.overwrite !== false) {
+      writer.uint32(40).bool(message.overwrite);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerPut {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerPut();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.spec = McpServerSpec.decode(reader, reader.uint32());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.preset = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.fsRoot = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.overwrite = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerPut {
+    return {
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      spec: isSet(object.spec) ? McpServerSpec.fromJSON(object.spec) : undefined,
+      preset: isSet(object.preset) ? globalThis.String(object.preset) : "",
+      fsRoot: isSet(object.fsRoot)
+        ? globalThis.String(object.fsRoot)
+        : isSet(object.fs_root)
+        ? globalThis.String(object.fs_root)
+        : "",
+      overwrite: isSet(object.overwrite) ? globalThis.Boolean(object.overwrite) : false,
+    };
+  },
+
+  toJSON(message: McpServerPut): unknown {
+    const obj: any = {};
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.spec !== undefined) {
+      obj.spec = McpServerSpec.toJSON(message.spec);
+    }
+    if (message.preset !== "") {
+      obj.preset = message.preset;
+    }
+    if (message.fsRoot !== "") {
+      obj.fsRoot = message.fsRoot;
+    }
+    if (message.overwrite !== false) {
+      obj.overwrite = message.overwrite;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerPut>, I>>(base?: I): McpServerPut {
+    return McpServerPut.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerPut>, I>>(object: I): McpServerPut {
+    const message = createBaseMcpServerPut();
+    message.name = object.name ?? "";
+    message.spec = (object.spec !== undefined && object.spec !== null)
+      ? McpServerSpec.fromPartial(object.spec)
+      : undefined;
+    message.preset = object.preset ?? "";
+    message.fsRoot = object.fsRoot ?? "";
+    message.overwrite = object.overwrite ?? false;
+    return message;
+  },
+};
+
+function createBaseMcpServerTestResult(): McpServerTestResult {
+  return { ok: false, error: "", serverInfo: "", tools: [] };
+}
+
+export const McpServerTestResult: MessageFns<McpServerTestResult> = {
+  encode(message: McpServerTestResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.ok !== false) {
+      writer.uint32(8).bool(message.ok);
+    }
+    if (message.error !== "") {
+      writer.uint32(18).string(message.error);
+    }
+    if (message.serverInfo !== "") {
+      writer.uint32(26).string(message.serverInfo);
+    }
+    for (const v of message.tools) {
+      writer.uint32(34).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): McpServerTestResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseMcpServerTestResult();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.ok = reader.bool();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.error = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.serverInfo = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.tools.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): McpServerTestResult {
+    return {
+      ok: isSet(object.ok) ? globalThis.Boolean(object.ok) : false,
+      error: isSet(object.error) ? globalThis.String(object.error) : "",
+      serverInfo: isSet(object.serverInfo)
+        ? globalThis.String(object.serverInfo)
+        : isSet(object.server_info)
+        ? globalThis.String(object.server_info)
+        : "",
+      tools: globalThis.Array.isArray(object?.tools) ? object.tools.map((e: any) => globalThis.String(e)) : [],
+    };
+  },
+
+  toJSON(message: McpServerTestResult): unknown {
+    const obj: any = {};
+    if (message.ok !== false) {
+      obj.ok = message.ok;
+    }
+    if (message.error !== "") {
+      obj.error = message.error;
+    }
+    if (message.serverInfo !== "") {
+      obj.serverInfo = message.serverInfo;
+    }
+    if (message.tools?.length) {
+      obj.tools = message.tools;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<McpServerTestResult>, I>>(base?: I): McpServerTestResult {
+    return McpServerTestResult.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<McpServerTestResult>, I>>(object: I): McpServerTestResult {
+    const message = createBaseMcpServerTestResult();
+    message.ok = object.ok ?? false;
+    message.error = object.error ?? "";
+    message.serverInfo = object.serverInfo ?? "";
+    message.tools = object.tools?.map((e) => e) || [];
+    return message;
+  },
+};
+
 function createBasePairingFilter(): PairingFilter {
   return { channelName: "" };
 }
@@ -15527,6 +17441,89 @@ export const AdminDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Skill management. `ListSkillCatalog` is the operator's view: every skill
+     * the loader knows, including disabled and unavailable ones, so a client
+     * can offer the switch. Writes land under `~/.borg/skills/<name>/SKILL.md`
+     * and the per-skill `skills.entries.<name>.enabled` setting.
+     */
+    listSkillCatalog: {
+      name: "ListSkillCatalog",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SkillCatalog as typeof SkillCatalog,
+      responseStream: false,
+      options: {},
+    },
+    getSkill: {
+      name: "GetSkill",
+      requestType: SkillRef as typeof SkillRef,
+      requestStream: false,
+      responseType: SkillDetail as typeof SkillDetail,
+      responseStream: false,
+      options: {},
+    },
+    putSkill: {
+      name: "PutSkill",
+      requestType: SkillPut as typeof SkillPut,
+      requestStream: false,
+      responseType: SkillDetail as typeof SkillDetail,
+      responseStream: false,
+      options: {},
+    },
+    deleteSkill: {
+      name: "DeleteSkill",
+      requestType: SkillRef as typeof SkillRef,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    setSkillEnabled: {
+      name: "SetSkillEnabled",
+      requestType: SkillEnabledMutation as typeof SkillEnabledMutation,
+      requestStream: false,
+      responseType: SkillDetail as typeof SkillDetail,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * MCP servers Borg connects to as a client. Writes land in the
+     * `mcp.servers` setting and the live registry is reloaded in the
+     * background; `ListMcpServers` joins config with the registry's view.
+     */
+    listMcpServers: {
+      name: "ListMcpServers",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: McpServerList as typeof McpServerList,
+      responseStream: false,
+      options: {},
+    },
+    putMcpServer: {
+      name: "PutMcpServer",
+      requestType: McpServerPut as typeof McpServerPut,
+      requestStream: false,
+      responseType: McpServerEntry as typeof McpServerEntry,
+      responseStream: false,
+      options: {},
+    },
+    removeMcpServer: {
+      name: "RemoveMcpServer",
+      requestType: McpServerRef as typeof McpServerRef,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    testMcpServer: {
+      name: "TestMcpServer",
+      requestType: McpServerRef as typeof McpServerRef,
+      requestStream: false,
+      responseType: McpServerTestResult as typeof McpServerTestResult,
+      responseStream: false,
+      options: {},
+    },
     /** Pairing requests + approved senders. */
     listPairingRequests: {
       name: "ListPairingRequests",
@@ -16168,6 +18165,10 @@ function longToNumber(int64: { toString(): string }): number {
     throw new globalThis.Error("Value is smaller than Number.MIN_SAFE_INTEGER");
   }
   return num;
+}
+
+function isObject(value: any): boolean {
+  return typeof value === "object" && value !== null;
 }
 
 function isSet(value: any): boolean {
