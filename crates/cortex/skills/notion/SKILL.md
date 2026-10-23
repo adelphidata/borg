@@ -9,6 +9,13 @@ triggers:
 requires:
   bins: ["curl", "jq"]
   env: ["NOTION_API_KEY"]
+install:
+  curl:
+    brew: curl
+    apt: curl
+  jq:
+    brew: jq
+    apt: jq
 ---
 
 # Notion

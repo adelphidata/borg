@@ -3,6 +3,10 @@ name: weather
 description: "Weather forecasts via wttr.in"
 requires:
   bins: ["curl"]
+install:
+  curl:
+    brew: curl
+    apt: curl
 ---
 
 # Weather

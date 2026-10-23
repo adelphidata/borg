@@ -68,6 +68,100 @@ pub struct InstallSpec {
     pub url: Option<String>,
 }
 
+/// A package manager that can put a missing binary on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    Brew,
+    Apt,
+    Npm,
+}
+
+/// One package-manager install, ready to show or to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallCommand {
+    pub manager: PackageManager,
+    pub package: String,
+}
+
+impl InstallCommand {
+    /// The program and its arguments. Never a shell string: the package
+    /// name comes from a skill's frontmatter.
+    pub fn argv(&self) -> (&'static str, Vec<String>) {
+        let package = self.package.clone();
+        match self.manager {
+            PackageManager::Brew => ("brew", vec!["install".into(), package]),
+            PackageManager::Apt => (
+                "sudo",
+                vec!["apt".into(), "install".into(), "-y".into(), package],
+            ),
+            PackageManager::Npm => ("npm", vec!["install".into(), "-g".into(), package]),
+        }
+    }
+
+    /// The command as someone would type it in a terminal.
+    pub fn display(&self) -> String {
+        let (program, args) = self.argv();
+        format!("{program} {}", args.join(" "))
+    }
+
+    /// Whether it runs with no one at a terminal: apt asks for a sudo
+    /// password, brew and npm do not.
+    pub fn unattended(&self) -> bool {
+        self.manager != PackageManager::Apt
+    }
+}
+
+/// A name a package manager reads as a package, never as a flag.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@/._+-".contains(c))
+}
+
+impl InstallSpec {
+    /// The install command for this machine: brew on macOS; apt, then brew,
+    /// on Linux; npm anywhere as the fallback. `None` when the spec names no
+    /// manager this machine uses, which leaves `url` as the only way.
+    pub fn command(&self) -> Option<InstallCommand> {
+        let order: &[PackageManager] = if cfg!(target_os = "macos") {
+            &[PackageManager::Brew, PackageManager::Npm]
+        } else if cfg!(target_os = "linux") {
+            &[
+                PackageManager::Apt,
+                PackageManager::Brew,
+                PackageManager::Npm,
+            ]
+        } else {
+            &[PackageManager::Npm]
+        };
+        order.iter().find_map(|&manager| {
+            let package = match manager {
+                PackageManager::Brew => self.brew.as_deref(),
+                PackageManager::Apt => self.apt.as_deref(),
+                PackageManager::Npm => self.npm.as_deref(),
+            }?;
+            is_package_name(package).then(|| InstallCommand {
+                manager,
+                package: package.to_string(),
+            })
+        })
+    }
+}
+
+/// One requirement a skill is still waiting on before it can run here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillNeed {
+    /// Runs only on these systems; nothing installed here changes that.
+    Os(Vec<String>),
+    /// Any one of these binaries on `$PATH`: one name for a `bins` entry,
+    /// the whole list for `any_bins`.
+    Bin(Vec<String>),
+    /// An environment variable, or a `[credentials]` entry of that name.
+    Env(String),
+}
+
 /// Legacy `prerequisites` block from agentskills.io frontmatter. Normalized
 /// into `SkillRequires` at parse time so the rest of the loader doesn't have
 /// to know about two shapes.
@@ -353,43 +447,29 @@ impl Skill {
         line
     }
 
-    /// Return a platform-appropriate install command for missing dependencies.
-    /// Looks at the `install` map in the manifest and picks the best option
-    /// for the current OS: brew (macOS), apt (Linux), npm, or url as fallback.
+    /// The install commands for this machine, one per dependency in the
+    /// `install` map, with a link where no package manager fits.
     pub fn install_hint(&self) -> Option<String> {
-        if self.manifest.install.is_empty() {
-            return None;
-        }
-
-        let mut hints = Vec::new();
         let mut keys: Vec<_> = self.manifest.install.keys().collect();
         keys.sort();
-        for key in keys {
-            let spec = &self.manifest.install[key];
-            let hint = if cfg!(target_os = "macos") {
-                spec.brew
-                    .as_deref()
-                    .map(|b| format!("brew install {b}"))
-                    .or_else(|| spec.npm.as_deref().map(|n| format!("npm install -g {n}")))
+        let hints: Vec<String> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let spec = &self.manifest.install[key];
+                spec.command()
+                    .map(|c| c.display())
                     .or_else(|| spec.url.as_deref().map(|u| format!("See: {u}")))
-            } else {
-                spec.apt
-                    .as_deref()
-                    .map(|a| format!("apt install {a}"))
-                    .or_else(|| spec.brew.as_deref().map(|b| format!("brew install {b}")))
-                    .or_else(|| spec.npm.as_deref().map(|n| format!("npm install -g {n}")))
-                    .or_else(|| spec.url.as_deref().map(|u| format!("See: {u}")))
-            };
-            if let Some(h) = hint {
-                hints.push(h);
-            }
-        }
+            })
+            .collect();
+        (!hints.is_empty()).then(|| hints.join("; "))
+    }
 
-        if hints.is_empty() {
-            None
-        } else {
-            Some(hints.join("; "))
-        }
+    /// What this skill still needs before it can run here, probed now.
+    pub fn needs(
+        &self,
+        resolved_creds: &std::collections::HashMap<String, String>,
+    ) -> Vec<SkillNeed> {
+        unmet_requirements(&self.manifest.requires, &self.manifest.os, resolved_creds)
     }
 }
 
@@ -565,19 +645,22 @@ pub(super) fn check_os_requirements(os: &[String]) -> bool {
         .any(|o| o == current || (o == "darwin" && current == "macos"))
 }
 
-pub(super) fn check_requirements(
+/// Every requirement not met on this machine. An unsupported system is the
+/// only need reported then: installing anything else would not help.
+pub(super) fn unmet_requirements(
     requires: &SkillRequires,
     os: &[String],
     resolved_creds: &std::collections::HashMap<String, String>,
-) -> bool {
+) -> Vec<SkillNeed> {
     if !check_os_requirements(os) {
         trace!("Skill requirement missing: unsupported OS (need {:?})", os);
-        return false;
+        return vec![SkillNeed::Os(os.to_vec())];
     }
+    let mut needs = Vec::new();
     for bin in &requires.bins {
         if which::which(bin).is_err() {
             trace!("Skill requirement missing: binary '{bin}'");
-            return false;
+            needs.push(SkillNeed::Bin(vec![bin.clone()]));
         }
     }
     if !requires.any_bins.is_empty() && !requires.any_bins.iter().any(|b| which::which(b).is_ok()) {
@@ -585,13 +668,21 @@ pub(super) fn check_requirements(
             "Skill requirement missing: none of {:?} found",
             requires.any_bins
         );
-        return false;
+        needs.push(SkillNeed::Bin(requires.any_bins.clone()));
     }
     for var in &requires.env {
         if std::env::var(var).is_err() && !resolved_creds.contains_key(var) {
             trace!("Skill requirement missing: env var '{var}'");
-            return false;
+            needs.push(SkillNeed::Env(var.clone()));
         }
     }
-    true
+    needs
+}
+
+pub(super) fn check_requirements(
+    requires: &SkillRequires,
+    os: &[String],
+    resolved_creds: &std::collections::HashMap<String, String>,
+) -> bool {
+    unmet_requirements(requires, os, resolved_creds).is_empty()
 }

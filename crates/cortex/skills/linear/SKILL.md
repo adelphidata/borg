@@ -4,6 +4,13 @@ description: "Manage Linear issues, projects, and cycles via the GraphQL API"
 requires:
   bins: ["curl", "jq"]
   env: ["LINEAR_API_KEY"]
+install:
+  curl:
+    brew: curl
+    apt: curl
+  jq:
+    brew: jq
+    apt: jq
 ---
 
 # Linear

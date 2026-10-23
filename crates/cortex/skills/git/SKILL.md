@@ -8,6 +8,10 @@ triggers:
   - "inspect git history"
 requires:
   bins: ["git"]
+install:
+  git:
+    brew: git
+    apt: git
 ---
 
 # Git

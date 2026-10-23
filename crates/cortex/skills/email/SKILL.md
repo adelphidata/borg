@@ -9,6 +9,10 @@ triggers:
   - "email inbox"
 requires:
   bins: ["himalaya"]
+install:
+  himalaya:
+    brew: himalaya
+    url: "https://github.com/pimalaya/himalaya"
 ---
 
 # Email

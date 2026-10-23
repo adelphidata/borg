@@ -8,6 +8,10 @@ triggers:
   - "merge pdfs"
 requires:
   bins: ["pdftotext"]
+install:
+  pdftotext:
+    brew: poppler
+    apt: poppler-utils
 ---
 
 # PDF

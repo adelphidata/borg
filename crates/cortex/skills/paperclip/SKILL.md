@@ -3,6 +3,14 @@ name: paperclip
 description: "Orchestrate multi-agent autonomous companies via the Paperclip control plane (localhost:3100 REST API)"
 requires:
   bins: ["npx", "curl"]
+install:
+  npx:
+    brew: node
+    apt: npm
+    url: "https://nodejs.org"
+  curl:
+    brew: curl
+    apt: curl
 ---
 
 # Paperclip

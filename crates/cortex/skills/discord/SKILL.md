@@ -4,6 +4,10 @@ description: "Send messages and manage Discord channels"
 requires:
   bins: ["curl"]
   env: ["DISCORD_BOT_TOKEN"]
+install:
+  curl:
+    brew: curl
+    apt: curl
 ---
 
 # Discord

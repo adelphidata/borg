@@ -1,24 +1,19 @@
-//! Skill environment + install helpers.
+//! Skill environment helpers.
 //!
-//! Three concerns extracted from `skills.rs`:
+//! Two concerns extracted from `skills.rs`:
 //!   - **Env aggregation** ([`collect_skill_env`]): per-skill `env` blocks
 //!     merged into the map injected into `run_shell`.
 //!   - **Env allowlist** ([`collect_required_env_vars`]): set of env var
 //!     names declared in `requires.env` across enabled skills — drives which
 //!     credentials are forwarded into subprocess environments.
-//!   - **Install dispatch** ([`install_skill_deps`]): walk a skill's
-//!     `install:` block and run the platform-appropriate package manager
-//!     for each missing dep.
 //!
 //! These don't touch the skill loader / parser internals, so they live in
 //! their own module to keep the main `skills.rs` focused on registry +
 //! loading + relevance scoring.
 
-use anyhow::Result;
-
 use crate::config::SkillsConfig;
 
-use super::{load_all_skills, Skill};
+use super::load_all_skills;
 
 /// Aggregate per-skill `env` blocks into a single map. Disabled entries are
 /// skipped; the first definition of any given key wins (no override-by-order
@@ -61,65 +56,12 @@ pub fn collect_required_env_vars(
     }
 }
 
-/// Install missing dependencies for a skill, returning names of those installed.
-pub fn install_skill_deps(skill: &Skill) -> Result<Vec<String>> {
-    let mut installed = Vec::new();
-    for (dep_name, spec) in &skill.manifest.install {
-        if which::which(dep_name).is_ok() {
-            println!("  {dep_name}: already installed");
-            continue;
-        }
-        let cmd = match std::env::consts::OS {
-            "macos" => spec.brew.as_ref().map(|p| format!("brew install {p}")),
-            "linux" => spec
-                .apt
-                .as_ref()
-                .map(|p| format!("sudo apt install -y {p}")),
-            _ => None,
-        }
-        .or_else(|| spec.npm.as_ref().map(|p| format!("npm install -g {p}")));
-
-        match cmd {
-            Some(c) => {
-                println!("  Installing {dep_name}: {c}");
-                #[cfg(unix)]
-                let (shell, shell_flag) = ("sh", "-c");
-                #[cfg(windows)]
-                let (shell, shell_flag) = ("cmd.exe", "/C");
-                // Null stdin: every generated command is non-interactive
-                // (`apt -y`, brew, npm), and an installer that does prompt
-                // should fail fast at EOF instead of hanging the agent on a
-                // read of the operator's terminal. sudo still works — it
-                // prompts on /dev/tty, not stdin.
-                let status = std::process::Command::new(shell)
-                    .arg(shell_flag)
-                    .arg(&c)
-                    .stdin(std::process::Stdio::null())
-                    .status()?;
-                if status.success() {
-                    installed.push(dep_name.clone());
-                } else {
-                    eprintln!("  Failed to install {dep_name}");
-                }
-            }
-            None => {
-                if let Some(url) = &spec.url {
-                    eprintln!("  Cannot auto-install {dep_name}. Install manually: {url}");
-                } else {
-                    eprintln!("  No install method available for {dep_name}");
-                }
-            }
-        }
-    }
-    Ok(installed)
-}
-
 /// Format detailed info about a skill. Test-only — the production `borg skill
 /// info` path lives in the CLI and renders into a TUI popup, not into
 /// stdout.
 #[cfg(test)]
 pub(super) fn format_skill_info(
-    skill: &Skill,
+    skill: &super::Skill,
     resolved_creds: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut out = String::new();

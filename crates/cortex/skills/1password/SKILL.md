@@ -3,6 +3,10 @@ name: 1password
 description: "Retrieve secrets and credentials via op CLI"
 requires:
   bins: ["op"]
+install:
+  op:
+    brew: 1password-cli
+    url: "https://developer.1password.com/docs/cli/get-started/"
 ---
 
 # 1Password

@@ -8,6 +8,13 @@ triggers:
   - "clip this video"
 requires:
   bins: ["ffmpeg", "ffprobe"]
+install:
+  ffmpeg:
+    brew: ffmpeg
+    apt: ffmpeg
+  ffprobe:
+    brew: ffmpeg
+    apt: ffmpeg
 ---
 
 # Video Frames

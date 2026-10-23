@@ -751,6 +751,131 @@ fn check_requirements_env_satisfied_by_credentials() {
 }
 
 #[test]
+fn needs_lists_every_unmet_requirement_and_skips_the_met_ones() {
+    // The setup screen shows each of these as its own step, so one missing
+    // binary must not hide the env var behind it the way a short-circuit would.
+    let reqs = SkillRequires {
+        bins: vec!["sh".into(), "no_such_bin_needs_xyz1".into()],
+        any_bins: vec![
+            "no_such_bin_needs_xyz2".into(),
+            "no_such_bin_needs_xyz3".into(),
+        ],
+        env: vec!["NO_SUCH_VAR_NEEDS_XYZ".into(), "CRED_VAR_NEEDS_XYZ".into()],
+    };
+    let mut creds = std::collections::HashMap::new();
+    creds.insert("CRED_VAR_NEEDS_XYZ".to_string(), "set".to_string());
+    assert_eq!(
+        types::unmet_requirements(&reqs, &[], &creds),
+        vec![
+            SkillNeed::Bin(vec!["no_such_bin_needs_xyz1".into()]),
+            SkillNeed::Bin(vec![
+                "no_such_bin_needs_xyz2".into(),
+                "no_such_bin_needs_xyz3".into()
+            ]),
+            SkillNeed::Env("NO_SUCH_VAR_NEEDS_XYZ".into()),
+        ]
+    );
+    // An any_bins list with one present member is met.
+    let met = SkillRequires {
+        any_bins: vec!["no_such_bin_needs_xyz4".into(), "sh".into()],
+        ..Default::default()
+    };
+    assert!(types::unmet_requirements(&met, &[], &creds).is_empty());
+}
+
+#[test]
+fn needs_on_an_unsupported_system_is_the_system_alone() {
+    // Installing the binary would not make the skill run here.
+    let reqs = SkillRequires {
+        bins: vec!["no_such_bin_needs_xyz5".into()],
+        ..Default::default()
+    };
+    let os = vec!["plan9".to_string()];
+    assert_eq!(
+        types::unmet_requirements(&reqs, &os, &std::collections::HashMap::new()),
+        vec![SkillNeed::Os(os.clone())]
+    );
+}
+
+#[test]
+fn install_command_picks_this_platform_and_never_a_flag() {
+    let both = InstallSpec {
+        brew: Some("ffmpeg".into()),
+        apt: Some("ffmpeg-apt".into()),
+        ..Default::default()
+    };
+    let command = both.command().expect("a manager for this platform");
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(command.manager, PackageManager::Brew);
+        assert_eq!(command.display(), "brew install ffmpeg");
+        assert!(command.unattended());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(command.manager, PackageManager::Apt);
+        assert_eq!(command.display(), "sudo apt install -y ffmpeg-apt");
+        // apt asks for a sudo password; nothing may run it unattended.
+        assert!(!command.unattended());
+    }
+    let _ = command;
+
+    // A package name that reads as a flag or carries shell syntax is skipped,
+    // falling through to the next manager, or to nothing.
+    let flag = InstallSpec {
+        brew: Some("--cask".into()),
+        apt: Some("-y".into()),
+        npm: Some("@scope/tool".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        flag.command(),
+        Some(InstallCommand {
+            manager: PackageManager::Npm,
+            package: "@scope/tool".into()
+        })
+    );
+    let npm = flag.command().unwrap();
+    assert_eq!(
+        npm.argv(),
+        (
+            "npm",
+            vec!["install".into(), "-g".into(), "@scope/tool".into()]
+        )
+    );
+    let shell = InstallSpec {
+        brew: Some("x; rm -rf ~".into()),
+        apt: Some("x && y".into()),
+        npm: Some("$(id)".into()),
+        url: Some("https://example.com".into()),
+    };
+    assert_eq!(shell.command(), None);
+}
+
+#[test]
+fn every_builtin_binary_names_a_way_to_get_it() {
+    // The setup screen turns a missing binary into an Install button or a
+    // link; a requirement with neither leaves the user at a dead end.
+    for &(name, content) in BUNDLED_SKILLS {
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        let reqs = &manifest.requires;
+        for bin in reqs.bins.iter().chain(&reqs.any_bins) {
+            let spec = manifest
+                .install
+                .get(bin)
+                .unwrap_or_else(|| panic!("{name}: `{bin}` has no install entry"));
+            assert!(
+                spec.brew.is_some()
+                    || spec.apt.is_some()
+                    || spec.npm.is_some()
+                    || spec.url.is_some(),
+                "{name}: `{bin}` names no package and no url"
+            );
+        }
+    }
+}
+
+#[test]
 fn user_skill_overrides_builtin() {
     // This tests the override logic in isolation
     let mut skills = vec![Skill {

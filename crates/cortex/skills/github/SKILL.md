@@ -8,6 +8,11 @@ triggers:
   - "review this github change"
 requires:
   bins: ["gh"]
+install:
+  gh:
+    brew: gh
+    apt: gh
+    url: "https://cli.github.com"
 ---
 
 # GitHub

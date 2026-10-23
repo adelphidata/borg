@@ -10,6 +10,10 @@ triggers:
   - "tidy this up"
 requires:
   bins: ["git"]
+install:
+  git:
+    brew: git
+    apt: git
 ---
 
 # Code Simplify

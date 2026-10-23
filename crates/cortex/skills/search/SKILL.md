@@ -8,6 +8,10 @@ triggers:
   - "find matching files"
 requires:
   bins: ["rg"]
+install:
+  rg:
+    brew: ripgrep
+    apt: ripgrep
 ---
 
 # Search

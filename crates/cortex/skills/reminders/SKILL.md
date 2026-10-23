@@ -3,6 +3,10 @@ name: reminders
 description: "Manage native macOS Reminders via reminders-cli"
 requires:
   bins: ["reminders"]
+install:
+  reminders:
+    brew: "keith/formulae/reminders-cli"
+    url: "https://github.com/keith/reminders-cli"
 ---
 
 # Reminders

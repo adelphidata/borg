@@ -3,6 +3,10 @@ name: database
 description: "Query SQLite and PostgreSQL databases via CLI"
 requires:
   bins: ["sqlite3"]
+install:
+  sqlite3:
+    brew: sqlite
+    apt: sqlite3
 ---
 
 # Database

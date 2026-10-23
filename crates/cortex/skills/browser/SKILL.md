@@ -8,6 +8,10 @@ triggers:
   - "inspect the web page"
 requires:
   bins: ["agent-browser"]
+install:
+  agent-browser:
+    npm: agent-browser
+    url: "https://github.com/vercel-labs/agent-browser"
 ---
 
 # Browser Automation

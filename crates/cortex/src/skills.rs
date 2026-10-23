@@ -1,7 +1,7 @@
 mod environment;
 #[cfg(test)]
 use environment::format_skill_info;
-pub use environment::{collect_required_env_vars, collect_skill_env, install_skill_deps};
+pub use environment::{collect_required_env_vars, collect_skill_env};
 
 mod selectors;
 
@@ -9,8 +9,9 @@ mod types;
 #[cfg(test)]
 use types::{check_os_requirements, check_requirements};
 pub use types::{
-    parse_skill_md, InstallSpec, PrerequisitesLegacy, Skill, SkillLoadLevel, SkillManifest,
-    SkillRequires, SkillSource, MAX_SKILL_DESCRIPTION_CHARS,
+    parse_skill_md, InstallCommand, InstallSpec, PackageManager, PrerequisitesLegacy, Skill,
+    SkillLoadLevel, SkillManifest, SkillNeed, SkillRequires, SkillSource,
+    MAX_SKILL_DESCRIPTION_CHARS,
 };
 
 mod loader;

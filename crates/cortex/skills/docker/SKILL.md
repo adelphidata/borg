@@ -3,6 +3,9 @@ name: docker
 description: "Build images, run and manage containers"
 requires:
   bins: ["docker"]
+install:
+  docker:
+    url: "https://docs.docker.com/get-docker/"
 ---
 
 # Docker

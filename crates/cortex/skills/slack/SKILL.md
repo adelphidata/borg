@@ -4,6 +4,10 @@ description: "Send messages and manage Slack channels"
 requires:
   bins: ["curl"]
   env: ["SLACK_BOT_TOKEN"]
+install:
+  curl:
+    brew: curl
+    apt: curl
 ---
 
 # Slack
