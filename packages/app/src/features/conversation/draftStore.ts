@@ -9,6 +9,8 @@
  * `sessionStorage` stays the durable copy that survives a reload.
  */
 
+import { displayTitle } from "./userTurn";
+
 const PREFIX = "borg:draft:";
 
 const drafts = new Map<string, string>();
@@ -114,7 +116,7 @@ export function draftsVersion(): number {
  * dropped here rather than rendered as part of the name.
  */
 export function rowTitle(rawTitle: string, messageCount: number, sessionId: string): string {
-  const title = rawTitle.replace(LIVE_SUFFIX, "").trim();
+  const title = displayTitle(rawTitle.replace(LIVE_SUFFIX, "").trim());
   if (title !== "" && title !== "New conversation") return title;
   if (messageCount === 0) {
     const derived = draftTitle(readDraft(draftKeyFor(sessionId)));

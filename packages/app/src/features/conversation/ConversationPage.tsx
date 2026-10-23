@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { AgentsIcon, FindBar, PageChrome, Pill, useIsMobile } from "@borg/ui";
+import { AgentsIcon, CONVERSATION_COL, FindBar, PageChrome, Pill, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
 import { DaemonState } from "../../components/DaemonState";
 import { formatElapsed } from "../../lib/format";
@@ -31,6 +31,7 @@ import { FailureCard } from "./FailureCard";
 import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
+import { displayTitle } from "./userTurn";
 import { useTurnNotifications } from "./useTurnNotifications";
 
 export function ConversationPage() {
@@ -252,7 +253,10 @@ export function ConversationPage() {
       </>
     ) : undefined;
 
-  const title = opened.state === "ready" && opened.data.title ? opened.data.title : "Conversation";
+  const title =
+    opened.state === "ready" && opened.data.title
+      ? displayTitle(opened.data.title)
+      : "Conversation";
   const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
 
   // Session lists look for a draft under the agent session id, but a
@@ -347,8 +351,8 @@ export function ConversationPage() {
         >
           <div
             ref={contentRef}
-            className={`mx-auto flex max-w-[660px] flex-col gap-6 ${
-              isMobile ? "px-[22px]" : "px-[30px]"
+            className={`mx-auto flex ${CONVERSATION_COL} flex-col gap-6 ${
+              isMobile ? "px-[22px]" : "px-[40px]"
             }`}
           >
             <DaemonState query={opened} label="the conversation" actions={failureActions}>
@@ -405,9 +409,7 @@ export function ConversationPage() {
         </div>
       </div>
 
-      <div
-        className={`mx-auto w-full max-w-[660px] ${isMobile ? "px-[40px]" : "px-[30px]"} empty:hidden`}
-      >
+      <div className={`mx-auto w-full ${CONVERSATION_COL} px-[40px] empty:hidden`}>
         {/* Only once something has actually arrived unseen. Scrolling up on a
             settled transcript is reading, not falling behind, and does not
             need a way back — unless Borg is waiting on one, which is the one

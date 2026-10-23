@@ -128,6 +128,11 @@ describe("rowTitle", () => {
     expect(rowTitle("(live) demo prep", 1, "s9")).toBe("(live) demo prep");
   });
 
+  it("names a heartbeat session for people, not after its marker", () => {
+    expect(rowTitle("*heartbeat tick*", 12, "s9")).toBe("Heartbeat check-in");
+    expect(rowTitle("*session start greeting* (live)", 2, "s9")).toBe("Session start");
+  });
+
   it("names an unsent session after what has been typed into it", () => {
     publishDraft(draftKeyFor("s1"), "Rewrite the scheduler");
     expect(rowTitle("New conversation", 0, "s1")).toBe("Rewrite the scheduler");

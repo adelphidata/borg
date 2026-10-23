@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure, retryHint } from "./sendFailure";
+import { classifyFailure, namedSetting, nextLimit, retryHint } from "./sendFailure";
 
 describe("classifyFailure — the layer", () => {
   it.each([
@@ -218,5 +218,97 @@ describe("classifyFailure — the provider's own wait", () => {
     const failure = classifyFailure({ message: "402 payment required, try again in 5 minutes" })!;
     expect(failure.layer).toBe("billing");
     expect(failure.message).not.toContain("Try again in about");
+  });
+});
+
+const BUDGET =
+  "Monthly token budget exceeded (1013994/1000000). Increase budget.monthly_token_limit in /settings to continue.";
+
+describe("classifyFailure — Borg's own monthly limit", () => {
+  it("names the limit in plain numbers instead of the setting key", () => {
+    const failure = classifyFailure({ message: BUDGET })!;
+    expect(failure.layer).toBe("budget");
+    expect(failure.message).toBe(
+      "Borg has used 1,013,994 of its 1,000,000 tokens this month. Raise the limit to keep going.",
+    );
+    expect(failure.message).not.toContain("budget.monthly_token_limit");
+  });
+
+  it("is not read as a provider rate limit or bill", () => {
+    // The text says "budget" and "limit"; neither the provider's 429 nor its
+    // billing page has anything to do with it.
+    expect(classifyFailure({ message: BUDGET })!.layer).toBe("budget");
+  });
+
+  it("offers a raise that clears what is already spent", () => {
+    const failure = classifyFailure({ message: BUDGET })!;
+    expect(failure.retryable).toBe(false);
+    expect(failure.fix).toMatchObject({
+      key: "budget.monthly_token_limit",
+      suggested: "2000000",
+      action: "Raise limit",
+    });
+    expect(failure.fix!.done!("2000000")).toBe("Limit raised to 2,000,000.");
+    expect(failure.fix!.done!("0")).toBe("Limit removed.");
+  });
+
+  it("still points at the setting when the numbers are missing", () => {
+    const failure = classifyFailure({ message: "Monthly token budget exceeded." })!;
+    expect(failure.message).toBe(
+      "Borg has used all of its tokens for this month. Raise the limit to keep going.",
+    );
+    expect(failure.fix).toMatchObject({ key: "budget.monthly_token_limit" });
+    expect(failure.fix!.suggested).toBeUndefined();
+  });
+});
+
+describe("nextLimit", () => {
+  it.each([
+    [1_013_994, 1_000_000, "2000000"],
+    // Usage far past the old limit (the limit was lowered mid-month).
+    [5_000_000, 1_000_000, "8000000"],
+    // A zero limit has no double; start from one.
+    [10, 0, "16"],
+  ])("used %d of %d → %s", (used, limit, next) => {
+    expect(nextLimit(used, limit)).toBe(next);
+  });
+});
+
+describe("namedSetting", () => {
+  it.each([
+    [BUDGET, "budget.monthly_token_limit"],
+    [
+      "Provider `custom` needs `llm.base_url` pointing at an endpoint. Set it via `/settings` or `borg settings set llm.base_url <url>`.",
+      "llm.base_url",
+    ],
+    ["TTS is not configured. Enable it via: borg settings set tts.enabled true", "tts.enabled"],
+    ["Usage: /settings gateway.port 7842", "gateway.port"],
+  ])("finds the key in %j", (raw, key) => {
+    expect(namedSetting(raw)).toBe(key);
+  });
+
+  it.each([
+    "could not read ~/.borg/hooks.json",
+    "Try switching the model or provider in /settings",
+    "connection refused",
+  ])("finds nothing in %j", (raw) => {
+    expect(namedSetting(raw)).toBeUndefined();
+  });
+
+  it("gives an unclassified failure that names a key the way to it", () => {
+    const failure = classifyFailure({
+      message: "gateway.host is empty. Set it with `borg settings set gateway.host 127.0.0.1`",
+    })!;
+    expect(failure.layer).toBe("unknown");
+    expect(failure.settings).toBe(true);
+    expect(failure.fix).toEqual({ key: "gateway.host" });
+  });
+
+  it("does not attach a key to a failure no setting can fix", () => {
+    const failure = classifyFailure({
+      message: "no space left on device while running borg settings set data.dir /x",
+    })!;
+    expect(failure.layer).toBe("disk");
+    expect(failure.fix).toBeUndefined();
   });
 });

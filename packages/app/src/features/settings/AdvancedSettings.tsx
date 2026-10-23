@@ -9,6 +9,7 @@ import {
   keyPrefix,
   type AdvancedCategory,
 } from "./catalog";
+import { summarizeValue } from "./settingValue";
 
 /** `localeCompare` builds a collator per call; ~500 rows makes that measurable. */
 const BY_NAME = new Intl.Collator();
@@ -182,7 +183,7 @@ function CategoryFold({
                   type="button"
                   key={r.key}
                   title={r.key}
-                  aria-label={`${r.key} ${r.value === "" ? "unset" : r.value}`}
+                  aria-label={`${r.key} ${r.value === "" ? "unset" : summarizeValue(r.key, r.value)}`}
                   className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
                   onClick={() => navigate(`/settings/key/${encodeURIComponent(r.key)}`)}
                 >
@@ -190,11 +191,11 @@ function CategoryFold({
                     {section.prefix === "" ? r.key : r.key.slice(section.prefix.length + 1)}
                   </span>
                   <span
-                    className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium ${
+                    className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium tabular-nums ${
                       r.overridden ? "text-neon-ink" : "text-ink3"
                     }`}
                   >
-                    {r.value === "" ? "—" : r.value}
+                    {summarizeValue(r.key, r.value)}
                   </span>
                 </button>
               ))}
@@ -251,10 +252,6 @@ export function AdvancedSettings({
 
       {folds.open && (
         <div className="flex flex-col gap-4 pt-2">
-          <div className="pt-3.5 text-[13px] leading-[1.6] text-pretty text-ink3">
-            Borg works without changing any of this. Everything below is on a sensible default;
-            anything shown in green has been changed.
-          </div>
           <div className="overflow-hidden rounded-[12px] border border-line2 bg-surface2">
             {groups.map((g) => (
               <CategoryFold
