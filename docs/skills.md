@@ -12,7 +12,7 @@ Skills are instruction bundles that teach the agent how to use external CLI tool
 
 ## Built-in skills
 
-Twenty-seven skills are embedded in the binary:
+Forty-five skills are embedded in the binary. Only a core set is enabled by default; turn another on with `borg skills enable <name>`:
 
 | Skill | Requirements | Description |
 |-------|-------------|-------------|
@@ -43,6 +43,24 @@ Twenty-seven skills are embedded in the binary:
 | `stripe-link` | `link-cli` | Fetch one-time payment credentials from a Stripe Link wallet to complete purchases on the user's behalf |
 | `subagent-driven-development` | -- | Implement a plan via parallel sub-agents with a two-stage review per task |
 | `video-frames` | `ffmpeg`, `ffprobe` | Extract frames, thumbnails, contact sheets, GIFs, and short clips from videos |
+| `inbox-triage` | -- (uses `gmail` or `himalaya`) | Triage an inbox into replies, actions, waiting, and noise; drafts replies for approval |
+| `weekly-review` | -- | Weekly look back and capacity-aware plan across calendar, tasks, notes, and flagged mail |
+| `action-items` | -- | Cited decisions, owners, and deadlines from meeting notes, transcripts, or documents |
+| `price-watch` | -- | Scheduled price or stock watch on an exact item, alerting once when the condition is met |
+| `humanizer` | -- | Rewrite text to drop machine-written tics and match the user's voice |
+| `x-twitter` | `xurl` | Search, read, and post on X (Twitter) with the official xurl CLI |
+| `word` | `python3` | Create and edit Word .docx files (python-docx in `~/.borg/venv`) |
+| `excel` | `python3` | Create and edit Excel .xlsx workbooks with live formulas and charts (openpyxl) |
+| `powerpoint` | `python3` | Create and edit PowerPoint .pptx decks (python-pptx) |
+| `youtube` | `python3` | Summaries, chapters, and quotes from a YouTube video's captions |
+| `rss` | `python3` | Read RSS/Atom/JSON feeds, discover a site's feed, scheduled digests |
+| `apple-notes` | `memo` (macOS) | Read, search, create, and append to Apple Notes |
+| `hue` | `openhue` | Control Philips Hue lights, rooms, and scenes on the local network |
+| `find-my` | -- (macOS) | Locate Apple devices and AirTags by reading the Find My app |
+| `maps` | `curl`, `jq` | Geocoding, nearby places, routes, and time zones from OpenStreetMap, no key |
+| `stocks` | `curl`, `jq` | Stock, index, currency, and crypto quotes and history, no key |
+| `reddit` | `python3` | Read subreddits, search, threads, and users through Reddit's public feeds |
+| `debugging` | -- | Root-cause debugging: reproduce, narrow, test hypotheses, then fix with a regression test |
 
 ## User skills
 
