@@ -19,6 +19,8 @@ export const CHANNELS = {
   revealSession: "borg:native:reveal", // renderer → main, raise the main window
   hideWindow: "borg:native:hide", // renderer → main, dismiss this window
   setBadge: "borg:native:badge", // renderer → main
+  dictationHotkey: "borg:native:dictation-hotkey", // renderer → main, accelerator or ""
+
   updateStatus: "borg:native:update:status", // main → renderer
   updateCheck: "borg:native:update:check", // renderer → main
   updateInstall: "borg:native:update:install", // renderer → main

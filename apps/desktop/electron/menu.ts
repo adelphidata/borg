@@ -70,6 +70,11 @@ export function installApplicationMenu(): void {
         // Pasting model output into the composer should not carry styling.
         ...(isMac ? [{ role: "pasteAndMatchStyle" as const }] : []),
         { role: "selectAll" },
+        { type: "separator" },
+        // No accelerator on purpose: the dictation key is a setting, and a
+        // menu accelerator would keep firing the old one after it changed.
+        // The renderer binds the chord itself and the menu is the other way in.
+        action("Start Dictation", "dictate"),
       ],
     },
     {

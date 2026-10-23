@@ -13,6 +13,7 @@ const {
   notificationState,
   resetElectron,
   setFocused,
+  shortcutState,
   windows,
 } = await import("./test/electron-stub");
 const { activateSession, raise, registerNativeIpc, sendMenuCommand } = await import("./native");
@@ -296,9 +297,71 @@ describe("registerNativeIpc", () => {
       CHANNELS.revealSession,
       CHANNELS.hideWindow,
       CHANNELS.setBadge,
+      CHANNELS.dictationHotkey,
     ]) {
       expect(handlers.has(channel)).toBe(false);
     }
+  });
+
+  describe("the dictation hotkey", () => {
+    it("registers the accelerator, and pressing it raises the window and dispatches dictate", () => {
+      const win = makeWindow();
+      windows.push(win);
+      win.minimized = true;
+      registerNativeIpc(() => win as never);
+
+      invoke(CHANNELS.dictationHotkey, {}, "CmdOrCtrl+Shift+Space");
+      shortcutState.registered.get("CmdOrCtrl+Shift+Space")?.();
+      expect(win.minimized).toBe(false);
+      expect(win.sent.at(-1)).toEqual({ channel: CHANNELS.menuCommand, args: ["dictate"] });
+    });
+
+    it("swaps a changed key and clears on empty, so only the current setting is live", () => {
+      const win = makeWindow();
+      windows.push(win);
+      registerNativeIpc(() => win as never);
+
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+V");
+      expect([...shortcutState.registered.keys()]).toEqual(["Alt+V"]);
+      invoke(CHANNELS.dictationHotkey, {}, "");
+      expect(shortcutState.registered.size).toBe(0);
+    });
+
+    it("ignores a repeat of the same key rather than re-registering it", () => {
+      const win = makeWindow();
+      windows.push(win);
+      registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      expect(shortcutState.registered.size).toBe(1);
+    });
+
+    it("does not keep a key another app already owns, and says so", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      shortcutState.available = false;
+      const win = makeWindow();
+      windows.push(win);
+      const native = registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Alt+D"));
+      // Nothing was held, so dispose has nothing to release.
+      native.dispose();
+      expect(shortcutState.registered.size).toBe(0);
+      warn.mockRestore();
+    });
+
+    it("releases the key on dispose and when the window is gone does nothing on press", () => {
+      const win = makeWindow();
+      windows.push(win);
+      const native = registerNativeIpc(() => win as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      win.destroy();
+      expect(() => shortcutState.registered.get("Alt+D")?.()).not.toThrow();
+      expect(win.sent).toEqual([]);
+      native.dispose();
+      expect(shortcutState.registered.size).toBe(0);
+    });
   });
 
   it("clears its ledger on dispose, so a fresh registration starts clean", () => {

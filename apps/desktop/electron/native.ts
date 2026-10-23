@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Notification, ipcMain } from "electron";
+import { app, BrowserWindow, Notification, globalShortcut, ipcMain } from "electron";
 import { CHANNELS, type WireNotification } from "./channels";
 
 /**
@@ -83,8 +83,33 @@ export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dis
     if (typeof app.setBadgeCount === "function") app.setBadgeCount(Math.max(0, count));
   });
 
+  // One system-wide dictation key at a time. The renderer owns the choice and
+  // sends the whole accelerator, so this stays a plain register/unregister.
+  // A key another app holds simply fails to register; the in-window shortcut
+  // still works, so that is a warning and not a failure.
+  let dictationHotkey = "";
+  const dropDictationHotkey = () => {
+    if (dictationHotkey !== "") globalShortcut.unregister(dictationHotkey);
+    dictationHotkey = "";
+  };
+  ipcMain.handle(CHANNELS.dictationHotkey, (_event, accelerator: string) => {
+    if (accelerator === dictationHotkey) return;
+    dropDictationHotkey();
+    if (accelerator === "") return;
+    const taken = globalShortcut.register(accelerator, () => {
+      const win = mainWindow();
+      if (!win || win.isDestroyed()) return;
+      raise(win);
+      win.webContents.send(CHANNELS.menuCommand, "dictate");
+    });
+    if (taken) dictationHotkey = accelerator;
+    else console.warn(`[borg] dictation hotkey ${accelerator} is already taken`);
+  });
+
   return {
     dispose() {
+      dropDictationHotkey();
+      ipcMain.removeHandler(CHANNELS.dictationHotkey);
       for (const notification of live.values()) notification.close();
       live.clear();
       ipcMain.removeHandler(CHANNELS.notify);

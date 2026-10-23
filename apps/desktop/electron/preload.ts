@@ -83,6 +83,9 @@ const native: NativeBridge = {
   setBadgeCount: (count) => {
     void ipcRenderer.invoke(CHANNELS.setBadge, count);
   },
+  setDictationHotkey: (accelerator) => {
+    void ipcRenderer.invoke(CHANNELS.dictationHotkey, accelerator);
+  },
   boot: {
     subscribe: (handler) => {
       let live = true;

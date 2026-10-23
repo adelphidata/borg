@@ -228,6 +228,8 @@ describe("native bridge", () => {
     const borg = await loadPreload();
     borg.native.revealSession("s2");
     borg.native.hideWindow();
+    borg.native.setDictationHotkey("Alt+D");
+    expect(invocations(CHANNELS.dictationHotkey).at(-1)?.args).toEqual(["Alt+D"]);
     borg.native.setBadgeCount(3);
     expect(invocations(CHANNELS.revealSession).at(-1)?.args).toEqual(["s2"]);
     expect(invocations(CHANNELS.hideWindow)).toHaveLength(1);

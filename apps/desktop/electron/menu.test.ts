@@ -68,6 +68,9 @@ const editMenu = (isMac: boolean): Shape => ({
     // Pasting model output into the composer should not carry styling.
     ...(isMac ? [{ role: "pasteAndMatchStyle" }] : []),
     { role: "selectAll" },
+    sep,
+    // Its key is a setting the renderer binds; the menu row carries none.
+    { label: "Start Dictation" },
   ],
 });
 
