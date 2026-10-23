@@ -1585,9 +1585,26 @@ async fn setup_status_reflects_provider_credentials_and_catalog() {
         .find(|p| p.id == "ollama")
         .expect("ollama in catalog");
     assert!(!ollama.needs_api_key && ollama.key_url.is_empty());
-    for p in &fresh.providers {
+    for p in fresh.providers.iter().filter(|p| p.first_run) {
         assert!(!p.models.is_empty(), "{} offers no models", p.id);
     }
+    // Every provider Borg runs is choosable; the ones that need more than a
+    // pasted key wait in Settings, after the first-run rows.
+    for id in cortex::llm::provider::Provider::ALL
+        .iter()
+        .map(cortex::llm::provider::Provider::as_str)
+    {
+        assert!(
+            fresh.providers.iter().any(|p| p.id == id),
+            "{id} missing from the catalog"
+        );
+    }
+    let custom = fresh
+        .providers
+        .iter()
+        .find(|p| p.id == "custom")
+        .expect("custom in catalog");
+    assert!(!custom.first_run, "a custom endpoint is set up in Settings");
 
     // A key in ~/.borg/.env is found, named by file, never by value.
     std::fs::write(

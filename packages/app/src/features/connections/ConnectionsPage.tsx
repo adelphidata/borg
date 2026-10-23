@@ -4,25 +4,15 @@ import {
   Badge,
   MobileTitle,
   PageChrome,
-  SECTION_LABEL,
   StatusDot,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
-import { useMutation } from "../../lib/useDaemon";
+import { PageGroup } from "../../components/PageGroup";
 import { McpServersSection } from "../mcp/McpServersSection";
 import { SkillsSection } from "../skills/SkillsSection";
-import type { admin } from "@borg/client";
-import {
-  PAIR_SOURCES,
-  badgeOf,
-  providerLabel,
-  useConnections,
-  type ChannelConnection,
-  type Connections,
-  type ProviderConnection,
-} from "./useConnections";
+import { badgeOf, useConnections, type ChannelConnection } from "./useConnections";
 
 interface Card {
   id: string;
@@ -32,27 +22,7 @@ interface Card {
   needsAttention: boolean;
 }
 
-function cardOf(
-  conn: ProviderConnection | ChannelConnection,
-  catalog: admin.ProviderChoice[],
-): Card {
-  if (conn.kind === "provider") {
-    const live = conn.entries.filter((e) => e.status !== "removed").length;
-    return {
-      id: `provider/${conn.name}`,
-      badge: badgeOf(conn.name),
-      name: providerLabel(catalog, conn.name),
-      sub:
-        live > 0
-          ? `${live} key${live === 1 ? "" : "s"} · ${conn.strategy.replace(/_/g, " ")}`
-          : conn.apiKeyBackend
-            ? "key saved"
-            : conn.foundAt
-              ? "key found on this computer"
-              : "no working keys",
-      needsAttention: live > 0 && conn.entries.every((e) => e.status !== "ok"),
-    };
-  }
+function cardOf(conn: ChannelConnection): Card {
   return {
     id: `channel/${conn.name}`,
     badge: badgeOf(conn.name),
@@ -65,11 +35,10 @@ function cardOf(
   };
 }
 
-/** Desktop: connected services as a card grid. */
+/** Desktop: channels as a card grid. */
 function ConnCards({ cards, open }: { cards: Card[]; open: (id: string) => void }) {
   return (
     <section>
-      <div className={SECTION_LABEL}>Connected</div>
       <div className="grid grid-cols-4 gap-3">
         {cards.map((c) => (
           <button
@@ -91,7 +60,7 @@ function ConnCards({ cards, open }: { cards: Card[]; open: (id: string) => void 
   );
 }
 
-/** Mobile: connected services as list rows. */
+/** Mobile: channels as list rows. */
 function ConnList({ cards, open }: { cards: Card[]; open: (id: string) => void }) {
   return (
     <div className="flex flex-col">
@@ -114,96 +83,30 @@ function ConnList({ cards, open }: { cards: Card[]; open: (id: string) => void }
   );
 }
 
-function AddGrid({ data, open }: { data: Connections; open: (id: string) => void }) {
-  const isMobile = useIsMobile();
-  const configured = new Set(data.providers.map((p) => p.name));
-  // The detail page behind each tile asks for a key. A provider that takes
-  // no key (Claude Code, Bedrock) has nothing to paste, so it does not
-  // belong here — it is chosen in Settings instead.
-  const available = data.catalog.filter((p) => p.needsApiKey && !configured.has(p.id));
-  if (available.length === 0) return null;
-  return (
-    <section>
-      <div className={SECTION_LABEL}>Add a model provider</div>
-      <div className={`grid gap-3 ${isMobile ? "grid-cols-2" : "grid-cols-4"}`}>
-        {available.map((p) => (
-          <button
-            type="button"
-            key={p.id}
-            className="flex cursor-pointer items-center gap-3 rounded-[11px] border border-line2 px-4 py-3.5 text-left transition-[border-color] duration-150 hover:border-neon"
-            onClick={() => open(`provider/${p.id}`)}
-          >
-            <Badge on={false}>{badgeOf(p.id)}</Badge>
-            <span className="text-[13px] leading-[1.2] font-medium text-ink2">{p.label}</span>
-          </button>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-/** Import OAuth sign-ins from coding tools already on this machine. */
-function PairRow({ refetch }: { refetch: () => void }) {
-  const pair = useMutation((borg, kind: string) => borg.admin.pairCredential({ kind }), {
-    onSuccess: refetch,
-  });
-
-  return (
-    <section>
-      <div className={SECTION_LABEL}>Import a sign-in</div>
-      <div className="flex flex-wrap items-center gap-2">
-        {PAIR_SOURCES.map((s) => (
-          <button
-            key={s.kind}
-            type="button"
-            disabled={pair.pending}
-            className="cursor-pointer rounded-full border border-line2 bg-transparent px-4 py-2 text-[12.5px] leading-none text-ink2 transition-[border-color] duration-150 hover:border-neon disabled:opacity-60"
-            onClick={() => void pair.run(s.kind)}
-          >
-            {s.label}
-          </button>
-        ))}
-      </div>
-      {pair.error && (
-        <div className="mt-3 text-[12.5px] leading-[1.45] text-ink2">{pair.error.message}</div>
-      )}
-      {pair.data && (
-        <div className="mt-3 text-[12.5px] leading-[1.45] text-ink2">
-          {pair.data.entries.length === 0
-            ? "Nothing found on this machine — sign in with that tool first."
-            : `Imported ${pair.data.entries.length} account${pair.data.entries.length === 1 ? "" : "s"}.`}
-        </div>
-      )}
-    </section>
-  );
-}
-
+/** What Borg is hooked up to beyond its model: channels, MCP servers and skills. */
 export function ConnectionsPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const open = (id: string) => navigate(`/connections/${id}`);
   const connections = useConnections();
+  const meta = (() => {
+    if (connections.state !== "ready") return undefined;
+    const { channels, pendingCount } = connections.data;
+    const parts = [
+      channels.length > 0 && `${channels.length} channel${channels.length === 1 ? "" : "s"}`,
+      pendingCount > 0 && `${pendingCount} needs attention`,
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(" · ") : undefined;
+  })();
 
   return (
-    <PageChrome
-      title="Connections"
-      meta={
-        connections.state === "ready"
-          ? `${connections.data.providers.length + connections.data.channels.length} connected` +
-            (connections.data.pendingCount > 0
-              ? ` · ${connections.data.pendingCount} needs attention`
-              : "")
-          : undefined
-      }
-    >
+    <PageChrome title="Connections" meta={meta}>
       <div className={scrollCol(isMobile, "px-[38px] py-[34px]")}>
-        <div className="flex max-w-[860px] flex-col gap-[30px]">
+        <div className="flex max-w-[860px] flex-col gap-8">
           <MobileTitle>Connections</MobileTitle>
           <DaemonState query={connections} label="connections">
             {(data) => {
-              const cards = [...data.providers, ...data.channels].map((c) =>
-                cardOf(c, data.catalog),
-              );
+              const cards = data.channels.map(cardOf);
               const alerted = data.channels.find((c) => c.pending.length > 0);
               return (
                 <>
@@ -219,25 +122,21 @@ export function ConnectionsPage() {
                       onAction={() => open(`channel/${alerted.name}`)}
                     />
                   )}
-                  {cards.length > 0 ? (
-                    isMobile ? (
-                      <ConnList cards={cards} open={open} />
-                    ) : (
-                      <ConnCards cards={cards} open={open} />
-                    )
-                  ) : (
-                    <div className="text-[14.5px] leading-[1.62] text-pretty text-ink2">
-                      Nothing connected yet.
-                    </div>
+                  {cards.length > 0 && (
+                    <PageGroup title="Channels">
+                      {isMobile ? (
+                        <ConnList cards={cards} open={open} />
+                      ) : (
+                        <ConnCards cards={cards} open={open} />
+                      )}
+                    </PageGroup>
                   )}
-                  <AddGrid data={data} open={open} />
-                  <PairRow refetch={connections.refetch} />
                 </>
               );
             }}
           </DaemonState>
-          {/* Tools and playbooks Borg reaches for sit with the services it
-              talks to: one page for everything it is hooked up to. */}
+          {/* Tools and playbooks Borg reaches for sit with the channels it
+              answers on: one page for everything it is hooked up to. */}
           <McpServersSection />
           <SkillsSection />
         </div>

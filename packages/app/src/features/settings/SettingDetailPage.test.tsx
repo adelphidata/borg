@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { act, fireEvent, screen, waitFor } from "@testing-library/react";
-import { Route, Routes } from "react-router-dom";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { Route, Routes, useLocation } from "react-router-dom";
 import { STORAGE_KEYS, ThemeProvider } from "@borg/ui";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
-import { setupStatus } from "../../test/setupStatus";
+import { SETUP_CATALOG, setupStatus } from "../../test/setupStatus";
 import { SettingsProvider } from "../../lib/settings";
 import { SettingDetailPage } from "./SettingDetailPage";
 
@@ -27,13 +27,23 @@ const REGISTRY = [
   entry("gateway.port", "7842"),
 ];
 
-const DAEMON = { GetSettings: { entries: REGISTRY }, GetSetupStatus: setupStatus() };
+const DAEMON = {
+  GetSettings: { entries: REGISTRY },
+  GetSetupStatus: setupStatus(),
+  ListCredentials: { providers: [] },
+  ListApiKeys: { entries: [] },
+};
+
+function Where() {
+  return <span data-testid="path">{useLocation().pathname}</span>;
+}
 
 function mount(route: string, daemon = fakeDaemon(DAEMON)) {
   return renderApp(
     <Routes>
       <Route path="/settings/:id" element={<SettingDetailPage />} />
       <Route path="/settings/key/:key" element={<SettingDetailPage />} />
+      <Route path="/settings/provider/:name" element={<Where />} />
     </Routes>,
     {
       daemon,
@@ -574,25 +584,187 @@ describe("SettingDetailPage for provider and model", () => {
     await waitFor(() => expect(screen.getByDisplayValue("anthropic")).toBeTruthy());
     expect(screen.queryByText("Back to the list")).toBeNull();
   });
+});
 
-  it("says when the chosen provider has no key, and where to add one", async () => {
-    mount("/settings/provider");
-    await waitFor(() => expect(screen.getByText(/No key saved for Anthropic yet/)).toBeTruthy());
-    expect((screen.getByText("Add one") as HTMLAnchorElement).getAttribute("href")).toBe(
-      "/connections/provider/anthropic",
+/** A catalog row for a provider the shared fixture leaves out. */
+const row = (id: string, label: string, over: Record<string, unknown> = {}) => ({
+  id,
+  label,
+  blurb: "",
+  keyUrl: "",
+  needsApiKey: false,
+  recommended: false,
+  featured: false,
+  firstRun: false,
+  defaultModel: "",
+  models: [],
+  ...over,
+});
+
+const CATALOG = [
+  ...SETUP_CATALOG,
+  row("bedrock", "AWS Bedrock", { firstRun: true, defaultModel: "claude-opus-5" }),
+  row("claude-cli", "Claude Code", { firstRun: true, defaultModel: "opus" }),
+  row("codex-oauth", "Codex sign-in", { needsApiKey: true, defaultModel: "gpt-5" }),
+  row("custom", "Custom endpoint", { needsApiKey: true }),
+];
+
+/** The Provider page with `provider` in force and the daemon answering `over`. */
+function providerPage(provider: string, over: Record<string, unknown> = {}, registry = REGISTRY) {
+  const daemon = fakeDaemon({
+    ...DAEMON,
+    GetSettings: {
+      entries: registry.map((e) => (e.key === "provider" ? { ...e, value: provider } : e)),
+    },
+    GetSetupStatus: setupStatus({ providers: CATALOG, provider }),
+    ...over,
+  });
+  mount("/settings/provider", daemon);
+  return daemon;
+}
+
+describe("SettingDetailPage: what the provider in force needs", () => {
+  it("says when the chosen provider has no key, and opens its key page", async () => {
+    providerPage("anthropic");
+    await waitFor(() => expect(screen.getByText("Set up Anthropic")).toBeTruthy());
+    const keyRow = screen.getByRole("button", { name: /^API key/ });
+    expect(keyRow.textContent).toContain("None saved");
+    click(keyRow);
+    expect(screen.getByTestId("path").textContent).toBe("/settings/provider/anthropic");
+  });
+
+  it("names a saved key instead of asking for one", async () => {
+    providerPage("anthropic", {
+      ListApiKeys: { entries: [{ provider: "anthropic", backend: "keychain" }] },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /^API key/ })).toBeTruthy());
+    expect(screen.getByRole("button", { name: /^API key/ }).textContent).toContain("Saved");
+    expect(screen.queryByText("None saved")).toBeNull();
+  });
+
+  it("asks Bedrock for its region and endpoint, not a key, and comes back to Provider", async () => {
+    const registry = [
+      ...REGISTRY,
+      { ...entry("llm.bedrock_region", "us-east-1", "db"), label: "Bedrock region" },
+      { ...entry("llm.bedrock_endpoint_url", ""), label: "Bedrock endpoint URL" },
+      { ...entry("llm.bedrock_use_fips", "false"), label: "Bedrock FIPS endpoints", kind: "bool" },
+    ];
+    providerPage("bedrock", {}, registry);
+    await waitFor(() => expect(screen.getByText("Set up AWS Bedrock")).toBeTruthy());
+    expect(screen.getByText(/AWS credentials on this machine/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Bedrock region/ }).textContent).toContain(
+      "us-east-1",
+    );
+    expect(screen.getByRole("button", { name: /^Bedrock endpoint URL/ }).textContent).toContain(
+      "Not set",
+    );
+    expect(screen.getByRole("button", { name: /^Bedrock FIPS endpoints/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^API key/ })).toBeNull();
+
+    click(screen.getByRole("button", { name: /^Bedrock region/ }));
+    await waitFor(() => expect(screen.getByDisplayValue("us-east-1")).toBeTruthy());
+    // The editor leads back to where it was opened from, not to Settings.
+    expect(screen.getByText("Provider")).toBeTruthy();
+    expect(screen.queryByText(/^Settings$/)).toBeNull();
+  });
+
+  it("says whether Claude Code is signed in on this machine", async () => {
+    providerPage("claude-cli", {
+      GetSetupStatus: setupStatus({
+        providers: CATALOG,
+        provider: "claude-cli",
+        detected: [
+          { provider: "claude-cli", source: "claude_cli", detail: "/usr/local/bin/claude" },
+        ],
+      }),
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByText("Signed in. Borg runs Claude Code from /usr/local/bin/claude."),
+      ).toBeTruthy(),
     );
   });
 
-  it("stays quiet about keys once the daemon has one for that provider", async () => {
-    const daemon = fakeDaemon({
-      ...DAEMON,
-      GetSetupStatus: setupStatus({
-        detected: [{ provider: "anthropic", source: "stored", detail: "" }],
-      }),
+  it("says what to do when Claude Code is not signed in", async () => {
+    providerPage("claude-cli");
+    await waitFor(() =>
+      expect(screen.getByText(/Claude Code is not signed in on this machine/)).toBeTruthy(),
+    );
+  });
+
+  it("imports a sign-in into the provider that runs on it", async () => {
+    const daemon = providerPage("codex-oauth", { PairCredential: { entries: [{ id: "o1" }] } });
+    await waitFor(() => expect(screen.getByText("Import from Codex")).toBeTruthy());
+    const listed = daemon.calls.filter((c) => c.method === "ListCredentials").length;
+    click(screen.getByText("Import from Codex"));
+    await waitFor(() => expect(screen.getByText("Imported 1 account.")).toBeTruthy());
+    expect(daemon.calls.find((c) => c.method === "PairCredential")?.request).toEqual({
+      kind: "codex",
     });
-    mount("/settings/provider", daemon);
-    await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
-    expect(screen.queryByText(/No key saved/)).toBeNull();
+    // The pool it landed in is read again, so the keys row is current.
+    await waitFor(() =>
+      expect(daemon.calls.filter((c) => c.method === "ListCredentials").length).toBe(listed + 1),
+    );
+  });
+
+  it("says what to do when there is no sign-in to import", async () => {
+    providerPage("codex-oauth", { PairCredential: { entries: [] } });
+    await waitFor(() => expect(screen.getByText("Import from Codex")).toBeTruthy());
+    click(screen.getByText("Import from Codex"));
+    await waitFor(() =>
+      expect(
+        screen.getByText("Nothing found on this machine — sign in with Codex first."),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("reports a failed import rather than looking like it did nothing", async () => {
+    providerPage("codex-oauth", {
+      PairCredential: new BorgError(GrpcStatus.NotFound, "no credentials file"),
+    });
+    await waitFor(() => expect(screen.getByText("Import from Codex")).toBeTruthy());
+    click(screen.getByText("Import from Codex"));
+    await waitFor(() => expect(screen.getByText("no credentials file")).toBeTruthy());
+  });
+
+  it("keeps every other provider's keys in reach, and flags a pool that stopped working", async () => {
+    providerPage("anthropic", {
+      ListCredentials: {
+        providers: [
+          {
+            provider: "openrouter",
+            strategy: "fill_first",
+            cooldownSecs: 60,
+            entries: [{ id: "c1", label: "k", status: "exhausted", fingerprint: "", useCount: 0 }],
+          },
+        ],
+      },
+    });
+    await waitFor(() => expect(screen.getByText("Keys for other providers")).toBeTruthy());
+    const section = screen.getByText("Keys for other providers").closest("section")!;
+    const other = within(section).getByRole("button", { name: /^OpenRouter/ });
+    expect(other.textContent).toContain("1 key");
+    expect(within(other).getByRole("img", { name: "Keys not working" })).toBeTruthy();
+    click(other);
+    expect(screen.getByTestId("path").textContent).toBe("/settings/provider/openrouter");
+  });
+
+  it("asks for the model when the new provider has no list to take one from", async () => {
+    const daemon = providerPage("anthropic", { SetSetting: {} });
+    await waitFor(() => expect(screen.getByText("Custom endpoint")).toBeTruthy());
+    click(screen.getByText("Custom endpoint"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Now using Custom endpoint. Name the model it should run./),
+      ).toBeTruthy(),
+    );
+    // Anthropic's model id would only be wrong on someone else's server.
+    expect(daemon.calls.filter((c) => c.method === "SetSetting").map((c) => c.request)).toEqual([
+      { key: "provider", value: "custom" },
+    ]);
+    expect((screen.getByText("Set the model") as HTMLAnchorElement).getAttribute("href")).toBe(
+      "/settings/model",
+    );
   });
 });
 

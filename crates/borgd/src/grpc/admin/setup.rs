@@ -8,7 +8,7 @@
 use super::*;
 use cortex::llm::credential_detect::{self, LocalCredential};
 use cortex::llm::provider::Provider;
-use cortex::llm::provider_catalog::{self, ONBOARDABLE};
+use cortex::llm::provider_catalog::{self, ONBOARDABLE, SETTINGS_ONLY};
 use protocols::admin::{DetectedCredential, ModelChoice, ProviderChoice, SetupStatus};
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -174,44 +174,49 @@ async fn pool_detections(
         .collect()
 }
 
-/// Catalog → wire. A provider whose curated block is missing borrows the
-/// recommended provider's models, the same rule the TUI wizard applies, so
-/// no row ever preselects nothing.
+/// Catalog → wire: the first-run rows, then the Settings-only ones. A
+/// first-run row whose curated block is missing borrows the recommended
+/// provider's models, the same rule the TUI wizard applies, so the first run
+/// never preselects nothing. A Settings-only row without a list keeps none:
+/// its model is typed, and another provider's ids would only be wrong there.
 fn provider_choices() -> Vec<ProviderChoice> {
-    ONBOARDABLE
+    let rows = ONBOARDABLE
         .iter()
-        .map(|c| {
-            let mut entries = cortex::llm::model_catalog::curated_entries(c.id);
-            if entries.is_empty() {
-                entries =
-                    cortex::llm::model_catalog::curated_entries(provider_catalog::RECOMMENDED);
-            }
-            let default_model = entries
-                .iter()
-                .find(|e| e.default)
-                .or_else(|| entries.first())
-                .map(|e| e.id.clone())
-                .unwrap_or_default();
-            ProviderChoice {
-                id: c.id.to_string(),
-                label: c.label.to_string(),
-                blurb: c.blurb.to_string(),
-                key_url: c.key_url.unwrap_or_default().to_string(),
-                needs_api_key: c.needs_api_key(),
-                recommended: c.recommended(),
-                featured: c.featured,
-                default_model,
-                models: entries
-                    .into_iter()
-                    .map(|e| ModelChoice {
-                        id: e.id,
-                        label: e.label,
-                        note: e.note.unwrap_or_default(),
-                    })
-                    .collect(),
-            }
-        })
-        .collect()
+        .map(|c| (c, true))
+        .chain(SETTINGS_ONLY.iter().map(|c| (c, false)));
+    rows.map(|(c, first_run)| {
+        let mut entries =
+            cortex::llm::model_catalog::curated_entries(provider_catalog::models_source(c.id));
+        if entries.is_empty() && first_run {
+            entries = cortex::llm::model_catalog::curated_entries(provider_catalog::RECOMMENDED);
+        }
+        let default_model = entries
+            .iter()
+            .find(|e| e.default)
+            .or_else(|| entries.first())
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        ProviderChoice {
+            id: c.id.to_string(),
+            label: c.label.to_string(),
+            blurb: c.blurb.to_string(),
+            key_url: c.key_url.unwrap_or_default().to_string(),
+            needs_api_key: c.needs_api_key(),
+            recommended: c.recommended(),
+            featured: c.featured,
+            first_run,
+            default_model,
+            models: entries
+                .into_iter()
+                .map(|e| ModelChoice {
+                    id: e.id,
+                    label: e.label,
+                    note: e.note.unwrap_or_default(),
+                })
+                .collect(),
+        }
+    })
+    .collect()
 }
 
 /// The decision the first-run screen branches on.
@@ -325,8 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_choice_preselects_a_real_model() {
-        for c in provider_choices() {
+    fn every_first_run_choice_preselects_a_real_model() {
+        for c in provider_choices().into_iter().filter(|c| c.first_run) {
             assert!(!c.models.is_empty(), "{} has no models", c.id);
             assert!(
                 c.models.iter().any(|m| m.id == c.default_model),
@@ -335,6 +340,32 @@ mod tests {
                 c.default_model
             );
             assert_eq!(c.key_url.is_empty(), !c.needs_api_key, "{}", c.id);
+        }
+    }
+
+    #[test]
+    fn settings_only_choices_follow_the_first_run_and_never_borrow_a_stranger() {
+        let choices = provider_choices();
+        let first_settings_only = choices.iter().position(|c| !c.first_run).unwrap();
+        assert!(
+            choices[first_settings_only..].iter().all(|c| !c.first_run),
+            "a first-run row sorts after a Settings-only one"
+        );
+        let by_id = |id: &str| choices.iter().find(|c| c.id == id).unwrap();
+        // A sign-in offers the models of the API it speaks.
+        assert_eq!(
+            by_id("claude-code-oauth").default_model,
+            by_id("anthropic").default_model
+        );
+        assert_eq!(
+            by_id("codex-oauth").default_model,
+            by_id("openai").default_model
+        );
+        // No curated list means a typed model, not OpenRouter's slugs.
+        for id in ["custom", "vertex-ai", "copilot-oauth"] {
+            let c = by_id(id);
+            assert!(c.models.is_empty(), "{id} borrowed a list");
+            assert_eq!(c.default_model, "", "{id} preselects a model");
         }
     }
 }

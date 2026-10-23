@@ -14,6 +14,7 @@ export const SETUP_CATALOG: admin.ProviderChoice[] = [
     needsApiKey: true,
     recommended: true,
     featured: true,
+    firstRun: true,
     defaultModel: "deepseek/deepseek-v4-flash",
     models: [
       { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", note: "" },
@@ -28,6 +29,7 @@ export const SETUP_CATALOG: admin.ProviderChoice[] = [
     needsApiKey: true,
     recommended: false,
     featured: true,
+    firstRun: true,
     defaultModel: "claude-opus-5",
     models: [
       { id: "claude-opus-5", label: "Opus 5", note: "" },
@@ -42,6 +44,7 @@ export const SETUP_CATALOG: admin.ProviderChoice[] = [
     needsApiKey: true,
     recommended: false,
     featured: false,
+    firstRun: true,
     defaultModel: "openai/gpt-oss-120b",
     models: [{ id: "openai/gpt-oss-120b", label: "GPT-OSS 120B", note: "" }],
   },
@@ -53,6 +56,7 @@ export const SETUP_CATALOG: admin.ProviderChoice[] = [
     needsApiKey: false,
     recommended: false,
     featured: false,
+    firstRun: true,
     defaultModel: "llama3.3",
     models: [{ id: "llama3.3", label: "Llama 3.3 70B", note: "" }],
   },

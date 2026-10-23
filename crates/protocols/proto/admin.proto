@@ -435,9 +435,14 @@ message ProviderChoice {
   bool recommended = 6;
   // Shown before the "more providers" fold on a first run.
   bool featured = 7;
-  // Preselected model id from the curated catalog.
+  // Preselected model id from the curated catalog. "" when the provider has
+  // no curated list (a custom endpoint, a Vertex project): the model is typed.
   string default_model = 8;
   repeated ModelChoice models = 9;
+  // Offered by the first-run picker. False for providers that need more than
+  // one pasted key (an imported sign-in, an endpoint, a cloud project); those
+  // are chosen in Settings, where their setup lives.
+  bool first_run = 10;
 }
 
 message DetectedCredential {

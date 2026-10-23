@@ -238,7 +238,8 @@ function Picker({
   onStart: (vars: { provider: string; apiKey: string; model: string }) => void;
   onLater: () => void;
 }) {
-  const providers = status.providers;
+  // Settings carries the providers that need more than one pasted key.
+  const providers = status.providers.filter((p) => p.firstRun);
   const recommended = providers.find((p) => p.recommended) ?? providers[0];
   const [providerId, setProviderId] = useState(recommended?.id ?? "");
   const [apiKey, setApiKey] = useState("");

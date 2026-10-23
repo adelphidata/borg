@@ -1,7 +1,8 @@
 //! Providers a first-time user is offered, with the copy every surface renders.
 //!
 //! One ordered list for the TUI wizard, `/settings`, `/model`, the desktop app
-//! and the browser. Model ids come from [`super::model_catalog`], auth facts
+//! and the browser, plus [`SETTINGS_ONLY`]: the providers Borg runs that the
+//! first run does not offer, so every provider is choosable somewhere. Model ids come from [`super::model_catalog`], auth facts
 //! from [`Provider`]; this module only owns the picker order and the words.
 //! Keeping the display copy here (rather than in each client) is what stops
 //! the surfaces from drifting into offering different answers to "which
@@ -131,6 +132,60 @@ pub const ONBOARDABLE: &[ProviderChoice] = &[
     },
 ];
 
+/// Providers Borg runs that the first run does not offer. Each needs more
+/// than one pasted key — a sign-in imported from another tool, an endpoint of
+/// your own, or a cloud project — so they are chosen in Settings, where the
+/// Provider page carries their setup. Settings lists them after
+/// [`ONBOARDABLE`].
+pub const SETTINGS_ONLY: &[ProviderChoice] = &[
+    ProviderChoice {
+        id: "claude-code-oauth",
+        label: "Claude Code sign-in",
+        blurb: "The sign-in Claude Code saved on this machine, imported.",
+        key_url: None,
+        featured: false,
+    },
+    ProviderChoice {
+        id: "codex-oauth",
+        label: "Codex sign-in",
+        blurb: "The ChatGPT sign-in Codex saved on this machine, imported.",
+        key_url: None,
+        featured: false,
+    },
+    ProviderChoice {
+        id: "copilot-oauth",
+        label: "GitHub Copilot",
+        blurb: "Copilot's models with a Copilot token.",
+        key_url: None,
+        featured: false,
+    },
+    ProviderChoice {
+        id: "vertex-ai",
+        label: "Vertex AI",
+        blurb: "Gemini and Claude through your Google Cloud project.",
+        key_url: None,
+        featured: false,
+    },
+    ProviderChoice {
+        id: "custom",
+        label: "Custom endpoint",
+        blurb: "Any OpenAI-compatible server, such as LM Studio, vLLM or llama.cpp.",
+        key_url: None,
+        featured: false,
+    },
+];
+
+/// The curated block a row's models come from. A sign-in that speaks a keyed
+/// provider's API offers that provider's models; every other row reads its
+/// own block, and one without a block has no list — its model is typed.
+pub fn models_source(id: &str) -> &str {
+    match id {
+        "claude-code-oauth" => "anthropic",
+        "codex-oauth" => "openai",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +195,7 @@ mod tests {
     /// `Provider::from_str` on the RPC path. Round-trip every row.
     #[test]
     fn every_id_is_a_real_provider_spelled_canonically() {
-        for c in ONBOARDABLE {
+        for c in ONBOARDABLE.iter().chain(SETTINGS_ONLY) {
             let p =
                 Provider::from_str(c.id).unwrap_or_else(|_| panic!("{} is not a provider", c.id));
             assert_eq!(p.as_str(), c.id, "catalog must use the canonical id");
@@ -172,6 +227,37 @@ mod tests {
                 "{} has no catalog block or no default model",
                 c.id
             );
+        }
+    }
+
+    /// A provider with code behind it and no row is one nobody can pick
+    /// outside a config file. Each appears exactly once across both lists.
+    #[test]
+    fn every_provider_borg_runs_has_exactly_one_row() {
+        for p in Provider::ALL {
+            let rows = ONBOARDABLE
+                .iter()
+                .chain(SETTINGS_ONLY)
+                .filter(|c| c.provider() == *p)
+                .count();
+            assert_eq!(rows, 1, "{} has {rows} catalog rows", p.as_str());
+        }
+    }
+
+    /// A borrowed list must exist, or the sign-in would preselect nothing
+    /// while claiming its sibling's models.
+    #[test]
+    fn a_borrowed_model_list_has_a_default() {
+        let manifest = embedded_manifest();
+        for c in SETTINGS_ONLY {
+            let source = models_source(c.id);
+            if source != c.id {
+                assert!(
+                    manifest.default_model(source).is_some(),
+                    "{} borrows {source}, which has no default model",
+                    c.id
+                );
+            }
         }
     }
 

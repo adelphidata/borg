@@ -290,9 +290,18 @@ export interface ProviderChoice {
   recommended: boolean;
   /** Shown before the "more providers" fold on a first run. */
   featured: boolean;
-  /** Preselected model id from the curated catalog. */
+  /**
+   * Preselected model id from the curated catalog. "" when the provider has
+   * no curated list (a custom endpoint, a Vertex project): the model is typed.
+   */
   defaultModel: string;
   models: ModelChoice[];
+  /**
+   * Offered by the first-run picker. False for providers that need more than
+   * one pasted key (an imported sign-in, an endpoint, a cloud project); those
+   * are chosen in Settings, where their setup lives.
+   */
+  firstRun: boolean;
 }
 
 export interface DetectedCredential {
@@ -4328,6 +4337,7 @@ function createBaseProviderChoice(): ProviderChoice {
     featured: false,
     defaultModel: "",
     models: [],
+    firstRun: false,
   };
 }
 
@@ -4359,6 +4369,9 @@ export const ProviderChoice: MessageFns<ProviderChoice> = {
     }
     for (const v of message.models) {
       ModelChoice.encode(v!, writer.uint32(74).fork()).join();
+    }
+    if (message.firstRun !== false) {
+      writer.uint32(80).bool(message.firstRun);
     }
     return writer;
   },
@@ -4448,6 +4461,14 @@ export const ProviderChoice: MessageFns<ProviderChoice> = {
             message.models.push(ModelChoice.decode(reader, reader.uint32()));
             continue;
           }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.firstRun = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4485,6 +4506,11 @@ export const ProviderChoice: MessageFns<ProviderChoice> = {
       models: globalThis.Array.isArray(object?.models)
         ? object.models.map((e: any) => ModelChoice.fromJSON(e))
         : [],
+      firstRun: isSet(object.firstRun)
+        ? globalThis.Boolean(object.firstRun)
+        : isSet(object.first_run)
+        ? globalThis.Boolean(object.first_run)
+        : false,
     };
   },
 
@@ -4517,6 +4543,9 @@ export const ProviderChoice: MessageFns<ProviderChoice> = {
     if (message.models?.length) {
       obj.models = message.models.map((e) => ModelChoice.toJSON(e));
     }
+    if (message.firstRun !== false) {
+      obj.firstRun = message.firstRun;
+    }
     return obj;
   },
 
@@ -4534,6 +4563,7 @@ export const ProviderChoice: MessageFns<ProviderChoice> = {
     message.featured = object.featured ?? false;
     message.defaultModel = object.defaultModel ?? "";
     message.models = object.models?.map((e) => ModelChoice.fromPartial(e)) || [];
+    message.firstRun = object.firstRun ?? false;
     return message;
   },
 };

@@ -25,6 +25,7 @@ import {
   subscribeDrafts,
 } from "./features/conversation/draftStore";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
+import { ProviderKeysPage } from "./features/settings/ProviderKeysPage";
 import { McpServerDetailPage } from "./features/mcp/McpServerDetailPage";
 import { SkillDetailPage } from "./features/skills/SkillDetailPage";
 import { CommandPalette } from "./features/palette/CommandPalette";
@@ -335,11 +336,13 @@ function Shell({ platform }: { platform: Platform }) {
                 route, and without a remount the page keeps the session it
                 already has. */}
             <Route path="/c/:sessionId" element={<ConversationPage key={location.key} />} />
-            {/* The two static segments outrank the generic kind/name route. */}
+            {/* The two static segments outrank the generic kind/name route,
+                which serves channels (and sends an old provider link to Settings). */}
             <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
             <Route path="/connections/skills/:name" element={<SkillDetailPage />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />
+            <Route path="/settings/provider/:name" element={<ProviderKeysPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
             <Route path="/settings/:id" element={<SettingDetailPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

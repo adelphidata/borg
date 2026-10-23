@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Pill, PlusIcon, SECTION_LABEL, StatusDot, TrashIcon } from "@borg/ui";
+import { Pill, PlusIcon, StatusDot, TrashIcon } from "@borg/ui";
 import type { admin } from "@borg/client";
 import { DaemonState } from "../../components/DaemonState";
+import { PageGroup } from "../../components/PageGroup";
 import { Switch } from "../../components/Switch";
 import { McpServerForm, draftOf, specOf, type McpDraft } from "./McpServerForm";
 import { stateTone, stateWords, useMcpServers, type McpServers } from "./useMcpServers";
@@ -164,17 +165,18 @@ export function McpServersSection() {
   const [adding, setAdding] = useState(false);
 
   return (
-    <section>
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className={`${SECTION_LABEL} mb-0`}>MCP servers</div>
-        {!adding && (
+    <PageGroup
+      title="MCP servers"
+      action={
+        !adding && (
           <Pill square onClick={() => setAdding(true)}>
             <span className="flex items-center gap-1.5">
               <PlusIcon size={13} /> Add server
             </span>
           </Pill>
-        )}
-      </div>
+        )
+      }
+    >
       <DaemonState query={servers.query} label="your MCP servers">
         {(data) => (
           <>
@@ -244,6 +246,6 @@ export function McpServersSection() {
           </>
         )}
       </DaemonState>
-    </section>
+    </PageGroup>
   );
 }

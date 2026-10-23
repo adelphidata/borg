@@ -31,6 +31,21 @@ describe("OnboardingPage with nothing on the machine", () => {
     expect(daemon.calls.filter((c) => c.method === "GetSetupStatus")).toHaveLength(1);
   });
 
+  it("offers only first-run providers; the ones that need more than a key wait in Settings", async () => {
+    const custom = {
+      ...SETUP_CATALOG[2]!,
+      id: "custom",
+      label: "Custom endpoint",
+      keyUrl: "",
+      firstRun: false,
+    };
+    mount({ GetSetupStatus: setupStatus({ providers: [...SETUP_CATALOG, custom] }) });
+    await waitFor(() => expect(screen.getByText("More providers")).toBeTruthy());
+    fireEvent.click(screen.getByText("More providers"));
+    expect(screen.getByText("Groq")).toBeTruthy();
+    expect(screen.queryByText("Custom endpoint")).toBeNull();
+  });
+
   it("says where the key comes from, using the daemon's link", async () => {
     // Picking a provider and being asked for a credential with no hint where
     // to get it is the one dead end a first run cannot recover from.

@@ -1,5 +1,5 @@
 import { useEffect, useId, useState, type KeyboardEvent, type ReactNode } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import {
   BackLink,
   CheckIcon,
@@ -17,30 +17,37 @@ import type { ThemePreference } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { ShuffleButton } from "../../components/NameField";
 import { DEFAULT_AGENT_NAME, rerollName } from "../../lib/agentName";
-import { useSettings } from "../../lib/settings";
+import { useSettings, type DaemonSetting } from "../../lib/settings";
 import { MAX_NAME_CHARS, USER_NAME_KEY } from "../../lib/userName";
 import {
   effectiveModel,
   modelsOf,
-  providerLabel,
   providerOf,
   useSetupStatus,
   type SetupStatus,
 } from "../onboarding/useSetupStatus";
 import { useAutoGrow } from "../../lib/useAutoGrow";
+import { ProviderSetup } from "./ProviderSetup";
 import { findBasicSetting, optionLabel, type BasicSetting, type SettingOption } from "./catalog";
 import { compactJson, groupDigits, prettyJson, ungroupDigits, valueShape } from "./settingValue";
 
 /** The row that opens the free-text editor under a catalog picker. */
 const SOMETHING_ELSE = "__something_else__";
 
+/** Where the back link leads: Settings, unless the page that opened this one said otherwise. */
+function useBackLink(): { to: string; label: string } {
+  const state = useLocation().state as { back?: { to: string; label: string } } | null;
+  return state?.back ?? { to: "/settings", label: "Settings" };
+}
+
 function DetailShell({ title, children }: { title: string; children: ReactNode }) {
   const isMobile = useIsMobile();
+  const back = useBackLink();
   return (
     <PageChrome title={title}>
       <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
         <div className={DETAIL_COL}>
-          <BackLink to="/settings" label="Settings" />
+          <BackLink to={back.to} label={back.label} />
           {children}
         </div>
       </div>
@@ -324,14 +331,17 @@ function catalogOptions(
  * The curated rows are the whole picker for almost everyone; "Something
  * else…" opens the plain field for an id the catalog does not carry, so the
  * power user loses nothing and the first-time user never meets a text box.
- * A provider with no key behind it says so here, with the way to fix it,
- * instead of failing on the next message.
+ * Under the provider picker sits what the provider in force needs — its
+ * settings, its runtime, its keys — so a provider with nothing behind it
+ * says so here, with the way to fix it, instead of failing on the next
+ * message.
  */
 function CatalogDetail({
   basic,
   entry,
   provider,
   model,
+  settings,
 }: {
   basic: BasicSetting;
   entry: { key: string; value: string; overridden: boolean };
@@ -339,14 +349,17 @@ function CatalogDetail({
   provider: string;
   /** The model in force, which a provider switch may have to replace. */
   model: string;
+  /** The whole registry, for the provider's own settings. */
+  settings: Map<string, DaemonSetting>;
 }) {
   const { save, clear, saving } = useSettings();
   const setup = useSetupStatus();
   // Undecided until the user says; a value the catalog does not know starts
   // as text, and "Back to the list" is still honoured after that.
   const [freeText, setFreeText] = useState<boolean>();
-  // The provider a switch moved to when its model could not follow.
-  const [modelStranded, setModelStranded] = useState<string>();
+  // The provider a switch moved to when its model could not follow: the
+  // write failed, or the provider has no list to take a default from.
+  const [modelStranded, setModelStranded] = useState<{ label: string; typed: boolean }>();
 
   const status = setup.state === "ready" ? setup.data : undefined;
   const options = status ? catalogOptions(basic.catalog, status, provider) : [];
@@ -358,13 +371,6 @@ function CatalogDetail({
   const listed = options.some((o) => o.value === current);
   const editing = options.length === 0 || (freeText ?? (!listed && entry.value !== ""));
 
-  const chosen =
-    status && basic.catalog === "provider" ? providerOf(status.providers, entry.value) : undefined;
-  const keyMissing =
-    chosen !== undefined &&
-    chosen.needsApiKey &&
-    !status!.detected.some((d) => d.provider.toLowerCase() === chosen.id.toLowerCase());
-
   // A model belongs to its provider. Keeping `claude-haiku-4-5` across a
   // switch to OpenAI sends OpenAI a model it has never heard of, so a switch
   // to a provider that does not list the current model takes its default too.
@@ -373,10 +379,15 @@ function CatalogDetail({
     if (!(await save(entry.key, value)) || basic.catalog !== "provider" || !status) return;
     const next = providerOf(status.providers, value);
     const known = modelsOf(status.providers, value).some((m) => m.id === model);
-    if (next && next.defaultModel !== "" && !known && !(await save("model", next.defaultModel))) {
+    if (!next || known) return;
+    if (next.defaultModel === "") {
+      // No list to take a default from (a custom endpoint, a Vertex
+      // project): the model is typed, and the old one belongs elsewhere.
+      setModelStranded({ label: next.label, typed: true });
+    } else if (!(await save("model", next.defaultModel))) {
       // Two writes, and only the first landed: the new provider now has a
       // model it does not carry. Say so, and where to fix it.
-      setModelStranded(next.label);
+      setModelStranded({ label: next.label, typed: false });
     }
   };
 
@@ -413,20 +424,15 @@ function CatalogDetail({
       )}
       {modelStranded && (
         <div className="rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
-          Now using {modelStranded}, but its model could not be switched.{" "}
+          {modelStranded.typed
+            ? `Now using ${modelStranded.label}. Name the model it should run.`
+            : `Now using ${modelStranded.label}, but its model could not be switched.`}{" "}
           <Link to="/settings/model" className="text-neon-ink no-underline">
-            Pick a model
+            {modelStranded.typed ? "Set the model" : "Pick a model"}
           </Link>
         </div>
       )}
-      {keyMissing && (
-        <div className="rounded-[10px] border border-line2 bg-surface2 px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
-          No key saved for {providerLabel(status!.providers, chosen.id)} yet.{" "}
-          <Link to={`/connections/provider/${chosen.id}`} className="text-neon-ink no-underline">
-            Add one
-          </Link>
-        </div>
-      )}
+      {basic.catalog === "provider" && <ProviderSetup provider={entry.value} settings={settings} />}
     </>
   );
 }
@@ -627,6 +633,7 @@ export function SettingDetailPage() {
                   entry={entry}
                   provider={map.get("provider")?.value ?? ""}
                   model={map.get("model")?.value ?? ""}
+                  settings={map}
                 />
               </>
             );
