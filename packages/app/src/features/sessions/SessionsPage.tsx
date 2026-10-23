@@ -37,6 +37,7 @@ function Row({
   onArchive,
   onRestore,
   onExport,
+  onPin,
 }: {
   session: SessionRow;
   /** The shared clock, so a running row counts up without a timer of its own. */
@@ -46,6 +47,7 @@ function Row({
   onArchive: () => void;
   onRestore: () => void;
   onExport: (format: string) => void;
+  onPin: (pinned: boolean) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(session.title);
@@ -62,6 +64,8 @@ function Row({
     onRestore,
     onExport,
     archived: session.archived,
+    pinned: session.pinned,
+    onPin,
   });
   useMenuEscape(menuAt !== undefined, () => setMenuAt(undefined));
 
@@ -137,6 +141,8 @@ function Row({
         onRestore={onRestore}
         onExport={onExport}
         archived={session.archived}
+        pinned={session.pinned}
+        onPin={onPin}
       />
       <Menu
         open={menuAt !== undefined}
@@ -236,6 +242,7 @@ export function SessionsPage() {
                       onArchive={() => void sessions.archive(session.id, session.title)}
                       onRestore={() => void sessions.restore(session.id)}
                       onExport={(format) => void sessions.exportSession(session.id, format)}
+                      onPin={(pinned) => void sessions.pin(session.id, pinned)}
                     />
                   ))}
                 </div>
@@ -282,6 +289,7 @@ export function SessionsPage() {
                         onArchive={() => void sessions.archive(session.id, session.title)}
                         onRestore={() => void sessions.restore(session.id)}
                         onExport={(format) => void sessions.exportSession(session.id, format)}
+                        onPin={(pinned) => void sessions.pin(session.id, pinned)}
                       />
                     ))
                   ))}

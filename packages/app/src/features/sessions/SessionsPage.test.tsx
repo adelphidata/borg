@@ -325,6 +325,41 @@ describe("SessionsPage row actions", () => {
     );
   });
 
+  it("pins from the row menu and unpins a pinned row, which leads the list", async () => {
+    const daemon = fakeDaemon({
+      ...listing([summary(), summary({ id: "s2", title: "Kept plan", pinned: true })]),
+      SetSessionPinned: {},
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Pinned")).toBeTruthy());
+    // The pinned row comes first even though the daemon listed it second.
+    const titles = screen.getAllByText(/^(Ship the daemon|Kept plan)$/).map((e) => e.textContent);
+    expect(titles).toEqual(["Kept plan", "Ship the daemon"]);
+
+    fireEvent.contextMenu(screen.getByText("Ship the daemon").closest("button")!, {
+      clientX: 10,
+      clientY: 10,
+    });
+    act(() => within(screen.getByRole("menu")).getByText("Pin").click());
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSessionPinned")?.request).toEqual({
+        id: "s1",
+        pinned: true,
+      }),
+    );
+
+    fireEvent.contextMenu(screen.getByText("Kept plan").closest("button")!, {
+      clientX: 10,
+      clientY: 10,
+    });
+    act(() => within(screen.getByRole("menu")).getByText("Unpin").click());
+    await waitFor(() =>
+      expect(
+        daemon.calls.filter((c) => c.method === "SetSessionPinned").map((c) => c.request),
+      ).toContainEqual({ id: "s2", pinned: false }),
+    );
+  });
+
   it("names the row it archived, so the way back says which conversation", async () => {
     const daemon = fakeDaemon({ ...listing([summary()]), SetSessionArchived: {} });
     mount(daemon);

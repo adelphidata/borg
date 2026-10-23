@@ -31,6 +31,24 @@ describe("sessionRowActions", () => {
     expect(h.onExport).toHaveBeenCalledWith("md");
   });
 
+  it("offers Pin after Rename when the caller can pin, and Unpin once pinned", () => {
+    const onPin = vi.fn();
+    const loose = sessionRowActions({ ...handlers(), onPin });
+    expect(loose.map((a) => a.label)).toEqual(["Rename", "Pin", "Export…", "Archive"]);
+    loose.find((a) => a.id === "pin")!.onSelect();
+    expect(onPin).toHaveBeenLastCalledWith(true);
+
+    const kept = sessionRowActions({ ...handlers(), onPin, pinned: true });
+    kept.find((a) => a.id === "pin")!.onSelect();
+    expect(kept.find((a) => a.id === "pin")!.label).toBe("Unpin");
+    expect(onPin).toHaveBeenLastCalledWith(false);
+  });
+
+  it("offers no pin on an archived row", () => {
+    const actions = sessionRowActions({ ...handlers(), onPin: vi.fn(), archived: true });
+    expect(actions.some((a) => a.id === "pin")).toBe(false);
+  });
+
   it("runs the caller's handler for a destructive action", () => {
     const h = handlers();
     sessionRowActions(h)

@@ -60,6 +60,18 @@ describe("groupSessions", () => {
   it("returns nothing for an empty list rather than empty groups", () => {
     expect(groupSessions([], NOW)).toEqual([]);
   });
+
+  it("leads with the pinned sessions, whatever their date, and lists each once", () => {
+    const groups = groupSessions(
+      [at(3600, "today"), { ...at(-90 * DAY, "kept"), pinned: true }, at(-1, "yesterday")],
+      NOW,
+    );
+    expect(groups.map((g) => [g.label, g.sessions.map((s) => s.id)])).toEqual([
+      ["Pinned", ["kept"]],
+      ["Today", ["today"]],
+      ["Yesterday", ["yesterday"]],
+    ]);
+  });
 });
 
 describe("filterSessions", () => {

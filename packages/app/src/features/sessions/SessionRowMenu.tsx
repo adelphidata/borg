@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { ArchiveIcon, Menu, MoreIcon, PencilIcon, type MenuAction } from "@borg/ui";
+import {
+  ArchiveIcon,
+  Menu,
+  MoreIcon,
+  PencilIcon,
+  PinIcon,
+  UnpinIcon,
+  type MenuAction,
+} from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
 
 export interface SessionRowMenuProps {
@@ -10,6 +18,10 @@ export interface SessionRowMenuProps {
   onExport: (format: string) => void;
   /** Whether this row is already archived. */
   archived?: boolean;
+  /** Whether this row is pinned to the top of the lists. */
+  pinned?: boolean;
+  /** Pins or unpins the row; without it the menu offers neither. */
+  onPin?: (pinned: boolean) => void;
 }
 
 /** Builds the row's actions once, so the kebab and right-click can never differ. */
@@ -19,9 +31,22 @@ export function sessionRowActions({
   onRestore,
   onExport,
   archived = false,
+  pinned = false,
+  onPin,
 }: SessionRowMenuProps): MenuAction[] {
   return [
     { id: "rename", label: "Rename", icon: <PencilIcon size={13} />, onSelect: onRename },
+    // An archived row is out of both lists, so there is nothing to pin it to.
+    ...(onPin && !archived
+      ? [
+          {
+            id: "pin",
+            label: pinned ? "Unpin" : "Pin",
+            icon: pinned ? <UnpinIcon size={13} /> : <PinIcon size={13} />,
+            onSelect: () => onPin(!pinned),
+          },
+        ]
+      : []),
     { id: "export", label: "Export…", onSelect: () => onExport("md") },
     // The same slot either way: a row never grows an action, it changes the one
     // it has, so the menu is the same shape wherever the conversation sits.

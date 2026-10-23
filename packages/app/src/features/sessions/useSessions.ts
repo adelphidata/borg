@@ -63,8 +63,13 @@ export function groupSessions(sessions: SessionRow[], now: number): SessionGroup
     return "Older";
   };
 
+  // Pinned rows lead, as they do in the sidebar, whatever their date.
+  const pinned = sessions.filter((s) => s.pinned);
+  if (pinned.length > 0) groups.push({ label: "Pinned", sessions: pinned });
+
   // Already newest-first from the daemon, so a single pass keeps the order.
   for (const session of sessions) {
+    if (session.pinned) continue;
     const label = labelFor(session.updatedAt);
     const tail = groups[groups.length - 1];
     if (tail && tail.label === label) tail.sessions.push(session);
@@ -154,6 +159,8 @@ export interface Sessions {
   archive: (id: string, title?: string) => Promise<unknown>;
   /** Brings an archived conversation back into the list. */
   restore: (id: string) => Promise<unknown>;
+  /** Pins a conversation to the top of the lists, or lets it go back. */
+  pin: (id: string, pinned: boolean) => Promise<unknown>;
   /** Archived conversations, empty until they are asked for. */
   archived: SessionRow[];
   showArchived: boolean;
@@ -223,6 +230,10 @@ export function useSessions(deps: unknown[] = []): Sessions {
       },
     },
   );
+  const pinMutation = useMutation(
+    (borg, vars: { id: string; pinned: boolean }) => borg.admin.setSessionPinned(vars),
+    { onSuccess: () => sessionsChanged() },
+  );
   const exportMutation = useMutation(async (borg, vars: { id: string; format: string }) => {
     const result = await borg.admin.exportSession({
       sessionId: vars.id,
@@ -275,10 +286,16 @@ export function useSessions(deps: unknown[] = []): Sessions {
     rename: (id, title) => renameMutation.run({ id, title }),
     archive: (id, title) => setArchivedMutation.run({ id, archived: true, title }),
     restore: (id) => setArchivedMutation.run({ id, archived: false }),
+    pin: (id, pinned) => pinMutation.run({ id, pinned }),
     archived: split.archived,
     showArchived,
     setShowArchived,
     exportSession: (id, format) => exportMutation.run({ id, format }),
-    error: (renameMutation.error ?? setArchivedMutation.error ?? exportMutation.error)?.message,
+    error: (
+      renameMutation.error ??
+      setArchivedMutation.error ??
+      pinMutation.error ??
+      exportMutation.error
+    )?.message,
   };
 }
