@@ -3,7 +3,7 @@ import type { ButtonHTMLAttributes } from "react";
 type PillVariant = "default" | "primary" | "danger";
 
 const BASE =
-  "cursor-pointer border bg-transparent font-medium leading-none transition-[border-color,color,background] duration-150";
+  "cursor-pointer border bg-transparent font-medium leading-none transition-[border-color,color,background,opacity] duration-150 disabled:cursor-default disabled:opacity-50";
 
 const VARIANT: Record<PillVariant, string> = {
   default: "border-line text-ink2 hover:border-neon hover:text-ink",

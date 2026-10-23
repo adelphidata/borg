@@ -301,6 +301,8 @@ not canned response data.
 
 The agent's name lives in the `user.agent_name` setting (first-run screen, Settings → Name, or `borg settings set user.agent_name …`). Changing it rewrites the name in `IDENTITY.md` (heading and `You are …,`), the `- Agent:` line of `$BORG_HOME/MEMORY.md`, and `SETUP.md` while it still exists. With no `IDENTITY.md`, the default identity uses the setting.
 
+The owner's name lives in the `user.name` setting (first-run wizard, Settings → Name, or `borg settings set user.name …`). It is shown in the desktop and web sidebar and given to the agent on an `Owner:` line in `<environment>`. When the owner says what to call them, the agent saves it by passing `user_name` to `write_memory`; a channel message (Slack, Telegram, …) cannot set it, since its sender may not be the owner. Changing it rewrites the `- Name:` line under `## Owner` in `$BORG_HOME/MEMORY.md` and the template's `belonging to …` in `IDENTITY.md`, and nothing else: owner names are often ordinary words.
+
 ## HEARTBEAT.md
 
 `HEARTBEAT.md` is an optional checklist used only during heartbeat turns.

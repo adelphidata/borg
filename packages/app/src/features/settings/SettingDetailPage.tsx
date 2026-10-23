@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   BackLink,
@@ -18,6 +18,7 @@ import { DaemonState } from "../../components/DaemonState";
 import { ShuffleButton } from "../../components/NameField";
 import { DEFAULT_AGENT_NAME, rerollName } from "../../lib/agentName";
 import { useSettings } from "../../lib/settings";
+import { MAX_NAME_CHARS, USER_NAME_KEY } from "../../lib/userName";
 import {
   effectiveModel,
   modelsOf,
@@ -433,54 +434,112 @@ function CatalogDetail({
   );
 }
 
+type Entry = { key: string; value: string; overridden: boolean };
+
 /**
- * The agent's name: typed, or rerolled from the pool the first run drew
- * from. A reroll only fills the field; Save is the commitment. The daemon
- * carries the new name into the memory files.
+ * A draft that follows its stored value: a save refreshes the snapshot, and
+ * the field takes the new value. Synced during render, not in an effect, so a
+ * keystroke before the first effect could run is kept.
  */
-function NameDetail({ entry }: { entry: { key: string; value: string; overridden: boolean } }) {
+function useSeededDraft(stored: string) {
+  const [draft, setDraft] = useState(stored);
+  const [seeded, setSeeded] = useState(stored);
+  if (stored !== seeded) {
+    setSeeded(stored);
+    setDraft(stored);
+  }
+  return [draft, setDraft] as const;
+}
+
+const NAME_LABEL = "text-[12.5px] leading-none font-medium text-ink2";
+const NAME_BOX =
+  "flex items-center gap-1 rounded-[10px] border border-field bg-surface2 py-1 pr-1.5 pl-4 focus-within:border-focus";
+const NAME_INPUT =
+  "min-w-0 flex-1 bg-transparent py-2 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3";
+
+/**
+ * Both names: what the agent answers to, typed or rerolled from the pool the
+ * first run drew from, and what it calls the user. A reroll only fills the
+ * field; Save is the commitment, and writes only the names that changed. A
+ * field cleared and saved goes back to its default: "Borg" for the agent, no
+ * name for the user. The daemon carries either into the memory files, and the
+ * agent fills in the user's name itself when they mention it.
+ */
+function NameDetail({ agent, user }: { agent: Entry; user: Entry | undefined }) {
   const { save, clear, saving } = useSettings();
   const setup = useSetupStatus();
   const pool = setup.state === "ready" ? setup.data.agentNames : [];
-  const current = entry.value.trim() || DEFAULT_AGENT_NAME;
-  const [draft, setDraft] = useState(current);
-  // A save refreshes the snapshot; follow the new name. Synced during
-  // render so a keystroke before the first effect could run is kept.
-  const [seeded, setSeeded] = useState(current);
-  if (current !== seeded) {
-    setSeeded(current);
-    setDraft(current);
-  }
-  const next = draft.trim();
-  const dirty = next !== "" && next !== current;
-  const commit = () => dirty && !saving && void save(entry.key, next);
+  const agentId = useId();
+  const userId = useId();
+
+  const agentName = agent.value.trim() || DEFAULT_AGENT_NAME;
+  const userName = user?.value.trim() ?? "";
+  const [agentDraft, setAgentDraft] = useSeededDraft(agentName);
+  const [userDraft, setUserDraft] = useSeededDraft(userName);
+
+  const nextAgent = agentDraft.trim();
+  const nextUser = userDraft.trim();
+  const agentDirty = nextAgent === "" ? agent.overridden : nextAgent !== agentName;
+  const userDirty = user !== undefined && nextUser !== userName;
+  const dirty = agentDirty || userDirty;
+
+  const write = (key: string, value: string) => (value === "" ? clear(key) : save(key, value));
+  const commit = async () => {
+    if (!dirty || saving) return;
+    // One at a time, and stop at the first refusal: its error is the one on screen.
+    if (agentDirty && !(await write(agent.key, nextAgent))) return;
+    if (userDirty) await write(USER_NAME_KEY, nextUser);
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => isSubmitEnter(e) && void commit();
 
   return (
     <>
-      <div className="flex flex-col gap-3.5">
-        <div className="flex items-center gap-1 rounded-[10px] border border-field bg-surface2 py-1 pr-1.5 pl-4 focus-within:border-focus">
-          <input
-            aria-label="Agent name"
-            className="min-w-0 flex-1 bg-transparent py-2 text-[13.5px] leading-none text-ink outline-none placeholder:text-ink3"
-            value={draft}
-            placeholder={DEFAULT_AGENT_NAME}
-            maxLength={40}
-            spellCheck={false}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => isSubmitEnter(e) && commit()}
-          />
-          <ShuffleButton
-            disabled={pool.length === 0}
-            onClick={() => setDraft(rerollName(pool, draft))}
-          />
+      <div className="flex flex-col gap-5">
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor={agentId} className={NAME_LABEL}>
+            Agent name
+          </label>
+          <div className={NAME_BOX}>
+            <input
+              id={agentId}
+              className={NAME_INPUT}
+              value={agentDraft}
+              placeholder={DEFAULT_AGENT_NAME}
+              maxLength={MAX_NAME_CHARS}
+              spellCheck={false}
+              onChange={(e) => setAgentDraft(e.target.value)}
+              onKeyDown={onKeyDown}
+            />
+            <ShuffleButton
+              disabled={pool.length === 0}
+              onClick={() => setAgentDraft(rerollName(pool, agentDraft))}
+            />
+          </div>
         </div>
+        {user && (
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor={userId} className={NAME_LABEL}>
+              Your name
+            </label>
+            <div className={NAME_BOX}>
+              <input
+                id={userId}
+                className={NAME_INPUT}
+                value={userDraft}
+                placeholder="What should Borg call you?"
+                maxLength={MAX_NAME_CHARS}
+                autoComplete="name"
+                spellCheck={false}
+                onChange={(e) => setUserDraft(e.target.value)}
+                onKeyDown={onKeyDown}
+              />
+            </div>
+          </div>
+        )}
         <div className="flex items-center gap-[9px]">
-          <Pill variant="primary" disabled={!dirty || saving} onClick={commit}>
+          <Pill variant="primary" disabled={!dirty || saving} onClick={() => void commit()}>
             {saving ? "Saving…" : "Save"}
           </Pill>
-          {entry.overridden && (
-            <Pill onClick={() => !saving && void clear(entry.key)}>Reset to default</Pill>
-          )}
         </div>
       </div>
     </>
@@ -556,7 +615,7 @@ export function SettingDetailPage() {
               <>
                 <Heading name={title} desc={basic.desc} />
                 <SaveError message={saveError?.message} />
-                <NameDetail entry={entry} />
+                <NameDetail agent={entry} user={map.get(USER_NAME_KEY)} />
               </>
             );
           }

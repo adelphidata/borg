@@ -19,6 +19,7 @@ const entry = (key: string, value: string, category = "default") => ({
 
 const REGISTRY = [
   entry("user.agent_name", ""),
+  entry("user.name", ""),
   entry("llm.thinking", "medium"),
   entry("provider", "anthropic"),
   entry("model", "claude-opus-5"),
@@ -48,9 +49,14 @@ function mount(route: string, daemon = fakeDaemon(DAEMON)) {
 
 const click = (element: HTMLElement) => act(() => element.click());
 
-describe("SettingDetailPage for the agent's name", () => {
+describe("SettingDetailPage for the names", () => {
   const nameInput = () => screen.getByLabelText("Agent name") as HTMLInputElement;
+  const userInput = () => screen.getByLabelText("Your name") as HTMLInputElement;
   const save = () => screen.getByText("Save").closest("button") as HTMLButtonElement;
+  const writes = (daemon: ReturnType<typeof fakeDaemon>) =>
+    daemon.calls
+      .filter((c) => c.method === "SetSetting" || c.method === "UnsetSetting")
+      .map((c) => ({ method: c.method, request: c.request }));
 
   it("shows Borg while unset, and saves only a real change", async () => {
     const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
@@ -60,10 +66,9 @@ describe("SettingDetailPage for the agent's name", () => {
     fireEvent.change(nameInput(), { target: { value: " Ada " } });
     fireEvent.keyDown(nameInput(), { key: "Enter" });
     await waitFor(() =>
-      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
-        key: "user.agent_name",
-        value: "Ada",
-      }),
+      expect(writes(daemon)).toEqual([
+        { method: "SetSetting", request: { key: "user.agent_name", value: "Ada" } },
+      ]),
     );
   });
 
@@ -72,7 +77,6 @@ describe("SettingDetailPage for the agent's name", () => {
       GetSettings: { entries: [entry("user.agent_name", "Borgzilla", "db")] },
       GetSetupStatus: setupStatus(),
       SetSetting: {},
-      UnsetSetting: {},
     });
     mount("/settings/name", daemon);
     await waitFor(() => expect(nameInput().value).toBe("Borgzilla"));
@@ -81,20 +85,110 @@ describe("SettingDetailPage for the agent's name", () => {
     await waitFor(() => expect(shuffle.disabled).toBe(false));
     click(shuffle);
     await waitFor(() => expect(nameInput().value).toBe("Borg Vader"));
-    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
+    expect(writes(daemon)).toEqual([]);
     click(save());
     await waitFor(() =>
-      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
-        key: "user.agent_name",
-        value: "Borg Vader",
-      }),
+      expect(writes(daemon)).toEqual([
+        { method: "SetSetting", request: { key: "user.agent_name", value: "Borg Vader" } },
+      ]),
     );
-    click(screen.getByText("Reset to default"));
+  });
+
+  it("puts a cleared agent name back to Borg", async () => {
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [entry("user.agent_name", "Borgzilla", "db")] },
+      GetSetupStatus: setupStatus(),
+      UnsetSetting: {},
+    });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(nameInput().value).toBe("Borgzilla"));
+    fireEvent.change(nameInput(), { target: { value: "  " } });
+    expect(nameInput().placeholder).toBe("Borg");
+    click(save());
     await waitFor(() =>
-      expect(daemon.calls.find((c) => c.method === "UnsetSetting")?.request).toEqual({
-        key: "user.agent_name",
+      expect(writes(daemon)).toEqual([
+        { method: "UnsetSetting", request: { key: "user.agent_name" } },
+      ]),
+    );
+  });
+
+  it("leaves a cleared default alone: there is nothing to put back", async () => {
+    mount("/settings/name");
+    await waitFor(() => expect(nameInput().value).toBe("Borg"));
+    fireEvent.change(nameInput(), { target: { value: "" } });
+    expect(save().disabled).toBe(true);
+  });
+
+  it("saves the user's name beside the agent's, and only that one when it alone changed", async () => {
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(userInput().value).toBe(""));
+    expect(userInput().placeholder).toBe("What should Borg call you?");
+    fireEvent.change(userInput(), { target: { value: " Ada Lovelace " } });
+    fireEvent.keyDown(userInput(), { key: "Enter" });
+    await waitFor(() =>
+      expect(writes(daemon)).toEqual([
+        { method: "SetSetting", request: { key: "user.name", value: "Ada Lovelace" } },
+      ]),
+    );
+  });
+
+  it("writes both names with one Save", async () => {
+    const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(userInput().value).toBe(""));
+    fireEvent.change(nameInput(), { target: { value: "Borgzilla" } });
+    fireEvent.change(userInput(), { target: { value: "Ada" } });
+    click(save());
+    await waitFor(() =>
+      expect(writes(daemon)).toEqual([
+        { method: "SetSetting", request: { key: "user.agent_name", value: "Borgzilla" } },
+        { method: "SetSetting", request: { key: "user.name", value: "Ada" } },
+      ]),
+    );
+  });
+
+  it("forgets the user's name when the field is cleared", async () => {
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [entry("user.agent_name", ""), entry("user.name", "Ada", "db")] },
+      GetSetupStatus: setupStatus(),
+      UnsetSetting: {},
+    });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(userInput().value).toBe("Ada"));
+    fireEvent.change(userInput(), { target: { value: "" } });
+    click(save());
+    await waitFor(() =>
+      expect(writes(daemon)).toEqual([{ method: "UnsetSetting", request: { key: "user.name" } }]),
+    );
+  });
+
+  it("stops at the first refusal, so the error on screen is the one that matters", async () => {
+    const daemon = fakeDaemon({
+      ...DAEMON,
+      SetSetting: new BorgError(INVALID_ARGUMENT, "keep the name to 40 characters"),
+    });
+    mount("/settings/name", daemon);
+    await waitFor(() => expect(userInput().value).toBe(""));
+    fireEvent.change(nameInput(), { target: { value: "Borgzilla" } });
+    fireEvent.change(userInput(), { target: { value: "Ada" } });
+    click(save());
+    await waitFor(() => expect(screen.getByText("keep the name to 40 characters")).toBeTruthy());
+    expect(writes(daemon)).toEqual([
+      { method: "SetSetting", request: { key: "user.agent_name", value: "Borgzilla" } },
+    ]);
+  });
+
+  it("offers only the agent's name to a daemon that has no setting for the user's", async () => {
+    mount(
+      "/settings/name",
+      fakeDaemon({
+        GetSettings: { entries: [entry("user.agent_name", "")] },
+        GetSetupStatus: setupStatus(),
       }),
     );
+    await waitFor(() => expect(nameInput().value).toBe("Borg"));
+    expect(screen.queryByLabelText("Your name")).toBeNull();
   });
 });
 

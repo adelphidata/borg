@@ -41,7 +41,8 @@ export interface BasicSetting {
    * Choices come from the daemon's catalog (`Admin.GetSetupStatus`) rather
    * than a list here: the providers, or the models of the current provider.
    * Free text stays reachable behind "Something else…". `name` is the
-   * agent's name: free text with a reroll from the daemon's name pool.
+   * agent's name, free text with a reroll from the daemon's name pool, and
+   * the user's beside it.
    */
   catalog?: "provider" | "model" | "name";
 }
@@ -66,7 +67,7 @@ export const basicSettings: BasicSetting[] = [
     id: "name",
     key: "user.agent_name",
     name: "Name",
-    desc: "What Borg answers to",
+    desc: "What Borg answers to, and what it calls you",
     catalog: "name",
   },
   {

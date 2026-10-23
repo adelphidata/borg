@@ -810,8 +810,11 @@ impl Agent {
             .update_limits(new_config.security.action_limits.clone());
         let resolved_creds = new_config.resolve_credentials();
         self.caches.on_config_reloaded(resolved_creds);
-        // A rename rewrites IDENTITY.md (or the default it falls back to).
-        if new_config.user.agent_name != self.config.user.agent_name {
+        // Renaming the agent or the owner rewrites IDENTITY.md (or the
+        // default it falls back to).
+        if new_config.user.agent_name != self.config.user.agent_name
+            || new_config.user.name != self.config.user.name
+        {
             self.caches
                 .on_memory_written("global", crate::constants::IDENTITY_FILE);
         }
@@ -824,6 +827,20 @@ impl Agent {
             &self.config.skills,
             Some(self.execution_context.workspace_root()),
         );
+    }
+
+    /// Take a just-saved owner's name now rather than on the config watcher's
+    /// next poll, so the rest of this turn already prompts with it. The save
+    /// may also have rewritten the owner in IDENTITY.md.
+    fn adopt_user_name(&mut self, name: &str) {
+        let name = Some(name.trim().to_string());
+        if self.config.user.name == name {
+            return;
+        }
+        self.config.user.name = name;
+        self.config_arc = Arc::new(self.config.clone());
+        self.caches
+            .on_memory_written("global", crate::constants::IDENTITY_FILE);
     }
 
     async fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {

@@ -3,6 +3,7 @@ import { act, render, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { BorgError, GrpcStatus, type session as sessionPb } from "@borg/client";
 import { PlatformProvider } from "../../lib/platform";
+import { SettingsProvider } from "../../lib/settings";
 import { FAILED_PRECONDITION, fakeDaemon } from "../../test/harness";
 import { useConversation, type Conversation } from "./useConversation";
 
@@ -614,6 +615,60 @@ describe("useConversation stream health", () => {
 
     emit(daemon, { textDelta: { text: "back" } as never });
     expect(conv.current.streamError).toBeUndefined();
+  });
+});
+
+describe("useConversation and the user's name", () => {
+  function mountWithSettings(daemon: ReturnType<typeof fakeDaemon>) {
+    const seen: { current: Conversation } = { current: undefined as never };
+    function Probe() {
+      seen.current = useConversation(undefined);
+      return null;
+    }
+    render(
+      <MemoryRouter>
+        <PlatformProvider
+          platform={{ kind: "desktop", transport: daemon.transport, titleBarDrag: false }}
+        >
+          <SettingsProvider>
+            <Probe />
+          </SettingsProvider>
+        </PlatformProvider>
+      </MemoryRouter>,
+    );
+    return seen;
+  }
+  const settingsReads = (daemon: ReturnType<typeof fakeDaemon>) =>
+    daemon.calls.filter((c) => c.method === "GetSettings").length;
+
+  it("renews the settings when the agent saves the name, so the sidebar shows it", async () => {
+    const daemon = fakeDaemon({ ...OPEN, GetSettings: { entries: [] } });
+    const conv = mountWithSettings(daemon);
+    await ready(conv);
+    await waitFor(() => expect(settingsReads(daemon)).toBe(1));
+    emit(daemon, {
+      toolExecuting: { toolCallId: "c1", name: "write_memory", argsJson: '{"user_name":"Ada"}' },
+    } as never);
+    expect(settingsReads(daemon)).toBe(1);
+    emit(daemon, { toolResult: { toolCallId: "c1", result: "Saved.", images: [] } } as never);
+    await waitFor(() => expect(settingsReads(daemon)).toBe(2));
+  });
+
+  it("leaves the settings alone for a memory write that names no one", async () => {
+    const daemon = fakeDaemon({ ...OPEN, GetSettings: { entries: [] } });
+    const conv = mountWithSettings(daemon);
+    await ready(conv);
+    await waitFor(() => expect(settingsReads(daemon)).toBe(1));
+    emit(daemon, {
+      toolExecuting: {
+        toolCallId: "c1",
+        name: "write_memory",
+        argsJson: '{"filename":"notes","content":"x","user_name":""}',
+      },
+    } as never);
+    emit(daemon, { toolResult: { toolCallId: "c1", result: "ok", images: [] } } as never);
+    await act(async () => {});
+    expect(settingsReads(daemon)).toBe(1);
   });
 });
 

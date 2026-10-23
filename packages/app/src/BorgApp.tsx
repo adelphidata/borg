@@ -51,15 +51,13 @@ import { SettingDetailPage } from "./features/settings/SettingDetailPage";
 import { VoiceSettingsPage } from "./features/settings/VoiceSettingsPage";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
 import { useAgentName } from "./lib/agentName";
+import { useNavUser } from "./lib/userName";
 import { sidebarUpdate, useUpdater } from "./lib/updater";
 import { SettingsProvider, useSettings } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useBorg, useMutation, useQuery } from "./lib/useDaemon";
 import type { admin } from "@borg/client";
 import { routes } from "./routes";
-
-// TODO(daemon): no RPC carries an operator identity yet; the footer stays static.
-const user = { name: "Operator", initials: "OP" };
 
 /**
  * Installs the keyboard layer and lets the native shell drive it.
@@ -94,6 +92,7 @@ function Shell({ platform }: { platform: Platform }) {
   usePauseAnimationsWhenHidden();
   const { theme, toggleTheme } = useTheme();
   const agentName = useAgentName();
+  const user = useNavUser();
   const updater = useUpdater();
   const navigate = useNavigate();
   const location = useLocation();
@@ -265,6 +264,7 @@ function Shell({ platform }: { platform: Platform }) {
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
             user={user}
+            onEditUser={() => navigate("/settings/name")}
             agentName={agentName}
             collapsed={sidebarCollapsed}
             onToggleCollapsed={toggleSidebar}

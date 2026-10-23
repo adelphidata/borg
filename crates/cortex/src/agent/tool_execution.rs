@@ -876,13 +876,17 @@ impl Agent {
         // Variants returning Result<String> wrap to ToolOutput::Text below.
         let text_result: Result<String> = match &tool {
             crate::tool::Tool::WriteMemory(args) => {
-                crate::tool::write_memory::handle(
+                let out = crate::tool::write_memory::handle(
                     args,
                     &self.config,
                     &self.config_arc,
                     &mut self.caches,
                 )
-                .await
+                .await;
+                if let (Ok(_), Some(name)) = (&out, args.user_name()) {
+                    self.adopt_user_name(name);
+                }
+                out
             }
             crate::tool::Tool::ReadMemory(args) => {
                 crate::tool::read_memory::handle(args, &self.config).await

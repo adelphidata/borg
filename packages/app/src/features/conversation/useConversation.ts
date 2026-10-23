@@ -14,6 +14,8 @@ import { draftKeyFor, moveDraft } from "./draftStore";
 import { awaitingInput as awaitingInputOf, retirePrompts } from "./queuedTurn";
 import { createTurnClock } from "./turnClock";
 import { sessionsChanged } from "../sessions/sessionsVersion";
+import { useOptionalSettings } from "../../lib/settings";
+import { savesUserName } from "../../lib/userName";
 
 /** An image riding along with a turn. */
 export interface Attachment {
@@ -725,6 +727,14 @@ export function useConversation(target: string | undefined): Conversation {
   const cellsRef = useRef(cells);
   cellsRef.current = cells;
   /**
+   * The agent saves the user's name through `write_memory`, and the sidebar
+   * reads it from the settings snapshot, which nothing else would renew
+   * mid-conversation. The ids are those calls still running.
+   */
+  const refetchSettings = useRef<(() => void) | undefined>(undefined);
+  refetchSettings.current = useOptionalSettings()?.settings.refetch;
+  const nameSaves = useRef(new Set<string>());
+  /**
    * Counts opens. Work that outlives a render — a title read, a reopen —
    * compares it before writing, so an answer about the conversation just left
    * never lands on the one now on screen.
@@ -929,6 +939,15 @@ export function useConversation(target: string | undefined): Conversation {
         armTurnClock();
       }
       if (event.planUpdated) setPlan(event.planUpdated.steps);
+      if (
+        event.toolExecuting &&
+        savesUserName(event.toolExecuting.name, event.toolExecuting.argsJson)
+      ) {
+        nameSaves.current.add(event.toolExecuting.toolCallId);
+      }
+      if (event.toolResult && nameSaves.current.delete(event.toolResult.toolCallId)) {
+        refetchSettings.current?.();
+      }
       setCells((prev) => reduceEvent(prev, event));
       if (event.turnComplete && stopRequested.current) {
         setCells((prev) => [...prev, { kind: "notice", text: STOPPED, at: Date.now() }]);

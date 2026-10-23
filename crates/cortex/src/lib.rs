@@ -196,6 +196,8 @@ pub mod url_policy;
 /// spend, cost, model usage, tool calls, channel activity) over a rolling
 /// time window. The TUI popup renders the returned string verbatim.
 pub mod usage;
+/// The owner's name: the `user.name` setting and its memory-file rewrite.
+pub mod user_name;
 /// Shared low-level primitives: hex, retry, panic-utils, truncate, unix-ext.
 pub mod util;
 /// Vitals system: passive agent health tracking via hooks.

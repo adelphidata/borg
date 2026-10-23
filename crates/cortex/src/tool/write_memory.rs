@@ -1,10 +1,10 @@
 //! `write_memory` tool: typed args + handler with co-located effects.
 //!
 //! Effects (IDENTITY cache invalidation, embedding spawn, optional
-//! quiet-hours timezone slide) live in this file alongside the handler so
-//! that "the place you go to understand `write_memory`" is exactly one
-//! module — replacing the prior `tool_dispatch::handle_write_memory_with_effects`
-//! split.
+//! quiet-hours timezone slide, the owner's `user_name`) live in this file
+//! alongside the handler so that "the place you go to understand
+//! `write_memory`" is exactly one module — replacing the prior
+//! `tool_dispatch::handle_write_memory_with_effects` split.
 
 use std::sync::Arc;
 
@@ -54,6 +54,8 @@ pub(crate) struct MemoryOp {
 /// - **batch**: `operations` — a list of add/replace/remove ops applied
 ///   atomically against the final per-entry token budget. When `operations`
 ///   is present, the top-level single-op fields are ignored.
+///
+/// Either shape may carry `user_name`, or it may come alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WriteMemoryArgs {
     #[serde(default)]
@@ -70,9 +72,23 @@ pub(crate) struct WriteMemoryArgs {
     pub scope: Option<String>,
     #[serde(default)]
     pub operations: Option<Vec<MemoryOp>>,
+    /// What the owner is called: saved to the `user.name` setting, which the
+    /// app shows and the system prompt reads. Rides on this tool rather than
+    /// a tool of its own, since every schema is sent on every turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
 }
 
 impl WriteMemoryArgs {
+    /// The name to save, if the call carries one. Blank counts as absent: a
+    /// model that fills every optional field with "" must not wipe the name.
+    pub(crate) fn user_name(&self) -> Option<&str> {
+        self.user_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    }
+
     pub(crate) fn to_value(&self) -> serde_json::Value {
         // Plain struct of primitives; serialization is infallible.
         // The expect would only fire on a serde upstream bug.
@@ -89,10 +105,48 @@ impl WriteMemoryArgs {
 ///    `IDENTITY.md` (so the next system prompt re-loads it).
 /// 3. On success, spawn a background embedding job (fire-and-forget).
 /// 4. On success, attempt a quiet-hours timezone slide based on the content.
+/// 5. On success, save `user_name` when the call carries one.
 ///
-/// All side effects log on failure rather than aborting — they never block
-/// the primary write or fail the tool call.
+/// Side effects 2–4 log on failure rather than aborting — they never block
+/// the primary write or fail the tool call. The name is a write of its own,
+/// so its failure fails the call; it is checked before the entry is written
+/// so a bad name rejects the call with nothing changed.
 pub(crate) async fn handle(
+    args: &WriteMemoryArgs,
+    config: &Config,
+    config_arc: &Arc<Config>,
+    caches: &mut SystemPromptCache,
+) -> Result<String> {
+    let user_name = args.user_name();
+    if let Some(name) = user_name {
+        // A channel message may come from anyone the owner let in, and only
+        // the owner names the owner.
+        if crate::gateway_context::current().is_some() {
+            anyhow::bail!(
+                "user_name can only be saved from the owner's own app, not from a channel message"
+            );
+        }
+        crate::user_name::validate(name).map_err(anyhow::Error::msg)?;
+    }
+    let has_entry = args.operations.as_ref().is_some_and(|ops| !ops.is_empty())
+        || args.filename.as_deref().is_some_and(|f| !f.is_empty());
+    let written = match (has_entry, user_name) {
+        (false, Some(_)) => None,
+        _ => Some(write_entries(args, config, config_arc, caches).await?),
+    };
+    let Some(name) = user_name else {
+        return Ok(written.unwrap_or_default());
+    };
+    let saved = crate::user_name::save(name).await?;
+    let line = format!("Owner's name saved: {saved}. The app shows it in the sidebar.");
+    Ok(match written {
+        Some(text) => format!("{text}\n{line}"),
+        None => line,
+    })
+}
+
+/// The memory-entry half of [`handle`]: one op or a batch.
+async fn write_entries(
     args: &WriteMemoryArgs,
     config: &Config,
     config_arc: &Arc<Config>,
@@ -109,7 +163,7 @@ pub(crate) async fn handle(
     let filename = match args.filename.as_deref() {
         Some(f) if !f.is_empty() => f,
         _ => anyhow::bail!(
-            "write_memory requires either 'filename'+'content' or a non-empty 'operations' array"
+            "write_memory requires 'filename'+'content', a non-empty 'operations' array, or 'user_name'"
         ),
     };
     let value = args.to_value();
@@ -408,6 +462,7 @@ mod tests {
             append: false,
             scope: Some("nonexistent_scope_just_for_test".into()),
             operations: None,
+            user_name: None,
         };
         let _ = handle(&args, &config, &config_arc, &mut caches).await;
         assert_eq!(
@@ -415,6 +470,75 @@ mod tests {
             Some("stale-identity"),
             "non-IDENTITY writes must not clear the identity cache"
         );
+    }
+
+    #[test]
+    fn blank_user_name_counts_as_absent() {
+        let parse = |v| serde_json::from_value::<WriteMemoryArgs>(v).unwrap();
+        assert_eq!(
+            parse(serde_json::json!({"user_name": "  "})).user_name(),
+            None
+        );
+        assert_eq!(parse(serde_json::json!({})).user_name(), None);
+        assert_eq!(
+            parse(serde_json::json!({"user_name": " Mike "})).user_name(),
+            Some("Mike")
+        );
+        // Absent stays absent on the way to the entry handler.
+        assert!(parse(serde_json::json!({"filename": "x"}))
+            .to_value()
+            .get("user_name")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_user_name_rejects_the_call() {
+        let config = Config::default();
+        let config_arc = Arc::new(Config::default());
+        let mut caches = SystemPromptCache::default();
+        let args: WriteMemoryArgs =
+            serde_json::from_value(serde_json::json!({"user_name": "Mi\nke"})).unwrap();
+        let err = handle(&args, &config, &config_arc, &mut caches)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("line breaks"), "{err}");
+    }
+
+    /// A channel sender is not necessarily the owner, so a name from one is
+    /// refused. The name is also invalid and there is no entry: with the
+    /// guard gone, the call fails on validation and still writes nothing, so
+    /// this test never reaches the real settings or memory files.
+    #[tokio::test]
+    async fn a_channel_message_cannot_name_the_owner() {
+        let config = Config::default();
+        let config_arc = Arc::new(Config::default());
+        let mut caches = SystemPromptCache::default();
+        let args: WriteMemoryArgs =
+            serde_json::from_value(serde_json::json!({"user_name": "Bo\nb"})).unwrap();
+        let origin = crate::gateway_context::GatewayOriginContext {
+            channel_name: "slack".into(),
+            sender_id: "U1".into(),
+            thread_id: None,
+            session_key: "U1:".into(),
+        };
+        let err =
+            crate::gateway_context::scope(origin, handle(&args, &config, &config_arc, &mut caches))
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("channel message"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_call_with_nothing_to_write_names_every_shape() {
+        let config = Config::default();
+        let config_arc = Arc::new(Config::default());
+        let mut caches = SystemPromptCache::default();
+        let args: WriteMemoryArgs =
+            serde_json::from_value(serde_json::json!({"user_name": ""})).unwrap();
+        let err = handle(&args, &config, &config_arc, &mut caches)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("'user_name'"), "{err}");
     }
 
     #[test]

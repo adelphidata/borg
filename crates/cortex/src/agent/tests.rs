@@ -845,6 +845,20 @@ async fn a_report_never_lands_after_a_partial_reply() {
     );
 }
 
+/// The owner's name reaches the prompt, and a name the agent just saved is
+/// in the very next prompt rather than after the config watcher's poll.
+#[tokio::test]
+async fn environment_section_names_the_owner_and_adopts_a_saved_name() {
+    let mut agent = minimal_test_agent(Config::default());
+    let env = agent.build_environment_section(true).await;
+    assert!(env.contains("Owner: name not known yet."), "got: {env}");
+
+    agent.adopt_user_name(" Mike ");
+    let env = agent.build_environment_section(true).await;
+    assert!(env.contains("Owner: Mike\n"), "got: {env}");
+    assert_eq!(agent.config_arc.user.name.as_deref(), Some("Mike"));
+}
+
 /// After a provider failover, the `<environment>` runtime line must report the
 /// model that actually served the response — not the configured primary — so
 /// the model identifies itself truthfully during an outage. Guards the
@@ -857,7 +871,7 @@ async fn environment_section_reports_failover_model_identity() {
     let mut agent = minimal_test_agent(config);
 
     // No failover this turn: report the configured primary, no marker.
-    let env = agent.build_environment_section().await;
+    let env = agent.build_environment_section(true).await;
     assert!(env.contains("provider=anthropic"), "got: {env}");
     assert!(env.contains("model=claude-primary"), "got: {env}");
     assert!(
@@ -867,7 +881,7 @@ async fn environment_section_reports_failover_model_identity() {
 
     // A failover occurred: report the slot that actually served the response.
     agent.active_failover_identity = Some(("openai".to_string(), "gpt-fallback".to_string()));
-    let env = agent.build_environment_section().await;
+    let env = agent.build_environment_section(true).await;
     assert!(
         env.contains("provider=openai (failover active)"),
         "got: {env}"

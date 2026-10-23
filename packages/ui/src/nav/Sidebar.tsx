@@ -1,6 +1,13 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
-import { ChevronIcon, LogoIcon, MoonIcon, SunIcon, UpdateIcon } from "../components/icons";
+import {
+  ChevronIcon,
+  LogoIcon,
+  MoonIcon,
+  PlusIcon,
+  SunIcon,
+  UpdateIcon,
+} from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
 import { Truncated } from "../components/Truncated";
 import type { AppRoute, NavUser, RecentItem, SidebarUpdate } from "../types";
@@ -27,7 +34,10 @@ export interface SidebarProps {
   onNewConversation: () => void;
   /** Opens the full, searchable conversation list. */
   onSeeAllConversations: () => void;
-  user: NavUser;
+  /** Who is using Borg. Absent until a name is known: the footer then offers to add one. */
+  user?: NavUser;
+  /** Opens where the user's name is set. Omit and the footer is not a control. */
+  onEditUser?: () => void;
   /** What the agent is called, shown beside the logo. Defaults to "Borg". */
   agentName?: string;
   /**
@@ -253,6 +263,54 @@ function RecentRow({
   );
 }
 
+/**
+ * Who is using Borg, at the foot of the sidebar. A name not yet known is a
+ * quiet offer to add one rather than a stand-in: Borg also fills it in when
+ * the user mentions it in a conversation, so most people never need the offer.
+ */
+function UserItem({ user, onEdit }: { user?: NavUser; onEdit?: () => void }) {
+  if (!user && !onEdit) return <div className="flex-1" />;
+  const body = user ? (
+    <>
+      <span
+        aria-hidden
+        className="flex h-[26px] w-[26px] flex-none items-center justify-center rounded-full border border-line bg-surface3 text-[10.5px] leading-none font-semibold text-ink2"
+      >
+        {user.initials}
+      </span>
+      <span
+        title={user.name}
+        className="min-w-0 flex-1 truncate text-[12.5px] leading-[1.2] font-medium text-ink"
+      >
+        {user.name}
+      </span>
+    </>
+  ) : (
+    <>
+      <span
+        aria-hidden
+        className="flex h-[26px] w-[26px] flex-none items-center justify-center rounded-full border border-dashed border-line text-ink3"
+      >
+        <PlusIcon size={11} />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[12.5px] leading-[1.2] text-ink3 group-hover:text-ink2">
+        Add your name
+      </span>
+    </>
+  );
+  if (!onEdit) return <div className="flex min-w-0 flex-1 items-center gap-[11px]">{body}</div>;
+  return (
+    <button
+      type="button"
+      onClick={onEdit}
+      title={user ? "Change your name" : undefined}
+      className="group -my-1 -ml-1.5 flex min-w-0 flex-1 cursor-pointer items-center gap-[11px] rounded-md border-0 bg-transparent py-1 pl-1.5 text-left hover:bg-surface3"
+    >
+      {body}
+    </button>
+  );
+}
+
 export function Sidebar({
   routes,
   recents,
@@ -263,6 +321,7 @@ export function Sidebar({
   onNewConversation,
   onSeeAllConversations,
   user,
+  onEditUser,
   agentName = "Borg",
   collapsed = false,
   onToggleCollapsed,
@@ -382,13 +441,8 @@ export function Sidebar({
         </div>
       )}
 
-      <div className="flex items-center gap-[11px] border-t border-line2 px-2 pt-3">
-        <span className="flex h-[26px] w-[26px] items-center justify-center rounded-full border border-line bg-surface3 text-[10.5px] leading-none font-semibold text-ink2">
-          {user.initials}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-[12.5px] leading-[1.2] font-medium text-ink">{user.name}</div>
-        </div>
+      <div className="flex items-center gap-2 border-t border-line2 px-2 pt-3">
+        <UserItem user={user} onEdit={onEditUser} />
         {onToggleTheme && theme && (
           // The icon shows where a click goes, and the label says it in words.
           <button

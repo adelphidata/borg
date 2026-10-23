@@ -346,6 +346,43 @@ describe("BorgApp shell", () => {
     await waitFor(() => expect(screen.getByText("Ship the daemon (done)")).toBeTruthy());
   });
 
+  it("names the user in the sidebar from their setting, and opens it from there", async () => {
+    mount(
+      fakeDaemon({
+        ...BASE,
+        GetSettings: {
+          entries: [
+            {
+              key: "user.agent_name",
+              value: "",
+              category: "default",
+              label: "",
+              kind: "",
+              group: "",
+            },
+            {
+              key: "user.name",
+              value: "Ada Lovelace",
+              category: "db",
+              label: "",
+              kind: "",
+              group: "",
+            },
+          ],
+        },
+      }),
+    );
+    const footer = await screen.findByRole("button", { name: "Ada Lovelace" });
+    expect(footer.textContent).toContain("AL");
+    act(() => footer.click());
+    await waitFor(() => expect(screen.getByLabelText("Your name")).toBeTruthy());
+  });
+
+  it("offers to add a name it does not know yet", async () => {
+    mount();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add your name" })).toBeTruthy());
+  });
+
   it("lights the nav for a health warning and a waiting pairing", async () => {
     const daemon = fakeDaemon({
       ...BASE,

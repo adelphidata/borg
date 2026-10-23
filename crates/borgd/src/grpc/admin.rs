@@ -348,12 +348,12 @@ impl Admin for AdminSvc {
     /// first and `llm.base_url` second, or the endpoint is lost.
     async fn set_setting(&self, req: Request<SettingMutation>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
-        let previous_name = if req.key == AGENT_NAME_KEY {
-            // Refuse a name that would break the memory files it lands in.
-            cortex::agent_name::validate(&req.value).map_err(TStatus::invalid_argument)?;
-            Some(current_agent_name().await?)
-        } else {
-            None
+        let previous_name = match NameSetting::of(&req.key) {
+            Some(named) => {
+                named.validate(&req.value)?;
+                Some((named, named.current().await?))
+            }
+            None => None,
         };
         let resolver = open_settings_resolver().await?;
         resolver
@@ -361,7 +361,7 @@ impl Admin for AdminSvc {
             .await
             .map_err(|e| TStatus::invalid_argument(format!("set `{}` failed: {e}", req.key)))?;
         let renamed = match previous_name {
-            Some(old) => rename_agent_in_memory(old, &req.value).await,
+            Some((named, old)) => named.rename_in_memory(old, &req.value).await,
             None => Ok(()),
         };
         // The row has landed either way, so running agents must reload.
@@ -372,10 +372,9 @@ impl Admin for AdminSvc {
 
     async fn unset_setting(&self, req: Request<SettingKey>) -> Result<Response<Empty>, TStatus> {
         let key = req.into_inner().key;
-        let previous_name = if key == AGENT_NAME_KEY {
-            Some(current_agent_name().await?)
-        } else {
-            None
+        let previous_name = match NameSetting::of(&key) {
+            Some(named) => Some((named, named.current().await?)),
+            None => None,
         };
         let resolver = open_settings_resolver().await?;
         resolver
@@ -383,7 +382,7 @@ impl Admin for AdminSvc {
             .await
             .map_err(|e| TStatus::invalid_argument(format!("unset `{key}` failed: {e}")))?;
         let renamed = match previous_name {
-            Some(old) => rename_agent_in_memory(old, "").await,
+            Some((named, old)) => named.rename_in_memory(old, "").await,
             None => Ok(()),
         };
         // The row has landed either way, so running agents must reload.
@@ -1743,6 +1742,7 @@ mod handoff;
 mod helpers;
 mod scheduled_tasks;
 mod setup;
+use helpers::NameSetting;
 use helpers::{
     approved_sender_row_to_proto, build_primary_pool, credential_pool_to_proto, goal_to_detail,
     load_ambient_status, map_internal, map_invalid_arg, notify_runtime_config_reload,
@@ -1753,7 +1753,6 @@ use helpers::{
     snapshot_row_to_pb, snapshot_to_reply, sub_agent_row_to_pb, task_run_row_to_proto,
     update_task_status, ApiKeyRouting, SetGoalError, SetGoalOutcome, WiredSlot,
 };
-use helpers::{current_agent_name, rename_agent_in_memory, AGENT_NAME_KEY};
 
 #[cfg(test)]
 mod display_text_tests {

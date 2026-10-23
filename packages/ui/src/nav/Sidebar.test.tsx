@@ -266,6 +266,36 @@ describe("Sidebar theme switch", () => {
   });
 });
 
+describe("Sidebar user", () => {
+  it("shows the name with its initials, and opens where it is changed", () => {
+    const onEditUser = vi.fn();
+    renderSidebar({ user: { name: "Ada Lovelace", initials: "AL" }, onEditUser });
+    const button = screen.getByRole("button", { name: "Ada Lovelace" });
+    expect(button.textContent).toBe("ALAda Lovelace");
+    expect(button.title).toBe("Change your name");
+    fireEvent.click(button);
+    expect(onEditUser).toHaveBeenCalledOnce();
+  });
+
+  it("quietly offers to add a name it does not know yet", () => {
+    const onEditUser = vi.fn();
+    renderSidebar({ user: undefined, onEditUser });
+    fireEvent.click(screen.getByRole("button", { name: "Add your name" }));
+    expect(onEditUser).toHaveBeenCalledOnce();
+  });
+
+  it("shows the name as text when the app has nowhere to change it", () => {
+    renderSidebar({ user: { name: "Ada", initials: "A" } });
+    expect(screen.getByText("Ada")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Ada" })).toBeNull();
+  });
+
+  it("offers nothing it cannot act on", () => {
+    renderSidebar({ user: undefined });
+    expect(screen.queryByText("Add your name")).toBeNull();
+  });
+});
+
 describe("Sidebar update", () => {
   it("says nothing when there is no update", () => {
     renderSidebar();

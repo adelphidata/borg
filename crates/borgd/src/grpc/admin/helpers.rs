@@ -19,36 +19,72 @@
 
 use std::sync::Mutex;
 
-/// The setting that names the agent. Writing it also renames the agent in
-/// its seeded memory files.
-pub(super) const AGENT_NAME_KEY: &str = "user.agent_name";
-
-/// The agent's name before a write, for the memory-file rename to replace.
-/// Read before the row changes; "" when unset.
-pub(super) async fn current_agent_name() -> Result<String, tonic::Status> {
-    cortex::config::Config::load_from_db()
-        .await
-        .map(|c| c.user.agent_name.unwrap_or_default())
-        .map_err(|e| tonic::Status::internal(format!("read current agent name: {e}")))
+/// A setting whose value is also written into the agent's seeded memory
+/// files: the agent's own name (`user.agent_name`) or the owner's
+/// (`user.name`). A write is validated first, and carried into the files
+/// after the row lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NameSetting {
+    Agent,
+    Owner,
 }
 
-/// Carry a `user.agent_name` write from `old` to `new` into `IDENTITY.md`,
-/// `MEMORY.md` and `SETUP.md`. The setting has already landed, so the error
-/// says the files lag rather than that the rename failed. The file work runs
-/// on the blocking pool, off the RPC worker.
-pub(super) async fn rename_agent_in_memory(old: String, new: &str) -> Result<(), tonic::Status> {
-    let new = new.to_string();
-    tokio::task::spawn_blocking(move || {
-        cortex::config::Config::data_dir()
-            .and_then(|dir| cortex::agent_name::rename_in_memory_files(&dir, &old, &new))
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("rename task failed: {e}")))
-    .map_err(|e| {
-        tonic::Status::internal(format!(
-            "name saved, but the memory files could not be updated: {e}"
-        ))
-    })
+impl NameSetting {
+    /// The name setting `key` is, if it is one.
+    pub(super) fn of(key: &str) -> Option<Self> {
+        match key {
+            "user.agent_name" => Some(Self::Agent),
+            cortex::user_name::USER_NAME_KEY => Some(Self::Owner),
+            _ => None,
+        }
+    }
+
+    /// Refuse a name that would break the memory files it lands in.
+    pub(super) fn validate(self, value: &str) -> Result<(), tonic::Status> {
+        match self {
+            Self::Agent => cortex::agent_name::validate(value),
+            Self::Owner => cortex::user_name::validate(value),
+        }
+        .map_err(tonic::Status::invalid_argument)
+    }
+
+    /// The name before a write, for the memory-file rename to replace.
+    /// Read before the row changes; "" when unset.
+    pub(super) async fn current(self) -> Result<String, tonic::Status> {
+        cortex::config::Config::load_from_db()
+            .await
+            .map(|c| match self {
+                Self::Agent => c.user.agent_name,
+                Self::Owner => c.user.name,
+            })
+            .map(Option::unwrap_or_default)
+            .map_err(|e| tonic::Status::internal(format!("read current name: {e}")))
+    }
+
+    /// Carry a write from `old` to `new` into the memory files. The setting
+    /// has already landed, so the error says the files lag rather than that
+    /// the rename failed. The file work runs on the blocking pool, off the
+    /// RPC worker.
+    pub(super) async fn rename_in_memory(
+        self,
+        old: String,
+        new: &str,
+    ) -> Result<(), tonic::Status> {
+        let new = new.to_string();
+        tokio::task::spawn_blocking(move || {
+            cortex::config::Config::data_dir().and_then(|dir| match self {
+                Self::Agent => cortex::agent_name::rename_in_memory_files(&dir, &old, &new),
+                Self::Owner => cortex::user_name::rename_in_memory_files(&dir, &old, &new),
+            })
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("rename task failed: {e}")))
+        .map_err(|e| {
+            tonic::Status::internal(format!(
+                "name saved, but the memory files could not be updated: {e}"
+            ))
+        })
+    }
 }
 
 /// A daemon dependency wired into [`super::AdminSvc`] after construction via a
@@ -609,5 +645,30 @@ pub(super) fn pooled_to_proto(
         last_error_message: c.last_error_message.clone().unwrap_or_default(),
         last_error_reset_at_ms: c.last_error_reset_at_ms.unwrap_or(0),
         removed_at_ms: c.removed_at_ms.unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NameSetting;
+
+    #[test]
+    fn both_name_settings_are_recognised_and_nothing_else() {
+        assert_eq!(NameSetting::of("user.agent_name"), Some(NameSetting::Agent));
+        assert_eq!(NameSetting::of("user.name"), Some(NameSetting::Owner));
+        assert_eq!(NameSetting::of("user.timezone"), None);
+        assert_eq!(NameSetting::of("model"), None);
+    }
+
+    /// A line break would split the `- Name:` line in MEMORY.md; the write
+    /// must be refused as the caller's mistake, before the row lands.
+    #[test]
+    fn a_name_that_breaks_the_files_is_an_invalid_argument() {
+        for named in [NameSetting::Agent, NameSetting::Owner] {
+            let err = named.validate("Mi\nke").unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{named:?}");
+            assert!(named.validate("Mike").is_ok());
+            assert!(named.validate("").is_ok(), "empty clears the name");
+        }
     }
 }
