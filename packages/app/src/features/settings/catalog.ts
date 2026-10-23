@@ -34,7 +34,6 @@ export interface BasicSetting {
   /** Daemon settings key; null for the local-only theme setting. */
   key: string | null;
   name: string;
-  desc: string;
   /** Enumerable choices. Absent = free-text value. */
   options?: SettingOption[];
   /**
@@ -67,35 +66,30 @@ export const basicSettings: BasicSetting[] = [
     id: "name",
     key: "user.agent_name",
     name: "Name",
-    desc: "What Borg answers to, and what it calls you",
     catalog: "name",
   },
   {
     id: "provider",
     key: "provider",
     name: "Provider",
-    desc: "Which service Borg's brain runs on",
     catalog: "provider",
   },
   {
     id: "model",
     key: "model",
     name: "Model",
-    desc: "Which brain Borg thinks with",
     catalog: "model",
   },
   {
     id: "thinking",
     key: "llm.thinking",
     name: "Thinking level",
-    desc: "How long Borg reasons before it answers",
     options: THINKING_OPTIONS,
   },
   {
     id: "mode",
     key: "conversation.collaboration_mode",
     name: "Mode",
-    desc: "How much Borg is allowed to do on its own",
     options: [
       { value: "execute", desc: "Borg acts. The default." },
       { value: "plan", desc: "Read-only. Borg proposes, you approve." },
@@ -105,7 +99,6 @@ export const basicSettings: BasicSetting[] = [
     id: "appearance",
     key: null,
     name: "Appearance",
-    desc: "",
     options: THEME_PREFERENCES.map((p) => ({
       value: p,
       label: APPEARANCE_LABELS[p],
@@ -141,11 +134,10 @@ export function settingPath(key: string): string {
 export interface AdvancedCategory {
   id: string;
   name: string;
-  desc: string;
   /** First key segments that land here (`voice` for `voice.enabled`). */
   prefixes: readonly string[];
   /** A guided page for this fold's settings, listed above the raw keys. */
-  page?: { path: string; name: string; desc: string };
+  page?: { path: string; name: string };
 }
 
 /**
@@ -158,7 +150,6 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
   {
     id: "model",
     name: "Model",
-    desc: "Providers, fallbacks, caching and spend",
     prefixes: [
       "llm",
       "temperature",
@@ -172,66 +163,55 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
   {
     id: "conversation",
     name: "Conversation",
-    desc: "Context, history and how each turn runs",
     prefixes: ["conversation", "loop_guard", "ui"],
   },
   {
     id: "memory",
     name: "Memory",
-    desc: "What Borg remembers and how it recalls it",
     prefixes: ["memory", "consolidation", "data"],
   },
   {
     id: "voice",
     name: "Voice & Media",
-    desc: "Speech, transcription, phone calls, images and video",
     prefixes: ["voice", "tts", "audio", "telephony", "media", "image_gen"],
     page: {
       path: "/settings/voice",
       name: "Voice & phone",
-      desc: "Pick who listens, who speaks, and who places calls",
     },
   },
   {
     id: "tools",
     name: "Tools & Skills",
-    desc: "Skills, scripts, MCP servers and plugins",
     prefixes: ["tools", "skills", "scripts", "mcp", "plugins", "hooks", "computer_use"],
   },
   {
     id: "browser",
     name: "Browser & Web",
-    desc: "Browsing, search and page fetching",
     prefixes: ["browser", "web"],
   },
   {
     id: "agents",
     name: "Agents & Goals",
-    desc: "Sub-agents, long-running goals and background tasks",
     prefixes: ["agents", "goals", "tasks", "evolution"],
   },
   {
     id: "heartbeat",
     name: "Heartbeat",
-    desc: "Proactive check-ins and quiet hours",
     prefixes: ["heartbeat"],
   },
   {
     id: "channels",
     name: "Channels & Network",
-    desc: "Messaging gateways, webhooks, tunnels and discovery",
     prefixes: ["gateway", "webhooks", "apns", "tunnel", "discovery"],
   },
   {
     id: "security",
     name: "Security",
-    desc: "Sandboxing, secrets and what Borg may touch",
     prefixes: ["security", "sandbox"],
   },
   {
     id: "system",
     name: "System",
-    desc: "Maintenance, processes, telemetry and updates",
     prefixes: [
       "maintenance",
       "process_registry",
@@ -248,7 +228,6 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
 export const OTHER_CATEGORY: AdvancedCategory = {
   id: "other",
   name: "Other",
-  desc: "Everything else",
   prefixes: [],
 };
 

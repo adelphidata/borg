@@ -19,15 +19,8 @@ import {
   useSetupStatus,
 } from "../onboarding/useSetupStatus";
 import { DEFAULT_AGENT_NAME } from "../../lib/agentName";
-import { AdvancedSettings } from "./AdvancedSettings";
+import { AdvancedSettings, SETTING_NAME, SETTING_ROW } from "./AdvancedSettings";
 import { APPEARANCE_LABELS, basicSettings, displayValue } from "./catalog";
-
-/**
- * A full-width row that is a real button, so the keyboard and screen readers
- * reach it; the resets strip the browser's button look.
- */
-const ROW_BUTTON =
-  "flex w-full cursor-pointer items-center border-0 bg-transparent text-left font-[inherit]";
 
 /** Registry keys already surfaced by the curated list above the fold. */
 const CURATED_KEYS = new Set(basicSettings.flatMap((s) => (s.key ? [s.key] : [])));
@@ -96,23 +89,14 @@ export function SettingsPage() {
                     <button
                       type="button"
                       key={s.id}
-                      className={`${ROW_BUTTON} gap-[18px] border-b border-line2 px-0.5 py-[18px]`}
+                      className={SETTING_ROW}
                       onClick={() => navigate(`/settings/${s.id}`)}
                     >
-                      <div className="min-w-0 flex-1">
-                        <div className="text-[14px] leading-[1.3] font-medium text-ink">
-                          {s.name}
-                        </div>
-                        {s.desc && (
-                          <div className="mt-1 text-[12.5px] leading-[1.45] text-ink3">
-                            {s.desc}
-                          </div>
-                        )}
-                      </div>
-                      <div className="max-w-[220px] flex-none truncate text-[13px] leading-none text-ink2">
+                      <span className={SETTING_NAME}>{s.name}</span>
+                      <span className="max-w-[220px] flex-none truncate text-[13px] leading-none text-ink2">
                         {value}
-                      </div>
-                      <ChevronIcon size={13} className="text-ink3" />
+                      </span>
+                      <ChevronIcon size={13} className="flex-none text-ink3" />
                     </button>
                   );
                 })}

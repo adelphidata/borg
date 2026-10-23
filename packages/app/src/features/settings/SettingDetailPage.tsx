@@ -48,14 +48,11 @@ function DetailShell({ title, children }: { title: string; children: ReactNode }
   );
 }
 
-function Heading({ name, desc }: { name: string; desc?: string }) {
+function Heading({ name }: { name: string }) {
   return (
-    <div>
-      <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] break-all text-ink">
-        {name}
-      </h2>
-      {desc && <div className="mt-2 text-[13.5px] leading-[1.55] text-ink2">{desc}</div>}
-    </div>
+    <h2 className="m-0 text-[24px] leading-[1.2] font-light tracking-[-0.025em] break-all text-ink">
+      {name}
+    </h2>
   );
 }
 
@@ -553,7 +550,7 @@ function AppearanceDetail() {
 
   return (
     <DetailShell title={setting.name}>
-      <Heading name={setting.name} desc={setting.desc} />
+      <Heading name={setting.name} />
       <OptionPicker
         options={setting.options ?? []}
         value={preference}
@@ -613,7 +610,7 @@ export function SettingDetailPage() {
           if (basic?.catalog === "name") {
             return (
               <>
-                <Heading name={title} desc={basic.desc} />
+                <Heading name={title} />
                 <SaveError message={saveError?.message} />
                 <NameDetail agent={entry} user={map.get(USER_NAME_KEY)} />
               </>
@@ -623,7 +620,7 @@ export function SettingDetailPage() {
           if (basic?.catalog) {
             return (
               <>
-                <Heading name={title} desc={basic.desc} />
+                <Heading name={title} />
                 <SaveError message={saveError?.message} />
                 <CatalogDetail
                   basic={basic}
@@ -637,7 +634,7 @@ export function SettingDetailPage() {
 
           return (
             <>
-              <Heading name={title} desc={basic?.desc ?? entry.key} />
+              <Heading name={title} />
               <SaveError message={saveError?.message} />
               {basic?.options ? (
                 <OptionPicker

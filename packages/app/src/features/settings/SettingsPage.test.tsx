@@ -208,8 +208,11 @@ describe("SettingsPage", () => {
     mount();
     await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
     act(() => screen.getByText("Advanced").click());
-    // Thinking level is curated, so Model has nothing left to show.
-    expect(screen.queryByText("Providers, fallbacks, caching and spend")).toBeNull();
+    // Thinking level is curated, so Model has nothing left to show. Folds are
+    // the only buttons with aria-expanded; the curated Model row has none.
+    const folds = screen.getAllByRole("button", { expanded: false });
+    expect(folds.some((b) => b.textContent?.startsWith("Agents & Goals"))).toBe(true);
+    expect(folds.some((b) => b.textContent?.startsWith("Model"))).toBe(false);
     act(() => screen.getByText("Agents & Goals").click());
     expect(screen.getByTitle("agents.max_depth")).toBeTruthy();
     expect(screen.queryByTitle("llm.thinking")).toBeNull();

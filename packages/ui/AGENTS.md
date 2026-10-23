@@ -23,3 +23,7 @@ A tooltip is worth its interruption only when hovering teaches something the scr
 What is left is the legitimate case: an icon-only control whose meaning is not obvious, or a status that has a reason worth reading. `Archive conversation` on the sidebar row's hover box survives on the first ground — the glyph alone does not say whether the conversation is kept or gone, and the difference between archiving and deleting is exactly what a person needs to know before they click. Its neighbours `Pin conversation` and `New conversation` survive on the same ground: a pin and a pencil-in-a-square each have more than one reading.
 
 Prefer an `aria-label` alone when the control is obvious to a sighted user but opaque to a screen reader. A label is not a tooltip and costs nothing.
+
+## Hints and descriptions
+
+No hint line that restates a heading, group, or row ("What Borg knows how to do" under Skills, "Browsing, email, calendar…" under a skill category). A secondary line must say what the label cannot: live state ("4 need setup"), a consequence to know before acting, or the next step out of a problem. Same for doc comments: what the component does and why, not a feature tagline.

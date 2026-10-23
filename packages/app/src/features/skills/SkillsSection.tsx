@@ -130,8 +130,8 @@ function Group({
 }
 
 /**
- * Skills — what Borg knows how to do, as a list of switches. One section of
- * the Connections page.
+ * The skills catalog as a list of switches. One section of the Connections
+ * page.
  *
  * Yours come first because they are the ones you can change. Built-ins can
  * be turned off, but not edited: the embedded copy always wins, so the

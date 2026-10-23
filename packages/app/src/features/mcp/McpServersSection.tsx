@@ -155,7 +155,7 @@ function ServerRow({
   );
 }
 
-/** MCP servers: tools Borg borrows from other programs. One section of Connections. */
+/** The configured MCP servers, each with a switch and its state. One section of Connections. */
 export function McpServersSection() {
   const location = useLocation();
   const navigate = useNavigate();

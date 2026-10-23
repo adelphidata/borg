@@ -18,6 +18,13 @@ const BY_NAME = new Intl.Collator();
 const ROW_BUTTON =
   "flex w-full cursor-pointer items-center border-0 bg-transparent text-left font-[inherit]";
 
+/**
+ * One row of the settings list. The curated rows and the Advanced toggle share
+ * it, so Advanced reads as the list's last row rather than a heading of its own.
+ */
+export const SETTING_ROW = `${ROW_BUTTON} gap-[18px] border-b border-line2 px-0.5 py-4`;
+export const SETTING_NAME = "min-w-0 flex-1 truncate text-[14px] leading-[1.3] font-medium text-ink";
+
 /** One run of keys sharing a prefix; `prefix` is "" for undotted keys. */
 interface AdvancedSection {
   prefix: string;
@@ -102,12 +109,12 @@ function writeFolds(state: FoldState): void {
   }
 }
 
-function Chevron({ open, neon }: { open: boolean; neon?: boolean }) {
+function Chevron({ open }: { open: boolean }) {
   return (
     <span
       className={`flex flex-none transition-transform duration-[180ms] ${open ? "[transform:rotate(90deg)]" : ""}`}
     >
-      <ChevronIcon size={13} className={neon || open ? "text-neon" : "text-ink3"} />
+      <ChevronIcon size={13} className={open ? "text-neon" : "text-ink3"} />
     </span>
   );
 }
@@ -139,10 +146,9 @@ function CategoryFold({
         }`}
         onClick={onToggle}
       >
-        <div className="min-w-0 flex-1">
-          <div className="text-[13.5px] leading-[1.3] font-medium text-ink">{category.name}</div>
-          <div className="mt-[3px] text-[12px] leading-[1.45] text-ink3">{category.desc}</div>
-        </div>
+        <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[1.3] font-medium text-ink">
+          {category.name}
+        </span>
         {changed > 0 && (
           <span className="flex-none rounded-full bg-nav-on-bg px-2 py-[3px] text-[10.5px] leading-none font-medium text-neon-ink">
             {changed} changed
@@ -161,13 +167,8 @@ function CategoryFold({
               className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
               onClick={() => navigate(category.page!.path)}
             >
-              <span className="min-w-0">
-                <span className="block text-[12.5px] leading-[1.3] font-medium text-ink">
-                  {category.page.name}
-                </span>
-                <span className="mt-[3px] block text-[11.5px] leading-[1.4] text-ink3">
-                  {category.page.desc}
-                </span>
+              <span className="min-w-0 truncate text-[12.5px] leading-[1.3] font-medium text-ink">
+                {category.page.name}
               </span>
               <ChevronIcon size={12} className="flex-none text-ink3" />
             </button>
@@ -244,18 +245,15 @@ export function AdvancedSettings({
       <button
         type="button"
         aria-expanded={folds.open}
-        className={`${ROW_BUTTON} gap-[11px] px-0.5 pt-[22px]`}
+        className={SETTING_ROW}
         onClick={() => update({ ...folds, open: !folds.open })}
       >
-        <Chevron open={folds.open} neon />
-        <span className="text-[10px] leading-none font-medium tracking-[0.16em] uppercase text-ink2">
-          Advanced
-        </span>
-        <span className="h-px flex-1 bg-line2" />
+        <span className={SETTING_NAME}>Advanced</span>
+        <Chevron open={folds.open} />
       </button>
 
       {folds.open && (
-        <div className="flex flex-col gap-4 pt-2">
+        <div className="pt-4">
           <div className="overflow-hidden rounded-[12px] border border-line2 bg-surface2">
             {groups.map((g) => (
               <CategoryFold
