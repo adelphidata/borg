@@ -428,7 +428,9 @@ export function Sidebar({
       <NavSection routes={routes} section="secondary" />
       <Rule className="mt-4 mb-3.5" />
 
-      <div className="flex items-center px-2 pb-2">
+      {/* The right inset, padding and icon size match a row's hover actions,
+          so the compose icon sits in the same column as the archive icons. */}
+      <div className="flex items-center pr-1.5 pb-2 pl-2">
         <span className="flex-1 text-[9.5px] leading-none font-medium tracking-[0.16em] uppercase text-ink3">
           Recent
         </span>
@@ -437,9 +439,9 @@ export function Sidebar({
           onClick={onNewConversation}
           aria-label="New conversation"
           title="New conversation"
-          className="-my-1 flex cursor-pointer items-center rounded border-0 bg-transparent p-1 text-ink3 hover:bg-surface3 hover:text-ink"
+          className="-my-1 flex cursor-pointer items-center rounded border-0 bg-transparent p-[3px] text-ink3 hover:bg-surface3 hover:text-ink"
         >
-          <NewChatIcon size={15} />
+          <NewChatIcon size={14} />
         </button>
       </div>
       <div className="flex flex-col gap-px">
