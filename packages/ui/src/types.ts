@@ -48,6 +48,8 @@ export interface RecentItem {
    * every row.
    */
   activity?: "working" | "unread" | "draft";
+  /** Pinned by the user: listed first, and its hover action unpins it. */
+  pinned?: boolean;
 }
 
 /** Signed-in identity shown in the sidebar footer. */

@@ -63,11 +63,33 @@ describe("Sidebar recents", () => {
   });
 
   it("archives without opening the conversation being closed", () => {
-    // The × sits inside a row whose own click opens the conversation.
+    // The archive button sits inside a row whose own click opens the conversation.
     const props = renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Archive a past conversation" }));
     expect(props.onArchiveRecent).toHaveBeenCalledWith("s1");
     expect(props.onOpenRecent).not.toHaveBeenCalled();
+  });
+
+  it("pins a loose conversation and unpins a pinned one from the row", () => {
+    const props = renderSidebar({
+      onPinRecent: vi.fn(),
+      recents: [
+        { id: "a", title: "loose one" },
+        { id: "b", title: "kept one", pinned: true },
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Pin loose one" }));
+    fireEvent.click(screen.getByRole("button", { name: "Unpin kept one" }));
+    expect(props.onPinRecent).toHaveBeenNthCalledWith(1, "a", true);
+    expect(props.onPinRecent).toHaveBeenNthCalledWith(2, "b", false);
+    // Like archiving, pinning acts on the row without opening it.
+    expect(props.onOpenRecent).not.toHaveBeenCalled();
+  });
+
+  it("offers no pin when the app cannot pin, and no × at all", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: /^Pin / })).toBeNull();
+    expect(screen.queryByText("×")).toBeNull();
   });
 
   it("hands a right-click to the app with the pointer position", () => {
@@ -90,7 +112,7 @@ describe("Sidebar recents", () => {
     expect(event.defaultPrevented).toBe(false);
   });
 
-  it("says why an archive failed, rather than leaving a dead ×", () => {
+  it("says why an archive failed, rather than leaving a dead button", () => {
     renderSidebar({ archiveError: "daemon not running" });
     expect(screen.getByRole("alert").textContent).toContain("daemon not running");
   });
@@ -131,7 +153,7 @@ describe("Sidebar recents", () => {
 
   it("starts a fresh conversation", () => {
     const props = renderSidebar();
-    fireEvent.click(screen.getByText("+ New"));
+    fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
     expect(props.onNewConversation).toHaveBeenCalledTimes(1);
   });
 
@@ -140,7 +162,7 @@ describe("Sidebar recents", () => {
   // it. Both controls are native buttons: the browser turns Enter and Space
   // into the click the test fires, and the tab order comes for free.
   it.each([
-    ["+ New", "onNewConversation", undefined],
+    ["New conversation", "onNewConversation", undefined],
     ["a past conversation", "onOpenRecent", "s1"],
   ] as const)("reaches %s from the keyboard", (name, prop, arg) => {
     const props = renderSidebar();
@@ -161,8 +183,8 @@ describe("Sidebar recents", () => {
     expect(row?.querySelector('[role="img"]')).not.toBeNull();
   });
 
-  it("keeps the archive × a separate tab stop from the row", () => {
-    // A button cannot contain a button; if the × were nested it would either
+  it("keeps the archive button a separate tab stop from the row", () => {
+    // A button cannot contain a button; if it were nested it would either
     // vanish from the tab order or open the conversation it is closing.
     renderSidebar();
     const open = screen.getByRole("button", { name: "a past conversation" });

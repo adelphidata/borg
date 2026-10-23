@@ -36,11 +36,11 @@ use protocols::admin::{
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
     ScheduledTaskUpdate, SessionActivityEvent as PbSessionActivityEvent, SessionArchiveMutation,
-    SessionDetail, SessionList, SessionRef, SessionSummary, SessionTitleMutation,
-    SetCredentialPriorityRequest, SetCredentialPriorityResponse, SetCredentialStrategyRequest,
-    SetSubprocessPinnedRequest, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
-    SkillEntry as PbSkillEntry, SkillList as PbSkillList, SubprocessSnapshot,
-    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
+    SessionDetail, SessionList, SessionPinMutation, SessionRef, SessionSummary,
+    SessionTitleMutation, SetCredentialPriorityRequest, SetCredentialPriorityResponse,
+    SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingEntry, SettingKey,
+    SettingMutation, SettingsSnapshot, SkillEntry as PbSkillEntry, SkillList as PbSkillList,
+    SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -545,6 +545,27 @@ impl Admin for AdminSvc {
         db.set_session_archived(&req.id, stamp)
             .await
             .map_err(|e| TStatus::internal(format!("set_session_archived failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn set_session_pinned(
+        &self,
+        req: Request<SessionPinMutation>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let db = Database::open()
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_pinned failed: {e}")))?;
+        let found = db
+            .set_session_pinned(&req.id, req.pinned)
+            .await
+            .map_err(|e| TStatus::internal(format!("set_session_pinned failed: {e}")))?;
+        if !found {
+            return Err(TStatus::not_found(format!(
+                "session `{}` not found",
+                req.id
+            )));
+        }
         Ok(Response::new(Empty {}))
     }
 

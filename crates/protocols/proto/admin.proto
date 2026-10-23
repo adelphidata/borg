@@ -20,6 +20,9 @@ service Admin {
   rpc ListSessions(ListSessionsRequest) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
   rpc SetSessionArchived(SessionArchiveMutation) returns (Empty);
+  // Pin or unpin one session. A pinned session is exempt from the stale
+  // auto-archive sweep and the retention purge, and listings always carry it.
+  rpc SetSessionPinned(SessionPinMutation) returns (Empty);
   rpc SetSessionTitle(SessionTitleMutation) returns (Empty);
   // Live turn-activity feed across every session, so a listing can show which
   // conversation is working without polling each one. Deltas only — clients
@@ -611,6 +614,10 @@ message SessionRef { string id = 1; }
 message SessionArchiveMutation {
   string id = 1;
   bool archived = 2;
+}
+message SessionPinMutation {
+  string id = 1;
+  bool pinned = 2;
 }
 // Rename one session. An empty title is rejected — a blank row in the picker
 // is indistinguishable from a broken one.

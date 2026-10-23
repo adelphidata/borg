@@ -1,11 +1,15 @@
 import { NavLink } from "react-router-dom";
 import { Brackets } from "../components/Brackets";
 import {
+  ArchiveIcon,
   ChevronIcon,
   LogoIcon,
   MoonIcon,
+  NewChatIcon,
+  PinIcon,
   PlusIcon,
   SunIcon,
+  UnpinIcon,
   UpdateIcon,
 } from "../components/icons";
 import { StatusDot } from "../components/StatusDot";
@@ -20,14 +24,16 @@ export interface SidebarProps {
   onOpenRecent: (id: string) => void;
   /** Archives one recent conversation, removing it from the list. */
   onArchiveRecent: (id: string) => void;
+  /** Pins or unpins one recent conversation. Omit and a row offers archiving alone. */
+  onPinRecent?: (id: string, pinned: boolean) => void;
   /**
    * Right-click on a recent row, with the pointer position. The app renders the
    * menu itself; omit and right-click falls through to the browser's own.
    */
   onRecentContextMenu?: (id: string, at: { x: number; y: number }) => void;
   /**
-   * Why the last archive failed, if it did. Rendered under the list — a × that
-   * silently does nothing reads as a broken button.
+   * Why the last archive failed, if it did. Rendered under the list — an
+   * archive button that silently does nothing reads as a broken button.
    */
   archiveError?: string;
   /** Starts a fresh conversation. */
@@ -209,25 +215,33 @@ const DOT_LABELS: Record<NonNullable<RecentItem["activity"]>, string> = {
   draft: "Unsent draft",
 };
 
+/** A row action: an icon alone, so the tooltip carries its name. */
+const ROW_ACTION =
+  "flex cursor-pointer items-center rounded border-0 bg-transparent p-[3px] text-ink3 hover:text-ink";
+
 /**
- * One recent conversation. The archive control only materializes on hover or
- * keyboard focus: eight rows each carrying a permanent × would read as a list
- * of delete buttons rather than a list of conversations.
+ * One recent conversation. The pin and archive controls only materialize on
+ * hover or keyboard focus: eight rows each carrying permanent buttons would read
+ * as a list of buttons rather than a list of conversations. They float over the
+ * end of the row instead of holding space beside it, so a title is never
+ * shortened for controls that are not on screen.
  */
 function RecentRow({
   item,
   onOpen,
   onArchive,
+  onPin,
   onContextMenu,
 }: {
   item: RecentItem;
   onOpen: () => void;
   onArchive: () => void;
+  onPin?: (pinned: boolean) => void;
   onContextMenu?: (at: { x: number; y: number }) => void;
 }) {
   return (
     <div
-      className="group flex items-center gap-1 rounded-md pr-3 text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
+      className="group relative flex items-center rounded-md pr-3 text-[12.5px] leading-[1.35] text-ink3 hover:bg-surface3 hover:text-ink2"
       // Right-click reaches the same action the hover × does. The menu itself
       // belongs to the app, which owns both the archive call and the stacked
       // Escape handling this package cannot see.
@@ -252,15 +266,30 @@ function RecentRow({
             and a clipped title ends before the mark rather than hiding it. */}
         {item.activity && <StatusDot tone={item.activity} label={DOT_LABELS[item.activity]} />}
       </button>
-      <button
-        type="button"
-        aria-label={`Archive ${item.title}`}
-        title="Archive conversation"
-        onClick={onArchive}
-        className="flex-none rounded px-1 text-[13px] leading-none text-ink3 hover-reveal hover:text-ink"
-      >
-        ×
-      </button>
+      {/* Over the mark, not beside it: the hovered row is the one being
+          acted on, and its dot has already been read on the way here. */}
+      <span className="hover-reveal absolute inset-y-0 right-1.5 flex items-center gap-0.5 bg-linear-to-l from-surface3 from-75% to-transparent pl-4">
+        {onPin && (
+          <button
+            type="button"
+            aria-label={`${item.pinned ? "Unpin" : "Pin"} ${item.title}`}
+            title={item.pinned ? "Unpin conversation" : "Pin conversation"}
+            onClick={() => onPin(!item.pinned)}
+            className={ROW_ACTION}
+          >
+            {item.pinned ? <UnpinIcon size={14} /> : <PinIcon size={14} />}
+          </button>
+        )}
+        <button
+          type="button"
+          aria-label={`Archive ${item.title}`}
+          title="Archive conversation"
+          onClick={onArchive}
+          className={ROW_ACTION}
+        >
+          <ArchiveIcon size={14} />
+        </button>
+      </span>
     </div>
   );
 }
@@ -318,6 +347,7 @@ export function Sidebar({
   recents,
   onOpenRecent,
   onArchiveRecent,
+  onPinRecent,
   onRecentContextMenu,
   archiveError,
   onNewConversation,
@@ -405,9 +435,11 @@ export function Sidebar({
         <button
           type="button"
           onClick={onNewConversation}
-          className="cursor-pointer rounded border-0 bg-transparent px-1.5 py-0.5 text-[11px] leading-none text-ink3 hover:bg-surface3 hover:text-ink"
+          aria-label="New conversation"
+          title="New conversation"
+          className="-my-1 flex cursor-pointer items-center rounded border-0 bg-transparent p-1 text-ink3 hover:bg-surface3 hover:text-ink"
         >
-          + New
+          <NewChatIcon size={15} />
         </button>
       </div>
       <div className="flex flex-col gap-px">
@@ -417,6 +449,7 @@ export function Sidebar({
             item={r}
             onOpen={() => onOpenRecent(r.id)}
             onArchive={() => onArchiveRecent(r.id)}
+            onPin={onPinRecent && ((pinned) => onPinRecent(r.id, pinned))}
             onContextMenu={onRecentContextMenu && ((at) => onRecentContextMenu(r.id, at))}
           />
         ))}

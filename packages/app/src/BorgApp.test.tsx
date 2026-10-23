@@ -125,10 +125,10 @@ describe("BorgApp shell", () => {
     const { daemon } = mount();
     await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());
     const opens = () => daemon.calls.filter((c) => c.method === "Open").length;
-    act(() => screen.getByText("+ New").click());
+    act(() => screen.getByRole("button", { name: "New conversation" }).click());
     await waitFor(() => expect(opens()).toBe(2));
     // The route is the same as the one on screen; it must still open afresh.
-    act(() => screen.getByText("+ New").click());
+    act(() => screen.getByRole("button", { name: "New conversation" }).click());
     await waitFor(() => expect(opens()).toBe(3));
   });
 
@@ -142,6 +142,55 @@ describe("BorgApp shell", () => {
       expect(daemon.calls.find((c) => c.method === "SetSessionArchived")?.request).toEqual({
         id: "s1",
         archived: true,
+      }),
+    );
+  });
+
+  it("pins a conversation from the sidebar and lists it first", async () => {
+    let pinned = false;
+    const daemon = fakeDaemon({
+      ...BASE,
+      ListSessions: () => ({
+        sessions: [
+          session({ id: "s2", title: "Newer chat" }),
+          session({ updatedUnixTs: 1, pinned }),
+        ],
+      }),
+      SetSessionPinned: (req: { pinned: boolean }) => {
+        pinned = req.pinned;
+        return {};
+      },
+    });
+    mount(daemon);
+    const rows = () =>
+      screen
+        .getAllByRole("button", { name: /^(Newer chat|Ship the daemon)/ })
+        .map((b) => b.textContent);
+    await waitFor(() => expect(rows()).toEqual(["Newer chat", "Ship the daemon"]));
+
+    await act(async () => screen.getByRole("button", { name: "Pin Ship the daemon" }).click());
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSessionPinned")?.request).toEqual({
+        id: "s1",
+        pinned: true,
+      }),
+    );
+    // The refetch carries the flag back, and the pinned row moves to the top.
+    await waitFor(() => expect(rows()).toEqual(["Ship the daemon", "Newer chat"]));
+    expect(screen.getByRole("button", { name: "Unpin Ship the daemon" })).toBeTruthy();
+  });
+
+  it("offers pinning from a right-click on a sidebar row", async () => {
+    const daemon = fakeDaemon({ ...BASE, SetSessionPinned: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+
+    fireEvent.contextMenu(screen.getByText("Ship the daemon"), { clientX: 20, clientY: 30 });
+    await act(async () => screen.getByRole("menuitem", { name: /^Pin/ }).click());
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSessionPinned")?.request).toEqual({
+        id: "s1",
+        pinned: true,
       }),
     );
   });

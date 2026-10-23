@@ -20,6 +20,6 @@ A tooltip is worth its interruption only when hovering teaches something the scr
 - **Never paraphrasing a visible label.** If the button says "Archive", the tip must not say "Archive this" or "Click to archive". Repeating a label teaches nothing and trains people to ignore tips that would have.
 - **Never on a menu trigger.** A kebab opens a menu whose items name themselves. The menu is the explanation.
 
-What is left is the legitimate case: an icon-only control whose meaning is not obvious, or a status that has a reason worth reading. `Archive conversation` on the sidebar's hover × survives on the first ground — the glyph alone reads as "delete", and the difference between archiving and deleting is exactly what a person needs to know before they click.
+What is left is the legitimate case: an icon-only control whose meaning is not obvious, or a status that has a reason worth reading. `Archive conversation` on the sidebar row's hover box survives on the first ground — the glyph alone does not say whether the conversation is kept or gone, and the difference between archiving and deleting is exactly what a person needs to know before they click. Its neighbours `Pin conversation` and `New conversation` survive on the same ground: a pin and a pencil-in-a-square each have more than one reading.
 
 Prefer an `aria-label` alone when the control is obvious to a sighted user but opaque to a screen reader. A label is not a tooltip and costs nothing.

@@ -3,10 +3,12 @@ import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "r
 import {
   ArchiveIcon,
   Menu,
+  PinIcon,
   Sidebar,
   TabBar,
   ThemeProvider,
   Toast,
+  UnpinIcon,
   useIsMobile,
   usePauseAnimationsWhenHidden,
   useTheme,
@@ -160,7 +162,14 @@ function Shell({ platform }: { platform: Platform }) {
       title: rowTitle(s.title, Number(s.messageCount), s.id),
       activity: sessionActivity(s.id, Number(s.messageCount), Number(s.updatedUnixTs)),
     }));
-  const recents = listed.slice(0, 8);
+      pinned: s.pinned || undefined,
+  // Pinned conversations lead, and every one of them shows: pinning is how a
+  // conversation stays in reach once newer ones would push it off the list.
+  const pinnedRows = listed.filter((r) => r.pinned);
+  const recents = [...pinnedRows, ...listed.filter((r) => !r.pinned)].slice(
+    0,
+    Math.max(8, pinnedRows.length),
+  );
 
   // Counted over the whole listing rather than the eight rows above: the badge
   // exists for the collapsed rail, where no row is on screen at all, and a
@@ -196,6 +205,12 @@ function Shell({ platform }: { platform: Platform }) {
   );
 
   const notice = useNotice();
+  const pinSession = useMutation(
+    (borg, { id, pinned }: { id: string; pinned: boolean }) =>
+      borg.admin.setSessionPinned({ id, pinned }),
+    { onSuccess: () => sessionsChanged() },
+  );
+
   // A restore that failed must not pass for one that worked: the row stays
   // gone, so saying nothing would leave the user believing the conversation
   // came back. `useMutation` parks the reason here rather than throwing.
@@ -204,6 +219,12 @@ function Shell({ platform }: { platform: Platform }) {
     if (restoreFailure) showNotice(`Could not bring the conversation back: ${restoreFailure}`);
   }, [restoreFailure]);
 
+  // The row stays where it was, which is also what a pin that worked looks like
+  // while the listing catches up — so a failure has to say so.
+  const pinFailure = pinSession.error?.message;
+  useEffect(() => {
+    if (pinFailure) showNotice(`Could not change the pin: ${pinFailure}`);
+  }, [pinFailure]);
   // Right-click on a sidebar row. The menu lives here rather than in the
   // sidebar because it needs the archive call and the stacked Escape registry,
   // neither of which the design-system package can see.
@@ -222,6 +243,7 @@ function Shell({ platform }: { platform: Platform }) {
   useKeybind("toggle-sidebar", toggleSidebar);
   useMenuEscape(recentMenu !== undefined, () => setRecentMenu(undefined));
 
+  const menuPinned = recents.find((r) => r.id === recentMenu?.id)?.pinned ?? false;
   // Attention dots: doctor warnings light Health, pending pairings light
   // Connections. Unreachable daemon lights nothing — the pages say it better.
   const alerts = useQuery(
@@ -260,6 +282,7 @@ function Shell({ platform }: { platform: Platform }) {
             onOpenRecent={(id) => navigate(`/c/${id}`)}
             onArchiveRecent={(id) => void archiveSession.run(id)}
             onRecentContextMenu={(id, at) => setRecentMenu({ id, at })}
+            onPinRecent={(id, pinned) => void pinSession.run({ id, pinned })}
             archiveError={archiveSession.error?.message}
             onNewConversation={() => navigate("/c/new")}
             onSeeAllConversations={() => navigate("/sessions")}
@@ -280,11 +303,19 @@ function Shell({ platform }: { platform: Platform }) {
           onClose={() => setRecentMenu(undefined)}
           label="Conversation actions"
           at={recentMenu?.at}
-          // The sidebar row offers archiving and nothing else, so the menu
-          // offers exactly that. Right-click should reach what the row can do,
-          // not advertise capability it does not have here.
+          // The sidebar row offers pinning and archiving and nothing else, so
+          // the menu offers exactly those. Right-click should reach what the row
+          // can do, not advertise capability it does not have here.
           actions={[
             {
+            {
+              id: "pin",
+              label: menuPinned ? "Unpin" : "Pin",
+              icon: menuPinned ? <UnpinIcon size={13} /> : <PinIcon size={13} />,
+              onSelect: () => {
+                if (recentMenu) void pinSession.run({ id: recentMenu.id, pinned: !menuPinned });
+              },
+            },
               id: "archive",
               label: "Archive",
               icon: <ArchiveIcon size={13} />,

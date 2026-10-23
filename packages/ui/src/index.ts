@@ -47,7 +47,9 @@ export {
   MicIcon,
   MoonIcon,
   MoreIcon,
+  NewChatIcon,
   PencilIcon,
+  PinIcon,
   PlugIcon,
   PlusIcon,
   ScheduleIcon,
@@ -61,6 +63,7 @@ export {
   StopIcon,
   SunIcon,
   TrashIcon,
+  UnpinIcon,
   UsageIcon,
 } from "./components/icons";
 export type { IconProps } from "./components/icons";

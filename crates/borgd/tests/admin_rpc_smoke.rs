@@ -31,7 +31,7 @@ use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
     ListSessionsRequest, ScheduledTaskCreate, ScheduledTaskUpdate, SessionArchiveMutation,
-    SessionRef, SessionTitleMutation, SettingMutation,
+    SessionPinMutation, SessionRef, SessionTitleMutation, SettingMutation,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
@@ -846,6 +846,53 @@ async fn set_session_archived_hides_a_session_from_the_listing_and_restores_it()
         tonic::Code::NotFound,
         "a typo'd id must report NotFound, not a silent success"
     );
+}
+
+#[tokio::test]
+async fn set_session_pinned_flags_the_listing_row_and_rejects_an_unknown_id() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = start_harness().await;
+    let chan = channel(&h.socket).await;
+    let mut admin = AdminClient::new(chan);
+
+    {
+        let db = Database::open().await.expect("db");
+        db.upsert_session("pin-me", 1, 10, 0, "m", "Pin me")
+            .await
+            .expect("seed");
+    }
+    // The sidebar reads the flag back from the listing it renders, so the
+    // listing is the contract: a stamp it did not carry would be a dead button.
+    for pin in [true, false] {
+        admin
+            .set_session_pinned(SessionPinMutation {
+                id: "pin-me".into(),
+                pinned: pin,
+            })
+            .await
+            .expect("set pinned");
+        let listed = admin
+            .list_sessions(ListSessionsRequest::default())
+            .await
+            .expect("list")
+            .into_inner()
+            .sessions
+            .into_iter()
+            .find(|s| s.id == "pin-me")
+            .map(|s| s.pinned);
+        assert_eq!(listed, Some(pin), "the listing must carry pinned = {pin}");
+    }
+
+    let missed = admin
+        .set_session_pinned(SessionPinMutation {
+            id: "no-such-session".into(),
+            pinned: true,
+        })
+        .await
+        .expect_err("pinning an unknown session must fail");
+    assert_eq!(missed.code(), tonic::Code::NotFound);
 }
 
 #[tokio::test]

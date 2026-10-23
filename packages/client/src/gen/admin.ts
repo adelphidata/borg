@@ -518,6 +518,11 @@ export interface SessionArchiveMutation {
   archived: boolean;
 }
 
+export interface SessionPinMutation {
+  id: string;
+  pinned: boolean;
+}
+
 /**
  * Rename one session. An empty title is rejected — a blank row in the picker
  * is indistinguishable from a broken one.
@@ -7137,6 +7142,91 @@ export const SessionArchiveMutation: MessageFns<SessionArchiveMutation> = {
     const message = createBaseSessionArchiveMutation();
     message.id = object.id ?? "";
     message.archived = object.archived ?? false;
+    return message;
+  },
+};
+
+function createBaseSessionPinMutation(): SessionPinMutation {
+  return { id: "", pinned: false };
+}
+
+export const SessionPinMutation: MessageFns<SessionPinMutation> = {
+  encode(message: SessionPinMutation, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.pinned !== false) {
+      writer.uint32(16).bool(message.pinned);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionPinMutation {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSessionPinMutation();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.pinned = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SessionPinMutation {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      pinned: isSet(object.pinned) ? globalThis.Boolean(object.pinned) : false,
+    };
+  },
+
+  toJSON(message: SessionPinMutation): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.pinned !== false) {
+      obj.pinned = message.pinned;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SessionPinMutation>, I>>(base?: I): SessionPinMutation {
+    return SessionPinMutation.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SessionPinMutation>, I>>(object: I): SessionPinMutation {
+    const message = createBaseSessionPinMutation();
+    message.id = object.id ?? "";
+    message.pinned = object.pinned ?? false;
     return message;
   },
 };
@@ -17302,6 +17392,18 @@ export const AdminDefinition = {
     setSessionArchived: {
       name: "SetSessionArchived",
       requestType: SessionArchiveMutation as typeof SessionArchiveMutation,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Pin or unpin one session. A pinned session is exempt from the stale
+     * auto-archive sweep and the retention purge, and listings always carry it.
+     */
+    setSessionPinned: {
+      name: "SetSessionPinned",
+      requestType: SessionPinMutation as typeof SessionPinMutation,
       requestStream: false,
       responseType: Empty as typeof Empty,
       responseStream: false,

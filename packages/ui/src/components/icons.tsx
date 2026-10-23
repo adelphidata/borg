@@ -17,6 +17,8 @@ import {
   MoreHorizontal,
   Paperclip,
   Pencil,
+  Pin,
+  PinOff,
   Plug,
   Plus,
   Search,
@@ -26,6 +28,7 @@ import {
   Shuffle,
   Sparkles,
   Square,
+  SquarePen,
   Sun,
   Trash2,
   Volume2,
@@ -81,6 +84,9 @@ export const TrashIcon = lucide(Trash2, 14);
 export const PencilIcon = lucide(Pencil, 14);
 export const BranchIcon = lucide(GitBranch, 14);
 export const ArchiveIcon = lucide(Archive, 14);
+export const PinIcon = lucide(Pin, 14);
+export const UnpinIcon = lucide(PinOff, 14);
+export const NewChatIcon = lucide(SquarePen, 15);
 export const ScheduleIcon = lucide(CalendarClock, 16);
 export const UsageIcon = lucide(Wallet, 16);
 export const AgentsIcon = lucide(ListTree, 16);
