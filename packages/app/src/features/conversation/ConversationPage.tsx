@@ -21,6 +21,7 @@ import { PlanPanel } from "./cells/PlanPanel";
 import { ToolRunCell } from "./cells/ToolRunCell";
 import { TranscriptCell } from "./cells";
 import { groupCells } from "./cells/toolRuns";
+import { placeTurnUsage } from "./cells/turnUsage";
 import {
   INITIAL_BUDGET,
   budgetCutIndex,
@@ -31,7 +32,13 @@ import {
   shouldRevealOnWheel,
 } from "./renderBudget";
 import { FailureCard } from "./FailureCard";
-import { createActivityHold, turnActivity, type ActivityHold } from "./turnActivity";
+import {
+  busyVerb,
+  createActivityHold,
+  turnActivity,
+  visibleLabel,
+  type ActivityHold,
+} from "./turnActivity";
 import { collectEdits, truncatedPatchCount, turnEditCells } from "./turnEdits";
 import { useConversation } from "./useConversation";
 import { displayTitle } from "./userTurn";
@@ -84,6 +91,7 @@ export function ConversationPage() {
     if (!busy) hold.current.reset();
   }, [busy]);
   const activity = busy ? hold.current.settle(turnActivity(cells), now) : undefined;
+  const shownActivity = activity && visibleLabel(activity, busyVerb(turnStartedAt));
 
   // The daemon rewinds by user-message ordinal, so each user cell needs its
   // position among user cells rather than its index in the list.
@@ -103,6 +111,7 @@ export function ConversationPage() {
   );
   // Settled tool calls fold into runs so a tool-heavy turn stays readable.
   const items = useMemo(() => groupCells(cells, busy), [cells, busy]);
+  const usage = useMemo(() => placeTurnUsage(cells), [cells]);
 
   // How much of a long history is mounted. Held as a cell index rather than
   // recomputed per render: the budget is spent once, when the conversation
@@ -276,7 +285,6 @@ export function ConversationPage() {
     opened.state === "ready" && opened.data.title
       ? displayTitle(opened.data.title)
       : "Conversation";
-  const meta = opened.state === "ready" && opened.data.model ? opened.data.model : undefined;
 
   // Session lists look for a draft under the agent session id, but a
   // conversation opened at `/c/new` has no id until the daemon answers, so the
@@ -295,7 +303,6 @@ export function ConversationPage() {
   return (
     <PageChrome
       title={title}
-      meta={meta}
       onRename={opened.state === "ready" ? rename : undefined}
       mobileBrandHeader
       headerActions={
@@ -403,6 +410,7 @@ export function ConversationPage() {
                         ordinal={ordinals[item.index]!}
                         editable={item.cell.kind === "user" && !busy}
                         onEdit={editAndResend}
+                        usage={usage.get(item.index)}
                       />
                     ),
                   )}
@@ -411,9 +419,9 @@ export function ConversationPage() {
                   {!busy && (edits.length > 0 || uncounted > 0) && (
                     <ChangedFilesCard edits={edits} uncounted={uncounted} />
                   )}
-                  {activity?.label !== undefined && (
+                  {shownActivity !== undefined && (
                     <div className="px-1 text-[12px] leading-none text-ink3" aria-hidden="true">
-                      {activity.label}
+                      {shownActivity}
                       {turnStartedAt !== undefined && (
                         <span className="text-ink3"> {formatElapsed(now - turnStartedAt)}</span>
                       )}

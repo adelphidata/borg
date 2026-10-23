@@ -618,7 +618,7 @@ export function contextUsed(
 
 export interface Conversation {
   /** Open + state + history, routed through DaemonState by the page. */
-  opened: QueryResult<{ title: string; model: string; agentSessionId: string }>;
+  opened: QueryResult<{ title: string; agentSessionId: string }>;
   /**
    * The live daemon session, undefined until it opens. Distinct from
    * `agentSessionId`, which stays empty on a conversation nobody has sent to
@@ -744,8 +744,6 @@ export function useConversation(target: string | undefined): Conversation {
   const agentSessionId = useRef("");
   /** The title as of the last finished turn; the open's own title until then. */
   const [title, setTitle] = useState<string>();
-  /** The model the last turn ran on, which the picker may have changed since the open. */
-  const [model, setModel] = useState<string>();
   /** True between the user pressing stop and the turn reporting that it ended. */
   const stopRequested = useRef(false);
   /**
@@ -815,7 +813,6 @@ export function useConversation(target: string | undefined): Conversation {
         if (forGeneration !== generation.current) return;
         if (live.agentSessionId) agentSessionId.current = live.agentSessionId;
         if (live.title) setTitle(live.title);
-        if (live.llmModel) setModel(live.llmModel);
       })
       .catch((error: unknown) => console.warn("reading the conversation title failed", error));
   };
@@ -849,7 +846,6 @@ export function useConversation(target: string | undefined): Conversation {
       setStreamError(undefined);
       setContext(undefined);
       setTitle(undefined);
-      setModel(undefined);
       setGone(false);
       stopTurnClock();
       generation.current += 1;
@@ -891,7 +887,6 @@ export function useConversation(target: string | undefined): Conversation {
       // to file this conversation's draft where those lists will look.
       return {
         title: state.title,
-        model: state.llmModel,
         agentSessionId: state.agentSessionId,
       };
     },
@@ -1322,20 +1317,13 @@ export function useConversation(target: string | undefined): Conversation {
     [renameMutation.run, opened],
   );
 
-  // The title and model the last turn left behind outrank what the open fetched.
+  // The title the last turn left behind outranks what the open fetched.
   const titled = useMemo(
     () =>
-      opened.state === "ready" && (title !== undefined || model !== undefined)
-        ? {
-            ...opened,
-            data: {
-              ...opened.data,
-              title: title ?? opened.data.title,
-              model: model ?? opened.data.model,
-            },
-          }
+      opened.state === "ready" && title !== undefined
+        ? { ...opened, data: { ...opened.data, title } }
         : opened,
-    [opened, title, model],
+    [opened, title],
   );
 
   return {

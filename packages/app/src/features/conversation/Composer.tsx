@@ -826,6 +826,9 @@ export function Composer({
               if (asFile) pasteText(text);
             }}
           />
+          {/* In the box, beside the send: choosing the model is part of
+              asking the question. */}
+          <ModelPill />
           <VoiceInputButton
             // Another conversation gets a new microphone, so a recording never
             // lands in another draft. Not `draftKey`: it changes when a new
@@ -854,12 +857,6 @@ export function Composer({
               <SendIcon size={14} />
             </button>
           )}
-        </div>
-
-        {/* Under the box, not in it: choosing the model is part of asking the
-            question, but it is not the question. */}
-        <div className="mt-1.5 flex items-center px-1">
-          <ModelPill />
         </div>
       </div>
     </div>

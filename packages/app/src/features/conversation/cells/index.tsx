@@ -1,6 +1,7 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useId, useMemo, useState } from "react";
 import {
   Brackets,
+  InfoIcon,
   isSubmitEnter,
   Markdown,
   PencilIcon,
@@ -17,7 +18,7 @@ import { FailureCard } from "../FailureCard";
 import { useAutoGrow } from "../../../lib/useAutoGrow";
 import { InputRequestCell } from "./InputRequestCell";
 import { ThinkingCell } from "./ThinkingCell";
-import { formatClock, formatElapsed, formatTimestamp, formatTokens } from "../../../lib/format";
+import { formatClock, formatTimestamp } from "../../../lib/format";
 import { KICKER } from "./styles";
 import { ToolCell } from "./ToolCell";
 import { parseUserTurn, type AttachedBlock } from "../userTurn";
@@ -87,17 +88,64 @@ function SpeakButton({ cell }: { cell: Cell & { kind: "assistant" } }) {
 }
 
 /**
- * The local time a message was sent, under its bottom-right corner — the same
- * place for the user's messages and Borg's. Hover gives the full date.
+ * A turn's time and tokens, behind an info mark that shows only on hover or
+ * focus. The numbers are for the curious; in the transcript they were a line
+ * under every reply that most people never read.
+ *
+ * `title=""` stops the row's own date tip from showing over this one. Escape
+ * puts the tip away without moving the pointer or focus.
  */
-function SentAt({ at }: { at: number }) {
+function UsageInfo({ label, reveal }: { label: string; reveal: boolean }) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
   return (
-    <time
-      dateTime={new Date(at).toISOString()}
-      className="mt-1.5 block text-right text-[11px] leading-none text-ink3 tabular-nums"
+    <span
+      title=""
+      className={`relative inline-flex ${reveal ? "hover-reveal" : ""}`}
+      onPointerEnter={() => setOpen(true)}
+      onPointerLeave={() => setOpen(false)}
     >
-      {formatClock(at)}
-    </time>
+      <button
+        type="button"
+        aria-label="Time and tokens"
+        aria-describedby={id}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
+        className="flex cursor-default items-center rounded-sm border-0 bg-transparent p-0 text-ink3 hover:text-ink2"
+      >
+        <InfoIcon size={12} />
+      </button>
+      <span
+        role="tooltip"
+        id={id}
+        hidden={!open}
+        className="absolute right-0 bottom-full z-30 mb-1.5 rounded-[8px] border border-line bg-surface2 px-2.5 py-1.5 text-[11px] leading-none whitespace-nowrap text-ink2 tabular-nums shadow-(--frameShadow)"
+      >
+        {label}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * The local time a message was sent, under its bottom-right corner — the same
+ * place for the user's messages and Borg's. Hover gives the full date, and a
+ * reply that ends its turn carries the turn's usage beside it.
+ */
+function SentAt({ at, usage }: { at?: number; usage?: string }) {
+  return (
+    <div className="mt-1.5 flex items-center justify-end gap-1.5">
+      {usage && <UsageInfo label={usage} reveal />}
+      {at !== undefined && (
+        <time
+          dateTime={new Date(at).toISOString()}
+          className="block text-[11px] leading-none text-ink3 tabular-nums"
+        >
+          {formatClock(at)}
+        </time>
+      )}
+    </div>
   );
 }
 
@@ -135,28 +183,16 @@ function ShellConfirmCell({
 }
 
 /**
- * Per-turn time and token accounting, deliberately quiet.
- *
- * The elapsed time leads, because "how long did that take" is the question a
- * user asks without being taught to. Token counts are omitted when the turn
- * never reported any, so the line never claims a turn cost zero.
+ * The usage of a turn that ended without a reply — it failed, or was stopped —
+ * so the numbers have no timestamp to sit beside. Shown whole, not on hover:
+ * there is no reply to hover. A usage cell whose turn has a reply renders
+ * nothing; its numbers are on that reply.
  */
-function UsageCell({ cell }: { cell: Cell & { kind: "usage" } }) {
-  const cached = cell.cacheRead + cell.cacheWrite;
-  const tokens = cell.input + cell.output > 0;
-  // Nothing to report is nothing to render: the transcript lays its cells out
-  // with a gap, so an empty footer is a blank band with no line in it.
-  if (cell.elapsedMs === undefined && !tokens) return null;
+function UsageCell({ usage }: { usage: string | undefined }) {
+  if (!usage) return null;
   return (
-    <div className="px-1 text-[11px] leading-none text-ink3">
-      {cell.elapsedMs !== undefined && formatElapsed(cell.elapsedMs)}
-      {cell.elapsedMs !== undefined && tokens && " · "}
-      {tokens && (
-        <>
-          {formatTokens(cell.input)} in · {formatTokens(cell.output)} out
-          {cached > 0 && <> · {formatTokens(cached)} cached</>}
-        </>
-      )}
+    <div className="flex justify-end px-1">
+      <UsageInfo label={usage} reveal={false} />
     </div>
   );
 }
@@ -427,6 +463,7 @@ export const TranscriptCell = memo(function TranscriptCell({
   ordinal,
   editable,
   onEdit,
+  usage,
 }: {
   cell: Cell;
   respond: (promptId: string, value: string) => void;
@@ -438,8 +475,10 @@ export const TranscriptCell = memo(function TranscriptCell({
   /** False mid-turn, when rewriting a turn would race the one in flight. */
   editable: boolean;
   onEdit: (nthUserMessage: number, text: string) => void;
+  /** The turn's time and tokens, on the cell that shows them (see `placeTurnUsage`). */
+  usage?: string;
 }) {
-  const body = renderCell(cell, respond, ordinal, editable, onEdit);
+  const body = renderCell(cell, respond, ordinal, editable, onEdit, usage);
   // Only the kinds the reducer stamps carry a time, so the presence of `at`
   // selects the rows worth asking "when" about — a usage footer or an open
   // prompt is not one of them. The wrapper is a plain block so the cell inside
@@ -454,6 +493,7 @@ function renderCell(
   ordinal: number,
   editable: boolean,
   onEdit: (nthUserMessage: number, text: string) => void,
+  usage: string | undefined,
 ) {
   switch (cell.kind) {
     case "user":
@@ -462,11 +502,12 @@ function renderCell(
       );
     case "assistant":
       return (
-        <div>
+        // A group, so hovering anywhere on the reply shows its usage mark.
+        <div className="group">
           <ReplyCard kicker="Borg" action={<SpeakButton cell={cell} />}>
             <Markdown>{cell.text}</Markdown>
           </ReplyCard>
-          {cell.at !== undefined && <SentAt at={cell.at} />}
+          {(cell.at !== undefined || usage) && <SentAt at={cell.at} usage={usage} />}
         </div>
       );
     case "thinking":
@@ -474,7 +515,7 @@ function renderCell(
     case "tool":
       return <ToolCell cell={cell} />;
     case "usage":
-      return <UsageCell cell={cell} />;
+      return <UsageCell usage={usage} />;
     case "sub-agent":
       return <SubAgentCell cell={cell} />;
     case "notice":

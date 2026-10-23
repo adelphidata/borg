@@ -8,6 +8,7 @@ import { SettingsProvider } from "../../lib/settings";
 import { dispatchKeybind } from "../../lib/keybinds";
 import { sessionsVersion } from "../sessions/sessionsVersion";
 import { ConversationPage } from "./ConversationPage";
+import { BUSY_VERBS } from "./turnActivity";
 
 const OPEN = {
   GetSettings: { entries: [] },
@@ -94,10 +95,10 @@ afterEach(() => {
 });
 
 describe("ConversationPage", () => {
-  it("names the conversation and the model it thinks with", async () => {
+  it("names the conversation, and leaves the model to the composer", async () => {
     mount(fakeDaemon(OPEN));
     await waitFor(() => expect(screen.getByText("Ship it")).toBeTruthy());
-    expect(screen.getByText("claude-opus-5")).toBeTruthy();
+    expect(screen.queryByText("claude-opus-5")).toBeNull();
   });
 
   it("renames the conversation from a double-click on its title", async () => {
@@ -136,19 +137,6 @@ describe("ConversationPage", () => {
     await act(async () => {});
     expect(screen.getByRole("textbox", { name: "Conversation name" })).toBeTruthy();
     expect(screen.queryByRole("heading", { level: 1, name: "Nope" })).toBeNull();
-  });
-
-  it("shows the model the last turn ran on, not the one the open found", async () => {
-    // The picker can change the model between turns; the heading followed
-    // the open's answer and said the old one until a reload.
-    let model = "claude-opus-5";
-    const daemon = fakeDaemon({ ...OPEN, GetState: () => ({ ...OPEN.GetState, llmModel: model }) });
-    mount(daemon);
-    await waitFor(() => expect(screen.getByText("claude-opus-5")).toBeTruthy());
-    model = "deepseek/deepseek-v3.2";
-    emit(daemon, { preparing: {} as never });
-    emit(daemon, { turnComplete: {} as never });
-    await waitFor(() => expect(screen.getByText("deepseek/deepseek-v3.2")).toBeTruthy());
   });
 
   it("invites a first message rather than showing a blank page", async () => {
@@ -294,12 +282,12 @@ describe("ConversationPage", () => {
         "Waiting for the model",
       ),
     );
-    // The visible line carries the elapsed counter, and only the visible line.
-    const visible = screen
-      .getAllByText("Waiting for the model", { exact: false })
-      .find((el) => el.getAttribute("role") !== "status")!;
+    // The visible line shows the turn's verb and the elapsed counter; the
+    // reader hears the plain words, and only once.
+    const verbs = new RegExp(`^(${BUSY_VERBS.join("|")})…`);
+    const visible = screen.getByText(verbs);
     expect(visible.getAttribute("aria-hidden")).toBe("true");
-    expect(visible.textContent).not.toBe("Waiting for the model");
+    expect(visible.textContent).not.toContain("Waiting for the model");
 
     emit(daemon, { turnComplete: {} as never });
     await waitFor(() =>

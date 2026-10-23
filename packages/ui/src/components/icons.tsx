@@ -9,6 +9,7 @@ import {
   CircleArrowUp,
   Copy,
   GitBranch,
+  Info,
   ListTree,
   MessageCircle,
   Mic,
@@ -89,6 +90,7 @@ export const ShuffleIcon = lucide(Shuffle, 15);
 export const ServerIcon = lucide(Server, 16);
 export const SparklesIcon = lucide(Sparkles, 16);
 export const SpeakerIcon = lucide(Volume2, 15);
+export const InfoIcon = lucide(Info, 13);
 export const StopIcon = lucide(Square, 13, 2);
 
 export function SendIcon({ size, ...props }: IconProps) {

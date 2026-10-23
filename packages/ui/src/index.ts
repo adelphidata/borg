@@ -42,6 +42,7 @@ export {
   CloseIcon,
   CopyIcon,
   GearIcon,
+  InfoIcon,
   LogoIcon,
   MicIcon,
   MoonIcon,

@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TranscriptCell } from "./index";
 import { registerComposer } from "../composerFocus";
 import type { Cell } from "../useConversation";
 import { formatClock } from "../../../lib/format";
 
-function renderCell(cell: Cell, over: { ordinal?: number; editable?: boolean } = {}) {
+function renderCell(
+  cell: Cell,
+  over: { ordinal?: number; editable?: boolean; usage?: string } = {},
+) {
   const respond = vi.fn();
   const onEdit = vi.fn();
   const view = render(
@@ -19,6 +22,7 @@ function renderCell(cell: Cell, over: { ordinal?: number; editable?: boolean } =
         ordinal={over.ordinal ?? -1}
         editable={over.editable ?? true}
         onEdit={onEdit}
+        usage={over.usage}
       />
     </MemoryRouter>,
   );
@@ -235,8 +239,7 @@ describe("TranscriptCell — other kinds", () => {
     expect(screen.queryByText("Allow")).toBeNull();
   });
 
-  it("leads a turn footer with the time it took", () => {
-    // "How long did that take" is the question people ask unprompted.
+  it("keeps a usage cell out of the transcript when its numbers sit on a reply", () => {
     const { container } = renderCell({
       kind: "usage",
       input: 1200,
@@ -245,45 +248,19 @@ describe("TranscriptCell — other kinds", () => {
       cacheWrite: 0,
       elapsedMs: 12_400,
     });
-    expect(container.textContent).toContain("12.4s");
-    expect(container.textContent).toContain("1.2K in");
-    expect(container.textContent).toContain("340 out");
-  });
-
-  it("reports cached tokens only when there were any", () => {
-    const { container } = renderCell({
-      kind: "usage",
-      input: 10,
-      output: 5,
-      cacheRead: 900,
-      cacheWrite: 100,
-      elapsedMs: 1000,
-    });
-    expect(container.textContent).toContain("1K cached");
-  });
-
-  it("omits token counts for a turn that reported none", () => {
-    // Otherwise the footer claims the turn cost zero.
-    const { container } = renderCell({
-      kind: "usage",
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      elapsedMs: 800,
-    });
-    expect(container.textContent).toBe("0.8s");
-  });
-
-  it("renders nothing at all when a footer has nothing to say", () => {
-    const { container } = renderCell({
-      kind: "usage",
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    });
     expect(container.firstChild).toBeNull();
+  });
+
+  it("shows a reply-less turn's numbers behind the mark, not as a line", () => {
+    const { container } = renderCell(
+      { kind: "usage", input: 1200, output: 340, cacheRead: 0, cacheWrite: 0, elapsedMs: 12_400 },
+      { usage: "12.4s · 1.2K in · 340 out" },
+    );
+    const tip = screen.getByRole("tooltip", { hidden: true });
+    expect(tip.hidden).toBe(true);
+    expect(tip.textContent).toBe("12.4s · 1.2K in · 340 out");
+    // There is no reply to hover, so the mark itself is always there.
+    expect(container.querySelector(".hover-reveal")).toBeNull();
   });
 
   it("reports a turn error as a card, with no retry of its own", () => {
@@ -345,15 +322,57 @@ describe("TranscriptCell — timestamps", () => {
   });
 
   it("adds no wrapper for a row with no time of its own", () => {
-    const { container } = renderCell({
-      kind: "usage",
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-    });
+    const { container } = renderCell(
+      { kind: "usage", input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+      { usage: "1 in · 1 out" },
+    );
     expect((container.firstElementChild as HTMLElement).title).toBe("");
     expect(container.querySelector("time")).toBeNull();
+  });
+});
+
+describe("TranscriptCell — a turn's usage", () => {
+  const at = Date.UTC(2026, 7, 19, 14, 32, 7);
+  const reply = (usage?: string) =>
+    renderCell({ kind: "assistant", text: "hi", at }, usage ? { usage } : {});
+  const mark = () => screen.getByRole("button", { name: "Time and tokens" });
+  const tip = () => screen.getByRole("tooltip", { hidden: true });
+
+  it("puts the numbers behind a mark beside the time, revealed on hover", () => {
+    const { container } = reply("4.3s · 15.8K in · 31 out · 14.8K cached");
+    // In the tree for screen readers, but hidden until asked for.
+    expect(tip().hidden).toBe(true);
+    const time = container.querySelector("time")!;
+    // The mark leads the time on the same row; the time stays the last thing.
+    expect(mark().closest(".hover-reveal")?.nextElementSibling).toBe(time);
+    expect(time.nextElementSibling).toBeNull();
+    expect(mark().closest(".group")).toBeTruthy();
+    expect(mark().getAttribute("aria-describedby")).toBe(tip().id);
+    expect(tip().textContent).toBe("4.3s · 15.8K in · 31 out · 14.8K cached");
+  });
+
+  it("opens the tip on hover and on focus, and Escape or leaving puts it away", () => {
+    reply("4.3s");
+    const holder = mark().parentElement!;
+    expect(tip().hidden).toBe(true);
+    fireEvent.pointerEnter(holder);
+    expect(tip().hidden).toBe(false);
+    fireEvent.pointerLeave(holder);
+    expect(tip().hidden).toBe(true);
+    act(() => mark().focus());
+    expect(tip().hidden).toBe(false);
+    fireEvent.keyDown(mark(), { key: "Escape" });
+    expect(tip().hidden).toBe(true);
+  });
+
+  it("keeps the row's date tip off the mark", () => {
+    reply("4.3s");
+    expect(mark().parentElement!.getAttribute("title")).toBe("");
+  });
+
+  it("has no mark on a reply that does not end its turn", () => {
+    reply();
+    expect(screen.queryByRole("button", { name: "Time and tokens" })).toBeNull();
   });
 });
 

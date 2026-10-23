@@ -687,17 +687,14 @@ describe("useConversation title", () => {
     expect(daemon.calls.filter((c) => c.method === "GetState")).toHaveLength(before + 1);
   });
 
-  it("keeps the model and session id the open reported", async () => {
+  it("keeps the session id the open reported", async () => {
     const daemon = fakeDaemon(OPEN);
     const conv = mount(daemon);
     await ready(conv);
     daemon.answer("GetState", { ...OPEN.GetState, title: "Renamed" });
     emit(daemon, { turnComplete: {} as never });
     await waitFor(() => expect(conv.current.opened.data?.title).toBe("Renamed"));
-    expect(conv.current.opened.data).toMatchObject({
-      model: "claude-opus-5",
-      agentSessionId: "agent-1",
-    });
+    expect(conv.current.opened.data).toEqual({ title: "Renamed", agentSessionId: "agent-1" });
   });
 });
 
