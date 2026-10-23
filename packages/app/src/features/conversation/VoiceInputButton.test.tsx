@@ -374,6 +374,31 @@ describe("VoiceInputButton", () => {
     expect(native.dictationHotkeys.filter((h) => h !== "")).toEqual([]);
   });
 
+  it("recovers when the recorder refuses to start, and records next time", async () => {
+    // Chrome builds a recorder on a stream whose tracks ended, then throws
+    // from start(); the button must not stay stuck behind that recorder.
+    let refuse = true;
+    vi.stubGlobal(
+      "MediaRecorder",
+      class extends FakeRecorder {
+        start() {
+          if (refuse) throw new DOMException("ended", "NotSupportedError");
+          super.start();
+        }
+      },
+    );
+    const { onError } = mount(daemonWith(true));
+    const mic = await findReadyMic();
+    await act(async () => fireEvent.click(mic));
+    await waitFor(() =>
+      expect(onError).toHaveBeenLastCalledWith(expect.stringMatching(/can't record from this/)),
+    );
+    expect(track.stop).toHaveBeenCalled();
+    refuse = false;
+    await act(async () => fireEvent.click(mic));
+    await waitFor(() => expect(mic.getAttribute("aria-pressed")).toBe("true"));
+  });
+
   it("explains a microphone the browser cannot record from", async () => {
     vi.stubGlobal(
       "MediaRecorder",

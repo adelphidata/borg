@@ -309,14 +309,17 @@ export function useDictation(options: DictationOptions): Dictation {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }
-    let r: MediaRecorder;
-    try {
-      r = new MediaRecorder(stream);
-    } catch {
+    const cannotRecord = () => {
       // A device that grants the stream but cannot record it (a track that
       // ended, a codec the browser lacks) must not leave the button stuck.
       stream.getTracks().forEach((t) => t.stop());
       opts.current.onError("Borg can't record from this microphone. Try another one in Settings.");
+    };
+    let r: MediaRecorder;
+    try {
+      r = new MediaRecorder(stream);
+    } catch {
+      cannotRecord();
       return;
     }
     const chunks: Blob[] = [];
@@ -330,8 +333,15 @@ export function useDictation(options: DictationOptions): Dictation {
       if (opts.current.beep) beep(660);
       void transcribe(new Blob(chunks, { type: r.mimeType || "audio/webm" }));
     };
+    try {
+      // Chrome accepts a stream whose tracks already ended, then refuses to
+      // start on it.
+      r.start();
+    } catch {
+      cannotRecord();
+      return;
+    }
     recorder.current = r;
-    r.start();
     if (opts.current.beep) beep(880);
     setSeconds(0);
     setLevel(0);
