@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { createActivityHold, turnActivity } from "./turnActivity";
+import {
+  BUSY_VERBS,
+  busyVerb,
+  createActivityHold,
+  turnActivity,
+  visibleLabel,
+} from "./turnActivity";
 import type { Cell } from "./useConversation";
 
 const user = (text = "go"): Cell => ({ kind: "user", text });
@@ -29,7 +35,7 @@ const prompt = (answered: boolean): Cell => ({
 describe("turnActivity", () => {
   it("names the provider wait before anything comes back", () => {
     // The long one, and the one users misread as Borg being slow.
-    expect(turnActivity([user()])).toEqual({ label: "Waiting for the model" });
+    expect(turnActivity([user()])).toEqual({ label: "Waiting for the model", generic: true });
   });
 
   it("says nothing while a tool row is running, because that row narrates", () => {
@@ -48,6 +54,7 @@ describe("turnActivity", () => {
     expect(turnActivity([user(), prompt(true)])).toEqual({
       label: "Working",
       tentative: true,
+      generic: true,
     });
   });
 
@@ -63,7 +70,11 @@ describe("turnActivity", () => {
 
   it("only guesses in the gap between one tool and the next", () => {
     // Marked tentative so the hold can keep it off screen when it is a blink.
-    expect(turnActivity([user(), tool(true)])).toEqual({ label: "Working", tentative: true });
+    expect(turnActivity([user(), tool(true)])).toEqual({
+      label: "Working",
+      tentative: true,
+      generic: true,
+    });
   });
 
   it("names the provider outage while the retry notice is the live state", () => {
@@ -75,7 +86,11 @@ describe("turnActivity", () => {
 
   it("reads an ordinary notice as an ordinary gap", () => {
     const notice: Cell = { kind: "notice", text: "Posture: reduced" };
-    expect(turnActivity([user(), notice])).toEqual({ label: "Working", tentative: true });
+    expect(turnActivity([user(), notice])).toEqual({
+      label: "Working",
+      tentative: true,
+      generic: true,
+    });
   });
 });
 
@@ -129,5 +144,50 @@ describe("createActivityHold", () => {
       label: "Working",
       tentative: true,
     });
+  });
+});
+
+describe("busyVerb", () => {
+  it("keeps one verb for the whole of a turn", () => {
+    // Re-renders and remounts read the same start time, so the line cannot
+    // swap words halfway through a wait.
+    expect(busyVerb(1_729_700_000_123)).toBe(busyVerb(1_729_700_000_123));
+  });
+
+  it("moves on between turns", () => {
+    const verbs = new Set(Array.from({ length: 10 }, (_, i) => busyVerb(1_729_700_000_000 + i)));
+    expect(verbs.size).toBeGreaterThan(1);
+  });
+
+  it("can reach every verb in the list", () => {
+    const seen = new Set(BUSY_VERBS.map((_, i) => busyVerb(i)));
+    expect(seen.size).toBe(BUSY_VERBS.length);
+  });
+
+  it("has a verb before the turn has a start time", () => {
+    expect(BUSY_VERBS).toContain(busyVerb(undefined));
+  });
+});
+
+describe("visibleLabel", () => {
+  it("shows the turn's verb for a wait that says only 'busy'", () => {
+    expect(visibleLabel({ label: "Waiting for the model", generic: true }, "Pondering")).toBe(
+      "Pondering…",
+    );
+    expect(visibleLabel({ label: "Working", tentative: true, generic: true }, "Percolating")).toBe(
+      "Percolating…",
+    );
+  });
+
+  it("keeps a label that says something specific", () => {
+    // Text arriving, or a provider outage: a whimsical verb would hide news.
+    expect(visibleLabel({ label: "Replying" }, "Pondering")).toBe("Replying");
+    expect(visibleLabel({ label: "Provider unreachable, retrying…" }, "Pondering")).toBe(
+      "Provider unreachable, retrying…",
+    );
+  });
+
+  it("shows nothing when the tail narrates for itself", () => {
+    expect(visibleLabel({}, "Pondering")).toBeUndefined();
   });
 });

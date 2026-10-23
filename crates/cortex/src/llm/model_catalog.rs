@@ -1513,13 +1513,7 @@ mod tests {
         /// rate card covers them yet. Spend on these is invisible to the
         /// budget, so the list is a debt register, not an escape hatch: add the
         /// rate rows and delete the entry as soon as pricing is published.
-        const UNPRICED_BY_DESIGN: &[&str] = &[
-            "gpt-5.5",
-            "gpt-5.5-pro",
-            "gpt-5.4-mini",
-            "gpt-5.4-nano",
-            "gpt-5.1-codex",
-        ];
+        const UNPRICED_BY_DESIGN: &[&str] = &[];
 
         #[test]
         fn every_curated_id_resolves_to_an_explicit_registry_row() {

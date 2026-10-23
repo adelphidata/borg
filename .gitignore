@@ -75,3 +75,6 @@ stryker-setup-*.js
 # The daemon binary copied in by `just desktop-bundle-borgd`; built, not tracked.
 apps/desktop/resources/bin/borgd
 apps/desktop/resources/bin/borgd.exe
+
+# Local UI screenshots for review (not tracked)
+/screenshots/

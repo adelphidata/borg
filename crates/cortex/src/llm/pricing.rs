@@ -38,7 +38,6 @@ impl ModelRate {
     }
 
     /// Rate row with a published cache-read rate.
-    #[cfg_attr(not(test), allow(dead_code))]
     const fn with_cached_input(
         input_per_mtok: &'static str,
         output_per_mtok: &'static str,
@@ -80,50 +79,135 @@ impl AnthropicModelRate {
     }
 }
 
-// Sources captured on 2026-05-02:
-// OpenAI official pricing/model docs:
-// - https://openai.com/api/pricing/
-// - https://developers.openai.com/api/docs/models/gpt-4
-// - https://developers.openai.com/api/docs/models/gpt-4.1
-// - https://developers.openai.com/api/docs/models/gpt-4.1-mini
-// - https://developers.openai.com/api/docs/models/gpt-4.1-nano
-// - https://developers.openai.com/api/docs/models/gpt-4o
-// - https://developers.openai.com/api/docs/models/gpt-4o-mini
-// - https://developers.openai.com/api/docs/models/gpt-5
-// - https://developers.openai.com/api/docs/models/gpt-5-mini
-// - https://developers.openai.com/api/docs/models/o3
-// - https://developers.openai.com/api/docs/models/o4-mini
-// Anthropic official pricing/model docs:
-// - https://docs.anthropic.com/en/docs/about-claude/pricing
-// - https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-// - https://docs.anthropic.com/en/docs/models-overview
-// - https://www.anthropic.com/claude/haiku?pubDate=20250827
+// Sources captured on 2026-10-23 (standard tier, USD per million tokens):
+// - Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
+// - OpenAI: https://developers.openai.com/api/docs/pricing
+// - Google: https://ai.google.dev/gemini-api/docs/pricing
+// - xAI: https://docs.x.ai/docs/models
+// A model a vendor no longer lists keeps the rate it was last billed at, so
+// replaying an old session prices the same; each such row says so.
 
 static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
+        // GPT-5.5 has a long-context tier above 272K; see LONG_CONTEXT_RATES.
+        (
+            "gpt-5.5",
+            ModelRate::with_cached_input("5.00", "30.00", "0.50"),
+        ),
+        ("gpt-5.5-pro", ModelRate::new("30.00", "180.00")),
+        (
+            "gpt-5.4-mini",
+            ModelRate::with_cached_input("0.75", "4.50", "0.075"),
+        ),
+        (
+            "gpt-5.4-nano",
+            ModelRate::with_cached_input("0.20", "1.25", "0.02"),
+        ),
+        (
+            "gpt-5.3-codex",
+            ModelRate::with_cached_input("1.75", "14.00", "0.175"),
+        ),
+        (
+            "gpt-5.1",
+            ModelRate::with_cached_input("1.25", "10.00", "0.125"),
+        ),
+        // Not on OpenAI's price page. OpenRouter serves it at GPT-5.1's input
+        // and output rate; no cache-read rate is published, so none is guessed.
+        ("gpt-5.1-codex", ModelRate::new("1.25", "10.00")),
+        (
+            "gpt-5",
+            ModelRate::with_cached_input("1.25", "10.00", "0.125"),
+        ),
+        (
+            "gpt-5-mini",
+            ModelRate::with_cached_input("0.25", "2.00", "0.025"),
+        ),
+        (
+            "gpt-5-nano",
+            ModelRate::with_cached_input("0.05", "0.40", "0.005"),
+        ),
+        ("o3", ModelRate::with_cached_input("2.00", "8.00", "0.50")),
+        (
+            "o4-mini",
+            ModelRate::with_cached_input("1.10", "4.40", "0.275"),
+        ),
+        (
+            "gpt-4.1",
+            ModelRate::with_cached_input("2.00", "8.00", "0.50"),
+        ),
+        (
+            "gpt-4.1-mini",
+            ModelRate::with_cached_input("0.40", "1.60", "0.10"),
+        ),
+        (
+            "gpt-4.1-nano",
+            ModelRate::with_cached_input("0.10", "0.40", "0.025"),
+        ),
+        (
+            "gpt-4o",
+            ModelRate::with_cached_input("2.50", "10.00", "1.25"),
+        ),
+        (
+            "gpt-4o-2024-08-06",
+            ModelRate::with_cached_input("2.50", "10.00", "1.25"),
+        ),
+        (
+            "gpt-4o-mini",
+            ModelRate::with_cached_input("0.15", "0.60", "0.075"),
+        ),
+        // Only dated GPT-4 snapshots remain on the page; this is their rate.
         ("gpt-4", ModelRate::new("30.00", "60.00")),
-        ("gpt-4.1", ModelRate::new("2.00", "8.00")),
-        ("gpt-4.1-mini", ModelRate::new("0.40", "1.60")),
-        ("gpt-4.1-nano", ModelRate::new("0.10", "0.40")),
-        ("gpt-4o", ModelRate::new("2.50", "10.00")),
-        ("gpt-4o-2024-08-06", ModelRate::new("2.50", "10.00")),
-        ("gpt-4o-mini", ModelRate::new("0.15", "0.60")),
-        ("gpt-5", ModelRate::new("1.25", "10.00")),
-        ("gpt-5-mini", ModelRate::new("0.25", "2.00")),
-        ("gpt-5-nano", ModelRate::new("0.05", "0.40")),
-        ("o3", ModelRate::new("2.00", "8.00")),
-        ("o4-mini", ModelRate::new("1.10", "4.40")),
     ])
 });
 
-// xAI Grok pricing per xAI's public docs (https://docs.x.ai/docs/models).
-// Captured 2026-05-24. xAI prices in USD per million tokens; cache-read is
-// charged separately on some models but the existing OpenAI-compat
-// cost-estimation path ignores cache tokens, so only input/output land here.
-// Update when xAI revises pricing.
+// xAI bills a whole request at the higher rate once its prompt reaches 200K
+// tokens; see LONG_CONTEXT_RATES.
 static XAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        ("grok-4", ModelRate::new("5.00", "15.00")),
+        (
+            "grok-4.7",
+            ModelRate::with_cached_input("2.00", "6.00", "0.50"),
+        ),
+        (
+            "grok-4.6",
+            ModelRate::with_cached_input("2.00", "6.00", "0.50"),
+        ),
+        (
+            "grok-4.5",
+            ModelRate::with_cached_input("2.00", "6.00", "0.30"),
+        ),
+        (
+            "grok-4.3",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        (
+            "grok-4.20-0309-reasoning",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        (
+            "grok-4.20-0309-non-reasoning",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        (
+            "grok-4.20-multi-agent-0309",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        // OpenRouter's undated names for the 4.20 family.
+        (
+            "grok-4.20",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        (
+            "grok-4.20-multi-agent",
+            ModelRate::with_cached_input("1.25", "2.50", "0.20"),
+        ),
+        (
+            "grok-build-0.1",
+            ModelRate::with_cached_input("1.00", "2.00", "0.20"),
+        ),
+        // No longer on xAI's price list; the rates they were billed at. Grok 4
+        // was $3/$15, not the $5/$15 this table used to carry.
+        ("grok-4", ModelRate::new("3.00", "15.00")),
         ("grok-4-fast", ModelRate::new("0.20", "0.50")),
         ("grok-4-fast-reasoning", ModelRate::new("0.20", "0.50")),
         ("grok-4-fast-non-reasoning", ModelRate::new("0.20", "0.50")),
@@ -134,166 +218,257 @@ static XAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| 
     ])
 });
 
+// Paid tier, text and image input. The Pro models have a long-context tier
+// above 200K; see LONG_CONTEXT_RATES.
 static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        ("gemini-3-pro", ModelRate::new("1.25", "10.00")),
-        ("gemini-3-flash", ModelRate::new("0.15", "0.60")),
+        (
+            "gemini-3.1-pro-preview",
+            ModelRate::with_cached_input("2.00", "12.00", "0.20"),
+        ),
+        // Retired in favour of 3.1 Pro; the launch rate it was billed at.
+        ("gemini-3-pro", ModelRate::new("2.00", "12.00")),
+        ("gemini-3-pro-preview", ModelRate::new("2.00", "12.00")),
+        // Introductory through 2026-12-31; Google lists $1.50 / $7.50 / $0.15
+        // cached from 2027-01-01.
+        (
+            "gemini-3.8-flash",
+            ModelRate::with_cached_input("0.75", "3.75", "0.075"),
+        ),
+        (
+            "gemini-3.6-flash",
+            ModelRate::with_cached_input("0.75", "3.75", "0.075"),
+        ),
+        (
+            "gemini-3-flash",
+            ModelRate::with_cached_input("0.50", "3.00", "0.05"),
+        ),
+        (
+            "gemini-3-flash-preview",
+            ModelRate::with_cached_input("0.50", "3.00", "0.05"),
+        ),
+        (
+            "gemini-3.5-flash-lite",
+            ModelRate::with_cached_input("0.30", "2.50", "0.03"),
+        ),
+        (
+            "gemini-3.1-flash-lite",
+            ModelRate::with_cached_input("0.25", "1.50", "0.025"),
+        ),
+        (
+            "gemini-3.1-flash-lite-preview",
+            ModelRate::with_cached_input("0.25", "1.50", "0.025"),
+        ),
+        // Google lists no Gemini 3 Flash-Lite; the curated id predates 3.1
+        // Flash-Lite. Kept at its old row until the catalog drops the id.
         ("gemini-3-flash-lite", ModelRate::new("0.05", "0.30")),
-        ("gemini-2.5-pro", ModelRate::new("1.25", "10.00")),
-        ("gemini-2.5-flash", ModelRate::new("0.30", "2.50")),
-        ("gemini-2.5-flash-lite", ModelRate::new("0.10", "0.40")),
+        (
+            "gemini-2.5-pro",
+            ModelRate::with_cached_input("1.25", "10.00", "0.125"),
+        ),
+        (
+            "gemini-2.5-flash",
+            ModelRate::with_cached_input("0.30", "2.50", "0.03"),
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            ModelRate::with_cached_input("0.10", "0.40", "0.01"),
+        ),
+        // No longer on Google's price page; the rate it was billed at.
         ("gemini-2.0-flash", ModelRate::new("0.10", "0.40")),
     ])
 });
 
+/// A rate that replaces a model's base row once a single request's prompt
+/// reaches `from_prompt_tokens`. Vendors bill the whole request at the higher
+/// rate, not just the tokens past the line.
+struct LongContext<R> {
+    from_prompt_tokens: u64,
+    rate: R,
+}
+
+static LONG_CONTEXT_RATES: LazyLock<HashMap<&'static str, LongContext<ModelRate>>> =
+    LazyLock::new(|| {
+        let above = |from_prompt_tokens, rate| LongContext {
+            from_prompt_tokens,
+            rate,
+        };
+        HashMap::from([
+            // OpenAI: over 272K input tokens.
+            (
+                "gpt-5.5",
+                above(
+                    272_001,
+                    ModelRate::with_cached_input("10.00", "45.00", "1.00"),
+                ),
+            ),
+            (
+                "gpt-5.5-pro",
+                above(272_001, ModelRate::new("60.00", "270.00")),
+            ),
+            // Google: over 200K.
+            (
+                "gemini-3.1-pro-preview",
+                above(
+                    200_001,
+                    ModelRate::with_cached_input("4.00", "18.00", "0.40"),
+                ),
+            ),
+            (
+                "gemini-3-pro",
+                above(200_001, ModelRate::new("4.00", "18.00")),
+            ),
+            (
+                "gemini-3-pro-preview",
+                above(200_001, ModelRate::new("4.00", "18.00")),
+            ),
+            (
+                "gemini-2.5-pro",
+                above(
+                    200_001,
+                    ModelRate::with_cached_input("2.50", "15.00", "0.25"),
+                ),
+            ),
+            // xAI: at 200K and above.
+            (
+                "grok-4.7",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("4.00", "12.00", "1.00"),
+                ),
+            ),
+            (
+                "grok-4.6",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("4.00", "12.00", "1.00"),
+                ),
+            ),
+            (
+                "grok-4.5",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("4.00", "12.00", "0.60"),
+                ),
+            ),
+            (
+                "grok-4.3",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-4.20-0309-reasoning",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-4.20-0309-non-reasoning",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-4.20-multi-agent-0309",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-4.20",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-4.20-multi-agent",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.50", "5.00", "0.40"),
+                ),
+            ),
+            (
+                "grok-build-0.1",
+                above(
+                    200_000,
+                    ModelRate::with_cached_input("2.00", "4.00", "0.40"),
+                ),
+            ),
+        ])
+    });
+
+/// Claude Haiku 5.5 bills a request whose prompt is over 100,000 tokens at
+/// its higher rates. Anthropic counts cache reads and writes in that length.
+static ANTHROPIC_LONG_CONTEXT_RATES: LazyLock<
+    HashMap<&'static str, LongContext<AnthropicModelRate>>,
+> = LazyLock::new(|| {
+    HashMap::from([(
+        "claude-haiku-5-5",
+        LongContext {
+            from_prompt_tokens: 100_001,
+            rate: AnthropicModelRate::new("0.50", "0.05", "0.625", "1.00", "2.50"),
+        },
+    )])
+});
+
 static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = LazyLock::new(|| {
+    // Columns: input, cache read, 5-minute cache write, 1-hour cache write,
+    // output. Cache reads are 0.1x input except where noted.
+    let opus_4_5_on = || AnthropicModelRate::new("5.00", "0.50", "6.25", "10.00", "25.00");
+    let opus_4 = || AnthropicModelRate::new("15.00", "1.50", "18.75", "30.00", "75.00");
+    let sonnet_4 = || AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00");
+    let haiku_4_5 = || AnthropicModelRate::new("1.00", "0.10", "1.25", "2.00", "5.00");
     HashMap::from([
+        // Cache reads are 0.025x input on Fable 5.1, and 0.05x on Opus 5.5
+        // and Sonnet 5.5.
         (
-            "claude-opus-4",
-            AnthropicModelRate {
-                input_per_mtok: "15.00",
-                cache_read_per_mtok: "1.50",
-                cache_write_5m_per_mtok: "18.75",
-                cache_write_1h_per_mtok: "30.00",
-                output_per_mtok: "75.00",
-            },
-        ),
-        (
-            "claude-opus-4-20250514",
-            AnthropicModelRate {
-                input_per_mtok: "15.00",
-                cache_read_per_mtok: "1.50",
-                cache_write_5m_per_mtok: "18.75",
-                cache_write_1h_per_mtok: "30.00",
-                output_per_mtok: "75.00",
-            },
-        ),
-        // Opus dropped from $15/$75 to $5/$25 at 4.6 and has stayed there
-        // through 4.7, 4.8, and 5. Cache multipliers are unchanged: read is
-        // 0.1x input, 5m write 1.25x, 1h write 2x.
-        // Opus 5.5 is the cheaper successor of Opus 5: $4/$20, cache read
-        // $0.20 (0.05x input, not the 0.1x of the rows above). Sonnet 5.5 is
-        // $2/$10 with the same $0.20 cache read.
-        (
-            "claude-opus-5-5",
-            AnthropicModelRate {
-                input_per_mtok: "4.00",
-                cache_read_per_mtok: "0.20",
-                cache_write_5m_per_mtok: "5.00",
-                cache_write_1h_per_mtok: "8.00",
-                output_per_mtok: "20.00",
-            },
-        ),
-        (
-            "claude-sonnet-5-5",
-            AnthropicModelRate {
-                input_per_mtok: "2.00",
-                cache_read_per_mtok: "0.20",
-                cache_write_5m_per_mtok: "2.50",
-                cache_write_1h_per_mtok: "4.00",
-                output_per_mtok: "10.00",
-            },
-        ),
-        (
-            "claude-opus-5",
-            AnthropicModelRate {
-                input_per_mtok: "5.00",
-                cache_read_per_mtok: "0.50",
-                cache_write_5m_per_mtok: "6.25",
-                cache_write_1h_per_mtok: "10.00",
-                output_per_mtok: "25.00",
-            },
-        ),
-        (
-            "claude-sonnet-5",
-            AnthropicModelRate {
-                input_per_mtok: "3.00",
-                cache_read_per_mtok: "0.30",
-                cache_write_5m_per_mtok: "3.75",
-                cache_write_1h_per_mtok: "6.00",
-                output_per_mtok: "15.00",
-            },
+            "claude-fable-5-1",
+            AnthropicModelRate::new("10.00", "0.25", "12.50", "20.00", "50.00"),
         ),
         (
             "claude-fable-5",
-            AnthropicModelRate {
-                input_per_mtok: "10.00",
-                cache_read_per_mtok: "1.00",
-                cache_write_5m_per_mtok: "12.50",
-                cache_write_1h_per_mtok: "20.00",
-                output_per_mtok: "50.00",
-            },
+            AnthropicModelRate::new("10.00", "1.00", "12.50", "20.00", "50.00"),
         ),
         (
-            "claude-opus-4-8",
-            AnthropicModelRate {
-                input_per_mtok: "5.00",
-                cache_read_per_mtok: "0.50",
-                cache_write_5m_per_mtok: "6.25",
-                cache_write_1h_per_mtok: "10.00",
-                output_per_mtok: "25.00",
-            },
+            "claude-opus-5-5",
+            AnthropicModelRate::new("4.00", "0.20", "5.00", "8.00", "20.00"),
         ),
         (
-            "claude-opus-4-7",
-            AnthropicModelRate {
-                input_per_mtok: "5.00",
-                cache_read_per_mtok: "0.50",
-                cache_write_5m_per_mtok: "6.25",
-                cache_write_1h_per_mtok: "10.00",
-                output_per_mtok: "25.00",
-            },
+            "claude-sonnet-5-5",
+            AnthropicModelRate::new("2.00", "0.10", "2.50", "4.00", "10.00"),
         ),
+        // Prompts up to 100K tokens; ANTHROPIC_LONG_CONTEXT_RATES has the rest.
         (
-            "claude-sonnet-4",
-            AnthropicModelRate {
-                input_per_mtok: "3.00",
-                cache_read_per_mtok: "0.30",
-                cache_write_5m_per_mtok: "3.75",
-                cache_write_1h_per_mtok: "6.00",
-                output_per_mtok: "15.00",
-            },
+            "claude-haiku-5-5",
+            AnthropicModelRate::new("0.10", "0.01", "0.125", "0.20", "0.50"),
         ),
+        ("claude-opus-5", opus_4_5_on()),
+        // Sonnet 5's $2/$10 launch rate is now its standard price; the rise to
+        // $3/$15 scheduled for 2026-09-01 did not happen.
         (
-            "claude-sonnet-4-20250514",
-            AnthropicModelRate {
-                input_per_mtok: "3.00",
-                cache_read_per_mtok: "0.30",
-                cache_write_5m_per_mtok: "3.75",
-                cache_write_1h_per_mtok: "6.00",
-                output_per_mtok: "15.00",
-            },
+            "claude-sonnet-5",
+            AnthropicModelRate::new("2.00", "0.20", "2.50", "4.00", "10.00"),
         ),
-        (
-            "claude-sonnet-4-6",
-            AnthropicModelRate {
-                input_per_mtok: "3.00",
-                cache_read_per_mtok: "0.30",
-                cache_write_5m_per_mtok: "3.75",
-                cache_write_1h_per_mtok: "6.00",
-                output_per_mtok: "15.00",
-            },
-        ),
-        (
-            "claude-haiku-4-5",
-            AnthropicModelRate {
-                input_per_mtok: "1.00",
-                cache_read_per_mtok: "0.10",
-                cache_write_5m_per_mtok: "1.25",
-                cache_write_1h_per_mtok: "2.00",
-                output_per_mtok: "5.00",
-            },
-        ),
-        (
-            "claude-haiku-4-5-20251001",
-            AnthropicModelRate {
-                input_per_mtok: "1.00",
-                cache_read_per_mtok: "0.10",
-                cache_write_5m_per_mtok: "1.25",
-                cache_write_1h_per_mtok: "2.00",
-                output_per_mtok: "5.00",
-            },
-        ),
+        // Opus dropped from $15/$75 to $5/$25 at 4.5.
+        ("claude-opus-4-8", opus_4_5_on()),
+        ("claude-opus-4-7", opus_4_5_on()),
+        ("claude-opus-4-6", opus_4_5_on()),
+        ("claude-opus-4-5", opus_4_5_on()),
+        ("claude-opus-4-1", opus_4()),
+        ("claude-opus-4", opus_4()),
+        ("claude-opus-4-20250514", opus_4()),
+        ("claude-sonnet-4-6", sonnet_4()),
+        ("claude-sonnet-4-5", sonnet_4()),
+        ("claude-sonnet-4", sonnet_4()),
+        ("claude-sonnet-4-20250514", sonnet_4()),
+        ("claude-haiku-4-5", haiku_4_5()),
+        ("claude-haiku-4-5-20251001", haiku_4_5()),
         // Claude 3.x families offered on AWS Bedrock (incl. GovCloud). The
         // `anthropic.*` Bedrock ids normalize onto these keys and are billed at
         // the same Anthropic public rates as the direct API.
@@ -360,9 +535,15 @@ fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelR
     }
 }
 
-fn anthropic_rates_for(model: &str) -> Option<&'static AnthropicModelRate> {
+/// The Anthropic rate a request pays, given its full prompt length (uncached
+/// input plus cache reads and writes).
+fn anthropic_rates_for(model: &str, prompt_len: u64) -> Option<&'static AnthropicModelRate> {
     let key = crate::pricing::fold_claude_dotted_version(normalize_model_id(model));
-    ANTHROPIC_RATES.get(key.as_ref())
+    let base = ANTHROPIC_RATES.get(key.as_ref())?;
+    match ANTHROPIC_LONG_CONTEXT_RATES.get(key.as_ref()) {
+        Some(tier) if prompt_len >= tier.from_prompt_tokens => Some(&tier.rate),
+        _ => Some(base),
+    }
 }
 
 /// Return the exact USD string for a direct OpenAI-compatible model.
@@ -380,19 +561,19 @@ pub fn estimate_cost_usd(
     completion_tokens: u64,
     cached_input_tokens: u64,
 ) -> Option<String> {
-    let rates = rates_for(provider)?;
-    cost_for_rate(
-        rates.get(normalize_model_id(model))?,
-        prompt_tokens,
-        completion_tokens,
-        cached_input_tokens,
-    )
+    let key = normalize_model_id(model);
+    let base = rates_for(provider)?.get(key)?;
+    // These providers count cached tokens inside `prompt_tokens`, so it is
+    // already the request's full prompt length.
+    let rate = match LONG_CONTEXT_RATES.get(key) {
+        Some(tier) if prompt_tokens >= tier.from_prompt_tokens => &tier.rate,
+        _ => base,
+    };
+    cost_for_rate(rate, prompt_tokens, completion_tokens, cached_input_tokens)
 }
 
 /// The arithmetic behind [`estimate_cost_usd`], split out so it can be pinned
-/// against a synthetic rate row — no shipped model carries a
-/// [`ModelRate::cached_input_per_mtok`] yet, so the discounted branch would
-/// otherwise be untestable through the public entry point.
+/// against a synthetic rate row independent of the shipped tables.
 fn cost_for_rate(
     rate: &ModelRate,
     prompt_tokens: u64,
@@ -428,7 +609,10 @@ pub fn estimate_anthropic_cost_usd(
     cache_creation_tokens: u64,
     cache_ttl: CacheTtl,
 ) -> Option<String> {
-    let rate = anthropic_rates_for(model)?;
+    let prompt_len = prompt_tokens
+        .saturating_add(cached_input_tokens)
+        .saturating_add(cache_creation_tokens);
+    let rate = anthropic_rates_for(model, prompt_len)?;
     let uncached_input =
         Usd::from_tokens_at_rate(prompt_tokens, Usd::parse(rate.input_per_mtok).ok()?);
     let cached_read = Usd::from_tokens_at_rate(
@@ -463,6 +647,13 @@ pub fn has_model_rate(provider: Provider, model: &str) -> bool {
 #[cfg(test)]
 pub fn shipped_xai_models() -> &'static [&'static str] {
     &[
+        "grok-4.7",
+        "grok-4.6",
+        "grok-4.5",
+        "grok-4.3",
+        "grok-4.20",
+        "grok-4.20-multi-agent",
+        "grok-build-0.1",
         "grok-4",
         "grok-4-fast",
         "grok-4-fast-reasoning",
@@ -478,7 +669,19 @@ pub fn shipped_xai_models() -> &'static [&'static str] {
 /// daemon cost-emission table.
 #[cfg(test)]
 pub fn shipped_openai_models() -> &'static [&'static str] {
-    &["gpt-4", "gpt-4.1", "gpt-4.1-mini"]
+    &[
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.1-codex",
+        "gpt-5",
+        "gpt-5-mini",
+        "o3",
+        "gpt-4",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+    ]
 }
 
 /// Shipped Anthropic direct models that must never silently fall out of the
@@ -486,11 +689,16 @@ pub fn shipped_openai_models() -> &'static [&'static str] {
 #[cfg(test)]
 pub fn shipped_anthropic_models() -> &'static [&'static str] {
     &[
+        "claude-fable-5-1",
+        "claude-fable-5",
         "claude-opus-5-5",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
         "claude-opus-5",
         "claude-sonnet-5",
-        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
         "claude-sonnet-4",
         "claude-haiku-4-5",
     ]
@@ -581,22 +789,33 @@ mod tests {
         );
     }
 
-    /// Until a model carries a published cache-read rate, cached tokens stay at
-    /// the input rate — an over-estimate we accept rather than guessing. Pins the
-    /// documented current behavior so filling a rate in is a visible change.
+    /// A model with no published cache-read rate bills cached tokens at the
+    /// input rate: an over-estimate we accept rather than guessing a discount.
     #[test]
     fn cached_tokens_do_not_change_cost_without_a_published_rate() {
         assert!(
             OPENAI_RATES
-                .get("gpt-4.1")
-                .expect("gpt-4.1 rate")
+                .get("gpt-5.5-pro")
+                .expect("gpt-5.5-pro rate")
                 .cached_input_per_mtok
                 .is_none(),
-            "update this test alongside the rate when gpt-4.1 gains a cache-read rate"
+            "update this test alongside the rate when gpt-5.5-pro gains a cache-read rate"
         );
-        let without = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 0).unwrap();
-        let with_cached = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 800).unwrap();
+        let without = estimate_cost_usd(Provider::OpenAi, "gpt-5.5-pro", 1_000, 500, 0).unwrap();
+        let with_cached =
+            estimate_cost_usd(Provider::OpenAi, "gpt-5.5-pro", 1_000, 500, 800).unwrap();
         assert_eq!(without, with_cached);
+    }
+
+    /// OpenAI publishes a cache-read rate for GPT-4.1, so the cached slice of
+    /// the prompt bills at it.
+    ///   uncached: 200 × 2.00/1e6 = 0.0004
+    ///   cached:   800 × 0.50/1e6 = 0.0004
+    ///   output:   500 × 8.00/1e6 = 0.004
+    #[test]
+    fn published_cache_read_rate_discounts_cached_prompt_tokens() {
+        let cost = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 1_000, 500, 800).unwrap();
+        assert_eq!(cost, "0.0048");
     }
 
     /// A provider reporting more cached than prompt tokens must not underflow the
@@ -605,8 +824,89 @@ mod tests {
     fn cached_tokens_exceeding_prompt_tokens_are_clamped() {
         let cost = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 100, 0, u64::MAX)
             .expect("cost must still compute");
-        let baseline = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 100, 0, 0).unwrap();
-        assert_eq!(cost, baseline);
+        let all_cached = estimate_cost_usd(Provider::OpenAi, "gpt-4.1", 100, 0, 100).unwrap();
+        assert_eq!(cost, all_cached);
+    }
+
+    /// Haiku 5.5 bills the whole request at its higher rate once the prompt,
+    /// counting cache reads and writes, is over 100,000 tokens.
+    #[test]
+    fn haiku_5_5_bills_long_prompts_at_the_higher_rate() {
+        // 50K uncached × $0.10 + 1K output × $0.50 = 0.005 + 0.0005.
+        let short =
+            estimate_anthropic_cost_usd("claude-haiku-5-5", 50_000, 1_000, 0, 0, CacheTtl::Auto)
+                .unwrap();
+        assert_eq!(short, "0.0055");
+
+        // 50K uncached + 60K cache reads = 110K, over the line:
+        // 50K × $0.50 + 60K × $0.05 + 1K × $2.50 = 0.025 + 0.003 + 0.0025.
+        let long = estimate_anthropic_cost_usd(
+            "claude-haiku-5-5",
+            50_000,
+            1_000,
+            60_000,
+            0,
+            CacheTtl::Auto,
+        )
+        .unwrap();
+        assert_eq!(long, "0.0305");
+
+        // Exactly 100,000 is not over the line.
+        let at_line =
+            estimate_anthropic_cost_usd("claude-haiku-5-5", 100_000, 0, 0, 0, CacheTtl::Auto)
+                .unwrap();
+        assert_eq!(at_line, "0.01");
+    }
+
+    #[test]
+    fn claude_rates_match_the_published_card() {
+        // Sonnet 5 at its standard $2/$10, not the $3/$15 that never took effect.
+        let sonnet_5 = estimate_anthropic_cost_usd(
+            "claude-sonnet-5",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            CacheTtl::Auto,
+        )
+        .unwrap();
+        assert_eq!(sonnet_5, "12.00");
+        // Cache reads: Sonnet 5.5 at 0.05x input, Fable 5.1 at 0.025x.
+        let sonnet_5_5_read =
+            estimate_anthropic_cost_usd("claude-sonnet-5-5", 0, 0, 1_000_000, 0, CacheTtl::Auto)
+                .unwrap();
+        assert_eq!(sonnet_5_5_read, "0.10");
+        let fable_5_1_read = estimate_anthropic_cost_usd(
+            "anthropic/claude-fable-5.1",
+            0,
+            0,
+            1_000_000,
+            0,
+            CacheTtl::Auto,
+        )
+        .expect("the OpenRouter spelling of Fable 5.1 must price");
+        assert_eq!(fable_5_1_read, "0.25");
+    }
+
+    /// GPT-5.5 bills a request over 272K input tokens at its long-context rate.
+    #[test]
+    fn gpt_5_5_long_context_rate_starts_past_272k() {
+        // 272,000 × $5 + 1K × $30 = 1.36 + 0.03.
+        let at_line = estimate_cost_usd(Provider::OpenAi, "gpt-5.5", 272_000, 1_000, 0).unwrap();
+        assert_eq!(at_line, "1.39");
+        // 300,000 × $10 + 1K × $45 = 3.00 + 0.045.
+        let long = estimate_cost_usd(Provider::OpenAi, "gpt-5.5", 300_000, 1_000, 0).unwrap();
+        assert_eq!(long, "3.045");
+    }
+
+    /// xAI's higher rate starts at 200K, inclusive.
+    #[test]
+    fn xai_long_context_rate_starts_at_200k() {
+        let below = estimate_cost_usd(Provider::XAi, "grok-4.3", 199_992, 0, 0).unwrap();
+        let at = estimate_cost_usd(Provider::XAi, "grok-4.3", 200_000, 0, 0).unwrap();
+        // 199,992 × $1.25 and 200,000 × $2.50.
+        assert_eq!(below, "0.24999");
+        assert_eq!(at, "0.50");
     }
 
     #[test]
@@ -631,13 +931,13 @@ mod tests {
 
     #[test]
     fn xai_cost_is_deterministic_for_grok_4() {
-        // Hand-computed: grok-4 = $5/Mtok input + $15/Mtok output.
-        // 1_000 prompt × 5 / 1e6 = 0.005; 500 completion × 15 / 1e6 = 0.0075.
-        // Total = 0.0125. If the rate table is corrupted or the lookup
+        // Hand-computed: grok-4 = $3/Mtok input + $15/Mtok output.
+        // 1_000 prompt × 3 / 1e6 = 0.003; 500 completion × 15 / 1e6 = 0.0075.
+        // Total = 0.0105. If the rate table is corrupted or the lookup
         // regresses to None, this asserts the exact dollar figure rather than
         // .is_some() — a tautological check would pass for the wrong rate.
         let cost = estimate_cost_usd(Provider::XAi, "grok-4", 1_000, 500, 0).unwrap();
-        assert_eq!(cost, "0.0125");
+        assert_eq!(cost, "0.0105");
     }
 
     #[test]
@@ -797,7 +1097,7 @@ mod tests {
     fn shipped_bedrock_models_resolve_to_anthropic_rates() {
         for model in shipped_bedrock_models() {
             assert!(
-                anthropic_rates_for(model).is_some(),
+                anthropic_rates_for(model, 0).is_some(),
                 "Bedrock model {model} lost its Anthropic rate mapping"
             );
         }

@@ -30,7 +30,83 @@ export interface TurnActivity {
    * flash it between every pair.
    */
   tentative?: boolean;
+  /**
+   * True when the label says only that the turn is busy, not what it is busy
+   * with. The visible line may then show the turn's verb instead; the label
+   * stays the plain words a screen reader announces.
+   */
+  generic?: boolean;
 }
+
+/**
+ * What the visible line says while a turn is busy with nothing more specific
+ * to report. One is picked per turn and kept for the whole of it, so the line
+ * reads as a mood rather than a status that keeps changing its mind.
+ */
+export const BUSY_VERBS = [
+  "Pondering",
+  "Percolating",
+  "Noodling",
+  "Mulling",
+  "Cogitating",
+  "Ruminating",
+  "Musing",
+  "Deliberating",
+  "Contemplating",
+  "Brewing",
+  "Simmering",
+  "Marinating",
+  "Stewing",
+  "Fermenting",
+  "Incubating",
+  "Hatching",
+  "Conjuring",
+  "Divining",
+  "Scheming",
+  "Tinkering",
+  "Puzzling",
+  "Untangling",
+  "Sleuthing",
+  "Spelunking",
+  "Wrangling",
+  "Finagling",
+  "Distilling",
+  "Synthesizing",
+  "Crunching",
+  "Calibrating",
+  "Whirring",
+  "Churning",
+  "Weaving",
+  "Moseying",
+  "Assimilating",
+  "Adapting",
+  "Harmonizing",
+  "Consulting the collective",
+] as const;
+
+/**
+ * The verb for a turn, chosen from when it started.
+ *
+ * Derived rather than drawn from `Math.random` on render: the same turn always
+ * gets the same verb, so a re-render or a remount mid-turn cannot swap it.
+ * Millisecond start times differ between turns, so consecutive turns still
+ * read differently.
+ */
+export function busyVerb(turnStartedAt: number | undefined): string {
+  const seed = Math.abs(Math.floor(turnStartedAt ?? 0));
+  return BUSY_VERBS[seed % BUSY_VERBS.length];
+}
+
+/** The text the visible status line shows for an activity. */
+export function visibleLabel(activity: TurnActivity, verb: string): string | undefined {
+  if (activity.label === undefined) return undefined;
+  return activity.generic ? `${verb}…` : activity.label;
+}
+
+/** The provider has not answered yet: the long wait, and the one to name. */
+const WAITING: TurnActivity = { label: "Waiting for the model", generic: true };
+/** The gap between one thing finishing and the next starting. A guess. */
+const WORKING: TurnActivity = { label: "Working", tentative: true, generic: true };
 
 /** Nothing to add: the cell at the tail is already narrating this wait. */
 const DEFER: TurnActivity = {};
@@ -52,7 +128,7 @@ export function turnActivity(cells: readonly Cell[]): TurnActivity {
   if (cells.some((c) => c.kind === "tool" && !c.done)) return DEFER;
 
   const last = cells[cells.length - 1];
-  if (!last) return { label: "Waiting for the model" };
+  if (!last) return WAITING;
 
   // The provider dropped and the daemon is redialling. Not "Working": nothing
   // is, and the wait is the provider's.
@@ -64,18 +140,18 @@ export function turnActivity(cells: readonly Cell[]): TurnActivity {
     // Every live tool row was handled above, so a tool on the tail is a
     // finished one: the gap before whatever comes next.
     case "tool":
-      return { label: "Working", tentative: true };
+      return WORKING;
     // "Thinking…" is what the reasoning block's own header says.
     case "thinking":
-      return last.streaming ? DEFER : { label: "Working", tentative: true };
+      return last.streaming ? DEFER : WORKING;
     // Nothing has come back yet. This is the long one, and the one worth naming:
     // it is almost always the provider, not Borg.
     case "user":
-      return { label: "Waiting for the model" };
+      return WAITING;
     case "assistant":
       return { label: "Replying" };
     default:
-      return { label: "Working", tentative: true };
+      return WORKING;
   }
 }
 
