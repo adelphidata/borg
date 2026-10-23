@@ -419,7 +419,13 @@ fn sync_indices_from_config() {
         .position(|(id, _, _)| *id == "anthropic")
         .expect("anthropic is offered");
     assert_eq!(popup.provider_index, anthropic);
-    assert_eq!(popup.model_index, 2); // claude-haiku-4-5 is index 2 in the curated Anthropic block
+    // Same for the model: the curated list is ordered strongest first and
+    // changes as models ship, so the row is looked up, not hard-coded.
+    let haiku = crate::onboarding::models_for_provider("anthropic")
+        .iter()
+        .position(|(id, _)| id == "claude-haiku-4-5")
+        .expect("claude-haiku-4-5 is curated");
+    assert_eq!(popup.model_index, haiku);
     assert!(popup.uncurated_model.is_none());
 }
 
