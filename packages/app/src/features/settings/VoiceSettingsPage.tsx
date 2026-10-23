@@ -328,12 +328,19 @@ function ShortcutField({ value, onCommit }: { value: string; onCommit: (v: strin
       stop();
     }
   };
+  const onMouseDown = (e: React.MouseEvent) => {
+    // The first three buttons are for clicking; a side button can be the key.
+    if (e.button < 3) return;
+    e.preventDefault();
+    onCommit(`mouse${e.button}`);
+    stop();
+  };
   return (
     <Field
       label="Shortcut"
       hint={
         listening
-          ? "Press a key combination, or press and release one modifier key (like Right ⌥) to hold it to talk. Esc cancels."
+          ? "Press a key combination, one modifier key on its own (like Right ⌥), or a side button on your mouse. Esc cancels."
           : "Press it to start talking, hold it to talk until you let go."
       }
     >
@@ -348,6 +355,7 @@ function ShortcutField({ value, onCommit }: { value: string; onCommit: (v: strin
             onBlur={stop}
             onKeyDown={listening ? onKeyDown : undefined}
             onKeyUp={listening ? onKeyUp : undefined}
+            onMouseDown={listening ? onMouseDown : undefined}
           />
           {value !== "" && !listening && (
             <Pill square onClick={() => onCommit("")}>
@@ -604,13 +612,24 @@ function DictationSection({
                 onCommit={(v) => save("audio.temperature", v.trim() === "" ? "0" : v.trim())}
               />
               {row?.provider === "local" && (
-                <TextSetting
-                  label="Beam size"
-                  hint="How many candidate transcripts the on-device decoder keeps. 1 is fastest; 5 is the usual trade-off."
-                  value={value("audio.beam_size")}
-                  placeholder="5"
-                  onCommit={(v) => save("audio.beam_size", v.trim() === "" ? "5" : v.trim())}
-                />
+                <>
+                  <TextSetting
+                    label="Beam size"
+                    hint="How many candidate transcripts the on-device decoder keeps. 1 is fastest; 5 is the usual trade-off."
+                    value={value("audio.beam_size")}
+                    placeholder="5"
+                    onCommit={(v) => save("audio.beam_size", v.trim() === "" ? "5" : v.trim())}
+                  />
+                  <TextSetting
+                    label="Silence threshold"
+                    hint="How sure the on-device decoder must be that a stretch is silence before it drops it, 0 to 1. Raise it if quiet words go missing."
+                    value={value("audio.no_speech_threshold")}
+                    placeholder="0.6"
+                    onCommit={(v) =>
+                      save("audio.no_speech_threshold", v.trim() === "" ? "0.6" : v.trim())
+                    }
+                  />
+                </>
               )}
               <Switch
                 label="Sounds"

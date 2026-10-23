@@ -32,6 +32,9 @@ pub(super) struct TranscriptionRequest<'a> {
     /// Beam width for the on-device decoder; cloud providers ignore it.
     #[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
     pub beam_size: u32,
+    /// Silence confidence the on-device decoder needs before dropping a stretch.
+    #[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
+    pub no_speech_threshold: f64,
     pub timeout: Duration,
 }
 
@@ -228,6 +231,7 @@ impl TranscriptionProvider for LocalWhisperProvider {
         let decode = LocalDecode {
             temperature: req.temperature as f32,
             beam_size: req.beam_size,
+            no_speech_threshold: req.no_speech_threshold as f32,
         };
 
         // whisper-rs is purely synchronous + heavy — push it to spawn_blocking
@@ -257,6 +261,7 @@ impl TranscriptionProvider for LocalWhisperProvider {
 struct LocalDecode {
     temperature: f32,
     beam_size: u32,
+    no_speech_threshold: f32,
 }
 
 #[cfg(feature = "local-stt")]
@@ -319,6 +324,7 @@ fn local_whisper_transcribe(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_temperature(decode.temperature.clamp(0.0, 1.0));
+    params.set_no_speech_thold(decode.no_speech_threshold.clamp(0.0, 1.0));
     if let Some(lang) = language {
         params.set_language(Some(lang));
     }
@@ -937,6 +943,7 @@ mod tests {
             prompt: None,
             temperature: 0.0,
             beam_size: 5,
+            no_speech_threshold: 0.6,
             timeout: Duration::from_secs(5),
         }
     }

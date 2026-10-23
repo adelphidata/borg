@@ -37,7 +37,13 @@ const MODIFIER_CODES_PC: Readonly<Record<string, string>> = {
 };
 
 export type DictationShortcut =
-  { kind: "chord"; chord: string } | { kind: "modifier"; code: string };
+  | { kind: "chord"; chord: string }
+  | { kind: "modifier"; code: string }
+  /** A side button on the mouse (`MouseEvent.button`, 3 and up). */
+  | { kind: "mouse"; button: number };
+
+/** `mouse4` → 4. The first three buttons click, select and scroll; only the rest are free. */
+const MOUSE_BUTTON = /^mouse([3-9])$/;
 
 /**
  * Reads `voice.dictation_shortcut`. A value naming a lone modifier is a
@@ -48,6 +54,8 @@ export function parseShortcut(value: string): DictationShortcut | undefined {
   const v = value.trim().toLowerCase();
   if (v === "") return undefined;
   if (v in MODIFIER_CODES) return { kind: "modifier", code: v };
+  const mouse = MOUSE_BUTTON.exec(v);
+  if (mouse) return { kind: "mouse", button: Number(mouse[1]) };
   const parts = v.split("+");
   const key = parts[parts.length - 1];
   // A chord is modifiers plus one key; a bare letter would swallow typing.
@@ -56,6 +64,9 @@ export function parseShortcut(value: string): DictationShortcut | undefined {
   if (!mods.every((m) => m === "mod" || m === "ctrl" || m === "alt" || m === "shift")) {
     return undefined;
   }
+  // Shift alone is how a capital letter is typed; the listener runs inside
+  // inputs too, so such a chord would swallow every "D" typed into the box.
+  if (mods.every((m) => m === "shift")) return undefined;
   return { kind: "chord", chord: v };
 }
 
@@ -66,6 +77,7 @@ export function shortcutLabel(value: string, isMac: boolean): string {
   if (parsed.kind === "modifier") {
     return (isMac ? MODIFIER_CODES : MODIFIER_CODES_PC)[parsed.code] ?? parsed.code;
   }
+  if (parsed.kind === "mouse") return `Mouse button ${parsed.button + 1}`;
   return hintForChord(parsed.chord, isMac);
 }
 
@@ -80,7 +92,13 @@ export function matchesShortcut(
   chordOf: (event: KeyboardEvent) => string,
 ): boolean {
   if (shortcut.kind === "modifier") return event.code.toLowerCase() === shortcut.code;
+  if (shortcut.kind === "mouse") return false;
   return chordOf(event) === shortcut.chord;
+}
+
+/** Whether a mousedown or mouseup is this shortcut's button. */
+export function matchesMouseShortcut(shortcut: DictationShortcut, event: MouseEvent): boolean {
+  return shortcut.kind === "mouse" && event.button === shortcut.button;
 }
 
 /**
@@ -90,6 +108,7 @@ export function matchesShortcut(
  */
 export function releasesShortcut(shortcut: DictationShortcut, event: KeyboardEvent): boolean {
   if (shortcut.kind === "modifier") return event.code.toLowerCase() === shortcut.code;
+  if (shortcut.kind === "mouse") return false;
   const key = event.key === " " ? "space" : event.key.toLowerCase();
   const parts = shortcut.chord.split("+");
   const main = parts[parts.length - 1];

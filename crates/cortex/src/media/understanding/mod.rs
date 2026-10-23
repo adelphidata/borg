@@ -50,6 +50,7 @@ pub struct AudioTranscriber {
     /// `audio.temperature` and `audio.beam_size`: how the decoder searches.
     temperature: f64,
     beam_size: u32,
+    no_speech_threshold: f64,
     default_timeout: Duration,
 }
 
@@ -83,6 +84,7 @@ impl AudioTranscriber {
             prompt: audio.prompt.clone().filter(|p| !p.trim().is_empty()),
             temperature: audio.temperature.clamp(0.0, 1.0),
             beam_size: audio.beam_size.max(1),
+            no_speech_threshold: audio.no_speech_threshold.clamp(0.0, 1.0),
             default_timeout: Duration::from_millis(audio.timeout_ms),
         })
     }
@@ -158,6 +160,7 @@ impl AudioTranscriber {
                 prompt: self.prompt.clone(),
                 temperature: self.temperature,
                 beam_size: self.beam_size,
+                no_speech_threshold: self.no_speech_threshold,
                 timeout,
             };
 
@@ -465,6 +468,7 @@ mod tests {
             prompt: None,
             temperature: 0.0,
             beam_size: 5,
+            no_speech_threshold: 0.6,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 100]; // < 1024
@@ -485,6 +489,7 @@ mod tests {
             prompt: None,
             temperature: 0.0,
             beam_size: 5,
+            no_speech_threshold: 0.6,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 2000]; // > 1000
@@ -557,6 +562,7 @@ mod tests {
             prompt: None,
             temperature: 0.0,
             beam_size: 5,
+            no_speech_threshold: 0.6,
             default_timeout: Duration::from_secs(5),
         };
 
@@ -624,6 +630,7 @@ mod tests {
             prompt: None,
             temperature: 0.0,
             beam_size: 5,
+            no_speech_threshold: 0.6,
             default_timeout: Duration::from_secs(5),
         };
 

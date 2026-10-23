@@ -300,6 +300,31 @@ describe("VoiceInputButton", () => {
     now.mockRestore();
   });
 
+  it("a mouse side button works as hold-to-talk too", async () => {
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValue(1_000);
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [setting("voice.dictation_shortcut", "mouse4")] },
+      GetVoiceCatalog: catalog(true),
+      Transcribe: { text: "side" },
+    });
+    const { onText } = mount(daemon);
+    const mic = await findReadyMic();
+    expect(mic.getAttribute("title")).toBe("Speak instead of typing (Mouse button 5)");
+    // An ordinary click elsewhere does nothing.
+    fireEvent.mouseDown(window, { button: 0 });
+    await act(async () => {});
+    expect(mic.getAttribute("aria-pressed")).toBe("false");
+    const down = new MouseEvent("mousedown", { button: 4, bubbles: true, cancelable: true });
+    fireEvent(window, down);
+    expect(down.defaultPrevented).toBe(true);
+    await waitFor(() => expect(mic.getAttribute("aria-pressed")).toBe("true"));
+    now.mockReturnValue(2_000);
+    fireEvent.mouseUp(window, { button: 4 });
+    await waitFor(() => expect(onText).toHaveBeenCalledWith("side", { send: false }));
+    now.mockRestore();
+  });
+
   it("asks for the words to be sent at once when Settings says so, and copies them when asked", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });

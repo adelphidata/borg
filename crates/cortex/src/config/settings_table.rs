@@ -322,6 +322,7 @@ define_settings! {
         "audio.prompt" => audio.prompt, opt_string;
         "audio.temperature" => audio.temperature, range(f64, 0.0_f64, 1.0);
         "audio.beam_size" => audio.beam_size, parsed(u32);
+        "audio.no_speech_threshold" => audio.no_speech_threshold, range(f64, 0.0_f64, 1.0);
         "audio.timeout_ms" => audio.timeout_ms, parsed(u64);
         "audio.echo_transcript" => audio.echo_transcript, parsed(bool);
 

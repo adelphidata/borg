@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   HOLD_MS,
+  matchesMouseShortcut,
   formatRecordingClock,
   matchesShortcut,
   mergeTranscript,
@@ -24,6 +25,9 @@ describe("parseShortcut", () => {
     expect(parseShortcut("")).toBeUndefined();
     expect(parseShortcut("hyper+d")).toBeUndefined();
     expect(parseShortcut("mod+")).toBeUndefined();
+    // Shift alone types a capital letter; the chord would fire on every "D".
+    expect(parseShortcut("shift+d")).toBeUndefined();
+    expect(parseShortcut("shift+alt+d")).toEqual({ kind: "chord", chord: "shift+alt+d" });
   });
 });
 
@@ -90,5 +94,28 @@ describe("formatRecordingClock", () => {
     expect(formatRecordingClock(0)).toBe("0:00");
     expect(formatRecordingClock(7)).toBe("0:07");
     expect(formatRecordingClock(65)).toBe("1:05");
+  });
+});
+
+describe("mouse side buttons", () => {
+  it("reads mouse3 and up, never the buttons that click and scroll", () => {
+    expect(parseShortcut("mouse4")).toEqual({ kind: "mouse", button: 4 });
+    expect(parseShortcut("MOUSE3")).toEqual({ kind: "mouse", button: 3 });
+    expect(parseShortcut("mouse0")).toBeUndefined();
+    expect(parseShortcut("mouse2")).toBeUndefined();
+    expect(shortcutLabel("mouse4", true)).toBe("Mouse button 5");
+  });
+
+  it("matches only its own button, and never a key", () => {
+    const side = parseShortcut("mouse4")!;
+    expect(matchesMouseShortcut(side, { button: 4 } as MouseEvent)).toBe(true);
+    expect(matchesMouseShortcut(side, { button: 3 } as MouseEvent)).toBe(false);
+    expect(matchesMouseShortcut(parseShortcut("altright")!, { button: 4 } as MouseEvent)).toBe(
+      false,
+    );
+    expect(
+      matchesShortcut(side, { code: "Space", key: " " } as KeyboardEvent, () => "mod+shift+space"),
+    ).toBe(false);
+    expect(releasesShortcut(side, { key: " " } as KeyboardEvent)).toBe(false);
   });
 });

@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { asBorgError, useBorg } from "../../lib/useDaemon";
 import { chordOf, isMacPlatform, useKeybind } from "../../lib/keybinds";
-import { HOLD_MS, matchesShortcut, parseShortcut, releasesShortcut } from "./dictation";
+import {
+  HOLD_MS,
+  matchesMouseShortcut,
+  matchesShortcut,
+  parseShortcut,
+  releasesShortcut,
+} from "./dictation";
 
 export type DictationPhase = "idle" | "recording" | "transcribing";
 
@@ -32,9 +38,13 @@ export async function toWav16k(blob: Blob): Promise<Blob> {
     .OfflineAudioContext;
   if (!Ctx || !Offline) return blob;
   try {
+    // Closed whether or not the decode works: the browser allows only a few
+    // live contexts, and one leaked per failed recording would soon leave
+    // none for the level meter.
     const ctx = new Ctx();
-    const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
-    void ctx.close();
+    const decoded = await ctx
+      .decodeAudioData(await blob.arrayBuffer())
+      .finally(() => void ctx.close().catch(() => {}));
     const frames = Math.ceil(decoded.duration * WAV_RATE || 1);
     const offline = new Offline(1, frames, WAV_RATE);
     const source = offline.createBufferSource();
@@ -255,14 +265,18 @@ export function useDictation(options: DictationOptions): Dictation {
       };
       return;
     }
+    let ctx: AudioContext | undefined;
     try {
-      const ctx = new Ctx();
+      ctx = new Ctx();
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       ctx.createMediaStreamSource(stream).connect(analyser);
       const timer = window.setInterval(tick, METER_INTERVAL_MS);
       meter.current = { ctx, analyser, timer };
     } catch {
+      // A context that opened but cannot read the stream is closed, not
+      // left to count against the browser's cap.
+      void ctx?.close().catch(() => {});
       const timer = window.setInterval(tick, METER_INTERVAL_MS);
       meter.current = {
         ctx: { close: () => Promise.resolve() } as AudioContext,
@@ -354,12 +368,9 @@ export function useDictation(options: DictationOptions): Dictation {
     const parsed = parseShortcut(shortcut);
     if (!parsed || !options.enabled) return;
     const isMac = isMacPlatform();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || !matchesShortcut(parsed, event, (e) => chordOf(e, isMac)))
-        return;
-      event.preventDefault();
-      // A held key repeats; the first press is the one that counts.
-      if (event.repeat) return;
+    // The same press/release logic serves a key, a lone modifier and a mouse
+    // side button; only the matching differs.
+    const pressed = () => {
       if (phaseRef.current === "recording") {
         pressedAt.current = null;
         stop();
@@ -369,9 +380,9 @@ export function useDictation(options: DictationOptions): Dictation {
       pressedAt.current = Date.now();
       void start();
     };
-    const onKeyUp = (event: KeyboardEvent) => {
+    const released = () => {
       const at = pressedAt.current;
-      if (at === null || !releasesShortcut(parsed, event)) return;
+      if (at === null) return;
       pressedAt.current = null;
       if (!opts.current.holdToRecord) return;
       // A quick tap toggles: the recording stays on until the next press.
@@ -380,11 +391,35 @@ export function useDictation(options: DictationOptions): Dictation {
       // Released during the permission prompt: nothing is recording yet, so
       // the start that follows stays on, as a tap would.
     };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !matchesShortcut(parsed, event, (e) => chordOf(e, isMac)))
+        return;
+      event.preventDefault();
+      // A held key repeats; the first press is the one that counts.
+      if (event.repeat) return;
+      pressed();
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (releasesShortcut(parsed, event)) released();
+    };
+    const onMouseDown = (event: MouseEvent) => {
+      if (event.defaultPrevented || !matchesMouseShortcut(parsed, event)) return;
+      // Side buttons otherwise navigate the browser's history.
+      event.preventDefault();
+      pressed();
+    };
+    const onMouseUp = (event: MouseEvent) => {
+      if (matchesMouseShortcut(parsed, event)) released();
+    };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shortcut, options.enabled]);

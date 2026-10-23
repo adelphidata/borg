@@ -198,9 +198,17 @@ describe("VoiceSettingsPage", () => {
     fireEvent.keyDown(field, { key: "Escape", code: "Escape" });
     expect(field.value).toBe("Ctrl+Shift+Space");
 
-    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    // A mouse side button is a trigger too; the buttons that click are not.
+    fireEvent.focus(field);
+    fireEvent.mouseDown(field, { button: 0 });
+    expect(field.value).toBe("Listening…");
+    fireEvent.mouseDown(field, { button: 4 });
     await waitFor(() => expect(saved(daemon, "voice.dictation_shortcut")).toHaveLength(3));
-    expect(saved(daemon, "voice.dictation_shortcut")[2]).toBe("");
+    expect(saved(daemon, "voice.dictation_shortcut")[2]).toBe("mouse4");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    await waitFor(() => expect(saved(daemon, "voice.dictation_shortcut")).toHaveLength(4));
+    expect(saved(daemon, "voice.dictation_shortcut")[3]).toBe("");
   });
 
   it("switching provider starts a fresh first row and keeps the fallbacks", async () => {

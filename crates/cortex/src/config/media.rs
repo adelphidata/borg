@@ -388,6 +388,10 @@ pub struct AudioConfig {
     /// fastest; whisper.cpp's own default is 5. Cloud providers ignore it.
     #[serde(default = "default_beam_size")]
     pub beam_size: u32,
+    /// How sure the on-device decoder must be that a stretch is silence
+    /// before it drops it, 0.0–1.0. whisper.cpp's own default is 0.6.
+    #[serde(default = "default_no_speech_threshold")]
+    pub no_speech_threshold: f64,
     /// Default timeout in milliseconds.
     pub timeout_ms: u64,
     /// Echo transcript back to the sender.
@@ -396,6 +400,10 @@ pub struct AudioConfig {
 
 fn default_beam_size() -> u32 {
     5
+}
+
+fn default_no_speech_threshold() -> f64 {
+    0.6
 }
 
 impl Default for AudioConfig {
@@ -409,6 +417,7 @@ impl Default for AudioConfig {
             prompt: None,
             temperature: 0.0,
             beam_size: default_beam_size(),
+            no_speech_threshold: default_no_speech_threshold(),
             timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }
