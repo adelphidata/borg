@@ -392,6 +392,14 @@ pub struct AudioConfig {
     /// before it drops it, 0.0–1.0. whisper.cpp's own default is 0.6.
     #[serde(default = "default_no_speech_threshold")]
     pub no_speech_threshold: f64,
+    /// On-device decoder only: one line per segment, each led by its
+    /// `[m:ss.cc → m:ss.cc]` span. Cloud providers return plain text.
+    #[serde(default)]
+    pub timestamps: bool,
+    /// Put one space between Chinese, Japanese or Korean text and the Latin
+    /// letters or digits next to it, as mixed-script writing prefers.
+    #[serde(default)]
+    pub cjk_spacing: bool,
     /// Default timeout in milliseconds.
     pub timeout_ms: u64,
     /// Echo transcript back to the sender.
@@ -418,6 +426,8 @@ impl Default for AudioConfig {
             temperature: 0.0,
             beam_size: default_beam_size(),
             no_speech_threshold: default_no_speech_threshold(),
+            timestamps: false,
+            cjk_spacing: false,
             timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }

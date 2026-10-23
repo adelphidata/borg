@@ -35,6 +35,9 @@ pub(super) struct TranscriptionRequest<'a> {
     /// Silence confidence the on-device decoder needs before dropping a stretch.
     #[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
     pub no_speech_threshold: f64,
+    /// One line per segment with its time span; the on-device decoder only.
+    #[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
+    pub timestamps: bool,
     pub timeout: Duration,
 }
 
@@ -232,6 +235,7 @@ impl TranscriptionProvider for LocalWhisperProvider {
             temperature: req.temperature as f32,
             beam_size: req.beam_size,
             no_speech_threshold: req.no_speech_threshold as f32,
+            timestamps: req.timestamps,
         };
 
         // whisper-rs is purely synchronous + heavy — push it to spawn_blocking
@@ -262,6 +266,15 @@ struct LocalDecode {
     temperature: f32,
     beam_size: u32,
     no_speech_threshold: f32,
+    timestamps: bool,
+}
+
+/// Centiseconds from whisper.cpp as `m:ss.cc`.
+#[cfg_attr(not(feature = "local-stt"), allow(dead_code))]
+fn segment_clock(centiseconds: i64) -> String {
+    let cs = centiseconds.max(0);
+    let total_secs = cs / 100;
+    format!("{}:{:02}.{:02}", total_secs / 60, total_secs % 60, cs % 100)
 }
 
 #[cfg(feature = "local-stt")]
@@ -342,7 +355,17 @@ fn local_whisper_transcribe(
         let seg = state
             .get_segment(i)
             .ok_or_else(|| anyhow::anyhow!("whisper: segment {i} missing"))?;
-        out.push_str(&seg.to_str_lossy().context("whisper: decode segment text")?);
+        let text = seg.to_str_lossy().context("whisper: decode segment text")?;
+        if decode.timestamps {
+            out.push_str(&format!(
+                "[{} → {}] {}\n",
+                segment_clock(seg.start_timestamp()),
+                segment_clock(seg.end_timestamp()),
+                text.trim()
+            ));
+        } else {
+            out.push_str(&text);
+        }
     }
     Ok(out.trim().to_string())
 }
@@ -944,6 +967,7 @@ mod tests {
             temperature: 0.0,
             beam_size: 5,
             no_speech_threshold: 0.6,
+            timestamps: false,
             timeout: Duration::from_secs(5),
         }
     }
@@ -1031,6 +1055,14 @@ mod tests {
         let mut req = make_request(b"audio-bytes");
         req.prompt = Some("Borg, Adelphi".to_string());
         provider.transcribe(&req).await.expect("mocked success");
+    }
+
+    #[test]
+    fn segment_clock_reads_as_minutes_seconds_and_hundredths() {
+        assert_eq!(segment_clock(0), "0:00.00");
+        assert_eq!(segment_clock(1_234), "0:12.34");
+        assert_eq!(segment_clock(60_00 + 5_07), "1:05.07");
+        assert_eq!(segment_clock(-5), "0:00.00");
     }
 
     #[tokio::test]

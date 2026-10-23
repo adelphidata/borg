@@ -629,6 +629,12 @@ function DictationSection({
                       save("audio.no_speech_threshold", v.trim() === "" ? "0.6" : v.trim())
                     }
                   />
+                  <Switch
+                    label="Timestamps"
+                    desc="One line per spoken segment, each with its start and end time."
+                    on={value("audio.timestamps") === "true"}
+                    onChange={(on) => void save("audio.timestamps", String(on))}
+                  />
                 </>
               )}
               <Switch
@@ -642,6 +648,12 @@ function DictationSection({
                 desc="Keep each transcript on the clipboard too, for pasting elsewhere."
                 on={prefs.copyTranscript}
                 onChange={(on) => void save("voice.copy_transcript", String(on))}
+              />
+              <Switch
+                label="Space between Asian and Latin text"
+                desc="Puts one space between Chinese, Japanese or Korean words and the Latin letters or numbers beside them."
+                on={value("audio.cjk_spacing") === "true"}
+                onChange={(on) => void save("audio.cjk_spacing", String(on))}
               />
               {kind === "desktop" && (
                 <Switch

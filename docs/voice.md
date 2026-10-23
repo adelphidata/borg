@@ -64,6 +64,8 @@ one press (when a saved key can transcribe) or points to Settings. Once ready:
 | `audio.temperature`         | `0`               | More options → Temperature                          | Decoding temperature for Whisper-shaped providers and the on-device decoder          |
 | `audio.beam_size`           | `5`               | More options → Beam size (local only)               | Beam width for whisper.cpp                                                           |
 | `audio.no_speech_threshold` | `0.6`             | More options → Silence threshold (local only)       | How sure whisper.cpp must be before dropping a stretch as silence                    |
+| `audio.timestamps`          | `false`           | More options → Timestamps (local only)              | One line per segment, led by its `[m:ss.cc → m:ss.cc]` span                          |
+| `audio.cjk_spacing`         | `false`           | More options → Space between Asian and Latin text   | One space between CJK text and the Latin letters or digits beside it                 |
 | `voice.beep_enabled`        | `true`            | More options → Sounds                               | A tick when recording starts and stops                                               |
 | `voice.copy_transcript`     | `false`           | More options → Copy to clipboard                    | Keep each transcript on the clipboard                                                |
 | `voice.background_shortcut` | `false`           | More options → Listen from the background (desktop) | The chord also works from another app: Borg comes forward and starts listening       |
@@ -76,30 +78,31 @@ not in the daemon, because they name hardware on this machine.
 
 The dictation feature set was checked against OpenSuperWhisper's preferences
 (`OpenSuperWhisper/Utils/AppPreferences.swift`), which has 24 user-facing
-fields. Eighteen have an equivalent here:
+fields. Twenty have an equivalent here:
 
-| OpenSuperWhisper                                       | Borg                                                  |
-| ------------------------------------------------------ | ----------------------------------------------------- |
-| selectedEngine, selectedModelPath                      | `audio.models` provider and model                     |
-| whisperLanguage                                        | `audio.language`                                      |
-| initialPrompt                                          | `audio.prompt`                                        |
-| temperature                                            | `audio.temperature`                                   |
-| beamSize, useBeamSearch                                | `audio.beam_size`                                     |
-| noSpeechThreshold                                      | `audio.no_speech_threshold`                           |
-| suppressBlankAudio                                     | an empty transcript is dropped with a notice          |
-| addSpaceAfterSentence                                  | spoken words join the draft with one space            |
-| autoCopyToClipboard                                    | `voice.copy_transcript`                               |
-| autoPasteTranscription                                 | words land in the box, or `voice.dictation_auto_send` |
-| key combination, modifierOnlyHotkey, mouseButtonHotkey | `voice.dictation_shortcut`                            |
-| holdToRecord with one-tap toggle                       | `voice.hold_to_record`                                |
-| playSoundOnRecordStart                                 | `voice.beep_enabled`                                  |
-| escCancelWithoutConfirmation                           | Escape cancels a recording                            |
-| selectedMicrophone                                     | Microphone                                            |
+| OpenSuperWhisper                                       | Borg                                                                              |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| selectedEngine, selectedModelPath                      | `audio.models` provider and model                                                 |
+| whisperLanguage                                        | `audio.language`                                                                  |
+| initialPrompt                                          | `audio.prompt`                                                                    |
+| temperature                                            | `audio.temperature`                                                               |
+| beamSize, useBeamSearch                                | `audio.beam_size`                                                                 |
+| noSpeechThreshold                                      | `audio.no_speech_threshold`                                                       |
+| showTimestamps                                         | `audio.timestamps`                                                                |
+| useAsianAutocorrect                                    | `audio.cjk_spacing` (the spacing rule; the reference also normalises punctuation) |
+| suppressBlankAudio                                     | an empty transcript is dropped with a notice                                      |
+| addSpaceAfterSentence                                  | spoken words join the draft with one space                                        |
+| autoCopyToClipboard                                    | `voice.copy_transcript`                                                           |
+| autoPasteTranscription                                 | words land in the box, or `voice.dictation_auto_send`                             |
+| key combination, modifierOnlyHotkey, mouseButtonHotkey | `voice.dictation_shortcut`                                                        |
+| holdToRecord with one-tap toggle                       | `voice.hold_to_record`                                                            |
+| playSoundOnRecordStart                                 | `voice.beep_enabled`                                                              |
+| escCancelWithoutConfirmation                           | Escape cancels a recording                                                        |
+| selectedMicrophone                                     | Microphone                                                                        |
 
-Not carried over: showTimestamps and useAsianAutocorrect (no use in a chat
-box), debugMode, and the three that belong to a menu-bar app that stores
-recordings on disk (startHiddenInMenuBar, autoDeleteRecordings, the history
-directory). Borg keeps no recordings.
+Not carried over: debugMode, and the three that belong to a menu-bar app that
+stores recordings on disk (startHiddenInMenuBar, autoDeleteRecordings, the
+history directory). Borg keeps no recordings.
 
 ## Keys
 

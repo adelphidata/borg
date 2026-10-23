@@ -141,10 +141,39 @@ describe("VoiceSettingsPage", () => {
     fireEvent.change(temperature, { target: { value: "0.2" } });
     fireEvent.blur(temperature);
     await waitFor(() => expect(saved(daemon, "audio.temperature")).toEqual(["0.2"]));
-    // Beam size only means something to the on-device decoder.
+    // Beam size and timestamps only mean something to the on-device decoder.
     expect(screen.queryByLabelText("Beam size")).toBeNull();
+    expect(screen.queryByRole("switch", { name: /Timestamps/ })).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: /Space between Asian and Latin text/ }));
+    await waitFor(() => expect(saved(daemon, "audio.cjk_spacing")).toEqual(["true"]));
     fireEvent.click(screen.getByRole("switch", { name: /Send right away/ }));
     await waitFor(() => expect(saved(daemon, "voice.dictation_auto_send")).toEqual(["true"]));
+  });
+
+  it("shows the on-device decoder's knobs only for the local provider", async () => {
+    const local = {
+      ...CATALOG,
+      transcription: [
+        ...CATALOG.transcription,
+        provider("local", "On this device (whisper.cpp)", {
+          needsKey: false,
+          hasKey: true,
+          keyUrl: "",
+        }),
+      ],
+    };
+    const { daemon } = mount(
+      [
+        entry("audio.enabled", "true"),
+        entry("audio.models", JSON.stringify([{ provider: "local" }])),
+      ],
+      local,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /More options/ }));
+    expect(screen.getByLabelText("Beam size")).toBeTruthy();
+    expect(screen.getByLabelText("Silence threshold")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: /Timestamps/ }));
+    await waitFor(() => expect(saved(daemon, "audio.timestamps")).toEqual(["true"]));
   });
 
   it("the background listener is a desktop-only option", async () => {

@@ -51,6 +51,10 @@ pub struct AudioTranscriber {
     temperature: f64,
     beam_size: u32,
     no_speech_threshold: f64,
+    /// `audio.timestamps`: segment spans from the on-device decoder.
+    timestamps: bool,
+    /// `audio.cjk_spacing`: the mixed-script spacing pass on every transcript.
+    cjk_spacing: bool,
     default_timeout: Duration,
 }
 
@@ -85,6 +89,8 @@ impl AudioTranscriber {
             temperature: audio.temperature.clamp(0.0, 1.0),
             beam_size: audio.beam_size.max(1),
             no_speech_threshold: audio.no_speech_threshold.clamp(0.0, 1.0),
+            timestamps: audio.timestamps,
+            cjk_spacing: audio.cjk_spacing,
             default_timeout: Duration::from_millis(audio.timeout_ms),
         })
     }
@@ -161,6 +167,7 @@ impl AudioTranscriber {
                 temperature: self.temperature,
                 beam_size: self.beam_size,
                 no_speech_threshold: self.no_speech_threshold,
+                timestamps: self.timestamps,
                 timeout,
             };
 
@@ -171,6 +178,11 @@ impl AudioTranscriber {
                         model: entry.model.clone(),
                         outcome: AttemptOutcome::Success,
                     });
+                    let text = if self.cjk_spacing {
+                        cjk_spacing(&text)
+                    } else {
+                        text
+                    };
                     return Ok((text, attempts));
                 }
                 Err(e) => {
@@ -193,6 +205,40 @@ impl AudioTranscriber {
             attempts.len()
         )
     }
+}
+
+/// Whether a character is Chinese, Japanese or Korean writing.
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF   // hiragana, katakana
+        | 0x3400..=0x4DBF // CJK extension A
+        | 0x4E00..=0x9FFF // CJK unified ideographs
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+        | 0xAC00..=0xD7AF // hangul syllables
+        | 0x1100..=0x11FF // hangul jamo
+        | 0xFF66..=0xFF9F // half-width katakana
+    )
+}
+
+/// One space between CJK text and the Latin letters or digits beside it,
+/// which is how mixed-script writing is usually set. Spaces already there
+/// are kept as they are; punctuation and other scripts are left alone.
+pub fn cjk_spacing(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut prev: Option<char> = None;
+    for c in text.chars() {
+        if let Some(p) = prev {
+            let boundary = (is_cjk(p) && c.is_ascii_alphanumeric())
+                || (p.is_ascii_alphanumeric() && is_cjk(c));
+            if boundary {
+                out.push(' ');
+            }
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
 }
 
 /// Reduce a language hint to a BCP-47-shaped tag or drop it.
@@ -469,6 +515,8 @@ mod tests {
             temperature: 0.0,
             beam_size: 5,
             no_speech_threshold: 0.6,
+            timestamps: false,
+            cjk_spacing: false,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 100]; // < 1024
@@ -490,6 +538,8 @@ mod tests {
             temperature: 0.0,
             beam_size: 5,
             no_speech_threshold: 0.6,
+            timestamps: false,
+            cjk_spacing: false,
             default_timeout: Duration::from_secs(60),
         };
         let bytes = vec![0u8; 2000]; // > 1000
@@ -563,6 +613,8 @@ mod tests {
             temperature: 0.0,
             beam_size: 5,
             no_speech_threshold: 0.6,
+            timestamps: false,
+            cjk_spacing: false,
             default_timeout: Duration::from_secs(5),
         };
 
@@ -631,6 +683,8 @@ mod tests {
             temperature: 0.0,
             beam_size: 5,
             no_speech_threshold: 0.6,
+            timestamps: false,
+            cjk_spacing: false,
             default_timeout: Duration::from_secs(5),
         };
 
@@ -648,5 +702,19 @@ mod tests {
             .await
             .expect("valid hint must be forwarded");
         server.verify().await;
+    }
+
+    #[test]
+    fn cjk_spacing_separates_scripts_and_keeps_existing_spaces() {
+        assert_eq!(
+            cjk_spacing("我用Borg写了3个skill"),
+            "我用 Borg 写了 3 个 skill"
+        );
+        assert_eq!(cjk_spacing("已经 有 空格 Borg"), "已经 有 空格 Borg");
+        assert_eq!(cjk_spacing("テストabc"), "テスト abc");
+        assert_eq!(cjk_spacing("한글test"), "한글 test");
+        // Punctuation and plain Latin text are untouched.
+        assert_eq!(cjk_spacing("hello, world 2.0"), "hello, world 2.0");
+        assert_eq!(cjk_spacing("你好，世界。"), "你好，世界。");
     }
 }
