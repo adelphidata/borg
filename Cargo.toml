@@ -166,6 +166,14 @@ unnecessary_lazy_evaluations = "deny"
 unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 
+# scrypt is a memory-hard loop by design. Unoptimized, one derivation takes
+# about 3 s, which a debug daemon on a file KEK pays on every boot.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
 [profile.release]
 lto = "fat"
 strip = "symbols"

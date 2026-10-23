@@ -39,7 +39,10 @@ just test           # all tests
 **Auto-rebuild on file changes** (install `cargo-watch` first with `cargo install cargo-watch --locked`):
 ```sh
 cargo watch -x 'build --bin borg' -x 'build --bin borgd'
+just daemon-watch   # rebuild borgd and restart the daemon on ~/.borg after each change
 ```
+
+A debug build is ad-hoc signed, so on macOS the keychain treats every rebuild as a new app and asks for your login password. `just daemon` and `just daemon-watch` set `BORG_DEV_KEK_CACHE`: a debug `borgd` then keeps an encrypted copy of its keychain keys in `~/.borg/secrets/dev-kek-cache.enc` and asks only once. Release builds ignore the variable. Delete the file if a release daemon on the same `~/.borg` renews its server certificate.
 
 ## Project Structure
 

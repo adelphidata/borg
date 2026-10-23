@@ -102,9 +102,16 @@ export RUST_LOG := env_var_or_default("RUST_LOG", "info,cortex=debug,borgd=debug
 run *args="":
     cargo run --bin borg -- {{args}}
 
+# BORG_DEV_KEK_CACHE keeps a rebuilt debug daemon from asking for the login
+# keychain password on every boot.
 # Run the daemon (borgd)
 daemon *args="":
-    cargo run --bin borgd -- {{args}}
+    BORG_DEV_KEK_CACHE="$(scripts/dev-kek-pass.sh)" cargo run --bin borgd -- {{args}}
+
+# Set BORGD_DEV_LOG to a file to keep the daemon's output.
+# Rebuild borgd on every change and restart the daemon on ~/.borg with it
+daemon-watch:
+    cargo watch -w crates -w Cargo.toml -w Cargo.lock -x "build --bin borgd" -s scripts/dev-restart-borgd.sh
 
 # Kill any running borgd + borg TUI from this repo's target/ so the next
 # `just daemon`/`just run` picks up the latest build. Path-scoped so we never

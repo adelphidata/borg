@@ -22,6 +22,8 @@ use cortex::db::Database;
 use cortex::paths::{self, BorgSubdir};
 #[cfg(unix)]
 use cortex::util::unix_ext::set_unix_mode;
+#[cfg(debug_assertions)]
+use identity::PkiError;
 use identity::{FileKekStore, KekStore, KeychainStore};
 use std::path::Path;
 use std::sync::Arc;
@@ -45,6 +47,15 @@ pub const PASSPHRASE_ENV: &str = "BORG_KEK_PASSPHRASE";
 
 pub use cortex::paths::kek_file_path;
 
+/// Debug builds only. Set it to a passphrase and a daemon that resolves to the
+/// OS keychain keeps an encrypted copy of what it reads there, at
+/// `<BORG_HOME>/secrets/dev-kek-cache.enc`, and reads the copy first. A debug
+/// build is ad-hoc signed, so macOS ties keychain access to that one binary and
+/// asks for the login password again after every rebuild; with the copy, only
+/// the boot that fills it touches the keychain.
+#[cfg(debug_assertions)]
+pub const DEV_CACHE_ENV: &str = "BORG_DEV_KEK_CACHE";
+
 /// Build the KEK store for this daemon process. Resolves `Auto` and
 /// persists the chosen backend so the posture snapshot reads a concrete
 /// value on the very next call.
@@ -56,7 +67,7 @@ pub async fn build_kek_store(
     match cfg.security.kek_backend {
         KekBackend::OsKeychain => {
             tracing::info!("KEK backend: os_keychain (explicit)");
-            Ok(Arc::new(KeychainStore::new()))
+            Ok(keychain_store(borg_home))
         }
         KekBackend::File => {
             tracing::info!("KEK backend: file (explicit)");
@@ -75,7 +86,7 @@ pub async fn build_kek_store(
                 // probe per start and preserves the always-boots guarantee.
                 // The `File` resolution below IS persisted: that probe is the
                 // expensive one, and it is the headless case worth caching.
-                Ok(Arc::new(KeychainStore::new()))
+                Ok(keychain_store(borg_home))
             } else {
                 tracing::warn!(
                     "KEK backend: file (OS keychain unavailable — \
@@ -93,6 +104,72 @@ pub async fn build_kek_store(
                 Ok(store)
             }
         }
+    }
+}
+
+/// The OS keychain store, behind the [`DEV_CACHE_ENV`] copy when a debug build
+/// is asked for one. A cache that will not open is skipped, not fatal: the
+/// daemon then boots the way it would without it.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn keychain_store(borg_home: &Path) -> Arc<dyn KekStore> {
+    let keychain: Arc<dyn KekStore> = Arc::new(KeychainStore::new());
+    #[cfg(debug_assertions)]
+    if let Some(passphrase) = std::env::var(DEV_CACHE_ENV).ok().filter(|v| !v.is_empty()) {
+        let path = paths::subdir(borg_home, BorgSubdir::Secrets).join("dev-kek-cache.enc");
+        match FileKekStore::open(&path, passphrase.into_bytes()) {
+            Ok(cache) => {
+                tracing::warn!(
+                    "KEK dev cache: keychain reads are served from {} (debug builds only)",
+                    path.display()
+                );
+                return Arc::new(DevCachedStore { keychain, cache });
+            }
+            Err(e) => tracing::warn!(
+                "KEK dev cache: cannot open {}: {e}; reading the keychain directly",
+                path.display()
+            ),
+        }
+    }
+    keychain
+}
+
+/// The keychain with an encrypted file copy in front of it. The keychain stays
+/// the source of truth, since a release daemon on the same home reads only that,
+/// so every write lands there first and the copy never holds a value the
+/// keychain does not.
+#[cfg(debug_assertions)]
+struct DevCachedStore {
+    keychain: Arc<dyn KekStore>,
+    cache: FileKekStore,
+}
+
+#[cfg(debug_assertions)]
+impl KekStore for DevCachedStore {
+    fn put(&self, account: &str, secret: &[u8]) -> std::result::Result<(), PkiError> {
+        // Dropped first: if the keychain write fails, the next read goes to
+        // the keychain instead of a copy that is now out of date.
+        self.cache.delete(account)?;
+        self.keychain.put(account, secret)?;
+        if let Err(e) = self.cache.put(account, secret) {
+            tracing::warn!("KEK dev cache: could not store {account}: {e}");
+        }
+        Ok(())
+    }
+
+    fn get(&self, account: &str) -> std::result::Result<Vec<u8>, PkiError> {
+        if let Ok(secret) = self.cache.get(account) {
+            return Ok(secret);
+        }
+        let secret = self.keychain.get(account)?;
+        if let Err(e) = self.cache.put(account, &secret) {
+            tracing::warn!("KEK dev cache: could not store {account}: {e}");
+        }
+        Ok(secret)
+    }
+
+    fn delete(&self, account: &str) -> std::result::Result<(), PkiError> {
+        self.cache.delete(account)?;
+        self.keychain.delete(account)
     }
 }
 
@@ -527,5 +604,119 @@ mod tests {
             "CA private key must survive a daemon restart on the file backend"
         );
         std::env::remove_var(PASSPHRASE_ENV);
+    }
+    /// Keychain stand-in that counts reads and can refuse writes, so a test
+    /// can tell a cache hit from a trip to the keychain.
+    #[derive(Default)]
+    struct FakeKeychain {
+        inner: identity::MemoryKekStore,
+        reads: std::sync::atomic::AtomicUsize,
+        refuse_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeKeychain {
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl KekStore for FakeKeychain {
+        fn put(&self, account: &str, secret: &[u8]) -> std::result::Result<(), PkiError> {
+            if self.refuse_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(PkiError::Keychain("denied".into()));
+            }
+            self.inner.put(account, secret)
+        }
+
+        fn get(&self, account: &str) -> std::result::Result<Vec<u8>, PkiError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(account)
+        }
+
+        fn delete(&self, account: &str) -> std::result::Result<(), PkiError> {
+            self.inner.delete(account)
+        }
+    }
+
+    fn dev_cache(home: &Path, keychain: &Arc<FakeKeychain>) -> DevCachedStore {
+        DevCachedStore {
+            keychain: keychain.clone(),
+            cache: FileKekStore::open(home.join("dev-kek-cache.enc"), b"pass".to_vec())
+                .expect("open cache"),
+        }
+    }
+
+    /// The point of the cache: a rebuilt daemon is a new process with a new
+    /// binary, and it must not go back to the keychain for a key it read before.
+    #[test]
+    fn dev_cache_reads_the_keychain_once_across_restarts() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let keychain = Arc::new(FakeKeychain::default());
+        keychain.inner.put("root-ca-key", b"PEM").expect("seed");
+
+        let first = dev_cache(home.path(), &keychain);
+        assert_eq!(first.get("root-ca-key").expect("get"), b"PEM".to_vec());
+        assert_eq!(keychain.reads(), 1);
+
+        let restarted = dev_cache(home.path(), &keychain);
+        assert_eq!(restarted.get("root-ca-key").expect("get"), b"PEM".to_vec());
+        assert_eq!(keychain.reads(), 1, "the restart must read the copy");
+    }
+
+    /// A release daemon on the same home reads only the keychain, so a key
+    /// the dev daemon mints or drops has to reach it there.
+    #[test]
+    fn dev_cache_writes_and_deletes_reach_the_keychain() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let keychain = Arc::new(FakeKeychain::default());
+        let store = dev_cache(home.path(), &keychain);
+
+        store.put("server-cert-key", b"KEY").expect("put");
+        assert_eq!(
+            keychain.inner.get("server-cert-key").expect("keychain"),
+            b"KEY".to_vec()
+        );
+        assert_eq!(store.get("server-cert-key").expect("get"), b"KEY".to_vec());
+        assert_eq!(
+            keychain.reads(),
+            0,
+            "a key just written is served from the copy"
+        );
+
+        store.delete("server-cert-key").expect("delete");
+        assert!(matches!(
+            keychain.inner.get("server-cert-key"),
+            Err(PkiError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.get("server-cert-key"),
+            Err(PkiError::NotFound(_))
+        ));
+    }
+
+    /// A write the keychain refused must not leave the old copy behind: the
+    /// next read has to see what the keychain holds, not what it used to.
+    #[test]
+    fn dev_cache_drops_its_copy_when_the_keychain_refuses_a_write() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let keychain = Arc::new(FakeKeychain::default());
+        keychain.inner.put("server-cert-key", b"OLD").expect("seed");
+        let store = dev_cache(home.path(), &keychain);
+        store.get("server-cert-key").expect("fill the copy");
+
+        keychain
+            .refuse_puts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(store.put("server-cert-key", b"NEW").is_err());
+        assert!(matches!(
+            store.cache.get("server-cert-key"),
+            Err(PkiError::NotFound(_))
+        ));
+        assert_eq!(store.get("server-cert-key").expect("get"), b"OLD".to_vec());
+        assert_eq!(
+            keychain.reads(),
+            2,
+            "the read after the refusal goes to the keychain"
+        );
     }
 }
