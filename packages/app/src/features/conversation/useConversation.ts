@@ -674,9 +674,9 @@ export interface Conversation {
    * after it is discarded, matching what the daemon does to its own history.
    */
   editAndResend: (nthUserMessage: number, text: string) => void;
-  /** Summarizes older turns to reclaim context. */
   /** Gives the conversation a new name. False when it did not save. */
   rename: (title: string) => Promise<boolean>;
+  /** Summarizes older turns to reclaim context. */
   compact: () => Promise<unknown>;
   /** Branches this conversation; resolves with the new session's id. */
   fork: () => Promise<string | undefined>;

@@ -37,6 +37,25 @@ export function useVoiceCatalog(): QueryResult<VoiceCatalog> {
   return useQuery((borg) => borg.voice.getVoiceCatalog({}), [key]);
 }
 
+/** Transcription providers in the order a one-click setup prefers them. */
+const PREFERRED_TRANSCRIBERS = ["openai", "groq", "deepgram", "elevenlabs", "mistral", "xai"];
+
+/**
+ * The provider a key is already saved for, best first; undefined when none.
+ * Keyless providers do not count: "no key needed" says nothing about a model
+ * file or a build flag, so one press on them could land on "not ready".
+ * Shared by the composer's setup card and the Settings switch, so both turn
+ * voice input on with the same provider.
+ */
+export function readyProvider(providers: VoiceProvider[]): VoiceProvider | undefined {
+  const keyed = providers.filter((p) => p.needsKey && p.hasKey && !p.requiresCommand);
+  return (
+    PREFERRED_TRANSCRIBERS.map((id) => keyed.find((p) => p.id === id)).find(
+      (p) => p !== undefined,
+    ) ?? keyed[0]
+  );
+}
+
 /** The daemon's compiled defaults, repeated here for the moment before the snapshot lands. */
 export const VOICE_DEFAULTS = {
   shortcut: "mod+shift+space",

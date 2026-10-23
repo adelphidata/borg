@@ -7,6 +7,7 @@ import { useNative } from "../../lib/platform";
 import { useSettings } from "../../lib/settings";
 import {
   readLocalVoiceChoice,
+  readyProvider,
   useVoiceCatalog,
   useVoicePrefs,
   type VoiceProvider,
@@ -14,21 +15,6 @@ import {
 import { formatRecordingClock, parseShortcut, shortcutLabel } from "./dictation";
 import { canRecord, useDictation } from "./useDictation";
 import { withPrimaryProvider } from "../settings/voiceChain";
-
-/** Transcription providers in the order a one-click setup prefers them. */
-const PREFERRED = ["openai", "groq", "deepgram", "elevenlabs", "mistral", "xai"];
-
-/**
- * The provider a key is already saved for, best first; undefined when none.
- * Keyless providers do not count: "no key needed" says nothing about a model
- * file or a build flag, so one press on them could land on "not ready".
- */
-export function readyProvider(providers: VoiceProvider[]): VoiceProvider | undefined {
-  const keyed = providers.filter((p) => p.needsKey && p.hasKey && !p.requiresCommand);
-  return (
-    PREFERRED.map((id) => keyed.find((p) => p.id === id)).find((p) => p !== undefined) ?? keyed[0]
-  );
-}
 
 /**
  * The composer's microphone, the way a chat app has one: always there, one
