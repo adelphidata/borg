@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "borgd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "coding"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "cortex"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anydoc",
  "anyhow",
@@ -3205,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3516,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "heartbeat"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4026,7 +4026,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "identity"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305 0.11.0",
@@ -4244,7 +4244,7 @@ dependencies = [
 
 [[package]]
 name = "interface"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -5152,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6433,7 +6433,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6791,7 +6791,7 @@ dependencies = [
 
 [[package]]
 name = "protocols"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures-util",
  "prost",
@@ -7816,7 +7816,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
