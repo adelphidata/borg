@@ -196,13 +196,6 @@ function EditBox({
 }
 
 /**
- * A user turn, rewritable in place.
- *
- * Editing truncates the conversation from this message onward — the daemon
- * has no way to splice a turn in the middle — so the button says so before it
- * does it.
- */
-/**
  * One block Borg attached for the model, folded behind its name and size.
  *
  * Closed by default: it is the brief the model read, not a message to the
@@ -211,7 +204,7 @@ function EditBox({
  */
 function AttachedSection({ block }: { block: AttachedBlock }) {
   return (
-    <details className="group/attached mt-2.5 first:mt-0">
+    <details className="mt-2.5 first:mt-0">
       <summary className="cursor-pointer text-[12px] leading-[1.4] text-ink3 select-none hover:text-ink2">
         {block.label}
         {block.items > 0 && <span className="tabular-nums"> · {block.items}</span>}
@@ -268,6 +261,13 @@ function SystemTurnCell({
   );
 }
 
+/**
+ * A user turn, rewritable in place.
+ *
+ * Editing truncates the conversation from this message onward — the daemon
+ * has no way to splice a turn in the middle — so the button says so before it
+ * does it.
+ */
 function UserCell({
   cell,
   onEdit,

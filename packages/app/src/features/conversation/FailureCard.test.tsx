@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
@@ -156,28 +157,36 @@ describe("FailureCard", () => {
 const BUDGET =
   "Monthly token budget exceeded (1013994/1000000). Increase budget.monthly_token_limit in /settings to continue.";
 
-const setting = (key: string, value: string) => ({
+const setting = (key: string, value: string, label = "") => ({
   key,
   value,
   category: "default",
-  label: "",
+  label,
   kind: "",
   group: "",
 });
+
+const limit = (value: string) =>
+  setting("budget.monthly_token_limit", value, "Monthly token limit");
+
+/** A daemon whose snapshot follows its own writes, as the real one does. */
+function limitDaemon(value = "1000000") {
+  let stored = value;
+  return fakeDaemon({
+    GetSettings: () => ({ entries: [limit(stored)] }),
+    SetSetting: (request: unknown) => {
+      stored = (request as { value: string }).value;
+      return {};
+    },
+  });
+}
 
 function Path() {
   return <span data-testid="path">{useLocation().pathname}</span>;
 }
 
 /** The card inside the app's settings context, as the conversation page has it. */
-function renderInApp(
-  message: string,
-  daemon = fakeDaemon({
-    GetSettings: { entries: [setting("budget.monthly_token_limit", "1000000")] },
-    SetSetting: {},
-  }),
-  onRetry?: () => void,
-) {
+function renderInApp(message: string, daemon = limitDaemon(), onRetry?: () => void) {
   const view = renderApp(
     <>
       <FailureCard error={{ message }} onRetry={onRetry} live />
@@ -193,7 +202,8 @@ function renderInApp(
 }
 
 describe("FailureCard with a setting that fixes it", () => {
-  const field = () => screen.getByLabelText("budget.monthly_token_limit") as HTMLInputElement;
+  // Named for people, by the daemon's own label, not by its dotted key.
+  const field = () => screen.getByLabelText("Monthly token limit") as HTMLInputElement;
 
   it("raises the monthly limit in place, with the suggestion prefilled", async () => {
     const { daemon } = renderInApp(BUDGET);
@@ -238,6 +248,69 @@ describe("FailureCard with a setting that fixes it", () => {
     expect(onRetry).toHaveBeenCalledOnce();
   });
 
+  it("keeps the receipt after the snapshot catches up with the raise", async () => {
+    // Once the refetch lands, the setting no longer holds the limit this card
+    // failed under; the card's own write must not read as someone else's.
+    const { daemon } = renderInApp(BUDGET);
+    await waitFor(() => expect(field()).toBeTruthy());
+    fireEvent.click(screen.getByText("Raise limit"));
+    await waitFor(() =>
+      expect(daemon.calls.filter((c) => c.method === "GetSettings").length).toBe(2),
+    );
+    expect(await screen.findByText("Limit raised to 2,000,000.")).toBeTruthy();
+    expect(screen.queryByText("Open this setting")).toBeNull();
+  });
+
+  it("stops offering an old card's numbers once the limit has moved past them", async () => {
+    // Raised to 4,000,000 since this card failed under 1,000,000: its 2,000,000
+    // would lower the limit while announcing a raise.
+    renderInApp(BUDGET, limitDaemon("4000000"));
+    fireEvent.click(await screen.findByText("Open this setting"));
+    expect(screen.queryByText("Raise limit")).toBeNull();
+    expect(screen.getByTestId("path").textContent).toBe("/settings/key/budget.monthly_token_limit");
+  });
+
+  it("starts a new failure in the live slot from its own suggestion", async () => {
+    // The live card never unmounts; a half-typed value belongs to the failure
+    // it was typed against.
+    function LiveSlot() {
+      const [message, setMessage] = useState(BUDGET);
+      return (
+        <>
+          <FailureCard error={{ message }} live />
+          <button onClick={() => setMessage(BUDGET.replace("1013994", "1000500"))}>next</button>
+        </>
+      );
+    }
+    renderApp(<LiveSlot />, {
+      daemon: limitDaemon(),
+      wrapper: (children) => <SettingsProvider>{children}</SettingsProvider>,
+    });
+    await waitFor(() => expect(field().value).toBe("2,000,000"));
+    fireEvent.change(field(), { target: { value: "3,000,000" } });
+
+    fireEvent.click(screen.getByText("next"));
+    expect(field().value).toBe("2,000,000");
+  });
+
+  it("does not claim another surface's failed write as its own", async () => {
+    // Two failures name the same setting; only the one that wrote says so.
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [limit("1000000")] },
+      SetSetting: new BorgError(INVALID_ARGUMENT, "value must be a whole number"),
+    });
+    renderApp(
+      <>
+        <FailureCard error={{ message: BUDGET }} />
+        <FailureCard error={{ message: BUDGET.replace("1013994", "1020000") }} />
+      </>,
+      { daemon, wrapper: (children) => <SettingsProvider>{children}</SettingsProvider> },
+    );
+    await waitFor(() => expect(screen.getAllByLabelText("Monthly token limit").length).toBe(2));
+    fireEvent.click(screen.getAllByText("Raise limit")[0]!);
+    expect(await screen.findAllByText(/value must be a whole number/)).toHaveLength(1);
+  });
+
   it("tells a settled card's reader to send again, since it has no retry", async () => {
     renderInApp(BUDGET);
     await waitFor(() => expect(field()).toBeTruthy());
@@ -247,7 +320,7 @@ describe("FailureCard with a setting that fixes it", () => {
 
   it("shows the daemon's refusal and keeps the field", async () => {
     const daemon = fakeDaemon({
-      GetSettings: { entries: [setting("budget.monthly_token_limit", "1000000")] },
+      GetSettings: { entries: [limit("1000000")] },
       SetSetting: new BorgError(INVALID_ARGUMENT, "value must be a whole number"),
     });
     renderInApp(BUDGET, daemon);

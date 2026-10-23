@@ -229,6 +229,13 @@ describe("SettingDetailPage for a count", () => {
       }),
     );
   });
+
+  it("leaves the digits of a number the daemon calls text alone", async () => {
+    // A Vertex project number is a name; `123,456,789,012` is nobody's project.
+    const project = { ...entry("llm.vertex_project", "123456789012", "db"), kind: "text" };
+    mount("/settings/key/llm.vertex_project", fakeDaemon({ GetSettings: { entries: [project] } }));
+    await waitFor(() => expect(screen.getByDisplayValue("123456789012")).toBeTruthy());
+  });
 });
 
 describe("SettingDetailPage for a JSON value", () => {
@@ -280,6 +287,19 @@ describe("SettingDetailPage for a JSON value", () => {
     // Typing again clears the complaint.
     fireEvent.change(box(), { target: { value: '[".ssh"]' } });
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("stops a list saved as something that is not a list", async () => {
+    // Valid JSON, but the daemon would refuse an object for a list with a
+    // serde trace; the box says it in words instead.
+    const daemon = daemonWith({ SetSetting: {} });
+    mount("/settings/key/security.blocked_paths", daemon);
+    await waitFor(() => expect(box().value).toContain(".ssh"));
+
+    fireEvent.change(box(), { target: { value: '{"path": ".ssh"}' } });
+    click(screen.getByText("Save"));
+    expect(screen.getByRole("alert").textContent).toMatch(/is a list/);
+    expect(daemon.calls.some((c) => c.method === "SetSetting")).toBe(false);
   });
 
   it("keeps Enter as a new line and saves on Cmd or Ctrl+Enter", async () => {

@@ -64,6 +64,35 @@ describe("parseUserTurn", () => {
   it("does not treat a marker mid-message as Borg's", () => {
     expect(parseUserTurn("what is a *heartbeat tick*?").system).toBeUndefined();
   });
+
+  it("keeps markup the user pasted in their own message", () => {
+    // A whole-line `<template>` block is the question, not a brief.
+    const raw = "why does this not render?\n<template>\n  <div>{{ msg }}</div>\n</template>";
+    expect(parseUserTurn(raw)).toEqual({ text: raw, blocks: [] });
+  });
+
+  it("still folds Borg's own brief in a message the user typed", () => {
+    const raw =
+      'check disk\n\n<preprocessed_context source="pre_run" exit_code="0">\n- 91% full\n</preprocessed_context>';
+    const turn = parseUserTurn(raw);
+    expect(turn.text).toBe("check disk");
+    expect(turn.blocks).toMatchObject([{ tag: "preprocessed_context", body: "- 91% full" }]);
+  });
+
+  it("names a heartbeat tick whose pre-run output leads the marker", () => {
+    // `borgd` prepends the pre-run block, attributes and all, to the tick.
+    const raw = [
+      '<preprocessed_context source="pre_run" exit_code="0">',
+      "load 0.4",
+      "</preprocessed_context>",
+      "",
+      TICK,
+    ].join("\n");
+    const turn = parseUserTurn(raw);
+    expect(turn.system).toBe("Heartbeat check-in");
+    expect(turn.text).toBe("");
+    expect(turn.blocks.map((b) => b.tag)).toEqual(["preprocessed_context", "proactive_nudges"]);
+  });
 });
 
 describe("displayTitle", () => {

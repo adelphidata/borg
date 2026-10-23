@@ -23,12 +23,28 @@ describe("valueShape", () => {
     expect(valueShape(key, value).kind).toBe(kind);
   });
 
-  it.each(["gateway.port", "apns.port", "telemetry.pid", "update.version", "user.birth_year"])(
-    "keeps %s as text, because it names a thing rather than counting one",
-    (key) => {
-      expect(valueShape(key, "65535").kind).toBe("text");
-    },
-  );
+  it.each([
+    "gateway.port",
+    "apns.port",
+    "telemetry.pid",
+    "update.version",
+    "user.birth_year",
+    "telephony.account_id",
+    "memory.mem0.user_id",
+  ])("keeps %s as text, because it names a thing rather than counting one", (key) => {
+    expect(valueShape(key, "65535").kind).toBe("text");
+  });
+
+  it.each([
+    // The daemon says it is text: a GCP project number, not a count.
+    ["llm.vertex_project", "123456789012", "text", "text"],
+    // Not every number is whole; `1` is just where a float happens to sit.
+    ["memory.embeddings.vector_weight", "1", "float", "text"],
+    ["budget.monthly_token_limit", "1000000", "uint", "integer"],
+    ["agents.child_timeout_ms", "120000", "", "integer"],
+  ] as const)("reads %s = %j of kind %j as %s", (key, value, kind, shape) => {
+    expect(valueShape(key, value, kind).kind).toBe(shape);
+  });
 });
 
 describe("groupDigits and ungroupDigits", () => {
@@ -52,6 +68,14 @@ describe("groupDigits and ungroupDigits", () => {
     expect(ungroupDigits("a,b")).toBe("a,b");
     expect(ungroupDigits(",")).toBe(",");
   });
+
+  it.each(["0,5", "1,5", "1,5000", "12,34,567"])(
+    "leaves %j for the daemon to refuse, since its commas do not group thousands",
+    (typed) => {
+      // `0,5` meant a half; dropping the comma would save five.
+      expect(ungroupDigits(typed)).toBe(typed);
+    },
+  );
 });
 
 describe("JSON editing", () => {
@@ -64,6 +88,21 @@ describe("JSON editing", () => {
   it("refuses a draft that does not parse, in words", () => {
     const out = compactJson('[".ssh",');
     expect("error" in out && out.error).toMatch(/not valid JSON/);
+  });
+
+  it.each([
+    ["list", "{}", /is a list/],
+    ["list", "5", /is a list/],
+    ["list", "null", /is a list/],
+    ["object", '["a"]', /is an object/],
+  ] as const)("refuses a %s setting saved as %s", (container, draft, reason) => {
+    const out = compactJson(draft, container);
+    expect("error" in out && out.error).toMatch(reason);
+  });
+
+  it("accepts a draft that keeps its container", () => {
+    expect(compactJson('[\n  "a"\n]', "list")).toEqual({ value: '["a"]' });
+    expect(compactJson('{ "a": 1 }', "object")).toEqual({ value: '{"a":1}' });
   });
 });
 

@@ -162,13 +162,15 @@ const JSON_MAX_PX = 420;
  *
  * On one line, `security.blocked_paths` ran off the edge of the field after
  * the fourth path, and nobody can edit what they cannot see. Monospace keeps
- * the quotes upright and the indentation honest. A draft that does not parse
- * is stopped here, in plain words, instead of reaching the daemon as a string
- * it rejects with a parser trace.
+ * the quotes upright and the indentation honest. A draft that does not parse,
+ * or no longer has the list or object shape the setting stores, is stopped
+ * here, in plain words, instead of reaching the daemon as a string it rejects
+ * with a parser trace.
  */
 function JsonEditor({
   label,
   initial,
+  container,
   saving,
   onSave,
   onReset,
@@ -176,6 +178,8 @@ function JsonEditor({
   label: string;
   /** Already pretty-printed. */
   initial: string;
+  /** What the stored value is, and so what a save must stay. */
+  container: "list" | "object";
   saving: boolean;
   /** Receives the compact form the daemon stores. */
   onSave: (value: string) => void;
@@ -191,7 +195,7 @@ function JsonEditor({
 
   const commit = () => {
     if (saving) return;
-    const out = compactJson(draft);
+    const out = compactJson(draft, container);
     if ("error" in out) {
       setInvalid(out.error);
       return;
@@ -246,6 +250,7 @@ function JsonEditor({
 function ShapedValueEditor({
   label,
   settingKey,
+  kind,
   initial,
   saving,
   onSave,
@@ -253,17 +258,20 @@ function ShapedValueEditor({
 }: {
   label: string;
   settingKey: string;
+  /** The daemon's type for a curated key; empty for the rest. */
+  kind: string;
   initial: string;
   saving: boolean;
   onSave: (value: string) => void;
   onReset?: () => void;
 }) {
-  const shape = valueShape(settingKey, initial);
+  const shape = valueShape(settingKey, initial, kind);
   if (shape.kind === "json") {
     return (
       <JsonEditor
         label={label}
         initial={prettyJson(shape.parsed)}
+        container={Array.isArray(shape.parsed) ? "list" : "object"}
         saving={saving}
         onSave={onSave}
         onReset={onReset}
@@ -497,8 +505,13 @@ export function SettingDetailPage() {
   const basic = rawKey ? undefined : findBasicSetting(id);
   const key = rawKey ? decodeURIComponent(rawKey) : (basic?.key ?? null);
 
-  // Leaving the page should not carry a stale failure to the next one.
-  useEffect(() => resetSaveError, [resetSaveError]);
+  // A failure belongs to the write that caused it: arriving must not show one
+  // left by another surface (an error card's inline fix), and leaving should
+  // not carry this page's to the next one.
+  useEffect(() => {
+    resetSaveError();
+    return resetSaveError;
+  }, [resetSaveError]);
 
   if (basic && basic.key === null) return <AppearanceDetail />;
 
@@ -567,6 +580,7 @@ export function SettingDetailPage() {
                 <ShapedValueEditor
                   label={title}
                   settingKey={entry.key}
+                  kind={entry.kind}
                   initial={entry.value}
                   saving={saving}
                   onSave={(v) => void save(entry.key, v)}

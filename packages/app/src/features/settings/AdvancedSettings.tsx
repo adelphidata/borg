@@ -7,6 +7,7 @@ import {
   OTHER_CATEGORY,
   advancedCategoryOf,
   keyPrefix,
+  settingPath,
   type AdvancedCategory,
 } from "./catalog";
 import { summarizeValue } from "./settingValue";
@@ -178,27 +179,30 @@ function CategoryFold({
                   {section.prefix.replaceAll("_", " ")}
                 </div>
               )}
-              {section.rows.map((r) => (
-                <button
-                  type="button"
-                  key={r.key}
-                  title={r.key}
-                  aria-label={`${r.key} ${r.value === "" ? "unset" : summarizeValue(r.key, r.value)}`}
-                  className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
-                  onClick={() => navigate(`/settings/key/${encodeURIComponent(r.key)}`)}
-                >
-                  <span className="min-w-0 truncate text-[12.5px] leading-[1.3] text-ink2">
-                    {section.prefix === "" ? r.key : r.key.slice(section.prefix.length + 1)}
-                  </span>
-                  <span
-                    className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium tabular-nums ${
-                      r.overridden ? "text-neon-ink" : "text-ink3"
-                    }`}
+              {section.rows.map((r) => {
+                const shown = summarizeValue(r.key, r.value, r.kind);
+                return (
+                  <button
+                    type="button"
+                    key={r.key}
+                    title={r.key}
+                    aria-label={`${r.key} ${r.value === "" ? "unset" : shown}`}
+                    className={`${ROW_BUTTON} justify-between gap-[18px] rounded-[7px] px-3 py-[9px] transition-[background] duration-150 hover:bg-surface3`}
+                    onClick={() => navigate(settingPath(r.key))}
                   >
-                    {summarizeValue(r.key, r.value)}
-                  </span>
-                </button>
-              ))}
+                    <span className="min-w-0 truncate text-[12.5px] leading-[1.3] text-ink2">
+                      {section.prefix === "" ? r.key : r.key.slice(section.prefix.length + 1)}
+                    </span>
+                    <span
+                      className={`max-w-[200px] flex-none truncate text-[12px] leading-none font-medium tabular-nums ${
+                        r.overridden ? "text-neon-ink" : "text-ink3"
+                      }`}
+                    >
+                      {shown}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           ))}
         </div>

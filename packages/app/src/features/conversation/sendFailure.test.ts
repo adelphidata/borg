@@ -246,6 +246,8 @@ describe("classifyFailure — Borg's own monthly limit", () => {
     expect(failure.fix).toMatchObject({
       key: "budget.monthly_token_limit",
       suggested: "2000000",
+      // The limit it failed under, so a card can tell when it has moved on.
+      was: "1000000",
       action: "Raise limit",
     });
     expect(failure.fix!.done!("2000000")).toBe("Limit raised to 2,000,000.");

@@ -131,6 +131,11 @@ export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);
 }
 
+/** Where a raw registry key's own editor lives. */
+export function settingPath(key: string): string {
+  return `/settings/key/${encodeURIComponent(key)}`;
+}
+
 /** One fold under Advanced: a plain-words bucket over several key prefixes. */
 export interface AdvancedCategory {
   id: string;
