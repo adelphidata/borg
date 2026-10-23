@@ -740,7 +740,7 @@ describe("typing while Borg waits on a prompt", () => {
     const { props, rerender } = awaiting();
     submit("also check the logs");
 
-    fireEvent.click(screen.getByText("Stop"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
 
     expect(props.onCancel).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("textbox")).toHaveProperty("value", "also check the logs");

@@ -5,9 +5,9 @@ import {
   CompletionList,
   CONVERSATION_COL,
   isSubmitEnter,
-  Pill,
   rowDomId,
   SendIcon,
+  StopIcon,
   useIsMobile,
 } from "@borg/ui";
 import { useKeybind } from "../../lib/keybinds";
@@ -844,9 +844,16 @@ export function Composer({
             onError={setError}
           />
           {busy && draft.trim() === "" ? (
-            <Pill variant="danger" square onClick={stop}>
-              Stop
-            </Pill>
+            // The send button's twin, so the swap does not move anything: same
+            // size, same place, the square every player uses for stop.
+            <button
+              type="button"
+              aria-label="Stop"
+              className="flex h-[29px] w-[29px] flex-none cursor-pointer items-center justify-center rounded-[9px] border border-alert bg-transparent text-alert hover:bg-alert-soft"
+              onClick={stop}
+            >
+              <StopIcon size={11} fill="currentColor" />
+            </button>
           ) : (
             <button
               type="button"
