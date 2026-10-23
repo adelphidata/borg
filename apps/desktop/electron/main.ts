@@ -148,6 +148,22 @@ function createWindow() {
   return win;
 }
 
+/**
+ * Raises the main window, or builds it again after it was closed.
+ *
+ * Must test the main window, not the window count: the hidden quick-entry
+ * panel is a BrowserWindow too, so once it has been summoned `getAllWindows()`
+ * is never empty and clicking the dock icon after closing the last real window
+ * would do nothing at all.
+ */
+function showMainWindow(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    raise(mainWindow);
+    return;
+  }
+  createWindow();
+}
+
 // A second launch — from the dock, a file open, or a stray CLI invocation —
 // must raise the window that already exists rather than start a rival instance
 // fighting it for the same daemon socket.
@@ -163,7 +179,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     const borg = registerBorgIpc();
-    const native = registerNativeIpc(() => mainWindow);
+    const native = registerNativeIpc(() => mainWindow, showMainWindow);
     // Start the daemon before anything asks it a question. The window opens
     // immediately either way and shows the wait; nothing here blocks it.
     const boot = registerBoot({
@@ -191,17 +207,7 @@ if (!app.requestSingleInstanceLock()) {
 
     installApplicationMenu();
     createWindow();
-    app.on("activate", () => {
-      // Must test the main window, not the window count: the hidden
-      // quick-entry panel is a BrowserWindow too, so once it has been summoned
-      // `getAllWindows()` is never empty and clicking the dock icon after
-      // closing the last real window would do nothing at all.
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        raise(mainWindow);
-        return;
-      }
-      createWindow();
-    });
+    app.on("activate", showMainWindow);
   });
 }
 

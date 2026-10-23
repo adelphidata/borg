@@ -38,9 +38,12 @@ export function activateSession(window: BrowserWindow, sessionId: string): void 
  *
  * `mainWindow` is read lazily rather than captured: the window can be closed
  * and recreated (macOS dock activate), and a stale reference would send the
- * reveal to a destroyed window.
+ * reveal to a destroyed window. `reopen` builds it again after it was closed.
  */
-export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dispose(): void } {
+export function registerNativeIpc(
+  mainWindow: () => BrowserWindow | null,
+  reopen: () => void = () => {},
+): { dispose(): void } {
   ipcMain.handle(CHANNELS.notify, (event, notification: WireNotification) => {
     if (!Notification.isSupported()) return;
 
@@ -106,7 +109,12 @@ export function registerNativeIpc(mainWindow: () => BrowserWindow | null): { dis
     try {
       held = globalShortcut.register(dictationHotkey, () => {
         const win = mainWindow();
-        if (!win || win.isDestroyed()) return;
+        if (!win || win.isDestroyed()) {
+          // The window was closed but the app still runs (macOS). The key is
+          // still Borg's, so a press opens Borg rather than doing nothing.
+          reopen();
+          return;
+        }
         raise(win);
         win.webContents.send(CHANNELS.menuCommand, "dictate");
       });

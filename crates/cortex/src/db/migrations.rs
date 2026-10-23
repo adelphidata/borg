@@ -215,14 +215,20 @@ impl Database {
     pub(super) async fn migrate_v6(&self) -> Result<()> {
         const KEY: &str = "voice.dictation_shortcut";
         const OLD_DEFAULT: &str = "mod+shift+space";
+        // Fixed, not read from the compiled default: this step means "move
+        // off the quick-entry key to the key that replaced it", and a later
+        // default change must not change what an old upgrade did.
+        const NEW_DEFAULT: &str = "mod+shift+d";
         const DONE_MARKER: &str = "dictation_shortcut_off_quick_entry";
         if self.get_meta(DONE_MARKER).await?.is_some() {
             return Ok(());
         }
         if self.get_setting(KEY).await?.as_deref() == Some(OLD_DEFAULT) {
-            let new_default = crate::config::VoiceConfig::default().dictation_shortcut;
-            self.set_setting(KEY, &new_default).await?;
-            tracing::info!(to = %new_default, "moved the dictation key off the quick-entry chord");
+            self.set_setting(KEY, NEW_DEFAULT).await?;
+            tracing::info!(
+                to = NEW_DEFAULT,
+                "moved the dictation key off the quick-entry chord"
+            );
         }
         self.set_meta(DONE_MARKER, "1").await?;
         Ok(())
@@ -1724,17 +1730,16 @@ mod tests {
             .await
             .unwrap();
 
-        db.migrate_v6().await.unwrap();
+        // Through the real upgrade path, so dropping the `migrate_v6` call
+        // from the runner fails here.
+        db.set_meta("schema_version", "5").await.unwrap();
+        db.run_migrations().await.unwrap();
         assert_eq!(
             db.get_setting("voice.dictation_shortcut")
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(
-                crate::config::VoiceConfig::default()
-                    .dictation_shortcut
-                    .as_str()
-            )
+            Some("mod+shift+d")
         );
 
         // Chosen again on purpose, then an older binary restamps the shared

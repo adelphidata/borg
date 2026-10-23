@@ -422,16 +422,59 @@ describe("registerNativeIpc", () => {
       const register = vi.spyOn(globalShortcut, "register").mockImplementation(() => {
         throw new TypeError("conversion failure from CmdOrCtrl+Alt+∂");
       });
+      // Restored even when an assertion fails, or every later test in the
+      // file would get a register that throws.
+      try {
+        const win = makeWindow();
+        windows.push(win);
+        registerNativeIpc(() => win as never);
+        invoke(CHANNELS.dictationHotkey, {}, "CmdOrCtrl+Alt+∂");
+        emitApp("browser-window-focus", {}, win);
+        expect(() => emitApp("browser-window-blur", {}, win)).not.toThrow();
+        expect(shortcutState.registered.size).toBe(0);
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        register.mockRestore();
+        warn.mockRestore();
+      }
+    });
+
+    it("opens Borg again on a press after the main window was closed", () => {
+      const reopen = vi.fn();
+      registerNativeIpc(() => null, reopen);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      shortcutState.registered.get("Alt+D")?.();
+      expect(reopen).toHaveBeenCalledTimes(1);
+    });
+
+    it("a press from another app brings the window forward, which lets the key go until it leaves", () => {
       const win = makeWindow();
       windows.push(win);
       registerNativeIpc(() => win as never);
-      invoke(CHANNELS.dictationHotkey, {}, "CmdOrCtrl+Alt+∂");
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      shortcutState.registered.get("Alt+D")?.();
+      expect(win.focus).toHaveBeenCalled();
+      // Electron reports the focus the raise caused.
       emitApp("browser-window-focus", {}, win);
-      expect(() => emitApp("browser-window-blur", {}, win)).not.toThrow();
       expect(shortcutState.registered.size).toBe(0);
-      expect(warn).toHaveBeenCalledTimes(1);
-      register.mockRestore();
-      warn.mockRestore();
+      emitApp("browser-window-blur", {}, win);
+      // Claimed again with a callback that still works.
+      shortcutState.registered.get("Alt+D")?.();
+      expect(win.sent.filter((m) => m.args[0] === "dictate")).toHaveLength(2);
+    });
+
+    it("follows a main window built again: the new one's focus counts, the old one's does not", () => {
+      const first = makeWindow();
+      const second = makeWindow();
+      windows.push(first, second);
+      let current = first;
+      registerNativeIpc(() => current as never);
+      invoke(CHANNELS.dictationHotkey, {}, "Alt+D");
+      current = second;
+      emitApp("browser-window-focus", {}, first);
+      expect(shortcutState.registered.has("Alt+D")).toBe(true);
+      emitApp("browser-window-focus", {}, second);
+      expect(shortcutState.registered.size).toBe(0);
     });
 
     it("releases the key on dispose and when the window is gone does nothing on press", () => {

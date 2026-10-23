@@ -223,7 +223,8 @@ describe("VoiceSettingsPage", () => {
     const entries = [
       entry("audio.enabled", "true"),
       entry("audio.models", JSON.stringify([{ provider: "openai" }])),
-      entry("voice.dictation_shortcut", "mod+shift+space"),
+      // Written by hand through the CLI: case and spaces do not hide it.
+      entry("voice.dictation_shortcut", " Mod+Shift+Space "),
     ];
     // The web app has no quick-entry panel, so the key is free there.
     const web = renderApp(<VoiceSettingsPage />, {

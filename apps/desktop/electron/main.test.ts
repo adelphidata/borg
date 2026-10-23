@@ -226,6 +226,17 @@ describe("main process launch", () => {
     expect(getWindow()).toBeNull();
   });
 
+  it("hands the native bridge a way to open the main window again after it closed", async () => {
+    // The background dictation key calls it when a press finds no window.
+    restores.push(await launch({ platform: "darwin" }));
+    const reopen = spies.registerNativeIpc.mock.calls[0][1] as () => void;
+    reopen();
+    expect(spies.raise).toHaveBeenCalledWith(mainWindow());
+    mainWindow().emit("closed");
+    reopen();
+    expect(stub.constructedWindows).toHaveLength(2);
+  });
+
   it("resolves the preload against the app root, not the source directory", async () => {
     // bun's bundler rewrites __dirname to electron/, where preload.js does not
     // exist — this has regressed once.

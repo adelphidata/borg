@@ -576,7 +576,9 @@ function DictationSection({
             <ShortcutField
               value={prefs.shortcut}
               warning={
-                kind === "desktop" && prefs.shortcut === QUICK_ENTRY_CHORD
+                kind === "desktop" &&
+                shortcut?.kind === "chord" &&
+                shortcut.chord === QUICK_ENTRY_CHORD
                   ? "Quick entry already uses this key."
                   : undefined
               }
