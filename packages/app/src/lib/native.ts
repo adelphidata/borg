@@ -60,6 +60,11 @@ export interface NativeBridge {
   hideWindow(): void;
   /** Dock/taskbar badge. 0 clears it. */
   setBadgeCount(count: number): void;
+  /**
+   * A system-wide shortcut, in Electron's accelerator grammar, that brings
+   * Borg forward and dispatches the `dictate` action. Empty clears it.
+   */
+  setDictationHotkey(accelerator: string): void;
   boot: {
     /** Pushes the current status at once, then every change. */
     subscribe(handler: (status: BootStatus) => void): () => void;
@@ -86,6 +91,7 @@ export const NO_NATIVE: NativeBridge = {
   revealSession: noop,
   hideWindow: noop,
   setBadgeCount: noop,
+  setDictationHotkey: noop,
   // The browser did not start the daemon and cannot: it reached the gateway to
   // load this page at all, so as far as this surface is concerned Borg is up.
   // Reporting "ready" immediately is what keeps the boot screen desktop-only.

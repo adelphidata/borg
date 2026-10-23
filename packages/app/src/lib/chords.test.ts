@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHORDS, acceleratorFor, hintFor } from "./chords";
+import { CHORDS, acceleratorFor, acceleratorForChord, hintFor, hintForChord } from "./chords";
 
 describe("acceleratorFor", () => {
   it("renders a chord in Electron's accelerator grammar", () => {
@@ -40,5 +40,14 @@ describe("hintFor", () => {
 
   it("has no hint for an action with no chord", () => {
     expect(hintFor("check-for-updates", true)).toBeUndefined();
+  });
+});
+
+describe("chord strings outside the table", () => {
+  it("renders the space bar by name on both platforms and for Electron", () => {
+    // A dictation key is a setting, so it never lives in CHORDS.
+    expect(hintForChord("mod+shift+space", true)).toBe("⌘⇧Space");
+    expect(hintForChord("mod+shift+space", false)).toBe("Ctrl+Shift+Space");
+    expect(acceleratorForChord("mod+shift+space")).toBe("CmdOrCtrl+Shift+Space");
   });
 });

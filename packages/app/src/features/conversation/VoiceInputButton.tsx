@@ -1,172 +1,275 @@
 import { useEffect, useRef, useState } from "react";
-import { MicIcon } from "@borg/ui";
-import { asBorgError, useBorg } from "../../lib/useDaemon";
-import { useVoiceCatalog } from "../../lib/voice";
+import { useNavigate } from "react-router-dom";
+import { CheckIcon, CloseIcon, MicIcon, Pill } from "@borg/ui";
+import { acceleratorForChord } from "../../lib/chords";
+import { isMacPlatform } from "../../lib/keybinds";
+import { useNative } from "../../lib/platform";
+import { useSettings } from "../../lib/settings";
+import {
+  readLocalVoiceChoice,
+  useVoiceCatalog,
+  useVoicePrefs,
+  type VoiceProvider,
+} from "../../lib/voice";
+import { formatRecordingClock, parseShortcut, shortcutLabel } from "./dictation";
+import { canRecord, useDictation } from "./useDictation";
+import { withPrimaryProvider } from "../settings/voiceChain";
 
-type Phase = "idle" | "recording" | "transcribing";
+/** Transcription providers in the order a one-click setup prefers them. */
+const PREFERRED = ["openai", "groq", "deepgram", "elevenlabs", "mistral", "xai"];
 
-/** Whether this browser can record at all. */
-function canRecord(): boolean {
+/**
+ * The provider a key is already saved for, best first; undefined when none.
+ * Keyless providers do not count: "no key needed" says nothing about a model
+ * file or a build flag, so one press on them could land on "not ready".
+ */
+export function readyProvider(providers: VoiceProvider[]): VoiceProvider | undefined {
+  const keyed = providers.filter((p) => p.needsKey && p.hasKey && !p.requiresCommand);
   return (
-    typeof MediaRecorder !== "undefined" &&
-    typeof navigator !== "undefined" &&
-    typeof navigator.mediaDevices?.getUserMedia === "function"
+    PREFERRED.map((id) => keyed.find((p) => p.id === id)).find((p) => p !== undefined) ?? keyed[0]
   );
 }
 
 /**
- * The composer's microphone: click to record, click again to turn the
- * recording into text through the daemon's transcription chain.
+ * The composer's microphone, the way a chat app has one: always there, one
+ * click to talk.
  *
- * It renders nothing unless transcription is set up and working — a
- * microphone that can only answer "voice input is off" is a control that
- * should not be at the door. Audio goes to the daemon, never straight to a
- * provider, so keys stay where they are kept.
+ * When transcription is not set up yet the click opens a small card instead
+ * of recording. If a chat key already serves a transcription provider the
+ * card turns voice input on with that provider in one press; otherwise it
+ * points at Settings. A microphone that is there but silent teaches more
+ * than one that is missing.
  */
 export function VoiceInputButton({
   onText,
   onError,
 }: {
-  /** The recognized words, trimmed and non-empty. */
-  onText: (text: string) => void;
+  /**
+   * The recognized words, trimmed and non-empty. `send` is true when Settings
+   * says a dictated message goes straight out rather than into the box.
+   */
+  onText: (text: string, options: { send: boolean }) => void;
   /** A plain-words failure; `undefined` clears an earlier one. */
   onError: (message: string | undefined) => void;
 }) {
-  const borg = useBorg();
   const catalog = useVoiceCatalog();
-  const [phase, setPhase] = useState<Phase>("idle");
-  const recorder = useRef<MediaRecorder | null>(null);
-  // Set from the click until the recorder runs, so a second click during the
-  // permission prompt cannot open a second stream.
-  const starting = useRef(false);
-  // Read by async work that outlives the render it was made in.
-  const live = useRef(true);
-  const handlers = useRef({ onText, onError });
-  handlers.current = { onText, onError };
-
+  const prefs = useVoicePrefs();
+  const native = useNative();
   // A failed refresh keeps the last answer: a network blip must not cut off a recording.
   const lastReady = useRef(false);
   if (catalog.state === "ready") lastReady.current = catalog.data.transcriptionReady;
-  const visible = canRecord() && lastReady.current;
-  // Read after the permission prompt, which can outlast the button.
-  const visibleRef = useRef(visible);
-  visibleRef.current = visible;
-
-  /**
-   * End a recording without sending it: the microphone goes off, the audio is
-   * dropped. True when there was a recording to drop.
-   */
-  const discard = () => {
-    const r = recorder.current;
-    recorder.current = null;
-    if (!r) return false;
-    r.onstop = null;
-    if (r.state !== "inactive") r.stop();
-    r.stream.getTracks().forEach((t) => t.stop());
-    return true;
-  };
-
+  const ready = lastReady.current;
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [deviceId, setDeviceId] = useState(() => readLocalVoiceChoice("microphone"));
+  // Settings writes the choice from another page; pick it up on the next recording.
   useEffect(() => {
-    live.current = true;
+    const sync = () => setDeviceId(readLocalVoiceChoice("microphone"));
+    window.addEventListener("storage", sync);
+    window.addEventListener("focus", sync);
     return () => {
-      live.current = false;
-      // Leaving the page must not leave the microphone on, nor send what it heard.
-      discard();
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("focus", sync);
     };
   }, []);
 
-  // Voice input turned off mid-recording: no button is left to stop it, so stop it here.
+  const dictation = useDictation({
+    enabled: ready,
+    shortcut: prefs.shortcut,
+    holdToRecord: prefs.holdToRecord,
+    beep: prefs.beep,
+    deviceId,
+    language: prefs.language,
+    onText: (text) => {
+      if (prefs.copyTranscript) void navigator.clipboard?.writeText(text).catch(() => {});
+      onText(text, { send: prefs.autoSend });
+    },
+    onError,
+  });
+
+  // The desktop shell can listen from behind another app; the chord is sent
+  // up as an accelerator, or cleared. A lone modifier cannot be one.
+  const shortcut = parseShortcut(prefs.shortcut);
+  const background =
+    ready && prefs.backgroundShortcut && shortcut?.kind === "chord"
+      ? acceleratorForChord(shortcut.chord)
+      : "";
   useEffect(() => {
-    if (!visible) {
-      if (discard())
-        handlers.current.onError("Voice input was turned off, so the recording was dropped.");
-      setPhase("idle");
-    }
-  }, [visible]);
+    native.setDictationHotkey(background);
+    return () => native.setDictationHotkey("");
+  }, [native, background]);
 
-  if (!visible) return null;
+  useEffect(() => {
+    if (ready) setSetupOpen(false);
+  }, [ready]);
 
-  const transcribe = async (blob: Blob) => {
-    setPhase("transcribing");
-    try {
-      const audio = new Uint8Array(await blob.arrayBuffer());
-      const { text } = await borg.voice.transcribe({
-        audio,
-        mimeType: blob.type,
-        language: "",
-      });
-      if (!live.current) return;
-      if (text.trim() === "")
-        handlers.current.onError("Didn't catch that. Try again a bit closer.");
-      else handlers.current.onText(text.trim());
-    } catch (e) {
-      if (live.current) handlers.current.onError(asBorgError(e).message);
-    } finally {
-      if (live.current) setPhase("idle");
-    }
-  };
+  if (!canRecord()) return null;
 
-  const start = async () => {
-    if (starting.current || recorder.current) return;
-    starting.current = true;
-    handlers.current.onError(undefined);
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
-      starting.current = false;
-      if (live.current)
-        handlers.current.onError(
-          "Borg can't use the microphone. Allow it for this app and try again.",
-        );
-      return;
-    }
-    starting.current = false;
-    // The composer went away, or voice input was turned off, while the
-    // permission prompt was open.
-    if (!live.current || !visibleRef.current) {
-      stream.getTracks().forEach((t) => t.stop());
-      return;
-    }
-    const r = new MediaRecorder(stream);
-    const chunks: Blob[] = [];
-    r.ondataavailable = (e) => {
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-    r.onstop = () => {
-      stream.getTracks().forEach((t) => t.stop());
-      recorder.current = null;
-      void transcribe(new Blob(chunks, { type: r.mimeType || "audio/webm" }));
-    };
-    recorder.current = r;
-    r.start();
-    setPhase("recording");
-  };
-
+  const { phase } = dictation;
+  const keyHint = shortcutLabel(prefs.shortcut, isMacPlatform());
   const hint =
     phase === "recording"
-      ? "Stop recording"
+      ? "Done (click, press the shortcut, or let it go)"
       : phase === "transcribing"
         ? "Transcribing…"
-        : "Speak instead of typing";
+        : ready
+          ? keyHint
+            ? `Speak instead of typing (${keyHint})`
+            : "Speak instead of typing"
+          : "Set up voice input";
 
   return (
-    <button
-      type="button"
-      // One stable name; the state rides on pressed/busy, as screen readers expect.
-      aria-label="Voice input"
-      title={hint}
-      aria-pressed={phase === "recording"}
-      aria-busy={phase === "transcribing"}
-      disabled={phase === "transcribing"}
-      onClick={() => (phase === "recording" ? recorder.current?.stop() : void start())}
-      className={`flex h-[29px] w-[29px] flex-none cursor-pointer items-center justify-center rounded-[9px] border-0 disabled:cursor-wait ${
-        phase === "recording"
-          ? "animate-pulse bg-alert text-white"
-          : "bg-transparent text-ink3 hover:text-ink2"
-      } ${phase === "transcribing" ? "opacity-50" : ""}`}
+    <>
+      {phase !== "idle" && (
+        <RecordingBar
+          phase={phase}
+          seconds={dictation.seconds}
+          level={dictation.level}
+          onCancel={dictation.cancel}
+        />
+      )}
+      {setupOpen && !ready && catalog.state === "ready" && (
+        <SetupCard providers={catalog.data.transcription} onClose={() => setSetupOpen(false)} />
+      )}
+      <button
+        type="button"
+        // One stable name; the state rides on pressed/busy, as screen readers expect.
+        aria-label="Voice input"
+        title={hint}
+        aria-pressed={phase === "recording"}
+        aria-busy={phase === "transcribing"}
+        disabled={phase === "transcribing"}
+        onClick={() => {
+          if (!ready) setSetupOpen((v) => !v);
+          else dictation.toggle();
+        }}
+        className={`relative z-10 flex h-[29px] w-[29px] flex-none cursor-pointer items-center justify-center rounded-[9px] border-0 disabled:cursor-wait ${
+          phase === "recording" ? "bg-neon text-ink" : "bg-transparent text-ink3 hover:text-ink2"
+        } ${phase === "transcribing" ? "opacity-50" : ""}`}
+      >
+        {/* While recording this is the Done button: the one place the eye
+            already is, and the one control the hand is already on. */}
+        {phase === "recording" ? (
+          <CheckIcon size={15} stroke="currentColor" />
+        ) : (
+          <MicIcon size={15} />
+        )}
+      </button>
+    </>
+  );
+}
+
+/** How many bars the level meter draws. */
+const BARS = 14;
+
+/**
+ * Covers the box while the microphone is on: a clock, a live level, and the
+ * way out that drops the audio (also Escape). Finishing is the mic button
+ * itself, which turns into a check for the duration.
+ */
+function RecordingBar({
+  phase,
+  seconds,
+  level,
+  onCancel,
+}: {
+  phase: "recording" | "transcribing";
+  seconds: number;
+  level: number;
+  onCancel: () => void;
+}) {
+  const recording = phase === "recording";
+  return (
+    <div
+      role="status"
+      aria-label={recording ? "Recording" : "Transcribing"}
+      className="absolute inset-0 z-[5] flex items-center gap-3 rounded-[inherit] bg-surface2 pr-[46px] pl-4"
     >
-      <MicIcon size={15} />
-    </button>
+      <button
+        type="button"
+        aria-label="Cancel recording"
+        title="Cancel (Esc)"
+        onClick={onCancel}
+        disabled={!recording}
+        className="flex h-[26px] w-[26px] flex-none cursor-pointer items-center justify-center rounded-full border-0 bg-field text-ink2 hover:text-ink disabled:cursor-wait disabled:opacity-50"
+      >
+        <CloseIcon size={13} />
+      </button>
+      <div
+        className="flex h-6 min-w-0 flex-1 items-center justify-center gap-[3px]"
+        aria-hidden="true"
+      >
+        {Array.from({ length: BARS }, (_, i) => {
+          // Bars nearer the middle stand taller, so the meter reads as a
+          // waveform rather than a row of equal ticks.
+          const shape = 1 - Math.abs(i - (BARS - 1) / 2) / ((BARS + 1) / 2);
+          const h = recording ? 3 + Math.round(level * 18 * (0.4 + 0.6 * shape)) : 3;
+          return (
+            <span
+              key={i}
+              className={`w-[3px] rounded-full transition-[height] duration-75 ${
+                recording ? "bg-alert" : "bg-ink3"
+              }`}
+              style={{ height: `${h}px` }}
+            />
+          );
+        })}
+      </div>
+      <span className="flex-none text-[12px] leading-none text-ink2 tabular-nums">
+        {recording ? formatRecordingClock(seconds) : "Transcribing…"}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * What the microphone shows before voice input is set up. One press when a
+ * saved chat key can do the job; otherwise the way to Settings.
+ */
+function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose: () => void }) {
+  const navigate = useNavigate();
+  const { settings, save, saving } = useSettings();
+  const provider = readyProvider(providers);
+  const [failed, setFailed] = useState(false);
+  const enable = async () => {
+    if (!provider || settings.state !== "ready") return;
+    setFailed(false);
+    const chain = settings.data.get("audio.models")?.value;
+    const ok =
+      (await save("audio.models", withPrimaryProvider(chain, provider.id))) &&
+      (await save("audio.enabled", "true"));
+    if (!ok) setFailed(true);
+  };
+  return (
+    <div
+      role="dialog"
+      aria-label="Set up voice input"
+      className="absolute right-0 bottom-[calc(100%+8px)] z-20 w-[300px] rounded-[12px] border border-line2 bg-surface2 p-4 shadow-(--plateGlow)"
+    >
+      <div className="text-[13.5px] leading-[1.3] font-medium text-ink">Talk instead of typing</div>
+      <div className="mt-1.5 text-[12px] leading-[1.45] text-ink3">
+        {provider
+          ? `Your ${provider.label} key can turn speech into text. Turn it on?`
+          : "Borg needs a transcription provider to understand your voice. Pick one in Settings."}
+      </div>
+      {failed && (
+        <div className="mt-2 text-[12px] leading-[1.45] text-alert">
+          That didn't save. Try again, or set it up in Settings.
+        </div>
+      )}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <Pill square onClick={onClose}>
+          Not now
+        </Pill>
+        {provider ? (
+          <Pill variant="primary" square onClick={() => void enable()}>
+            {saving ? "Turning on…" : `Use ${provider.label}`}
+          </Pill>
+        ) : (
+          <Pill variant="primary" square onClick={() => navigate("/settings/voice")}>
+            Open Settings
+          </Pill>
+        )}
+      </div>
+    </div>
   );
 }

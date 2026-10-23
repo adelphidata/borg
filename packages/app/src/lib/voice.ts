@@ -36,3 +36,83 @@ export function useVoiceCatalog(): QueryResult<VoiceCatalog> {
   const key = useMemo(() => (data ? voiceSettingsKey(data) : ""), [data]);
   return useQuery((borg) => borg.voice.getVoiceCatalog({}), [key]);
 }
+
+/** The daemon's compiled defaults, repeated here for the moment before the snapshot lands. */
+export const VOICE_DEFAULTS = {
+  shortcut: "mod+shift+space",
+  holdToRecord: true,
+  autoSend: false,
+  copyTranscript: false,
+  beep: true,
+  autoSpeak: false,
+  backgroundShortcut: false,
+  language: "",
+} as const;
+
+/** How dictation and spoken replies behave, as Settings has them. */
+export interface VoicePrefs {
+  /** `voice.dictation_shortcut`: a chord or a lone modifier code. */
+  shortcut: string;
+  holdToRecord: boolean;
+  autoSend: boolean;
+  copyTranscript: boolean;
+  beep: boolean;
+  /** `voice.auto_tts`: read each reply aloud as it finishes. */
+  autoSpeak: boolean;
+  /** Desktop only: the shortcut also works while Borg is behind another app. */
+  backgroundShortcut: boolean;
+  /** `audio.language`: BCP-47, empty for auto-detect. */
+  language: string;
+}
+
+/** Reads the dictation preferences out of a settings snapshot. */
+export function voicePrefsOf(settings: Map<string, DaemonSetting> | undefined): VoicePrefs {
+  const get = (key: string) => settings?.get(key)?.value;
+  const bool = (key: string, fallback: boolean) => {
+    const v = get(key);
+    return v === undefined ? fallback : v === "true";
+  };
+  return {
+    shortcut: get("voice.dictation_shortcut") || VOICE_DEFAULTS.shortcut,
+    holdToRecord: bool("voice.hold_to_record", VOICE_DEFAULTS.holdToRecord),
+    autoSend: bool("voice.dictation_auto_send", VOICE_DEFAULTS.autoSend),
+    copyTranscript: bool("voice.copy_transcript", VOICE_DEFAULTS.copyTranscript),
+    beep: bool("voice.beep_enabled", VOICE_DEFAULTS.beep),
+    autoSpeak: bool("voice.auto_tts", VOICE_DEFAULTS.autoSpeak),
+    backgroundShortcut: bool("voice.background_shortcut", VOICE_DEFAULTS.backgroundShortcut),
+    language: get("audio.language") ?? VOICE_DEFAULTS.language,
+  };
+}
+
+export function useVoicePrefs(): VoicePrefs {
+  const { settings } = useSettings();
+  const data = settings.state === "ready" ? settings.data : undefined;
+  return useMemo(() => voicePrefsOf(data), [data]);
+}
+
+/**
+ * Per-device choices, kept in this browser rather than in the daemon: which
+ * microphone to use and which built-in voice to speak with are facts about
+ * this machine, not about the user's Borg.
+ */
+export const VOICE_LOCAL_KEYS = {
+  microphone: "borg.voice.microphone",
+  builtInVoice: "borg.voice.builtInVoice",
+} as const;
+
+export function readLocalVoiceChoice(key: keyof typeof VOICE_LOCAL_KEYS): string {
+  try {
+    return localStorage.getItem(VOICE_LOCAL_KEYS[key]) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function writeLocalVoiceChoice(key: keyof typeof VOICE_LOCAL_KEYS, value: string): void {
+  try {
+    if (value === "") localStorage.removeItem(VOICE_LOCAL_KEYS[key]);
+    else localStorage.setItem(VOICE_LOCAL_KEYS[key], value);
+  } catch {
+    // Private mode or a full store: the choice simply does not stick.
+  }
+}

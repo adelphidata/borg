@@ -64,7 +64,8 @@ export function chordOf(event: KeyboardEvent, isMac: boolean): string {
   // chord, so they must resolve to one that is bound to nothing.
   if (typeof event.key !== "string") return "";
   // "K" and "k" are the same chord; "Escape" keeps its name, lowercased.
-  parts.push(event.key.toLowerCase());
+  // The space bar reports " ", which no table could spell; it is "space".
+  parts.push(event.key === " " ? "space" : event.key.toLowerCase());
   return parts.join("+");
 }
 

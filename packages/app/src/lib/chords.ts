@@ -41,15 +41,23 @@ const MAC_SYMBOLS: Record<string, string> = { mod: "⌘", shift: "⇧", alt: "�
 export function hintFor(action: string, isMac: boolean = isMacPlatform()): string | undefined {
   const chord = CHORDS[action];
   if (!chord) return undefined;
+  return hintForChord(chord, isMac);
+}
+
+/** `hintFor` over a chord string rather than an action id. */
+export function hintForChord(chord: string, isMac: boolean = isMacPlatform()): string {
   const parts = chord.split("+");
   if (isMac) {
-    return parts.map((p) => MAC_SYMBOLS[p] ?? (p.length === 1 ? p.toUpperCase() : p)).join("");
+    return parts
+      .map((p) => MAC_SYMBOLS[p] ?? (p.length === 1 ? p.toUpperCase() : capitalize(p)))
+      .join("");
   }
-  return parts
-    .map((p) =>
-      p === "mod" ? "Ctrl" : p.length === 1 ? p.toUpperCase() : p[0]!.toUpperCase() + p.slice(1),
-    )
-    .join("+");
+  return parts.map((p) => (p === "mod" ? "Ctrl" : capitalize(p))).join("+");
+}
+
+/** `space` → `Space`; a single letter is simply uppercased. */
+function capitalize(part: string): string {
+  return part[0]!.toUpperCase() + part.slice(1);
 }
 
 /**
@@ -60,6 +68,11 @@ export function hintFor(action: string, isMac: boolean = isMacPlatform()): strin
 export function acceleratorFor(action: string): string | undefined {
   const chord = CHORDS[action];
   if (!chord) return undefined;
+  return acceleratorForChord(chord);
+}
+
+/** `acceleratorFor` over a chord string rather than an action id. */
+export function acceleratorForChord(chord: string): string {
   return chord
     .split("+")
     .map((part) => {

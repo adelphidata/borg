@@ -49,6 +49,7 @@ vi.mock("./ModelPill", () => ({ ModelPill: () => null }));
 const spoken = vi.hoisted(() => ({
   text: "hello there",
   error: undefined as string | undefined,
+  send: false,
   mounts: 0,
 }));
 vi.mock("./VoiceInputButton", async () => {
@@ -58,7 +59,7 @@ vi.mock("./VoiceInputButton", async () => {
       onText,
       onError,
     }: {
-      onText: (t: string) => void;
+      onText: (t: string, options: { send: boolean }) => void;
       onError: (m: string | undefined) => void;
     }) => {
       useEffect(() => {
@@ -68,7 +69,9 @@ vi.mock("./VoiceInputButton", async () => {
         <button
           type="button"
           aria-label="Speak instead of typing"
-          onClick={() => (spoken.error ? onError(spoken.error) : onText(spoken.text))}
+          onClick={() =>
+            spoken.error ? onError(spoken.error) : onText(spoken.text, { send: spoken.send })
+          }
         />
       );
     },
@@ -1162,7 +1165,26 @@ describe("Composer voice input", () => {
   beforeEach(() => {
     spoken.text = "hello there";
     spoken.error = undefined;
+    spoken.send = false;
     spoken.mounts = 0;
+  });
+
+  it("sends the spoken words at once when Settings says to, through the same path as Enter", () => {
+    spoken.send = true;
+    const onSend = vi.fn();
+    render(
+      <Composer
+        busy={false}
+        onSend={onSend}
+        onSteer={noop}
+        onCancel={noop}
+        draftKey="v0"
+        conversationKey="v0"
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("Speak instead of typing"));
+    expect(onSend).toHaveBeenCalledWith("hello there", []);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 
   it("keeps the same microphone when a new conversation is issued its id", () => {

@@ -33,6 +33,8 @@ function press(init: KeyboardEventInit & { key: string }, target?: Element) {
 describe("chordOf", () => {
   const cases: [string, KeyboardEventInit & { key: string }, boolean, string][] = [
     ["plain letter", { key: "k" }, true, "k"],
+    // The bar reports a literal " ", which no chord table can spell.
+    ["space bar", { key: " ", metaKey: true, shiftKey: true }, true, "mod+shift+space"],
     ["uppercases fold", { key: "K" }, true, "k"],
     ["cmd on mac is mod", { key: "k", metaKey: true }, true, "mod+k"],
     ["ctrl on windows is mod", { key: "k", ctrlKey: true }, false, "mod+k"],

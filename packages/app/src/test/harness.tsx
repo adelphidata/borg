@@ -93,6 +93,7 @@ export function fakeDaemon(table: UnaryTable = {}): FakeDaemon {
 export function fakeNative(): NativeBridge & {
   notifications: { title: string; body: string }[];
   badges: number[];
+  dictationHotkeys: string[];
   revealed: string[];
   hidden: number;
   emitMenuCommand(action: string): void;
@@ -103,6 +104,7 @@ export function fakeNative(): NativeBridge & {
   const bridge = {
     notifications: [] as { title: string; body: string }[],
     badges: [] as number[],
+    dictationHotkeys: [] as string[],
     revealed: [] as string[],
     hidden: 0,
     onMenuCommand(handler: (action: string) => void) {
@@ -124,6 +126,9 @@ export function fakeNative(): NativeBridge & {
     },
     setBadgeCount(count: number) {
       bridge.badges.push(count);
+    },
+    setDictationHotkey(accelerator: string) {
+      bridge.dictationHotkeys.push(accelerator);
     },
     // Reports Borg as already up, the way a warm start does — otherwise every
     // test would render the boot screen instead of the app. A test about the

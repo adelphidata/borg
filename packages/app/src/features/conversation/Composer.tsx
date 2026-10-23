@@ -21,6 +21,7 @@ import { draftTitle, publishDraft, readDraft } from "./draftStore";
 import { carriesFiles, carriesText, insertAt, readDrop } from "./dropContent";
 import { ModelPill } from "./ModelPill";
 import { VoiceInputButton } from "./VoiceInputButton";
+import { mergeTranscript } from "./dictation";
 import { backspacePathToken, pathToken, replacePathToken } from "./pathToken";
 import { mergeQueued } from "./queuedTurn";
 import { slashQuery } from "./slashToken";
@@ -104,6 +105,8 @@ export function Composer({
   const isMobile = useIsMobile();
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** True once a transcript lands that Settings says to send right away. */
+  const sendAfterDictation = useRef(false);
   /**
    * What was typed while a prompt was open, waiting for the turn to end.
    *
@@ -494,6 +497,14 @@ export function Composer({
     setError(undefined);
   };
 
+  // "Send right away" fires once the dictated words are the draft; `submit`
+  // then takes the same path a typed message does, commands included.
+  useEffect(() => {
+    if (!sendAfterDictation.current || draft.trim() === "") return;
+    sendAfterDictation.current = false;
+    submit();
+  });
+
   /**
    * Steers the running turn, and hands the text back if the turn did not take
    * it.
@@ -739,7 +750,8 @@ export function Composer({
           }}
           // Focus rests in the box, so the focus border is nearly always on; a
           // drag also tints the frame, or it would look like nothing changed.
-          className={`flex items-end gap-3 border py-2 pr-2 pl-[19px] ${
+          // `relative`: the recording bar and the voice setup card float over it.
+          className={`relative flex items-end gap-3 border py-2 pr-2 pl-[19px] ${
             isMobile ? "rounded-[22px]" : "rounded-[13px]"
           } ${
             dragging
@@ -819,8 +831,11 @@ export function Composer({
             // lands in another draft. Not `draftKey`: it changes when a new
             // conversation is issued its id, which would drop the recording.
             key={conversationKey}
-            onText={(spoken) => {
-              setDraft((prev) => (prev.trim() === "" ? spoken : `${prev.trimEnd()} ${spoken}`));
+            onText={(spoken, { send }) => {
+              setDraft((prev) => mergeTranscript(prev, spoken));
+              // Sent on the next render, once the words are in the box and
+              // `submit` can see them.
+              if (send) sendAfterDictation.current = true;
               focusComposer();
             }}
             onError={setError}
