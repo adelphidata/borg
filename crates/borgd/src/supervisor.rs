@@ -61,6 +61,13 @@ async fn try_observe_issue(db: &DbHandle, key: &str, ts: i64, status: &str) {
 /// that doesn't have a concrete reason to differ.
 pub const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 
+/// How long a cancelled task gets to finish on its own before it is aborted.
+/// The token reaches the task as well as the supervisor, and a task's
+/// shutdown arm can have work to do: the dispatcher releases the daemon lock
+/// there, and an abort that lands first makes the next boot report an
+/// unclean exit that never happened.
+const CANCEL_GRACE: Duration = Duration::from_secs(1);
+
 /// Knobs for one supervised subsystem. Every field has a default
 /// suitable for borgd's long-running daemon tasks; override only
 /// when there's a concrete reason.
@@ -208,7 +215,7 @@ async fn supervised_loop<F, Fut, E>(
         }
 
         let future = factory();
-        let join = tokio::spawn(AssertUnwindSafe(future).catch_unwind());
+        let mut join = tokio::spawn(AssertUnwindSafe(future).catch_unwind());
         let abort = join.abort_handle();
 
         // Arm a stall watchdog against this incarnation, if configured. Its
@@ -230,14 +237,15 @@ async fn supervised_loop<F, Fut, E>(
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // Best-effort cancel of the inner task — the cancel
-                // token would normally have signalled it through, but
-                // an inner task that doesn't observe the token still
-                // gets aborted at shutdown.
-                abort.abort();
+                // The token has signalled the inner task too; let it run its
+                // own shutdown arm. Only a task that ignores the token is
+                // aborted, once the grace runs out.
+                if tokio::time::timeout(CANCEL_GRACE, &mut join).await.is_err() {
+                    abort.abort();
+                }
                 IterationOutcome::Cancelled
             }
-            res = join => match res {
+            res = &mut join => match res {
                 // Inner future returned cleanly with Ok.
                 Ok(Ok(Ok(()))) => IterationOutcome::CleanExit,
                 // Inner future returned Err — task-level error, treat as restart.
@@ -613,7 +621,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel_clone.cancel();
 
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(CANCEL_GRACE + Duration::from_secs(2), handle)
             .await
             .expect("supervisor did not respect cancel")
             .expect("supervisor task panicked");
@@ -627,6 +635,44 @@ mod tests {
         assert!(
             restart_rows.is_empty(),
             "cancel must not produce restart rows, got {restart_rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_lets_the_task_finish_its_shutdown_arm() {
+        // The dispatcher releases the daemon lock after it sees the token;
+        // an abort that races ahead of that leaves the lock row behind.
+        let db = test_db().await;
+        let cancel = CancellationToken::new();
+        let finished = Arc::new(AtomicU64::new(0));
+
+        let handle = spawn_supervised(fast_cfg("grace-test", 5), cancel.clone(), db.clone(), {
+            let cancel = cancel.clone();
+            let finished = finished.clone();
+            move || {
+                let cancel = cancel.clone();
+                let finished = finished.clone();
+                async move {
+                    cancel.cancelled().await;
+                    // Shutdown work that has to await, as a DB write does.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    finished.store(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor did not return after cancel")
+            .expect("supervisor task panicked");
+
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the task's shutdown arm must run to completion"
         );
     }
 
