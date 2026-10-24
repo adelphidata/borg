@@ -384,11 +384,19 @@ export function SchedulesPage() {
                     savingLabel="Saving…"
                     onCancel={() => setEditing(undefined)}
                     onSubmit={(draft) =>
-                      schedules.update(task.id, draft).then((r) => {
-                        if (r === undefined) return false;
-                        setEditing(undefined);
-                        return true;
-                      })
+                      schedules
+                        .update(
+                          task.id,
+                          draft,
+                          draft.scheduleType !== asScheduleType(task.scheduleType) ||
+                            draft.scheduleExpr !==
+                              editableExpr(task.scheduleType, task.scheduleExpr),
+                        )
+                        .then((r) => {
+                          if (r === undefined) return false;
+                          setEditing(undefined);
+                          return true;
+                        })
                     }
                   />
                 ) : (

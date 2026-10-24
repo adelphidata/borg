@@ -1325,16 +1325,19 @@ impl Database {
         let schedule_expr = update.schedule_expr.unwrap_or(&existing.schedule_expr);
         let timezone = update.timezone.unwrap_or(&existing.timezone);
 
-        // A timezone-only change moves the next fire too: without the
-        // recompute the task fires once more at the old zone's hour.
-        let timezone_changed = update.timezone.is_some_and(|tz| tz != existing.timezone);
-        let next_run =
-            if update.schedule_type.is_some() || update.schedule_expr.is_some() || timezone_changed
-            {
-                crate::tasks::calculate_next_run(schedule_type, schedule_expr, timezone)?
-            } else {
-                existing.next_run
-            };
+        // Only a schedule that actually changed moves the next fire. A
+        // client that re-sends the stored values with a new name must not
+        // push a due run a whole interval out. A timezone-only change does
+        // move it: without the recompute the task fires once more at the old
+        // zone's hour.
+        let schedule_changed = schedule_type != existing.schedule_type
+            || schedule_expr != existing.schedule_expr
+            || timezone != existing.timezone;
+        let next_run = if schedule_changed {
+            crate::tasks::calculate_next_run(schedule_type, schedule_expr, timezone)?
+        } else {
+            existing.next_run
+        };
 
         self.conn.execute(
             "UPDATE scheduled_tasks SET name = ?1, prompt = ?2, schedule_type = ?3, schedule_expr = ?4, timezone = ?5, next_run = ?6 WHERE id = ?7",
@@ -1530,6 +1533,30 @@ mod tests {
         assert!(db.update_task("same-tz", &update).await.unwrap());
 
         let row = db.get_task_by_id("same-tz").await.unwrap().unwrap();
+        assert_eq!(row.name, "renamed");
+        assert_eq!(row.next_run, Some(1234));
+    }
+
+    /// A client that re-sends the stored schedule with a new name (the web
+    /// edit form) must not push a due run a whole interval out.
+    #[tokio::test]
+    async fn resending_the_stored_schedule_keeps_next_run() {
+        let db = test_db().await;
+        db.create_task(&cron_task("resend", "Asia/Tokyo", Some(1234)))
+            .await
+            .expect("create task");
+        let stored = db.get_task_by_id("resend").await.unwrap().unwrap();
+
+        let update = UpdateTask {
+            name: Some("renamed"),
+            prompt: None,
+            schedule_type: Some(&stored.schedule_type),
+            schedule_expr: Some(&stored.schedule_expr),
+            timezone: None,
+        };
+        assert!(db.update_task("resend", &update).await.unwrap());
+
+        let row = db.get_task_by_id("resend").await.unwrap().unwrap();
         assert_eq!(row.name, "renamed");
         assert_eq!(row.next_run, Some(1234));
     }

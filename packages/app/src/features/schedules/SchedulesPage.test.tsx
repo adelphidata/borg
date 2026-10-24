@@ -410,6 +410,26 @@ describe("SchedulesPage editing", () => {
     await waitFor(() => expect(screen.queryByText("Save")).toBeNull());
   });
 
+  it("leaves the schedule out when only the name changed, so the next run stays", async () => {
+    const daemon = fakeDaemon({ ...listing([task()]), UpdateScheduledTask: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Edit")).toBeTruthy());
+    click("Edit");
+    fireEvent.change(screen.getByPlaceholderText("Name"), { target: { value: "Briefing" } });
+    click("Save");
+
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UpdateScheduledTask")?.request).toEqual({
+        id: "t1",
+        name: "Briefing",
+        prompt: "summarise my mail",
+        scheduleType: "",
+        scheduleExpr: "",
+        timezone: "",
+      }),
+    );
+  });
+
   it("keeps the edit open when the daemon rejects it", async () => {
     const daemon = fakeDaemon({
       ...listing([task()]),

@@ -142,8 +142,12 @@ export function relativeTime(unix: number, now: number): string {
 export interface Schedules {
   query: QueryResult<adminPb.ScheduledTask[]>;
   create: (task: NewSchedule) => Promise<unknown>;
-  /** Rewrites a task's name, prompt and schedule; its zone stays as stored. */
-  update: (id: string, task: NewSchedule) => Promise<unknown>;
+  /**
+   * Rewrites a task's name and prompt, and its schedule when
+   * `scheduleChanged`; its zone stays as stored. A schedule that is sent
+   * moves the next run, so an unchanged one is left out.
+   */
+  update: (id: string, task: NewSchedule, scheduleChanged: boolean) => Promise<unknown>;
   remove: (id: string) => Promise<unknown>;
   pause: (id: string) => Promise<unknown>;
   resume: (id: string) => Promise<unknown>;
@@ -195,14 +199,14 @@ export function useSchedules(deps: unknown[] = []): Schedules {
     refresh,
   );
   const updateMutation = useMutation(
-    (borg, vars: { id: string; task: NewSchedule }) =>
+    (borg, vars: { id: string; task: NewSchedule; scheduleChanged: boolean }) =>
       borg.admin.updateScheduledTask({
         id: vars.id,
         name: vars.task.name,
         prompt: vars.task.prompt,
-        scheduleType: vars.task.scheduleType,
-        scheduleExpr: vars.task.scheduleExpr,
-        // Empty leaves the stored zone alone.
+        // Empty leaves the stored value alone.
+        scheduleType: vars.scheduleChanged ? vars.task.scheduleType : "",
+        scheduleExpr: vars.scheduleChanged ? vars.task.scheduleExpr : "",
         timezone: "",
       }),
     refresh,
@@ -227,7 +231,7 @@ export function useSchedules(deps: unknown[] = []): Schedules {
   return {
     query,
     create: (task) => createMutation.run(task),
-    update: (id, task) => updateMutation.run({ id, task }),
+    update: (id, task, scheduleChanged) => updateMutation.run({ id, task, scheduleChanged }),
     remove: (id) => deleteMutation.run(id),
     pause: (id) => pauseMutation.run(id),
     resume: (id) => resumeMutation.run(id),
