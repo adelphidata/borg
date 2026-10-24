@@ -26,8 +26,19 @@ async fn a_new_session_is_listed_stamped_and_forkable() {
         workspace.path().to_path_buf(),
     )
     .expect("workspace context");
+    // Evolution off: the SessionStart XP write signs with a key loaded from
+    // the OS keychain, which a test must never touch. The hook reads the
+    // flag from the settings table, so it is set there.
+    cortex::db::Database::open()
+        .await
+        .expect("db")
+        .set_setting("evolution.enabled", "false")
+        .await
+        .expect("disable evolution");
+    let mut config = Config::default();
+    config.evolution.enabled = false;
     let backend = AgentBackend::new(
-        Config::default(),
+        config,
         BorgMetrics::default(),
         None,
         None,
