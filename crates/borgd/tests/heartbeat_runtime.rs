@@ -579,3 +579,79 @@ async fn admin_subscribe_heartbeat_events_skips_no_llm_provider_without_invoking
         "whitespace-only provider must take the same short-circuit path as None"
     );
 }
+
+/// Records, at `start_turn` time, the session key and whether a session
+/// already exists on disk under exactly that id.
+struct SessionProbeExecutor {
+    seen: Mutex<Vec<(String, Option<String>)>>,
+}
+
+#[async_trait]
+impl SessionExecutor for SessionProbeExecutor {
+    async fn start_turn(
+        &self,
+        turn: InboundTurn,
+    ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+        let on_disk = cortex::session::Session::load(&turn.session_key)
+            .ok()
+            .map(|s| s.meta.id);
+        self.seen.lock().await.push((turn.session_key, on_disk));
+        let (tx, rx) = mpsc::channel::<AgentEvent>(1);
+        drop(tx);
+        Ok((rx, CancellationToken::new()))
+    }
+
+    async fn cancel(&self, _session_key: &str) -> bool {
+        true
+    }
+
+    async fn cancel_all(&self) -> usize {
+        0
+    }
+
+    async fn active_turns(&self) -> usize {
+        0
+    }
+}
+
+/// A poked check-in must run in the session stored under its deterministic
+/// `heartbeat:<source>` key. The daemon executor resumes a session by that
+/// key; with nothing on disk under it the agent mints a random-id session, so
+/// every `borg poke` added a new "*heartbeat tick*" conversation to the
+/// session list and parked one more host in the registry that no later tick
+/// could find.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_turn_runs_in_a_session_stored_under_its_key() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // SAFETY: never restored on purpose; the other tests here assert nothing
+    // on BORG_HOME-relative state, so pointing them at a tempdir only isolates
+    // their best-effort activity-log writes too.
+    unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
+
+    let executor = SessionProbeExecutor {
+        seen: Mutex::new(Vec::new()),
+    };
+    let mut config = Config::default();
+    config.llm.provider = Some("openrouter".to_string());
+    config.heartbeat.turn_timeout_secs = 5;
+
+    for source in [HeartbeatSource::Scheduled, HeartbeatSource::SessionStart] {
+        heartbeat::execute_heartbeat_turn(&executor, &config, source).await;
+    }
+
+    let seen = executor.seen.lock().await.clone();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "heartbeat:scheduled".to_string(),
+                Some("heartbeat:scheduled".to_string())
+            ),
+            (
+                "heartbeat:session_start".to_string(),
+                Some("heartbeat:session_start".to_string())
+            ),
+        ],
+        "each heartbeat turn must find its session already stored under its key"
+    );
+}

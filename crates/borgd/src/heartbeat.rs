@@ -553,6 +553,7 @@ pub async fn execute_heartbeat_turn(
     };
 
     let session_key = format!("heartbeat:{}", source.as_wire());
+    materialize_heartbeat_session(&session_key);
     let turn = InboundTurn {
         session_key,
         text: user_msg,
@@ -728,6 +729,18 @@ pub(crate) fn scheduled_session_key() -> String {
     format!("heartbeat:{}", HeartbeatSource::Scheduled.as_wire())
 }
 
+/// Materialize the heartbeat session under exactly `session_key` before a
+/// turn, so `AgentBackend::new`'s `load_session(session_key)` succeeds and the
+/// agent's `meta.id` becomes `session_key`. Without it every turn mints a fresh
+/// random-id session: each check-in lists as a new conversation, and its host
+/// stays in the registry (never found again under the key) for the daemon's
+/// lifetime.
+fn materialize_heartbeat_session(session_key: &str) {
+    if let Err(e) = cortex::session::ensure_session_on_disk(session_key) {
+        tracing::warn!("Heartbeat: could not materialize session '{session_key}': {e}");
+    }
+}
+
 /// What the conversation lists call a heartbeat session. Its first message is
 /// the tick prompt, which never titles it, so it otherwise lists as
 /// "Untitled" — a conversation the owner does not remember starting.
@@ -755,15 +768,10 @@ pub(crate) async fn run_scheduled_remediation_turn(
     timeout_secs: u64,
 ) -> CollectOutcome {
     let session_key = scheduled_session_key();
-    // Materialize the session under this exact id BEFORE the turn so
-    // `AgentBackend::new`'s `load_session(session_key)` succeeds and the
-    // agent's `meta.id` becomes `session_key` rather than a fresh random
-    // UUID. Without this the agent-created goal is stored under a random id
-    // and the budget / max-ticks / escalation queries below — which key on
+    // Without this the agent-created goal is stored under a random id and the
+    // budget / max-ticks / escalation queries below — which key on
     // `session_key` — would never find it.
-    if let Err(e) = cortex::session::ensure_session_on_disk(&session_key) {
-        tracing::warn!("Heartbeat remediation: could not materialize session '{session_key}': {e}");
-    }
+    materialize_heartbeat_session(&session_key);
     let turn = InboundTurn {
         session_key,
         text: user_msg,
