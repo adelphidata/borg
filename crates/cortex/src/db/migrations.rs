@@ -1339,6 +1339,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_events_dedup
 CREATE INDEX IF NOT EXISTS idx_sub_events_sub_time
     ON subscription_events(subscription_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sub_events_status ON subscription_events(status);
+CREATE INDEX IF NOT EXISTS idx_sub_events_run
+    ON subscription_events(run_id) WHERE run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS providers (
     id              TEXT PRIMARY KEY,
@@ -1677,6 +1679,7 @@ mod tests {
             "subscriptions",
             "subscription_events",
             "idx_sub_events_dedup",
+            "idx_sub_events_run",
             "apns_device_tokens",
             "apns_device_tokens_active",
             "idx_sessions_created_at",
