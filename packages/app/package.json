@@ -1,6 +1,6 @@
 {
   "name": "@borg/app",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "description": "The shared Borg product shell — routes, feature pages, and providers used by both apps/desktop and apps/web",
   "license": "MIT",
