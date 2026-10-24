@@ -723,8 +723,9 @@ impl Database {
     ///
     /// Runnable means: `pending`, its subscription `active`, no run of that
     /// subscription in flight (one run at a time per subscription), and the
-    /// subscription under its hourly run budget. Test runs do not count
-    /// toward that budget.
+    /// subscription under its hourly run budget. A test event neither counts
+    /// toward that budget nor waits for it: Test must show what a run does
+    /// even on a subscription that spent its hour.
     pub async fn claim_next_subscription_event(
         &self,
         run_id: &str,
@@ -780,10 +781,11 @@ impl Database {
                      WHERE e.status = 'pending' AND (s.status = 'active' OR e.kind = 'test') \
                      AND NOT EXISTS (SELECT 1 FROM subscription_events r \
                          WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
-                     AND (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
+                     AND (e.kind = 'test' OR \
+                         (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
                          WHERE h.subscription_id = e.subscription_id AND h.run_id IS NOT NULL \
                          AND h.started_at > ?1 AND (h.kind IS NULL OR h.kind != 'test')) \
-                         < s.rate_limit_per_hour \
+                         < s.rate_limit_per_hour) \
                      AND e.subscription_id NOT IN (SELECT value FROM json_each(?2)) \
                      ORDER BY e.received_at, e.id LIMIT 1",
                 params!(now - 3600, skip_json),
@@ -1817,6 +1819,41 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_test_event_runs_while_the_hourly_budget_is_spent() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.update_subscription(
+            &s.id,
+            &SubscriptionUpdate {
+                rate_limit_per_hour: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.insert_subscription_event(&event(&s.id, Some("x"), 10), LIMITS)
+            .await
+            .unwrap();
+        let now = 5_000;
+        db.claim_next_subscription_event("run_1", now)
+            .await
+            .unwrap()
+            .unwrap();
+        db.finish_subscription_run(&s.id, "run_1", "succeeded", None, None, 1)
+            .await
+            .unwrap();
+        db.insert_subscription_test_event(&s.id, "Test: x", "{}")
+            .await
+            .unwrap();
+        let lead = db
+            .claim_next_subscription_event("run_t", now + 10)
+            .await
+            .unwrap()
+            .expect("a test runs even when the hour's budget is spent");
+        assert_eq!(lead.kind.as_deref(), Some("test"));
     }
 
     #[tokio::test]
