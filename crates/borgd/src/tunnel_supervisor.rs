@@ -187,17 +187,24 @@ impl TunnelSupervisor {
     /// the way `stop()` on a fresh tunnel might (idempotency invariant).
     pub async fn stop(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        if let Some(t) = inner.handle.take() {
-            t.stop().await?;
-        }
+        let stopped = match inner.handle.take() {
+            Some(t) => t.stop().await,
+            None => Ok(()),
+        };
+        // The handle is gone either way, so the address is too: an endpoint
+        // shown after this must not name a tunnel that no longer runs.
         inner.snapshot = TunnelSnapshot {
             provider: inner.snapshot.provider.clone(),
             running: false,
             public_url: String::new(),
-            last_error: String::new(),
+            last_error: stopped
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
         };
         note_public_url(&inner.snapshot);
-        Ok(())
+        stopped
     }
 
     /// Cheap read of the most recent snapshot. Refreshes `public_url` /
