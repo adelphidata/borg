@@ -486,6 +486,47 @@ describe("SettingDetailPage for provider and model", () => {
     );
   });
 
+  it("brings the new provider's setup into view after a switch", async () => {
+    // The setup sits under the whole provider list; a missing key there is
+    // only seen if the page scrolls to it.
+    const scrolled: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const daemon = fakeDaemon({ ...DAEMON, SetSetting: {} });
+      mount("/settings/provider", daemon);
+      await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+      click(screen.getByText("OpenRouter"));
+      await waitFor(() => expect(scrolled).toHaveLength(1));
+      expect(scrolled[0]!.textContent).toMatch(/Set up/);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it("does not scroll when the provider write fails", async () => {
+    const scrolled: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      scrolled.push(this);
+    };
+    try {
+      const daemon = fakeDaemon({
+        ...DAEMON,
+        SetSetting: new BorgError(GrpcStatus.Internal, "disk full"),
+      });
+      mount("/settings/provider", daemon);
+      await waitFor(() => expect(screen.getByText("OpenRouter")).toBeTruthy());
+      click(screen.getByText("OpenRouter"));
+      await waitFor(() => expect(screen.getByText(/disk full/)).toBeTruthy());
+      expect(scrolled).toEqual([]);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
   it("leaves the model alone when the provider write fails", async () => {
     const daemon = fakeDaemon({
       ...DAEMON,

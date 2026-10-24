@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import {
   BackLink,
@@ -360,6 +360,9 @@ function CatalogDetail({
   // The provider a switch moved to when its model could not follow: the
   // write failed, or the provider has no list to take a default from.
   const [modelStranded, setModelStranded] = useState<{ label: string; typed: boolean }>();
+  // The new provider's setup sits under a long list, below the fold; a
+  // switch brings it into view so a missing key is seen before a message.
+  const setupRef = useRef<HTMLDivElement>(null);
 
   const status = setup.state === "ready" ? setup.data : undefined;
   const options = status ? catalogOptions(basic.catalog, status, provider) : [];
@@ -377,6 +380,7 @@ function CatalogDetail({
   const pick = async (value: string) => {
     setModelStranded(undefined);
     if (!(await save(entry.key, value)) || basic.catalog !== "provider" || !status) return;
+    setupRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
     const next = providerOf(status.providers, value);
     const known = modelsOf(status.providers, value).some((m) => m.id === model);
     if (!next || known) return;
@@ -432,7 +436,11 @@ function CatalogDetail({
           </Link>
         </div>
       )}
-      {basic.catalog === "provider" && <ProviderSetup provider={entry.value} settings={settings} />}
+      {basic.catalog === "provider" && (
+        <div ref={setupRef} className="flex scroll-mt-6 flex-col gap-7">
+          <ProviderSetup provider={entry.value} settings={settings} />
+        </div>
+      )}
     </>
   );
 }
