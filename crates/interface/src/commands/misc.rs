@@ -287,10 +287,8 @@ pub(crate) async fn run_away(message: Option<String>) -> Result<()> {
                 .unwrap_or("(default)");
             println!("Agent set to away: {msg}");
         }
-        Ok(r) => println!("Away failed: {}", r.status()),
-        Err(_) => {
-            println!("Could not reach gateway. Is it running?");
-        }
+        Ok(r) => anyhow::bail!("Away failed: {}", r.status()),
+        Err(_) => anyhow::bail!("Could not reach the gateway at {url}. Is borgd running?"),
     }
     Ok(())
 }
@@ -309,10 +307,8 @@ pub(crate) async fn run_available() -> Result<()> {
         .await
     {
         Ok(r) if r.status().is_success() => println!("Agent set to available."),
-        Ok(r) => println!("Available failed: {}", r.status()),
-        Err(_) => {
-            println!("Could not reach gateway. Is it running?");
-        }
+        Ok(r) => anyhow::bail!("Available failed: {}", r.status()),
+        Err(_) => anyhow::bail!("Could not reach the gateway at {url}. Is borgd running?"),
     }
     Ok(())
 }
