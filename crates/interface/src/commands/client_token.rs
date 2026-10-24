@@ -48,13 +48,23 @@ async fn run_issue(label: &str, scopes: &str) -> Result<()> {
     println!();
     println!("    {}", issued.plaintext);
     println!();
-    println!(
+    let config = cortex::config::Config::load_from_db()
+        .await
+        .context("loading gateway settings")?;
+    println!("{}", issued_hint(&config.gateway.host, config.gateway.port));
+    Ok(())
+}
+
+/// What to do with a token just issued, naming the web UI this install's
+/// gateway serves.
+fn issued_hint(host: &str, port: u16) -> String {
+    let web_ui = super::web::web_ui_url(host, port)
+        .unwrap_or_else(|_| format!("http://{}:{port}/ui/", host.trim()));
+    format!(
         "Copy it now — the plaintext is not stored and cannot be recovered. \
          Use it as `Authorization: Bearer <token>` against the OpenAI-compat \
-         and MCP HTTP endpoints, or paste it into the web UI at \
-         http://127.0.0.1:7842/ui/ to sign in."
-    );
-    Ok(())
+         and MCP HTTP endpoints, or paste it into the web UI at {web_ui} to sign in."
+    )
 }
 
 async fn run_list() -> Result<()> {
@@ -108,4 +118,16 @@ async fn run_revoke(label: &str) -> Result<()> {
 
 fn truncate(s: &str, max: usize) -> String {
     cortex::util::truncate::pad_or_truncate(s, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::issued_hint;
+
+    #[test]
+    fn hint_names_the_configured_gateway() {
+        assert!(issued_hint("127.0.0.1", 7995).contains("http://127.0.0.1:7995/ui/ to sign in"));
+        assert!(issued_hint("0.0.0.0", 8000).contains("http://127.0.0.1:8000/ui/"));
+        assert!(issued_hint("borg.example.net", 443).contains("http://borg.example.net:443/ui/"));
+    }
 }

@@ -34,6 +34,13 @@ fn stale_web_labels(rows: &[cortex::auth::tokens::TokenRow]) -> Vec<&str> {
 /// Only loopback hosts are accepted: the URL carries a live token, and a
 /// gateway reachable from elsewhere is not the daemon on this machine.
 pub(crate) fn sign_in_url(host: &str, port: u16, token: &str) -> Result<String> {
+    // Hash router: `#/` is the app's root route and `?token=` its query, so
+    // the whole thing stays client-side.
+    Ok(format!("{}#/?token={token}", web_ui_url(host, port)?))
+}
+
+/// The root of the web UI the local gateway at `host:port` serves.
+pub(crate) fn web_ui_url(host: &str, port: u16) -> Result<String> {
     let host = host.trim();
     let loopback = matches!(
         host,
@@ -52,9 +59,7 @@ pub(crate) fn sign_in_url(host: &str, port: u16, token: &str) -> Result<String> 
         "::1" => "[::1]",
         other => other,
     };
-    // Hash router: `#/` is the app's root route and `?token=` its query, so
-    // the whole thing stays client-side.
-    Ok(format!("http://{host}:{port}/ui/#/?token={token}"))
+    Ok(format!("http://{host}:{port}/ui/"))
 }
 
 /// Hand `url` to the desktop's default browser. Best effort by nature; the
