@@ -723,7 +723,8 @@ impl Database {
     ///
     /// Runnable means: `pending`, its subscription `active`, no run of that
     /// subscription in flight (one run at a time per subscription), and the
-    /// subscription under its hourly run budget.
+    /// subscription under its hourly run budget. Test runs do not count
+    /// toward that budget.
     pub async fn claim_next_subscription_event(
         &self,
         run_id: &str,
@@ -781,7 +782,8 @@ impl Database {
                          WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
                      AND (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
                          WHERE h.subscription_id = e.subscription_id AND h.run_id IS NOT NULL \
-                         AND h.started_at > ?1) < s.rate_limit_per_hour \
+                         AND h.started_at > ?1 AND (h.kind IS NULL OR h.kind != 'test')) \
+                         < s.rate_limit_per_hour \
                      AND e.subscription_id NOT IN (SELECT value FROM json_each(?2)) \
                      ORDER BY e.received_at, e.id LIMIT 1",
                 params!(now - 3600, skip_json),
@@ -816,7 +818,7 @@ impl Database {
                      AND (kind IS NULL OR kind != 'test') \
                      AND NOT EXISTS (SELECT 1 FROM subscription_events l \
                          WHERE l.run_id = ?2 AND l.kind = 'test') \
-                     AND (kind = 'test' OR (SELECT status FROM subscriptions WHERE id = ?1) = 'active') \
+                     AND (SELECT status FROM subscriptions WHERE id = ?1) = 'active' \
                      AND (?5 IS NULL OR ( \
                          json_extract(origin, '$.channel') IS json_extract(?5, '$.channel') \
                          AND COALESCE(json_extract(origin, '$.chat'), json_extract(origin, '$.sender')) \
@@ -1008,12 +1010,14 @@ impl Database {
     }
 
     /// Runs started since `since` across every subscription (the daily cap).
+    /// Test runs are not counted: Test never uses up a limit.
     pub async fn subscription_runs_since(&self, since: i64) -> Result<i64> {
         let mut rows = self
             .conn
             .query(
                 "SELECT COUNT(DISTINCT run_id) FROM subscription_events \
-                 WHERE run_id IS NOT NULL AND started_at > ?1",
+                 WHERE run_id IS NOT NULL AND started_at > ?1 \
+                 AND (kind IS NULL OR kind != 'test')",
                 params!(since),
             )
             .await?;
@@ -1296,6 +1300,49 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a failed test does not count toward the failure breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runs_do_not_use_the_hourly_or_daily_run_budget() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.update_subscription(
+            &s.id,
+            &SubscriptionUpdate {
+                rate_limit_per_hour: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.insert_subscription_test_event(&s.id, "Test: x", "{}")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp() + 1;
+        let lead = db
+            .claim_next_subscription_event("run_t", now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead.kind.as_deref(), Some("test"));
+        db.finish_subscription_run(&s.id, "run_t", "succeeded", None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.subscription_runs_since(0).await.unwrap(),
+            0,
+            "a test run is not counted against the daily cap"
+        );
+        db.insert_subscription_event(&event(&s.id, Some("real"), now), LIMITS)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_next_subscription_event("run_1", now + 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "the one run this hour is still free after a test"
         );
     }
 
