@@ -228,6 +228,7 @@ pub async fn start(
                     host: host.clone(),
                     config_rx: rx.clone(),
                     bus: bus.clone(),
+                    defer_backoff: crate::subscriptions::dispatcher::DEFER_BACKOFF,
                 };
                 let cancel = cancel.child_token();
                 let liveness = liveness_for_loop.clone();

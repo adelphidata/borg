@@ -161,6 +161,17 @@ pub(crate) fn materialize_session(key: &str, name: &str) {
     }
 }
 
+/// How a run task ended, when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The run finished (or had nothing left to run).
+    Ran,
+    /// No turn could start; the events wait again. The dispatcher holds the
+    /// subscription back for a moment, or it would claim the same events
+    /// again at once, in a loop, while the cause lasts.
+    Deferred,
+}
+
 /// Run the events of `lead`'s run. Errors are returned to the dispatcher,
 /// which closes the run as failed with the message.
 pub(crate) async fn execute(
@@ -168,14 +179,14 @@ pub(crate) async fn execute(
     config: Config,
     bus: SubscriptionBus,
     lead: SubscriptionEventRow,
-) -> Result<()> {
+) -> Result<Ended> {
     let Some(run_id) = lead.run_id.clone() else {
         anyhow::bail!("claimed event {} has no run", lead.id);
     };
     let db = Database::open().await?;
     let Some(sub) = db.get_subscription(&lead.subscription_id).await? else {
         // Deleted while it waited; its events went with it.
-        return Ok(());
+        return Ok(Ended::Ran);
     };
     let key = session_key(&sub.id);
 
@@ -187,7 +198,7 @@ pub(crate) async fn execute(
         if waited.elapsed() >= BUSY_WAIT {
             db.release_subscription_run(&run_id).await?;
             tracing::info!(subscription = %sub.id, "subscription run waited for a busy session; events wait again");
-            return Ok(());
+            return Ok(Ended::Deferred);
         }
         tokio::time::sleep(BUSY_POLL).await;
     }
@@ -240,7 +251,7 @@ pub(crate) async fn execute(
         Ok((_, cancel)) if cancel.is_cancelled() => {
             db.release_subscription_run(&run_id).await?;
             tracing::info!(subscription = %sub.id, "subscription run deferred; events wait again");
-            return Ok(());
+            return Ok(Ended::Deferred);
         }
         Ok((rx, cancel)) => {
             publish_started(&bus, &sub, &lead, &run_id, count, now);
@@ -313,7 +324,7 @@ pub(crate) async fn execute(
         event_count: count,
         emitted_at_unix: chrono::Utc::now().timestamp(),
     });
-    Ok(())
+    Ok(Ended::Ran)
 }
 
 fn publish_started(

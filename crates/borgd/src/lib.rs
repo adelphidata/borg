@@ -70,4 +70,36 @@ pub(crate) mod test_env {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// `BORG_HOME` pointed at a fresh directory for the guard's life, under
+    /// [`env_lock`], so `Database::open` and `Config::load_from_db` in the
+    /// code under test never touch the real `~/.borg`.
+    pub(crate) struct IsolatedHome {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl IsolatedHome {
+        pub(crate) fn new() -> Self {
+            let lock = env_lock();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let prev = std::env::var("BORG_HOME").ok();
+            std::env::set_var("BORG_HOME", tmp.path());
+            Self {
+                prev,
+                _tmp: tmp,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("BORG_HOME", v),
+                None => std::env::remove_var("BORG_HOME"),
+            }
+        }
+    }
 }

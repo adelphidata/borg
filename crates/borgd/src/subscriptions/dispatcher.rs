@@ -6,10 +6,11 @@
 //! boot reset hands their events back to the queue: no run is ever left
 //! orphaned and none runs twice at once.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use cortex::config::Config;
@@ -40,7 +41,7 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 struct Joined {
     subscription_id: String,
     run_id: String,
-    result: std::result::Result<Result<()>, String>,
+    result: std::result::Result<Result<run::Ended>, String>,
 }
 
 /// The dispatcher's moving parts.
@@ -52,7 +53,12 @@ pub(crate) struct Dispatcher {
     pub config_rx: watch::Receiver<Config>,
     /// Activity for the app.
     pub bus: SubscriptionBus,
+    /// How long a subscription whose run was deferred is passed over.
+    pub defer_backoff: Duration,
 }
+
+/// Production [`Dispatcher::defer_backoff`].
+pub(crate) const DEFER_BACKOFF: Duration = TICK;
 
 impl Dispatcher {
     /// Run until `cancel`. Bumps `liveness` every pass, at least once per
@@ -71,6 +77,8 @@ impl Dispatcher {
         }
         let mut runs: JoinSet<Joined> = JoinSet::new();
         let mut cap_logged_at: i64 = 0;
+        // Subscriptions whose last run was deferred, until when.
+        let mut held_back: HashMap<String, Instant> = HashMap::new();
         loop {
             liveness.fetch_add(1, Ordering::Relaxed);
             let config = self.config_rx.borrow().clone();
@@ -85,8 +93,9 @@ impl Dispatcher {
                 // A database error (the write lock held by a burst of
                 // inserts) costs one pass, never the loop and the runs in
                 // flight with it.
+                held_back.retain(|_, until| *until > Instant::now());
                 if let Err(e) = self
-                    .start_runs(&db, &config, &mut runs, &mut cap_logged_at)
+                    .start_runs(&db, &config, &mut runs, &mut cap_logged_at, &held_back)
                     .await
                 {
                     tracing::warn!("subscriptions: could not start runs this pass: {e:#}");
@@ -102,7 +111,15 @@ impl Dispatcher {
                 }
                 Some(joined) = runs.join_next(), if !runs.is_empty() => {
                     match joined {
-                        Ok(joined) => self.reap(&db, &config, joined).await,
+                        Ok(joined) => {
+                            if matches!(joined.result, Ok(Ok(run::Ended::Deferred))) {
+                                held_back.insert(
+                                    joined.subscription_id.clone(),
+                                    Instant::now() + self.defer_backoff,
+                                );
+                            }
+                            self.reap(&db, &config, joined).await;
+                        }
                         // Panics are caught inside the task, so this is an
                         // abort; its events wait for the boot reset.
                         Err(e) => tracing::warn!("subscriptions: a run task ended abnormally: {e}"),
@@ -121,11 +138,13 @@ impl Dispatcher {
         config: &Config,
         runs: &mut JoinSet<Joined>,
         cap_logged_at: &mut i64,
+        held_back: &HashMap<String, Instant>,
     ) -> Result<()> {
         let max = config.subscriptions.max_concurrent.max(1);
-        // Subscriptions whose session the user is chatting in: passed over
-        // for this pass, so they hold neither a slot nor the others up.
-        let mut busy: Vec<String> = Vec::new();
+        // Subscriptions whose session the user is chatting in, and those
+        // just deferred: passed over, so they hold neither a slot nor the
+        // others up.
+        let mut busy: Vec<String> = held_back.keys().cloned().collect();
         while runs.len() < max {
             let now = chrono::Utc::now().timestamp();
             let today = db.subscription_runs_since(now - DAY_SECS).await?;
@@ -179,7 +198,7 @@ impl Dispatcher {
     /// stay `running` and block the subscription.
     async fn reap(&self, db: &Database, config: &Config, joined: Joined) {
         let message = match joined.result {
-            Ok(Ok(())) => return,
+            Ok(Ok(_)) => return,
             Ok(Err(e)) => format!("Borg hit an internal error: {e:#}"),
             Err(panic) => format!("Borg hit an internal error: {panic}"),
         };
@@ -273,37 +292,6 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
-    /// `Database::open` reads `BORG_HOME`; point it at a fresh directory and
-    /// hold the crate-wide env lock.
-    struct HomeGuard {
-        prev: Option<String>,
-        _tmp: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl HomeGuard {
-        fn isolated() -> Self {
-            let lock = crate::test_env::env_lock();
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let prev = std::env::var("BORG_HOME").ok();
-            std::env::set_var("BORG_HOME", tmp.path());
-            Self {
-                prev,
-                _tmp: tmp,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("BORG_HOME", v),
-                None => std::env::remove_var("BORG_HOME"),
-            }
-        }
-    }
-
     /// Records turns and sends; answers every turn with `reply`, or with an
     /// agent error when `reply` is `None`.
     #[derive(Default)]
@@ -319,6 +307,7 @@ mod tests {
         defer: std::sync::atomic::AtomicBool,
         /// `borg pause` is on.
         stopped: std::sync::atomic::AtomicBool,
+        deferrals: std::sync::atomic::AtomicUsize,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
         peak: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -350,6 +339,7 @@ mod tests {
             turn: InboundTurn,
         ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
             if self.defer.load(Ordering::SeqCst) {
+                self.deferrals.fetch_add(1, Ordering::SeqCst);
                 let cancelled = CancellationToken::new();
                 cancelled.cancel();
                 let (_, rx) = mpsc::channel(1);
@@ -455,6 +445,7 @@ mod tests {
             host,
             config_rx: rx,
             bus: bus.clone(),
+            defer_backoff: Duration::from_millis(200),
         };
         let cancel = CancellationToken::new();
         let token = cancel.clone();
@@ -491,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_queue_of_fifty_one_events_is_a_full_digest_and_the_rest() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
         for i in 0..51 {
@@ -532,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reply_goes_to_the_thread_that_fired_it_and_silence_goes_nowhere() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, Some("origin")).await;
         let origin = r#"{"channel":"slack","sender":"U1","chat":"C9","thread_id":"1.0","session_key":"U1:1.0"}"#;
@@ -565,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_runs_in_a_row_pause_the_subscription_and_say_so_once() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
         let mut config = Config::default();
@@ -651,17 +642,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_deferred_turn_hands_its_events_back_instead_of_closing_them() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
         add_event(&db, &sub, "a", None).await;
         let host = RecordingHost::with(Some("done"), |h| h.defer = true.into());
         let running = start(host.clone(), Config::default());
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(eventually(|| host.deferrals.load(Ordering::SeqCst) >= 1).await);
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             statuses(&db, &sub).await,
             vec!["pending"],
             "not closed as silent"
+        );
+        let deferrals = host.deferrals.load(Ordering::SeqCst);
+        assert!(
+            deferrals <= 5,
+            "a deferred subscription is held back, not claimed again at once: {deferrals}"
         );
 
         host.defer.store(false, Ordering::SeqCst);
@@ -676,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_is_claimed_while_the_emergency_stop_holds() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
         add_event(&db, &sub, "a", None).await;
@@ -690,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_session_does_not_hold_up_other_subscriptions() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let chatting = active_sub(&db, None).await;
         let quiet = active_sub(&db, None).await;
@@ -719,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_never_exceed_max_concurrent() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let mut subs = Vec::new();
         for i in 0..4 {
@@ -741,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_daily_cap_holds_events_back() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let a = active_sub(&db, None).await;
         let b = active_sub(&db, None).await;
@@ -763,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_of_a_run_cut_short_by_a_restart_run_again() {
-        let _home = HomeGuard::isolated();
+        let _home = crate::test_env::IsolatedHome::new();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
         add_event(&db, &sub, "a", None).await;
