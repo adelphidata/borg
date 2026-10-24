@@ -65,11 +65,7 @@ pub fn on_channel_message(
         channel: channel.to_string(),
         sender: inbound.sender_id.clone(),
         chat: inbound.channel_id.clone(),
-        thread_id: inbound
-            .thread_ts
-            .clone()
-            .or_else(|| inbound.thread_id.clone())
-            .or_else(|| inbound.message_id.clone()),
+        thread_id: reply_thread(channel, inbound),
         session_key: Some(session_key.to_string()),
     };
     let channel = channel.to_string();
@@ -87,6 +83,22 @@ pub fn on_channel_message(
             tracing::warn!(%channel, "subscription tap: store event: {e:#}");
         }
     });
+}
+
+/// The thread a reply to `inbound` goes in. Slack threads hang off a
+/// message's timestamp, so a top-level message starts its own thread.
+/// Elsewhere a message id is not a thread (Telegram's `message_thread_id`
+/// names a forum topic), so only a real thread id is kept.
+fn reply_thread(channel: &str, inbound: &InboundMessage) -> Option<String> {
+    inbound
+        .thread_ts
+        .clone()
+        .or_else(|| inbound.thread_id.clone())
+        .or_else(|| {
+            (channel == "slack")
+                .then(|| inbound.message_id.clone())
+                .flatten()
+        })
 }
 
 /// Gives the slot back when the task ends, panics included.
@@ -170,6 +182,17 @@ mod tests {
             "reaction": reaction,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn only_slack_turns_a_message_id_into_a_thread() {
+        let mut top_level = inbound("hi", None);
+        top_level.thread_ts = None;
+        assert_eq!(reply_thread("slack", &top_level).as_deref(), Some("1.2"));
+        assert_eq!(reply_thread("telegram", &top_level), None);
+        assert_eq!(reply_thread("discord", &top_level), None);
+        let threaded = inbound("hi", None);
+        assert_eq!(reply_thread("telegram", &threaded).as_deref(), Some("1.0"));
     }
 
     #[test]
