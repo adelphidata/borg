@@ -66,12 +66,17 @@ where
 {
     let mut restart = false;
     loop {
-        match spawn(outer.child_token(), restart).await {
+        let token = outer.child_token();
+        match spawn(token.clone(), restart).await {
             Ok(()) => {}
             Err(e) if e.is_cancelled() => {}
             Err(e) => return Err(anyhow::anyhow!("gateway task join error: {e}")),
         }
-        if outer.is_cancelled() {
+        // Only a stop someone asked for (its own token cancelled) starts a
+        // new gateway. A gateway that ended by itself — a failed bind, a
+        // construction error — goes back to the supervisor, whose backoff
+        // and crash cap apply; looping here would retry it with no pause.
+        if outer.is_cancelled() || !token.is_cancelled() {
             return Ok(());
         }
         tracing::info!("gateway stopped on request; starting it again");
@@ -492,6 +497,27 @@ mod tests {
             vec![false, true],
             "a restart must start a second gateway on reloaded config"
         );
+    }
+
+    /// A gateway that ends by itself (a failed bind returns `Ok` after
+    /// logging) is not a requested restart: the loop hands it back to the
+    /// supervisor instead of binding again at once, forever.
+    #[tokio::test]
+    async fn a_gateway_that_ends_by_itself_is_not_restarted() {
+        let outer = CancellationToken::new();
+        let mut spawns = 0;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_gateway_incarnations(outer.clone(), |_token, _restart| {
+                spawns += 1;
+                async move { tokio::spawn(async {}).await }
+            }),
+        )
+        .await
+        .expect("a gateway that ended by itself must not loop");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(spawns, 1, "only one gateway may start");
     }
 
     async fn in_memory_db() -> cortex::db::Database {
