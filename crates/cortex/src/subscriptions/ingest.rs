@@ -146,6 +146,7 @@ mod tests {
         let origin = EventOrigin {
             channel: "slack".into(),
             sender: "U1".into(),
+            chat: Some("C1".into()),
             thread_id: Some("t1".into()),
             session_key: None,
         };

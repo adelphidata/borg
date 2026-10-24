@@ -1391,7 +1391,7 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let max_iterations = self.config.conversation.max_iterations as usize;
+        let max_iterations = crate::subscriptions::step_limit(&self.config, &self.session.meta.id);
         let mut iteration: usize = 0;
         let mut needs_response = false;
         let mut nudged_for_response = false;

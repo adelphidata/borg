@@ -393,6 +393,19 @@ impl Database {
         self.get_subscription(id).await
     }
 
+    /// Record that the sender reached the subscription, without storing an
+    /// event. Used while it is paused, so the app can show that the sender
+    /// is set up before the user turns it on.
+    pub async fn mark_subscription_seen(&self, id: &str, now: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE subscriptions SET last_event_at = ?2 WHERE id = ?1",
+                params!(id, now),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Set the status. Setting `active` clears a storm's error and the
     /// dropped counter and restarts the burst windows, which is what "Resume"
     /// means to the user: without the restart, the events that tripped the
@@ -738,6 +751,22 @@ impl Database {
             Some(row) => Ok(Some(map_event(&row)?)),
             None => Ok(None),
         }
+    }
+
+    /// Hand every event of a run that has not started back to the queue, as
+    /// if it had never been claimed. Used when the subscription's session is
+    /// busy (the user is chatting in it): the run waits instead of being lost,
+    /// and does not count against the hourly budget.
+    pub async fn release_subscription_run(&self, run_id: &str) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE subscription_events SET status = 'pending', run_id = NULL, started_at = NULL \
+                 WHERE run_id = ?1 AND status = 'running'",
+                params!(run_id),
+            )
+            .await?;
+        Ok(n)
     }
 
     /// Close one event that will not run (did not match the filter).
@@ -1269,6 +1298,39 @@ mod tests {
             again.run_id.as_deref(),
             Some("run_2"),
             "a reset event runs again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_run_waits_and_does_not_use_the_hourly_budget() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.update_subscription(
+            &s.id,
+            &SubscriptionUpdate {
+                rate_limit_per_hour: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.insert_subscription_event(&event(&s.id, Some("a"), 10), LIMITS)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.claim_next_subscription_event("run_1", now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.release_subscription_run("run_1").await.unwrap(), 1);
+        let again = db
+            .claim_next_subscription_event("run_2", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.and_then(|e| e.run_id).as_deref(),
+            Some("run_2"),
+            "a released run is not a run: the budget of one still allows this claim"
         );
     }
 

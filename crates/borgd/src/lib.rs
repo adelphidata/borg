@@ -44,6 +44,9 @@ pub mod scheduler;
 pub mod session;
 pub mod session_activity;
 pub mod session_heartbeat;
+/// Subscriptions: the dispatcher that turns outside and internal events into
+/// agent runs, and the activity bus the app listens to.
+pub mod subscriptions;
 pub mod supervisor;
 pub mod task_preflight;
 pub mod task_runner;

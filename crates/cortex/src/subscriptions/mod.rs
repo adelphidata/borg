@@ -36,6 +36,19 @@ pub fn is_subscription_session(session_key: &str) -> bool {
     session_key.starts_with(SESSION_PREFIX)
 }
 
+/// Agent-loop steps a turn in `session_id` may take. A subscription run gets
+/// the lower `subscriptions.max_steps`: nobody watches it, and a burst may
+/// start many of them, so a confused run stops early instead of spending
+/// the full interactive budget.
+pub fn step_limit(config: &crate::config::Config, session_id: &str) -> usize {
+    let interactive = config.conversation.max_iterations as usize;
+    if is_subscription_session(session_id) {
+        interactive.min(config.subscriptions.max_steps.max(1) as usize)
+    } else {
+        interactive
+    }
+}
+
 /// Where a subscription's events come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,12 +126,27 @@ pub struct EventOrigin {
     pub channel: String,
     /// Sender id on that channel.
     pub sender: String,
+    /// The chat the message was in (a Slack or Discord channel id, a
+    /// Telegram chat id). A reply goes here, so "reply where it came from"
+    /// answers in the channel, not in the sender's direct messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
     /// Thread to reply in, when the channel has threads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// The gateway session key of the conversation the message belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
+}
+
+impl EventOrigin {
+    /// The address a reply is sent to: the chat, else the sender.
+    pub fn reply_address(&self) -> &str {
+        self.chat
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .unwrap_or(&self.sender)
+    }
 }
 
 /// Prefix of a subscription id.
@@ -190,6 +218,27 @@ mod tests {
         let k = generate_key();
         assert!(k.starts_with(KEY_PREFIX) && k.len() == KEY_PREFIX.len() + 64);
         assert_ne!(k, generate_key());
+    }
+
+    #[test]
+    fn subscription_runs_get_the_lower_step_limit() {
+        let mut config = crate::config::Config::default();
+        config.conversation.max_iterations = 200;
+        config.subscriptions.max_steps = 40;
+        assert_eq!(step_limit(&config, &session_key("sub_x")), 40);
+        assert_eq!(step_limit(&config, "U1:thread"), 200);
+        config.conversation.max_iterations = 10;
+        assert_eq!(
+            step_limit(&config, &session_key("sub_x")),
+            10,
+            "never above the interactive limit"
+        );
+        config.subscriptions.max_steps = 0;
+        assert_eq!(
+            step_limit(&config, &session_key("sub_x")),
+            1,
+            "zero still allows one step"
+        );
     }
 
     #[test]

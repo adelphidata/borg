@@ -137,10 +137,20 @@ async fn events_handler(
     // A handshake (GitHub's ping) is answered even while paused: new
     // subscriptions start paused, and the provider's setup check must pass.
     if normalized.handshake {
+        wake::report_seen(&sub.id);
         return reply(StatusCode::OK, json!({ "ok": true, "handshake": true }));
     }
 
     if sub.status != status::ACTIVE {
+        if sub.status == status::PAUSED {
+            if let Err(e) = db
+                .mark_subscription_seen(&sub.id, chrono::Utc::now().timestamp())
+                .await
+            {
+                tracing::warn!(subscription = %sub.id, "subscription endpoint: mark seen: {e:#}");
+            }
+            wake::report_seen(&sub.id);
+        }
         let message = if sub.status == status::STORM {
             "This subscription paused itself after a burst. Resume it in Borg."
         } else {
@@ -190,7 +200,7 @@ async fn events_handler(
     };
     match db.insert_subscription_event(&event, state.limits).await {
         Ok(InsertOutcome::Inserted(event_id)) => {
-            wake::poke();
+            wake::report_seen(&sub.id);
             reply(
                 StatusCode::ACCEPTED,
                 json!({ "ok": true, "event_id": event_id }),
@@ -422,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_paused_subscription_answers_409_only_after_auth() {
-        let (app, _db, id, _tmp) = setup("custom", "bearer", "paused").await;
+        let (app, db, id, _tmp) = setup("custom", "bearer", "paused").await;
         assert_eq!(
             send(&app, post(&id, &[], "{}")).await.0,
             StatusCode::UNAUTHORIZED
@@ -430,6 +440,18 @@ mod tests {
         let (code, body) = send(&app, post(&id, &[BEARER], "{}")).await;
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(body["status"], "paused");
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert!(
+            row.last_event_at.is_some(),
+            "the setup card can see the sender is wired up"
+        );
+        assert!(
+            db.list_subscription_events(&id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is stored"
+        );
     }
 
     #[tokio::test]

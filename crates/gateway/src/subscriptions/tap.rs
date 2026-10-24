@@ -32,6 +32,7 @@ pub fn on_channel_message(
     let origin = EventOrigin {
         channel: channel.to_string(),
         sender: inbound.sender_id.clone(),
+        chat: inbound.channel_id.clone(),
         thread_id: inbound
             .thread_ts
             .clone()

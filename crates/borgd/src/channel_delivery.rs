@@ -87,6 +87,39 @@ pub(crate) fn prepare_outbound<'a>(
     )
 }
 
+/// Send `text` along a stored `(channel, target)` route (a bare recipient id
+/// or the `{sender, thread_id, session_key}` JSON an origin-resolved route
+/// stores), then mirror it into the chat session the target names, so the
+/// agent there remembers what was said and a reply continues coherently.
+///
+/// The text is redacted once, before both the send and the mirror: the
+/// session must not keep a secret the channel never saw. A failed mirror is
+/// logged, not returned; the message did reach the user.
+pub(crate) async fn deliver_with_mirror(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    text: &str,
+    executor: Option<&std::sync::Arc<crate::session::DaemonSessionExecutor>>,
+) -> Result<()> {
+    let crate::task_runner::DeliveryTarget { sender, thread_id } =
+        crate::task_runner::parse_delivery_target(target);
+    let msg = prepare_outbound(channel, &sender, text);
+    let msg = msg.as_ref();
+    send_threaded(config, channel, &sender, msg, thread_id.as_deref()).await?;
+    if let (Some(exec), Some(session_key)) =
+        (executor, crate::task_runner::origin_session_key(target))
+    {
+        if let Err(e) = exec
+            .append_assistant_message(channel, &session_key, msg)
+            .await
+        {
+            tracing::warn!("delivery: could not mirror into session {session_key}: {e}");
+        }
+    }
+    Ok(())
+}
+
 /// Send `text` to `sender_id` on `channel`, inside `thread_id` when given:
 /// a Telegram forum topic, a Slack thread, or a Discord thread channel.
 pub(crate) async fn send_threaded(

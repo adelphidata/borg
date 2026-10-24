@@ -398,6 +398,7 @@ pub async fn spawn_task_execution(
                 .await;
             }
         }
+        crate::subscriptions::internal::after_task_run(&task, run_id, &exec_ctx.config).await;
     });
 }
 
@@ -2281,41 +2282,11 @@ async fn deliver_task_result(
         record_delivery_failure(run, "unresolved 'origin' delivery target — result dropped").await;
         return;
     }
-    let DeliveryTarget { sender, thread_id } = parse_delivery_target(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    // Redact here, not only inside `send_threaded`: the same string is
-    // mirrored into the chat session below, and the session must not keep the
-    // raw secret.
-    let msg = crate::channel_delivery::prepare_outbound(channel, &sender, &msg);
-    let msg = msg.as_ref();
-    match crate::channel_delivery::send_threaded(
-        config,
-        channel,
-        &sender,
-        msg,
-        thread_id.as_deref(),
-    )
-    .await
+    match crate::channel_delivery::deliver_with_mirror(config, channel, target, &msg, executor)
+        .await
     {
-        Ok(()) => {
-            // Mirror the delivered message into the originating chat session so
-            // the agent remembers its own proactive output and a later user
-            // reply stays coherent. Only origin-resolved deliveries carry the
-            // `{sender, thread_id}` JSON target needed to rebuild the session
-            // key; plain single-channel targets have no conversation to thread
-            // into and are skipped.
-            if let (Some(exec), Some(session_key)) = (executor, origin_session_key(target)) {
-                if let Err(e) = exec
-                    .append_assistant_message(channel, &session_key, msg)
-                    .await
-                {
-                    tracing::warn!(
-                        "Task '{task_name}': failed to mirror delivery into session \
-                         {session_key}: {e}"
-                    );
-                }
-            }
-        }
+        Ok(()) => {}
         Err(e) => {
             tracing::warn!("Failed to deliver task result via {channel}: {e}");
             // The body succeeded and `complete_task_run` already marked the
@@ -2353,7 +2324,7 @@ async fn record_delivery_failure(run: RunRef<'_>, note: &str) {
 /// `{sender}` when there is no thread), matching the default-binding key the
 /// gateway inbound handler builds. Returns `None` for a plain (non-origin)
 /// sender target, which maps to no specific conversation.
-fn origin_session_key(target: &str) -> Option<String> {
+pub(crate) fn origin_session_key(target: &str) -> Option<String> {
     if !target.starts_with('{') {
         return None;
     }

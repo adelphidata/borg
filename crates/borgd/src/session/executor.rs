@@ -60,6 +60,14 @@ impl DaemonSessionExecutor {
         }
     }
 
+    /// Whether a turn is in flight in `session_key`. A peek: asking must not
+    /// keep an idle session resident.
+    pub fn is_session_busy(&self, session_key: &str) -> bool {
+        self.registry
+            .peek(session_key)
+            .is_some_and(|host| host.is_busy())
+    }
+
     fn current_config(&self) -> Config {
         self.config_rx
             .as_ref()

@@ -13,6 +13,10 @@ use tokio::sync::Notify;
 static WAKE: OnceLock<Arc<Notify>> = OnceLock::new();
 static TAPPED_CHANNELS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 static STORM_NOTICES: OnceLock<Mutex<Vec<StormNotice>>> = OnceLock::new();
+static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Distinct subscriptions remembered as "seen" between two drains.
+const MAX_SEEN: usize = 256;
 
 /// Notices kept while nobody drains them; a storm is rare, so this only
 /// bounds a process with no dispatcher (the CLI).
@@ -58,6 +62,36 @@ pub fn take_storm_notices() -> Vec<StormNotice> {
         Err(poisoned) => poisoned.into_inner(),
     };
     std::mem::take(&mut *guard)
+}
+
+fn seen() -> &'static Mutex<HashSet<String>> {
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Report that an authenticated request reached a subscription, whether or
+/// not it was stored. The dispatcher turns it into a live "event received"
+/// for the app, which is how the setup card learns the sender is wired up
+/// while the subscription is still paused. A set, so a burst costs one entry.
+pub fn report_seen(subscription_id: &str) {
+    {
+        let mut guard = match seen().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.len() < MAX_SEEN || guard.contains(subscription_id) {
+            guard.insert(subscription_id.to_string());
+        }
+    }
+    poke();
+}
+
+/// Take every subscription reported as seen since the last call.
+pub fn take_seen() -> Vec<String> {
+    let mut guard = match seen().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.drain().collect()
 }
 
 /// Install the dispatcher's wake handle. The first install wins; later calls
@@ -125,6 +159,19 @@ mod tests {
         assert!(take_storm_notices()
             .iter()
             .all(|n| n.subscription_id != "sub_storm_test"));
+    }
+
+    #[test]
+    fn a_burst_of_seen_reports_is_one_entry() {
+        for _ in 0..1000 {
+            report_seen("sub_seen_test");
+        }
+        let taken: Vec<_> = take_seen()
+            .into_iter()
+            .filter(|id| id == "sub_seen_test")
+            .collect();
+        assert_eq!(taken.len(), 1);
+        assert!(!take_seen().contains(&"sub_seen_test".to_string()));
     }
 
     #[tokio::test]

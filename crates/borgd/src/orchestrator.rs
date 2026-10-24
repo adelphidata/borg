@@ -147,6 +147,8 @@ pub struct OrchestratorHandles {
     /// is plumbed into every agent backend so accounting transitions and
     /// the four goal RPC handlers all publish to one place.
     pub goal_bus: GoalEventBus,
+    /// Bus subscribers read for `Admin.SubscribeSubscriptionEvents`.
+    pub subscription_bus: crate::subscriptions::SubscriptionBus,
 }
 
 /// Start every long-running subsystem managed by `borgd`. Returns control
@@ -194,6 +196,7 @@ pub async fn start(
         ),
     };
 
+    let subscription_config_rx = config_rx.clone();
     let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
         config.clone(),
         executor.clone(),
@@ -201,6 +204,55 @@ pub async fn start(
         config_rx,
         supervisor_db.clone(),
     );
+
+    // Subscriptions: the dispatcher that runs waiting events, and Borg's own
+    // goals and heartbeat as a source. Both supervised; the dispatcher's runs
+    // live inside its incarnation, so a restart never leaves one orphaned.
+    let subscription_bus = crate::subscriptions::SubscriptionBus::new();
+    {
+        let dispatch_liveness = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let liveness_for_loop = dispatch_liveness.clone();
+        let host: Arc<dyn crate::subscriptions::RunHost> =
+            Arc::new(crate::subscriptions::DaemonRunHost {
+                executor: executor.clone(),
+            });
+        let bus = subscription_bus.clone();
+        let rx = subscription_config_rx.clone();
+        let cancel = shutdown.clone();
+        spawn_supervised(
+            SupervisorConfig::new("subscriptions-dispatch").with_liveness(dispatch_liveness),
+            shutdown.clone(),
+            supervisor_db.clone(),
+            move || {
+                let dispatcher = crate::subscriptions::dispatcher::Dispatcher {
+                    host: host.clone(),
+                    config_rx: rx.clone(),
+                    bus: bus.clone(),
+                };
+                let cancel = cancel.child_token();
+                let liveness = liveness_for_loop.clone();
+                async move { dispatcher.run(cancel, liveness).await }
+            },
+        );
+    }
+    {
+        let goals = goal_bus.clone();
+        let beats = heartbeat_bus.clone();
+        let rx = subscription_config_rx;
+        let cancel = shutdown.clone();
+        spawn_supervised(
+            SupervisorConfig::new("subscriptions-internal"),
+            shutdown.clone(),
+            supervisor_db.clone(),
+            move || {
+                let goals = goals.clone();
+                let beats = beats.clone();
+                let rx = rx.clone();
+                let cancel = cancel.child_token();
+                async move { crate::subscriptions::internal::run(goals, beats, rx, cancel).await }
+            },
+        );
+    }
 
     // Hourly budget reset. Supervised for the same reason as everything
     // else here: a swallowed panic would freeze budgets and leave the agent
@@ -418,6 +470,7 @@ pub async fn start(
         poke_tx,
         executor,
         goal_bus,
+        subscription_bus,
     }
 }
 
