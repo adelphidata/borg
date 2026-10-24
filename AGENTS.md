@@ -37,22 +37,6 @@ Both apps are thin shells: they build a transport, name their platform, and moun
 
 **The transport seam is the invariant.** Feature code calls `createBorgClient(transport)` and never learns which surface it is on. Desktop goes IPC → unix socket (authenticated by file permissions); the browser goes gRPC-Web → the gateway's `/grpc` mount (authenticated by a client token). Adding a second hand-written client is the failure mode to avoid.
 
-### Web surfaces (TypeScript)
-
-A Bun workspace alongside the crates. **Package manager is Bun**, not npm/yarn/pnpm.
-
-| Package | Purpose |
-|---------|---------|
-| `apps/desktop` | Electron shell. Main process holds the gRPC channel to borgd's unix socket; the renderer reaches it over a typed IPC bridge |
-| `apps/web` | Browser SPA. Served by the gateway at `/ui/`, embedded into `borgd` via rust-embed |
-| `packages/app` | The product: routes, feature pages, providers. Shared verbatim by both apps |
-| `packages/ui` | Design system. Presentational only — every component takes data via props |
-| `packages/client` | Generated gRPC client + the `BorgTransport` seam, with a node (UDS) and a web (gRPC-Web) implementation |
-
-Both apps are thin shells: they build a transport, name their platform, and mount `<BorgApp/>`. A feature is written once in `packages/app` and appears on both.
-
-**The transport seam is the invariant.** Feature code calls `createBorgClient(transport)` and never learns which surface it is on. Desktop goes IPC → unix socket (authenticated by file permissions); the browser goes gRPC-Web → the gateway's `/grpc` mount (authenticated by a client token). Adding a second hand-written client is the failure mode to avoid.
-
 ## Build & Test
 
 ```sh
@@ -91,24 +75,6 @@ just web-ci          # everything CI runs for the web side
 **Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 
 **One release train.** `.github/workflows/release.yml` builds a `vX.Y.Z` release with the `borg`/`borgd` archives (SPA embedded) and the desktop installers together. Run it from Actions → Release → Run workflow (`mode: artifacts` builds without publishing) or push a `v*` tag. Bump the `[workspace.package]` version in `Cargo.toml` and `apps/desktop/package.json` first; the workflow refuses a mismatch and a commit whose CI has not passed.
-
-### Web surfaces
-
-```sh
-just web-install     # bun install (workspace)
-just gen             # regenerate packages/client/src/gen from crates/protocols/proto
-just gen-check       # fail if the committed client drifted from the protos
-just web-lint        # prettier --check + typecheck every package
-just web-test        # vitest across every package, with the 90% coverage gate
-just web-build       # build apps/web (REQUIRED before cargo build — borgd embeds it)
-just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
-just desktop-dev     # Vite + Electron with hot reload
-just web-ci          # everything CI runs for the web side
-```
-
-**Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. The codegen drift step in CI's Web surfaces job fails otherwise.
-
-**Build order matters for releases.** `borgd` embeds `apps/web/dist` at compile time, so `just web-build` must run before `cargo build --release`. `apps/web/dist/.gitkeep` is committed so a clean checkout still compiles; an empty dist serves a "web UI not bundled" page instead of failing.
 
 **Desktop installers carry `borgd`.** The release packs the same `borgd` the CLI archive ships as `Contents/Resources/bin/borgd` (`extraResources`); locally `just desktop-bundle-borgd` does the same before `pack`/`dist`.
 
