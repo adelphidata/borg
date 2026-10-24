@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { AgentsIcon, CONVERSATION_COL, FindBar, PageChrome, Pill, useIsMobile } from "@borg/ui";
 import { AgentPanel } from "../agents/AgentPanel";
@@ -75,6 +75,10 @@ export function ConversationPage() {
     fork,
     context,
   } = useConversation(target);
+  const runCompact = useCallback(() => {
+    setCompacting(true);
+    void compact().finally(() => setCompacting(false));
+  }, [compact]);
 
   // A live count of the wait, ticking only while there is a wait to count.
   const now = useTick(1_000, busy && turnStartedAt !== undefined);
@@ -470,10 +474,7 @@ export function ConversationPage() {
           context={context}
           busy={busy}
           compacting={compacting}
-          onCompact={() => {
-            setCompacting(true);
-            void compact().finally(() => setCompacting(false));
-          }}
+          onCompact={runCompact}
           onFork={() => {
             void fork().then((id) => {
               if (id) navigate(`/c/${id}`);
@@ -497,6 +498,7 @@ export function ConversationPage() {
           onSteer={steer}
           onCancel={cancel}
           onCommand={runCommand}
+          onCompact={cells.length > 0 && !busy && !compacting ? runCompact : undefined}
         />
       </div>
     </PageChrome>

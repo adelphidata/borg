@@ -276,3 +276,27 @@ describe("starting over", () => {
     expect(rank(commands, "clear").map((c) => c.id)).toContain("action:mark-read");
   });
 });
+
+describe("compacting the conversation", () => {
+  it("is offered only where there is a conversation to compact", () => {
+    expect(buildCommands(context(), ROUTES).map((c) => c.id)).not.toContain("action:compact");
+  });
+
+  it("answers /compact ahead of the settings and skills that mention it", () => {
+    const compact = vi.fn();
+    const commands = buildCommands(
+      context({
+        searching: true,
+        compact,
+        skills: [{ name: "planner", description: "compact plans into small tasks" }],
+      }),
+      ROUTES,
+    );
+
+    const top = rank(commands, "compact")[0];
+    top?.run();
+
+    expect(top?.id).toBe("action:compact");
+    expect(compact).toHaveBeenCalledTimes(1);
+  });
+});

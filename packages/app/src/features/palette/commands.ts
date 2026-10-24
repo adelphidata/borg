@@ -46,6 +46,12 @@ export interface CommandContext {
    * do nothing is a row that teaches nothing, so it simply is not offered.
    */
   markAllRead?: () => void;
+  /**
+   * Summarises the open conversation to free its context, or undefined where
+   * there is none to compact (⌘K away from a chat, an empty chat, a turn in
+   * flight).
+   */
+  compact?: () => void;
   /** Empty on a surface with no prompt box — skill rows need one to write into. */
   skills: CommandSkill[];
   /** Skill names most-recently-used first, from `skillRecency`. */
@@ -116,6 +122,14 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
       run: () => ctx.dispatch("new-conversation"),
     },
   ];
+  if (ctx.compact) {
+    actions.push({
+      id: "action:compact",
+      label: "Compact conversation",
+      keywords: "summarize summarise shrink context window free tokens",
+      run: ctx.compact,
+    });
+  }
   if (ctx.markAllRead) {
     actions.push({
       id: "action:mark-read",

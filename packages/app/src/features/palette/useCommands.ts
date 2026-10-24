@@ -23,6 +23,8 @@ interface UseCommandsOptions {
    * the composer can, so only the composer pays for the listing.
    */
   withSkills?: boolean;
+  /** Compacts the conversation this surface belongs to, when it can. */
+  compact?: () => void;
 }
 
 export interface CommandsResult {
@@ -46,6 +48,7 @@ export function useCommands({
   active,
   searching,
   withSkills = false,
+  compact,
 }: UseCommandsOptions): CommandsResult {
   const navigate = useNavigate();
   const settings = useSettings();
@@ -165,6 +168,7 @@ export function useCommands({
               saveSetting,
               sessions: sessions.state === "ready" ? sessions.data : [],
               markAllRead: anyUnread ? () => markAllSessionsRead(readRows) : undefined,
+              compact,
               skills: skills.state === "ready" ? skills.data : [],
               skillRecency,
               noteSkillUse: noteSkill,
@@ -184,6 +188,7 @@ export function useCommands({
       sessions.data,
       readRows,
       anyUnread,
+      compact,
       skills.state,
       skills.data,
       skillRecency,

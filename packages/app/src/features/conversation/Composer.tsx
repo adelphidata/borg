@@ -80,6 +80,8 @@ interface ComposerProps {
    * steered as prose. Returns false for anything that is not one.
    */
   onCommand?: (text: string) => boolean;
+  /** Offered in the `/` menu; undefined while there is nothing to compact. */
+  onCompact?: () => void;
 }
 
 /**
@@ -101,6 +103,7 @@ export function Composer({
   onSteer,
   onCancel,
   onCommand,
+  onCompact,
 }: ComposerProps) {
   const isMobile = useIsMobile();
   const [draft, setDraft] = useState("");
@@ -225,6 +228,7 @@ export function Composer({
     searching: (token ?? "") !== "",
     // This surface has the prompt box a skill row writes into.
     withSkills: true,
+    compact: onCompact,
   });
 
   // The failure belongs to the menu that caused it. The composer outlives the
