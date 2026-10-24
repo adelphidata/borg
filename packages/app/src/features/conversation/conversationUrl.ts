@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 /**
  * Points the address bar of a conversation opened at `/c/new` at the session
  * it became, so a reload or a copied link reopens that conversation instead
@@ -14,4 +16,22 @@ export function adoptConversationUrl(
 ): void {
   if (!agentSessionId || !/^#\/c\/new(?:[?#]|$)/.test(win.location.hash)) return;
   win.history.replaceState(win.history.state, "", `#/c/${encodeURIComponent(agentSessionId)}`);
+}
+
+/**
+ * Counts the browser's own navigations: Back, Forward, or an address typed by
+ * hand. A page first loaded at `/c/new` and an address typed later both carry
+ * the router's "default" key, so `location.key` alone cannot tell them apart
+ * once the page has adopted its session id.
+ */
+export function usePopCount(
+  win: Pick<Window, "addEventListener" | "removeEventListener"> = window,
+): number {
+  const [pops, setPops] = useState(0);
+  useEffect(() => {
+    const onPop = () => setPops((n) => n + 1);
+    win.addEventListener("popstate", onPop);
+    return () => win.removeEventListener("popstate", onPop);
+  }, [win]);
+  return pops;
 }

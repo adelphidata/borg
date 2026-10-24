@@ -1,5 +1,6 @@
+import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { adoptConversationUrl } from "./conversationUrl";
+import { adoptConversationUrl, usePopCount } from "./conversationUrl";
 
 function fakeWindow(hash: string) {
   const replaceState = vi.fn();
@@ -25,5 +26,19 @@ describe("adoptConversationUrl", () => {
     const { win, replaceState } = fakeWindow("#/c/new");
     adoptConversationUrl("", win);
     expect(replaceState).not.toHaveBeenCalled();
+  });
+});
+
+describe("usePopCount", () => {
+  it("counts each browser navigation and stops once unmounted", () => {
+    const { result, unmount } = renderHook(() => usePopCount());
+    expect(result.current).toBe(0);
+    act(() => {
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(result.current).toBe(2);
+    unmount();
+    act(() => void window.dispatchEvent(new PopStateEvent("popstate")));
   });
 });

@@ -18,6 +18,7 @@ import { QUICK_ENTRY_HASH } from "./lib/chords";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
 import { clearNotice, offerRestore, showNotice, takeNotice, useNotice } from "./lib/notice";
 import { ConversationPage } from "./features/conversation/ConversationPage";
+import { usePopCount } from "./features/conversation/conversationUrl";
 import {
   draftsVersion,
   isBlankSession,
@@ -99,6 +100,7 @@ function Shell({ platform }: { platform: Platform }) {
   const updater = useUpdater();
   const navigate = useNavigate();
   const location = useLocation();
+  const pops = usePopCount();
   // Re-fetched on every navigation so fresh conversations and cleared
   // warnings appear without a reload.
   // A write on the conversations page must renew this list too — the two
@@ -334,8 +336,11 @@ function Shell({ platform }: { platform: Platform }) {
             {/* Keyed on the navigation, not the path: "+ New" from a
                 conversation that itself began at `/c/new` lands on the same
                 route, and without a remount the page keeps the session it
-                already has. */}
-            <Route path="/c/:sessionId" element={<ConversationPage key={location.key} />} />
+                already has. The pop count covers `/c/new` typed by hand. */}
+            <Route
+              path="/c/:sessionId"
+              element={<ConversationPage key={`${location.key}:${pops}`} />}
+            />
             {/* The two static segments outrank the generic kind/name route,
                 which serves channels (and sends an old provider link to Settings). */}
             <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
