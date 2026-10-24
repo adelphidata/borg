@@ -326,15 +326,12 @@ async fn events_handler(
     // A handshake (GitHub's ping) is answered even while paused: new
     // subscriptions start paused, and the provider's setup check must pass.
     if normalized.handshake {
-        wake::report_seen(&sub.id);
+        note_seen(&db, &sub.id, now).await;
         return reply(StatusCode::OK, json!({ "ok": true, "handshake": true }));
     }
 
     if sub.status == status::PAUSED {
-        if let Err(e) = db.mark_subscription_seen(&sub.id, now).await {
-            tracing::warn!(subscription = %sub.id, "subscription endpoint: mark seen: {e:#}");
-        }
-        wake::report_seen(&sub.id);
+        note_seen(&db, &sub.id, now).await;
         return not_accepted(
             status::PAUSED,
             "This subscription is paused, so the event was not kept. Enable it in Borg.",
@@ -424,6 +421,16 @@ async fn events_handler(
             )
         }
     }
+}
+
+/// An authenticated request reached the subscription without storing an
+/// event (a handshake, a paused subscription): record it, so the row shows
+/// a last event after a reload, and tell the app now.
+async fn note_seen(db: &Database, id: &str, now: i64) {
+    if let Err(e) = db.mark_subscription_seen(id, now).await {
+        tracing::warn!(subscription = %id, "subscription endpoint: mark seen: {e:#}");
+    }
+    wake::report_seen(id);
 }
 
 #[allow(clippy::result_large_err)]
@@ -813,6 +820,15 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        assert!(
+            db.get_subscription(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_event_at
+                .is_some(),
+            "a ping proves the sender is wired, like any request while paused"
+        );
         let unsigned_ping = [("x-github-event", "ping")];
         assert_eq!(
             send(&app, post(&id, &unsigned_ping, ping)).await.0,
