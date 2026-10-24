@@ -72,8 +72,13 @@ function TextSetting({
   const [draft, setDraft] = useState(value);
   // The last value handed to `onCommit`, so Enter then blur saves once.
   const sent = useRef(value);
-  // A save refreshes the snapshot; follow the stored value.
+  // A save refreshes the snapshot; follow the stored value. Only on a real
+  // change: the mount run lands after first paint, and would wipe whatever
+  // was typed before it.
+  const shown = useRef(value);
   useEffect(() => {
+    if (shown.current === value) return;
+    shown.current = value;
     setDraft(value);
     sent.current = value;
   }, [value]);
