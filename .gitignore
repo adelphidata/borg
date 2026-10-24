@@ -78,3 +78,4 @@ apps/desktop/resources/bin/borgd.exe
 
 # Local UI screenshots for review (not tracked)
 /screenshots/
+/output/*
