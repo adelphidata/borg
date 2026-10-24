@@ -222,10 +222,7 @@ pub(crate) fn run_tasks_model(
         // Accept an id prefix like every other `borg tasks` subcommand.
         let full_id = match resolve_task_id_prefix(&db, id).await? {
             Some(full) => full,
-            None => {
-                println!("Task not found: {id}");
-                return Ok(());
-            }
+            None => anyhow::bail!("Task not found: {id}"),
         };
         // The guards above make `clear` equivalent to "both are None".
         db.set_task_model_pin(&full_id, model, provider).await?;
@@ -389,9 +386,9 @@ pub(crate) fn run_tasks_run(id: &str) -> Result<()> {
         Ok(()) => println!("Task {} queued for immediate execution.", short_id(id)),
         Err(e) => {
             // NotFound from the daemon surfaces as an anyhow error wrapping the
-            // tonic Status; print a friendly message rather than failing.
+            // tonic Status; name the id instead of dumping the status.
             if format!("{e:?}").contains("NotFound") {
-                println!("Task not found: {id}");
+                anyhow::bail!("Task not found: {id}");
             } else {
                 return Err(e);
             }
@@ -440,10 +437,7 @@ pub(crate) fn run_tasks_status(id: &str) -> Result<()> {
         client.get_scheduled_task_detail(id).await
     }) {
         Ok(d) => d,
-        Err(e) if format!("{e:?}").contains("NotFound") => {
-            println!("Task not found: {id}");
-            return Ok(());
-        }
+        Err(e) if format!("{e:?}").contains("NotFound") => anyhow::bail!("Task not found: {id}"),
         Err(e) => return Err(e),
     };
 
@@ -526,7 +520,7 @@ pub(crate) fn run_tasks_delete(id: &str) -> Result<()> {
     });
     match result {
         Ok(()) => println!("Deleted task {}", short_id(id)),
-        Err(e) if format!("{e:?}").contains("NotFound") => println!("Task not found: {id}"),
+        Err(e) if format!("{e:?}").contains("NotFound") => anyhow::bail!("Task not found: {id}"),
         Err(e) => return Err(e),
     }
     Ok(())
@@ -552,7 +546,7 @@ fn pause_or_resume(id: &str, pause: bool) -> Result<()> {
     let status = if pause { "paused" } else { "active" };
     match result {
         Ok(()) => println!("Task {} status: {status}", short_id(id)),
-        Err(e) if format!("{e:?}").contains("NotFound") => println!("Task not found: {id}"),
+        Err(e) if format!("{e:?}").contains("NotFound") => anyhow::bail!("Task not found: {id}"),
         Err(e) => return Err(e),
     }
     Ok(())
