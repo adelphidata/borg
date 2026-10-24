@@ -18,6 +18,8 @@ interface PageChromeProps {
    * false when the save did not take, so the box stays open with the text.
    */
   onRename?: (title: string) => Promise<boolean> | boolean | void;
+  /** Accessible name of the rename box. Defaults to "Conversation name". */
+  renameLabel?: string;
   /**
    * A companion panel alongside the page. Desktop only — at phone width there
    * is no room for two columns, and the caller should not have to know that.
@@ -35,9 +37,11 @@ interface PageChromeProps {
 function RenamableTitle({
   title,
   onRename,
+  label,
 }: {
   title: string;
   onRename: NonNullable<PageChromeProps["onRename"]>;
+  label: string;
 }) {
   const [draft, setDraft] = useState<string>();
   const [saving, setSaving] = useState(false);
@@ -60,7 +64,7 @@ function RenamableTitle({
     return (
       <input
         autoFocus
-        aria-label="Conversation name"
+        aria-label={label}
         className="m-0 min-w-0 max-w-[420px] flex-1 rounded-[7px] border border-focus bg-surface2 px-2 py-1 text-[14px] leading-none font-medium tracking-[-0.01em] text-ink outline-none"
         value={draft}
         disabled={saving}
@@ -101,6 +105,7 @@ export function PageChrome({
   mobileBrandHeader = false,
   headerActions,
   onRename,
+  renameLabel = "Conversation name",
   aside,
   children,
 }: PageChromeProps) {
@@ -111,7 +116,7 @@ export function PageChrome({
       {!isMobile && (
         <header className="flex h-14 flex-none items-center gap-3 border-b border-line2 px-[30px]">
           {onRename ? (
-            <RenamableTitle title={title} onRename={onRename} />
+            <RenamableTitle title={title} onRename={onRename} label={renameLabel} />
           ) : (
             <h1 className="m-0 text-[14px] leading-none font-medium tracking-[-0.01em] text-ink">
               {title}
