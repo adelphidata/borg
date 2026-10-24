@@ -14,6 +14,7 @@ const daemon = vi.hoisted(() => ({
   /** Settles the in-flight `save`, so a test can hold the round-trip open. */
   resolveSave: undefined as ((ok: boolean) => void) | undefined,
   saveError: undefined as { message: string } | undefined,
+  sessions: [] as { id: string; title: string; messageCount: bigint; pinned: boolean }[],
 }));
 
 vi.mock("react-router-dom", () => ({ useNavigate: () => vi.fn() }));
@@ -29,7 +30,11 @@ vi.mock("@borg/ui", () => ({
 }));
 
 vi.mock("../../lib/useDaemon", () => ({
-  useQuery: () => ({ state: "ready", data: [] }),
+  // Told apart by what they ask for: the conversation listing, or the skills.
+  useQuery: (fn: () => unknown) => ({
+    state: "ready",
+    data: String(fn).includes("listSessions") ? daemon.sessions : [],
+  }),
 }));
 
 vi.mock("../../lib/settings", () => ({
@@ -54,11 +59,22 @@ beforeEach(() => {
   daemon.settings = new Map([["evolution.enabled", bool("evolution.enabled", "true")]]);
   daemon.resolveSave = undefined;
   daemon.saveError = undefined;
+  daemon.sessions = [];
 });
 
 afterEach(() => vi.clearAllMocks());
 
 describe("useCommands", () => {
+  it("names conversations as the sidebar does and leaves out empty ones", () => {
+    daemon.sessions = [
+      { id: "a", title: "Ship the fix (live)", messageCount: 2n, pinned: false },
+      { id: "b", title: "New conversation", messageCount: 0n, pinned: false },
+    ];
+    const { result } = renderHook(() => useCommands({ active: true, searching: false }));
+    const rows = result.current.commands.filter((c) => c.id.startsWith("session:"));
+    expect(rows.map((r) => r.label)).toEqual(["Ship the fix"]);
+  });
+
   it("keeps the new value on the row until the snapshot confirms it", async () => {
     const { result, rerender } = renderHook(() => useCommands({ active: true, searching: false }));
     expect(toggle(result.current.commands).detail).toBe("on");

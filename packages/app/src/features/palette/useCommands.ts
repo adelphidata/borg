@@ -4,6 +4,7 @@ import { useTheme } from "@borg/ui";
 import { dispatchKeybind, hintFor } from "../../lib/keybinds";
 import { useQuery } from "../../lib/useDaemon";
 import { useSettings } from "../../lib/settings";
+import { isBlankSession, rowTitle } from "../conversation/draftStore";
 import { isSessionUnread, markAllSessionsRead } from "../sessions/unreadStore";
 import { routes } from "../../routes";
 import { buildCommands } from "./commands";
@@ -153,6 +154,15 @@ export function useCommands({
       })),
     [sessions.state, sessions.data],
   );
+  // Named and filtered as the sidebar does, so a row never shows the daemon's
+  // " (live)" marker or an empty session the lists already hide.
+  const commandSessions = useMemo(
+    () =>
+      (sessions.state === "ready" ? sessions.data : [])
+        .filter((s) => s.pinned || !isBlankSession(s.title, Number(s.messageCount), s.id))
+        .map((s) => ({ id: s.id, title: rowTitle(s.title, Number(s.messageCount), s.id) })),
+    [sessions.state, sessions.data],
+  );
   const anyUnread = readRows.some((r) => isSessionUnread(r.id, r.updatedAt, r.messageCount));
 
   const commands = useMemo<Command[]>(
@@ -166,7 +176,7 @@ export function useCommands({
               hintFor,
               settings: effective,
               saveSetting,
-              sessions: sessions.state === "ready" ? sessions.data : [],
+              sessions: commandSessions,
               markAllRead: anyUnread ? () => markAllSessionsRead(readRows) : undefined,
               compact,
               skills: skills.state === "ready" ? skills.data : [],
@@ -184,8 +194,7 @@ export function useCommands({
     [
       active,
       navigate,
-      sessions.state,
-      sessions.data,
+      commandSessions,
       readRows,
       anyUnread,
       compact,
