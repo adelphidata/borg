@@ -123,8 +123,10 @@ pub fn build_services_with_extras(
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin_svc),
-        session: SessionServer::new(session::SessionSvc::new(registry, factory))
-            .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
+        session: SessionServer::new(
+            session::SessionSvc::new(registry, factory).with_emergency_pause_gate(),
+        )
+        .max_decoding_message_size(cortex::session_types::MAX_INBOUND_TURN_BYTES),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
         voice: voice_server(),

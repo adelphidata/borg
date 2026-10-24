@@ -141,6 +141,31 @@ impl DaemonSessionExecutor {
     }
 }
 
+/// The notice for a turn rejected by the emergency stop (`borg pause`), or
+/// `None` when new turns may run. Reads the settings DB directly (not the
+/// cached config watch) so a pause written by the CLI in another process gates
+/// the very next turn, and so a corrupt flag fails safe to paused. A DB that
+/// cannot even be opened is "unreadable" for the same fail-safe purpose —
+/// nothing downstream would work anyway.
+pub(crate) async fn emergency_pause_notice() -> Option<String> {
+    let reason = match cortex::db::Database::open().await {
+        Ok(db) => {
+            if !cortex::emergency_pause::is_engaged(&db).await {
+                return None;
+            }
+            cortex::emergency_pause::details(&db).await.0
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "emergency-pause check could not open DB — failing safe to paused"
+            );
+            None
+        }
+    };
+    Some(cortex::emergency_pause::paused_notice(reason.as_deref()))
+}
+
 /// Build the short-circuit stream returned instead of running a turn while
 /// the emergency pause is engaged. User turns get the paused notice as a
 /// single `TextDelta` before the channel closes (the gateway's collect loop
@@ -174,36 +199,13 @@ impl SessionExecutor for DaemonSessionExecutor {
         turn: InboundTurn,
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
         // Emergency stop (`borg pause`): reject NEW turns before any host is
-        // created or any in-flight turn is cancelled. Reads the settings DB
-        // directly (not the cached config watch) so a pause written by the
-        // CLI in another process gates the very next inbound message, and so
-        // a corrupt flag fails safe to paused. A DB that cannot even be
-        // opened is "unreadable" for the same fail-safe purpose — nothing
-        // downstream would work anyway.
-        let paused_reason = match cortex::db::Database::open().await {
-            Ok(db) => {
-                if cortex::emergency_pause::is_engaged(&db).await {
-                    let (reason, _) = cortex::emergency_pause::details(&db).await;
-                    Some(reason)
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "emergency-pause check could not open DB — failing safe to paused"
-                );
-                Some(None)
-            }
-        };
-        if let Some(reason) = paused_reason {
+        // created or any in-flight turn is cancelled.
+        if let Some(notice) = emergency_pause_notice().await {
             tracing::info!(
                 session_key = %turn.session_key,
                 kind = ?turn.kind,
                 "turn rejected: emergency pause engaged (`borg resume` to continue)"
             );
-            let notice = cortex::emergency_pause::paused_notice(reason.as_deref());
             return Ok(paused_turn_stream(turn.kind, notice));
         }
 

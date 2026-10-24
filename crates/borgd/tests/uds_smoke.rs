@@ -156,11 +156,16 @@ async fn spawn_session_service(
     tmp: &std::path::Path,
     factory: Arc<dyn SessionFactory>,
 ) -> (PathBuf, oneshot::Sender<()>) {
+    serve_session_svc(tmp, SessionSvc::new(SessionRegistry::new(), factory)).await
+}
+
+async fn serve_session_svc(
+    tmp: &std::path::Path,
+    svc: SessionSvc,
+) -> (PathBuf, oneshot::Sender<()>) {
     let socket = tmp.join("borgd.sock");
     let listener = bind_uds(&socket).expect("bind_uds");
     let stream = UnixListenerStream::new(listener);
-    let registry = SessionRegistry::new();
-    let svc = SessionSvc::new(registry, factory);
 
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -780,4 +785,91 @@ async fn get_state_reports_whether_a_turn_is_in_flight() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(settled, "the flag must clear once the turn completes");
+}
+
+/// Spec: `borg pause` halts NEW turns on every surface. The TUI, `borg ask`,
+/// desktop, and web all start turns through `Session.Send`, so it must refuse
+/// with the paused notice (naming `borg resume`) without reaching the backend,
+/// and run turns again once the flag is released.
+#[tokio::test]
+async fn send_is_refused_while_the_emergency_pause_is_engaged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // SAFETY: the only test in this binary that reads the settings DB; the
+    // others serve a SessionSvc without the pause gate.
+    unsafe { std::env::set_var("BORG_HOME", tmp.path()) };
+    let db = cortex::db::Database::open().await.expect("db");
+    db.set_setting(cortex::emergency_pause::SETTING_KEY, "true")
+        .await
+        .expect("engage pause");
+
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runs_in_script = runs.clone();
+    let backend = ScriptedBackend::new("paused", move |_text, tx, _cancel| {
+        runs_in_script.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            let _ = tx.send(CoreEvent::TurnComplete).await;
+        })
+    });
+    let svc = SessionSvc::new(SessionRegistry::new(), StubFactory::new(backend))
+        .with_emergency_pause_gate();
+    let (socket, _shutdown) = serve_session_svc(tmp.path(), svc).await;
+
+    let mut client = SessionClient::new(uds_channel(socket).await);
+    let opened = client
+        .open(OpenRequest {
+            resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
+        })
+        .await
+        .expect("open ok")
+        .into_inner();
+
+    async fn send_and_collect(
+        client: &mut SessionClient<Channel>,
+        session_id: &str,
+    ) -> Vec<Option<Kind>> {
+        let mut stream = client
+            .send(SendRequest {
+                session_id: session_id.to_string(),
+                text: "do something".into(),
+                images: Vec::new(),
+                documents: Vec::new(),
+                resume_interrupted: false,
+            })
+            .await
+            .expect("send ok")
+            .into_inner();
+        let mut kinds = Vec::new();
+        while let Some(item) = stream.next().await {
+            kinds.push(item.expect("evt ok").kind);
+        }
+        kinds
+    }
+
+    let paused = send_and_collect(&mut client, &opened.session_id).await;
+    match paused.as_slice() {
+        [Some(Kind::Error(e))] => assert!(
+            e.message.contains("borg resume"),
+            "the refusal must name the next action: {}",
+            e.message
+        ),
+        other => panic!("a paused Send must answer with only the paused notice: {other:?}"),
+    }
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a paused Send must not reach the backend"
+    );
+
+    db.set_setting(cortex::emergency_pause::SETTING_KEY, "false")
+        .await
+        .expect("release pause");
+    let resumed = send_and_collect(&mut client, &opened.session_id).await;
+    assert!(
+        matches!(resumed.last(), Some(Some(Kind::TurnComplete(_)))),
+        "after resume the turn must run: {resumed:?}"
+    );
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

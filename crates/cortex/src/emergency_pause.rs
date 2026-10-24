@@ -16,7 +16,8 @@
 //!   that can be disabled by corrupting its own flag is not a stop lever).
 //!
 //! Gated seams (all in `borgd`): scheduled-task dispatch, session-executor
-//! turn start, and session-heartbeat prompt injection. Internal maintenance
+//! turn start, `Session.Send`/`AcpTurn` (TUI, `borg ask`, desktop, web), and
+//! session-heartbeat prompt injection. Internal maintenance
 //! (self-heal sweep, log pruning, stalled-task recovery) is *not* agent work
 //! and keeps running while paused.
 

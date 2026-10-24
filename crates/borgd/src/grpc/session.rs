@@ -249,13 +249,35 @@ impl cortex::execution_context::TextFileBridge for GrpcAcpTextFileBridge {
 pub struct SessionSvc {
     registry: SessionRegistry,
     factory: Arc<dyn SessionFactory>,
+    /// Refuse new turns while the emergency stop (`borg pause`) is engaged.
+    /// Off by default so transport tests never read a settings DB.
+    pause_gate: bool,
 }
 
 impl SessionSvc {
     /// Construct a new Session service against `registry` using `factory` for
     /// new session creation.
     pub fn new(registry: SessionRegistry, factory: Arc<dyn SessionFactory>) -> Self {
-        Self { registry, factory }
+        Self {
+            registry,
+            factory,
+            pause_gate: false,
+        }
+    }
+
+    /// Refuse `Send` and `AcpTurn` while `borg pause` is engaged, the same
+    /// stop the session executor applies to gateway turns. Without it the
+    /// TUI, `borg ask`, desktop, and web kept running new turns while paused.
+    pub fn with_emergency_pause_gate(mut self) -> Self {
+        self.pause_gate = true;
+        self
+    }
+
+    async fn paused_notice(&self) -> Option<String> {
+        if !self.pause_gate {
+            return None;
+        }
+        crate::session::executor::emergency_pause_notice().await
     }
 
     #[allow(clippy::result_large_err)]
@@ -346,6 +368,19 @@ impl Session for SessionSvc {
         }
         let resume = req.resume_interrupted;
         let text = compose_turn_text(req.text, req.documents)?;
+        if let Some(notice) = self.paused_notice().await {
+            tracing::info!(
+                session_id = %req.session_id,
+                "turn rejected: emergency pause engaged (`borg resume` to continue)"
+            );
+            let refused = Ok(AgentEvent {
+                event_seq: 0,
+                kind: Some(protocols::session::agent_event::Kind::Error(
+                    protocols::session::ErrorEvent { message: notice },
+                )),
+            });
+            return Ok(Response::new(Box::pin(tokio_stream::iter([refused]))));
+        }
 
         // Subscribe BEFORE starting the turn so we can't miss the first event.
         // `start_turn` returns the baseline seq sampled atomically *after*
@@ -418,6 +453,9 @@ impl Session for SessionSvc {
         };
 
         let host = self.host_or_err(&start.session_id)?;
+        if let Some(notice) = self.paused_notice().await {
+            return Err(TStatus::failed_precondition(notice));
+        }
         let (tx, out_rx) = mpsc::channel::<Result<AcpServerMessage, TStatus>>(64);
         let pending: PendingAcpFsRequests = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
