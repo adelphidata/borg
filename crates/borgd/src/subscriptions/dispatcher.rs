@@ -6,7 +6,7 @@
 //! boot reset hands their events back to the queue: no run is ever left
 //! orphaned and none runs twice at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -79,6 +79,11 @@ impl Dispatcher {
         let mut cap_logged_at: i64 = 0;
         // Subscriptions whose last run was deferred, until when.
         let mut held_back: HashMap<String, Instant> = HashMap::new();
+        // Subscriptions whose session the user was chatting in at the last
+        // claim. Passed over without a claim while that turn lasts: a claim
+        // and its release are two write transactions on every pass, and in a
+        // burst the endpoint needs that write lock.
+        let mut chatting: HashSet<String> = HashSet::new();
         // A settings change starts a pass now, so the gateway's endpoint and
         // tap hear it at once instead of on the next tick.
         let mut config_changes = self.config_rx.clone();
@@ -99,7 +104,14 @@ impl Dispatcher {
                 // flight with it.
                 held_back.retain(|_, until| *until > Instant::now());
                 if let Err(e) = self
-                    .start_runs(&db, &config, &mut runs, &mut cap_logged_at, &held_back)
+                    .start_runs(
+                        &db,
+                        &config,
+                        &mut runs,
+                        &mut cap_logged_at,
+                        &held_back,
+                        &mut chatting,
+                    )
                     .await
                 {
                     tracing::warn!("subscriptions: could not start runs this pass: {e:#}");
@@ -144,12 +156,14 @@ impl Dispatcher {
         runs: &mut JoinSet<Joined>,
         cap_logged_at: &mut i64,
         held_back: &HashMap<String, Instant>,
+        chatting: &mut HashSet<String>,
     ) -> Result<()> {
         let max = config.subscriptions.max_concurrent.max(1);
+        chatting.retain(|id| self.host.is_busy(&session_key(id)));
         // Subscriptions whose session the user is chatting in, and those
         // just deferred: passed over, so they hold neither a slot nor the
         // others up.
-        let mut busy: Vec<String> = held_back.keys().cloned().collect();
+        let mut busy: Vec<String> = held_back.keys().chain(chatting.iter()).cloned().collect();
         while runs.len() < max {
             let now = chrono::Utc::now().timestamp();
             let today = db.subscription_runs_since(now - DAY_SECS).await?;
@@ -171,6 +185,7 @@ impl Dispatcher {
             };
             if self.host.is_busy(&session_key(&lead.subscription_id)) {
                 db.release_subscription_run(&run_id).await?;
+                chatting.insert(lead.subscription_id.clone());
                 busy.push(lead.subscription_id);
                 continue;
             }
