@@ -172,6 +172,18 @@ impl ToolGroup {
                 "weekly",
                 "timer",
                 "alarm",
+                // `subscribe`: "wake me when Sentry reports an error".
+                "subscri",
+                "webhook",
+                "whenever",
+                "wake me",
+                "let me know when",
+                "tell me when",
+                "alert",
+                "sentry",
+                "datadog",
+                "pagerduty",
+                "incident",
             ],
             Self::Media => &[
                 "image",
@@ -710,6 +722,35 @@ mod tests {
     }
 
     #[test]
+    fn a_request_to_react_to_outside_events_loads_the_subscribe_tool() {
+        let profile_groups = ToolProfile::Full.groups();
+        for message in [
+            "Wake me when Sentry reports a new error in checkout",
+            "let me know when a Datadog alert fires",
+            "set up a webhook so Borg triages new PagerDuty incidents",
+            "pause my subscriptions",
+        ] {
+            let filtered = filter_tools_by_relevance(
+                make_test_tools(),
+                message,
+                &HashSet::new(),
+                &profile_groups,
+            );
+            assert!(
+                filtered.iter().any(|t| t.function.name == "subscribe"),
+                "{message}"
+            );
+        }
+        let filtered = filter_tools_by_relevance(
+            make_test_tools(),
+            "fix the bug in main.rs",
+            &HashSet::new(),
+            &profile_groups,
+        );
+        assert!(!filtered.iter().any(|t| t.function.name == "subscribe"));
+    }
+
+    #[test]
     fn filter_tools_includes_recently_used() {
         let tools = make_test_tools();
         let profile_groups = ToolProfile::Full.groups();
@@ -776,6 +817,7 @@ mod tests {
             ToolDefinition::new("web_search", "Search web", schema.clone()),
             ToolDefinition::new("browser", "Browser", schema.clone()),
             ToolDefinition::new("schedule", "Schedule", schema.clone()),
+            ToolDefinition::new("subscribe", "Subscribe", schema.clone()),
             ToolDefinition::new("generate_image", "Generate image", schema.clone()),
             ToolDefinition::new("gmail", "Gmail", schema.clone()),
             ToolDefinition::new("spawn_agent", "Spawn agent", schema.clone()),

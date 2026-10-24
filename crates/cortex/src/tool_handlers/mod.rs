@@ -291,9 +291,9 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            19,
-            "expected 19 core tools (all enabled: 3 goal tools, vision_analyze, \
-             video_analyze, computer_use), got: {names:?}"
+            20,
+            "expected 20 core tools (all enabled: 3 goal tools, vision_analyze, \
+             video_analyze, computer_use, subscribe), got: {names:?}"
         );
 
         let mut minimal_config = config.clone();
@@ -303,8 +303,8 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            14,
-            "expected 14 base tools: full minus web_fetch/web_search/vision_analyze/\
+            15,
+            "expected 15 base tools: full minus web_fetch/web_search/vision_analyze/\
              video_analyze (web-gated) and browser, got: {names:?}"
         );
     }
