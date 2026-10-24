@@ -1,3 +1,5 @@
+![Borg](docs/assets/borg-logo.png)
+
 # Borg
 
 [![CI](https://github.com/adelphidata/borg/actions/workflows/ci.yml/badge.svg)](https://github.com/adelphidata/borg/actions/workflows/ci.yml)
