@@ -4,6 +4,16 @@
 //! row is the hand-off, and the dispatcher in `borgd` picks it up. That keeps
 //! the response fast (providers time out in a few seconds) and means a burst
 //! costs rows, not turns.
+//!
+//! What a sender sees is chosen for how providers retry. Every refusal that
+//! a retry cannot fix (paused, paused itself, queue full) is a 200 with
+//! `accepted: false`: Stripe, PagerDuty and Linear retry any other status for
+//! days and then disable the endpoint. Only the per-minute cap answers 429,
+//! because waiting a minute does fix it.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Bytes,
@@ -17,7 +27,7 @@ use cortex::db::{IngestLimits, InsertOutcome, NewSubscriptionEvent, Subscription
 use cortex::security::secrets_resolve::SecretRef;
 use cortex::subscriptions::filter::{EventView, Filter};
 use cortex::subscriptions::presets::{self, AuthScheme};
-use cortex::subscriptions::{cap_payload, status, wake, Source};
+use cortex::subscriptions::{cap_payload, ingest, status, wake, Source};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -28,6 +38,14 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Path the endpoint is mounted at, without the id.
 pub const ENDPOINT_PREFIX: &str = "/v1/events/";
+
+/// The endpoint's database wait. Short: past a few seconds the provider has
+/// given up anyway, and a request queued behind a burst only adds to it.
+pub const BUSY_TIMEOUT_MS: u64 = 2_000;
+
+/// How long a resolved key is reused. A keychain or `exec` reference is
+/// not re-run for every request of a burst.
+const SECRET_TTL: Duration = Duration::from_secs(60);
 
 /// State for the endpoint.
 #[derive(Clone)]
@@ -57,6 +75,14 @@ fn refuse(status: StatusCode, message: &str) -> Response {
     reply(status, json!({ "ok": false, "error": message }))
 }
 
+/// A refusal a retry cannot fix: 200, so the provider does not retry.
+fn not_accepted(state: &str, message: &str) -> Response {
+    reply(
+        StatusCode::OK,
+        json!({ "ok": true, "accepted": false, "status": state, "note": message }),
+    )
+}
+
 fn too_many(message: &str) -> Response {
     let mut resp = refuse(StatusCode::TOO_MANY_REQUESTS, message);
     resp.headers_mut()
@@ -64,17 +90,117 @@ fn too_many(message: &str) -> Response {
     resp
 }
 
+/// Requests per subscription per minute, counted in memory before any
+/// secret or database work. It admits twice the ledger's cap, so the
+/// ledger stays the authority for normal traffic; past it, a burst costs a
+/// map lookup per request instead of a keychain read and a write lock.
+struct Gate {
+    windows: Mutex<HashMap<String, Window>>,
+}
+
+struct Window {
+    started: i64,
+    count: u32,
+    /// Refused here and not yet added to the subscription's counter.
+    dropped: i64,
+}
+
+/// Distinct ids tracked at once; probes for unknown ids cannot grow it
+/// without bound.
+const GATE_MAX_IDS: usize = 4_096;
+
+enum Admit {
+    /// Go on; add `dropped` refusals to the counter once the id is known.
+    Yes { dropped: i64 },
+    /// Over the in-memory cap.
+    No,
+}
+
+impl Gate {
+    fn global() -> &'static Gate {
+        static GATE: OnceLock<Gate> = OnceLock::new();
+        GATE.get_or_init(|| Gate {
+            windows: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn admit(&self, id: &str, now: i64, per_minute: u32) -> Admit {
+        let cap = per_minute.saturating_mul(2).max(10);
+        let mut windows = match self.windows.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if windows.len() >= GATE_MAX_IDS && !windows.contains_key(id) {
+            windows.retain(|_, w| now - w.started < 60);
+            if windows.len() >= GATE_MAX_IDS {
+                return Admit::Yes { dropped: 0 };
+            }
+        }
+        let w = windows.entry(id.to_string()).or_insert(Window {
+            started: now,
+            count: 0,
+            dropped: 0,
+        });
+        if now - w.started >= 60 {
+            w.started = now;
+            w.count = 0;
+        }
+        if w.count >= cap {
+            w.dropped += 1;
+            return Admit::No;
+        }
+        w.count += 1;
+        Admit::Yes {
+            dropped: std::mem::take(&mut w.dropped),
+        }
+    }
+
+    /// Give back the slot of an authenticated request the filter rejected:
+    /// a provider's unwanted events (pushes to other branches) must not use
+    /// up the budget of the ones the subscription wants.
+    fn refund(&self, id: &str) {
+        let mut windows = match self.windows.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(w) = windows.get_mut(id) {
+            w.count = w.count.saturating_sub(1);
+        }
+    }
+}
+
 async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
     let Some(text) = json_ref else {
         return Ok(None);
     };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = match cache.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((at, value)) = guard.get(&text) {
+            if at.elapsed() < SECRET_TTL {
+                return Ok(Some(value.clone()));
+            }
+        }
+    }
     let secret_ref: SecretRef = serde_json::from_str(&text).map_err(|_| ())?;
     // A keychain or exec reference may block; keep it off the reactor.
-    tokio::task::spawn_blocking(move || secret_ref.resolve())
+    let value = tokio::task::spawn_blocking(move || secret_ref.resolve())
         .await
         .map_err(|_| ())?
-        .map(Some)
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() >= GATE_MAX_IDS {
+        guard.clear();
+    }
+    guard.insert(text, (Instant::now(), value.clone()));
+    Ok(Some(value))
 }
 
 async fn events_handler(
@@ -95,6 +221,12 @@ async fn events_handler(
             "Subscriptions are turned off in Borg's settings.",
         );
     }
+    let now = chrono::Utc::now().timestamp();
+    let Admit::Yes { dropped } = Gate::global().admit(&id, now, state.limits.per_minute) else {
+        return too_many(
+            "Too many events this minute. Borg keeps the first ones and drops the rest.",
+        );
+    };
     let db = match (state.db_open)().await {
         Ok(db) => db,
         Err(e) => {
@@ -116,6 +248,9 @@ async fn events_handler(
             );
         }
     };
+    if let Err(e) = db.add_subscription_dropped(&sub.id, dropped).await {
+        tracing::warn!(subscription = %sub.id, "subscription endpoint: count drops: {e:#}");
+    }
 
     // Authenticate before saying anything about the subscription's state, so
     // an unauthenticated caller learns nothing beyond "it exists".
@@ -141,24 +276,23 @@ async fn events_handler(
         return reply(StatusCode::OK, json!({ "ok": true, "handshake": true }));
     }
 
-    if sub.status != status::ACTIVE {
-        if sub.status == status::PAUSED {
-            if let Err(e) = db
-                .mark_subscription_seen(&sub.id, chrono::Utc::now().timestamp())
-                .await
-            {
-                tracing::warn!(subscription = %sub.id, "subscription endpoint: mark seen: {e:#}");
-            }
-            wake::report_seen(&sub.id);
+    if sub.status == status::PAUSED {
+        if let Err(e) = db.mark_subscription_seen(&sub.id, now).await {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: mark seen: {e:#}");
         }
-        let message = if sub.status == status::STORM {
-            "This subscription paused itself after a burst. Resume it in Borg."
-        } else {
-            "This subscription is paused. Enable it in Borg."
-        };
-        return reply(
-            StatusCode::CONFLICT,
-            json!({ "ok": false, "status": sub.status, "error": message }),
+        wake::report_seen(&sub.id);
+        return not_accepted(
+            status::PAUSED,
+            "This subscription is paused, so the event was not kept. Enable it in Borg.",
+        );
+    }
+    if sub.status != status::ACTIVE {
+        if let Err(e) = db.add_subscription_dropped(&sub.id, 1).await {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: count drops: {e:#}");
+        }
+        return not_accepted(
+            &sub.status,
+            "This subscription paused itself after a burst, so the event was not kept. Resume it in Borg.",
         );
     }
 
@@ -175,11 +309,12 @@ async fn events_handler(
     let wanted = match Filter::parse(&sub.filter) {
         Some(filter) => filter.matches(&view),
         None => {
-            tracing::warn!(subscription = %sub.id, "subscription filter is unreadable; skipping event");
+            ingest::report_unreadable_filter(&db, &sub.id).await;
             false
         }
     };
     if !wanted {
+        Gate::global().refund(&sub.id);
         return reply(StatusCode::OK, json!({ "ok": true, "filtered": true }));
     }
 
@@ -196,7 +331,7 @@ async fn events_handler(
         payload: &stored,
         payload_truncated: truncated,
         origin: None,
-        received_at: chrono::Utc::now().timestamp(),
+        received_at: now,
     };
     match db.insert_subscription_event(&event, state.limits).await {
         Ok(InsertOutcome::Inserted(event_id)) => {
@@ -212,22 +347,19 @@ async fn events_handler(
         Ok(InsertOutcome::RateLimited) => {
             too_many("Too many events this minute. Borg keeps the first ones and drops the rest.")
         }
-        Ok(InsertOutcome::QueueFull(_)) => {
-            too_many("Too many events are waiting. This one was recorded but will not run.")
-        }
+        Ok(InsertOutcome::QueueFull(_)) => not_accepted(
+            "queue_full",
+            "Too many events are waiting. This one was noted in the history but will not run.",
+        ),
         Ok(InsertOutcome::StormTripped { events_in_window }) => {
             wake::report_storm(&sub.id, events_in_window);
-            reply(
-                StatusCode::CONFLICT,
-                json!({
-                    "ok": false,
-                    "status": status::STORM,
-                    "error": "Too many events. This subscription paused itself; resume it in Borg.",
-                }),
+            not_accepted(
+                status::STORM,
+                "Too many events. This subscription paused itself; resume it in Borg.",
             )
         }
-        Ok(InsertOutcome::NotAccepting) => refuse(
-            StatusCode::CONFLICT,
+        Ok(InsertOutcome::NotAccepting) => not_accepted(
+            "not_accepting",
             "This subscription is not accepting events. Check it in Borg.",
         ),
         Err(e) => {
@@ -317,11 +449,27 @@ mod tests {
         setup_with(provider, auth, st, "{}").await
     }
 
+    const TEST_LIMITS: IngestLimits = IngestLimits {
+        per_minute: 5,
+        storm_threshold: 8,
+        max_pending: 100,
+    };
+
     async fn setup_with(
         provider: &str,
         auth: &str,
         st: &str,
         filter: &str,
+    ) -> (Router, Database, String, tempfile::TempDir) {
+        setup_full(provider, auth, st, filter, TEST_LIMITS).await
+    }
+
+    async fn setup_full(
+        provider: &str,
+        auth: &str,
+        st: &str,
+        filter: &str,
+        limits: IngestLimits,
     ) -> (Router, Database, String, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("test.db");
@@ -352,11 +500,7 @@ mod tests {
         let state = EventsState {
             db_open: opener,
             enabled: true,
-            limits: IngestLimits {
-                per_minute: 5,
-                storm_threshold: 8,
-                max_pending: 100,
-            },
+            limits,
             payload_max_bytes: 64 * 1024,
         };
         (router(state), db, sub.id, tmp)
@@ -431,14 +575,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_paused_subscription_answers_409_only_after_auth() {
+    async fn a_paused_subscription_keeps_nothing_and_asks_for_no_retry() {
         let (app, db, id, _tmp) = setup("custom", "bearer", "paused").await;
         assert_eq!(
             send(&app, post(&id, &[], "{}")).await.0,
-            StatusCode::UNAUTHORIZED
+            StatusCode::UNAUTHORIZED,
+            "the state is told only after auth"
         );
         let (code, body) = send(&app, post(&id, &[BEARER], "{}")).await;
-        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "any other status makes providers retry for days"
+        );
+        assert_eq!(body["accepted"], false);
         assert_eq!(body["status"], "paused");
         let row = db.get_subscription(&id).await.unwrap().unwrap();
         assert!(
@@ -455,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_burst_gets_429_then_the_breaker_pauses_the_subscription() {
+    async fn a_burst_gets_429_past_the_per_minute_cap() {
         let (app, db, id, _tmp) = setup("custom", "bearer", "active").await;
         let mut codes = Vec::new();
         for i in 0..20 {
@@ -473,14 +623,71 @@ mod tests {
             db.list_subscription_events(&id, 100).await.unwrap().len(),
             5
         );
+        // Five more reached the ledger and were counted there; the last ten
+        // stopped at the in-memory gate, which hands its count over with the
+        // next admitted request.
         assert_eq!(
             db.get_subscription(&id)
                 .await
                 .unwrap()
                 .unwrap()
                 .dropped_count,
-            15
+            5
         );
+    }
+
+    #[tokio::test]
+    async fn a_storm_pauses_the_subscription_once_and_counts_what_follows() {
+        let limits = IngestLimits {
+            per_minute: 50,
+            storm_threshold: 8,
+            max_pending: 100,
+        };
+        let (app, db, id, _tmp) = setup_full("custom", "bearer", "active", "{}", limits).await;
+        let mut replies = Vec::new();
+        for i in 0..12 {
+            let body = format!(r#"{{"id":"s{i}"}}"#);
+            replies.push(send(&app, post(&id, &[BEARER], &body)).await);
+        }
+        assert!(replies[..8].iter().all(|(c, _)| *c == StatusCode::ACCEPTED));
+        for (code, body) in &replies[8..] {
+            assert_eq!(*code, StatusCode::OK);
+            assert_eq!(body["accepted"], false);
+            assert_eq!(body["status"], "storm");
+        }
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert_eq!(row.status, "storm");
+        assert!(
+            row.dropped_count >= 3,
+            "events after the storm are counted: {}",
+            row.dropped_count
+        );
+        let notices: Vec<_> = wake::take_storm_notices()
+            .into_iter()
+            .filter(|n| n.subscription_id == id)
+            .collect();
+        assert_eq!(notices.len(), 1, "the user is told once");
+    }
+
+    #[test]
+    fn the_gate_refuses_past_twice_the_cap_and_hands_the_count_back() {
+        let gate = Gate {
+            windows: Mutex::new(HashMap::new()),
+        };
+        for _ in 0..10 {
+            assert!(matches!(gate.admit("s", 100, 5), Admit::Yes { dropped: 0 }));
+        }
+        for _ in 0..3 {
+            assert!(matches!(gate.admit("s", 100, 5), Admit::No));
+        }
+        assert!(
+            matches!(gate.admit("t", 100, 5), Admit::Yes { dropped: 0 }),
+            "another subscription has its own window"
+        );
+        match gate.admit("s", 161, 5) {
+            Admit::Yes { dropped } => assert_eq!(dropped, 3, "a new minute hands the drops back"),
+            Admit::No => panic!("a new minute must admit again"),
+        }
     }
 
     #[tokio::test]
@@ -528,6 +735,11 @@ mod tests {
             ("x-github-delivery", "del-1"),
             ("x-hub-signature-256", sig.as_str()),
         ];
+        let replayed = [
+            ("x-github-event", "release"),
+            ("x-github-delivery", "del-forged"),
+            ("x-hub-signature-256", sig.as_str()),
+        ];
         assert_eq!(
             send(&app, post(&id, &headers, push)).await.0,
             StatusCode::ACCEPTED
@@ -537,10 +749,19 @@ mod tests {
             StatusCode::OK,
             "redelivery is a duplicate"
         );
+        assert_eq!(
+            send(&app, post(&id, &replayed, push)).await.0,
+            StatusCode::OK,
+            "a replay with rewritten unsigned headers is still a duplicate"
+        );
         let events = db.list_subscription_events(&id, 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind.as_deref(), Some("push"));
-        assert_eq!(events[0].dedup_key.as_deref(), Some("del-1"));
+        assert_eq!(
+            events[0].dedup_key.as_deref(),
+            Some(hex::encode(Sha256::digest(push.as_bytes())).as_str()),
+            "GitHub is deduped on the signed body"
+        );
 
         let forged = [
             ("x-github-event", "push"),
@@ -599,9 +820,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_filter_stores_nothing() {
-        let (app, db, id, _tmp) =
-            setup_with("custom", "bearer", "active", r#"{"severity":"error"}"#).await;
+    async fn an_unreadable_filter_stores_nothing_and_says_so() {
+        let (app, db, id, _tmp) = setup("custom", "bearer", "active").await;
+        // Saving validates the filter, so only an older build could have
+        // stored this one.
+        db.conn()
+            .execute(
+                "UPDATE subscriptions SET filter = ?2 WHERE id = ?1",
+                libsql::params!(id.clone(), r#"{"severity":"error"}"#),
+            )
+            .await
+            .unwrap();
         let (code, reply) = send(&app, post(&id, &[BEARER], r#"{"id":"e1"}"#)).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(reply["filtered"], true);
@@ -610,6 +839,8 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert_eq!(row.last_error.as_deref(), Some(ingest::UNREADABLE_FILTER));
     }
 
     #[test]

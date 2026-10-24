@@ -1144,8 +1144,17 @@ fn build_generic_webhook_router(config: &Config) -> Router {
 /// authenticates against its own subscription's key or provider signature.
 fn build_subscription_events_router(config: &Config) -> Router {
     use crate::subscriptions::{router, EventsState};
+    // A short wait for the write lock: a provider gives up after a few
+    // seconds, and a request queued behind a burst only adds to it.
+    let db_open: crate::DbOpener = Arc::new(|| {
+        Box::pin(async {
+            Database::open_with_timeout(crate::subscriptions::routes::BUSY_TIMEOUT_MS)
+                .await
+                .map_err(|e| anyhow::anyhow!("open db: {e}"))
+        })
+    });
     router(EventsState {
-        db_open: db_open_factory(),
+        db_open,
         enabled: config.subscriptions.enabled,
         limits: cortex::subscriptions::ingest::limits(&config.subscriptions),
         payload_max_bytes: config.subscriptions.payload_max_bytes,

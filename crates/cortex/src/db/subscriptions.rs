@@ -261,9 +261,21 @@ fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Refuse a filter the endpoint could not read. Stored unreadable, it would
+/// reject every event with nobody told.
+fn check_filter(filter: &str) -> Result<()> {
+    if crate::subscriptions::filter::Filter::parse(filter).is_none() {
+        anyhow::bail!(
+            "The filter is not valid. Use only the fields the source offers (kinds, severity_min, phrase, …)."
+        );
+    }
+    Ok(())
+}
+
 impl Database {
     /// Store a new subscription and return it.
     pub async fn create_subscription(&self, new: &NewSubscription<'_>) -> Result<SubscriptionRow> {
+        check_filter(new.filter)?;
         let id = new_id(crate::subscriptions::ID_PREFIX);
         let now = now_unix();
         self.conn
@@ -351,6 +363,7 @@ impl Database {
             row.name.clone_from(v);
         }
         if let Some(v) = &update.filter {
+            check_filter(v)?;
             row.filter.clone_from(v);
         }
         if let Some(v) = &update.instruction {
@@ -419,10 +432,13 @@ impl Database {
         let clears = new_status == status::ACTIVE;
         self.conn
             .execute(
+                // `status` on the right is the old value: only a real resume
+                // (paused or storm to active) restarts the windows, so a
+                // repeated "enable" during a burst cannot reopen them.
                 "UPDATE subscriptions SET status = ?2, updated_at = ?3, \
                  last_error = CASE WHEN ?4 THEN NULL ELSE COALESCE(?5, last_error) END, \
-                 dropped_count = CASE WHEN ?4 THEN 0 ELSE dropped_count END, \
-                 accepting_since = CASE WHEN ?4 THEN ?3 ELSE accepting_since END \
+                 dropped_count = CASE WHEN ?4 AND status != 'active' THEN 0 ELSE dropped_count END, \
+                 accepting_since = CASE WHEN ?4 AND status != 'active' THEN ?3 ELSE accepting_since END \
                  WHERE id = ?1",
                 params!(id, new_status, now_unix(), i64::from(clears), last_error),
             )
@@ -607,6 +623,13 @@ impl Database {
         // A refused event keeps no dedup key, so the provider's retry after
         // the 429 is accepted once there is room, not treated as a repeat.
         let dedup_key = if queue_full { None } else { ev.dedup_key };
+        // A refused event keeps its summary for the history, not its payload:
+        // a burst of refusals must not fill the disk.
+        let (payload, truncated) = if queue_full {
+            ("{}", true)
+        } else {
+            (ev.payload, ev.payload_truncated)
+        };
         let (row_status, error) = if queue_full {
             (
                 event_status::SKIPPED,
@@ -628,8 +651,8 @@ impl Database {
                     ev.kind,
                     dedup_key,
                     ev.summary,
-                    ev.payload,
-                    i64::from(ev.payload_truncated),
+                    payload,
+                    i64::from(truncated),
                     ev.origin,
                     row_status,
                     ev.received_at,
@@ -893,30 +916,78 @@ impl Database {
         Ok(n)
     }
 
-    /// Delete finished events beyond the newest `keep` finished ones.
+    /// Bound the history: the newest `keep` finished events stay whole;
+    /// older ones lose their payload, then go.
     ///
-    /// Two things are never pruned: waiting and running events, and anything
-    /// from the last day. Every limit (the burst windows, the hourly and daily
-    /// run budgets, the failure breaker) counts these rows, so history
-    /// younger than the longest window must stay.
+    /// Older finished events that ran stay a day, as small rows, because the
+    /// hourly and daily run budgets and the failure breaker count them; age
+    /// is read from when they ran, not when they arrived, so a backlog
+    /// drained after a pause still counts. Events that never ran (refused
+    /// as queue full) only matter to the ten-minute storm window. Waiting and
+    /// running events are never touched.
     pub async fn prune_subscription_events(
         &self,
         subscription_id: &str,
         keep: u32,
         now: i64,
     ) -> Result<u64> {
-        let n = self
+        const NEWEST: &str = "SELECT id FROM subscription_events WHERE subscription_id = ?1 \
+             AND status NOT IN ('pending', 'running') ORDER BY received_at DESC, id DESC LIMIT ?2";
+        let deleted = self
             .conn
             .execute(
-                "DELETE FROM subscription_events WHERE subscription_id = ?1 \
-                 AND status NOT IN ('pending', 'running') AND received_at < ?3 \
-                 AND id NOT IN (SELECT id FROM subscription_events WHERE subscription_id = ?1 \
-                     AND status NOT IN ('pending', 'running') \
-                     ORDER BY received_at DESC, id DESC LIMIT ?2)",
-                params!(subscription_id, i64::from(keep), now - PRUNE_MIN_AGE_SECS),
+                &format!(
+                    "DELETE FROM subscription_events WHERE subscription_id = ?1 \
+                     AND status NOT IN ('pending', 'running') AND id NOT IN ({NEWEST}) \
+                     AND ((run_id IS NULL AND received_at < ?3) \
+                          OR COALESCE(finished_at, started_at, received_at) < ?4)"
+                ),
+                params!(
+                    subscription_id,
+                    i64::from(keep),
+                    now - STORM_WINDOW_SECS,
+                    now - PRUNE_MIN_AGE_SECS
+                ),
             )
             .await?;
-        Ok(n)
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE subscription_events SET payload = '{{}}', payload_truncated = 1 \
+                     WHERE subscription_id = ?1 AND status NOT IN ('pending', 'running') \
+                     AND payload != '{{}}' AND id NOT IN ({NEWEST})"
+                ),
+                params!(subscription_id, i64::from(keep)),
+            )
+            .await?;
+        Ok(deleted)
+    }
+
+    /// Add `n` events refused before the ledger (the endpoint's in-memory
+    /// gate, a storm) to the dropped counter.
+    pub async fn add_subscription_dropped(&self, id: &str, n: i64) -> Result<()> {
+        if n <= 0 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE subscriptions SET dropped_count = dropped_count + ?2 WHERE id = ?1",
+                params!(id, n),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record a problem the user must fix (an unreadable filter) where the
+    /// app shows it.
+    pub async fn set_subscription_error(&self, id: &str, error: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE subscriptions SET last_error = ?2 WHERE id = ?1",
+                params!(id, error),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Channel names with at least one active channel subscription.
@@ -946,8 +1017,12 @@ mod tests {
         max_pending: 200,
     };
 
-    async fn sub(db: &Database, status: &str) -> SubscriptionRow {
-        db.create_subscription(&NewSubscription {
+    async fn sub(db: &Database, status: &'static str) -> SubscriptionRow {
+        db.create_subscription(&new_sub(status)).await.unwrap()
+    }
+
+    fn new_sub(status: &'static str) -> NewSubscription<'static> {
+        NewSubscription {
             name: "Sentry errors",
             source: "webhook",
             provider: "sentry",
@@ -960,9 +1035,7 @@ mod tests {
             status,
             rate_limit_per_hour: 60,
             timeout_secs: 300,
-        })
-        .await
-        .unwrap()
+        }
     }
 
     fn event<'a>(sub_id: &'a str, dedup: Option<&'a str>, at: i64) -> NewSubscriptionEvent<'a> {
@@ -1334,50 +1407,97 @@ mod tests {
         );
     }
 
-    /// Pruning keeps the last day whatever the retention says: the hourly and
-    /// daily budgets and the failure breaker count those rows.
+    /// Pruning bounds the history without breaking the budgets: rows that
+    /// ran stay a day (aged by when they ran), refused rows only the storm
+    /// window, waiting rows always; past the newest `keep`, payloads go.
     #[tokio::test]
-    async fn pruning_keeps_waiting_events_and_the_last_day() {
+    async fn pruning_bounds_the_history_and_keeps_what_the_limits_count() {
         let db = Database::test_db().await;
         let s = sub(&db, status::ACTIVE).await;
         let day = 24 * 3600;
-        let now = 10 * day;
-        // Three old finished events, two recent finished, two waiting.
-        for (i, at) in [
-            now - 3 * day,
-            now - 3 * day + 1,
-            now - 2 * day,
-            now - 60,
-            now - 30,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let key = format!("f{i}");
-            db.insert_subscription_event(&event(&s.id, Some(&key), at), LIMITS)
+        let now = chrono::Utc::now().timestamp();
+        let big = r#"{"blob":"xxxxxxxx"}"#;
+        let finish = |key: &'static str, at: i64| {
+            let db = &db;
+            let id = s.id.clone();
+            async move {
+                db.insert_subscription_event(
+                    &NewSubscriptionEvent {
+                        payload: big,
+                        ..event(&id, Some(key), at)
+                    },
+                    LIMITS,
+                )
                 .await
                 .unwrap();
-            let run = format!("run_{i}");
-            db.claim_next_subscription_event(&run, at)
-                .await
-                .unwrap()
-                .unwrap();
-            db.finish_subscription_run(&s.id, &run, "succeeded", None, None, 1)
+                let run = format!("run_{key}");
+                db.claim_next_subscription_event(&run, at)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db.finish_subscription_run(&id, &run, "succeeded", None, None, 1)
+                    .await
+                    .unwrap();
+                run
+            }
+        };
+        // Ran three days ago.
+        for key in ["old1", "old2", "old3"] {
+            let run = finish(key, now - 3 * day).await;
+            db.conn
+                .execute(
+                    "UPDATE subscription_events SET finished_at = ?2 WHERE run_id = ?1",
+                    params!(run, now - 3 * day),
+                )
                 .await
                 .unwrap();
         }
-        for i in 0..2 {
-            let key = format!("w{i}");
-            db.insert_subscription_event(&event(&s.id, Some(&key), now - 3 * day - 10 + i), LIMITS)
+        // Arrived three days ago, ran just now (a backlog drained after a
+        // pause): still counted by the budgets, so it stays.
+        finish("backlog", now - 3 * day).await;
+        finish("recent", now - 60).await;
+        finish("newest", now - 30).await;
+        // Refused as queue full twenty minutes ago.
+        let full = IngestLimits {
+            max_pending: 0,
+            ..LIMITS
+        };
+        for key in ["full1", "full2"] {
+            db.insert_subscription_event(&event(&s.id, Some(key), now - 1200), full)
+                .await
+                .unwrap();
+        }
+        for key in ["wait1", "wait2"] {
+            db.insert_subscription_event(&event(&s.id, Some(key), now - 4 * day), LIMITS)
                 .await
                 .unwrap();
         }
 
         let pruned = db.prune_subscription_events(&s.id, 1, now).await.unwrap();
-        assert_eq!(pruned, 3, "only the finished events older than a day go");
+        assert_eq!(pruned, 5, "three old runs and two refusals go");
         let left = db.list_subscription_events(&s.id, 50).await.unwrap();
-        assert_eq!(left.iter().filter(|e| e.status == "pending").count(), 2);
-        assert_eq!(left.iter().filter(|e| e.status == "succeeded").count(), 2);
+        let summary: Vec<_> = left
+            .iter()
+            .map(|e| (e.dedup_key.clone().unwrap_or_default(), e.payload.clone()))
+            .collect();
+        assert_eq!(
+            left.iter().filter(|e| e.status == "pending").count(),
+            2,
+            "{summary:?}"
+        );
+        assert_eq!(
+            left.iter().filter(|e| e.status == "succeeded").count(),
+            3,
+            "{summary:?}"
+        );
+        for e in left.iter().filter(|e| e.status == "succeeded") {
+            let whole = e.dedup_key.as_deref() == Some("newest");
+            assert_eq!(
+                e.payload == big,
+                whole,
+                "only the newest keeps its payload: {summary:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1417,6 +1537,53 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(next, InsertOutcome::Inserted(_)), "got {next:?}");
+    }
+
+    #[tokio::test]
+    async fn enabling_an_active_subscription_again_keeps_the_burst_windows() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let limits = IngestLimits {
+            per_minute: 3,
+            storm_threshold: 100,
+            max_pending: 100,
+        };
+        let t = chrono::Utc::now().timestamp();
+        for i in 0..3 {
+            let key = format!("k{i}");
+            db.insert_subscription_event(&event(&s.id, Some(&key), t), limits)
+                .await
+                .unwrap();
+        }
+        // An agent or a double click enables it again mid-burst.
+        db.set_subscription_status(&s.id, status::ACTIVE, None)
+            .await
+            .unwrap();
+        let next = db
+            .insert_subscription_event(&event(&s.id, Some("k3"), t + 1), limits)
+            .await
+            .unwrap();
+        assert!(matches!(next, InsertOutcome::RateLimited), "got {next:?}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_the_endpoint_cannot_read_is_refused_on_save() {
+        let db = Database::test_db().await;
+        let bad = NewSubscription {
+            filter: r#"{"severity":"error"}"#,
+            ..new_sub(status::PAUSED)
+        };
+        assert!(db.create_subscription(&bad).await.is_err());
+        let s = sub(&db, status::PAUSED).await;
+        let update = SubscriptionUpdate {
+            filter: Some(r#"{"drafts":true}"#.into()),
+            ..Default::default()
+        };
+        assert!(db.update_subscription(&s.id, &update).await.is_err());
+        assert_eq!(
+            db.get_subscription(&s.id).await.unwrap().unwrap().filter,
+            "{}"
+        );
     }
 
     #[tokio::test]

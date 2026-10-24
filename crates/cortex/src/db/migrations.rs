@@ -276,6 +276,23 @@ impl Database {
                 "migration v8: `{table}` missing after the baseline"
             );
         }
+        // Columns added while v8 was in development: a database created by
+        // an earlier v8 build has the table without them, and
+        // `CREATE TABLE IF NOT EXISTS` never adds a column.
+        for (column, ddl) in [
+            (
+                "accepting_since",
+                "ALTER TABLE subscriptions ADD COLUMN accepting_since INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "signing_secret_ref",
+                "ALTER TABLE subscriptions ADD COLUMN signing_secret_ref TEXT",
+            ),
+        ] {
+            if !self.column_exists("subscriptions", column).await? {
+                self.conn.execute(ddl, ()).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1701,6 +1718,31 @@ mod tests {
             db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION
         );
+    }
+
+    /// A database made by an early v8 build has `subscriptions` without the
+    /// columns added later; `CREATE TABLE IF NOT EXISTS` leaves it alone, so
+    /// v8 must add them or every event insert fails.
+    #[tokio::test]
+    async fn an_early_v8_subscriptions_table_gains_the_later_columns() {
+        let db = Database::test_db().await;
+        db.conn
+            .execute_batch(
+                "DROP TABLE subscription_events; DROP TABLE subscriptions; \
+                 CREATE TABLE subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '');",
+            )
+            .await
+            .expect("simulate an early v8 table");
+        db.set_meta("schema_version", "7").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        for column in ["accepting_since", "signing_secret_ref"] {
+            assert!(
+                db.column_exists("subscriptions", column).await.unwrap(),
+                "{column} was not added"
+            );
+        }
     }
 
     /// Developer databases predate the squash and still carry a stamp of 16.

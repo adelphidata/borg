@@ -70,9 +70,10 @@ pub async fn fan_out(
     let now = chrono::Utc::now().timestamp();
 
     let mut delivered = 0;
+    let mut first_error = None;
     for sub in subs.iter().filter(|s| s.provider == ev.provider) {
         let Some(filter) = Filter::parse(&sub.filter) else {
-            tracing::warn!(subscription = %sub.id, "subscription filter is unreadable; skipping event");
+            report_unreadable_filter(db, &sub.id).await;
             continue;
         };
         if !filter.matches(&view) {
@@ -88,21 +89,47 @@ pub async fn fan_out(
             origin: origin.as_deref(),
             received_at: now,
         };
-        match db.insert_subscription_event(&new, limits(cfg)).await? {
-            InsertOutcome::Inserted(_) => delivered += 1,
-            InsertOutcome::StormTripped { events_in_window } => {
+        // One subscription's failure must not cost the others the event.
+        match db.insert_subscription_event(&new, limits(cfg)).await {
+            Ok(InsertOutcome::Inserted(_)) => delivered += 1,
+            Ok(InsertOutcome::StormTripped { events_in_window }) => {
                 wake::report_storm(&sub.id, events_in_window);
             }
-            InsertOutcome::Duplicate
-            | InsertOutcome::RateLimited
-            | InsertOutcome::QueueFull(_)
-            | InsertOutcome::NotAccepting => {}
+            Ok(
+                InsertOutcome::Duplicate
+                | InsertOutcome::RateLimited
+                | InsertOutcome::QueueFull(_)
+                | InsertOutcome::NotAccepting,
+            ) => {}
+            Err(e) => {
+                tracing::warn!(subscription = %sub.id, "subscription event insert failed: {e:#}");
+                first_error.get_or_insert(e);
+            }
         }
     }
     if delivered > 0 {
         wake::poke();
     }
-    Ok(delivered)
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(delivered),
+    }
+}
+
+/// What the app shows when a stored filter cannot be read.
+pub const UNREADABLE_FILTER: &str =
+    "The filter could not be read, so events are being ignored. Edit the subscription to fix it.";
+
+/// Put an unreadable filter where the user sees it. A stored filter is
+/// validated on save, so this means an older build wrote it.
+pub async fn report_unreadable_filter(db: &Database, subscription_id: &str) {
+    tracing::warn!(subscription = %subscription_id, "subscription filter is unreadable; skipping event");
+    if let Err(e) = db
+        .set_subscription_error(subscription_id, UNREADABLE_FILTER)
+        .await
+    {
+        tracing::warn!(subscription = %subscription_id, "could not record the unreadable filter: {e:#}");
+    }
 }
 
 #[cfg(test)]
