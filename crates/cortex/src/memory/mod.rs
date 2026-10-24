@@ -298,6 +298,31 @@ pub async fn write_memory_db(
     Ok(format!("Written to memory: {name} (scope: {scope})"))
 }
 
+/// Index a stored memory entry for search: its whole-entry embedding and the
+/// chunks `memory_search` and `borg memory search` read. Reads the row back
+/// so the index matches what is stored, and redacts it first since the text
+/// leaves the machine for the embedding endpoint. A missing row is skipped.
+/// Every failure logs and continues — the write it follows already succeeded.
+pub async fn index_memory_entry(config: &Config, name: &str, scope: &str) {
+    let content = match read_memory_db(name, scope).await {
+        Ok(Some(content)) => crate::security::secrets::redact_secrets(&content),
+        Ok(None) => {
+            tracing::debug!("index_memory_entry: entry {name} (scope {scope}) missing, skipping");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read memory entry {name} for indexing: {e}");
+            return;
+        }
+    };
+    if let Err(e) = embeddings::embed_memory_file(config, name, &content, scope).await {
+        tracing::warn!("Failed to embed memory {name}: {e}");
+    }
+    if let Err(e) = embeddings::embed_memory_file_chunked(config, name, &content, scope).await {
+        tracing::warn!("Failed to chunk-embed memory {name}: {e}");
+    }
+}
+
 /// The `memory_entries.content_hash` value for `content` (hex SHA-256 of the
 /// bytes). A read-modify-write hashes what it read and passes the result to
 /// [`write_memory_db_if_unchanged`] as its precondition.

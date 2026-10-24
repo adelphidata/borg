@@ -150,6 +150,13 @@ async fn run_write(
         cortex::memory::WriteMode::Overwrite
     };
     let msg = cortex::memory::write_memory_db(name, &body, mode, scope).await?;
+    // Index it now, as the agent's memory tool does: `borg memory search`
+    // reads the chunk index, so an unindexed entry is unfindable until the
+    // nightly repair sweep.
+    let config = cortex::config::Config::load_from_db().await?;
+    if config.memory.embeddings.enabled {
+        cortex::memory::index_memory_entry(&config, name, scope).await;
+    }
     println!("{msg}");
     Ok(())
 }

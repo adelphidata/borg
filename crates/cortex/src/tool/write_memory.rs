@@ -234,35 +234,7 @@ fn spawn_embedding_task(raw_filename: &str, scope: Option<&str>, config_arc: &Ar
         .to_string();
     let filename = entry_name;
     crate::agent::spawn_logged("embed_memory_write", async move {
-        let full_content = match crate::memory::read_memory_db(&filename, &scope).await {
-            Ok(Some(content)) => crate::security::secrets::redact_secrets(&content),
-            Ok(None) => {
-                tracing::debug!(
-                    "spawn_embedding_task: entry {filename} (scope {scope}) missing, skipping embed"
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read memory entry {filename} for embedding: {e}");
-                return;
-            }
-        };
-        if let Err(e) =
-            crate::memory::embeddings::embed_memory_file(&config, &filename, &full_content, &scope)
-                .await
-        {
-            tracing::warn!("Failed to embed memory {filename}: {e}");
-        }
-        if let Err(e) = crate::memory::embeddings::embed_memory_file_chunked(
-            &config,
-            &filename,
-            &full_content,
-            &scope,
-        )
-        .await
-        {
-            tracing::warn!("Failed to chunk-embed memory {filename}: {e}");
-        }
+        crate::memory::index_memory_entry(&config, &filename, &scope).await;
     });
 }
 
