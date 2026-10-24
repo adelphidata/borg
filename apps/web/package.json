@@ -1,6 +1,6 @@
 {
   "name": "@borg/web",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "Browser UI for Borg — served by the borgd gateway at /ui/",
   "license": "MIT",
