@@ -231,6 +231,12 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Restore the terminal for a signal exit, which skips [`TerminalGuard`].
+pub(crate) fn restore_terminal() {
+    // The process exits right after; there is no one to report a failure to.
+    let _ = tui_lifecycle::restore();
+}
+
 /// Information needed to print a "resume this session" hint after the TUI exits.
 pub struct ResumeHint {
     /// Short (8-char) session ID for compact display.

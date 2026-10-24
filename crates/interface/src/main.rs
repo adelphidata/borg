@@ -27,7 +27,6 @@ use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 // Action enums and their dispatch live in `commands/<name>.rs`; the `Cli`
@@ -575,7 +574,7 @@ async fn async_main() -> Result<()> {
     // _guard and _telemetry_guard must live for the program's duration to flush logs
     let (_guard, _telemetry_guard) = init_diagnostics(tui_mode).await;
 
-    let _shutdown = spawn_shutdown_listener();
+    spawn_shutdown_listener(tui_mode);
 
     autostart_daemon(&cli).await;
 
@@ -731,36 +730,53 @@ async fn init_diagnostics(
     (guard, telemetry_guard)
 }
 
-/// Spawn the ctrl-c / SIGTERM listener and return the token it cancels.
-fn spawn_shutdown_listener() -> CancellationToken {
-    let shutdown = CancellationToken::new();
+/// Exit on SIGTERM, and on ctrl-c outside the TUI.
+///
+/// Installing the handlers replaces the default "terminate" action, so the
+/// listener must end the process itself. The TUI reads ctrl-c as a key in raw
+/// mode; a SIGINT reaches it only while a `!` shell command or an editor holds
+/// the terminal, and that one belongs to the child, so the TUI ignores it.
+fn spawn_shutdown_listener(tui_mode: bool) {
+    tokio::spawn(async move {
+        let code = wait_for_shutdown_signal(tui_mode).await;
+        // A signal exit skips every drop guard, so undo raw mode here.
+        if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+            tui::restore_terminal();
+        }
+        std::process::exit(code);
+    });
+}
+
+/// Wait for the signal that should end the process and return the shell's
+/// exit code for it (128 + signal number).
+async fn wait_for_shutdown_signal(tui_mode: bool) -> i32 {
+    #[cfg(unix)]
     {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-                    // If SIGTERM handler fails, just listen for ctrl_c
-                    let _ = ctrl_c.await;
-                    shutdown.cancel();
-                    return;
-                };
-                tokio::select! {
-                    _ = ctrl_c => {},
-                    _ = sigterm.recv() => {},
-                }
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            // A handler that did not install leaves the default action, which
+            // already ends the process.
+            return std::future::pending().await;
+        };
+        loop {
+            tokio::select! {
+                _ = interrupt.recv() => if !tui_mode { return 130 },
+                _ = terminate.recv() => return 143,
             }
-            #[cfg(not(unix))]
-            {
-                // Non-Unix has no SIGTERM to race; a broken ctrl_c handler still ends in shutdown.
-                let _ = ctrl_c.await;
-            }
-            shutdown.cancel();
-        });
+        }
     }
-    shutdown
+    #[cfg(not(unix))]
+    loop {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return std::future::pending().await;
+        }
+        if !tui_mode {
+            return 130;
+        }
+    }
 }
 
 /// Ensure daemon service is installed and running on every command
