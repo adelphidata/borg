@@ -469,7 +469,7 @@ impl Status for StatusSvc {
     async fn get_heartbeat(&self, _req: Request<Empty>) -> Result<Response<Heartbeat>, TStatus> {
         // The heartbeat is the seeded scheduled-task row; the dispatcher fires
         // it from that row's `next_run`, so that is when the next one really
-        // is. `heartbeat.interval` is not: the row keeps its own schedule.
+        // is. Writes of `heartbeat.interval` move the row's schedule.
         let db = Database::open()
             .await
             .map_err(|e| TStatus::internal(format!("heartbeat status failed: {e}")))?;

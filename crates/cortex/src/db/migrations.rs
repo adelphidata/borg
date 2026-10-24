@@ -234,6 +234,36 @@ impl Database {
         Ok(())
     }
 
+    /// Move a stored `heartbeat.interval` of `60m`, its first default, to
+    /// `30m`.
+    ///
+    /// The heartbeat row ran at `30m` while every database stored the `60m`
+    /// default, because nothing moved the row. Settings writes now move it,
+    /// and so does each boot. Without this step, every install would drop to
+    /// half the cadence it has always had. A `60m` the user picked had no
+    /// effect before, so this changes no cadence. Gated on its own marker for
+    /// the reason given on [`Self::migrate_v4`].
+    pub(super) async fn migrate_v7(&self) -> Result<()> {
+        const KEY: &str = "heartbeat.interval";
+        const OLD_DEFAULT: &str = "60m";
+        // Fixed, not read from the compiled default, for the reason given on
+        // `migrate_v6`.
+        const RUNNING_CADENCE: &str = "30m";
+        const DONE_MARKER: &str = "heartbeat_interval_matches_the_row";
+        if self.get_meta(DONE_MARKER).await?.is_some() {
+            return Ok(());
+        }
+        if self.get_setting(KEY).await?.as_deref() == Some(OLD_DEFAULT) {
+            self.set_setting(KEY, RUNNING_CADENCE).await?;
+            tracing::info!(
+                to = RUNNING_CADENCE,
+                "kept heartbeat.interval on the cadence the heartbeat runs at"
+            );
+        }
+        self.set_meta(DONE_MARKER, "1").await?;
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -513,7 +543,8 @@ impl Database {
     async fn seed_heartbeat_task(&self) -> Result<()> {
         let task_id = crate::heartbeat_task::HEARTBEAT_TASK_ID;
         let now = chrono::Utc::now().timestamp();
-        let next_run = crate::tasks::calculate_next_run("interval", "30m", "local")?;
+        let interval = crate::constants::DEFAULT_HEARTBEAT_INTERVAL;
+        let next_run = crate::tasks::calculate_next_run("interval", interval, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
@@ -523,7 +554,7 @@ impl Database {
                 "Heartbeat",
                 "",
                 "interval",
-                "30m",
+                interval,
                 "local",
                 next_run,
                 now,
@@ -1772,6 +1803,58 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("mod+shift+space")
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_v7_keeps_the_old_interval_default_on_the_running_cadence() {
+        let db = Database::test_db().await;
+        db.delete_meta("heartbeat_interval_matches_the_row")
+            .await
+            .unwrap();
+        db.set_setting("heartbeat.interval", "60m").await.unwrap();
+
+        db.set_meta("schema_version", "6").await.unwrap();
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            db.get_setting("heartbeat.interval")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("30m")
+        );
+
+        // Chosen on purpose after the upgrade: a restamp must keep it.
+        db.set_setting("heartbeat.interval", "60m").await.unwrap();
+        db.set_meta("schema_version", "6").await.unwrap();
+        db.run_migrations().await.unwrap();
+        assert_eq!(
+            db.get_setting("heartbeat.interval")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("60m")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_seeded_heartbeat_row_runs_on_the_default_interval() {
+        let db = Database::test_db().await;
+        let row = db
+            .get_task_by_id(crate::task_ids::HEARTBEAT_TASK_ID)
+            .await
+            .unwrap()
+            .expect("seeded");
+        assert_eq!(
+            row.schedule_expr,
+            crate::constants::DEFAULT_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            db.get_setting("heartbeat.interval")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(crate::constants::DEFAULT_HEARTBEAT_INTERVAL)
         );
     }
 

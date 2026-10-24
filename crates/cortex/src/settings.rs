@@ -244,6 +244,9 @@ impl SettingsResolver {
         // Validate by applying to a throwaway config
         let mut scratch = Config::default();
         let confirmation = scratch.apply_setting(key, value)?;
+        if crate::heartbeat_task::is_schedule_key(key) {
+            crate::heartbeat_task::validate_schedule_setting(key, value)?;
+        }
         let prev = self.read_prior(key).await?;
         if key == PROVIDER_KEY {
             self.clear_base_url_on_provider_change(prev.as_deref(), value)
@@ -257,6 +260,11 @@ impl SettingsResolver {
         // on the next reload — silently negating the user's clear.
         if key == "llm.aux" && value.trim().is_empty() {
             self.cascade_clear_aux_subkeys().await;
+        }
+        // The dispatcher fires the seeded heartbeat row, so its schedule
+        // follows the heartbeat settings.
+        if crate::heartbeat_task::is_schedule_key(key) {
+            crate::heartbeat_task::sync_schedule(&self.db).await?;
         }
         Ok(confirmation)
     }
@@ -282,6 +290,9 @@ impl SettingsResolver {
         // cascade — see the matching path in `set` for rationale.
         if key == "llm.aux" {
             self.cascade_clear_aux_subkeys().await;
+        }
+        if crate::heartbeat_task::is_schedule_key(key) {
+            crate::heartbeat_task::sync_schedule(&self.db).await?;
         }
         Ok(())
     }
@@ -441,6 +452,73 @@ mod tests {
     async fn test_resolver() -> SettingsResolver {
         let db = Database::test_db().await;
         SettingsResolver::new(db)
+    }
+
+    async fn heartbeat_expr(resolver: &SettingsResolver) -> String {
+        resolver
+            .db
+            .get_task_by_id(crate::task_ids::HEARTBEAT_TASK_ID)
+            .await
+            .unwrap()
+            .expect("the heartbeat row is seeded")
+            .schedule_expr
+    }
+
+    #[tokio::test]
+    async fn setting_the_heartbeat_interval_moves_the_heartbeat_row() {
+        let resolver = test_resolver().await;
+        resolver.set("heartbeat.interval", "2h").await.unwrap();
+        assert_eq!(heartbeat_expr(&resolver).await, "2h");
+
+        resolver.unset("heartbeat.interval").await.unwrap();
+        assert_eq!(
+            heartbeat_expr(&resolver).await,
+            crate::constants::DEFAULT_HEARTBEAT_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_cron_replaces_the_interval_until_it_is_cleared() {
+        let resolver = test_resolver().await;
+        let row = |r: crate::db::ScheduledTaskRow| (r.schedule_type, r.schedule_expr);
+        let read = || async {
+            row(resolver
+                .db
+                .get_task_by_id(crate::task_ids::HEARTBEAT_TASK_ID)
+                .await
+                .unwrap()
+                .unwrap())
+        };
+
+        resolver.set("heartbeat.cron", "0 0 9 * * *").await.unwrap();
+        assert_eq!(read().await, ("cron".into(), "0 0 9 * * *".into()));
+        // The interval is stored, but the cron still wins.
+        resolver.set("heartbeat.interval", "2h").await.unwrap();
+        assert_eq!(read().await, ("cron".into(), "0 0 9 * * *".into()));
+
+        resolver.unset("heartbeat.cron").await.unwrap();
+        assert_eq!(read().await, ("interval".into(), "2h".into()));
+
+        assert!(resolver.set("heartbeat.cron", "every day").await.is_err());
+        assert_eq!(read().await, ("interval".into(), "2h".into()));
+    }
+
+    #[tokio::test]
+    async fn a_bad_heartbeat_interval_is_refused_and_changes_nothing() {
+        let resolver = test_resolver().await;
+        let before = heartbeat_expr(&resolver).await;
+        let stored = resolver.db.get_setting("heartbeat.interval").await.unwrap();
+        for bad in ["often", "10s", "0"] {
+            assert!(
+                resolver.set("heartbeat.interval", bad).await.is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert_eq!(heartbeat_expr(&resolver).await, before);
+        assert_eq!(
+            resolver.db.get_setting("heartbeat.interval").await.unwrap(),
+            stored
+        );
     }
 
     #[test]

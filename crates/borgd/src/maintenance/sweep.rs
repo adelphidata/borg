@@ -85,6 +85,7 @@ pub(crate) async fn boot_recovery(db: &Database) -> BootRecovery {
         }
     };
     let stale_tasks_advanced = advance_stale_tasks(db).await;
+    sync_heartbeat_schedule(db).await;
     // Cold boot: every on-disk lease belongs to a previous (now-dead) daemon
     // instance, so reclaim them all — not just the TTL-expired ones — or a
     // crash-restart within the lease TTL would leave the new process unable to
@@ -108,6 +109,17 @@ pub(crate) async fn boot_recovery(db: &Database) -> BootRecovery {
         stale_runs_recovered,
         stale_tasks_advanced,
         stale_leases_expired,
+    }
+}
+
+/// Put the heartbeat row on the heartbeat schedule settings. Settings
+/// writes move the row too; this pass covers rows seeded before that, and
+/// rows written by an older daemon.
+async fn sync_heartbeat_schedule(db: &Database) {
+    match cortex::heartbeat_task::sync_schedule(db).await {
+        Ok(true) => tracing::info!("moved the heartbeat to its schedule settings"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("heartbeat schedule sync skipped: {e:#}"),
     }
 }
 
@@ -254,6 +266,29 @@ mod tests {
             stale_run.status, "failed",
             "stale run must be marked failed: {stale_run:?}"
         );
+    }
+
+    /// An install whose heartbeat row predates the settings sync runs on
+    /// the stored `heartbeat.interval` after the next boot.
+    #[tokio::test]
+    async fn boot_recovery_moves_the_heartbeat_to_the_setting() {
+        let db = test_db().await;
+        let id = cortex::task_ids::HEARTBEAT_TASK_ID;
+        db.set_setting("heartbeat.interval", "2h").await.unwrap();
+
+        boot_recovery(&db).await;
+
+        let row = db.get_task_by_id(id).await.unwrap().expect("seeded");
+        assert_eq!(row.schedule_expr, "2h");
+        let next = row.next_run.expect("an active row has a next run");
+        let ahead = next - chrono::Utc::now().timestamp();
+        assert!((7000..=7300).contains(&ahead), "next run {ahead}s ahead");
+
+        // A bad stored value leaves the row alone instead of failing the boot.
+        db.set_setting("heartbeat.interval", "often").await.unwrap();
+        boot_recovery(&db).await;
+        let row = db.get_task_by_id(id).await.unwrap().expect("seeded");
+        assert_eq!(row.schedule_expr, "2h");
     }
 
     /// A supervisor respawn of the dispatcher must not fail the runs the

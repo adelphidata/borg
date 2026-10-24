@@ -532,7 +532,7 @@ pub const DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 pub const DEFAULT_LLM_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 /// Default heartbeat check-in interval.
-pub const DEFAULT_HEARTBEAT_INTERVAL: &str = "60m";
+pub const DEFAULT_HEARTBEAT_INTERVAL: &str = "30m";
 
 /// Default heartbeat quiet-hours window start (HH:MM, local time).
 pub const DEFAULT_HEARTBEAT_QUIET_START: &str = "00:00";
