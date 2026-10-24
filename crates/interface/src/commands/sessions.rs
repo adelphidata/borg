@@ -149,19 +149,19 @@ async fn run_list(limit: usize) -> Result<()> {
         println!("No sessions.");
         return Ok(());
     }
-    println!("{:10} {:>6}  {:16}  TITLE", "ID", "MSGS", "UPDATED");
-    for s in list.sessions.iter().take(limit) {
+    let header = format!("{:10} {:>6}  {:16}  TITLE", "ID", "MSGS", "UPDATED");
+    let rows = list.sessions.iter().take(limit).map(|s| {
         let updated = chrono::DateTime::from_timestamp(s.updated_unix_ts as i64, 0)
             .map(|dt| dt.format(super::TS_FMT).to_string())
             .unwrap_or_else(|| "?".to_string());
         let short = super::short_id(&s.id);
         let pin = if s.pinned { " *" } else { "" };
-        println!(
+        format!(
             "{:10} {:>6}  {:16}  {}{pin}",
             short, s.message_count, updated, s.title
-        );
-    }
-    Ok(())
+        )
+    });
+    super::print_lines(std::iter::once(header).chain(rows))
 }
 
 /// The full id `borg sessions show <id>` asks the daemon for: the unique
@@ -180,19 +180,19 @@ async fn run_show(id: &str) -> Result<()> {
         .get_session(&id)
         .await
         .context("Admin.GetSession via borgd")?;
-    println!("Session: {} ({})", detail.title, detail.id);
-    println!("Messages: {}", detail.messages.len());
-    println!("──────────────");
+    let mut lines = vec![
+        format!("Session: {} ({})", detail.title, detail.id),
+        format!("Messages: {}", detail.messages.len()),
+        "──────────────".to_string(),
+    ];
     for m in &detail.messages {
         let when = chrono::DateTime::from_timestamp(m.unix_ts as i64, 0)
             .map(|dt| dt.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "?".to_string());
-        println!("[{when}] {role}:", role = m.role);
-        for line in m.text.lines() {
-            println!("  {line}");
-        }
+        lines.push(format!("[{when}] {role}:", role = m.role));
+        lines.extend(m.text.lines().map(|line| format!("  {line}")));
     }
-    Ok(())
+    super::print_lines(lines)
 }
 
 #[cfg(test)]
