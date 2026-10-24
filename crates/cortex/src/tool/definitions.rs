@@ -642,7 +642,7 @@ fn build_subscribe_tool_def() -> ToolDefinition {
             "provider":{"type":"string","enum": providers,"description":"Source, for create."},
             "name":{"type":"string","description":"Display name. Defaults to the source's."},
             "instruction":{"type":"string","description":"What Borg does when an event arrives, e.g. 'Find the likely commit and post a one-paragraph diagnosis. Never resolve the issue.' Defaults to the source's."},
-            "filter":{"type":"object","description":"Which events wake Borg. Keys: kinds (event kinds, e.g. [\"pull_request.opened\"]), severity_min (info|warning|error|critical), repos, branch, labels, author, exclude_drafts, phrase, mention_only, channel_id, sender, reaction, field_equals ({\"dot.path\": value})."},
+            "filter":{"type":"object","description":"Which events wake Borg. Keys: kinds (event kinds, e.g. [\"pull_request.opened\"]), severity_min (info|warning|error|critical), repos, branch, labels, author, exclude_drafts, phrase, mention_only, channel_id, sender, reaction, field_equals ([{\"path\": \"dot.path\", \"value\": …}])."},
             "delivery_channel":{"type":"string","description":"Where results also go: slack, telegram or discord, or 'origin' for the conversation this request came from when it is one of those (for channel sources: the thread each message came from). Omit for the subscription's own conversation only; on update, \"\" removes it."},
             "delivery_target":{"type":"string","description":"Chat or channel id on delivery_channel. Omit with 'origin'."},
             "signing_secret":{"type":"string","description":"The signing secret the provider shows (Stripe, Sentry, PagerDuty, Linear). Empty on update clears it."},
