@@ -50,6 +50,35 @@ fn spawn_gateway(
     })
 }
 
+/// Run gateways one after another until the daemon shuts down.
+///
+/// `/internal/restart` stops a gateway by cancelling only that gateway's
+/// token, and the gateway then returns cleanly. The supervisor reads a clean
+/// return as "finished for good", so the restart happens here: a gateway that
+/// stops while `outer` is still live is followed by a new one (`spawn` gets
+/// `true` for each of those). Each gateway gets a child token of `outer`, and
+/// `spawn` resolves when its gateway task ends. A panic or join error goes
+/// back to the supervisor as a crash.
+async fn run_gateway_incarnations<S, Fut>(outer: CancellationToken, mut spawn: S) -> Result<()>
+where
+    S: FnMut(CancellationToken, bool) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), tokio::task::JoinError>>,
+{
+    let mut restart = false;
+    loop {
+        match spawn(outer.child_token(), restart).await {
+            Ok(()) => {}
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => return Err(anyhow::anyhow!("gateway task join error: {e}")),
+        }
+        if outer.is_cancelled() {
+            return Ok(());
+        }
+        tracing::info!("gateway stopped on request; starting it again");
+        restart = true;
+    }
+}
+
 /// Persist the "gateway is unrecoverable" sentinel after the respawn
 /// supervisor abandons the gateway. The heartbeat
 /// `gateway_unrecoverable` augmenter and the maintenance recovery step
@@ -207,27 +236,24 @@ pub async fn start(
             // The slot survives gateway restarts: borgd installs the router
             // once, and every respawned gateway serves the same one.
             let gw_grpc_web = gw_grpc_web_outer.clone();
-            // Per-iteration child token — cancels when the outer
-            // shutdown does AND when this iteration's future drops, so
-            // we don't leak a long-lived bridge task across respawns.
-            let inner_shutdown = gw_outer_shutdown.child_token();
-            async move {
-                let handle = spawn_gateway(
-                    &gw_config,
-                    inner_shutdown,
-                    Some(gw_poke_tx),
-                    gw_executor,
-                    gw_grpc_web.clone(),
-                );
-                // Treat any inner error or panic as a supervisor-level
-                // restart; convert into a Result so the supervisor's
-                // restart logic kicks in.
-                match handle.await {
-                    Ok(()) => Ok::<(), anyhow::Error>(()),
-                    Err(e) if e.is_cancelled() => Ok(()),
-                    Err(e) => Err(anyhow::anyhow!("gateway task join error: {e}")),
+            run_gateway_incarnations(gw_outer_shutdown.clone(), move |token, restart| {
+                let fallback = gw_config.clone();
+                let poke_tx = gw_poke_tx.clone();
+                let executor = gw_executor.clone();
+                let grpc_web = gw_grpc_web.clone();
+                async move {
+                    // A restart exists to pick up changed settings.
+                    let config = if restart {
+                        Config::load_from_db().await.unwrap_or_else(|e| {
+                            tracing::warn!("gateway restart: config reload failed: {e}");
+                            fallback
+                        })
+                    } else {
+                        fallback
+                    };
+                    spawn_gateway(&config, token, Some(poke_tx), executor, grpc_web).await
                 }
-            }
+            })
         },
     );
 
@@ -433,6 +459,40 @@ mod tests {
         check_gateway_unrecoverable, GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY,
     };
     use std::time::Duration;
+
+    /// REGRESSION: `/internal/restart` stopped the gateway and nothing
+    /// started it again. The gateway returns cleanly once its token is
+    /// cancelled, the supervisor treats a clean return as final, and so the
+    /// port stayed closed until the daemon itself restarted.
+    #[tokio::test]
+    async fn a_requested_gateway_stop_starts_a_new_gateway() {
+        let outer = CancellationToken::new();
+        let mut spawns = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_gateway_incarnations(outer.clone(), |token, restart| {
+                spawns.push(restart);
+                // The first gateway is restarted (its own token is cancelled,
+                // as `/internal/restart` does); the second sees the daemon
+                // shut down.
+                if spawns.len() == 1 {
+                    token.cancel();
+                } else {
+                    outer.cancel();
+                }
+                async move { tokio::spawn(async move { token.cancelled().await }).await }
+            }),
+        )
+        .await
+        .expect("gateway loop must end once the daemon shuts down");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            spawns,
+            vec![false, true],
+            "a restart must start a second gateway on reloaded config"
+        );
+    }
 
     async fn in_memory_db() -> cortex::db::Database {
         cortex::db::Database::test_db().await
