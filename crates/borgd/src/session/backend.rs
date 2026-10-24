@@ -730,9 +730,18 @@ impl SessionBackend for AgentBackend {
         let id = agent.session().meta.id.clone();
         // Same row an open writes: a turn only updates an existing row, so
         // without it the new conversation never lists, exports, or forks.
-        let db = cortex::db::Database::open().await?;
-        let workspace = agent.execution_context().workspace_cwd().to_path_buf();
-        materialize_session_row(&db, &id, &agent.config().llm.model, Some(&workspace)).await;
+        // Best-effort: the agent is already on the new session, so failing
+        // the call here would leave the client on the old id.
+        match cortex::db::Database::open().await {
+            Ok(db) => {
+                let workspace = agent.execution_context().workspace_cwd().to_path_buf();
+                materialize_session_row(&db, &id, &agent.config().llm.model, Some(&workspace))
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %id, error = %e, "new session: could not write its row");
+            }
+        }
         Ok(id)
     }
 
