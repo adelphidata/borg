@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -222,7 +223,7 @@ fn flush_drops_later(db_open: crate::DbOpener, id: String) {
     });
 }
 
-async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> {
+async fn resolve_secret(json_ref: Option<String>) -> anyhow::Result<Option<String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
     let Some(text) = json_ref else {
         return Ok(None);
@@ -236,12 +237,11 @@ async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> 
             }
         }
     }
-    let secret_ref: SecretRef = serde_json::from_str(&text).map_err(|_| ())?;
+    let secret_ref: SecretRef = serde_json::from_str(&text).context("stored key reference")?;
     // A keychain or exec reference may block; keep it off the reactor.
     let value = tokio::task::spawn_blocking(move || secret_ref.resolve())
         .await
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+        .context("read key")??;
     let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.len() >= GATE_MAX_IDS {
         guard.clear();
@@ -448,15 +448,19 @@ async fn authenticate(
     };
     let key = match resolve_secret(sub.secret_ref.clone()).await {
         Ok(Some(k)) => k,
-        Ok(None) | Err(()) => {
-            tracing::warn!(subscription = %sub.id, "subscription endpoint: key unreadable");
+        Ok(None) => {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: no key is stored");
+            return Err(unavailable());
+        }
+        Err(e) => {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: key unreadable: {e:#}");
             return Err(unavailable());
         }
     };
     let signing = match resolve_secret(sub.signing_secret_ref.clone()).await {
         Ok(s) => s,
-        Err(()) => {
-            tracing::warn!(subscription = %sub.id, "subscription endpoint: signing secret unreadable");
+        Err(e) => {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: signing secret unreadable: {e:#}");
             return Err(unavailable());
         }
     };
