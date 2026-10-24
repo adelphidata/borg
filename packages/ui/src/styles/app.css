@@ -33,8 +33,9 @@
   --neonInk: #3e6b00;
   --navOnBg: rgba(143, 212, 0, 0.2);
   --navOnInk: #2f5400;
-  --alert: #c4304e;
-  --alertSoft: rgba(196, 48, 78, 0.1);
+  /* Alert text holds 4.5:1 on every surface and on its own soft pill. */
+  --alert: #b02843;
+  --alertSoft: rgba(176, 40, 67, 0.1);
   /* Warn marks something to set up, not a failure. The text holds 4.5:1 on
      every surface and on its own soft pill. */
   --warn: #7a5200;
