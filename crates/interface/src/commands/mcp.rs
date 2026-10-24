@@ -19,10 +19,9 @@ pub(crate) enum McpAction {
     Stdio,
     /// List configured MCP servers and their live status.
     List,
+    // Boxed: `AddArgs` carries every transport, TLS, and rate-limit knob, so
+    // inlining it would size every other variant of this enum after it.
     /// Add a configured MCP server (writes a `mcp.servers` entry).
-    ///
-    /// Boxed: `AddArgs` carries every transport, TLS, and rate-limit knob, so
-    /// inlining it would size every other variant of this enum after it.
     Add(Box<super::mcp_client::AddArgs>),
     /// Add a configured MCP server from a built-in preset (time / filesystem / github / notion).
     AddPreset(super::mcp_client::AddPresetArgs),

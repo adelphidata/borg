@@ -1168,6 +1168,39 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// `--help` is rendered from `///` doc comments, so a code note written
+    /// there (why a variant is boxed, how an enum is laid out) is printed to
+    /// the user as if it were usage text.
+    #[test]
+    fn help_text_carries_no_code_notes() {
+        use clap::CommandFactory;
+        fn walk(cmd: &clap::Command, path: &str, found: &mut Vec<String>) {
+            let texts = [cmd.get_about(), cmd.get_long_about()]
+                .into_iter()
+                .flatten()
+                .map(|t| t.to_string())
+                .chain(cmd.get_arguments().filter_map(|a| {
+                    a.get_long_help()
+                        .or_else(|| a.get_help())
+                        .map(|t| t.to_string())
+                }));
+            for text in texts {
+                if ["this enum", "Boxed:", "Box<"]
+                    .iter()
+                    .any(|n| text.contains(n))
+                {
+                    found.push(format!("{path}: {text}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Cli::command(), "borg", &mut found);
+        assert!(found.is_empty(), "code notes in --help: {found:#?}");
+    }
+
     /// Uninstall confirmation is intentionally narrower than a typical y/N
     /// prompt: only exactly `y` or `Y` proceeds. "yes" / empty / anything
     /// else is rejected so an accidental return key never wipes the data dir.
