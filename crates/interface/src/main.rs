@@ -184,6 +184,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<TasksAction>,
     },
+    /// List, pause, resume and test the subscriptions that wake Borg
+    Subscriptions {
+        #[command(subcommand)]
+        action: Option<commands::subscriptions::SubscriptionsAction>,
+    },
     /// Show token usage and cost breakdown for the current month
     Usage,
     /// Manage sender pairing and access control for messaging channels
@@ -883,6 +888,9 @@ async fn dispatch_command(cli: Cli, worktree_dir: Option<std::path::PathBuf>) ->
                 .await?
         }
         Some(Commands::Tasks { action }) => commands::tasks::dispatch_tasks(action)?,
+        Some(Commands::Subscriptions { action }) => {
+            commands::subscriptions::dispatch(action).await?
+        }
         Some(Commands::Cron { action }) => commands::tasks::dispatch_cron(action)?,
         Some(Commands::Providers { action }) => commands::providers::dispatch(action).await?,
         Some(Commands::Usage) => commands::status::run_usage().await?,
@@ -1598,6 +1606,29 @@ mod tests {
             }
             other => panic!("expected worktree remove, got {:?}", other.is_some()),
         }
+    }
+
+    #[test]
+    fn test_parse_subscriptions() {
+        use commands::subscriptions::SubscriptionsAction;
+        let cli = Cli::try_parse_from(["borg", "subscriptions"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Subscriptions { action: None })
+        ));
+        let cli =
+            Cli::try_parse_from(["borg", "subscriptions", "events", "sub_ab", "-n", "5"]).unwrap();
+        match cli.command {
+            Some(Commands::Subscriptions { action }) => assert_eq!(
+                action,
+                Some(SubscriptionsAction::Events {
+                    id: "sub_ab".into(),
+                    count: 5
+                })
+            ),
+            _ => panic!("expected subscriptions events"),
+        }
+        assert!(Cli::try_parse_from(["borg", "subscriptions", "pause"]).is_err());
     }
 
     #[test]

@@ -43,8 +43,9 @@ use protocols::admin::{
     ScheduledTaskRunList, ScheduledTaskUpdate, SessionArchiveMutation, SessionDetail, SessionList,
     SessionRef, SetCredentialPriorityRequest, SetCredentialPriorityResponse,
     SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey, SettingMutation,
-    SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, TunnelStatusReply, WarningList,
-    WebhookRef,
+    SettingsSnapshot, SubprocessSnapshot, Subscription, SubscriptionEvent, SubscriptionEventList,
+    SubscriptionEventsRequest, SubscriptionList, SubscriptionRef, SubscriptionStatusRequest,
+    TriggerHeartbeatRequest, TunnelStatusReply, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -953,6 +954,32 @@ rpc_wrappers! {
     session fn fork_session(session_id: &str) -> ForkResponse =
         fork("Session.Fork", ForkRequest {
             session_id: session_id.to_string(),
+        });
+
+    // ── Subscriptions ─────────────────────────────────────────────────────
+
+    /// List subscriptions.
+    admin fn list_subscriptions() -> SubscriptionList =
+        list_subscriptions("Admin.ListSubscriptions", AdminEmpty {});
+
+    /// Turn a subscription on or off. Turning it on clears a storm pause.
+    admin fn set_subscription_status(id: &str, active: bool) -> Subscription =
+        set_subscription_status("Admin.SetSubscriptionStatus", SubscriptionStatusRequest {
+            id: id.to_string(),
+            active,
+        });
+
+    /// The latest events of one subscription, newest first.
+    admin fn list_subscription_events(id: &str, limit: u32) -> SubscriptionEventList =
+        list_subscription_events("Admin.ListSubscriptionEvents", SubscriptionEventsRequest {
+            id: id.to_string(),
+            limit,
+        });
+
+    /// Queue the source's sample event as a test run.
+    admin fn test_subscription(id: &str) -> SubscriptionEvent =
+        test_subscription("Admin.TestSubscription", SubscriptionRef {
+            id: id.to_string(),
         });
 
     // ── Scheduled tasks ───────────────────────────────────────────────────

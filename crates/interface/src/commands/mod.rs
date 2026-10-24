@@ -22,6 +22,7 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod skills;
 pub(crate) mod status;
+pub(crate) mod subscriptions;
 pub(crate) mod tasks;
 pub(crate) mod tunnel;
 pub(crate) mod update_args;
