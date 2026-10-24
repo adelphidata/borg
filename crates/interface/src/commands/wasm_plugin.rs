@@ -348,7 +348,7 @@ async fn show(plugin_id: &str) -> Result<()> {
 }
 
 async fn verify(plugin_id: &str) -> Result<()> {
-    let db = Database::open_readonly().await.context("open db")?;
+    let db = Database::open().await.context("open db")?;
     let row = db
         .get_wasm_plugin(plugin_id)
         .await?
