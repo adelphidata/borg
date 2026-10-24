@@ -1645,6 +1645,11 @@ export interface SubscriptionEvent {
   /** JSON, cut to 16 KiB for display */
   payload: string;
   payloadTruncated: boolean;
+  /**
+   * Events its run digested, including any the listing leaves out; 0 when
+   * it has not run.
+   */
+  runSize: number;
 }
 
 export interface SubscriptionEventList {
@@ -19070,6 +19075,7 @@ function createBaseSubscriptionEvent(): SubscriptionEvent {
     error: "",
     payload: "",
     payloadTruncated: false,
+    runSize: 0,
   };
 }
 
@@ -19116,6 +19122,9 @@ export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
     }
     if (message.payloadTruncated !== false) {
       writer.uint32(112).bool(message.payloadTruncated);
+    }
+    if (message.runSize !== 0) {
+      writer.uint32(120).uint32(message.runSize);
     }
     return writer;
   },
@@ -19245,6 +19254,14 @@ export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
             message.payloadTruncated = reader.bool();
             continue;
           }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.runSize = reader.uint32();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -19301,6 +19318,11 @@ export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
         : isSet(object.payload_truncated)
         ? globalThis.Boolean(object.payload_truncated)
         : false,
+      runSize: isSet(object.runSize)
+        ? globalThis.Number(object.runSize)
+        : isSet(object.run_size)
+        ? globalThis.Number(object.run_size)
+        : 0,
     };
   },
 
@@ -19348,6 +19370,9 @@ export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
     if (message.payloadTruncated !== false) {
       obj.payloadTruncated = message.payloadTruncated;
     }
+    if (message.runSize !== 0) {
+      obj.runSize = Math.round(message.runSize);
+    }
     return obj;
   },
 
@@ -19370,6 +19395,7 @@ export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
     message.error = object.error ?? "";
     message.payload = object.payload ?? "";
     message.payloadTruncated = object.payloadTruncated ?? false;
+    message.runSize = object.runSize ?? 0;
     return message;
   },
 };

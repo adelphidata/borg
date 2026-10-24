@@ -131,6 +131,18 @@ describe("SubscriptionDetailPage", () => {
     expect(screen.getByText("And 34 more in this run.")).toBeTruthy();
   });
 
+  it("counts a run the listing cuts short by its own size", async () => {
+    // The newest 50 events hold only 2 of a 50-event run.
+    const events = ["x1", "x2"].map((id) =>
+      event({ id, runId: "run_old", runSize: 50, summary: "Disk full on db-2" }),
+    );
+    mount(daemonWith(detail({}, { events })));
+    await ready();
+    expect(screen.getByText(/50 events → 1 run/)).toBeTruthy();
+    click(screen.getByRole("button", { name: /Disk full on db-2/ }));
+    expect(screen.getByText("And 48 more in this run.")).toBeTruthy();
+  });
+
   it("links to the conversation its runs land in, once there is one", async () => {
     mount(daemonWith(detail({}, { events: [event()] })));
     await ready();

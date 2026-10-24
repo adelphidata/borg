@@ -1440,6 +1440,9 @@ message SubscriptionEvent {
   string error = 12;
   string payload = 13;  // JSON, cut to 16 KiB for display
   bool payload_truncated = 14;
+  // Events its run digested, including any the listing leaves out; 0 when
+  // it has not run.
+  uint32 run_size = 15;
 }
 message SubscriptionEventList { repeated SubscriptionEvent events = 1; }
 message SubscriptionEventsRequest {

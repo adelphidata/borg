@@ -130,6 +130,7 @@ export function event(over: Partial<admin.SubscriptionEvent> = {}): admin.Subscr
     error: "",
     payload: '{"title":"CPU above 90%"}',
     payloadTruncated: false,
+    runSize: 0,
     ...over,
   };
 }

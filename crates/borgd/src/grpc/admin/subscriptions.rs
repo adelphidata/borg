@@ -109,8 +109,13 @@ fn cut(s: &str, max: usize) -> (&str, bool) {
 }
 
 pub(super) fn event_to_pb(e: SubscriptionEventRow) -> PbSubscriptionEvent {
+    event_with_run_size(e, 0)
+}
+
+fn event_with_run_size(e: SubscriptionEventRow, run_size: u32) -> PbSubscriptionEvent {
     let (payload, cut_here) = cut(&e.payload, DISPLAY_PAYLOAD_BYTES);
     PbSubscriptionEvent {
+        run_size,
         payload: payload.to_string(),
         payload_truncated: e.payload_truncated || cut_here,
         id: e.id,
@@ -126,6 +131,32 @@ pub(super) fn event_to_pb(e: SubscriptionEventRow) -> PbSubscriptionEvent {
         result: e.result.unwrap_or_default(),
         error: e.error.unwrap_or_default(),
     }
+}
+
+/// A listing of events, each with the full size of its run.
+async fn events_to_pb(
+    db: &Database,
+    events: Vec<SubscriptionEventRow>,
+) -> Result<Vec<PbSubscriptionEvent>, TStatus> {
+    let mut run_ids: Vec<String> = events.iter().filter_map(|e| e.run_id.clone()).collect();
+    run_ids.sort();
+    run_ids.dedup();
+    let sizes = db
+        .subscription_run_sizes(&run_ids)
+        .await
+        .map_err(map_internal("count run events"))?;
+    Ok(events
+        .into_iter()
+        .map(|e| {
+            let size = e
+                .run_id
+                .as_ref()
+                .and_then(|r| sizes.get(r))
+                .copied()
+                .unwrap_or(0);
+            event_with_run_size(e, size)
+        })
+        .collect())
 }
 
 fn preset_to_pb(p: &Preset) -> PbPreset {
@@ -214,9 +245,10 @@ pub(super) async fn get(
         .await
         .map_err(map_internal("count runs"))?;
     let sender_steps = steps_with(&row, &config, KEY_PLACEHOLDER);
+    let events = events_to_pb(&db, events).await?;
     Ok(Response::new(SubscriptionDetail {
         subscription: Some(subscription_to_pb(row, &config)),
-        events: events.into_iter().map(event_to_pb).collect(),
+        events,
         sender_steps,
         runs_today: u32::try_from(runs_today).unwrap_or(u32::MAX),
     }))
@@ -377,7 +409,7 @@ pub(super) async fn list_events(
         .await
         .map_err(map_internal("list subscription events"))?;
     Ok(Response::new(SubscriptionEventList {
-        events: events.into_iter().map(event_to_pb).collect(),
+        events: events_to_pb(&db, events).await?,
     }))
 }
 

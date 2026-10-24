@@ -167,8 +167,11 @@ function RunRow({ run }: { run: admin.SubscriptionEvent[] }) {
   const [open, setOpen] = useState(false);
   const lead = run[0]!;
   const words = EVENT_WORDS[lead.status] ?? lead.status;
+  // The run's own count: the listing holds only the newest events, so the
+  // oldest run on the page may show fewer than it digested.
+  const size = Math.max(run.length, lead.runSize ?? 0);
   const meta = [
-    run.length > 1 ? `${run.length} events → 1 run` : undefined,
+    size > 1 ? `${size} events → 1 run` : undefined,
     words,
     lead.receivedAtUnix > 0 ? ago(lead.receivedAtUnix) : undefined,
     lead.durationMs > 0 ? formatElapsed(lead.durationMs) : undefined,
@@ -219,8 +222,10 @@ function RunRow({ run }: { run: admin.SubscriptionEvent[] }) {
               )}
             </div>
           ))}
-          {run.length > PAYLOADS_SHOWN && (
-            <div className={HELP_LINE}>And {run.length - PAYLOADS_SHOWN} more in this run.</div>
+          {size > Math.min(run.length, PAYLOADS_SHOWN) && (
+            <div className={HELP_LINE}>
+              And {size - Math.min(run.length, PAYLOADS_SHOWN)} more in this run.
+            </div>
           )}
         </div>
       )}

@@ -961,6 +961,32 @@ impl Database {
         Ok(out)
     }
 
+    /// How many events each of `run_ids` digested, all of them: a listing
+    /// that shows only the newest events must not under-count a run.
+    pub async fn subscription_run_sizes(
+        &self,
+        run_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let mut out = std::collections::HashMap::new();
+        if run_ids.is_empty() {
+            return Ok(out);
+        }
+        let ids = serde_json::to_string(run_ids)?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT run_id, COUNT(*) FROM subscription_events \
+                 WHERE run_id IN (SELECT value FROM json_each(?1)) GROUP BY run_id",
+                params!(ids),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let n: i64 = row.get(1)?;
+            out.insert(row.get(0)?, u32::try_from(n).unwrap_or(u32::MAX));
+        }
+        Ok(out)
+    }
+
     /// Runs of one subscription started since `since` ("runs today").
     pub async fn subscription_runs_of_since(
         &self,
@@ -1271,6 +1297,37 @@ mod tests {
                 .is_empty(),
             "a failed test does not count toward the failure breaker"
         );
+    }
+
+    #[tokio::test]
+    async fn run_sizes_count_every_event_of_a_run() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let limits = IngestLimits {
+            per_minute: 100,
+            storm_threshold: 100,
+            max_pending: 100,
+        };
+        let t = chrono::Utc::now().timestamp();
+        for key in ["a", "b", "c"] {
+            db.insert_subscription_event(&event(&s.id, Some(key), t), limits)
+                .await
+                .unwrap();
+        }
+        db.claim_next_subscription_event("run_a", t)
+            .await
+            .unwrap()
+            .unwrap();
+        db.claim_subscription_batch(&s.id, "run_a", 50, t, None)
+            .await
+            .unwrap();
+        let sizes = db
+            .subscription_run_sizes(&["run_a".into(), "run_none".into()])
+            .await
+            .unwrap();
+        assert_eq!(sizes.get("run_a"), Some(&3));
+        assert_eq!(sizes.get("run_none"), None);
+        assert!(db.subscription_run_sizes(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
