@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes, useLocation } from "react-router-dom";
 import { STORAGE_KEYS, ThemeProvider } from "@borg/ui";
 import { BorgError, GrpcStatus } from "@borg/client";
@@ -225,6 +225,24 @@ describe("SettingDetailPage for a curated choice", () => {
       expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
         key: "llm.thinking",
         value: "high",
+      }),
+    );
+  });
+
+  it("offers a reset once the choice was changed, and only then", async () => {
+    mount("/settings/thinking");
+    await waitFor(() => expect(screen.getByText("Medium")).toBeTruthy());
+    expect(screen.queryByText("Reset to default")).toBeNull();
+    cleanup();
+
+    const changed = REGISTRY.map((e) => (e.key === "llm.thinking" ? { ...e, category: "db" } : e));
+    const daemon = fakeDaemon({ GetSettings: { entries: changed }, UnsetSetting: {} });
+    mount("/settings/thinking", daemon);
+    await waitFor(() => expect(screen.getByText("Reset to default")).toBeTruthy());
+    click(screen.getByText("Reset to default"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UnsetSetting")?.request).toEqual({
+        key: "llm.thinking",
       }),
     );
   });

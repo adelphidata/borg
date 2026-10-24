@@ -979,6 +979,23 @@ describe("useConversation commands", () => {
     expect(daemon.calls.some((c) => c.method === "Send")).toBe(false);
   });
 
+  it("switches the mode before the conversation has a session", async () => {
+    const daemon = fakeDaemon({ ...OPEN, SetSetting: {} });
+    const conv = mount(daemon);
+    let taken = false;
+    act(() => {
+      taken = conv.current.runCommand("/mode plan");
+    });
+    expect(taken).toBe(true);
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "conversation.collaboration_mode",
+        value: "plan",
+      }),
+    );
+    expect(daemon.calls.some((c) => c.method === "Send")).toBe(false);
+  });
+
   it("leaves ordinary text to be sent", async () => {
     const conv = mount(fakeDaemon(OPEN));
     await ready(conv);

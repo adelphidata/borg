@@ -657,18 +657,11 @@ export function SettingDetailPage() {
             <>
               <Heading name={title} />
               <SaveError message={saveError?.message} />
-              {basic?.options ? (
-                <OptionPicker
-                  options={basic.options}
-                  value={entry.value}
-                  disabled={saving}
-                  onPick={(v) => v !== entry.value && void save(entry.key, v)}
-                />
-              ) : entry.kind === "bool" ? (
+              {basic?.options || entry.kind === "bool" ? (
                 <div className="flex flex-col items-start gap-3">
                   <div className="self-stretch">
                     <OptionPicker
-                      options={BOOL_OPTIONS}
+                      options={basic?.options ?? BOOL_OPTIONS}
                       value={entry.value}
                       disabled={saving}
                       onPick={(v) => v !== entry.value && void save(entry.key, v)}

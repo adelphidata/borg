@@ -1134,12 +1134,19 @@ export function useConversation(target: string | undefined): Conversation {
   const runCommand = useCallback(
     (text: string): boolean => {
       const cmd = parseArgCommand(text);
-      if (!cmd || !sessionId) return false;
+      if (!cmd) return false;
       const forGeneration = generation.current;
       const answer = (reply: string) => {
         if (forGeneration !== generation.current) return;
         setCells((prev) => [...prev, { kind: "notice", text: reply, at: Date.now() }]);
       };
+      // The mode is a global setting: it needs no session, and must not wait
+      // for one, or `/mode plan` typed early would go to the model as prose.
+      if (cmd.kind === "mode") {
+        void runArgCommand(borg, "", cmd, saveSetting).then(answer);
+        return true;
+      }
+      if (!sessionId) return false;
       void (async () => {
         // Asked fresh rather than read from the ref: an empty id makes the
         // daemon pick its most recent session, which can be another

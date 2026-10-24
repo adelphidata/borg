@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { startTransition, useEffect, useState } from "react";
 
 /**
  * Points the address bar of a conversation opened at `/c/new` at the session
@@ -29,7 +29,9 @@ export function usePopCount(
 ): number {
   const [pops, setPops] = useState(0);
   useEffect(() => {
-    const onPop = () => setPops((n) => n + 1);
+    // In the router's own transition, so the new key and the new location
+    // commit together: a key alone would remount the page on the old route.
+    const onPop = () => startTransition(() => setPops((n) => n + 1));
     win.addEventListener("popstate", onPop);
     return () => win.removeEventListener("popstate", onPop);
   }, [win]);
