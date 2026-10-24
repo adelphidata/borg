@@ -68,16 +68,41 @@ describe("runArgCommand", () => {
       method: "SetGoal",
       request: { sessionId: "conv-7", op: admin.GoalMutation_Op.OP_REPLACE, objective: "Ship it" },
     });
-    expect(reply).toContain("Goal set: Ship it");
+    expect(reply).toContain("Goal set: Ship it. Borg");
+  });
+
+  it("does not double the stop after a goal that has one", async () => {
+    const daemon = fakeDaemon({
+      SetGoal: { present: true, objective: "Ship it.", status: "active" },
+    });
+    const reply = await runArgCommand(createBorgClient(daemon.transport), "c", {
+      kind: "goal-set",
+      objective: "Ship it.",
+    });
+    expect(reply).toContain("Goal set: Ship it. Borg");
   });
 
   it("says when there is no goal to pause", async () => {
-    const daemon = fakeDaemon({ SetGoal: { present: false } });
+    const daemon = fakeDaemon({ GetGoal: { present: false } });
     const reply = await runArgCommand(createBorgClient(daemon.transport), "c", {
       kind: "goal-status",
       status: "paused",
     });
     expect(reply).toBe("There is no goal to pause.");
+    expect(daemon.calls.map((c) => c.method)).toEqual(["GetGoal"]);
+  });
+
+  it("pauses a goal that is set", async () => {
+    const daemon = fakeDaemon({
+      GetGoal: { present: true, objective: "Ship it", status: "active" },
+      SetGoal: { present: true, objective: "Ship it", status: "paused" },
+    });
+    const reply = await runArgCommand(createBorgClient(daemon.transport), "c", {
+      kind: "goal-status",
+      status: "paused",
+    });
+    expect(daemon.calls[1]?.request).toMatchObject({ status: "paused" });
+    expect(reply).toBe("Goal paused: Ship it");
   });
 
   it("reads a heartbeat back in whole units", async () => {

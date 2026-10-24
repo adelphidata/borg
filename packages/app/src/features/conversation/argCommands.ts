@@ -158,9 +158,14 @@ export async function runArgCommand(
           tokenBudget: 0,
           status: "",
         });
-        return `Goal set: ${goal.objective}. Borg works toward it after each of your messages.`;
+        const stop = /[.!?]$/.test(goal.objective) ? "" : ".";
+        return `Goal set: ${goal.objective}${stop} Borg works toward it after each of your messages.`;
       }
       case "goal-status": {
+        // The daemon refuses a status change with no goal, in its own words.
+        const current = await borg.admin.getGoal({ sessionId });
+        if (!current.present)
+          return `There is no goal to ${cmd.status === "paused" ? "pause" : "resume"}.`;
         const goal = await borg.admin.setGoal({
           sessionId,
           op: admin.GoalMutation_Op.OP_SET_STATUS,
@@ -169,8 +174,6 @@ export async function runArgCommand(
           tokenBudget: 0,
           status: cmd.status,
         });
-        if (!goal.present)
-          return `There is no goal to ${cmd.status === "paused" ? "pause" : "resume"}.`;
         return `Goal ${cmd.status === "paused" ? "paused" : "resumed"}: ${goal.objective}`;
       }
       case "heartbeat":
