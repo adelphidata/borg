@@ -118,7 +118,7 @@ pub(crate) struct AddPresetArgs {
     /// Server name (`mcp.servers` map key).
     pub id: String,
 
-    /// Preset name. See `PRESETS` for the catalog.
+    /// Preset name.
     #[arg(long, value_parser = ["time", "filesystem", "github", "notion"])]
     pub preset: String,
 

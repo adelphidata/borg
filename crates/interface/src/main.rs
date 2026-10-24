@@ -1185,7 +1185,7 @@ mod tests {
                         .map(|t| t.to_string())
                 }));
             for text in texts {
-                if ["this enum", "Boxed:", "Box<"]
+                if ["this enum", "Boxed:", "Box<", "See `PRESETS`"]
                     .iter()
                     .any(|n| text.contains(n))
                 {
