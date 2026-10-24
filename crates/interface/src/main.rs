@@ -557,6 +557,17 @@ async fn async_main() -> Result<()> {
         return commands::acp::run_acp_stdio().await;
     }
 
+    // A restore writes a whole `BORG_HOME`, and refuses one that already holds
+    // state. The diagnostics setup below opens (creating) `borg.db` and the
+    // auto-start launches a daemon on the home, so either would make a fresh
+    // target look occupied and the restore could never run without `--force`.
+    if let Some(Commands::Backup {
+        action: BackupCmd::Restore { file, force },
+    }) = &cli.command
+    {
+        return commands::backup::run_restore(file, *force).await;
+    }
+
     let worktree_dir = enter_worktree(requested_worktree.as_deref()).await?;
 
     let tui_mode = matches!(cli.command, Some(Commands::Start) | None);
