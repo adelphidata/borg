@@ -28,6 +28,24 @@ pub struct RateRow {
     pub source: String,
 }
 
+/// The provider id and model a `<vendor>/<model>` id has in the bundled
+/// cards, or `None` when the vendor has no cards there.
+fn vendor_card(model: &str) -> Option<(&'static str, String)> {
+    let (vendor, name) = model.split_once('/')?;
+    let provider = match vendor.to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic",
+        "openai" => "openai",
+        "google" => "gemini",
+        "deepseek" => "deepseek",
+        "x-ai" | "xai" => "xai",
+        _ => return None,
+    };
+    Some((
+        provider,
+        crate::pricing::fold_claude_dotted_version(name).into_owned(),
+    ))
+}
+
 /// Rate-card resolver.
 pub struct RateCard;
 
@@ -48,7 +66,16 @@ impl RateCard {
         if let Some(row) = Self::lookup_exact(db, provider_id, model, call_ts).await? {
             return Ok(Some(row));
         }
-        Self::lookup_exact(db, provider_id, "*", call_ts).await
+        if let Some(row) = Self::lookup_exact(db, provider_id, "*", call_ts).await? {
+            return Ok(Some(row));
+        }
+        // An aggregator names the model `<vendor>/<model>` and has no card of
+        // its own. The vendor's card is the closest fixed price; without it
+        // the call skips post-flight and the dollar cap never sees its spend.
+        match vendor_card(model) {
+            Some((vendor, name)) => Self::lookup_exact(db, vendor, &name, call_ts).await,
+            None => Ok(None),
+        }
     }
 
     async fn lookup_exact(
@@ -129,5 +156,40 @@ impl RateCard {
             .await
             .context("failed to insert rate-card row")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The aggregator's own id resolves to the vendor's bundled card, so the
+    /// dollar cap counts calls made through it.
+    #[tokio::test]
+    async fn an_aggregator_model_prices_at_its_vendor_card() {
+        let db = Database::test_db().await;
+        let now = chrono::Utc::now().timestamp();
+        let direct = RateCard::lookup(&db, "deepseek", "deepseek-v4-flash", now)
+            .await
+            .unwrap()
+            .expect("bundled card");
+        let routed = RateCard::lookup(&db, "openrouter", "deepseek/deepseek-v4-flash", now)
+            .await
+            .unwrap()
+            .expect("vendor card through the aggregator");
+        assert_eq!(routed, direct);
+
+        // Dotted Claude ids fold to the bundled spelling.
+        assert!(
+            RateCard::lookup(&db, "openrouter", "anthropic/claude-opus-5.5", now)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // An unknown vendor still has no price.
+        assert!(RateCard::lookup(&db, "openrouter", "acme/model-x", now)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
