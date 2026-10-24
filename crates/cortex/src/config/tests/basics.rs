@@ -380,7 +380,13 @@ fn a_bad_setting_value_names_what_it_takes() {
         "agents.delegate_timeout_secs takes a whole number of 0 or more, not \"abc\"."
     );
     let err = parse_value::<bool>("maybe", "web.enabled").unwrap_err();
-    assert_eq!(err.to_string(), "web.enabled takes true or false, not \"maybe\".");
+    assert_eq!(
+        err.to_string(),
+        "web.enabled takes true or false, not \"maybe\"."
+    );
     let err = parse_value::<f64>("x", "llm.temperature").unwrap_err();
-    assert_eq!(err.to_string(), "llm.temperature takes a number, not \"x\".");
+    assert_eq!(
+        err.to_string(),
+        "llm.temperature takes a number, not \"x\"."
+    );
 }
