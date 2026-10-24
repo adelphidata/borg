@@ -10,10 +10,10 @@
   "type": "commonjs",
   "scripts": {
     "dev": "bun run build:electron && concurrently -k \"vite\" \"bun run dev:electron\"",
-    "dev:electron": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .",
+    "dev:electron": "wait-on tcp:5173 && bun scripts/brand-dev-bundle.mjs && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .",
     "build:electron": "bun build ./electron/main.ts ./electron/preload.ts --outdir dist-electron --target node --format cjs --external electron",
     "build": "vite build && bun run build:electron",
-    "start": "bun run build && electron .",
+    "start": "bun run build && bun scripts/brand-dev-bundle.mjs && electron .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "dist": "bun run build && electron-builder --config electron-builder.yml",
