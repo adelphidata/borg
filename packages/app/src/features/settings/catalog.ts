@@ -212,7 +212,7 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
   {
     id: "channels",
     name: "Channels & Network",
-    prefixes: ["gateway", "webhooks", "apns", "tunnel", "discovery"],
+    prefixes: ["gateway", "webhooks", "subscriptions", "apns", "tunnel", "discovery"],
   },
   {
     id: "security",

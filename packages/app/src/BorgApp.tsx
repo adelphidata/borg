@@ -29,6 +29,8 @@ import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPag
 import { ProviderKeysPage } from "./features/settings/ProviderKeysPage";
 import { McpServerDetailPage } from "./features/mcp/McpServerDetailPage";
 import { SkillDetailPage } from "./features/skills/SkillDetailPage";
+import { SubscriptionDetailPage } from "./features/subscriptions/SubscriptionDetailPage";
+import { needsAttention } from "./features/subscriptions/useSubscriptions";
 import { CommandPalette } from "./features/palette/CommandPalette";
 import { BootGate } from "./features/boot/BootGate";
 import { OnboardingPage } from "./features/onboarding/OnboardingPage";
@@ -247,17 +249,26 @@ function Shell({ platform }: { platform: Platform }) {
   useMenuEscape(recentMenu !== undefined, () => setRecentMenu(undefined));
 
   const menuPinned = recents.find((r) => r.id === recentMenu?.id)?.pinned ?? false;
-  // Attention dots: doctor warnings light Health, pending pairings light
-  // Connections. Unreachable daemon lights nothing — the pages say it better.
+  // Attention dots: doctor warnings light Health; pending pairings and a
+  // subscription that paused itself or failed its last run light Connections.
+  // Unreachable daemon lights nothing — the pages say it better.
   const alerts = useQuery(
     async (borg) => {
-      const [warnings, pairings] = await Promise.all([
+      const [warnings, pairings, subscriptions] = await Promise.all([
         borg.admin.getPersistentWarnings({}),
         borg.admin.listPairingRequests({}),
+        // A daemon from before subscriptions has no such call; that must not
+        // take the other two dots down with it.
+        borg.admin.listSubscriptions({}).catch((error: unknown) => {
+          console.warn("subscription alerts unavailable", error);
+          return { subscriptions: [] };
+        }),
       ]);
       return {
         health: warnings.warnings.length > 0,
-        connections: pairings.requests.some((r) => r.status === "pending"),
+        connections:
+          pairings.requests.some((r) => r.status === "pending") ||
+          subscriptions.subscriptions.some(needsAttention),
       };
     },
     [location.key],
@@ -341,9 +352,10 @@ function Shell({ platform }: { platform: Platform }) {
               path="/c/:sessionId"
               element={<ConversationPage key={`${location.key}:${pops}`} />}
             />
-            {/* The two static segments outrank the generic kind/name route,
+            {/* The static segments outrank the generic kind/name route,
                 which serves channels (and sends an old provider link to Settings). */}
             <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
+            <Route path="/connections/subscriptions/:id" element={<SubscriptionDetailPage />} />
             <Route path="/connections/skills/:name" element={<SkillDetailPage />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />

@@ -1,4 +1,4 @@
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   AlertBanner,
   Badge,
@@ -12,6 +12,8 @@ import { DaemonState } from "../../components/DaemonState";
 import { PageGroup } from "../../components/PageGroup";
 import { McpServersSection } from "../mcp/McpServersSection";
 import { SkillsSection } from "../skills/SkillsSection";
+import { SubscriptionsSection, subscriptionPath } from "../subscriptions/SubscriptionsSection";
+import { attentionAlert, useSubscriptions } from "../subscriptions/useSubscriptions";
 import { badgeOf, useConnections, type ChannelConnection } from "./useConnections";
 
 interface Card {
@@ -83,12 +85,19 @@ function ConnList({ cards, open }: { cards: Card[]; open: (id: string) => void }
   );
 }
 
-/** What Borg is hooked up to beyond its model: channels, MCP servers and skills. */
+/**
+ * What Borg is hooked up to beyond its model: channels, the subscriptions
+ * that wake it, MCP servers and skills.
+ */
 export function ConnectionsPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
+  const location = useLocation();
   const open = (id: string) => navigate(`/connections/${id}`);
   const connections = useConnections();
+  const subs = useSubscriptions([location.key]);
+  const subAlert =
+    subs.query.state === "ready" ? attentionAlert(subs.query.data.subscriptions) : undefined;
   const meta = (() => {
     if (connections.state !== "ready") return undefined;
     const { channels, pendingCount } = connections.data;
@@ -110,6 +119,15 @@ export function ConnectionsPage() {
               const alerted = data.channels.find((c) => c.pending.length > 0);
               return (
                 <>
+                  {/* One banner at a time: a person waiting outranks a
+                      subscription, whose row stays red either way. */}
+                  {!alerted && subAlert && (
+                    <AlertBanner
+                      alert={subAlert.alert}
+                      stacked={isMobile}
+                      onAction={() => navigate(subscriptionPath(subAlert.sub.id))}
+                    />
+                  )}
                   {alerted && (
                     <AlertBanner
                       alert={{
@@ -135,6 +153,7 @@ export function ConnectionsPage() {
               );
             }}
           </DaemonState>
+          <SubscriptionsSection subs={subs} />
           {/* Tools and playbooks Borg reaches for sit with the channels it
               answers on: one page for everything it is hooked up to. */}
           <McpServersSection />

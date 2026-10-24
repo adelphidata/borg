@@ -6,6 +6,7 @@ import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { ConnectionsPage } from "./ConnectionsPage";
 import { badgeOf } from "./useConnections";
+import { subscription } from "../../test/subscriptions";
 
 const media = installMatchMedia(() => false);
 const mobile = media.controller("(max-width: 700px)");
@@ -15,6 +16,8 @@ const EMPTY = {
   ListPairingRequests: { requests: [] },
   ListMcpServers: { servers: [], presets: [], mcpEnabled: true },
   ListSkillCatalog: { skills: [] },
+  ListSubscriptions: { subscriptions: [] },
+  ListSubscriptionPresets: { presets: [] },
 };
 
 const TELEGRAM = {
@@ -74,8 +77,8 @@ describe("ConnectionsPage", () => {
     for (const gone of ["Model providers", "Add a provider", "Import a sign-in", "Anthropic"]) {
       expect(screen.queryByText(gone)).toBeNull();
     }
-    // What the page is for still stands: channels, MCP servers, skills.
-    for (const heading of ["Channels", "MCP servers", "Skills"]) {
+    // What the page is for still stands: channels, subscriptions, MCP servers, skills.
+    for (const heading of ["Channels", "Subscriptions", "MCP servers", "Skills"]) {
       expect(screen.getByRole("heading", { name: heading })).toBeTruthy();
     }
   });
@@ -109,6 +112,44 @@ describe("ConnectionsPage", () => {
 
     act(() => screen.getByRole("button", { name: "Review" }).click());
     expect(screen.getByTestId("path").textContent).toBe("/connections/channel/telegram");
+  });
+
+  it("names a subscription that paused itself, and opens it", async () => {
+    mount(
+      fakeDaemon({
+        ...EMPTY,
+        ListSubscriptions: {
+          subscriptions: [
+            subscription({ id: "a", name: "Fine" }),
+            subscription({ id: "sub_9", name: "Sentry errors", status: "storm" }),
+          ],
+        },
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Sentry errors paused itself")).toBeTruthy());
+    act(() => screen.getByRole("button", { name: "Review" }).click());
+    expect(screen.getByTestId("path").textContent).toBe("/connections/subscriptions/sub_9");
+  });
+
+  it("puts a waiting person ahead of a subscription in the one banner", async () => {
+    mount(
+      fakeDaemon({
+        ...EMPTY,
+        ListPairingRequests: {
+          requests: [
+            { id: "p1", channelName: "telegram", senderId: "42", status: "pending", code: "" },
+          ],
+        },
+        ListSubscriptions: {
+          subscriptions: [subscription({ name: "Broken", lastRunStatus: "failed" })],
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("telegram has 1 pairing request waiting")).toBeTruthy(),
+    );
+    expect(screen.queryByText("Broken: the last run failed")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Review" })).toHaveLength(1);
   });
 
   it("ignores a pairing request that is no longer pending", async () => {

@@ -10,6 +10,7 @@ import { sessionsChanged } from "./features/sessions/sessionsVersion";
 import { STORAGE_KEYS } from "@borg/ui";
 import { fakeDaemon, fakeNative } from "./test/harness";
 import { setupStatus } from "./test/setupStatus";
+import { subscription } from "./test/subscriptions";
 import type { Platform } from "./lib/platform";
 
 const media = installMatchMedia(() => false);
@@ -32,6 +33,7 @@ const BASE = {
   ListSessions: { sessions: [session()] },
   GetPersistentWarnings: { warnings: [] },
   ListPairingRequests: { requests: [] },
+  ListSubscriptions: { subscriptions: [] },
   GetSettings: { entries: [] },
   ListSkills: { skills: [] },
   // The conversation page opens as soon as the shell routes to "/".
@@ -442,6 +444,53 @@ describe("BorgApp shell", () => {
     // The dots ride the nav rows, so their presence is what the shell renders.
     await waitFor(() => expect(screen.getByText("Health")).toBeTruthy());
     expect(screen.getByText("Connections")).toBeTruthy();
+  });
+
+  it("lights Connections for a subscription that paused itself, and not for a quiet one", async () => {
+    const connectionsDot = () =>
+      screen.getByRole("link", { name: /Connections/ }).querySelector(".bg-alert");
+
+    const quiet = mount(
+      fakeDaemon({ ...BASE, ListSubscriptions: { subscriptions: [subscription()] } }),
+    );
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(connectionsDot()).toBeNull();
+    quiet.unmount();
+
+    mount(
+      fakeDaemon({
+        ...BASE,
+        ListSubscriptions: { subscriptions: [subscription({ status: "storm" })] },
+      }),
+    );
+    await waitFor(() => expect(connectionsDot()).not.toBeNull());
+  });
+
+  it("routes a subscription link to its own page, not the channel page", async () => {
+    window.location.hash = "#/connections/subscriptions/sub_1";
+    mount(
+      fakeDaemon({
+        ...BASE,
+        GetSubscription: {
+          subscription: subscription(),
+          events: [],
+          senderSteps: [],
+          runsToday: 0,
+        },
+        ListSubscriptionPresets: { presets: [] },
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Recent events")).toBeTruthy());
+  });
+
+  it("keeps the other dots when the daemon has no subscriptions call", async () => {
+    const { ListSubscriptions: _gone, ...older } = BASE;
+    mount(fakeDaemon({ ...older, GetPersistentWarnings: { warnings: ["Sandbox: missing"] } }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("link", { name: /Health/ }).querySelector(".bg-alert"),
+      ).not.toBeNull(),
+    );
   });
 
   it("remembers a collapsed sidebar across a restart", async () => {
