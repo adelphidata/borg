@@ -148,7 +148,9 @@ impl DaemonSessionExecutor {
 /// cannot even be opened is "unreadable" for the same fail-safe purpose —
 /// nothing downstream would work anyway.
 pub(crate) async fn emergency_pause_notice() -> Option<String> {
-    let reason = match cortex::db::Database::open().await {
+    // Read-only: this runs on every turn, and the check only reads, so it
+    // must not run the migration check or contend for the writer lock.
+    let reason = match cortex::db::Database::open_readonly().await {
         Ok(db) => {
             if !cortex::emergency_pause::is_engaged(&db).await {
                 return None;
