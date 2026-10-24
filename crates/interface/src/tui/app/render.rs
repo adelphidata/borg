@@ -198,11 +198,11 @@ impl<'a> App<'a> {
         // misleadingly looks like compaction never ran. See
         // crates/interface/src/tui/app/mod.rs `last_prompt_tokens`.
         //
-        // The denominator is the EFFECTIVE budget (configured cap clamped by
-        // the model's usable window) — the same threshold the agent compacts
-        // against. Dividing by the raw configured cap understates occupancy
-        // whenever the model's window is the binding constraint.
-        let max = cortex::conversation::effective_history_budget_for(&self.config);
+        // The denominator is the model's whole window, because the numerator
+        // is the whole prompt: system prompt, tools and history. Dividing it
+        // by the history-only compaction budget read 34% on a chat with 78
+        // tokens of history, and 100% before compaction was due.
+        let max = cortex::llm::model_registry::context_window_for(&self.config.llm.model) as usize;
         if max == 0 {
             return 0;
         }

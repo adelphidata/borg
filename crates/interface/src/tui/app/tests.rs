@@ -486,6 +486,11 @@ fn usage(prompt_tokens: u64) -> cortex::llm::UsageData {
     }
 }
 
+/// The model's whole window: the footer's denominator.
+fn window(app: &App<'_>) -> u64 {
+    cortex::llm::model_registry::context_window_for(&app.config.llm.model) as u64
+}
+
 #[test]
 fn ctx_pct_zero_by_default() {
     let app = make_app();
@@ -499,7 +504,7 @@ fn ctx_pct_reflects_current_context_not_cumulative_session_tokens() {
     // turn, so ten turns at 25% each saturated the gauge to 100% even
     // though the live context was still ~25%.
     let mut app = make_app();
-    let max = app.config.conversation.max_history_tokens.max(1) as u64;
+    let max = window(&app);
     let quarter = max / 4;
     for _ in 0..10 {
         app.process_agent_event(AgentEvent::Usage(usage(quarter)));
@@ -515,7 +520,7 @@ fn ctx_pct_reflects_current_context_not_cumulative_session_tokens() {
 #[test]
 fn ctx_pct_drops_after_history_compacted_event() {
     let mut app = make_app();
-    let max = app.config.conversation.max_history_tokens.max(1) as u64;
+    let max = window(&app);
     // Drive the gauge up to 90%.
     app.process_agent_event(AgentEvent::Usage(usage((max * 90) / 100)));
     assert!(app.compute_context_pct() >= 89);
@@ -536,7 +541,7 @@ fn ctx_pct_drops_after_history_compacted_event() {
 #[test]
 fn ctx_pct_clamps_to_100_on_overflow() {
     let mut app = make_app();
-    let max = app.config.conversation.max_history_tokens.max(1) as u64;
+    let max = window(&app);
     app.last_prompt_tokens = max * 5;
     assert_eq!(app.compute_context_pct(), 100);
 }
