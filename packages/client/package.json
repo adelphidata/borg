@@ -1,6 +1,6 @@
 {
   "name": "@borg/client",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "description": "Generated gRPC client for borgd — one typed API, node (UDS) and browser (gRPC-Web) transports",
   "license": "MIT",
