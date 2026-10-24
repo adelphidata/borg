@@ -14,6 +14,7 @@
 //! runs, and one self-pause.
 
 pub mod filter;
+pub mod ingest;
 pub mod presets;
 pub mod prompt;
 pub mod wake;
