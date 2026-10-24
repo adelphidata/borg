@@ -756,6 +756,11 @@ impl Agent {
         if let Some(err) = reject_non_object_args(&mut raw_args) {
             return Ok(ToolOutput::Text(err));
         }
+        if let Some(refusal) =
+            crate::subscriptions::run_refusal(self.root_session_id(), name, &raw_args)
+        {
+            return Ok(ToolOutput::Text(refusal));
+        }
 
         // MCP tools live outside the typed `Tool` enum and use a reserved
         // `mcp_` prefix. Short-circuit before `Tool::parse` so the LLM
@@ -1547,6 +1552,34 @@ mod session_availability_tests {
         assert!(
             !result.contains(NEEDLE),
             "handler ran: the file content leaked into the result: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_of_a_subscription_run_cannot_schedule_work() {
+        let mut agent = minimal_test_agent(Config::default());
+        // What a child spawned by a subscription run inherits.
+        agent.set_prompt_cache_scope("subscription:sub_abc".to_string());
+        let call = ToolCall {
+            id: "s1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tool::names::SCHEDULE.to_string(),
+                arguments: serde_json::json!({
+                    "action": "create",
+                    "type": "prompt",
+                    "name": "follow up",
+                    "prompt": "check again",
+                    "schedule": "every 1m",
+                })
+                .to_string(),
+            },
+        };
+        let (results, _) = run(&mut agent, &[call], false).await;
+        assert!(
+            results[0].contains("cannot change anything inside a subscription run"),
+            "got: {}",
+            results[0]
         );
     }
 

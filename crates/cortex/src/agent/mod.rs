@@ -648,6 +648,17 @@ impl Agent {
         self.prompt_cache_scope = Some(scope);
     }
 
+    /// The session at the root of this agent's tree: its own session for a
+    /// top-level agent, the spawning root's for a sub-agent (the prompt-cache
+    /// scope a sub-agent inherits is that root's session id). Rules that
+    /// follow a whole run, such as the subscription step limit and loop
+    /// guard, key on this so a sub-agent cannot step around them.
+    pub(crate) fn root_session_id(&self) -> &str {
+        self.prompt_cache_scope
+            .as_deref()
+            .unwrap_or(&self.session.meta.id)
+    }
+
     /// OpenAI-family `prompt_cache_key` for this agent's requests: the
     /// spawn-time scope when present (sub-agents share the parent session's
     /// key), otherwise this agent's own session ID.
@@ -1391,7 +1402,7 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let max_iterations = crate::subscriptions::step_limit(&self.config, &self.session.meta.id);
+        let max_iterations = crate::subscriptions::step_limit(&self.config, self.root_session_id());
         let mut iteration: usize = 0;
         let mut needs_response = false;
         let mut nudged_for_response = false;

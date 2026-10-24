@@ -37,6 +37,36 @@ pub fn is_subscription_session(session_key: &str) -> bool {
     session_key.starts_with(SESSION_PREFIX)
 }
 
+/// Refuse a call that would let a subscription run set up more work that
+/// wakes Borg again: scheduling a task, starting a goal, or changing a
+/// subscription. Reading stays allowed.
+///
+/// `root_session` is the session at the root of the agent tree, so a
+/// sub-agent a run spawned is held to the same rule. Without this, a run
+/// that schedules a follow-up whose result it listens to is a loop that
+/// only the run budget stops.
+pub fn run_refusal(root_session: &str, tool: &str, args: &serde_json::Value) -> Option<String> {
+    use crate::tool::names as tn;
+    if !is_subscription_session(root_session) {
+        return None;
+    }
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let reads = matches!(action, "list" | "get" | "history" | "events" | "status");
+    let refused = match tool {
+        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON | SUBSCRIBE_TOOL => !reads,
+        tn::CREATE_GOAL => true,
+        _ => false,
+    };
+    refused.then(|| {
+        format!(
+            "Error: `{tool}` cannot change anything inside a subscription run, because new work started here could wake this subscription again. Say in your reply what should be set up, and the user can do it."
+        )
+    })
+}
+
+/// The agent tool that manages subscriptions.
+pub const SUBSCRIBE_TOOL: &str = "subscribe";
+
 /// Agent-loop steps a turn in `session_id` may take. A subscription run gets
 /// the lower `subscriptions.max_steps`: nobody watches it, and a burst may
 /// start many of them, so a confused run stops early instead of spending
@@ -211,6 +241,38 @@ pub fn cap_payload(payload: &serde_json::Value, max_bytes: usize) -> (String, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_run_may_read_its_schedules_but_not_start_more_work() {
+        let run = "subscription:sub_abc";
+        let cases = [
+            (
+                run,
+                "schedule",
+                json!({"action": "create", "type": "prompt"}),
+                true,
+            ),
+            (run, "schedule", json!({"action": "list"}), false),
+            (run, "manage_tasks", json!({"action": "resume"}), true),
+            (run, "manage_tasks", json!({"action": "get"}), false),
+            (run, "manage_cron", json!({"action": "update"}), true),
+            (run, "create_goal", json!({"objective": "x"}), true),
+            (run, "subscribe", json!({"action": "create"}), true),
+            (run, "subscribe", json!({"action": "events"}), false),
+            (run, "schedule", json!({}), true),
+            (run, "read_file", json!({"path": "/x"}), false),
+            ("chat-123", "schedule", json!({"action": "create"}), false),
+            ("chat-123", "create_goal", json!({}), false),
+        ];
+        for (session, tool, args, refused) in cases {
+            assert_eq!(
+                run_refusal(session, tool, &args).is_some(),
+                refused,
+                "{session} {tool} {args}"
+            );
+        }
+    }
 
     #[test]
     fn ids_and_keys_have_their_prefix_and_differ() {
