@@ -712,7 +712,7 @@ impl Session for SessionSvc {
         let (before, after) = host
             .compact()
             .await
-            .map_err(|e| TStatus::internal(format!("compact: {e}")))?;
+            .map_err(|e| TStatus::internal(format!("{e:#}")))?;
         Ok(Response::new(CompactResponse {
             before_tokens: before as u64,
             after_tokens: after as u64,

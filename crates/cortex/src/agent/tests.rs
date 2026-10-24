@@ -501,7 +501,7 @@ async fn manual_compact_retries_with_primary_model_when_override_fails() {
     mount_dead_override_live_primary(&server).await;
     let mut agent = over_budget_agent_with_dead_override(&server.uri());
 
-    let (before, after) = agent.compact().await;
+    let (before, after) = agent.compact().await.expect("compact");
 
     assert!(
         after < before,
@@ -523,7 +523,7 @@ async fn manual_compact_summarizes_history_under_the_automatic_threshold() {
     agent.config.conversation.max_history_tokens = 1_000_000;
     let budget = agent.effective_history_budget();
 
-    let (before, after) = agent.compact().await;
+    let (before, after) = agent.compact().await.expect("compact");
 
     assert!(
         before * 4 < budget,
@@ -532,6 +532,39 @@ async fn manual_compact_summarizes_history_under_the_automatic_threshold() {
     assert!(
         after < before,
         "manual compaction must fold history even under the budget ({before} → {after} tokens)"
+    );
+}
+
+/// A summary call the provider refuses is a failure the user can act on, not
+/// "nothing to compact": the error names the cause and the history stays.
+#[tokio::test]
+async fn manual_compact_reports_a_refused_summary() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
+        .mount(&server)
+        .await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+    agent.config.compaction.model = None;
+    let before_len = agent.history.len();
+
+    let err = agent
+        .compact()
+        .await
+        .expect_err("a refused summary must not read as a no-op");
+
+    assert!(
+        err.to_string().contains("API key"),
+        "the error must point at the key: {err}"
+    );
+    assert_eq!(
+        agent.history.len(),
+        before_len,
+        "history must be kept whole"
     );
 }
 
@@ -549,7 +582,7 @@ async fn manual_compact_leaves_a_tiny_history_alone() {
         crate::types::Message::assistant("hello"),
     ];
 
-    let (before, after) = agent.compact().await;
+    let (before, after) = agent.compact().await.expect("compact");
 
     assert_eq!(before, after, "a tiny history must not be replaced");
     assert_eq!(agent.history.len(), 2);

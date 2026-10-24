@@ -690,7 +690,7 @@ impl SessionBackend for AgentBackend {
 
     async fn compact(&self) -> anyhow::Result<(usize, usize)> {
         let mut agent = self.agent.lock().await;
-        Ok(agent.compact().await)
+        agent.compact().await
     }
 
     async fn context_breakdown(&self) -> anyhow::Result<cortex::agent::ContextBreakdown> {

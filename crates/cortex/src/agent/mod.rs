@@ -989,9 +989,11 @@ impl Agent {
     }
 
     /// Compact conversation history via LLM summarization. Returns the history
-    /// token estimates (before, after).
+    /// token estimates (before, after); equal values mean there was nothing
+    /// worth folding. A summary that failed is an error, so the user is not
+    /// told "nothing to compact" about a history that could not be compacted.
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
-    pub async fn compact(&mut self) -> (usize, usize) {
+    pub async fn compact(&mut self) -> anyhow::Result<(usize, usize)> {
         let before = history_tokens(&self.history);
         // Same lane as the automatic paths: the compaction-tuned client
         // (operator overrides + a summary output-cap floor) with the
@@ -1005,23 +1007,33 @@ impl Agent {
         // about to run anyway. A history too small to beat the summary
         // marker it would be replaced with is left alone.
         if before / 2 <= crate::constants::COMPACTION_MARKER_TOKENS {
-            return (before, before);
+            return Ok((before, before));
         }
         let target = self.effective_history_budget().min(before / 2);
-        let (dropped, failure) = match self.run_compaction_with_fallback(target).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                warn!("Manual compaction could not build a summarizer client: {e}");
-                return (before, before);
+        let (dropped, failure) = self
+            .run_compaction_with_fallback(target)
+            .await
+            .context("could not start the summarizer")?;
+        let failed = (dropped == 0).then(|| match &failure {
+            Some(crate::conversation::SummarizeFailure::Persistent(category)) => format!(
+                "the summarizer could not reach the model provider ({category}); \
+                 check your API key or billing"
+            ),
+            Some(crate::conversation::SummarizeFailure::Transient) => {
+                "the summarizer returned no summary; try again in a moment".to_string()
             }
-        };
-        // No event channel here — the caller renders the before/after counts.
-        // Still record the outcome so a persistent outage latches (and gets
-        // announced by the next path that can reach the user) instead of
-        // silently reporting "compacted 0".
+            None => String::new(),
+        });
+        // No event channel here — the caller renders the before/after counts
+        // or the error. Still record the outcome so a persistent outage
+        // latches (and gets announced by the next path that can reach the
+        // user).
         self.record_compaction_outcome(dropped, failure, None).await;
+        if let Some(reason) = failed.filter(|r| !r.is_empty()) {
+            anyhow::bail!("{reason}");
+        }
         let after = history_tokens(&self.history);
-        (before, after)
+        Ok((before, after))
     }
 
     /// Clear all conversation history.
