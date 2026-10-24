@@ -39,6 +39,26 @@ const RENEWAL_WINDOW_DAYS: u32 = 14;
 /// Default validity in days for the server cert.
 const SERVER_VALIDITY_DAYS: u32 = 90;
 
+/// The stored key as PEM when it is the private half of `cert_pem`, or the
+/// self-heal reason when it is not. A key that is not valid PEM counts as
+/// a mismatch: failing the boot over it would crash-loop the daemon.
+fn stored_key_fits(
+    key_bytes: Vec<u8>,
+    cert_pem: &str,
+) -> std::result::Result<String, &'static str> {
+    let Ok(key_pem) = String::from_utf8(key_bytes) else {
+        return Err("kek-key-unreadable-self-heal");
+    };
+    match key_matches_cert(&key_pem, cert_pem) {
+        Ok(true) => Ok(key_pem),
+        Ok(false) => Err("kek-key-mismatch-self-heal"),
+        Err(e) => {
+            tracing::warn!(error = %e, "stored key or cert does not parse");
+            Err("kek-key-unreadable-self-heal")
+        }
+    }
+}
+
 /// Ensure a root CA exists in DB + keychain. Mints one if absent.
 ///
 /// Self-heals when the DB has a CA cert but the KEK has no matching private
@@ -55,13 +75,10 @@ pub async fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String
         .context("query root ca")?
     {
         let reason = match kek.get(ROOT_CA_KEY) {
-            Ok(key_bytes) => {
-                let key_pem = String::from_utf8(key_bytes).context("root CA key not utf-8 PEM")?;
-                if key_matches_cert(&key_pem, &row.pem).context("check root CA key")? {
-                    return Ok((row.pem, key_pem));
-                }
-                "kek-key-mismatch-self-heal"
-            }
+            Ok(key_bytes) => match stored_key_fits(key_bytes, &row.pem) {
+                Ok(key_pem) => return Ok((row.pem, key_pem)),
+                Err(reason) => reason,
+            },
             Err(PkiError::NotFound(_)) => "kek-key-missing-self-heal",
             Err(e) => return Err(anyhow!("load root CA key from keychain: {e}")),
         };
@@ -131,11 +148,9 @@ pub async fn ensure_server_cert(
         .context("query server cert")?
     {
         let reason = match kek.get(SERVER_CERT_KEY) {
-            Ok(key_bytes) => {
-                let key_pem = String::from_utf8(key_bytes).context("server key not utf-8 PEM")?;
-                if !key_matches_cert(&key_pem, &row.pem).context("check server cert key")? {
-                    "kek-key-mismatch-self-heal"
-                } else {
+            Ok(key_bytes) => match stored_key_fits(key_bytes, &row.pem) {
+                Err(reason) => reason,
+                Ok(key_pem) => {
                     let meta = CertMetadata {
                         subject_cn: None,
                         san_uri: None,
@@ -154,7 +169,7 @@ pub async fn ensure_server_cert(
                         .context("mark old renewed")?;
                     return Ok((issued.cert_pem, new_key, serial));
                 }
-            }
+            },
             Err(PkiError::NotFound(_)) => "kek-key-missing-self-heal",
             Err(e) => return Err(anyhow!("load server cert key from keychain: {e}")),
         };
@@ -407,6 +422,31 @@ mod tests {
             .expect("self-heal");
         assert_ne!(orig, fresh);
         assert_ne!(orig_serial, fresh_serial);
+        assert!(key_matches_cert(&fresh_key, &fresh).expect("check"));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_stored_key_self_heals_instead_of_failing_the_boot() {
+        let kek = MemoryKekStore::new();
+        let d = db().await;
+        let (orig_pem, _) = ensure_root_ca(&d, &kek).await.expect("ca");
+        kek.put(ROOT_CA_KEY, b"-----BEGIN PRIVATE KEY-----\ntruncated")
+            .expect("corrupt");
+
+        let (new_pem, new_key) = ensure_root_ca(&d, &kek)
+            .await
+            .expect("a corrupt key must not fail the boot");
+        assert_ne!(orig_pem, new_pem);
+        assert!(key_matches_cert(&new_key, &new_pem).expect("check"));
+
+        let san = vec![crate::auth::san::LOOPBACK_SAN.to_string()];
+        ensure_server_cert(&d, &kek, &new_pem, &new_key, &san)
+            .await
+            .expect("server");
+        kek.put(SERVER_CERT_KEY, &[0xff, 0xfe]).expect("corrupt");
+        let (fresh, fresh_key, _) = ensure_server_cert(&d, &kek, &new_pem, &new_key, &san)
+            .await
+            .expect("a corrupt server key must not fail the boot");
         assert!(key_matches_cert(&fresh_key, &fresh).expect("check"));
     }
 }
