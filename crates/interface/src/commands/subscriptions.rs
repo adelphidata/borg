@@ -123,6 +123,8 @@ fn list_lines(subs: &[Subscription]) -> Vec<String> {
         let mut status = status_words(&s.status).to_string();
         if s.last_run_status == "failed" {
             status.push_str(", last run failed");
+        } else if !s.last_error.is_empty() {
+            status.push_str(", needs you");
         }
         out.push(format!(
             "{:w$}  {:24}  {:10}  {:28}  {last}",
@@ -190,7 +192,10 @@ mod tests {
         let mut failed = sub("sub_b", "Deploys", "active");
         failed.last_run_status = "failed".into();
         failed.last_event_at_unix = 1_700_000_000;
-        let lines = list_lines(&[sub("sub_a", "Sentry errors", "storm"), failed]);
+        let mut lost = sub("sub_c", "Inbox", "active");
+        lost.last_run_status = "succeeded".into();
+        lost.last_error = "The reply could not be sent to slack: invalid_auth".into();
+        let lines = list_lines(&[sub("sub_a", "Sentry errors", "storm"), failed, lost]);
         assert!(lines[1].contains("paused itself"), "{}", lines[1]);
         assert!(
             lines[1].trim_end().ends_with('-'),
@@ -199,6 +204,7 @@ mod tests {
         );
         assert!(lines[2].contains("on, last run failed"), "{}", lines[2]);
         assert!(lines[2].contains("2023-11-1"), "{}", lines[2]);
+        assert!(lines[3].contains("on, needs you"), "{}", lines[3]);
         assert!(list_lines(&[])[0].contains("Connections page"));
     }
 

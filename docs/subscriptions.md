@@ -134,7 +134,8 @@ nothing needed attention; it is recorded and not delivered.
 - **Only here** (default): the subscription's conversation.
 - **A channel**: Slack, Telegram or Discord with a target, prefixed with the
   subscription's name. The app offers only the channels whose credential is
-  set on this machine.
+  set on this machine. A reply that cannot be sent (a revoked token) lights
+  the subscription's alert and names the reason until a later reply arrives.
 - **Reply where it came from**: channel sources only. Borg answers in the
   Slack thread (or chat) the message came from. A test has no conversation to
   reply to, so its result stays in the subscription's conversation. Asked

@@ -883,9 +883,11 @@ impl Database {
     }
 
     /// Close every still-running event of a run, and record the outcome on
-    /// the subscription. A second finish of the same run (a watchdog and the
-    /// real completion racing) changes nothing. Returns whether this call
-    /// closed the run.
+    /// the subscription. `error` is kept on the subscription also for a run
+    /// that succeeded: a reply that could not be delivered is a problem the
+    /// user must see, or every reply is lost while the card says all is well.
+    /// A second finish of the same run (a watchdog and the real completion
+    /// racing) changes nothing. Returns whether this call closed the run.
     pub async fn finish_subscription_run(
         &self,
         subscription_id: &str,
@@ -911,8 +913,7 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE subscriptions SET last_run_status = ?2, \
-                 last_error = CASE WHEN status = 'storm' THEN last_error \
-                                   WHEN ?2 = 'failed' THEN ?3 ELSE NULL END \
+                 last_error = CASE WHEN status = 'storm' THEN last_error ELSE ?3 END \
                  WHERE id = ?1",
                 params!(subscription_id, final_status, error),
             )
@@ -2120,6 +2121,30 @@ mod tests {
         let row = db.get_subscription(&s.id).await.unwrap().unwrap();
         assert_eq!(row.last_run_status.as_deref(), Some("failed"));
         assert_eq!(row.last_error.as_deref(), Some("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_was_not_delivered_stays_on_the_subscription_until_one_is() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let lost = "The reply could not be sent to slack: invalid_auth";
+        for (i, error) in [Some(lost), None].into_iter().enumerate() {
+            let t = 10 + i64::try_from(i).unwrap();
+            db.insert_subscription_event(&event(&s.id, Some(&format!("e{i}")), t), LIMITS)
+                .await
+                .unwrap();
+            let run = format!("run_{i}");
+            db.claim_next_subscription_event(&run, t + 1)
+                .await
+                .unwrap()
+                .unwrap();
+            db.finish_subscription_run(&s.id, &run, "succeeded", Some("done"), error, 1)
+                .await
+                .unwrap();
+            let row = db.get_subscription(&s.id).await.unwrap().unwrap();
+            assert_eq!(row.last_run_status.as_deref(), Some("succeeded"));
+            assert_eq!(row.last_error.as_deref(), error, "run {i}");
+        }
     }
 
     #[tokio::test]

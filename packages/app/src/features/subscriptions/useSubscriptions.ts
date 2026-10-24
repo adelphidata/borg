@@ -97,9 +97,18 @@ export function waitingForSecret(
   return sub.status === "paused" && !!preset?.takesSigningSecret && !sub.hasSigningSecret;
 }
 
-/** Storm, or a listening subscription whose last run failed: something the user should see. */
-export function needsAttention(sub: Pick<admin.Subscription, "status" | "lastRunStatus">): boolean {
-  return sub.status === "storm" || (sub.status === "active" && sub.lastRunStatus === "failed");
+/**
+ * Storm, or a listening subscription whose last run failed or left a problem
+ * (a reply that could not be delivered, an unreadable filter): something the
+ * user should see.
+ */
+export function needsAttention(
+  sub: Pick<admin.Subscription, "status" | "lastRunStatus" | "lastError">,
+): boolean {
+  return (
+    sub.status === "storm" ||
+    (sub.status === "active" && (sub.lastRunStatus === "failed" || sub.lastError !== ""))
+  );
 }
 
 /** Dot tone for a row. */
@@ -108,6 +117,7 @@ export function toneOf(sub: admin.Subscription): SubscriptionTone {
   if (sub.status !== "active") return "paused";
   if (sub.lastRunStatus === "failed") return "alert";
   if (sub.lastRunStatus === "running" || sub.lastRunStatus === "pending") return "busy";
+  if (sub.lastError) return "alert";
   // A test run is not an event from the source: until one arrives, the
   // subscription has never been proven to hear anything.
   if (sub.lastEventAtUnix === 0) return "idle";
@@ -141,6 +151,7 @@ export function wordsOf(
     return sub.lastError ? `Last run failed: ${sub.lastError}` : "Last run failed";
   }
   if (sub.lastRunStatus === "running") return "Working on an event now";
+  if (sub.lastError) return sub.lastError;
   if (sub.lastEventAtUnix === 0) return "Listening for the first event";
   return `Last event ${ago(sub.lastEventAtUnix, nowMs)}`;
 }
@@ -168,7 +179,10 @@ export function attentionAlert(
   return {
     sub,
     alert: {
-      title: `${sub.name}: the last run failed`,
+      title:
+        sub.lastRunStatus === "failed"
+          ? `${sub.name}: the last run failed`
+          : `${sub.name} needs you`,
       stackedTitle: `${sub.name} needs you`,
       sub: sub.lastError || "Open it to see what went wrong.",
       action: "Review",

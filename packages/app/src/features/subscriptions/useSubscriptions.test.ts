@@ -38,6 +38,16 @@ describe("toneOf and wordsOf", () => {
       "Last run failed: model timed out",
     ],
     ["last run failed, no reason", { lastRunStatus: "failed" }, "alert", "Last run failed"],
+    [
+      "ran, but the reply did not arrive",
+      {
+        lastEventAtUnix: nowSecs,
+        lastRunStatus: "succeeded",
+        lastError: "The reply could not be sent to slack: invalid_auth",
+      },
+      "alert",
+      "The reply could not be sent to slack: invalid_auth",
+    ],
     ["paused by the user", { status: "paused" }, "paused", "Paused"],
     ["paused itself in a burst", { status: "storm" }, "alert", "Paused itself — too many events"],
     [
@@ -84,6 +94,10 @@ describe("needsAttention and attentionAlert", () => {
     // Paused by hand: the failure is old news the user already acted on.
     expect(needsAttention(subscription({ status: "paused", lastRunStatus: "failed" }))).toBe(false);
     expect(needsAttention(subscription())).toBe(false);
+    // A run that worked but whose reply was lost is still something to fix.
+    expect(
+      needsAttention(subscription({ lastRunStatus: "succeeded", lastError: "reply not sent" })),
+    ).toBe(true);
   });
 
   it("names the first one that needs the user and says what happened", () => {
@@ -99,6 +113,11 @@ describe("needsAttention and attentionAlert", () => {
     ]);
     expect(failed?.alert.title).toBe("Inbox: the last run failed");
     expect(failed?.alert.sub).toBe("no credits left");
+    const lost = attentionAlert([
+      subscription({ name: "Deploys", lastRunStatus: "succeeded", lastError: "reply not sent" }),
+    ]);
+    expect(lost?.alert.title).toBe("Deploys needs you");
+    expect(lost?.alert.sub).toBe("reply not sent");
     expect(attentionAlert([ok])).toBeUndefined();
   });
 });
