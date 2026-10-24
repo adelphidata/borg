@@ -101,11 +101,10 @@ fn cut(s: &str, max: usize) -> (&str, bool) {
     if s.len() <= max {
         return (s, false);
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], true)
+    (
+        &s[..cortex::util::truncate::floor_char_boundary(s, max)],
+        true,
+    )
 }
 
 pub(super) fn event_to_pb(e: SubscriptionEventRow) -> PbSubscriptionEvent {

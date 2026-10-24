@@ -115,7 +115,7 @@ pub fn truncate_bytes(s: &str, max_bytes: usize, marker: &str) -> String {
 }
 
 /// Find the largest byte index <= `index` that is a char boundary.
-pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
+pub fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
     }

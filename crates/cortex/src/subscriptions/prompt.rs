@@ -143,10 +143,7 @@ fn cut(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = crate::util::truncate::floor_char_boundary(text, max);
     format!(
         "{}\n… [payload truncated: {} of {} bytes shown]",
         &text[..end],

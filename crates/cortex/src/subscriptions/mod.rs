@@ -220,9 +220,7 @@ pub fn cap_payload(payload: &serde_json::Value, max_bytes: usize) -> (String, bo
     // times (a control character becomes `\u0000`), so shrink until it fits.
     let mut end = (max_bytes / 2).min(text.len());
     loop {
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
+        end = crate::util::truncate::floor_char_boundary(&text, end);
         let capped = serde_json::json!({
             "_truncated": true,
             "_original_bytes": text.len(),
