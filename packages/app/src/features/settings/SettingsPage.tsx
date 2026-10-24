@@ -22,8 +22,16 @@ import { DEFAULT_AGENT_NAME } from "../../lib/agentName";
 import { AdvancedSettings, SETTING_NAME, SETTING_ROW } from "./AdvancedSettings";
 import { APPEARANCE_LABELS, basicSettings, displayValue } from "./catalog";
 
-/** Registry keys already surfaced by the curated list above the fold. */
-const CURATED_KEYS = new Set(basicSettings.flatMap((s) => (s.key ? [s.key] : [])));
+/**
+ * Registry keys Advanced leaves out: the curated list above the fold already
+ * shows them, or the daemon writes them as its own state. The heartbeat
+ * stamps `last_fired_at` on every fire to share one throttle across
+ * scheduled, poked and session-start runs; a hand edit only breaks that.
+ */
+const SKIPPED_KEYS = new Set([
+  ...basicSettings.flatMap((s) => (s.key ? [s.key] : [])),
+  "heartbeat.last_fired_at",
+]);
 
 export function SettingsPage() {
   const isMobile = useIsMobile();
@@ -101,7 +109,7 @@ export function SettingsPage() {
                   );
                 })}
 
-                <AdvancedSettings settings={map} skip={CURATED_KEYS} />
+                <AdvancedSettings settings={map} skip={SKIPPED_KEYS} />
               </>
             )}
           </DaemonState>

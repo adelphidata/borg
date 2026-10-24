@@ -32,6 +32,7 @@ const REGISTRY = [
   entry("llm.thinking", "medium"),
   entry("conversation.collaboration_mode", "execute"),
   entry("heartbeat.enabled", "true", "db"),
+  entry("heartbeat.last_fired_at", "1761264000", "db"),
   entry("agents.max_depth", "3"),
   entry("standalone", "yes"),
 ];
@@ -202,6 +203,15 @@ describe("SettingsPage", () => {
     expect(screen.queryByTitle("heartbeat.enabled")).toBeNull();
     act(() => screen.getByText("Heartbeat").click());
     expect(screen.getByTitle("heartbeat.enabled")).toBeTruthy();
+  });
+
+  it("leaves the heartbeat's own fire stamp out of Advanced", async () => {
+    mount();
+    await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
+    act(() => screen.getByText("Advanced").click());
+    act(() => screen.getByText("Heartbeat").click());
+    expect(screen.getByTitle("heartbeat.enabled")).toBeTruthy();
+    expect(screen.queryByTitle("heartbeat.last_fired_at")).toBeNull();
   });
 
   it("does not repeat a curated key inside Advanced", async () => {
