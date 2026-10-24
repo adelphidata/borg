@@ -702,7 +702,9 @@ function Detail({
           onSave={() =>
             void write(
               "when",
-              changeOf(sub.id, { filterJson: filterJsonOf(filter.draft, preset.filterFields) }),
+              changeOf(sub.id, {
+                filterJson: filterJsonOf(filter.draft, preset.filterFields, sub.filterJson),
+              }),
               filter.settle,
             )
           }

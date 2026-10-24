@@ -212,9 +212,27 @@ function listOf(value: string | string[]): string[] {
  * The draft as `filter_json`: only the preset's own keys, and none that are
  * empty, so "no condition" is an absent key rather than a blank one the
  * daemon has to interpret.
+ *
+ * `base` is the stored filter being edited. Its keys the form does not show
+ * (a `field_equals` or a `phrase` set in chat) are kept: dropping them would
+ * quietly widen what wakes Borg.
  */
-export function filterJsonOf(draft: FilterDraft, fields: readonly string[]): string {
-  const out: Record<string, string | string[] | boolean> = {};
+export function filterJsonOf(
+  draft: FilterDraft,
+  fields: readonly string[],
+  base: string = "{}",
+): string {
+  const out: Record<string, unknown> = {};
+  try {
+    const stored: unknown = JSON.parse(base || "{}");
+    if (stored !== null && typeof stored === "object" && !Array.isArray(stored)) {
+      for (const [key, value] of Object.entries(stored)) {
+        if (!fields.includes(key)) out[key] = value;
+      }
+    }
+  } catch {
+    // An unreadable stored filter has nothing to keep.
+  }
   for (const field of fields) {
     const value = draft[field];
     if (value === undefined) continue;

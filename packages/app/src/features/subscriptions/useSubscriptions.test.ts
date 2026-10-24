@@ -129,6 +129,23 @@ describe("filters", () => {
     expect(filterJsonOf({ kinds: [] }, ["kinds"])).toBe("{}");
   });
 
+  it("keeps the stored keys the form does not show when it saves an edit", () => {
+    const stored = JSON.stringify({
+      kinds: ["push"],
+      phrase: "deploy",
+      field_equals: [{ path: "repository.private", value: true }],
+    });
+    const json = filterJsonOf({ kinds: ["pull_request"] }, ["kinds", "repos"], stored);
+    expect(JSON.parse(json)).toEqual({
+      kinds: ["pull_request"],
+      phrase: "deploy",
+      field_equals: [{ path: "repository.private", value: true }],
+    });
+    // A form field cleared in the draft is cleared, not kept from the stored one.
+    expect(JSON.parse(filterJsonOf({ kinds: [] }, ["kinds"], stored))).not.toHaveProperty("kinds");
+    expect(filterJsonOf({}, ["kinds"], "not json")).toBe("{}");
+  });
+
   it("reads a stored filter back, and starts empty from anything unreadable", () => {
     expect(filterDraftOf('{"kinds":["push"],"mention_only":true,"phrase":"hi","n":3}')).toEqual({
       kinds: ["push"],
