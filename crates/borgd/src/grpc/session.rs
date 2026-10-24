@@ -656,10 +656,17 @@ impl Session for SessionSvc {
         let snap = host
             .snapshot_state()
             .map_err(|e| TStatus::internal(format!("snapshot_state: {e}")))?;
+        let title = match cortex::db::Database::open_readonly().await {
+            Ok(db) => stored_title(&db, &snap.agent_session_id, snap.title).await,
+            Err(e) => {
+                tracing::debug!("get_state: no database for the stored title: {e}");
+                snap.title
+            }
+        };
         Ok(Response::new(SessionState {
             session_id: req.session_id,
             agent_session_id: snap.agent_session_id,
-            title: snap.title,
+            title,
             message_count: snap.message_count,
             user_message_count: snap.user_message_count,
             token_estimate: snap.token_estimate,
@@ -1036,5 +1043,53 @@ mod parse_grpc_timeout_tests {
                 "parse_grpc_timeout({raw:?}) must reject non-ASCII without panicking"
             );
         }
+    }
+}
+
+/// The title the session lists show for `agent_session_id`, else `live`.
+///
+/// A rename and the background titler write the stored row only, so the live
+/// agent keeps the title it started with; answering from it would put a
+/// heading over the conversation that no list shows.
+async fn stored_title(db: &cortex::db::Database, agent_session_id: &str, live: String) -> String {
+    if agent_session_id.is_empty() {
+        return live;
+    }
+    match db.session_by_id(agent_session_id).await {
+        Ok(Some(row)) if !row.title.trim().is_empty() => row.title,
+        Ok(_) => live,
+        Err(e) => {
+            tracing::warn!("get_state: reading the stored title of {agent_session_id} failed: {e}");
+            live
+        }
+    }
+}
+
+#[cfg(test)]
+mod stored_title_tests {
+    use super::stored_title;
+
+    #[tokio::test]
+    async fn a_renamed_conversation_answers_with_its_new_title() {
+        let db = cortex::db::Database::test_db().await;
+        db.upsert_session("s1", 1, 10, 0, "m", "First message")
+            .await
+            .unwrap();
+        db.update_session_title("s1", "Pelican chat").await.unwrap();
+
+        assert_eq!(
+            stored_title(&db, "s1", "First message".into()).await,
+            "Pelican chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_title_stands_in_until_a_row_has_one() {
+        let db = cortex::db::Database::test_db().await;
+        db.upsert_session("blank", 1, 10, 0, "m", "").await.unwrap();
+
+        assert_eq!(stored_title(&db, "blank", "Live".into()).await, "Live");
+        assert_eq!(stored_title(&db, "unknown", "Live".into()).await, "Live");
+        assert_eq!(stored_title(&db, "", "Live".into()).await, "Live");
     }
 }
