@@ -103,7 +103,17 @@ struct Window {
     count: u32,
     /// Refused here and not yet added to the subscription's counter.
     dropped: i64,
+    /// A write of `dropped` is scheduled; later refusals join it.
+    flush_pending: bool,
 }
+
+/// How long refusals gather before they are written to the subscription's
+/// counter: at most one write per second per subscription during a burst,
+/// and the count is right a second after the burst ends.
+#[cfg(not(test))]
+const DROP_FLUSH_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const DROP_FLUSH_DELAY: Duration = Duration::from_millis(20);
 
 /// Distinct ids tracked at once; probes for unknown ids cannot grow it
 /// without bound.
@@ -112,8 +122,9 @@ const GATE_MAX_IDS: usize = 4_096;
 enum Admit {
     /// Go on; add `dropped` refusals to the counter once the id is known.
     Yes { dropped: i64 },
-    /// Over the in-memory cap.
-    No,
+    /// Over the in-memory cap. `flush` is set on the refusal that must
+    /// schedule the write of the gathered count ([`Gate::take_dropped`]).
+    No { flush: bool },
 }
 
 impl Gate {
@@ -140,6 +151,7 @@ impl Gate {
             started: now,
             count: 0,
             dropped: 0,
+            flush_pending: false,
         });
         if now - w.started >= 60 {
             w.started = now;
@@ -147,12 +159,25 @@ impl Gate {
         }
         if w.count >= cap {
             w.dropped += 1;
-            return Admit::No;
+            let flush = !std::mem::replace(&mut w.flush_pending, true);
+            return Admit::No { flush };
         }
         w.count += 1;
         Admit::Yes {
             dropped: std::mem::take(&mut w.dropped),
         }
+    }
+
+    /// The refusals gathered for `id` since the last write, for the counter.
+    fn take_dropped(&self, id: &str) -> i64 {
+        let mut windows = match self.windows.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows.get_mut(id).map_or(0, |w| {
+            w.flush_pending = false;
+            std::mem::take(&mut w.dropped)
+        })
     }
 
     /// Give back the slot of an authenticated request the filter rejected:
@@ -167,6 +192,25 @@ impl Gate {
             w.count = w.count.saturating_sub(1);
         }
     }
+}
+
+/// Write the refusals the gate gathers for `id` once they settle, so the
+/// app shows how many a burst dropped even when no request follows it.
+fn flush_drops_later(db_open: crate::DbOpener, id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(DROP_FLUSH_DELAY).await;
+        let n = Gate::global().take_dropped(&id);
+        if n == 0 {
+            return;
+        }
+        let written = match db_open().await {
+            Ok(db) => db.add_subscription_dropped(&id, n).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            tracing::warn!(subscription = %id, "subscription endpoint: count {n} drops: {e:#}");
+        }
+    });
 }
 
 async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> {
@@ -222,10 +266,16 @@ async fn events_handler(
         );
     }
     let now = chrono::Utc::now().timestamp();
-    let Admit::Yes { dropped } = Gate::global().admit(&id, now, state.limits.per_minute) else {
-        return too_many(
-            "Too many events this minute. Borg keeps the first ones and drops the rest.",
-        );
+    let dropped = match Gate::global().admit(&id, now, state.limits.per_minute) {
+        Admit::Yes { dropped } => dropped,
+        Admit::No { flush } => {
+            if flush {
+                flush_drops_later(state.db_open.clone(), id);
+            }
+            return too_many(
+                "Too many events this minute. Borg keeps the first ones and drops the rest.",
+            );
+        }
     };
     let db = match (state.db_open)().await {
         Ok(db) => db,
@@ -633,15 +683,17 @@ mod tests {
             5
         );
         // Five more reached the ledger and were counted there; the last ten
-        // stopped at the in-memory gate, which hands its count over with the
-        // next admitted request.
+        // stopped at the in-memory gate, which writes its count once the
+        // burst settles, with no later request needed.
+        tokio::time::sleep(DROP_FLUSH_DELAY * 10).await;
         assert_eq!(
             db.get_subscription(&id)
                 .await
                 .unwrap()
                 .unwrap()
                 .dropped_count,
-            5
+            15,
+            "every refused request is counted"
         );
     }
 
@@ -686,8 +738,12 @@ mod tests {
         for _ in 0..10 {
             assert!(matches!(gate.admit("s", 100, 5), Admit::Yes { dropped: 0 }));
         }
-        for _ in 0..3 {
-            assert!(matches!(gate.admit("s", 100, 5), Admit::No));
+        assert!(matches!(gate.admit("s", 100, 5), Admit::No { flush: true }));
+        for _ in 0..2 {
+            assert!(
+                matches!(gate.admit("s", 100, 5), Admit::No { flush: false }),
+                "one write is scheduled per batch of refusals"
+            );
         }
         assert!(
             matches!(gate.admit("t", 100, 5), Admit::Yes { dropped: 0 }),
@@ -695,7 +751,7 @@ mod tests {
         );
         match gate.admit("s", 161, 5) {
             Admit::Yes { dropped } => assert_eq!(dropped, 3, "a new minute hands the drops back"),
-            Admit::No => panic!("a new minute must admit again"),
+            Admit::No { .. } => panic!("a new minute must admit again"),
         }
     }
 
