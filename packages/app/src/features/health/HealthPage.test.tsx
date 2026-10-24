@@ -75,6 +75,16 @@ describe("HealthPage", () => {
     await waitFor(() => expect(screen.getByText("Borg is healthy.")).toBeTruthy());
   });
 
+  it("gives no verdict before the checks answer", async () => {
+    let answer: (v: unknown) => void = () => {};
+    mount(fakeDaemon({ ...HEALTHY, GetPersistentWarnings: new Promise((r) => (answer = r)) }));
+    expect(screen.getByText("Checking Borg…")).toBeTruthy();
+    expect(screen.getByText("Running the checks…")).toBeTruthy();
+    expect(screen.queryByText("Borg is healthy.")).toBeNull();
+    answer(HEALTHY.GetPersistentWarnings);
+    await waitFor(() => expect(screen.getByText("Borg is healthy.")).toBeTruthy());
+  });
+
   it("names the checks that need a look", async () => {
     const daemon = fakeDaemon({
       ...HEALTHY,

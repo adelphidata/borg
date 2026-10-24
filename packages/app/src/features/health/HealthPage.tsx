@@ -219,8 +219,14 @@ export function HealthPage() {
   const checks = health.state === "ready" ? buildChecks(health.data) : [];
   const failing = checks.filter((c) => c.state === "alert");
   const unchecked = checks.filter((c) => c.state === "unchecked");
-  const headline =
-    failing.length > 0
+  // Until the checks answer, nothing is known: no green tick, no verdict.
+  const known = health.state === "ready";
+  const neutral = !known || unchecked.length > 0;
+  const headline = !known
+    ? health.state === "error"
+      ? "Borg did not answer."
+      : "Checking Borg…"
+    : failing.length > 0
       ? "Borg needs a look."
       : unchecked.length > 0
         ? "Some checks did not answer."
@@ -244,12 +250,12 @@ export function HealthPage() {
               className={`flex h-13 w-13 flex-none items-center justify-center rounded-full border-[1.5px] ${
                 failing.length > 0
                   ? "border-alert"
-                  : unchecked.length > 0
+                  : neutral
                     ? "border-ink3"
                     : "border-neon shadow-(--plateGlow)"
               }`}
             >
-              {failing.length > 0 || unchecked.length > 0 ? (
+              {health.state === "loading" ? null : failing.length > 0 || neutral ? (
                 // A check mark in an alert ring reads as "fine"; say what it is.
                 <span
                   aria-hidden
@@ -275,7 +281,11 @@ export function HealthPage() {
                     moment.{" "}
                   </>
                 )}
-                Everything else checked out {lastChecked}.
+                {known
+                  ? `Everything else checked out ${lastChecked}.`
+                  : health.state === "error"
+                    ? "Try again in a moment."
+                    : "Running the checks…"}
               </p>
             </div>
           </div>
