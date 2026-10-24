@@ -301,30 +301,39 @@ pub async fn advance_next_run_raw(
     Ok(())
 }
 
-/// True for the spellings that select the schedule's default zone instead of
-/// an IANA zone. `local` matches in any letter case, because the validation
-/// error recommends that word and a user can type it with a capital.
+/// The zone a schedule's wall-clock times are read in.
+enum ScheduleZone {
+    /// The host's own zone: `""` and `local` (any letter case), the default
+    /// every built-in task is stored with.
+    Local,
+    /// `UTC` / `utc`.
+    Utc,
+    Named(Tz),
+}
+
+/// True for the spellings that name a zone without an IANA name. `local`
+/// matches in any letter case, because a user can type it with a capital.
 fn is_default_zone(timezone: &str) -> bool {
     matches!(timezone, "" | "UTC" | "utc") || timezone.eq_ignore_ascii_case("local")
 }
 
-/// Resolve a timezone string to a `chrono_tz::Tz`. Returns `None` for
-/// values that should retain the historical UTC behavior (`""`,
-/// `"local"`, `"UTC"`) and for unparseable IANA names (after logging).
-fn resolve_cron_timezone(timezone: &str) -> Option<Tz> {
+/// Resolve a stored timezone string. An unparseable IANA name falls back to
+/// the host's zone after logging: a scheduled task must never fail to
+/// compute a next run because its timezone field got corrupted.
+fn resolve_schedule_zone(timezone: &str) -> ScheduleZone {
     match timezone {
-        tz if is_default_zone(tz) => None,
+        "UTC" | "utc" => ScheduleZone::Utc,
+        tz if is_default_zone(tz) => ScheduleZone::Local,
         other => match Tz::from_str(other) {
-            Ok(tz) => Some(tz),
+            Ok(tz) => ScheduleZone::Named(tz),
             Err(e) => {
                 tracing::warn!(
                     timezone = %other,
                     error = %e,
                     "unrecognized IANA timezone on scheduled task — ignoring; \
-                     applying the schedule's default zone (UTC for cron, \
-                     system-local for once)"
+                     applying the host's local zone"
                 );
-                None
+                ScheduleZone::Local
             }
         },
     }
@@ -332,12 +341,11 @@ fn resolve_cron_timezone(timezone: &str) -> Option<Tz> {
 
 /// Calculate the next run time for a task based on its schedule.
 ///
-/// `timezone` is honored only for cron schedules: an IANA zone name
-/// (e.g. `"America/New_York"`) evaluates the cron expression in that
-/// zone. The strings `""`, `"local"`, and `"UTC"` preserve the
-/// historical UTC behavior. An unparseable zone falls back to UTC with
-/// a `tracing::warn!` — a scheduled task must never fail to compute a
-/// next_run just because its timezone field got corrupted.
+/// `timezone` applies to cron and one-shot schedules: an IANA zone name
+/// (e.g. `"America/New_York"`) reads the wall-clock times in that zone,
+/// `"UTC"` in UTC, and `""` / `"local"` in the host's zone — so the
+/// built-in "daily at 03:00" runs at 03:00 on the user's clock. An
+/// unparseable zone falls back to the host's zone with a `tracing::warn!`.
 pub fn calculate_next_run(
     schedule_type: &str,
     schedule_expr: &str,
@@ -346,9 +354,10 @@ pub fn calculate_next_run(
     match schedule_type {
         SCHEDULE_TYPE_CRON => {
             let schedule = parse_cron_schedule(schedule_expr)?;
-            let next = match resolve_cron_timezone(timezone) {
-                Some(tz) => schedule.upcoming(tz).next().map(|t| t.timestamp()),
-                None => schedule.upcoming(Utc).next().map(|t| t.timestamp()),
+            let next = match resolve_schedule_zone(timezone) {
+                ScheduleZone::Named(tz) => schedule.upcoming(tz).next().map(|t| t.timestamp()),
+                ScheduleZone::Utc => schedule.upcoming(Utc).next().map(|t| t.timestamp()),
+                ScheduleZone::Local => schedule.upcoming(Local).next().map(|t| t.timestamp()),
             };
             Ok(next)
         }
@@ -414,18 +423,15 @@ pub fn parse_once_timestamp(expr: &str, timezone: &str) -> Result<i64> {
                     "Invalid ISO-8601 timestamp: {trimmed}. Examples: '2026-04-22T09:00:00', '2026-04-22T09:00:00-07:00'"
                 )
             })?;
-        match resolve_cron_timezone(timezone) {
-            Some(tz) => local_result_to_timestamp(tz.from_local_datetime(&naive), trimmed)?,
-            None => {
-                // `resolve_cron_timezone` folds "UTC"/"utc" into `None` because
-                // its cron default is already UTC. One-shots default `None` to
-                // system-local (historical behavior), so honor an explicit UTC
-                // request here rather than silently resolving it as local.
-                if matches!(timezone.trim(), "UTC" | "utc") {
-                    local_result_to_timestamp(Utc.from_local_datetime(&naive), trimmed)?
-                } else {
-                    local_result_to_timestamp(Local.from_local_datetime(&naive), trimmed)?
-                }
+        match resolve_schedule_zone(timezone.trim()) {
+            ScheduleZone::Named(tz) => {
+                local_result_to_timestamp(tz.from_local_datetime(&naive), trimmed)?
+            }
+            ScheduleZone::Utc => {
+                local_result_to_timestamp(Utc.from_local_datetime(&naive), trimmed)?
+            }
+            ScheduleZone::Local => {
+                local_result_to_timestamp(Local.from_local_datetime(&naive), trimmed)?
             }
         }
     };
@@ -836,11 +842,10 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
 
 /// Validate a timezone on the write path (task create / update).
 ///
-/// Accepts the UTC-preserving spellings (`""`, `"UTC"`, `"utc"`, and
-/// `"local"` in any letter case) and any IANA zone name. Everything else is
-/// rejected: the runtime fallback
-/// in [`calculate_next_run`] exists for rows that are already stored, and a
-/// new task must not be accepted with a zone that silently evaluates as UTC.
+/// Accepts `""`, `"UTC"`, `"utc"`, `"local"` in any letter case, and any
+/// IANA zone name. Everything else is rejected: the runtime fallback in
+/// [`calculate_next_run`] exists for rows that are already stored, and a new
+/// task must not be accepted with a zone that silently means something else.
 pub fn validate_timezone(timezone: &str) -> Result<()> {
     match timezone {
         tz if is_default_zone(tz) => Ok(()),
@@ -1052,8 +1057,8 @@ mod tests {
                     msg.contains(tz) && msg.contains("America/New_York") && msg.contains("'UTC'"),
                     "the error must name the bad value and the next action, got: {msg}"
                 );
-                // A cron schedule with 'local' runs in UTC, so the message
-                // must not recommend it as the zone of the host.
+                // The message points at the two zones that mean the same on
+                // every host, not at the host-dependent 'local'.
                 assert!(
                     !msg.replace(tz, "").to_lowercase().contains("local"),
                     "the error must not recommend 'local', got: {msg}"
@@ -1270,6 +1275,32 @@ mod tests {
             .unwrap()
             .expect("valid cron resolves");
         assert!(next > now && next <= now + 86_400 + 60);
+    }
+
+    #[test]
+    fn cron_wall_clock_is_read_in_the_named_zone() {
+        // The built-in tasks are stored as "local": "daily at 03:00" must run
+        // at 03:00 on the host's clock, not at 03:00 UTC. "" means the same;
+        // an explicit "UTC" and an IANA name keep their own zone.
+        use chrono::Timelike;
+        let hour_in = |tz: &str| {
+            calculate_next_run("cron", "0 0 3 * * *", tz)
+                .unwrap()
+                .unwrap()
+        };
+        for tz in ["local", "Local", ""] {
+            let at = Local.timestamp_opt(hour_in(tz), 0).unwrap();
+            assert_eq!(at.hour(), 3, "{tz:?} must fire at 03:00 host time");
+        }
+        assert_eq!(Utc.timestamp_opt(hour_in("UTC"), 0).unwrap().hour(), 3);
+        let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
+        assert_eq!(
+            tokyo
+                .timestamp_opt(hour_in("Asia/Tokyo"), 0)
+                .unwrap()
+                .hour(),
+            3
+        );
     }
 
     #[test]
