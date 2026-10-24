@@ -65,6 +65,18 @@ fn display_text(role: &str, content: String) -> String {
     }
 }
 
+/// A failed setting write as the client shows it. A bad value already names
+/// its key; any other failure (a store error, a rule about the value) gets the
+/// key in front, so a client that shows only this line still says which one.
+fn setting_error(key: &str, e: impl std::fmt::Display) -> TStatus {
+    let message = e.to_string();
+    if message.contains(key) {
+        TStatus::invalid_argument(message)
+    } else {
+        TStatus::invalid_argument(format!("{key}: {message}"))
+    }
+}
+
 /// Longest preview a session row can carry. Long enough to recognise the
 /// conversation, short enough that the daemon is not shipping transcripts to
 /// anything that only asked for a list.
@@ -360,7 +372,7 @@ impl Admin for AdminSvc {
         resolver
             .set(&req.key, &req.value)
             .await
-            .map_err(|e| TStatus::invalid_argument(e.to_string()))?;
+            .map_err(|e| setting_error(&req.key, e))?;
         let renamed = match previous_name {
             Some((named, old)) => named.rename_in_memory(old, &req.value).await,
             None => Ok(()),
@@ -381,7 +393,7 @@ impl Admin for AdminSvc {
         resolver
             .unset(&key)
             .await
-            .map_err(|e| TStatus::invalid_argument(e.to_string()))?;
+            .map_err(|e| setting_error(&key, e))?;
         let renamed = match previous_name {
             Some((named, old)) => named.rename_in_memory(old, "").await,
             None => Ok(()),
@@ -1814,6 +1826,25 @@ mod display_text_tests {
         let stored = wrap_untrusted("fetch", "the page body");
         assert_eq!(display_text("tool", stored.clone()), stored);
         assert_eq!(display_text("assistant", stored.clone()), stored);
+    }
+}
+
+#[cfg(test)]
+mod setting_error_tests {
+    use super::setting_error;
+
+    #[test]
+    fn a_failed_write_always_names_its_key() {
+        let bad = setting_error(
+            "max_tokens",
+            "max_tokens takes a whole number greater than 0, not \"0\".",
+        );
+        assert_eq!(
+            bad.message(),
+            "max_tokens takes a whole number greater than 0, not \"0\"."
+        );
+        let store = setting_error("max_tokens", "database is locked");
+        assert_eq!(store.message(), "max_tokens: database is locked");
     }
 }
 
