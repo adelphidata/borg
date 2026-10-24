@@ -1036,6 +1036,27 @@ impl Database {
         }
     }
 
+    /// Point the chat `(channel_name, sender_id)` at `session_id`, so its
+    /// next turns continue that session. Used when a handoff lands here.
+    pub async fn bind_channel_session(
+        &self,
+        channel_name: &str,
+        sender_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO channel_sessions (channel_name, sender_id, session_id, created_at, last_active)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(channel_name, sender_id)
+                 DO UPDATE SET session_id = excluded.session_id, last_active = excluded.last_active",
+                params!(channel_name, sender_id, session_id, now),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn log_channel_message(
         &self,
         channel_name: &str,

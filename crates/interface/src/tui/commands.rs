@@ -1442,7 +1442,7 @@ impl App<'_> {
         }
         let report = match self.rpc_request_handoff(platform) {
             Ok(()) => format!(
-                "/handoff: pending → {platform}. The destination will pick it up on its next sweep."
+                "/handoff: pending → {platform}. Send any message to Borg on {platform}; that chat then continues this session."
             ),
             Err(e) => format!("/handoff: failed — {e}"),
         };

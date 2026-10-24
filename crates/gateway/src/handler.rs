@@ -594,6 +594,39 @@ fn build_session_key(inbound: &InboundMessage, binding_id: &str) -> String {
 }
 
 /// Resolve the session and handle slash commands (`/cancel`, `/poke`, other commands).
+/// The session a `/handoff <channel_name>` left for this platform, now bound
+/// to the chat that sent the first message since. `None` when no handoff is
+/// pending, or when the claim or the bind failed (the chat keeps its own
+/// session, and a failed handoff records why).
+async fn take_handoff(db: &Database, channel_name: &str, session_key: &str) -> Option<String> {
+    let session_id = match db.claim_handoff_for_platform(channel_name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("handoff claim on '{channel_name}' failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = db
+        .bind_channel_session(channel_name, session_key, &session_id)
+        .await
+    {
+        warn!("handoff of {session_id} to '{channel_name}' failed: {e}");
+        let _ = db
+            .fail_handoff(&session_id, &format!("could not bind the chat: {e}"))
+            .await;
+        return None;
+    }
+    if let Err(e) = db.complete_handoff(&session_id).await {
+        warn!("handoff of {session_id} to '{channel_name}' did not complete: {e}");
+    }
+    info!(
+        session_id,
+        channel_name, "handoff landed; this chat continues the session"
+    );
+    Some(session_id)
+}
+
 async fn resolve_session_and_commands(
     channel_name: &str,
     inbound: &InboundMessage,
@@ -609,6 +642,9 @@ async fn resolve_session_and_commands(
         .resolve_channel_session(channel_name, &session_key)
         .await
         .context("Failed to resolve channel session")?;
+    let session_id = take_handoff(&db, channel_name, &session_key)
+        .await
+        .unwrap_or(session_id);
 
     if let Err(e) = db
         .log_channel_message(
@@ -1496,6 +1532,35 @@ pub fn format_gateway_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending handoff lands on the first chat that writes on its platform:
+    /// that chat now runs the handed-off session, and the handoff completes.
+    #[tokio::test]
+    async fn the_next_message_on_the_platform_takes_a_pending_handoff() {
+        let db = Database::test_db().await;
+        db.ensure_session_row("tui-session", 0, "m").await.unwrap();
+        let own = db.resolve_channel_session("telegram", "42:").await.unwrap();
+
+        // Nothing pending: the chat keeps its own session.
+        assert_eq!(take_handoff(&db, "telegram", "42:").await, None);
+
+        db.request_handoff("tui-session", "telegram").await.unwrap();
+        // Another platform does not take it.
+        assert_eq!(take_handoff(&db, "slack", "7:").await, None);
+        assert_eq!(
+            take_handoff(&db, "telegram", "42:").await.as_deref(),
+            Some("tui-session")
+        );
+        assert_eq!(
+            db.resolve_channel_session("telegram", "42:").await.unwrap(),
+            "tui-session"
+        );
+        assert_ne!(own, "tui-session");
+        let status = db.handoff_status("tui-session").await.unwrap();
+        assert_eq!(status.state.map(|s| s.as_str()), Some("completed"));
+        // Taken once: the next message does not take it again.
+        assert_eq!(take_handoff(&db, "telegram", "42:").await, None);
+    }
 
     fn inbound(sender_id: &str, thread_id: Option<&str>) -> InboundMessage {
         InboundMessage {
