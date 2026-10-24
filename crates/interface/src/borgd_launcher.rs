@@ -188,7 +188,7 @@ pub(crate) fn detach_from_console(cmd: &mut std::process::Command) {
     let _ = cmd;
 }
 
-fn find_borgd_binary() -> Result<PathBuf> {
+pub(crate) fn find_borgd_binary() -> Result<PathBuf> {
     if let Ok(env_path) = std::env::var("BORG_DAEMON_BIN") {
         let p = PathBuf::from(env_path);
         if p.exists() {

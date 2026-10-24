@@ -166,14 +166,10 @@ pub async fn connect_or_spawn() -> Result<DaemonClient> {
 
 fn spawn_detached_daemon() -> Result<()> {
     use std::process::{Command, Stdio};
-    // Find `borgd` next to the current binary so dev installs (cargo run -p
-    // borg) and release installs both work without PATH gymnastics.
-    let exe = std::env::current_exe().context("locating current exe")?;
-    let mut borgd = exe.with_file_name(crate::borgd_launcher::BORGD_FILE_NAME);
-    if !borgd.exists() {
-        // Fallback: trust PATH.
-        borgd = PathBuf::from("borgd");
-    }
+    // The launcher's lookup: `BORG_DAEMON_BIN`, then next to this binary, then
+    // PATH. A private lookup here skipped `BORG_DAEMON_BIN`, so a client told
+    // to start a stub (or a pinned build) started the sibling `borgd` instead.
+    let borgd = crate::borgd_launcher::find_borgd_binary()?;
     let mut cmd = Command::new(&borgd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
