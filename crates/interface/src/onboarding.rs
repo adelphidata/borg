@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use cortex::config::Config;
 use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE, SETUP_FILE};
 use cortex::llm::provider::Provider;
-use cortex::security::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
+use cortex::security::secrets_resolve::provider_api_key_secret_ref;
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
 
 use crate::async_bridge::block_on;
@@ -137,88 +137,6 @@ pub(crate) fn keychain_available() -> bool {
 fn store_in_keychain(provider_id: &str, api_key: &str) -> Result<()> {
     let service_name = format!("borg-{provider_id}");
     plugins::keychain::store(&service_name, "borg", api_key)
-}
-
-fn keychain_api_key_toml(provider_id: &str) -> Result<String> {
-    let secret_ref = provider_api_key_secret_ref(provider_id);
-    let SecretRef::Keychain { service, account } = secret_ref else {
-        unreachable!("provider_api_key_secret_ref must return Keychain")
-    };
-    let service = escape_toml_string(&service);
-    let account = escape_toml_string(&account);
-    Ok(format!(
-        r#"api_key = {{ source = "keychain", service = "{service}", account = "{account}" }}"#
-    ))
-}
-
-/// Validate that a model ID is safe for TOML interpolation and for use as a URL
-/// path segment.
-///
-/// Delegates to the catalog's validator rather than keeping a second copy of
-/// the rules: the two had drifted apart already, and a tightening applied to one
-/// left the other permissive.
-fn validate_model_id(model_id: &str) -> Result<()> {
-    cortex::llm::model_catalog::validate_model_id(model_id)
-}
-
-/// Escape a string value for safe embedding in TOML double-quoted strings.
-fn escape_toml_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', " ")
-        .replace('\r', "")
-}
-
-/// Generate config.toml content from onboarding choices.
-pub fn generate_config(
-    model_id: &str,
-    provider_id: &str,
-    user_name: &str,
-    agent_name: &str,
-    use_keychain: bool,
-) -> Result<String> {
-    validate_model_id(model_id)?;
-    let user_name = escape_toml_string(user_name);
-    let agent_name = escape_toml_string(agent_name);
-
-    let provider = Provider::from_str(provider_id)?;
-
-    let api_key_line = if provider.uses_aws_credential_chain() {
-        "# Uses the AWS credential chain (env/profile/role)\n# bedrock_region = \"us-east-1\"  # uncomment to override AWS_REGION / AWS_DEFAULT_REGION".to_string()
-    } else if !provider.requires_api_key() {
-        "# No API key required for local provider\n# base_url = \"http://localhost:11434/v1/chat/completions\"  # uncomment to override".to_string()
-    } else if use_keychain {
-        keychain_api_key_toml(provider_id)?
-    } else {
-        let env_var = provider.default_env_var();
-        format!(r#"api_key_env = "{env_var}""#)
-    };
-
-    // Auxiliary chain: same provider as primary, `model = "auto"` sentinel
-    // resolved at daemon-boot time via `aux_model_picker`. Background work
-    // (memory consolidation, heartbeat, scheduled prompts) routes through
-    // this chain so a primary outage doesn't kill nightly cron. We emit
-    // the block for every provider — even keyless ones like Ollama, where
-    // the resolver returns `None` and `for_auxiliary` silently falls
-    // through to primary. No special-casing in onboarding; the resolver
-    // is the single place that decides "no aux available."
-    Ok(format!(
-        r#"[user]
-name = "{user_name}"
-agent_name = "{agent_name}"
-
-[llm]
-provider = "{provider_id}"
-{api_key_line}
-model = "{model_id}"
-temperature = 0.7
-max_tokens = 4096
-
-[llm.aux]
-provider = "{provider_id}"
-model = "auto"
-"#,
-    ))
 }
 
 /// Crash-safe write for the non-secret onboarding files (config, persona,
@@ -708,247 +626,15 @@ mod tests {
     }
 
     #[test]
-    fn generate_config_default_model() {
-        let config = generate_config(
-            "anthropic/claude-sonnet-4",
-            "openrouter",
-            "Mike",
-            "Buddy",
-            false,
-        )
-        .expect("valid model");
-        assert!(config.contains("model = \"anthropic/claude-sonnet-4\""));
-        assert!(config.contains("provider = \"openrouter\""));
-        assert!(config.contains("api_key_env = \"OPENROUTER_API_KEY\""));
-        assert!(config.contains("[llm]"));
-    }
-
-    #[test]
-    fn generate_config_includes_user_section() {
-        let config = generate_config(
-            "anthropic/claude-sonnet-4",
-            "openrouter",
-            "Mike",
-            "Buddy",
-            false,
-        )
-        .expect("valid model");
-        assert!(config.contains("[user]"));
-        assert!(config.contains("name = \"Mike\""));
-        assert!(config.contains("agent_name = \"Buddy\""));
-    }
-
-    #[test]
-    fn generate_config_provider_matrix() {
-        // One test covering the env-var → provider wiring for every env-key
-        // provider. Ollama is tested separately because it has its own branch
-        // (no api_key_env / no api_key block).
-        let cases: &[(&str, &str, &str)] = &[
-            ("claude-sonnet-4", "anthropic", "ANTHROPIC_API_KEY"),
-            ("gpt-4.1", "openai", "OPENAI_API_KEY"),
-            ("gemini-2.5-pro", "gemini", "GEMINI_API_KEY"),
-            ("deepseek-chat", "deepseek", "DEEPSEEK_API_KEY"),
-            ("llama-3.3-70b-versatile", "groq", "GROQ_API_KEY"),
-            ("grok-4-fast-non-reasoning", "xai", "XAI_API_KEY"),
-        ];
-        for (model, provider, env) in cases {
-            let config = generate_config(model, provider, "User", "Agent", false)
-                .unwrap_or_else(|e| panic!("{provider}: {e}"));
-            assert!(
-                config.contains(&format!("provider = \"{provider}\"")),
-                "{provider}: provider line missing"
-            );
-            assert!(
-                config.contains(&format!("api_key_env = \"{env}\"")),
-                "{provider}: api_key_env line missing"
-            );
-            assert!(
-                config.contains(&format!("model = \"{model}\"")),
-                "{provider}: model line missing"
-            );
-        }
-    }
-
-    #[test]
-    fn generate_config_rejects_empty_model() {
-        assert!(generate_config("", "openrouter", "User", "Agent", false).is_err());
-    }
-
-    #[test]
-    fn generate_config_rejects_injection() {
-        assert!(generate_config(
-            "model\"\nmalicious = true",
-            "openrouter",
-            "User",
-            "Agent",
-            false,
-        )
-        .is_err());
-    }
-
-    /// Table-driven check that model-id validation accepts the slug shapes
-    /// real providers emit and rejects inputs that could inject into config
-    /// TOML (quotes, newlines, internal whitespace). Both directions live in
-    /// one test so a regression that flips a rule into being a no-op fails
-    /// loudly here.
-    #[test]
-    fn validate_model_id_accepts_safe_and_rejects_unsafe() {
-        let valid = [
-            "anthropic/claude-sonnet-4",
-            "openai/gpt-4.1-mini",
-            "meta-llama/llama-4-scout",
-            "llama3.3",
-        ];
-        let invalid = [
-            ("", "empty string must not pass"),
-            ("model\"", "embedded quote could inject into TOML"),
-            ("model\nkey=val", "newline could inject a fake key"),
-            ("model with spaces", "whitespace not allowed in model slug"),
-        ];
-        for id in valid {
-            validate_model_id(id).unwrap_or_else(|e| panic!("expected {id:?} to be accepted: {e}"));
-        }
-        for (id, why) in invalid {
-            assert!(
-                validate_model_id(id).is_err(),
-                "expected {id:?} to be rejected ({why})"
-            );
-        }
-    }
-
-    #[test]
-    fn format_number_basic() {
-        assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(999), "999");
-        assert_eq!(format_number(1000), "1,000");
-        assert_eq!(format_number(1_000_000), "1,000,000");
-        assert_eq!(format_number(500_000), "500,000");
-        assert_eq!(format_number(5_000_000), "5,000,000");
-    }
-
-    #[test]
-    fn generate_config_keychain_storage() {
-        let config = generate_config(
-            "anthropic/claude-sonnet-4",
-            "openrouter",
-            "User",
-            "Agent",
-            true,
-        )
-        .expect("valid");
-        assert!(config.contains("api_key = {"));
-        assert!(config.contains("source = \"keychain\""));
-        let parsed: cortex::config::Config = toml::from_str(&config).expect("parse config");
-        match parsed.llm.api_key {
-            Some(SecretRef::Keychain { service, account }) => {
-                assert_eq!(service, "borg-openrouter");
-                assert_eq!(account, "borg");
-            }
-            other => panic!("expected Keychain ref, got {other:?}"),
-        }
-        // Should NOT contain api_key_env when using keychain
-        assert!(!config.contains("api_key_env"));
-    }
-
-    #[test]
-    fn generate_config_emits_aux_sentinel_for_remote_provider() {
-        // Onboarding ships every config with `[llm.aux] provider=<same>
-        // model="auto"` so background work has its own failover chain by
-        // default. Sentinel-based — `for_auxiliary` resolves "auto" via
-        // `aux_model_picker` at daemon-boot, so model id drift in this
-        // file isn't a maintenance trap.
-        let config = generate_config("claude-sonnet-4", "anthropic", "Mike", "Buddy", false)
-            .expect("valid config");
-        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
-        let aux = parsed.llm.aux.expect("aux block must be emitted");
-        assert_eq!(aux.provider.as_deref(), Some("anthropic"));
-        assert!(
-            aux.model_is_auto(),
-            "aux model must be the 'auto' sentinel (got {:?})",
-            aux.model
-        );
-    }
-
-    #[test]
-    fn generate_config_emits_aux_sentinel_for_openrouter() {
-        // Mirrors the remote-provider test for openrouter, where the
-        // model id includes a slash (`anthropic/claude-…`). Validates
-        // the aux block stays on the same provider regardless of the
-        // primary's model-slug shape.
-        let config = generate_config(
-            "anthropic/claude-sonnet-4",
-            "openrouter",
-            "Mike",
-            "Buddy",
-            false,
-        )
-        .expect("valid config");
-        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
-        let aux = parsed.llm.aux.expect("aux block must be emitted");
-        assert_eq!(aux.provider.as_deref(), Some("openrouter"));
-        assert!(aux.model_is_auto());
-    }
-
-    #[test]
-    fn generate_config_emits_aux_sentinel_even_for_ollama() {
-        // Local providers get the sentinel too — no special-casing in
-        // onboarding. The runtime resolver returns `None` for ollama so
-        // `for_auxiliary` silently falls through to primary. This locks
-        // the "no special-casing" invariant: future contributors who add
-        // a local provider must NOT need to remember to skip aux here.
-        let config =
-            generate_config("llama3.3", "ollama", "Mike", "Buddy", false).expect("valid config");
-        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
-        let aux = parsed
-            .llm
-            .aux
-            .expect("aux block must be emitted for ollama too");
-        assert_eq!(aux.provider.as_deref(), Some("ollama"));
-        assert!(aux.model_is_auto());
-    }
-
-    #[test]
-    fn generate_config_ollama_provider() {
-        let config =
-            generate_config("llama3.3", "ollama", "Mike", "Buddy", false).expect("valid config");
-        assert!(config.contains("provider = \"ollama\""));
-        assert!(config.contains("model = \"llama3.3\""));
-        // Ollama config should NOT contain api_key_env or api_key = { lines
-        assert!(!config.contains("api_key_env"));
-        assert!(!config.contains("api_key = {"));
-    }
-
-    #[test]
-    fn generate_config_bedrock_uses_region_comment_not_api_key() {
-        let model = "anthropic.claude-3-7-sonnet-20250219-v1:0";
-        let config = generate_config(model, "bedrock", "Mike", "Buddy", false).expect("valid");
-        assert!(config.contains("provider = \"bedrock\""));
-        assert!(config.contains(&format!("model = \"{model}\"")));
-        assert!(config.contains("bedrock_region = \"us-east-1\""));
-        assert!(!config.contains("api_key_env"));
-        assert!(!config.contains("api_key = {"));
-    }
-
-    #[test]
     fn bedrock_models_non_empty_and_parseable() {
         let models = models_for_provider("bedrock");
         assert!(!models.is_empty());
         for (id, _) in &models {
             assert!(
-                validate_model_id(id).is_ok(),
+                cortex::llm::model_catalog::validate_model_id(id).is_ok(),
                 "invalid bedrock model id: {id}"
             );
         }
-    }
-
-    #[test]
-    fn generate_config_ollama_keychain_still_no_api_key() {
-        // Even with keychain flag, Ollama should skip API key config
-        let config =
-            generate_config("llama3.3", "ollama", "Mike", "Buddy", true).expect("valid config");
-        assert!(config.contains("provider = \"ollama\""));
-        assert!(!config.contains("api_key_env"));
-        assert!(!config.contains("api_key = {"));
     }
 
     #[test]
@@ -956,15 +642,18 @@ mod tests {
         let models = models_for_provider("ollama");
         assert!(!models.is_empty());
         for (id, _) in &models {
-            assert!(validate_model_id(id).is_ok(), "invalid model id: {id}");
+            assert!(
+                cortex::llm::model_catalog::validate_model_id(id).is_ok(),
+                "invalid model id: {id}"
+            );
         }
     }
 
     #[test]
     fn bundled_model_ids_all_parse() {
-        // Regression guard: every curated model ID must pass validate_model_id.
-        // If a typo (or an injected char) reaches the catalog, onboarding would
-        // generate an invalid config without this guard. Driven off the catalog
+        // Regression guard: every curated model ID must pass the catalog's validate_model_id.
+        // A typo (or an injected char) in the catalog would otherwise reach the
+        // model setting and the provider URL. Driven off the catalog
         // rather than a fixed provider list, so a new provider block is covered
         // the day it lands.
         // Reads the compiled-in floor, not process state: `models_for_provider`
@@ -981,11 +670,21 @@ mod tests {
             assert!(!models.is_empty(), "no models for provider: {provider}");
             for (id, _) in &models {
                 assert!(
-                    validate_model_id(id).is_ok(),
+                    cortex::llm::model_catalog::validate_model_id(id).is_ok(),
                     "{provider} model id invalid: {id}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn format_number_basic() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1_000_000), "1,000,000");
+        assert_eq!(format_number(500_000), "500,000");
+        assert_eq!(format_number(5_000_000), "5,000,000");
     }
 
     /// Every provider the wizard offers must have a curated block, or the

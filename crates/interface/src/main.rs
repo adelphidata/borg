@@ -1163,14 +1163,6 @@ fn init_data_dir_defaults(data_dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(data_dir.join(sub))?;
     }
 
-    let config_path = data_dir.join("config.toml");
-    if !config_path.exists() {
-        let config_content =
-            onboarding::generate_config("anthropic/claude-sonnet-4", "openrouter", "", "", false)?;
-        std::fs::write(&config_path, config_content)?;
-        println!("  Created {}", config_path.display());
-    }
-
     // Migrate SOUL.md → IDENTITY.md for existing users
     let old_identity = data_dir.join("SOUL.md");
     let new_identity = data_dir.join(IDENTITY_FILE);
