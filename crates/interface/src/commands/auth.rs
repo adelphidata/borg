@@ -98,7 +98,7 @@ pub(crate) fn dispatch_auth(action: Option<AuthAction>) -> Result<()> {
 }
 
 fn run_pair(kind: &str) -> Result<()> {
-    let entries = tokio::runtime::Handle::current().block_on(async {
+    let entries = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .pair_credential(kind)
@@ -122,7 +122,7 @@ fn run_pair(kind: &str) -> Result<()> {
 }
 
 fn run_list(provider: Option<&str>) -> Result<()> {
-    let list = tokio::runtime::Handle::current().block_on(async {
+    let list = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .list_credentials(provider)
@@ -184,7 +184,7 @@ fn run_add(provider: &str, key: &str, label: Option<&str>) -> Result<()> {
     } else {
         key.to_string()
     };
-    let entry = tokio::runtime::Handle::current().block_on(async {
+    let entry = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .add_credential(provider, &key_owned, label)
@@ -199,7 +199,7 @@ fn run_add(provider: &str, key: &str, label: Option<&str>) -> Result<()> {
 }
 
 fn run_remove(provider: &str, target: &str) -> Result<()> {
-    let entry = tokio::runtime::Handle::current().block_on(async {
+    let entry = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .remove_credential(provider, target)
@@ -215,7 +215,7 @@ fn run_remove(provider: &str, target: &str) -> Result<()> {
 }
 
 fn run_reset(provider: &str, target: Option<&str>) -> Result<()> {
-    let cleared = tokio::runtime::Handle::current().block_on(async {
+    let cleared = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .reset_credentials(provider, target)
@@ -241,7 +241,7 @@ fn run_priority(provider: &str, target: &str, position: u32) -> Result<()> {
     if position == 0 {
         anyhow::bail!("position must be 1 or greater (1 = tried first)");
     }
-    let resp = tokio::runtime::Handle::current().block_on(async {
+    let resp = crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .set_credential_priority(provider, target, position)
@@ -280,7 +280,7 @@ fn display_priority(e: &CredentialEntry) -> String {
 }
 
 fn run_set_strategy(provider: &str, strategy: &str) -> Result<()> {
-    tokio::runtime::Handle::current().block_on(async {
+    crate::async_bridge::block_on(async {
         let mut client = crate::daemon_client::connect_or_spawn().await?;
         client
             .set_credential_strategy(provider, strategy)
