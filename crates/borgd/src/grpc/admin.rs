@@ -79,9 +79,10 @@ const PREVIEW_MAX_CHARS: usize = 140;
 fn preview_line(content: &str) -> String {
     let redacted = cortex::security::secrets::redact_secrets(content);
     let flattened = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Leading markdown is scaffolding, not what was said.
-    let trimmed = flattened
-        .trim_start_matches("```")
+    // Markdown is scaffolding, not what was said: a list row shows plain
+    // text, so `**Plan Mode**` would otherwise render with its asterisks.
+    let unmarked = flattened.replace("**", "").replace('`', "");
+    let trimmed = unmarked
         .trim_start_matches('#')
         .trim_start_matches('>')
         .trim();
@@ -1813,5 +1814,30 @@ mod display_text_tests {
         let stored = wrap_untrusted("fetch", "the page body");
         assert_eq!(display_text("tool", stored.clone()), stored);
         assert_eq!(display_text("assistant", stored.clone()), stored);
+    }
+}
+
+#[cfg(test)]
+mod preview_line_tests {
+    use super::{preview_line, PREVIEW_MAX_CHARS};
+
+    #[test]
+    fn markdown_marks_do_not_reach_the_row() {
+        assert_eq!(
+            preview_line("I'm in **Plan Mode**, so `run_shell` is blocked."),
+            "I'm in Plan Mode, so run_shell is blocked."
+        );
+        assert_eq!(
+            preview_line("```rust\nfn main() {}\n```"),
+            "rust fn main() {}"
+        );
+        assert_eq!(preview_line("## Heading\n> quoted"), "Heading > quoted");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_with_an_ellipsis() {
+        let line = preview_line(&"word ".repeat(100));
+        assert!(line.ends_with('…'));
+        assert_eq!(line.chars().count(), PREVIEW_MAX_CHARS);
     }
 }
