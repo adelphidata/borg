@@ -369,6 +369,14 @@ pub async fn update(
         ..change.clone()
     };
     let updated = db.update_subscription(id, &change).await?;
+    // The conversation list names the session after the subscription, so a
+    // rename follows it there. The subscription is already renamed; a
+    // failure here only leaves the old title in the list.
+    if let (Some(name), Some(_)) = (&change.name, &updated) {
+        if let Err(e) = db.update_session_title(&session_key(id), name).await {
+            tracing::warn!(subscription = %id, "rename: session title not updated: {e:#}");
+        }
+    }
     wake::poke();
     Ok(updated)
 }
@@ -577,6 +585,25 @@ mod tests {
         set_active(&db, &id, false).await.unwrap();
         let cleared = update(&db, &id, &clear).await.unwrap().unwrap();
         assert!(cleared.signing_secret_ref.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rename_renames_the_subscription_session_too() {
+        let db = Database::test_db().await;
+        let created = create(&db, &Config::default(), &spec("custom"))
+            .await
+            .unwrap();
+        let id = created.row.id;
+        db.upsert_session(&session_key(&id), 1, 1, 0, "m", &created.row.name)
+            .await
+            .unwrap();
+        let change = SubscriptionUpdate {
+            name: Some("Checkout errors".into()),
+            ..Default::default()
+        };
+        update(&db, &id, &change).await.unwrap().unwrap();
+        let session = db.session_by_id(&session_key(&id)).await.unwrap().unwrap();
+        assert_eq!(session.title, "Checkout errors");
     }
 
     #[tokio::test]
