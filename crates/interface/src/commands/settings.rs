@@ -56,9 +56,26 @@ pub(crate) async fn run_settings_show() -> Result<()> {
     super::print_lines(std::iter::once("Settings:".to_string()).chain(rows))
 }
 
+/// A running daemon, without starting one. A write through it reaches the
+/// running agents at once; a direct DB write waits for the daemon's next
+/// config poll.
+async fn running_daemon() -> Option<crate::daemon_client::DaemonClient> {
+    crate::daemon_client::connect_default().await.ok()
+}
+
 pub(crate) async fn run_settings_set(key: &str, value: &str) -> Result<()> {
-    let resolver = cortex::settings::SettingsResolver::load().await?;
-    let confirmation = resolver.set(key, value).await?;
+    let confirmation = match running_daemon().await {
+        Some(mut client) => {
+            // The same check the daemon makes, for the confirmation text.
+            let confirmation = cortex::config::Config::default().apply_setting(key, value)?;
+            client.set_setting(key, value).await?;
+            confirmation
+        }
+        None => {
+            let resolver = cortex::settings::SettingsResolver::load().await?;
+            resolver.set(key, value).await?
+        }
+    };
     println!("Updated: {confirmation}");
     Ok(())
 }
@@ -71,8 +88,16 @@ pub(crate) async fn run_settings_get(key: &str) -> Result<()> {
 }
 
 pub(crate) async fn run_settings_unset(key: &str) -> Result<()> {
+    match running_daemon().await {
+        Some(mut client) => client.unset_setting(key).await?,
+        None => {
+            cortex::settings::SettingsResolver::load()
+                .await?
+                .unset(key)
+                .await?
+        }
+    }
     let resolver = cortex::settings::SettingsResolver::load().await?;
-    resolver.unset(key).await?;
     let (value, source) = resolver.get_with_source(key).await?;
     println!("Unset {key} — effective value: {value} [{source}]");
     Ok(())
