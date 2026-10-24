@@ -251,17 +251,31 @@ describe("SchedulesPage actions", () => {
     );
   });
 
-  it("deletes a task from a control that names it", async () => {
+  it("deletes a task from a control that names it, once confirmed", async () => {
     const daemon = withActions();
     mount(daemon);
     await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
 
     click(screen.getByRole("button", { name: "Delete Morning briefing" }));
+    expect(screen.getByText("Delete Morning briefing?")).toBeTruthy();
+    expect(daemon.calls.some((c) => c.method === "DeleteScheduledTask")).toBe(false);
+    click(screen.getByRole("button", { name: "Delete" }));
     await waitFor(() =>
       expect(daemon.calls.find((c) => c.method === "DeleteScheduledTask")?.request).toEqual({
         id: "t1",
       }),
     );
+  });
+
+  it("keeps a task when the delete is called off", async () => {
+    const daemon = withActions();
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Morning briefing")).toBeTruthy());
+
+    click(screen.getByRole("button", { name: "Delete Morning briefing" }));
+    click(screen.getByRole("button", { name: "Keep" }));
+    expect(screen.getByText("Morning briefing")).toBeTruthy();
+    expect(daemon.calls.some((c) => c.method === "DeleteScheduledTask")).toBe(false);
   });
 
   it("surfaces a failed action", async () => {

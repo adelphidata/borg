@@ -350,6 +350,7 @@ export function SchedulesPage() {
   const schedules = useSchedules([location.key]);
   const [open, setOpen] = useState<string>();
   const [editing, setEditing] = useState<string>();
+  const [confirm, setConfirm] = useState<string>();
 
   return (
     <PageChrome title="Scheduled" mobileBrandHeader>
@@ -399,6 +400,28 @@ export function SchedulesPage() {
                         })
                     }
                   />
+                ) : confirm === task.id ? (
+                  <div
+                    key={task.id}
+                    className="flex flex-wrap items-center gap-3 rounded-[10px] border border-alert bg-alert-soft px-4 py-3"
+                  >
+                    <div className="min-w-0 flex-1 text-[12.5px] leading-[1.45] text-ink">
+                      Delete {task.name}?
+                    </div>
+                    <Pill square onClick={() => setConfirm(undefined)}>
+                      Keep
+                    </Pill>
+                    <Pill
+                      square
+                      variant="danger"
+                      onClick={() => {
+                        setConfirm(undefined);
+                        void schedules.remove(task.id);
+                      }}
+                    >
+                      Delete
+                    </Pill>
+                  </div>
                 ) : (
                   <TaskRow
                     key={task.id}
@@ -409,7 +432,7 @@ export function SchedulesPage() {
                     onResume={() => void schedules.resume(task.id)}
                     onRunNow={() => void schedules.runNow(task.id)}
                     onEdit={() => setEditing(task.id)}
-                    onDelete={() => void schedules.remove(task.id)}
+                    onDelete={() => setConfirm(task.id)}
                   />
                 ),
               )}
