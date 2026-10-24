@@ -164,10 +164,20 @@ async fn run_list(limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// The full id `borg sessions show <id>` asks the daemon for: the unique
+/// session `id` prefixes, or `id` unchanged when nothing matches so the daemon
+/// stays the one place that reports "not found".
+async fn show_target(db: &cortex::db::Database, id: &str) -> Result<String> {
+    Ok(resolve_session_id_prefix(db, id)
+        .await?
+        .unwrap_or_else(|| id.to_string()))
+}
+
 async fn run_show(id: &str) -> Result<()> {
+    let id = show_target(&cortex::db::Database::open_readonly().await?, id).await?;
     let mut client = crate::daemon_client::connect_default().await?;
     let detail = client
-        .get_session(id)
+        .get_session(&id)
         .await
         .context("Admin.GetSession via borgd")?;
     println!("Session: {} ({})", detail.title, detail.id);
@@ -183,4 +193,26 @@ async fn run_show(id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::show_target;
+
+    /// The listing prints 8-character ids and `show` documents "full UUID or
+    /// unique prefix", so a printed id must reach the daemon as the full id.
+    #[tokio::test]
+    async fn show_expands_a_listed_prefix_to_the_full_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = cortex::db::Database::open_at(&tmp.path().join("borg.db"))
+            .await
+            .expect("db");
+        let full = "1a6907c8-4caf-43cf-b5d6-278d2c35d3e6";
+        db.ensure_session_row(full, 0, "m").await.expect("row");
+
+        assert_eq!(show_target(&db, "1a6907c8").await.unwrap(), full);
+        assert_eq!(show_target(&db, full).await.unwrap(), full);
+        // No match passes through for the daemon to report.
+        assert_eq!(show_target(&db, "ffff").await.unwrap(), "ffff");
+    }
 }
