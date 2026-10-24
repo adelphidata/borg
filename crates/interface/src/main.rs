@@ -1170,7 +1170,8 @@ mod tests {
 
     /// `--help` is rendered from `///` doc comments, so a code note written
     /// there (why a variant is boxed, how an enum is laid out) is printed to
-    /// the user as if it were usage text.
+    /// the user as if it were usage text. Settings live in the DB only, so a
+    /// mention of `config.toml` points at a file that does not exist.
     #[test]
     fn help_text_carries_no_code_notes() {
         use clap::CommandFactory;
@@ -1185,9 +1186,15 @@ mod tests {
                         .map(|t| t.to_string())
                 }));
             for text in texts {
-                if ["this enum", "Boxed:", "Box<", "See `PRESETS`"]
-                    .iter()
-                    .any(|n| text.contains(n))
+                if [
+                    "this enum",
+                    "Boxed:",
+                    "Box<",
+                    "See `PRESETS`",
+                    "config.toml",
+                ]
+                .iter()
+                .any(|n| text.contains(n))
                 {
                     found.push(format!("{path}: {text}"));
                 }

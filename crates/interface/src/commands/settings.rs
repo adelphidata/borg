@@ -3,7 +3,7 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub(crate) enum SettingsAction {
-    /// Update a configuration setting (writes to DB, not config.toml)
+    /// Update a configuration setting
     Set {
         /// Setting key (e.g. temperature, model, sandbox.enabled)
         key: String,
@@ -15,7 +15,7 @@ pub(crate) enum SettingsAction {
         /// Setting key
         key: String,
     },
-    /// Remove a DB override, reverting to config.toml or default
+    /// Remove a saved value, reverting to the default
     Unset {
         /// Setting key
         key: String,
