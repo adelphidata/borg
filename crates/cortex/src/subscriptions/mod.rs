@@ -53,7 +53,7 @@ pub fn run_refusal(root_session: &str, tool: &str, args: &serde_json::Value) -> 
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let reads = matches!(action, "list" | "get" | "history" | "events" | "status");
     let refused = match tool {
-        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON | SUBSCRIBE_TOOL => !reads,
+        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON | tn::SUBSCRIBE => !reads,
         tn::CREATE_GOAL => true,
         _ => false,
     };
@@ -63,9 +63,6 @@ pub fn run_refusal(root_session: &str, tool: &str, args: &serde_json::Value) -> 
         )
     })
 }
-
-/// The agent tool that manages subscriptions.
-pub const SUBSCRIBE_TOOL: &str = "subscribe";
 
 /// Agent-loop steps a turn in `session_id` may take. A subscription run gets
 /// the lower `subscriptions.max_steps`: nobody watches it, and a burst may

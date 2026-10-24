@@ -958,6 +958,17 @@ impl Agent {
             crate::tool::Tool::ManageCron(args) => {
                 crate::tool::schedule::handle_manage_cron(args, &self.config).await
             }
+            crate::tool::Tool::Subscribe(args) => {
+                // A sub-agent reports back to its parent; it does not set up
+                // standing work of its own.
+                if self.spawn_depth > 0
+                    && !crate::tool_handlers::subscribe::is_read_action(&args.0)
+                {
+                    Ok("Error: a sub-agent can read subscriptions but not change them. Report what should change to the parent agent.".to_string())
+                } else {
+                    crate::tool_handlers::subscribe::handle_subscribe(&args.0, &self.config).await
+                }
+            }
             crate::tool::Tool::GenerateImage(args) => {
                 crate::tool::generate_image::handle(args, &self.config).await
             }

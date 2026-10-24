@@ -51,7 +51,10 @@ pub(crate) fn is_mutating_tool_call(name: &str, raw_args: &str) -> bool {
 /// tool (a static blocklist can't express per-action). Both consumers read
 /// this slice so the two enforcement paths can't drift.
 pub fn conditionally_mutating_tool_names() -> &'static [&'static str] {
-    &[crate::tool::names::COMPUTER_USE]
+    &[
+        crate::tool::names::COMPUTER_USE,
+        crate::tool::names::SUBSCRIBE,
+    ]
 }
 
 /// Names of every tool that `is_mutating_tool` considers mutating.

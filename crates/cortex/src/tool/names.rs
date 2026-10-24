@@ -21,6 +21,7 @@ pub const WEB_SEARCH: &str = "web_search";
 pub const SCHEDULE: &str = "schedule";
 pub const MANAGE_TASKS: &str = "manage_tasks";
 pub const MANAGE_CRON: &str = "manage_cron";
+pub const SUBSCRIBE: &str = "subscribe";
 
 // ── Media tools ──
 pub const BROWSER: &str = "browser";
@@ -88,6 +89,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     SCHEDULE,
     MANAGE_TASKS,
     MANAGE_CRON,
+    SUBSCRIBE,
     BROWSER,
     GENERATE_IMAGE,
     TEXT_TO_SPEECH,

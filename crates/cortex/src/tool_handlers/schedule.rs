@@ -1,3 +1,4 @@
+use crate::heartbeat_task::resolve_origin_delivery;
 use anyhow::Result;
 
 use crate::config::Config;
@@ -153,37 +154,6 @@ fn reject_system_task(task_id: &str, action: &str) -> Option<String> {
 const ORIGIN_KEPT_WITH_TASK: &str = "\n  Delivery: results are kept with the task \
      (the Scheduled page shows them). This conversation is not on a chat channel, \
      so nothing will be sent into it.";
-
-/// Resolve an "origin" sentinel on `delivery_channel` to the concrete
-/// `(channel, target)` of the current gateway conversation.
-///
-/// Outside a gateway turn — the app, the TUI — there is no channel to send
-/// to, so `origin` resolves to no delivery: results stay with the task. The
-/// sentinel used to be stored as-is, and every run then failed as
-/// "misconfigured" while the user waited for a reply that could never come.
-fn resolve_origin_delivery(
-    delivery_channel: Option<String>,
-    delivery_target: Option<String>,
-) -> (Option<String>, Option<String>) {
-    let Some(ch) = delivery_channel else {
-        return (None, delivery_target);
-    };
-    if ch != crate::heartbeat_task::ORIGIN_DELIVERY {
-        return (Some(ch), delivery_target);
-    }
-    let Some(origin) = crate::gateway_context::current() else {
-        return (None, None);
-    };
-    let target_json = serde_json::json!({
-        "sender": origin.sender_id,
-        "thread_id": origin.thread_id,
-        // Exact gateway session key (binding-aware) so delivery can mirror the
-        // reply back into this precise transcript, not a reconstructed one.
-        "session_key": origin.session_key,
-    })
-    .to_string();
-    (Some(origin.channel_name), Some(target_json))
-}
 
 /// The zone a new task's clock times are read in.
 ///

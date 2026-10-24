@@ -50,6 +50,7 @@ pub(crate) mod request_user_input;
 pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod search_tools;
+pub(crate) mod subscribe;
 pub(crate) mod text_to_speech;
 pub(crate) mod transcribe_audio;
 pub(crate) mod update_goal;
@@ -77,6 +78,7 @@ pub(crate) use request_user_input::RequestUserInputArgs;
 pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use search_tools::SearchToolsArgs;
+pub(crate) use subscribe::SubscribeArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
 pub(crate) use transcribe_audio::TranscribeAudioArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
@@ -125,6 +127,8 @@ pub(crate) enum Tool {
     Schedule(ScheduleArgs),
     ManageTasks(ScheduleArgs),
     ManageCron(ScheduleArgs),
+    /// Event subscriptions: what wakes Borg besides the clock.
+    Subscribe(SubscribeArgs),
 
     // Media
     Browser(BrowserArgs),
@@ -214,6 +218,7 @@ impl Tool {
 
             // Scheduling
             tn::SCHEDULE => Tool::Schedule(from(tn::SCHEDULE, args)?),
+            tn::SUBSCRIBE => Tool::Subscribe(from(tn::SUBSCRIBE, args)?),
             tn::MANAGE_TASKS => Tool::ManageTasks(from(tn::MANAGE_TASKS, args)?),
             tn::MANAGE_CRON => Tool::ManageCron(from(tn::MANAGE_CRON, args)?),
 
@@ -266,6 +271,7 @@ impl Tool {
             Tool::ListChannels => tn::LIST_CHANNELS,
             Tool::SearchTools(_) => tn::SEARCH_TOOLS,
             Tool::Schedule(_) => tn::SCHEDULE,
+            Tool::Subscribe(_) => tn::SUBSCRIBE,
             Tool::ManageTasks(_) => tn::MANAGE_TASKS,
             Tool::ManageCron(_) => tn::MANAGE_CRON,
             Tool::Browser(_) => tn::BROWSER,
@@ -317,6 +323,7 @@ impl Tool {
             | Tool::Schedule(_)
             | Tool::ManageTasks(_)
             | Tool::ManageCron(_)
+            | Tool::Subscribe(_)
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
@@ -363,6 +370,7 @@ impl Tool {
             | Tool::VideoAnalyze(_) => true,
 
             Tool::ComputerUse(args) => computer_use::action_allowed_in_plan_mode(&args.action),
+            Tool::Subscribe(args) => crate::tool_handlers::subscribe::is_read_action(&args.0),
 
             Tool::WriteMemory(_)
             | Tool::ApplyPatch(_)
@@ -410,7 +418,9 @@ impl Tool {
             | Tool::RequestUserInput(_) => ToolGroup::Discovery,
             Tool::WebFetch(_) | Tool::WebSearch(_) => ToolGroup::Web,
             Tool::Browser(_) => ToolGroup::Ui,
-            Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) => ToolGroup::Scheduling,
+            Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) | Tool::Subscribe(_) => {
+                ToolGroup::Scheduling
+            }
             Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::TranscribeAudio(_)
@@ -456,6 +466,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::VISION_ANALYZE,
             tn::VIDEO_ANALYZE,
             tn::COMPUTER_USE,
+            tn::SUBSCRIBE,
         ],
     )
 }
@@ -471,11 +482,16 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
 /// lives in `agent::tool_classification::is_mutating_tool`.
 pub(crate) fn readonly_tool_call(name: &str, raw_args: &str) -> bool {
     if crate::agent::conditionally_mutating_tool_names().contains(&name) {
-        // Today only `computer_use` is args-dependent; dispatch to its
-        // per-action check. Add a match arm here when a second one appears.
-        debug_assert_eq!(name, tn::COMPUTER_USE);
-        return serde_json::from_str::<serde_json::Value>(raw_args)
-            .is_ok_and(|v| computer_use::args_action_is_readonly(&v));
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+            return false;
+        };
+        return match name {
+            tn::SUBSCRIBE => crate::tool_handlers::subscribe::is_read_action(&args),
+            _ => {
+                debug_assert_eq!(name, tn::COMPUTER_USE);
+                computer_use::args_action_is_readonly(&args)
+            }
+        };
     }
     allowed_in_plan_mode_name(name)
 }
@@ -566,6 +582,7 @@ mod tests {
             (tn::SCHEDULE, json!({})),
             (tn::MANAGE_TASKS, json!({})),
             (tn::MANAGE_CRON, json!({})),
+            (tn::SUBSCRIBE, json!({"action":"list"})),
             (
                 tn::BROWSER,
                 json!({"action":"navigate","url":"https://example.com"}),
@@ -668,6 +685,7 @@ mod tests {
             (tn::SCHEDULE, json!({})),
             (tn::MANAGE_TASKS, json!({})),
             (tn::MANAGE_CRON, json!({})),
+            (tn::SUBSCRIBE, json!({"action":"list"})),
             (
                 tn::BROWSER,
                 json!({"action":"navigate","url":"https://example.com"}),

@@ -18,6 +18,38 @@ pub const BROADCAST_DELIVERY: &str = "broadcast";
 /// has nowhere to go.
 pub const ORIGIN_DELIVERY: &str = "origin";
 
+/// Resolve an "origin" sentinel on `delivery_channel` to the concrete
+/// `(channel, target)` of the current gateway conversation.
+///
+/// Outside a gateway turn — the app, the TUI — there is no channel to send
+/// to, so `origin` resolves to no delivery: results stay with the task or
+/// subscription. The
+/// sentinel used to be stored as-is, and every run then failed as
+/// "misconfigured" while the user waited for a reply that could never come.
+pub fn resolve_origin_delivery(
+    delivery_channel: Option<String>,
+    delivery_target: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(ch) = delivery_channel else {
+        return (None, delivery_target);
+    };
+    if ch != crate::heartbeat_task::ORIGIN_DELIVERY {
+        return (Some(ch), delivery_target);
+    }
+    let Some(origin) = crate::gateway_context::current() else {
+        return (None, None);
+    };
+    let target_json = serde_json::json!({
+        "sender": origin.sender_id,
+        "thread_id": origin.thread_id,
+        // Exact gateway session key (binding-aware) so delivery can mirror the
+        // reply back into this precise transcript, not a reconstructed one.
+        "session_key": origin.session_key,
+    })
+    .to_string();
+    (Some(origin.channel_name), Some(target_json))
+}
+
 /// Returns true if the task ID matches the seeded heartbeat row.
 pub fn is_heartbeat_task_id(id: &str) -> bool {
     id == HEARTBEAT_TASK_ID

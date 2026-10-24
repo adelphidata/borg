@@ -65,6 +65,7 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     (crate::tool::names::BROWSER, ToolGroup::Ui),
     // Scheduling
     (crate::tool::names::SCHEDULE, ToolGroup::Scheduling),
+    (crate::tool::names::SUBSCRIBE, ToolGroup::Scheduling),
     // Media
     (crate::tool::names::GENERATE_IMAGE, ToolGroup::Media),
     (crate::tool::names::TEXT_TO_SPEECH, ToolGroup::Media),
@@ -847,6 +848,7 @@ mod tests {
             tool_names::SCHEDULE,
             tool_names::MANAGE_TASKS,
             tool_names::MANAGE_CRON,
+            tool_names::SUBSCRIBE,
             tool_names::BROWSER,
             tool_names::GENERATE_IMAGE,
             tool_names::TEXT_TO_SPEECH,

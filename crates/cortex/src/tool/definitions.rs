@@ -50,6 +50,10 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
         "Manage scheduled jobs: prompt tasks and cron commands",
     ),
     (
+        tool_names::SUBSCRIBE,
+        "Wake on outside events (webhooks, alerts, chat messages, email) and act on them",
+    ),
+    (
         tool_names::REQUEST_USER_INPUT,
         "Last-resort prompt for information no other tool can obtain (personal preference, credential, external decision). Do not use for questions answerable by reading files or running commands.",
     ),
@@ -114,6 +118,9 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     }
 
     defs.push(build_schedule_tool_def());
+    if config.subscriptions.enabled {
+        defs.push(build_subscribe_tool_def());
+    }
 
     defs.extend(crate::wasm_plugins::tool_definitions().await);
     // MCP tools: tiered disclosure. Small catalogs are advertised directly
@@ -625,6 +632,29 @@ fn build_search_tools_def(catalog_listing: Option<&str>) -> ToolDefinition {
 /// Prompt tasks may optionally specify a `pre_run_command` whose stdout is
 /// injected into the prompt as `<preprocessed_context>`, plus a `[SILENT]`
 /// sentinel the model can return to suppress channel delivery.
+fn build_subscribe_tool_def() -> ToolDefinition {
+    let providers: Vec<&str> = crate::subscriptions::presets::all()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    ToolDefinition::new(
+        tool_names::SUBSCRIBE,
+        "Subscribe Borg to outside events so it wakes up and acts on them: a GitHub pull request or push, a Sentry, Datadog or PagerDuty alert, a Stripe or Linear webhook, a Slack, Discord or Telegram message, inbound email, or Borg's own goal and task results. A subscription is a source, an optional filter, an instruction, and where to report. Each matching event runs the instruction in the subscription's own conversation. create returns an endpoint URL, a key and the sender's setup steps: give all three to the user. Keep filters narrow, because every match wakes Borg. For time-based jobs use schedule instead. Actions: sources, create, list, get, update, pause, resume, delete, events, test.",
+        serde_json::json!({"type":"object","properties":{
+            "action":{"type":"string","enum":["sources","create","list","get","update","pause","resume","delete","events","test"]},
+            "id":{"type":"string","description":"Subscription id (sub_…), for every action but sources, create and list."},
+            "provider":{"type":"string","enum": providers,"description":"Source, for create."},
+            "name":{"type":"string","description":"Display name. Defaults to the source's."},
+            "instruction":{"type":"string","description":"What Borg does when an event arrives, e.g. 'Find the likely commit and post a one-paragraph diagnosis. Never resolve the issue.' Defaults to the source's."},
+            "filter":{"type":"object","description":"Which events wake Borg. Keys: kinds (event kinds, e.g. [\"pull_request.opened\"]), severity_min (info|warning|error|critical), repos, branch, labels, author, exclude_drafts, phrase, mention_only, channel_id, sender, reaction, field_equals ({\"dot.path\": value})."},
+            "delivery_channel":{"type":"string","description":"Where results also go: slack, telegram or discord, or 'origin' for the conversation this request came from (for channel sources: the thread each message came from). Omit for the subscription's own conversation only."},
+            "delivery_target":{"type":"string","description":"Chat or channel id on delivery_channel. Omit with 'origin'."},
+            "signing_secret":{"type":"string","description":"The signing secret the provider shows (Stripe, Sentry, PagerDuty, Linear). Empty on update clears it."},
+            "limit":{"type":"integer","description":"Events to show, for events (default 10)."}
+        },"required":["action"]}),
+    )
+}
+
 fn build_schedule_tool_def() -> ToolDefinition {
     let properties = serde_json::json!({
         "action": {"type":"string","enum":["create","list","get","update","pause","resume","cancel","delete","runs","run_now"],"description":"Action to perform"},
