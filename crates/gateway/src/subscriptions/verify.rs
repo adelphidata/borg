@@ -40,6 +40,9 @@ pub enum AuthError {
     Stale,
     /// The provider signed the request, but no signing secret was pasted.
     NeedsSigningSecret,
+    /// A signing secret is pasted, so the provider's signature is required,
+    /// and this request does not carry the named header.
+    SignatureRequired(&'static str),
     /// A header could not be read.
     Malformed(&'static str),
 }
@@ -57,6 +60,10 @@ impl std::fmt::Display for AuthError {
             AuthError::Stale => f.write_str("The signature is too old. Check the sender's clock."),
             AuthError::NeedsSigningSecret => f.write_str(
                 "This provider signs its requests. Paste its signing secret into the subscription in Borg.",
+            ),
+            AuthError::SignatureRequired(h) => write!(
+                f,
+                "This subscription checks the provider's signature, and the request has no {h} header. Send events from the provider itself."
             ),
             AuthError::Malformed(h) => write!(f, "The {h} header could not be read."),
         }
@@ -93,9 +100,22 @@ pub fn verify(
     // required: accepting the bare key instead would skip the timestamp
     // check and let a replayed request through.
     if scheme.provider_issues_secret() && secrets.signing_secret.is_some() {
-        return Err(AuthError::Missing);
+        return Err(AuthError::SignatureRequired(signature_header(scheme)));
     }
     verify_key(headers, secrets.key)
+}
+
+/// The header a provider that issues its own secret signs with.
+fn signature_header(scheme: AuthScheme) -> &'static str {
+    match scheme {
+        AuthScheme::Sentry => "Sentry-Hook-Signature",
+        AuthScheme::Linear => "Linear-Signature",
+        AuthScheme::Pagerduty => "X-PagerDuty-Signature",
+        AuthScheme::Stripe => "Stripe-Signature",
+        AuthScheme::Svix => "svix-signature",
+        AuthScheme::Github => "X-Hub-Signature-256",
+        AuthScheme::Bearer | AuthScheme::None => "signature",
+    }
 }
 
 /// Whether `ts` is outside the tolerance around `now`. `abs_diff` because
@@ -343,11 +363,14 @@ mod tests {
             AuthScheme::Linear,
             AuthScheme::Svix,
         ] {
+            let err = verify(scheme, &bearer, b"{}", secrets(Some("whsec_x")), NOW).unwrap_err();
             assert_eq!(
-                verify(scheme, &bearer, b"{}", secrets(Some("whsec_x")), NOW),
-                Err(AuthError::Missing),
+                err,
+                AuthError::SignatureRequired(signature_header(scheme)),
                 "{scheme:?}"
             );
+            // The sender's log names what is missing, not "no credentials".
+            assert!(err.to_string().contains(signature_header(scheme)), "{err}");
         }
         // GitHub signs with Borg's own key, so the key stays accepted.
         assert_eq!(
