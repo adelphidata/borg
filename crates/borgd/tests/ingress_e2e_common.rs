@@ -234,15 +234,26 @@ pub fn register_stub_for_session(session_key: &str, events: Vec<AgentEvent>) {
 /// so repeat calls (across multiple test files in the same binary)
 /// silently no-op — that's fine; the registry is shared regardless.
 fn install_global_executor() {
-    let exec = Arc::new(DaemonSessionExecutor::new(
-        shared_registry().clone(),
-        Config::default(),
-        BorgMetrics::noop(),
-        None,
-        None,
-        None,
-    ));
-    session_executor::set_global(exec);
+    session_executor::set_global(shared_executor());
+}
+
+/// The executor over [`shared_registry`], one per test binary, for tests
+/// that drive a daemon lane (the subscription dispatcher) beside the
+/// gateway.
+pub fn shared_executor() -> Arc<DaemonSessionExecutor> {
+    use std::sync::OnceLock;
+    static E: OnceLock<Arc<DaemonSessionExecutor>> = OnceLock::new();
+    E.get_or_init(|| {
+        Arc::new(DaemonSessionExecutor::new(
+            shared_registry().clone(),
+            Config::default(),
+            BorgMetrics::noop(),
+            None,
+            None,
+            None,
+        ))
+    })
+    .clone()
 }
 
 /// Process-shared `BORG_HOME`. Created on first call, kept alive

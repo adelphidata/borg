@@ -95,6 +95,26 @@ impl RunHost for DaemonRunHost {
     }
 }
 
+/// Run the dispatcher over the daemon's session executor until `cancel`.
+/// The orchestrator supervises one of these; the e2e tests run one beside a
+/// real gateway. Bumps `liveness` every pass.
+pub async fn run_dispatcher(
+    executor: Arc<DaemonSessionExecutor>,
+    config_rx: tokio::sync::watch::Receiver<Config>,
+    bus: SubscriptionBus,
+    cancel: CancellationToken,
+    liveness: Arc<std::sync::atomic::AtomicU64>,
+) -> anyhow::Result<()> {
+    dispatcher::Dispatcher {
+        host: Arc::new(DaemonRunHost { executor }),
+        config_rx,
+        bus,
+        defer_backoff: dispatcher::DEFER_BACKOFF,
+    }
+    .run(cancel, liveness)
+    .await
+}
+
 /// Tell the user, once, that a subscription paused itself: the app (alert
 /// dot and banner, through the bus), a line in the subscription's session,
 /// and the delivery channel when it has a fixed one. Best-effort on each

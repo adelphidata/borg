@@ -212,10 +212,7 @@ pub async fn start(
     {
         let dispatch_liveness = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let liveness_for_loop = dispatch_liveness.clone();
-        let host: Arc<dyn crate::subscriptions::RunHost> =
-            Arc::new(crate::subscriptions::DaemonRunHost {
-                executor: executor.clone(),
-            });
+        let executor = executor.clone();
         let bus = subscription_bus.clone();
         let rx = subscription_config_rx.clone();
         let cancel = shutdown.clone();
@@ -224,15 +221,13 @@ pub async fn start(
             shutdown.clone(),
             supervisor_db.clone(),
             move || {
-                let dispatcher = crate::subscriptions::dispatcher::Dispatcher {
-                    host: host.clone(),
-                    config_rx: rx.clone(),
-                    bus: bus.clone(),
-                    defer_backoff: crate::subscriptions::dispatcher::DEFER_BACKOFF,
-                };
-                let cancel = cancel.child_token();
-                let liveness = liveness_for_loop.clone();
-                async move { dispatcher.run(cancel, liveness).await }
+                crate::subscriptions::run_dispatcher(
+                    executor.clone(),
+                    rx.clone(),
+                    bus.clone(),
+                    cancel.child_token(),
+                    liveness_for_loop.clone(),
+                )
             },
         );
     }
