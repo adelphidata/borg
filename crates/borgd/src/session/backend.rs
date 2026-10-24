@@ -533,7 +533,7 @@ impl SessionBackend for AgentBackend {
         let mut agent = match self.agent.try_lock() {
             Ok(a) => a,
             Err(_) => {
-                let msg = "another turn is already in flight for this session";
+                let msg = "Another turn is still running in this session. Wait for it to finish, or stop it first.";
                 tracing::warn!(session_id = %self.session_id, "{msg}");
                 if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
                     tracing::warn!(error = %e, "failed to surface concurrent-turn error");
@@ -549,7 +549,7 @@ impl SessionBackend for AgentBackend {
         // worker's lease expires and any worker can then reconstruct from the
         // log and continue.
         if let LeaseStatus::Conflict = self.acquire_lease().await {
-            let msg = "this session is owned by another worker; cannot run the turn here";
+            let msg = "Another Borg worker owns this session, so it cannot run the turn here. Try again in a moment.";
             tracing::warn!(session_id = %self.session_id, "{msg}");
             if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
                 tracing::warn!(error = %e, "failed to surface session-ownership conflict");
@@ -632,7 +632,7 @@ impl SessionBackend for AgentBackend {
         let mut agent = match self.agent.try_lock() {
             Ok(a) => a,
             Err(_) => {
-                let msg = "another turn is already in flight for this session";
+                let msg = "Another turn is still running in this session. Wait for it to finish, or stop it first.";
                 tracing::warn!(session_id = %self.session_id, "{msg}");
                 if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
                     tracing::warn!(error = %e, "failed to surface concurrent-turn error");
@@ -643,7 +643,7 @@ impl SessionBackend for AgentBackend {
         self.remember_snapshot(&agent);
 
         if let LeaseStatus::Conflict = self.acquire_lease().await {
-            let msg = "this session is owned by another worker; cannot run the turn here";
+            let msg = "Another Borg worker owns this session, so it cannot run the turn here. Try again in a moment.";
             tracing::warn!(session_id = %self.session_id, "{msg}");
             if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
                 tracing::warn!(error = %e, "failed to surface session-ownership conflict");

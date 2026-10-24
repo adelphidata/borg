@@ -158,6 +158,17 @@ fn strip_html(raw: &str) -> &str {
     raw
 }
 
+/// True for a short, single-line message that reads as a full sentence: a
+/// capital first letter and a final period. Provider bodies and error chains
+/// (`openai returned 500: {…}`, `open db: no such file`) do not.
+fn is_written_for_the_user(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.len() <= 300
+        && raw.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && raw.ends_with('.')
+        && !raw.contains(['\n', '{', '<'])
+}
+
 /// Format a friendly, user-facing error message from a raw error string.
 ///
 /// The returned message is safe to send to external messaging channels.
@@ -254,6 +265,11 @@ pub fn format_friendly_error(raw: &str) -> String {
              gets the same answer. Rephrase the request, or switch to another provider."
                 .to_string()
         }
+
+        // Borg's own refusals ("nothing to resume", "another turn is
+        // running") are already written for the user. The generic prefix
+        // would call them unexpected, which they are not.
+        ErrorCategory::Unknown if is_written_for_the_user(raw) => raw.trim().to_string(),
 
         ErrorCategory::Unknown => {
             // For unknown errors, give a safe generic message
@@ -845,6 +861,27 @@ mod tests {
     #[test]
     fn empty_error_classifies_as_unknown() {
         assert_eq!(classify_error(""), ErrorCategory::Unknown);
+    }
+
+    /// A refusal Borg wrote for the user reaches the TUI as an error event.
+    /// It must not read as a crash.
+    #[test]
+    fn a_refusal_written_for_the_user_is_shown_as_it_is() {
+        let refusal = "The last reply finished normally, so there is nothing to resume. \
+                       Send a message to continue.";
+        assert_eq!(format_friendly_error(refusal), refusal);
+        for raw in [
+            "openai returned 500: internal",
+            "Failed to open database: no such file",
+            "Parse failed {\"error\": \"x\"}.",
+            "First line.\nSecond line.",
+        ] {
+            let shown = format_friendly_error(raw);
+            assert!(
+                shown.contains("unexpected error"),
+                "{raw} must keep the wrapper: {shown}"
+            );
+        }
     }
 
     #[test]
