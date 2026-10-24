@@ -26,6 +26,12 @@ ignore = [
     # buffer holds `u8` (input/adapters/async_adapter.rs), which has no `Drop`.
     # No songbird release takes ringbuf >= 0.5.2 yet; drop this when one does.
     "RUSTSEC-2026-0293", # ringbuf: double free in Consumer::skip/clear on panicking Drop
+    # crypto-bigint 0.5 reaches the graph only through songbird's DAVE chain
+    # (davey → p256/ecdsa → elliptic-curve 0.13), so it is built only with the
+    # opt-in voice feature. The fix is crypto-bigint 0.7.6, which needs
+    # elliptic-curve 0.14; no davey/openmls release takes it yet. Drop this
+    # when songbird's chain moves, or voice is dropped.
+    "RUSTSEC-2026-0387", # crypto-bigint: timing variability in constant-time ops
     # zip 8 reaches the graph only through anydoc and calamine (document
     # text extraction), and every release of both still requires `zip ^8`.
     # All three bugs live in `ZipArchive::extract` / `ZipStreamReader::extract`
