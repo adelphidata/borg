@@ -35,7 +35,7 @@ pub async fn handle_generate_image(args: &serde_json::Value, config: &Config) ->
         Some(p) => p,
         None => {
             return Ok(
-                "No image generation provider available. Set OPENAI_API_KEY or FAL_KEY environment variable, or configure [image_gen] in config.toml"
+                "No image generation provider available. Set the OPENAI_API_KEY or FAL_KEY environment variable."
                     .to_string(),
             );
         }

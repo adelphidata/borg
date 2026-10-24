@@ -668,7 +668,7 @@ impl Config {
         }
         std::env::var(&self.llm.api_key_env).with_context(|| {
             format!(
-                "API key not found. Set the {} environment variable or configure api_key in config.toml.",
+                "API key not found. Set the {} environment variable, or add a key with `borg auth add` or the app's Provider settings.",
                 self.llm.api_key_env
             )
         })
