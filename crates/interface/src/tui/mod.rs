@@ -387,8 +387,7 @@ pub async fn run(
                 let title = meta.title.clone();
                 let count = meta.message_count;
                 if let Err(e) = client.load_agent_session(&session_id, &meta.id).await {
-                    eprintln!("borg: failed to load session '{}': {e}", meta.id);
-                    return Ok(None);
+                    anyhow::bail!("failed to load session '{}': {e}", meta.id);
                 }
                 // The conversation continues under the *loaded* session id,
                 // so that row (not just the host's fresh one) carries the
@@ -396,10 +395,7 @@ pub async fn run(
                 stamp_session_workspace(&meta.id).await;
                 resumed_info = Some((title, count));
             }
-            Err(e) => {
-                eprintln!("borg: {e}");
-                return Ok(None);
-            }
+            Err(e) => anyhow::bail!("{e}"),
         }
     }
 

@@ -805,8 +805,13 @@ async fn run_start(
     worktree_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     ensure_onboarded()?;
-    let resume = if resume_flag.is_some() {
-        resume_flag
+    let resume = if let Some(prefix) = resume_flag {
+        // Checked before the TUI starts: an id that matches nothing is a
+        // failed command, not a fresh session.
+        if let Err(e) = cortex::session::resolve_session_id(&prefix) {
+            anyhow::bail!("{e}");
+        }
+        Some(prefix)
     } else if continue_session {
         resolve_continue_session().await
     } else {
