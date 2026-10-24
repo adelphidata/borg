@@ -74,7 +74,7 @@ pub async fn build_kek_store(
             Ok(open_file_store(borg_home)?)
         }
         KekBackend::Auto => {
-            if probe_keychain() {
+            if probe_keychain(borg_home) {
                 tracing::info!("KEK backend: os_keychain (auto-detected)");
                 // Deliberately NOT persisted. Latching `auto` to
                 // `os_keychain` removed the fallback from every later boot:
@@ -111,10 +111,10 @@ pub async fn build_kek_store(
 /// is asked for one. A cache that will not open is skipped, not fatal: the
 /// daemon then boots the way it would without it.
 fn keychain_store(borg_home: &Path) -> Arc<dyn KekStore> {
-    let keychain: Arc<dyn KekStore> = Arc::new(KeychainStore::for_home(
-        borg_home,
-        paths::default_borg_home().as_deref(),
-    ));
+    let keychain: Arc<dyn KekStore> = Arc::new(
+        KeychainStore::for_home(borg_home, paths::default_borg_home().as_deref())
+            .with_legacy_fallback(),
+    );
     #[cfg(debug_assertions)]
     if let Some(passphrase) = std::env::var(DEV_CACHE_ENV).ok().filter(|v| !v.is_empty()) {
         let path = paths::subdir(borg_home, BorgSubdir::Secrets).join("dev-kek-cache.enc");
@@ -177,9 +177,10 @@ impl KekStore for DevCachedStore {
 
 /// Probe the OS keychain by writing-and-reading a sentinel. Any error
 /// (unavailable backend, missing dbus session, locked keyring, …) returns
-/// `false` so the caller falls back to `File`.
-fn probe_keychain() -> bool {
-    let store = KeychainStore::new();
+/// `false` so the caller falls back to `File`. The sentinel is scoped like the
+/// keys, so two daemons that start together never delete each other's.
+fn probe_keychain(borg_home: &Path) -> bool {
+    let store = KeychainStore::for_home(borg_home, paths::default_borg_home().as_deref());
     if store.put(PROBE_ACCOUNT, PROBE_VALUE).is_err() {
         return false;
     }

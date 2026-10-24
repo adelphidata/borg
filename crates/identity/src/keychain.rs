@@ -42,11 +42,14 @@ pub trait KekStore: Send + Sync {
 /// another `BORG_HOME` would otherwise write the same accounts and replace the
 /// CA of the first. A store made with [`KeychainStore::for_home`] for any dir
 /// other than the default suffixes each account with a short hash of that dir.
-/// The default dir keeps the bare names, and a scoped store copies a bare
-/// entry it lacks on first read, so existing installs keep their keys.
+/// The default dir keeps the bare names. A daemon store made
+/// [`with_legacy_fallback`](KeychainStore::with_legacy_fallback) also copies a
+/// bare entry it lacks on first read, so a home that stored its keys before
+/// accounts were scoped keeps them.
 #[derive(Debug, Default)]
 pub struct KeychainStore {
     scope: Option<String>,
+    legacy_fallback: bool,
 }
 
 impl KeychainStore {
@@ -65,7 +68,19 @@ impl KeychainStore {
         }
         let digest = Sha256::digest(home.as_os_str().as_encoded_bytes());
         let scope = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
-        Self { scope: Some(scope) }
+        Self {
+            scope: Some(scope),
+            legacy_fallback: false,
+        }
+    }
+
+    /// A scoped read that finds nothing falls back to the bare name once and
+    /// copies the value over. The bare names are also what the default home
+    /// writes, so the entry may belong to that home: only a caller that checks
+    /// the key against its own records (the daemon's CA bootstrap) turns this on.
+    pub fn with_legacy_fallback(mut self) -> Self {
+        self.legacy_fallback = true;
+        self
     }
 
     fn account(&self, account: &str) -> String {
@@ -97,7 +112,7 @@ impl KekStore for KeychainStore {
         match read_secret(&self.entry(account)?, account) {
             // A home that stored its keys before accounts were scoped still
             // has them under the bare name; copy them over once.
-            Err(PkiError::NotFound(_)) if self.scope.is_some() => {
+            Err(PkiError::NotFound(_)) if self.scope.is_some() && self.legacy_fallback => {
                 let secret = read_secret(&Self::new().entry(account)?, account)?;
                 if let Err(e) = self.put(account, &secret) {
                     tracing::warn!("keychain: could not copy {account} to its scoped name: {e}");
@@ -462,8 +477,8 @@ mod tests {
     /// A missing keychain entry must surface as PkiError::NotFound naming the
     /// account — callers key their "run `borg device pair` first" guidance on
     /// that variant, and a fabricated Ok(secret) would hand out a bogus KEK.
-    /// Runs against keyring's in-process mock backend (whose entries are
-    /// always absent) so the test never touches the real OS keychain.
+    /// Runs against keyring's in-process mock backend so the test never
+    /// touches the real OS keychain.
     #[test]
     fn keychain_store_maps_missing_entry_to_notfound() {
         // Trigger the platform registration first so it cannot replace the
@@ -484,6 +499,17 @@ mod tests {
             Err(PkiError::NotFound(a)) => assert_eq!(a, account),
             other => panic!("expected NotFound for an absent scoped entry, got {other:?}"),
         }
+
+        // Only a store that opts in reads a key from before scoping, and it
+        // then keeps a copy under its own name.
+        let legacy = "borg-test-kek-legacy";
+        KeychainStore::new().put(legacy, b"old").expect("bare put");
+        assert!(matches!(scoped.get(legacy), Err(PkiError::NotFound(_))));
+        let daemon = KeychainStore::for_home(home.path(), None).with_legacy_fallback();
+        assert_eq!(daemon.get(legacy).expect("fallback"), b"old".to_vec());
+        assert_eq!(scoped.get(legacy).expect("copied"), b"old".to_vec());
+        KeychainStore::new().delete(legacy).expect("bare delete");
+        scoped.delete(legacy).expect("scoped delete");
     }
 
     /// The default data dir keeps the bare account names an existing install
