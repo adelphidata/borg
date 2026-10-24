@@ -510,6 +510,59 @@ async fn manual_compact_retries_with_primary_model_when_override_fails() {
     );
 }
 
+/// `/compact` is a request to compact now. A conversation well under the
+/// automatic threshold must still be summarized, or the command does nothing
+/// until the moment the automatic pass would have run anyway.
+#[tokio::test]
+async fn manual_compact_summarizes_history_under_the_automatic_threshold() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    mount_dead_override_live_primary(&server).await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+    agent.config.compaction.model = None;
+    agent.config.conversation.max_history_tokens = 1_000_000;
+    let budget = agent.effective_history_budget();
+
+    let (before, after) = agent.compact().await;
+
+    assert!(
+        before * 4 < budget,
+        "precondition: history ({before}) must sit far below the budget ({budget})"
+    );
+    assert!(
+        after < before,
+        "manual compaction must fold history even under the budget ({before} → {after} tokens)"
+    );
+}
+
+/// A history smaller than the summary marker would grow if folded, so a
+/// manual compaction leaves it untouched and makes no LLM call.
+#[tokio::test]
+async fn manual_compact_leaves_a_tiny_history_alone() {
+    let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
+    let server = wiremock::MockServer::start().await;
+    mount_dead_override_live_primary(&server).await;
+    let mut agent = over_budget_agent_with_dead_override(&server.uri());
+    agent.config.compaction.model = None;
+    agent.history = vec![
+        crate::types::Message::user("hi"),
+        crate::types::Message::assistant("hello"),
+    ];
+
+    let (before, after) = agent.compact().await;
+
+    assert_eq!(before, after, "a tiny history must not be replaced");
+    assert_eq!(agent.history.len(), 2);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "no summarizer call may be made for a history that cannot shrink"
+    );
+}
+
 /// When the summarizer itself fails transiently, the reactive error must say
 /// so. "Compaction freed nothing — raise `max_history_tokens`" sends the user
 /// after a knob that cannot help with a provider hiccup.

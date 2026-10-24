@@ -988,7 +988,8 @@ impl Agent {
         &self.metrics
     }
 
-    /// Compact conversation history via LLM summarization. Returns (before, after) message counts.
+    /// Compact conversation history via LLM summarization. Returns the history
+    /// token estimates (before, after).
     #[instrument(skip_all, fields(session_id = %self.session.meta.id))]
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
@@ -997,8 +998,17 @@ impl Agent {
         // primary-model fallback, so a manual /compact can't truncate the
         // summary mid-section or wedge on a dead override any more than
         // they can.
-        let max_hist = self.effective_history_budget();
-        let (dropped, failure) = match self.run_compaction_with_fallback(max_hist).await {
+        //
+        // The target is half the current history, not the full budget: the
+        // planner only folds history that is past the target, so aiming at
+        // the budget made `/compact` a no-op until the automatic pass was
+        // about to run anyway. A history too small to beat the summary
+        // marker it would be replaced with is left alone.
+        if before / 2 <= crate::constants::COMPACTION_MARKER_TOKENS {
+            return (before, before);
+        }
+        let target = self.effective_history_budget().min(before / 2);
+        let (dropped, failure) = match self.run_compaction_with_fallback(target).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Manual compaction could not build a summarizer client: {e}");
