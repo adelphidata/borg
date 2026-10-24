@@ -12,6 +12,16 @@ use super::Database;
 /// silently truncated; if a deployment hits this we have a separate problem.
 const SESSIONS_SINCE_HARD_CAP: i64 = 10_000;
 
+/// A session worth resuming: not archived, not one of the daemon's own
+/// check-in sessions (`heartbeat:*`, which every TUI start refreshes), and
+/// holding a conversation — every TUI start writes an empty row, so an
+/// open-and-quit must not shadow the conversation before it. A fork holds
+/// its history through its parent, so it counts with no rows of its own.
+const RESUMABLE_SESSION: &str = "archived_at IS NULL \
+     AND id NOT LIKE 'heartbeat:%' \
+     AND (parent_session_id IS NOT NULL \
+          OR EXISTS (SELECT 1 FROM messages m WHERE m.session_id = sessions.id))";
+
 /// One event for [`Database::append_session_events`]. Field-for-field the
 /// parameters of [`Database::append_session_event`], owned so a batch can be
 /// assembled before the transaction opens.
@@ -86,7 +96,7 @@ impl Database {
         Ok(())
     }
 
-    /// Most recent non-archived session belonging to the given workspace.
+    /// Most recent resumable session belonging to the given workspace.
     ///
     /// Matching is two-tier: prefer sessions stamped with the same
     /// `git_repo_root` (any directory inside the same checkout counts as the
@@ -94,39 +104,45 @@ impl Database {
     /// directories outside any git repo. Returns `None` when neither tier
     /// matches — callers decide whether to fall back to the global MRU.
     /// Both arguments must be canonicalized the same way the stamps were
-    /// (see `crate::session::workspace_identity`).
+    /// (see `crate::session::workspace_identity`). Only conversations count:
+    /// see [`RESUMABLE_SESSION`].
     pub async fn most_recent_session_in_workspace(
         &self,
         git_repo_root: Option<&str>,
         cwd: &str,
     ) -> Result<Option<SessionRow>> {
         if let Some(root) = git_repo_root {
-            let mut rows = self
-                .conn
-                .query(
-                    &format!(
-                        "SELECT {} FROM sessions \
-                         WHERE git_repo_root = ?1 AND archived_at IS NULL \
-                         ORDER BY updated_at DESC, id DESC LIMIT 1",
-                        SessionRow::COLUMNS
-                    ),
-                    params!(root),
-                )
-                .await?;
-            if let Some(row) = rows.next().await? {
-                return Ok(Some(SessionRow::from_row(&row)?));
+            if let Some(row) = self
+                .newest_resumable_session("AND git_repo_root = ?1", params!(root))
+                .await?
+            {
+                return Ok(Some(row));
             }
         }
+        self.newest_resumable_session("AND cwd = ?1", params!(cwd))
+            .await
+    }
+
+    /// Most recent resumable session anywhere — `--continue`'s fallback when
+    /// the workspace has none.
+    pub async fn most_recent_resumable_session(&self) -> Result<Option<SessionRow>> {
+        self.newest_resumable_session("", ()).await
+    }
+
+    async fn newest_resumable_session(
+        &self,
+        scope: &str,
+        args: impl libsql::params::IntoParams,
+    ) -> Result<Option<SessionRow>> {
         let mut rows = self
             .conn
             .query(
                 &format!(
-                    "SELECT {} FROM sessions \
-                     WHERE cwd = ?1 AND archived_at IS NULL \
+                    "SELECT {} FROM sessions WHERE {RESUMABLE_SESSION} {scope} \
                      ORDER BY updated_at DESC, id DESC LIMIT 1",
                     SessionRow::COLUMNS
                 ),
-                params!(cwd),
+                args,
             )
             .await?;
         match rows.next().await? {
@@ -1568,6 +1584,9 @@ mod tests {
             db.upsert_session(id, 1, *updated_at, 0, "m", "")
                 .await
                 .unwrap();
+            db.insert_message(id, "user", Some("hi"), None, None, None, None)
+                .await
+                .unwrap();
             db.set_session_workspace(id, cwd, *root).await.unwrap();
             if *archived {
                 db.conn
@@ -1625,6 +1644,76 @@ mod tests {
             .is_none());
     }
 
+    /// `--continue` resumes the user's last conversation. Every TUI start
+    /// writes an empty row and refreshes the daemon's check-in session, both
+    /// stamped with the same workspace and both newer than the conversation;
+    /// resolving to either loses it. A fork with no turns of its own still
+    /// holds a conversation through its parent.
+    #[tokio::test]
+    async fn resume_lookups_skip_check_ins_and_empty_rows() {
+        let db = test_db().await;
+        // (id, updated_at, has_own_message, parent)
+        let rows: &[(&str, i64, bool, Option<&str>)] = &[
+            ("chat", 10, true, None),
+            ("fork", 20, false, Some("chat")),
+            ("chat-newer", 30, true, None),
+            ("empty-open", 40, false, None),
+            ("heartbeat:session_start", 50, true, None),
+            ("heartbeat:scheduled", 60, true, None),
+        ];
+        for (id, updated_at, has_message, parent) in rows {
+            db.upsert_session(id, 1, *updated_at, 0, "m", "")
+                .await
+                .unwrap();
+            db.set_session_workspace(id, "/w/a", Some("/w/a"))
+                .await
+                .unwrap();
+            if *has_message {
+                db.insert_message(id, "user", Some("hi"), None, None, None, None)
+                    .await
+                    .unwrap();
+            }
+            if let Some(parent) = parent {
+                db.conn
+                    .execute(
+                        "UPDATE sessions SET parent_session_id = ?1, forked_from_message_id = 1 \
+                         WHERE id = ?2",
+                        params!(*parent, *id),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let in_workspace = db
+            .most_recent_session_in_workspace(Some("/w/a"), "/w/a")
+            .await
+            .unwrap()
+            .map(|r| r.id);
+        let global = db
+            .most_recent_resumable_session()
+            .await
+            .unwrap()
+            .map(|r| r.id);
+        assert_eq!(in_workspace.as_deref(), Some("chat-newer"));
+        assert_eq!(global.as_deref(), Some("chat-newer"));
+
+        db.conn
+            .execute("DELETE FROM messages WHERE session_id = 'chat-newer'", ())
+            .await
+            .unwrap();
+        let in_workspace = db
+            .most_recent_session_in_workspace(Some("/w/a"), "/w/a")
+            .await
+            .unwrap()
+            .map(|r| r.id);
+        assert_eq!(
+            in_workspace.as_deref(),
+            Some("fork"),
+            "a fork resumes through its parent's history"
+        );
+    }
+
     /// A session resumed from a new directory follows its user: the stamp is
     /// last-write-wins, and clearing the repo root (repo → plain dir) must
     /// actually clear it rather than leave a stale association.
@@ -1632,6 +1721,9 @@ mod tests {
     async fn workspace_stamp_is_last_write_wins() {
         let db = test_db().await;
         db.upsert_session("s", 1, 2, 0, "m", "").await.unwrap();
+        db.insert_message("s", "user", Some("hi"), None, None, None, None)
+            .await
+            .unwrap();
         db.set_session_workspace("s", "/w/a", Some("/w/a"))
             .await
             .unwrap();

@@ -967,9 +967,9 @@ async fn resolve_continue_session() -> Option<String> {
     let row = match workspace_hit {
         Some(row) => row,
         None => {
-            // Global fallback: newest non-archived session anywhere.
-            let global = match db.list_sessions(50).await {
-                Ok(rows) => rows.into_iter().find(|r| r.archived_at.is_none()),
+            // Global fallback: newest resumable session anywhere.
+            let global = match db.most_recent_resumable_session().await {
+                Ok(row) => row,
                 Err(e) => {
                     tracing::warn!(error = %e, "--continue global lookup failed");
                     None
