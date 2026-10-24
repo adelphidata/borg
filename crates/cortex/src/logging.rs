@@ -195,7 +195,9 @@ fn format_entry(entry: &LogEntry) -> String {
             tool_calls,
         } => {
             let mut parts = Vec::new();
-            if let Some(text) = content.as_deref() {
+            // Models often open a reply with blank lines; they would leave
+            // the `Assistant:` line itself looking empty.
+            if let Some(text) = content.as_deref().map(str::trim) {
                 if !text.is_empty() {
                     parts.push(truncate(text, 200));
                 }
@@ -237,7 +239,9 @@ fn format_entry_verbose(entry: &LogEntry) -> String {
             tool_calls,
         } => {
             let mut parts = Vec::new();
-            if let Some(text) = content.as_deref() {
+            // Models often open a reply with blank lines; they would leave
+            // the `Assistant:` line itself looking empty.
+            if let Some(text) = content.as_deref().map(str::trim) {
                 if !text.is_empty() {
                     parts.push(text.to_string());
                 }
@@ -304,6 +308,15 @@ mod tests {
             r#"{"timestamp":"2026-03-14T10:31:00+00:00","type":"assistant_message","content":"Sure, I can help."}"#,
         ).unwrap();
         assert_eq!(format_entry(&entry), "[10:31] Assistant: Sure, I can help.");
+    }
+
+    #[test]
+    fn format_entry_assistant_message_drops_leading_blank_lines() {
+        let entry: LogEntry = serde_json::from_str(
+            r#"{"timestamp":"2026-03-14T10:31:00+00:00","type":"assistant_message","content":"\n\npong\n"}"#,
+        ).unwrap();
+        assert_eq!(format_entry(&entry), "[10:31] Assistant: pong");
+        assert_eq!(format_entry_verbose(&entry), "[10:31] Assistant: pong");
     }
 
     #[test]
