@@ -13,7 +13,7 @@ use anyhow::Result;
 use cortex::config::Config;
 use cortex::db::{Database, SubscriptionEventRow, SubscriptionRow};
 use cortex::subscriptions::prompt::{build_run_prompt, PromptContext, PromptEvent};
-use cortex::subscriptions::{event_status, presets, session_key, status, EventOrigin};
+use cortex::subscriptions::{event_status, presets, session_key, EventOrigin};
 use gateway::{InboundTurn, TurnKind};
 
 use super::bus::{kind, SubscriptionActivity, SubscriptionBus};
@@ -193,23 +193,16 @@ pub(crate) async fn execute(
     }
 
     let now = chrono::Utc::now().timestamp();
+    // One reply per run: when it goes back where the events came from, the
+    // digest keeps to the lead's conversation.
+    let same_origin = (sub.delivery_channel.as_deref()
+        == Some(cortex::heartbeat_task::ORIGIN_DELIVERY))
+    .then_some(lead.origin.as_deref())
+    .flatten();
     let events = db
-        .claim_subscription_batch(&sub.id, &run_id, DIGEST_LIMIT - 1, now)
+        .claim_subscription_batch(&sub.id, &run_id, DIGEST_LIMIT - 1, now, same_origin)
         .await?;
     let count = events.len().max(1) as u32;
-    bus.publish(SubscriptionActivity {
-        subscription_id: sub.id.clone(),
-        kind: kind::STARTED.to_string(),
-        run_id: Some(run_id.clone()),
-        status: None,
-        summary: if count == 1 {
-            lead.summary.clone()
-        } else {
-            format!("{count} events")
-        },
-        event_count: count,
-        emitted_at_unix: now,
-    });
 
     let started = Instant::now();
     materialize_session(&key, &sub.name);
@@ -240,10 +233,30 @@ pub(crate) async fn execute(
         kind: TurnKind::Internal,
     };
     let collected = match host.start_turn(turn).await {
-        Ok((rx, cancel)) => {
-            collect_heartbeat_response(rx, cancel, Duration::from_secs(timeout_secs)).await
+        // A pre-cancelled token is the executor's "deferred": the emergency
+        // stop holds, or the user started a turn in the session after the
+        // busy check. No turn ran, so the events wait again; closing them
+        // would report thousands of alerts as handled.
+        Ok((_, cancel)) if cancel.is_cancelled() => {
+            db.release_subscription_run(&run_id).await?;
+            tracing::info!(subscription = %sub.id, "subscription run deferred; events wait again");
+            return Ok(());
         }
-        Err(e) => CollectOutcome::Failed(format!("Borg could not start the run: {e}")),
+        Ok((rx, cancel)) => {
+            publish_started(&bus, &sub, &lead, &run_id, count, now);
+            // A run dropped mid-turn (shutdown, supervisor restart) stops
+            // its turn too. Left running, the turn would keep acting while
+            // the boot reset hands the same events to a second run.
+            let stop_turn = cancel.clone().drop_guard();
+            let collected =
+                collect_heartbeat_response(rx, cancel, Duration::from_secs(timeout_secs)).await;
+            stop_turn.disarm();
+            collected
+        }
+        Err(e) => {
+            publish_started(&bus, &sub, &lead, &run_id, count, now);
+            CollectOutcome::Failed(format!("Borg could not start the run: {e}"))
+        }
     };
     let mut outcome = outcome_of(collected, timeout_secs);
 
@@ -277,7 +290,7 @@ pub(crate) async fn execute(
 
     if outcome.status == event_status::FAILED {
         if let Some(reason) = failure_breaker(&db, &sub, &config).await? {
-            super::announce_pause(host.as_ref(), &db, &config, &bus, &sub, &reason).await;
+            super::announce_pause(&host, &db, &config, &bus, &sub, &reason).await;
         }
     }
     if let Err(e) = db
@@ -303,8 +316,31 @@ pub(crate) async fn execute(
     Ok(())
 }
 
-/// Pause the subscription when its last `storm_failures` runs all failed.
-/// Returns the reason when it paused.
+fn publish_started(
+    bus: &SubscriptionBus,
+    sub: &SubscriptionRow,
+    lead: &SubscriptionEventRow,
+    run_id: &str,
+    count: u32,
+    now: i64,
+) {
+    bus.publish(SubscriptionActivity {
+        subscription_id: sub.id.clone(),
+        kind: kind::STARTED.to_string(),
+        run_id: Some(run_id.to_string()),
+        status: None,
+        summary: if count == 1 {
+            lead.summary.clone()
+        } else {
+            format!("{count} events")
+        },
+        event_count: count,
+        emitted_at_unix: now,
+    });
+}
+
+/// Pause the subscription when its last `storm_failures` runs since it was
+/// last resumed all failed. Returns the reason when this call paused it.
 pub(crate) async fn failure_breaker(
     db: &Database,
     sub: &SubscriptionRow,
@@ -322,9 +358,10 @@ pub(crate) async fn failure_breaker(
     let reason = format!(
         "Paused itself: the last {n} runs failed. Fix the cause in the instruction or the source, then resume it."
     );
-    db.set_subscription_status(&sub.id, status::STORM, Some(&reason))
-        .await?;
-    Ok(Some(reason))
+    Ok(db
+        .trip_subscription_storm(&sub.id, &reason)
+        .await?
+        .then_some(reason))
 }
 
 #[cfg(test)]

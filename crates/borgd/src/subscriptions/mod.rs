@@ -40,6 +40,8 @@ pub(crate) trait RunHost: Send + Sync + 'static {
     /// Whether a turn is in flight in `session_key` (the user chatting in
     /// the subscription's session).
     fn is_busy(&self, session_key: &str) -> bool;
+    /// Whether the emergency stop (`borg pause`) refuses new turns.
+    async fn emergency_stopped(&self) -> bool;
     /// Send `text` along a stored `(channel, target)` route.
     async fn deliver(
         &self,
@@ -69,6 +71,12 @@ impl RunHost for DaemonRunHost {
         self.executor.is_session_busy(session_key)
     }
 
+    async fn emergency_stopped(&self) -> bool {
+        crate::session::executor::emergency_pause_notice()
+            .await
+            .is_some()
+    }
+
     async fn deliver(
         &self,
         config: &Config,
@@ -90,9 +98,11 @@ impl RunHost for DaemonRunHost {
 /// Tell the user, once, that a subscription paused itself: the app (alert
 /// dot and banner, through the bus), a line in the subscription's session,
 /// and the delivery channel when it has a fixed one. Best-effort on each
-/// path; a failure is logged and the others still run.
+/// path; a failure is logged and the others still run. The channel send
+/// runs on its own task: a chat network that does not answer must not stall
+/// the dispatcher loop that called this.
 pub(crate) async fn announce_pause(
-    host: &dyn RunHost,
+    host: &Arc<dyn RunHost>,
     db: &Database,
     config: &Config,
     bus: &SubscriptionBus,
@@ -123,10 +133,18 @@ pub(crate) async fn announce_pause(
         .delivery_channel
         .as_deref()
         .filter(|c| !c.is_empty() && *c != cortex::heartbeat_task::ORIGIN_DELIVERY);
-    if let (Some(channel), Some(target)) = (fixed, sub.delivery_target.as_deref()) {
+    if let (Some(channel), Some(target)) = (fixed, sub.delivery_target.clone()) {
         let text = format!("[{}]\n{reason}", sub.name);
-        if let Err(e) = host.deliver(config, channel, target, &text).await {
-            tracing::warn!(subscription = %sub.id, "subscription: pause notice to {channel} failed: {e}");
-        }
+        let (host, config, channel, id) = (
+            host.clone(),
+            config.clone(),
+            channel.to_string(),
+            sub.id.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = host.deliver(&config, &channel, &target, &text).await {
+                tracing::warn!(subscription = %id, "subscription: pause notice to {channel} failed: {e}");
+            }
+        });
     }
 }

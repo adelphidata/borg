@@ -728,32 +728,36 @@ impl Database {
         run_id: &str,
         now: i64,
     ) -> Result<Option<SubscriptionEventRow>> {
+        self.claim_next_subscription_event_except(run_id, now, &[])
+            .await
+    }
+
+    /// [`Self::claim_next_subscription_event`], passing over the
+    /// subscriptions in `skip` (their session is busy), so one subscription
+    /// the user is chatting in does not hold up the others.
+    pub async fn claim_next_subscription_event_except(
+        &self,
+        run_id: &str,
+        now: i64,
+        skip: &[String],
+    ) -> Result<Option<SubscriptionEventRow>> {
+        let skip = serde_json::to_string(skip).context("encode skip list")?;
+        // Most passes find nothing (a run is in flight, the budget is spent).
+        // Look first without the write lock, which every producer's insert
+        // also needs, and take it only when there is something to claim.
+        if self.runnable_lead(now, &skip).await?.is_none() {
+            return Ok(None);
+        }
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = async {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT e.id FROM subscription_events e \
-                     JOIN subscriptions s ON s.id = e.subscription_id \
-                     WHERE e.status = 'pending' AND (s.status = 'active' OR e.kind = 'test') \
-                     AND NOT EXISTS (SELECT 1 FROM subscription_events r \
-                         WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
-                     AND (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
-                         WHERE h.subscription_id = e.subscription_id AND h.run_id IS NOT NULL \
-                         AND h.started_at > ?1) < s.rate_limit_per_hour \
-                     ORDER BY e.received_at, e.id LIMIT 1",
-                    params!(now - 3600),
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
+            // Again under the lock: another claimer may have taken it.
+            let Some(id) = self.runnable_lead(now, &skip).await? else {
                 return anyhow::Ok(None);
             };
-            let id: String = row.get(0)?;
-            drop(rows);
             self.conn
                 .execute(
-                    "UPDATE subscription_events SET status = 'running', run_id = ?2, started_at = ?3 \
-                     WHERE id = ?1",
+                    "UPDATE subscription_events SET status = 'running', run_id = ?2, started_at = ?3, \
+                     attempts = attempts + 1 WHERE id = ?1",
                     params!(id.clone(), run_id, now),
                 )
                 .await?;
@@ -764,23 +768,58 @@ impl Database {
             .await
     }
 
+    /// The id of the oldest runnable event, if any.
+    async fn runnable_lead(&self, now: i64, skip_json: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT e.id FROM subscription_events e \
+                     JOIN subscriptions s ON s.id = e.subscription_id \
+                     WHERE e.status = 'pending' AND (s.status = 'active' OR e.kind = 'test') \
+                     AND NOT EXISTS (SELECT 1 FROM subscription_events r \
+                         WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
+                     AND (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
+                         WHERE h.subscription_id = e.subscription_id AND h.run_id IS NOT NULL \
+                         AND h.started_at > ?1) < s.rate_limit_per_hour \
+                     AND e.subscription_id NOT IN (SELECT value FROM json_each(?2)) \
+                     ORDER BY e.received_at, e.id LIMIT 1",
+                params!(now - 3600, skip_json),
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
     /// Pull up to `limit` more waiting events of `subscription_id` into run
     /// `run_id` (the digest). Oldest first.
+    ///
+    /// `same_origin` (the lead's stored origin) keeps a digest to one
+    /// conversation: a run that replies where its events came from has one
+    /// reply, so events from another chat or thread wait for their own run.
     pub async fn claim_subscription_batch(
         &self,
         subscription_id: &str,
         run_id: &str,
         limit: u32,
         now: i64,
+        same_origin: Option<&str>,
     ) -> Result<Vec<SubscriptionEventRow>> {
         self.conn
             .execute(
-                "UPDATE subscription_events SET status = 'running', run_id = ?2, started_at = ?3 \
+                "UPDATE subscription_events SET status = 'running', run_id = ?2, started_at = ?3, \
+                 attempts = attempts + 1 \
                  WHERE id IN (SELECT id FROM subscription_events \
                      WHERE subscription_id = ?1 AND status = 'pending' \
                      AND (kind = 'test' OR (SELECT status FROM subscriptions WHERE id = ?1) = 'active') \
+                     AND (?5 IS NULL OR ( \
+                         json_extract(origin, '$.channel') IS json_extract(?5, '$.channel') \
+                         AND COALESCE(json_extract(origin, '$.chat'), json_extract(origin, '$.sender')) \
+                             IS COALESCE(json_extract(?5, '$.chat'), json_extract(?5, '$.sender')) \
+                         AND json_extract(origin, '$.thread_id') IS json_extract(?5, '$.thread_id'))) \
                      ORDER BY received_at, id LIMIT ?4)",
-                params!(subscription_id, run_id, now, i64::from(limit)),
+                params!(subscription_id, run_id, now, i64::from(limit), same_origin),
             )
             .await?;
         self.run_events(run_id).await
@@ -817,8 +856,8 @@ impl Database {
         let n = self
             .conn
             .execute(
-                "UPDATE subscription_events SET status = 'pending', run_id = NULL, started_at = NULL \
-                 WHERE run_id = ?1 AND status = 'running'",
+                "UPDATE subscription_events SET status = 'pending', run_id = NULL, started_at = NULL, \
+                 attempts = MAX(attempts - 1, 0) WHERE run_id = ?1 AND status = 'running'",
                 params!(run_id),
             )
             .await?;
@@ -875,7 +914,25 @@ impl Database {
         Ok(true)
     }
 
-    /// The statuses of the newest `n` runs of a subscription, newest first.
+    /// Pause an active subscription that keeps failing. Returns whether this
+    /// call paused it: one already paused (by the user, or by the ingest
+    /// breaker while the run was in flight) keeps its reason, and the caller
+    /// announces nothing twice.
+    pub async fn trip_subscription_storm(&self, id: &str, reason: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE subscriptions SET status = ?2, last_error = ?3, updated_at = ?4 \
+                 WHERE id = ?1 AND status = ?5",
+                params!(id, status::STORM, reason, now_unix(), status::ACTIVE),
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// The statuses of the newest `n` runs of a subscription since it last
+    /// became active, newest first. Runs before a resume do not count: the
+    /// user fixed something and starts from a clean slate.
     pub async fn recent_subscription_run_statuses(
         &self,
         subscription_id: &str,
@@ -887,6 +944,7 @@ impl Database {
                 "SELECT CASE WHEN SUM(status = 'failed') > 0 THEN 'failed' ELSE MAX(status) END \
                  FROM subscription_events \
                  WHERE subscription_id = ?1 AND run_id IS NOT NULL AND finished_at IS NOT NULL \
+                 AND started_at >= (SELECT accepting_since FROM subscriptions WHERE id = ?1) \
                  GROUP BY run_id ORDER BY MAX(finished_at) DESC, run_id DESC LIMIT ?2",
                 params!(subscription_id, i64::from(n)),
             )
@@ -935,10 +993,26 @@ impl Database {
         Ok(out)
     }
 
-    /// Put every `running` event back to `pending`. Run once at boot: a run
-    /// that was in flight when the daemon stopped will run again.
-    pub async fn reset_running_subscription_events(&self) -> Result<u64> {
-        let n = self
+    /// Run once at boot for events whose run the daemon's stop cut short.
+    /// They run again, unless they were already claimed `max_attempts`
+    /// times: then they close as failed, because an event that stops the
+    /// daemon each time it runs would otherwise restart it in a loop. The
+    /// failed run keeps its id and start time, so the run budgets and the
+    /// failure breaker count it. Returns `(requeued, abandoned)`.
+    pub async fn reset_running_subscription_events(&self, max_attempts: i64) -> Result<(u64, u64)> {
+        let abandoned = self
+            .conn
+            .execute(
+                "UPDATE subscription_events SET status = 'failed', finished_at = ?2, error = ?3 \
+                 WHERE status = 'running' AND attempts >= ?1",
+                params!(
+                    max_attempts,
+                    now_unix(),
+                    "Borg stopped each time this event ran, so it will not run again."
+                ),
+            )
+            .await?;
+        let requeued = self
             .conn
             .execute(
                 "UPDATE subscription_events SET status = 'pending', run_id = NULL, started_at = NULL \
@@ -946,7 +1020,7 @@ impl Database {
                 (),
             )
             .await?;
-        Ok(n)
+        Ok((requeued, abandoned))
     }
 
     /// Bound the history: the newest `keep` finished events stay whole;
@@ -1082,6 +1156,193 @@ mod tests {
             origin: None,
             received_at: at,
         }
+    }
+
+    #[tokio::test]
+    async fn an_event_that_stops_the_daemon_each_time_runs_at_most_three_times() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.insert_subscription_event(&event(&s.id, Some("crash"), 10), LIMITS)
+            .await
+            .unwrap();
+        for boot in 1..=3 {
+            let run = format!("run_{boot}");
+            let claimed = db
+                .claim_next_subscription_event(&run, 100 + boot)
+                .await
+                .unwrap();
+            assert!(claimed.is_some(), "boot {boot} runs it again");
+            // The daemon dies mid-run; the next boot resets.
+            let (requeued, abandoned) = db.reset_running_subscription_events(3).await.unwrap();
+            if boot < 3 {
+                assert_eq!((requeued, abandoned), (1, 0), "boot {boot}");
+            } else {
+                assert_eq!((requeued, abandoned), (0, 1), "the third crash closes it");
+            }
+        }
+        assert!(db
+            .claim_next_subscription_event("run_4", 200)
+            .await
+            .unwrap()
+            .is_none());
+        let rows = db.list_subscription_events(&s.id, 10).await.unwrap();
+        assert_eq!(rows[0].status, "failed");
+        assert!(
+            rows[0].run_id.is_some(),
+            "the breaker and budgets still count it"
+        );
+        assert_eq!(
+            db.recent_subscription_run_statuses(&s.id, 5).await.unwrap(),
+            vec!["failed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skipped_subscription_does_not_hold_up_the_others() {
+        let db = Database::test_db().await;
+        let busy = sub(&db, status::ACTIVE).await;
+        let free = sub(&db, status::ACTIVE).await;
+        db.insert_subscription_event(&event(&busy.id, Some("old"), 10), LIMITS)
+            .await
+            .unwrap();
+        db.insert_subscription_event(&event(&free.id, Some("new"), 20), LIMITS)
+            .await
+            .unwrap();
+        let lead = db
+            .claim_next_subscription_event_except("run_1", 100, std::slice::from_ref(&busy.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lead.subscription_id, free.id,
+            "the older busy one is passed over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_session_hands_events_back_without_using_an_attempt() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.insert_subscription_event(&event(&s.id, Some("e"), 10), LIMITS)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let run = format!("busy_{i}");
+            db.claim_next_subscription_event(&run, 100 + i)
+                .await
+                .unwrap()
+                .unwrap();
+            db.release_subscription_run(&run).await.unwrap();
+        }
+        db.claim_next_subscription_event("real", 200)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.reset_running_subscription_events(3).await.unwrap(),
+            (1, 0),
+            "releases are not crashes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_origin_digest_keeps_to_one_conversation() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let thread_a = r#"{"channel":"slack","sender":"U1","chat":"C1","thread_id":"1.0"}"#;
+        let thread_a_other_sender =
+            r#"{"channel":"slack","sender":"U2","chat":"C1","thread_id":"1.0"}"#;
+        let thread_b = r#"{"channel":"slack","sender":"U1","chat":"C1","thread_id":"2.0"}"#;
+        let other_chat = r#"{"channel":"slack","sender":"U1","chat":"C2","thread_id":"1.0"}"#;
+        for (i, origin) in [thread_a, thread_b, thread_a_other_sender, other_chat]
+            .into_iter()
+            .enumerate()
+        {
+            let key = format!("o{i}");
+            let ev = NewSubscriptionEvent {
+                origin: Some(origin),
+                ..event(&s.id, Some(&key), 10 + i as i64)
+            };
+            db.insert_subscription_event(&ev, LIMITS).await.unwrap();
+        }
+        let lead = db
+            .claim_next_subscription_event("run_1", 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead.origin.as_deref(), Some(thread_a));
+        let run = db
+            .claim_subscription_batch(&s.id, "run_1", 50, 100, lead.origin.as_deref())
+            .await
+            .unwrap();
+        let origins: Vec<_> = run.iter().filter_map(|e| e.origin.as_deref()).collect();
+        assert_eq!(origins, vec![thread_a, thread_a_other_sender]);
+
+        let all = db
+            .claim_subscription_batch(&s.id, "run_2", 50, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "without an origin the rest digest together");
+    }
+
+    #[tokio::test]
+    async fn the_failure_breaker_forgets_failures_before_a_resume_and_trips_once() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let now = chrono::Utc::now().timestamp();
+        let fail = |i: i64| {
+            let db = &db;
+            let id = s.id.clone();
+            async move {
+                let key = format!("f{i}");
+                db.insert_subscription_event(&event(&id, Some(&key), now + i), LIMITS)
+                    .await
+                    .unwrap();
+                let run = format!("run_{i}");
+                db.claim_next_subscription_event(&run, now + i)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db.finish_subscription_run(&id, &run, "failed", None, Some("x"), 1)
+                    .await
+                    .unwrap();
+            }
+        };
+        fail(0).await;
+        fail(1).await;
+        db.set_subscription_status(&s.id, status::PAUSED, None)
+            .await
+            .unwrap();
+        // Resume a moment later, so the earlier runs started before it.
+        db.conn
+            .execute(
+                "UPDATE subscriptions SET status = 'paused' WHERE id = ?1",
+                params!(s.id.clone()),
+            )
+            .await
+            .unwrap();
+        db.set_subscription_status(&s.id, status::ACTIVE, None)
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE subscriptions SET accepting_since = ?2 WHERE id = ?1",
+                params!(s.id.clone(), now + 2),
+            )
+            .await
+            .unwrap();
+        fail(3).await;
+        assert_eq!(
+            db.recent_subscription_run_statuses(&s.id, 5).await.unwrap(),
+            vec!["failed"],
+            "only the run after the resume counts"
+        );
+
+        assert!(db.trip_subscription_storm(&s.id, "first").await.unwrap());
+        assert!(!db.trip_subscription_storm(&s.id, "second").await.unwrap());
+        let row = db.get_subscription(&s.id).await.unwrap().unwrap();
+        assert_eq!(row.status, "storm");
+        assert_eq!(row.last_error.as_deref(), Some("first"));
     }
 
     #[tokio::test]
@@ -1313,7 +1574,7 @@ mod tests {
             .is_none());
 
         let batch = db
-            .claim_subscription_batch(&a.id, "run_1", 50, now)
+            .claim_subscription_batch(&a.id, "run_1", 50, now, None)
             .await
             .unwrap();
         assert_eq!(batch.len(), 5, "lead plus the four waiting");
@@ -1391,10 +1652,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        db.claim_subscription_batch(&s.id, "run_1", 50, 100)
+        db.claim_subscription_batch(&s.id, "run_1", 50, 100, None)
             .await
             .unwrap();
-        assert_eq!(db.reset_running_subscription_events().await.unwrap(), 3);
+        assert_eq!(
+            db.reset_running_subscription_events(3).await.unwrap(),
+            (3, 0)
+        );
         let again = db
             .claim_next_subscription_event("run_2", 200)
             .await

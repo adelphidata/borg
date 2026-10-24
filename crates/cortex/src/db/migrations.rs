@@ -279,17 +279,24 @@ impl Database {
         // Columns added while v8 was in development: a database created by
         // an earlier v8 build has the table without them, and
         // `CREATE TABLE IF NOT EXISTS` never adds a column.
-        for (column, ddl) in [
+        for (table, column, ddl) in [
             (
+                "subscriptions",
                 "accepting_since",
                 "ALTER TABLE subscriptions ADD COLUMN accepting_since INTEGER NOT NULL DEFAULT 0",
             ),
             (
+                "subscriptions",
                 "signing_secret_ref",
                 "ALTER TABLE subscriptions ADD COLUMN signing_secret_ref TEXT",
             ),
+            (
+                "subscription_events",
+                "attempts",
+                "ALTER TABLE subscription_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            ),
         ] {
-            if !self.column_exists("subscriptions", column).await? {
+            if !self.column_exists(table, column).await? {
                 self.conn.execute(ddl, ()).await?;
             }
         }
@@ -1324,7 +1331,8 @@ CREATE TABLE IF NOT EXISTS subscription_events (
     finished_at       INTEGER,
     duration_ms       INTEGER,
     result            TEXT,
-    error             TEXT
+    error             TEXT,
+    attempts          INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_events_dedup
     ON subscription_events(subscription_id, dedup_key) WHERE dedup_key IS NOT NULL;
@@ -1729,7 +1737,14 @@ mod tests {
         db.conn
             .execute_batch(
                 "DROP TABLE subscription_events; DROP TABLE subscriptions; \
-                 CREATE TABLE subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '');",
+                 CREATE TABLE subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT ''); \
+                 CREATE TABLE subscription_events (id TEXT PRIMARY KEY, \
+                     subscription_id TEXT NOT NULL, kind TEXT, dedup_key TEXT, \
+                     summary TEXT NOT NULL, payload TEXT NOT NULL, \
+                     payload_truncated INTEGER NOT NULL DEFAULT 0, origin TEXT, \
+                     status TEXT NOT NULL, run_id TEXT, received_at INTEGER NOT NULL, \
+                     started_at INTEGER, finished_at INTEGER, duration_ms INTEGER, \
+                     result TEXT, error TEXT);",
             )
             .await
             .expect("simulate an early v8 table");
@@ -1737,10 +1752,14 @@ mod tests {
 
         db.run_migrations().await.unwrap();
 
-        for column in ["accepting_since", "signing_secret_ref"] {
+        for (table, column) in [
+            ("subscriptions", "accepting_since"),
+            ("subscriptions", "signing_secret_ref"),
+            ("subscription_events", "attempts"),
+        ] {
             assert!(
-                db.column_exists("subscriptions", column).await.unwrap(),
-                "{column} was not added"
+                db.column_exists(table, column).await.unwrap(),
+                "{table}.{column} was not added"
             );
         }
     }

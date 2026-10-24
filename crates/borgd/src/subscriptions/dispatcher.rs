@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::db::Database;
-use cortex::subscriptions::{event_status, new_id, wake, RUN_ID_PREFIX};
+use cortex::subscriptions::{event_status, new_id, session_key, wake, RUN_ID_PREFIX};
 use futures::FutureExt;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -28,6 +28,13 @@ pub(crate) const TICK: Duration = Duration::from_secs(15);
 
 /// Seconds in the daily cap's window.
 const DAY_SECS: i64 = 24 * 3600;
+
+/// Claims of one event before the boot reset gives up on it. An event whose
+/// run stops the daemon would otherwise restart it in a loop.
+pub(crate) const MAX_ATTEMPTS: i64 = 3;
+
+/// Pause after a wake before claiming, so a burst of pokes is one pass.
+const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// What a finished run task hands back.
 struct Joined {
@@ -53,9 +60,14 @@ impl Dispatcher {
     pub async fn run(&self, cancel: CancellationToken, liveness: Arc<AtomicU64>) -> Result<()> {
         let notify = wake::install();
         let db = Database::open().await?;
-        let reset = db.reset_running_subscription_events().await?;
-        if reset > 0 {
-            tracing::info!("subscriptions: {reset} events from runs cut short wait again");
+        let (requeued, abandoned) = db.reset_running_subscription_events(MAX_ATTEMPTS).await?;
+        if requeued > 0 {
+            tracing::info!("subscriptions: {requeued} events from runs cut short wait again");
+        }
+        if abandoned > 0 {
+            tracing::warn!(
+                "subscriptions: {abandoned} events closed as failed: Borg stopped each time they ran"
+            );
         }
         let mut runs: JoinSet<Joined> = JoinSet::new();
         let mut cap_logged_at: i64 = 0;
@@ -67,9 +79,18 @@ impl Dispatcher {
                 Ok(channels) => wake::set_tapped_channels(channels),
                 Err(e) => tracing::warn!("subscriptions: could not read tapped channels: {e}"),
             }
-            if config.subscriptions.enabled {
-                self.start_runs(&db, &config, &mut runs, &mut cap_logged_at)
-                    .await?;
+            // `borg pause` stops new turns; a claimed run would only find its
+            // turn refused, so nothing is claimed while it holds.
+            if config.subscriptions.enabled && !self.host.emergency_stopped().await {
+                // A database error (the write lock held by a burst of
+                // inserts) costs one pass, never the loop and the runs in
+                // flight with it.
+                if let Err(e) = self
+                    .start_runs(&db, &config, &mut runs, &mut cap_logged_at)
+                    .await
+                {
+                    tracing::warn!("subscriptions: could not start runs this pass: {e:#}");
+                }
             }
             tokio::select! {
                 biased;
@@ -80,11 +101,14 @@ impl Dispatcher {
                     return Ok(());
                 }
                 Some(joined) = runs.join_next(), if !runs.is_empty() => {
-                    if let Ok(joined) = joined {
-                        self.reap(&db, &config, joined).await;
+                    match joined {
+                        Ok(joined) => self.reap(&db, &config, joined).await,
+                        // Panics are caught inside the task, so this is an
+                        // abort; its events wait for the boot reset.
+                        Err(e) => tracing::warn!("subscriptions: a run task ended abnormally: {e}"),
                     }
                 }
-                _ = notify.notified() => {}
+                _ = notify.notified() => tokio::time::sleep(DEBOUNCE).await,
                 _ = tokio::time::sleep(TICK) => {}
             }
         }
@@ -99,6 +123,9 @@ impl Dispatcher {
         cap_logged_at: &mut i64,
     ) -> Result<()> {
         let max = config.subscriptions.max_concurrent.max(1);
+        // Subscriptions whose session the user is chatting in: passed over
+        // for this pass, so they hold neither a slot nor the others up.
+        let mut busy: Vec<String> = Vec::new();
         while runs.len() < max {
             let now = chrono::Utc::now().timestamp();
             let today = db.subscription_runs_since(now - DAY_SECS).await?;
@@ -112,9 +139,17 @@ impl Dispatcher {
                 return Ok(());
             }
             let run_id = new_id(RUN_ID_PREFIX);
-            let Some(lead) = db.claim_next_subscription_event(&run_id, now).await? else {
+            let Some(lead) = db
+                .claim_next_subscription_event_except(&run_id, now, &busy)
+                .await?
+            else {
                 return Ok(());
             };
+            if self.host.is_busy(&session_key(&lead.subscription_id)) {
+                db.release_subscription_run(&run_id).await?;
+                busy.push(lead.subscription_id);
+                continue;
+            }
             let subscription_id = lead.subscription_id.clone();
             let host = self.host.clone();
             let bus = self.bus.clone();
@@ -186,7 +221,7 @@ impl Dispatcher {
         };
         match run::failure_breaker(db, &sub, config).await {
             Ok(Some(reason)) => {
-                announce_pause(self.host.as_ref(), db, config, &self.bus, &sub, &reason).await;
+                announce_pause(&self.host, db, config, &self.bus, &sub, &reason).await;
             }
             Ok(None) => {}
             Err(e) => tracing::warn!(subscription = %sub.id, "subscription: failure breaker: {e}"),
@@ -222,7 +257,7 @@ impl Dispatcher {
                     notice.events_in_window.saturating_sub(1)
                 )
             });
-            announce_pause(self.host.as_ref(), db, config, &self.bus, &sub, &reason).await;
+            announce_pause(&self.host, db, config, &self.bus, &sub, &reason).await;
         }
     }
 }
@@ -271,19 +306,40 @@ mod tests {
 
     /// Records turns and sends; answers every turn with `reply`, or with an
     /// agent error when `reply` is `None`.
+    #[derive(Default)]
     struct RecordingHost {
         reply: Option<String>,
+        /// How long each turn takes.
+        turn_ms: u64,
         turns: Mutex<Vec<InboundTurn>>,
         sent: Mutex<Vec<(String, String, String)>>,
+        /// Sessions the user is "chatting in".
+        busy: Mutex<std::collections::HashSet<String>>,
+        /// Hand back the executor's deferred shape (pre-cancelled, closed).
+        defer: std::sync::atomic::AtomicBool,
+        /// `borg pause` is on.
+        stopped: std::sync::atomic::AtomicBool,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RecordingHost {
         fn new(reply: Option<&str>) -> Arc<Self> {
-            Arc::new(Self {
+            Self::with(reply, |_| {})
+        }
+
+        fn with(reply: Option<&str>, tweak: impl FnOnce(&mut Self)) -> Arc<Self> {
+            let mut host = Self {
                 reply: reply.map(str::to_string),
-                turns: Mutex::new(Vec::new()),
-                sent: Mutex::new(Vec::new()),
-            })
+                turn_ms: 50,
+                ..Default::default()
+            };
+            tweak(&mut host);
+            Arc::new(host)
+        }
+
+        fn turn_count(&self) -> usize {
+            self.turns.lock().unwrap().len()
         }
     }
 
@@ -293,22 +349,37 @@ mod tests {
             &self,
             turn: InboundTurn,
         ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
+            if self.defer.load(Ordering::SeqCst) {
+                let cancelled = CancellationToken::new();
+                cancelled.cancel();
+                let (_, rx) = mpsc::channel(1);
+                return Ok((rx, cancelled));
+            }
             self.turns.lock().unwrap().push(turn);
             let (tx, rx) = mpsc::channel(4);
             let reply = self.reply.clone();
+            let turn_ms = self.turn_ms;
+            let (in_flight, peak) = (self.in_flight.clone(), self.peak.clone());
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(turn_ms)).await;
                 let evt = match reply {
                     Some(text) => AgentEvent::TextDelta(text),
                     None => AgentEvent::Error("provider down".into()),
                 };
+                in_flight.fetch_sub(1, Ordering::SeqCst);
                 let _ = tx.send(evt).await;
             });
             Ok((rx, CancellationToken::new()))
         }
 
-        fn is_busy(&self, _session_key: &str) -> bool {
-            false
+        fn is_busy(&self, session_key: &str) -> bool {
+            self.busy.lock().unwrap().contains(session_key)
+        }
+
+        async fn emergency_stopped(&self) -> bool {
+            self.stopped.load(Ordering::SeqCst)
         }
 
         async fn deliver(
@@ -419,11 +490,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_queue_of_fifty_events_is_one_digest_run() {
+    async fn a_queue_of_fifty_one_events_is_a_full_digest_and_the_rest() {
         let _home = HomeGuard::isolated();
         let db = Database::open().await.unwrap();
         let sub = active_sub(&db, None).await;
-        for i in 0..50 {
+        for i in 0..51 {
             add_event(&db, &sub, &format!("e{i}"), None).await;
         }
         let host = RecordingHost::new(Some("Found the cause."));
@@ -431,12 +502,22 @@ mod tests {
         let events = settled(&db, &sub).await;
         stop(running).await;
 
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 51);
         assert!(events.iter().all(|e| e.status == "succeeded"));
-        let runs: std::collections::HashSet<_> = events.iter().map(|e| e.run_id.clone()).collect();
-        assert_eq!(runs.len(), 1, "one run handled every event");
+        let mut per_run: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
+        for e in &events {
+            *per_run.entry(e.run_id.clone()).or_default() += 1;
+        }
+        let mut sizes: Vec<_> = per_run.into_values().collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![1, 50],
+            "a run takes at most {DIGEST}",
+            DIGEST = run::DIGEST_LIMIT
+        );
         let turns = host.turns.lock().unwrap();
-        assert_eq!(turns.len(), 1);
+        assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].session_key, format!("subscription:{sub}"));
         assert!(
             turns[0].text.contains("50"),
@@ -496,6 +577,16 @@ mod tests {
             add_event(&db, &sub, key, None).await;
             settled(&db, &sub).await;
         }
+        // A row that was already waiting when the breaker tripped.
+        db.conn()
+            .execute(
+                "INSERT INTO subscription_events (id, subscription_id, summary, payload, status, received_at) \
+                 VALUES ('evt_waiting', ?1, 'late', '{}', 'pending', ?2)",
+                libsql::params!(sub.clone(), chrono::Utc::now().timestamp()),
+            )
+            .await
+            .unwrap();
+        wake::poke();
         let refused = db
             .insert_subscription_event(
                 &NewSubscriptionEvent {
@@ -522,11 +613,13 @@ mod tests {
             matches!(refused, cortex::db::InsertOutcome::NotAccepting),
             "a paused subscription takes no new events: {refused:?}"
         );
-        assert_eq!(
-            host.turns.lock().unwrap().len(),
-            2,
-            "no run after the pause"
-        );
+        assert_eq!(host.turn_count(), 2, "no run after the pause");
+        let waiting = db
+            .get_subscription_event("evt_waiting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(waiting.status, "pending", "it waits for a resume");
         let mut storms = 0;
         while let Ok(a) = activity.try_recv() {
             if a.kind == kind::STORM {
@@ -534,6 +627,138 @@ mod tests {
             }
         }
         assert_eq!(storms, 1, "the pause is announced once");
+    }
+
+    /// Poll `cond` for up to five seconds.
+    async fn eventually(cond: impl Fn() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn statuses(db: &Database, sub: &str) -> Vec<String> {
+        db.list_subscription_events(sub, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.status)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_deferred_turn_hands_its_events_back_instead_of_closing_them() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.unwrap();
+        let sub = active_sub(&db, None).await;
+        add_event(&db, &sub, "a", None).await;
+        let host = RecordingHost::with(Some("done"), |h| h.defer = true.into());
+        let running = start(host.clone(), Config::default());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            statuses(&db, &sub).await,
+            vec!["pending"],
+            "not closed as silent"
+        );
+
+        host.defer.store(false, Ordering::SeqCst);
+        wake::poke();
+        let events = settled(&db, &sub).await;
+        stop(running).await;
+        assert_eq!(
+            events[0].status, "succeeded",
+            "it runs once turns start again"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_claimed_while_the_emergency_stop_holds() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.unwrap();
+        let sub = active_sub(&db, None).await;
+        add_event(&db, &sub, "a", None).await;
+        let host = RecordingHost::with(Some("done"), |h| h.stopped = true.into());
+        let running = start(host.clone(), Config::default());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(host.turn_count(), 0);
+        assert_eq!(statuses(&db, &sub).await, vec!["pending"]);
+        stop(running).await;
+    }
+
+    #[tokio::test]
+    async fn a_busy_session_does_not_hold_up_other_subscriptions() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.unwrap();
+        let chatting = active_sub(&db, None).await;
+        let quiet = active_sub(&db, None).await;
+        // The busy one's event is older, so a plain claim would pick it first.
+        add_event(&db, &chatting, "old", None).await;
+        add_event(&db, &quiet, "new", None).await;
+        let host = RecordingHost::with(Some("done"), |h| {
+            h.busy
+                .get_mut()
+                .unwrap()
+                .insert(format!("subscription:{chatting}"));
+        });
+        let mut config = Config::default();
+        config.subscriptions.max_concurrent = 1;
+        let running = start(host.clone(), config);
+        settled(&db, &quiet).await;
+        assert_eq!(statuses(&db, &chatting).await, vec!["pending"]);
+        assert_eq!(host.turn_count(), 1);
+
+        host.busy.lock().unwrap().clear();
+        wake::poke();
+        settled(&db, &chatting).await;
+        stop(running).await;
+        assert_eq!(host.turn_count(), 2, "it runs once the user is done");
+    }
+
+    #[tokio::test]
+    async fn runs_never_exceed_max_concurrent() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.unwrap();
+        let mut subs = Vec::new();
+        for i in 0..4 {
+            let sub = active_sub(&db, None).await;
+            add_event(&db, &sub, &format!("e{i}"), None).await;
+            subs.push(sub);
+        }
+        let host = RecordingHost::with(Some("done"), |h| h.turn_ms = 200);
+        let mut config = Config::default();
+        config.subscriptions.max_concurrent = 2;
+        let running = start(host.clone(), config);
+        for sub in &subs {
+            settled(&db, sub).await;
+        }
+        stop(running).await;
+        assert_eq!(host.turn_count(), 4);
+        assert_eq!(host.peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_daily_cap_holds_events_back() {
+        let _home = HomeGuard::isolated();
+        let db = Database::open().await.unwrap();
+        let a = active_sub(&db, None).await;
+        let b = active_sub(&db, None).await;
+        add_event(&db, &a, "a", None).await;
+        add_event(&db, &b, "b", None).await;
+        let host = RecordingHost::new(Some("done"));
+        let mut config = Config::default();
+        config.subscriptions.max_runs_per_day = 1;
+        let running = start(host.clone(), config);
+        assert!(eventually(|| host.turn_count() == 1).await);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        stop(running).await;
+        assert_eq!(host.turn_count(), 1, "the second run waits for tomorrow");
+        let mut all = statuses(&db, &a).await;
+        all.extend(statuses(&db, &b).await);
+        all.sort();
+        assert_eq!(all, vec!["pending", "succeeded"]);
     }
 
     #[tokio::test]
