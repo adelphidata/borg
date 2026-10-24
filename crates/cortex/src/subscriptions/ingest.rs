@@ -56,6 +56,10 @@ pub async fn fan_out(
     let subs = db
         .active_subscriptions_for_source(ev.source.as_str())
         .await?;
+    let subs: Vec<_> = subs.iter().filter(|s| s.provider == ev.provider).collect();
+    if subs.is_empty() {
+        return Ok(0);
+    }
     let normalized = preset.normalize(&|_| None, ev.payload);
     let text = preset.text(ev.payload);
     let view = EventView {
@@ -71,7 +75,7 @@ pub async fn fan_out(
 
     let mut delivered = 0;
     let mut first_error = None;
-    for sub in subs.iter().filter(|s| s.provider == ev.provider) {
+    for sub in subs {
         let Some(filter) = Filter::parse(&sub.filter) else {
             report_unreadable_filter(db, &sub.id).await;
             continue;
