@@ -5,8 +5,8 @@ mod media;
 mod memory;
 mod schedule;
 mod scripts;
-pub(crate) mod subscribe;
 pub(crate) mod shell;
+pub(crate) mod subscribe;
 pub mod user_input;
 mod web;
 

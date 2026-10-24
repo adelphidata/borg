@@ -626,12 +626,8 @@ fn build_search_tools_def(catalog_listing: Option<&str>) -> ToolDefinition {
     )
 }
 
-/// Build the schedule tool definition.
-///
-/// Supports two task kinds — `prompt` (LLM-driven) and `command` (shell cron).
-/// Prompt tasks may optionally specify a `pre_run_command` whose stdout is
-/// injected into the prompt as `<preprocessed_context>`, plus a `[SILENT]`
-/// sentinel the model can return to suppress channel delivery.
+/// Build the subscribe tool definition. Its provider enum comes from the
+/// presets, so a new preset is offered without touching this.
 fn build_subscribe_tool_def() -> ToolDefinition {
     let providers: Vec<&str> = crate::subscriptions::presets::all()
         .iter()
@@ -647,7 +643,7 @@ fn build_subscribe_tool_def() -> ToolDefinition {
             "name":{"type":"string","description":"Display name. Defaults to the source's."},
             "instruction":{"type":"string","description":"What Borg does when an event arrives, e.g. 'Find the likely commit and post a one-paragraph diagnosis. Never resolve the issue.' Defaults to the source's."},
             "filter":{"type":"object","description":"Which events wake Borg. Keys: kinds (event kinds, e.g. [\"pull_request.opened\"]), severity_min (info|warning|error|critical), repos, branch, labels, author, exclude_drafts, phrase, mention_only, channel_id, sender, reaction, field_equals ({\"dot.path\": value})."},
-            "delivery_channel":{"type":"string","description":"Where results also go: slack, telegram or discord, or 'origin' for the conversation this request came from (for channel sources: the thread each message came from). Omit for the subscription's own conversation only."},
+            "delivery_channel":{"type":"string","description":"Where results also go: slack, telegram or discord, or 'origin' for the conversation this request came from when it is one of those (for channel sources: the thread each message came from). Omit for the subscription's own conversation only; on update, \"\" removes it."},
             "delivery_target":{"type":"string","description":"Chat or channel id on delivery_channel. Omit with 'origin'."},
             "signing_secret":{"type":"string","description":"The signing secret the provider shows (Stripe, Sentry, PagerDuty, Linear). Empty on update clears it."},
             "limit":{"type":"integer","description":"Events to show, for events (default 10)."}
@@ -655,6 +651,12 @@ fn build_subscribe_tool_def() -> ToolDefinition {
     )
 }
 
+/// Build the schedule tool definition.
+///
+/// Supports two task kinds — `prompt` (LLM-driven) and `command` (shell cron).
+/// Prompt tasks may optionally specify a `pre_run_command` whose stdout is
+/// injected into the prompt as `<preprocessed_context>`, plus a `[SILENT]`
+/// sentinel the model can return to suppress channel delivery.
 fn build_schedule_tool_def() -> ToolDefinition {
     let properties = serde_json::json!({
         "action": {"type":"string","enum":["create","list","get","update","pause","resume","cancel","delete","runs","run_now"],"description":"Action to perform"},

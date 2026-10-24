@@ -30,34 +30,43 @@ pub fn is_read_action(args: &Value) -> bool {
     optional_str_param(args, "action").is_some_and(|a| READ_ACTIONS.contains(&a))
 }
 
-/// Run one `subscribe` call.
-pub async fn handle_subscribe(args: &Value, config: &Config) -> Result<String> {
+/// Run one `subscribe` call. `sub_agent` is true for a spawned child, which
+/// reports to its parent and does not set up standing work of its own.
+pub async fn handle_subscribe(args: &Value, config: &Config, sub_agent: bool) -> Result<String> {
     if !config.subscriptions.enabled {
         return Ok(
             "Subscriptions are turned off. Turn on subscriptions.enabled to use them.".into(),
         );
     }
-    let action = optional_str_param(args, "action").unwrap_or("");
+    if sub_agent && !is_read_action(args) {
+        return Ok("Error: a sub-agent can read subscriptions but not change them. Report what should change to the parent agent.".into());
+    }
     let db = match Database::open().await {
         Ok(db) => db,
         Err(e) => return Ok(format!("Error opening database: {e}")),
     };
+    handle_subscribe_with(&db, args, config).await
+}
+
+/// [`handle_subscribe`] on an open database.
+async fn handle_subscribe_with(db: &Database, args: &Value, config: &Config) -> Result<String> {
+    let action = optional_str_param(args, "action").unwrap_or("");
     let reply = match action {
         "sources" => Ok(sources()),
-        "list" => list(&db).await,
-        "create" => create(&db, config, args).await,
+        "list" => list(db).await,
+        "create" => create(db, config, args).await,
         "get" | "events" | "update" | "pause" | "resume" | "delete" | "test" => {
             let Some(id) = optional_str_param(args, "id").filter(|s| !s.is_empty()) else {
                 return Ok(format!("Error: '{action}' needs the subscription 'id'. Use action='list' to find it."));
             };
             match action {
-                "get" => get(&db, config, id).await,
-                "events" => events(&db, id, limit(args)).await,
-                "update" => update(&db, id, args).await,
-                "pause" => set_active(&db, id, false).await,
-                "resume" => set_active(&db, id, true).await,
-                "delete" => delete(&db, id).await,
-                _ => test(&db, config, id).await,
+                "get" => get(db, config, id).await,
+                "events" => events(db, id, limit(args)).await,
+                "update" => update(db, id, args).await,
+                "pause" => set_active(db, id, false).await,
+                "resume" => set_active(db, id, true).await,
+                "delete" => delete(db, id).await,
+                _ => test(db, config, id).await,
             }
         }
         other => Ok(format!(
@@ -160,11 +169,21 @@ fn delivery_arg(
     if channel.as_deref() != Some(ORIGIN_DELIVERY) || source == Source::Channel {
         return (channel, target, None);
     }
-    let (channel, target) = resolve_origin_delivery(channel, target);
-    let note = channel.is_none().then_some(
-        "There is no chat to reply to from here, so results stay in the subscription's own conversation.",
-    );
-    (channel, target, note)
+    match resolve_origin_delivery(channel, target) {
+        (Some(c), target) if manage::DELIVERY_CHANNELS.contains(&c.as_str()) => {
+            (Some(c), target, None)
+        }
+        (Some(_), _) => (
+            None,
+            None,
+            Some("Borg can post results only to Slack, Telegram or Discord, so from this chat they stay in the subscription's own conversation."),
+        ),
+        (None, _) => (
+            None,
+            None,
+            Some("There is no chat to reply to from here, so results stay in the subscription's own conversation."),
+        ),
+    }
 }
 
 async fn create(db: &Database, config: &Config, args: &Value) -> Result<String> {
@@ -301,9 +320,16 @@ async fn update(db: &Database, id: &str, args: &Value) -> Result<String> {
         return Ok(format!("No subscription {id}."));
     };
     let source = Source::parse(&row.source).unwrap_or(Source::Webhook);
-    let wants_delivery =
-        args.get("delivery_channel").is_some() || args.get("delivery_target").is_some();
+    // Only the fields the call names change; `null` (a strict-schema model
+    // filling every field) changes nothing, and "" clears. A channel that is
+    // cleared or resolved from "origin" sets the target with it.
+    let named = |key: &str| args.get(key).is_some_and(|v| !v.is_null());
+    let from_origin = optional_str_param(args, "delivery_channel") == Some(ORIGIN_DELIVERY)
+        && source != Source::Channel;
     let (channel, target, note) = delivery_arg(args, source);
+    let channel_changes = named("delivery_channel");
+    let target_changes =
+        named("delivery_target") || (channel_changes && (from_origin || channel.is_none()));
     let change = SubscriptionUpdate {
         name: optional_str_param(args, "name")
             .filter(|s| !s.is_empty())
@@ -312,8 +338,8 @@ async fn update(db: &Database, id: &str, args: &Value) -> Result<String> {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         filter: filter_arg(args)?,
-        delivery_channel: wants_delivery.then(|| channel.clone()),
-        delivery_target: wants_delivery.then_some(target),
+        delivery_channel: channel_changes.then(|| channel.clone()),
+        delivery_target: target_changes.then_some(target),
         signing_secret_ref: manage::signing_secret_change(optional_str_param(
             args,
             "signing_secret",
@@ -431,6 +457,118 @@ mod tests {
             "a channel source keeps it"
         );
         assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn origin_from_a_chat_borg_cannot_post_to_stays_in_the_conversation() {
+        let ctx = crate::gateway_context::GatewayOriginContext {
+            channel_name: "imessage".into(),
+            sender_id: "+15550100".into(),
+            thread_id: None,
+            session_key: "+15550100".into(),
+        };
+        let (channel, target, note) = crate::gateway_context::scope(ctx, async {
+            delivery_arg(&json!({"delivery_channel": "origin"}), Source::Webhook)
+        })
+        .await;
+        assert_eq!((channel, target), (None, None));
+        assert!(note.unwrap().contains("Slack, Telegram or Discord"));
+    }
+
+    async fn call(db: &Database, args: Value) -> String {
+        handle_subscribe_with(db, &args, &Config::default())
+            .await
+            .unwrap()
+    }
+
+    fn id_in(text: &str) -> String {
+        let start = text.find("sub_").expect("an id in the reply");
+        text[start..]
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_key_is_shown_once_at_create_and_never_after() {
+        let db = Database::test_db().await;
+        let created = call(&db, json!({"action": "create", "provider": "custom"})).await;
+        let id = id_in(&created);
+        let key = manage::reveal_key(&db, &id).await.unwrap().unwrap();
+        assert!(created.contains(&key), "create gives the key: {created}");
+        manage::test(&db, &Config::default(), &id).await.unwrap();
+        for action in ["get", "list", "events"] {
+            let out = call(&db, json!({"action": action, "id": id})).await;
+            assert!(
+                out.contains(&id) || out.contains("Test:"),
+                "{action} shows the subscription: {out}"
+            );
+            assert!(!out.contains(&key), "{action} leaks the key: {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_update_changes_only_the_delivery_fields_it_names() {
+        let db = Database::test_db().await;
+        let created = call(
+            &db,
+            json!({"action": "create", "provider": "custom",
+                   "delivery_channel": "slack", "delivery_target": "C123"}),
+        )
+        .await;
+        let id = id_in(&created);
+        call(
+            &db,
+            json!({"action": "update", "id": id, "delivery_target": "C456"}),
+        )
+        .await;
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                row.delivery_channel.as_deref(),
+                row.delivery_target.as_deref()
+            ),
+            (Some("slack"), Some("C456")),
+            "a new target keeps the channel"
+        );
+        call(
+            &db,
+            json!({"action": "update", "id": id, "name": "Deploys",
+                   "delivery_channel": null, "delivery_target": null}),
+        )
+        .await;
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert_eq!(row.name, "Deploys");
+        assert_eq!(
+            row.delivery_channel.as_deref(),
+            Some("slack"),
+            "null changes nothing"
+        );
+        let out = call(
+            &db,
+            json!({"action": "update", "id": id, "delivery_channel": ""}),
+        )
+        .await;
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (row.delivery_channel, row.delivery_target),
+            (None, None),
+            "\"\" clears the route: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_reads_but_does_not_change_subscriptions() {
+        let config = Config::default();
+        let out = handle_subscribe(
+            &json!({"action": "delete", "id": "sub_none"}),
+            &config,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("a sub-agent can read subscriptions"), "{out}");
     }
 
     #[tokio::test]

@@ -1236,7 +1236,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let t = chrono::Utc::now().timestamp();
+        // A second later, so the tests are the oldest: in one second the
+        // order falls back to the random ids.
+        let t = chrono::Utc::now().timestamp() + 1;
         for key in ["a", "b"] {
             let outcome = db
                 .insert_subscription_event(&event(&s.id, Some(key), t), limits)

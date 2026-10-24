@@ -959,15 +959,12 @@ impl Agent {
                 crate::tool::schedule::handle_manage_cron(args, &self.config).await
             }
             crate::tool::Tool::Subscribe(args) => {
-                // A sub-agent reports back to its parent; it does not set up
-                // standing work of its own.
-                if self.spawn_depth > 0
-                    && !crate::tool_handlers::subscribe::is_read_action(&args.0)
-                {
-                    Ok("Error: a sub-agent can read subscriptions but not change them. Report what should change to the parent agent.".to_string())
-                } else {
-                    crate::tool_handlers::subscribe::handle_subscribe(&args.0, &self.config).await
-                }
+                crate::tool_handlers::subscribe::handle_subscribe(
+                    &args.0,
+                    &self.config,
+                    self.spawn_depth > 0,
+                )
+                .await
             }
             crate::tool::Tool::GenerateImage(args) => {
                 crate::tool::generate_image::handle(args, &self.config).await
@@ -1589,6 +1586,28 @@ mod session_availability_tests {
         let (results, _) = run(&mut agent, &[call], false).await;
         assert!(
             results[0].contains("cannot change anything inside a subscription run"),
+            "got: {}",
+            results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_cannot_change_subscriptions() {
+        let mut agent = minimal_test_agent(Config::default());
+        agent.spawn_depth = 1;
+        let call = ToolCall {
+            id: "s1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: crate::tool::names::SUBSCRIBE.to_string(),
+                // An id that matches nothing: should the guard ever go, the
+                // call still changes no real data.
+                arguments: serde_json::json!({"action": "delete", "id": "sub_none"}).to_string(),
+            },
+        };
+        let (results, _) = run(&mut agent, &[call], false).await;
+        assert!(
+            results[0].contains("a sub-agent can read subscriptions"),
             "got: {}",
             results[0]
         );

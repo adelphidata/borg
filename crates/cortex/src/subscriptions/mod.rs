@@ -53,7 +53,8 @@ pub fn run_refusal(root_session: &str, tool: &str, args: &serde_json::Value) -> 
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let reads = matches!(action, "list" | "get" | "history" | "events" | "status");
     let refused = match tool {
-        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON | tn::SUBSCRIBE => !reads,
+        tn::SUBSCRIBE => !crate::tool_handlers::subscribe::is_read_action(args),
+        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON => !reads,
         tn::CREATE_GOAL => true,
         _ => false,
     };
