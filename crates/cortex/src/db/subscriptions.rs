@@ -568,7 +568,8 @@ impl Database {
                     .conn
                     .query(
                         "SELECT COUNT(*) FROM subscription_events \
-                         WHERE subscription_id = ?1 AND received_at > ?2",
+                         WHERE subscription_id = ?1 AND received_at > ?2 \
+                         AND (kind IS NULL OR kind != 'test')",
                         params!(sub, since),
                     )
                     .await?;
@@ -812,6 +813,9 @@ impl Database {
                  attempts = attempts + 1 \
                  WHERE id IN (SELECT id FROM subscription_events \
                      WHERE subscription_id = ?1 AND status = 'pending' \
+                     AND (kind IS NULL OR kind != 'test') \
+                     AND NOT EXISTS (SELECT 1 FROM subscription_events l \
+                         WHERE l.run_id = ?2 AND l.kind = 'test') \
                      AND (kind = 'test' OR (SELECT status FROM subscriptions WHERE id = ?1) = 'active') \
                      AND (?5 IS NULL OR ( \
                          json_extract(origin, '$.channel') IS json_extract(?5, '$.channel') \
@@ -945,6 +949,7 @@ impl Database {
                  FROM subscription_events \
                  WHERE subscription_id = ?1 AND run_id IS NOT NULL AND finished_at IS NOT NULL \
                  AND started_at >= (SELECT accepting_since FROM subscriptions WHERE id = ?1) \
+                 AND (kind IS NULL OR kind != 'test') \
                  GROUP BY run_id ORDER BY MAX(finished_at) DESC, run_id DESC LIMIT ?2",
                 params!(subscription_id, i64::from(n)),
             )
@@ -1214,6 +1219,55 @@ mod tests {
         assert_eq!(
             db.recent_subscription_run_statuses(&s.id, 5).await.unwrap(),
             vec!["failed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_events_never_mix_with_real_ones_or_count_against_limits() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        let limits = IngestLimits {
+            per_minute: 2,
+            storm_threshold: 100,
+            max_pending: 100,
+        };
+        for _ in 0..3 {
+            db.insert_subscription_test_event(&s.id, "Test: x", "{}")
+                .await
+                .unwrap();
+        }
+        let t = chrono::Utc::now().timestamp();
+        for key in ["a", "b"] {
+            let outcome = db
+                .insert_subscription_event(&event(&s.id, Some(key), t), limits)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, InsertOutcome::Inserted(_)),
+                "tests do not use the burst budget: {outcome:?}"
+            );
+        }
+        // The oldest waiting event is a test: it runs alone.
+        let lead = db
+            .claim_next_subscription_event("run_t", t)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead.kind.as_deref(), Some("test"));
+        let run = db
+            .claim_subscription_batch(&s.id, "run_t", 50, t, None)
+            .await
+            .unwrap();
+        assert_eq!(run.len(), 1, "the test does not take in other events");
+        db.finish_subscription_run(&s.id, "run_t", "failed", None, Some("x"), 1)
+            .await
+            .unwrap();
+        assert!(
+            db.recent_subscription_run_statuses(&s.id, 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed test does not count toward the failure breaker"
         );
     }
 

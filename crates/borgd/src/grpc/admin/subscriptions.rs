@@ -31,9 +31,21 @@ const DETAIL_EVENTS: u32 = 50;
 pub type SubscriptionActivityStream =
     Pin<Box<dyn Stream<Item = Result<PbSubscriptionActivity, TStatus>> + Send + 'static>>;
 
-#[allow(clippy::result_large_err)]
-fn refused(e: anyhow::Error) -> TStatus {
-    TStatus::invalid_argument(e.to_string())
+/// A refusal goes out as `InvalidArgument` with its sentence unchanged; any
+/// other error is a fault in Borg and goes out as `Internal`.
+fn manage_err(verb: &'static str) -> impl FnOnce(anyhow::Error) -> TStatus {
+    move |e| match manage::refusal_text(&e) {
+        Some(text) => TStatus::invalid_argument(text),
+        None => TStatus::internal(format!("{verb} failed: {e:#}")),
+    }
+}
+
+/// Record a key event before the key leaves the daemon. Fails closed: a key
+/// whose showing cannot be recorded is not shown.
+async fn audit(db: &Database, message: String) -> Result<(), TStatus> {
+    db.log_activity("info", "subscriptions", &message, None)
+        .await
+        .map_err(map_internal("record key access"))
 }
 
 fn not_found() -> TStatus {
@@ -221,13 +233,16 @@ pub(super) async fn create(
         timeout_secs: non_zero(req.timeout_secs),
         active: req.active,
     };
-    let created = manage::create(&db, &config, &spec).await.map_err(refused)?;
+    let created = manage::create(&db, &config, &spec)
+        .await
+        .map_err(manage_err("create subscription"))?;
     let key = created.key.unwrap_or_default();
     let sender_steps = steps_with(&created.row, &config, &key);
     Ok(Response::new(SubscriptionCreated {
         subscription: Some(subscription_to_pb(created.row, &config)),
         key,
         sender_steps,
+        waiting_for_secret: created.waiting_for_secret,
     }))
 }
 
@@ -237,7 +252,8 @@ pub(super) async fn update(
     let req = req.into_inner();
     let (db, config) = open().await?;
     let signing_secret_ref = if req.set_signing_secret {
-        manage::signing_secret_change(Some(&req.signing_secret)).map_err(refused)?
+        manage::signing_secret_change(Some(&req.signing_secret))
+            .map_err(manage_err("update subscription"))?
     } else {
         None
     };
@@ -253,7 +269,7 @@ pub(super) async fn update(
     };
     let row = manage::update(&db, &req.id, &change)
         .await
-        .map_err(refused)?
+        .map_err(manage_err("update subscription"))?
         .ok_or_else(not_found)?;
     Ok(Response::new(subscription_to_pb(row, &config)))
 }
@@ -277,7 +293,7 @@ pub(super) async fn set_status(
     let (db, config) = open().await?;
     let row = manage::set_active(&db, &req.id, req.active)
         .await
-        .map_err(map_internal("set subscription status"))?
+        .map_err(manage_err("set subscription status"))?
         .ok_or_else(not_found)?;
     Ok(Response::new(subscription_to_pb(row, &config)))
 }
@@ -296,13 +312,7 @@ pub(super) async fn reveal_key(
         .await
         .map_err(map_internal("read subscription key"))?
         .ok_or_else(|| TStatus::failed_precondition("This subscription has no key."))?;
-    cortex::activity_log::log_activity(
-        &db,
-        "info",
-        "subscriptions",
-        &format!("The key of \"{}\" was shown", row.name),
-    )
-    .await;
+    audit(&db, format!("The key of \"{}\" was shown", row.name)).await?;
     let sender_steps = steps_with(&row, &config, &key);
     Ok(Response::new(SubscriptionKey { key, sender_steps }))
 }
@@ -314,20 +324,14 @@ pub(super) async fn rotate_key(
     let (db, config) = open().await?;
     let key = manage::rotate_key(&db, &id)
         .await
-        .map_err(refused)?
+        .map_err(manage_err("replace subscription key"))?
         .ok_or_else(not_found)?;
     let row = db
         .get_subscription(&id)
         .await
         .map_err(map_internal("get subscription"))?
         .ok_or_else(not_found)?;
-    cortex::activity_log::log_activity(
-        &db,
-        "info",
-        "subscriptions",
-        &format!("The key of \"{}\" was replaced", row.name),
-    )
-    .await;
+    audit(&db, format!("The key of \"{}\" was replaced", row.name)).await?;
     let sender_steps = steps_with(&row, &config, &key);
     Ok(Response::new(SubscriptionKey { key, sender_steps }))
 }
@@ -336,10 +340,10 @@ pub(super) async fn test(
     req: Request<SubscriptionRef>,
 ) -> Result<Response<PbSubscriptionEvent>, TStatus> {
     let id = req.into_inner().id;
-    let db = Database::open().await.map_err(map_internal("open db"))?;
-    let event = manage::test(&db, &id)
+    let (db, config) = open().await?;
+    let event = manage::test(&db, &config, &id)
         .await
-        .map_err(refused)?
+        .map_err(manage_err("queue test event"))?
         .ok_or_else(not_found)?;
     Ok(Response::new(event_to_pb(event)))
 }

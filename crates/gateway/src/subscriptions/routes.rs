@@ -23,7 +23,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use cortex::db::{IngestLimits, InsertOutcome, NewSubscriptionEvent, SubscriptionRow};
+use cortex::db::{Database, IngestLimits, InsertOutcome, NewSubscriptionEvent, SubscriptionRow};
 use cortex::security::secrets_resolve::SecretRef;
 use cortex::subscriptions::filter::{EventView, Filter};
 use cortex::subscriptions::presets::{self, AuthScheme};
@@ -254,7 +254,7 @@ async fn events_handler(
 
     // Authenticate before saying anything about the subscription's state, so
     // an unauthenticated caller learns nothing beyond "it exists".
-    if let Err(resp) = authenticate(&sub, &headers, &body).await {
+    if let Err(resp) = authenticate(&db, &sub, &headers, &body).await {
         return resp;
     }
 
@@ -374,6 +374,7 @@ async fn events_handler(
 
 #[allow(clippy::result_large_err)]
 async fn authenticate(
+    db: &Database,
     sub: &SubscriptionRow,
     headers: &HeaderMap,
     body: &[u8],
@@ -404,14 +405,22 @@ async fn authenticate(
         key: &key,
         signing_secret: signing.as_deref(),
     };
-    verify(scheme, headers, body, secrets, now).map_err(|e| {
-        tracing::info!(subscription = %sub.id, "subscription endpoint refused: {e}");
-        let code = match e {
-            AuthError::Malformed(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::UNAUTHORIZED,
-        };
-        refuse(code, &e.to_string())
-    })
+    let Err(e) = verify(scheme, headers, body, secrets, now) else {
+        return Ok(());
+    };
+    tracing::info!(subscription = %sub.id, "subscription endpoint refused: {e}");
+    // The one refusal the user can fix in Borg: say it on the subscription,
+    // or it looks like a subscription that never hears anything.
+    if e == AuthError::NeedsSigningSecret {
+        if let Err(db_err) = db.set_subscription_error(&sub.id, &e.to_string()).await {
+            tracing::warn!(subscription = %sub.id, "subscription endpoint: record error: {db_err:#}");
+        }
+    }
+    let code = match e {
+        AuthError::Malformed(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::UNAUTHORIZED,
+    };
+    Err(refuse(code, &e.to_string()))
 }
 
 /// JSON bodies are kept as JSON; anything else (a form post, plain text) is
@@ -770,6 +779,35 @@ mod tests {
         assert_eq!(
             send(&app, post(&id, &forged, push)).await.0,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signed_request_without_a_pasted_secret_says_so_on_the_subscription() {
+        let (app, db, id, _tmp) = setup("sentry", "sentry", "active").await;
+        let (code, body) = send(
+            &app,
+            post(
+                &id,
+                &[("sentry-hook-signature", "abc123")],
+                r#"{"action":"created"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("signing secret"),
+            "{body}"
+        );
+        let row = db.get_subscription(&id).await.unwrap().unwrap();
+        assert!(
+            row.last_error
+                .unwrap_or_default()
+                .contains("signing secret"),
+            "the app can show what to fix"
         );
     }
 

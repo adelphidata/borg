@@ -57,7 +57,7 @@ pub async fn handle_subscribe(args: &Value, config: &Config) -> Result<String> {
                 "pause" => set_active(&db, id, false).await,
                 "resume" => set_active(&db, id, true).await,
                 "delete" => delete(&db, id).await,
-                _ => test(&db, id).await,
+                _ => test(&db, config, id).await,
             }
         }
         other => Ok(format!(
@@ -213,6 +213,13 @@ async fn create(db: &Database, config: &Config, args: &Value) -> Result<String> 
         }
         out.push_str("Give the user the endpoint, the key and the steps. The key is shown again only in the app.\n");
     }
+    if created.waiting_for_secret {
+        let _ = writeln!(
+            out,
+            "It stays paused until the signing secret {} shows is pasted: call update with signing_secret, then resume.",
+            preset.label
+        );
+    }
     if let Some(note) = note {
         let _ = writeln!(out, "{note}");
     }
@@ -350,8 +357,8 @@ async fn delete(db: &Database, id: &str) -> Result<String> {
     })
 }
 
-async fn test(db: &Database, id: &str) -> Result<String> {
-    Ok(match manage::test(db, id).await? {
+async fn test(db: &Database, config: &Config, id: &str) -> Result<String> {
+    Ok(match manage::test(db, config, id).await? {
         Some(event) => format!(
             "Queued a test event ({}). It runs like a real one, in the subscription's own conversation.",
             event.summary

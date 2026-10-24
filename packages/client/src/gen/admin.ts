@@ -1685,6 +1685,12 @@ export interface SubscriptionCreated {
   key: string;
   /** with the key filled in */
   senderSteps: string[];
+  /**
+   * Asked to start active, but the provider signs its requests and shows
+   * its signing secret only after the endpoint is added there, so it waits
+   * paused until the secret is pasted.
+   */
+  waitingForSecret: boolean;
 }
 
 /**
@@ -19855,7 +19861,7 @@ export const SubscriptionSpec: MessageFns<SubscriptionSpec> = {
 };
 
 function createBaseSubscriptionCreated(): SubscriptionCreated {
-  return { subscription: undefined, key: "", senderSteps: [] };
+  return { subscription: undefined, key: "", senderSteps: [], waitingForSecret: false };
 }
 
 export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
@@ -19868,6 +19874,9 @@ export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
     }
     for (const v of message.senderSteps) {
       writer.uint32(26).string(v!);
+    }
+    if (message.waitingForSecret !== false) {
+      writer.uint32(32).bool(message.waitingForSecret);
     }
     return writer;
   },
@@ -19909,6 +19918,14 @@ export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
             message.senderSteps.push(reader.string());
             continue;
           }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.waitingForSecret = reader.bool();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -19930,6 +19947,11 @@ export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
         : globalThis.Array.isArray(object?.sender_steps)
         ? object.sender_steps.map((e: any) => globalThis.String(e))
         : [],
+      waitingForSecret: isSet(object.waitingForSecret)
+        ? globalThis.Boolean(object.waitingForSecret)
+        : isSet(object.waiting_for_secret)
+        ? globalThis.Boolean(object.waiting_for_secret)
+        : false,
     };
   },
 
@@ -19944,6 +19966,9 @@ export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
     if (message.senderSteps?.length) {
       obj.senderSteps = message.senderSteps;
     }
+    if (message.waitingForSecret !== false) {
+      obj.waitingForSecret = message.waitingForSecret;
+    }
     return obj;
   },
 
@@ -19957,6 +19982,7 @@ export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
       : undefined;
     message.key = object.key ?? "";
     message.senderSteps = object.senderSteps?.map((e) => e) || [];
+    message.waitingForSecret = object.waitingForSecret ?? false;
     return message;
   },
 };

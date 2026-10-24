@@ -1464,6 +1464,10 @@ message SubscriptionCreated {
   Subscription subscription = 1;
   string key = 2;                  // empty for sources without an endpoint
   repeated string sender_steps = 3; // with the key filled in
+  // Asked to start active, but the provider signs its requests and shows
+  // its signing secret only after the endpoint is added there, so it waits
+  // paused until the secret is pasted.
+  bool waiting_for_secret = 4;
 }
 
 // Empty strings and zeros leave a field unchanged. Delivery and the signing

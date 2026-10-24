@@ -112,6 +112,10 @@ pub(crate) fn resolve_route(
         return Ok(Route::SessionOnly);
     };
     if channel == cortex::heartbeat_task::ORIGIN_DELIVERY {
+        // A test has no conversation; its result stays in the session.
+        if lead.kind.as_deref() == Some(cortex::subscriptions::TEST_KIND) {
+            return Ok(Route::SessionOnly);
+        }
         let origin: EventOrigin = lead
             .origin
             .as_deref()
@@ -501,6 +505,13 @@ mod tests {
             Ok(Route::SessionOnly)
         );
         assert!(resolve_route(&sub_row(Some("origin"), None), &event_row(None)).is_err());
+        let mut test_event = event_row(None);
+        test_event.kind = Some(cortex::subscriptions::TEST_KIND.into());
+        assert_eq!(
+            resolve_route(&sub_row(Some("origin"), None), &test_event),
+            Ok(Route::SessionOnly),
+            "a test has no conversation to reply to; its result stays in the session"
+        );
         assert!(resolve_route(&sub_row(Some("telegram"), None), &event_row(None)).is_err());
         assert_eq!(
             resolve_route(&sub_row(Some("telegram"), Some("42")), &event_row(None)),
