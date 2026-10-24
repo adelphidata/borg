@@ -83,6 +83,21 @@ pub fn fingerprint_of_pem(cert_pem: &[u8]) -> Result<String, PkiError> {
     Ok(fingerprint_sha256(&der))
 }
 
+/// True iff `key_pem` (PKCS#8 PEM) is the private half of the public key in
+/// `cert_pem`. A key store can hold a key that another daemon minted under
+/// the same account; signing with it yields certs nobody can verify.
+pub fn key_matches_cert(key_pem: &str, cert_pem: &str) -> Result<bool, PkiError> {
+    use rcgen::PublicKeyData;
+    let key = rcgen::KeyPair::from_pem(key_pem)
+        .map_err(|e| PkiError::Parse(format!("private key pem: {e}")))?;
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|e| PkiError::Parse(format!("cert pem: {e}")))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|e| PkiError::Parse(format!("cert der: {e}")))?;
+    Ok(key.subject_public_key_info() == cert.public_key().raw)
+}
+
 /// True iff the cert expires within `days` from `now`.
 pub fn expires_within(meta: &CertMetadata, now_unix: i64, days: u32) -> bool {
     let cutoff = now_unix.saturating_add(i64::from(days) * SECONDS_PER_DAY);
@@ -187,5 +202,14 @@ mod tests {
     fn parse_invalid_der_returns_parse_error() {
         let result = parse_cert_metadata(&[0u8; 32]);
         assert!(matches!(result, Err(PkiError::Parse(_))));
+    }
+
+    #[test]
+    fn key_matches_only_its_own_cert() {
+        let a = crate::ca::generate_root_ca("a").expect("a");
+        let b = crate::ca::generate_root_ca("b").expect("b");
+        assert!(key_matches_cert(&a.key_pkcs8_pem, &a.cert_pem).expect("a/a"));
+        assert!(!key_matches_cert(&b.key_pkcs8_pem, &a.cert_pem).expect("b/a"));
+        assert!(key_matches_cert("not a key", &a.cert_pem).is_err());
     }
 }
