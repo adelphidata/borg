@@ -440,29 +440,17 @@ impl AgentBackend {
         // may be one the user or the titler gave it.
         if let Ok(db) = cortex::db::Database::open().await {
             let now = chrono::Utc::now().timestamp();
-            let model = agent.config().llm.model.clone();
-            if let Err(e) = db.ensure_session_row(&session_id, now, &model).await {
-                tracing::warn!(session_id = %session_id, error = %e, "ensure_session_row on open failed");
-            }
-            // Stamp workspace identity so workspace-scoped resume
-            // (`borg --continue`) can find this session again. Client-provided
-            // workspace wins; a daemon opened without one falls back to its
-            // own process cwd (best-effort — TUI clients re-stamp with their
-            // real cwd right after open).
+            // Client-provided workspace wins; a daemon opened without one
+            // falls back to its own process cwd (best-effort — TUI clients
+            // re-stamp with their real cwd right after open).
             let stamp_cwd = workspace_cwd_hint.or_else(|| std::env::current_dir().ok());
-            if let Some(dir) = stamp_cwd {
-                let (dir, repo_root) = cortex::session::workspace_identity(&dir);
-                if let Err(e) = db
-                    .set_session_workspace(
-                        &session_id,
-                        &dir.to_string_lossy(),
-                        repo_root.as_ref().map(|p| p.to_string_lossy()).as_deref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(session_id = %session_id, error = %e, "workspace stamp on open failed");
-                }
-            }
+            materialize_session_row(
+                &db,
+                &session_id,
+                &agent.config().llm.model,
+                stamp_cwd.as_deref(),
+            )
+            .await;
             // Take ownership of the session up front. A conflict here (another
             // live worker owns it) is only possible in a multi-worker setup; we
             // warn but still open locally — the per-turn claim is the real gate.
@@ -739,7 +727,13 @@ impl SessionBackend for AgentBackend {
     async fn new_agent_session(&self) -> anyhow::Result<String> {
         let mut agent = self.agent.lock().await;
         agent.new_session().await;
-        Ok(agent.session().meta.id.clone())
+        let id = agent.session().meta.id.clone();
+        // Same row an open writes: a turn only updates an existing row, so
+        // without it the new conversation never lists, exports, or forks.
+        let db = cortex::db::Database::open().await?;
+        let workspace = agent.execution_context().workspace_cwd().to_path_buf();
+        materialize_session_row(&db, &id, &agent.config().llm.model, Some(&workspace)).await;
+        Ok(id)
     }
 
     fn load_agent_session(&self, id: &str) -> anyhow::Result<u64> {
@@ -918,6 +912,37 @@ impl SessionBackend for AgentBackend {
             title: forked.meta.title,
             message_count: forked.meta.message_count as u64,
         })
+    }
+}
+
+/// Write the `sessions` row for a session that is about to take turns, and
+/// stamp its workspace identity so workspace-scoped resume (`borg
+/// --continue`) can find it again. A row that already exists keeps its
+/// title, place in the list and archive state. Best-effort: a failure only
+/// costs listing precision, so it logs and moves on.
+async fn materialize_session_row(
+    db: &cortex::db::Database,
+    session_id: &str,
+    model: &str,
+    workspace: Option<&std::path::Path>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = db.ensure_session_row(session_id, now, model).await {
+        tracing::warn!(session_id = %session_id, error = %e, "ensure_session_row failed");
+    }
+    let Some(dir) = workspace else {
+        return;
+    };
+    let (dir, repo_root) = cortex::session::workspace_identity(dir);
+    if let Err(e) = db
+        .set_session_workspace(
+            session_id,
+            &dir.to_string_lossy(),
+            repo_root.as_ref().map(|p| p.to_string_lossy()).as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(session_id = %session_id, error = %e, "workspace stamp failed");
     }
 }
 
