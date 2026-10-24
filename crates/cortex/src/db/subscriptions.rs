@@ -676,6 +676,38 @@ impl Database {
         })
     }
 
+    /// Queue a test event: the source's sample payload, kind
+    /// [`crate::subscriptions::TEST_KIND`]. It skips the ingest budget and
+    /// runs even while the subscription is paused, so Test works before the
+    /// user turns the subscription on.
+    pub async fn insert_subscription_test_event(
+        &self,
+        subscription_id: &str,
+        summary: &str,
+        payload: &str,
+    ) -> Result<SubscriptionEventRow> {
+        let id = new_id(EVENT_ID_PREFIX);
+        let now = now_unix();
+        self.conn
+            .execute(
+                "INSERT INTO subscription_events (id, subscription_id, kind, summary, payload, \
+                 payload_truncated, status, received_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                params!(
+                    id.clone(),
+                    subscription_id,
+                    crate::subscriptions::TEST_KIND,
+                    summary,
+                    payload,
+                    event_status::PENDING,
+                    now
+                ),
+            )
+            .await?;
+        self.get_subscription_event(&id)
+            .await?
+            .context("test event vanished right after insert")
+    }
+
     async fn bump_dropped(&self, id: &str) -> Result<()> {
         self.conn
             .execute(
@@ -703,7 +735,7 @@ impl Database {
                 .query(
                     "SELECT e.id FROM subscription_events e \
                      JOIN subscriptions s ON s.id = e.subscription_id \
-                     WHERE e.status = 'pending' AND s.status = 'active' \
+                     WHERE e.status = 'pending' AND (s.status = 'active' OR e.kind = 'test') \
                      AND NOT EXISTS (SELECT 1 FROM subscription_events r \
                          WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
                      AND (SELECT COUNT(DISTINCT h.run_id) FROM subscription_events h \
@@ -746,6 +778,7 @@ impl Database {
                 "UPDATE subscription_events SET status = 'running', run_id = ?2, started_at = ?3 \
                  WHERE id IN (SELECT id FROM subscription_events \
                      WHERE subscription_id = ?1 AND status = 'pending' \
+                     AND (kind = 'test' OR (SELECT status FROM subscriptions WHERE id = ?1) = 'active') \
                      ORDER BY received_at, id LIMIT ?4)",
                 params!(subscription_id, run_id, now, i64::from(limit)),
             )

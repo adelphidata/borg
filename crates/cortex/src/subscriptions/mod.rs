@@ -15,6 +15,7 @@
 
 pub mod filter;
 pub mod ingest;
+pub mod manage;
 pub mod presets;
 pub mod prompt;
 pub mod wake;
@@ -157,6 +158,8 @@ pub const EVENT_ID_PREFIX: &str = "evt_";
 pub const RUN_ID_PREFIX: &str = "run_";
 /// Prefix of an endpoint key, so a leaked one is recognisable in a scan.
 pub const KEY_PREFIX: &str = "bsk_";
+/// Kind of an event queued by Test. It runs even while paused.
+pub const TEST_KIND: &str = "test";
 
 /// A short random id: `prefix` + 12 lowercase base32 characters.
 pub fn new_id(prefix: &str) -> String {
