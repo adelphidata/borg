@@ -64,10 +64,11 @@ async fn run_create(
         resp.name, resp.name
     );
     println!();
-    println!("HMAC key (hex): {}", hex_encode(&resp.hmac_secret));
+    println!("Signing key: {}", hex_encode(&resp.hmac_secret));
     println!();
     println!(
         "Sign requests with: HMAC-SHA256(<key>, \"{{ts}}.{{body}}\")\n\
+         The key is the text above as written; do not hex-decode it.\n\
          Headers: X-Borg-Signature: v1=<hex>, X-Borg-Timestamp: <unix-seconds>\n\
          Replay window: 5 minutes."
     );
