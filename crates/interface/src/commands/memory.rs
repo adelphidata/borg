@@ -110,8 +110,7 @@ async fn run_read(scope: &str, name: &str) -> Result<()> {
     let content = cortex::memory::read_memory_db(name, scope)
         .await?
         .ok_or_else(|| anyhow!("memory entry '{scope}/{name}' not found"))?;
-    print!("{content}");
-    Ok(())
+    super::print_lines([content.strip_suffix('\n').unwrap_or(&content)])
 }
 
 async fn run_write(
