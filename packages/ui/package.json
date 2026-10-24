@@ -1,6 +1,6 @@
 {
   "name": "@borg/ui",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Shared Borg UI: components, theme, breakpoint hook, design tokens, fonts",
   "license": "MIT",
