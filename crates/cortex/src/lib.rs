@@ -170,6 +170,9 @@ pub mod shell_session;
 pub mod skills;
 /// Shared SSE stream processing for LLM providers.
 pub mod sse;
+/// Subscriptions: outside events (webhooks, channel messages, Borg's own
+/// goals and tasks) that wake the agent with an instruction.
+pub mod subscriptions;
 /// Fixed UUIDs for built-in seeded `scheduled_tasks` rows.
 pub mod task_ids;
 /// Scheduled task management (prompt and command jobs).

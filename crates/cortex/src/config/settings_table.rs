@@ -413,6 +413,20 @@ define_settings! {
         "loop_guard.web_search_max_per_turn" => loop_guard.web_search_max_per_turn, parsed(u32);
         "loop_guard.subagent_max_per_turn" => loop_guard.subagent_max_per_turn, parsed(u32);
 
+        // ── Subscriptions (outside events that wake the agent) ──
+        "subscriptions.enabled" => subscriptions.enabled, parsed(bool);
+        "subscriptions.max_concurrent" => subscriptions.max_concurrent, nonzero(usize);
+        "subscriptions.default_rate_limit_per_hour" => subscriptions.default_rate_limit_per_hour, nonzero(u32);
+        "subscriptions.max_runs_per_day" => subscriptions.max_runs_per_day, nonzero(u32);
+        "subscriptions.ingest_burst" => subscriptions.ingest_burst, nonzero(u32);
+        "subscriptions.storm_threshold" => subscriptions.storm_threshold, nonzero(u32);
+        "subscriptions.storm_failures" => subscriptions.storm_failures, nonzero(u32);
+        "subscriptions.max_steps" => subscriptions.max_steps, nonzero(u32);
+        "subscriptions.max_pending" => subscriptions.max_pending, nonzero(u32);
+        "subscriptions.default_timeout_secs" => subscriptions.default_timeout_secs, nonzero(u64);
+        "subscriptions.event_retention" => subscriptions.event_retention, nonzero(u32);
+        "subscriptions.payload_max_bytes" => subscriptions.payload_max_bytes, nonzero(usize);
+
         // ── Subprocess process registry ──
         "process_registry.orphan_warn_secs" => process_registry.orphan_warn_secs, parsed(u64);
         "process_registry.orphan_fail_secs" => process_registry.orphan_fail_secs, parsed(u64);
@@ -1064,6 +1078,8 @@ define_settings! {
         "loop_guard.unknown_tool_max_per_name" => "Unknown-tool max / name", Uint, "Reliability";
         "loop_guard.web_search_max_per_turn" => "Web searches / turn (0=off)", Uint, "Reliability";
         "loop_guard.subagent_max_per_turn" => "Sub-agent spawns / turn (0=off)", Uint, "Reliability";
+
+        "subscriptions.enabled" => "Let subscriptions wake Borg", Bool, "Subscriptions";
 
         "process_registry.orphan_warn_secs" => "Subprocess warn age (s)", Uint, "Subprocesses";
         "process_registry.orphan_fail_secs" => "Subprocess fail age (s)", Uint, "Subprocesses";

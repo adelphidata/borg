@@ -14,6 +14,7 @@ pub mod mcp_supply_chain;
 pub mod media;
 pub mod process_registry;
 pub mod security;
+pub mod subscriptions;
 #[macro_use]
 mod settings_macro;
 pub mod settings_table;
@@ -59,6 +60,7 @@ pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
 pub use process_registry::*;
 pub use security::*;
+pub use subscriptions::*;
 pub use telephony::TelephonyConfig;
 pub use tunnel::{
     CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, TailscaleTunnelConfig,
@@ -198,6 +200,9 @@ pub struct Config {
     /// Agent-loop safety guards: stuck-loop backoff + hallucinated-tool refusal.
     #[serde(default)]
     pub loop_guard: LoopGuardConfig,
+    /// Outside events that wake the agent, and the storm-control budget.
+    #[serde(default)]
+    pub subscriptions: SubscriptionsConfig,
     /// Per-session goal subsystem tunables.
     #[serde(default)]
     pub goals: GoalsConfig,
