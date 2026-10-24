@@ -286,4 +286,146 @@ mod tests {
         assert!(task_payload(&task("heartbeat", "hb"), &task_run(Some("x"))).is_none());
         assert!(task_payload(&task("maintenance", "m"), &task_run(None)).is_none());
     }
+
+    async fn active_borg_sub(db: &Database) -> String {
+        db.create_subscription(&cortex::db::NewSubscription {
+            name: "Borg events",
+            source: "internal",
+            provider: PROVIDER,
+            auth_scheme: "none",
+            secret_ref: None,
+            filter: "{}",
+            instruction: "Tell me what happened.",
+            delivery_channel: None,
+            delivery_target: None,
+            status: cortex::subscriptions::status::ACTIVE,
+            rate_limit_per_hour: 60,
+            timeout_secs: 30,
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn kinds(db: &Database, sub: &str) -> Vec<String> {
+        let mut kinds: Vec<String> = db
+            .list_subscription_events(sub, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.kind)
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    #[tokio::test]
+    async fn bus_events_wake_a_subscription_except_those_born_in_a_subscription_run() {
+        let _home = crate::test_env::IsolatedHome::new();
+        let db = Database::open().await.unwrap();
+        let sub = active_borg_sub(&db).await;
+        let (goal_bus, heartbeat_bus) = (GoalEventBus::new(), HeartbeatBus::default());
+        let (_config_tx, config_rx) = watch::channel(Config::default());
+        let cancel = CancellationToken::new();
+        let listener = tokio::spawn(run(
+            goal_bus.clone(),
+            heartbeat_bus.clone(),
+            config_rx,
+            cancel.clone(),
+        ));
+
+        let mut own_run = goal_event(event_kind::COMPLETED);
+        own_run.session_id = cortex::subscriptions::session_key(&sub);
+        let beat = |status| DaemonHeartbeatEvent {
+            source: crate::heartbeat::HeartbeatSource::Scheduled,
+            started_at_unix: 7,
+            finished_at_unix: 8,
+            status,
+            message: "provider down".into(),
+            skip_reason: None,
+            duration_ms: 1.0,
+        };
+        // The listener subscribes once it starts, so publish until it has
+        // stored both; dedup keeps the repeats to one row each. The goal
+        // born in the subscription's own session goes first on its bus, so
+        // by the time the later goal is stored it was already refused.
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            goal_bus.publish(own_run.clone());
+            goal_bus.publish(goal_event(event_kind::COMPLETED));
+            goal_bus.publish(goal_event(event_kind::CREATED));
+            heartbeat_bus.publish_for_test(beat("ran"));
+            heartbeat_bus.publish_for_test(beat("failed"));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            seen = kinds(&db, &sub).await;
+            if seen.len() >= 2 {
+                break;
+            }
+        }
+        cancel.cancel();
+        listener.await.unwrap().unwrap();
+
+        assert_eq!(seen, vec!["goal.completed", "heartbeat.failed"]);
+        let events = db.list_subscription_events(&sub, 100).await.unwrap();
+        let goal = events
+            .iter()
+            .find(|e| e.kind.as_deref() == Some("goal.completed"));
+        assert_eq!(
+            goal.and_then(|e| e.dedup_key.as_deref()),
+            Some("goal:s1:g1:completed"),
+            "only the goal from an ordinary session was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_task_run_wakes_a_subscription_only_while_subscriptions_are_on() {
+        let _home = crate::test_env::IsolatedHome::new();
+        let db = Database::open().await.unwrap();
+        let sub = active_borg_sub(&db).await;
+        let row = task("prompt", "nightly");
+        db.create_task(&cortex::db::NewTask {
+            id: &row.id,
+            name: &row.name,
+            prompt: &row.prompt,
+            schedule_type: &row.schedule_type,
+            schedule_expr: &row.schedule_expr,
+            timezone: &row.timezone,
+            next_run: None,
+            max_retries: None,
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: &row.task_type,
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+            continuity: false,
+        })
+        .await
+        .unwrap();
+        db.record_task_run(&row.id, 100, 5, None, Some("exit status 1"))
+            .await
+            .unwrap();
+        let run_id = db.task_run_history(&row.id, 1).await.unwrap()[0].id;
+
+        let mut off = Config::default();
+        off.subscriptions.enabled = false;
+        after_task_run(&row, run_id, &off).await;
+        assert!(
+            kinds(&db, &sub).await.is_empty(),
+            "the off switch stores nothing"
+        );
+
+        after_task_run(&row, run_id, &Config::default()).await;
+        after_task_run(&row, run_id + 1, &Config::default()).await;
+        let events = db.list_subscription_events(&sub, 100).await.unwrap();
+        assert_eq!(events.len(), 1, "an unknown run id stores nothing");
+        assert_eq!(events[0].kind.as_deref(), Some("task.failed"));
+        assert_eq!(
+            events[0].summary,
+            "Scheduled task \"Nightly report\" failed: exit status 1"
+        );
+    }
 }
