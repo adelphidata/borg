@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { CheckIcon, ChevronDownIcon, useIsMobile } from "@borg/ui";
 import { effectiveModel, modelLabel, modelsOf, useSetupStatus } from "../onboarding/useSetupStatus";
-import { THINKING_OPTIONS, optionLabel } from "../settings/catalog";
+import { MODE_KEY, MODE_OPTIONS, THINKING_OPTIONS, optionLabel } from "../settings/catalog";
 import { capitalize } from "../../lib/format";
 import { useKeybind } from "../../lib/keybinds";
 import { useSettings } from "../../lib/settings";
@@ -16,8 +16,8 @@ const MODEL_ROW =
 const ITEMS = '[role="menuitemradio"]';
 
 /**
- * Which model answers, and how hard it thinks — in the composer, beside the
- * microphone.
+ * Which model answers, how hard it thinks, and whether it may act — in the
+ * composer, beside the microphone.
  *
  * Both live in Settings, which is the right home for them and the wrong place
  * to go mid-conversation: choosing the model is part of asking the question,
@@ -45,6 +45,7 @@ export function ModelPill() {
     if (!isMobile) focusComposer();
   };
   const root = useRef<HTMLDivElement>(null);
+  const planNote = useId();
   const menu = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -73,6 +74,11 @@ export function ModelPill() {
   const provider = settings.data.get("provider")?.value ?? "";
   const model = effectiveModel(catalog, provider, settings.data.get("model")?.value ?? "");
   const thinking = settings.data.get("llm.thinking")?.value ?? "";
+  const mode = settings.data.get(MODE_KEY)?.value ?? "";
+  // Plan mode stops every change Borg would make, so it is on the pill at all
+  // widths: a user who forgot it is on sees nothing happen and no reason why.
+  const planning = mode === "plan";
+  const modeOption = MODE_OPTIONS.find((o) => o.value === mode);
   // No model and no provider default means onboarding has not run; a pill
   // naming no model, opening a menu offering none, is worse than no pill.
   if (model === "") return null;
@@ -129,7 +135,8 @@ export function ModelPill() {
     <div ref={root} className="relative flex-none">
       <button
         type="button"
-        aria-label="Model and thinking level"
+        aria-label="Model, thinking level and mode"
+        aria-describedby={planning ? planNote : undefined}
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={saving}
@@ -140,6 +147,14 @@ export function ModelPill() {
       >
         <span className="min-w-0 truncate">{modelLabel(catalog, provider, model)}</span>
         {effort && <span className="flex-none text-ink3">{effort}</span>}
+        {planning && (
+          <span className="flex-none font-medium text-neon-ink">
+            Plan
+            <span id={planNote} className="sr-only">
+              Plan mode is on. Borg proposes changes and makes none.
+            </span>
+          </span>
+        )}
         <ChevronDownIcon size={12} className="flex-none text-ink3" />
       </button>
       {saveError && (
@@ -147,7 +162,7 @@ export function ModelPill() {
           role="alert"
           className="absolute right-0 bottom-[calc(100%+6px)] z-20 text-[11px] whitespace-nowrap text-alert"
         >
-          Could not change the model. Try again.
+          Could not save the change. Try again.
         </div>
       )}
 
@@ -155,7 +170,7 @@ export function ModelPill() {
         <div
           ref={menu}
           role="menu"
-          aria-label="Model and thinking level"
+          aria-label="Model, thinking level and mode"
           onKeyDown={onMenuKey}
           className="absolute right-0 bottom-[calc(100%+10px)] z-30 w-[280px] overflow-hidden rounded-[11px] border border-line bg-surface2 shadow-(--frameShadow)"
         >
@@ -215,6 +230,35 @@ export function ModelPill() {
             </div>
             {level?.desc && (
               <div className="mt-2 text-[11.5px] leading-[1.4] text-ink3">{level.desc}</div>
+            )}
+          </div>
+          <div role="group" aria-label="Mode" className="border-t border-line2 px-3 pt-3 pb-3">
+            <div className={HEADING}>Mode</div>
+            <div className="mt-2 flex gap-0.5 rounded-[8px] border border-line2 p-0.5">
+              {MODE_OPTIONS.map((option) => {
+                const on = option.value === mode;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={on}
+                    tabIndex={-1}
+                    title={option.desc}
+                    className={`flex-auto cursor-pointer rounded-[6px] border-0 px-1.5 py-1.5 text-[11.5px] leading-none outline-none focus-visible:ring-1 focus-visible:ring-focus ${
+                      on
+                        ? "bg-surface3 font-medium text-ink"
+                        : "bg-transparent text-ink3 hover:text-ink2"
+                    }`}
+                    onClick={() => (on ? close() : pick(MODE_KEY, option.value))}
+                  >
+                    {optionLabel(option)}
+                  </button>
+                );
+              })}
+            </div>
+            {modeOption?.desc && (
+              <div className="mt-2 text-[11.5px] leading-[1.4] text-ink3">{modeOption.desc}</div>
             )}
           </div>
         </div>

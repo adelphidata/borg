@@ -9,7 +9,13 @@
 
 import { THEME_PREFERENCES, type ThemePreference } from "@borg/ui";
 import type { DaemonSetting } from "../../lib/settings";
-import { APPEARANCE_LABELS, settingPath } from "../settings/catalog";
+import {
+  APPEARANCE_LABELS,
+  MODE_KEY,
+  MODE_OPTIONS,
+  optionLabel,
+  settingPath,
+} from "../settings/catalog";
 import type { Command } from "./score";
 import { byRecency } from "./skillRecency";
 
@@ -158,6 +164,24 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
     run: () => ctx.setThemePreference(preference),
   }));
 
+  // Plan mode is something people switch while they talk, so it is a
+  // command that acts in place, not only a row that opens Settings. Unlike
+  // the theme rows they close: the composer's pill shows the mode in force,
+  // and a `/plan` left in the box would be sent as the next message.
+  const mode = ctx.settings?.get(MODE_KEY)?.value;
+  const modes: Command[] =
+    mode === undefined
+      ? []
+      : MODE_OPTIONS.map((option) => ({
+          id: `mode:${option.value}`,
+          label: `${optionLabel(option)} mode`,
+          hint: "Mode",
+          detail: option.desc,
+          active: mode === option.value,
+          keywords: "mode collaboration read only propose act",
+          run: () => ctx.saveSetting(MODE_KEY, option.value),
+        }));
+
   const recents: Command[] = ctx.sessions.map((session) => ({
     id: `session:${session.id}`,
     label: session.title || "Untitled",
@@ -203,5 +227,14 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
     run: () => ctx.noteSkillUse(skill.name),
   }));
 
-  return [...actions, ...go, ...appearance, ...settingRows, ...skills, ...recents, ...raw];
+  return [
+    ...actions,
+    ...modes,
+    ...go,
+    ...appearance,
+    ...settingRows,
+    ...skills,
+    ...recents,
+    ...raw,
+  ];
 }

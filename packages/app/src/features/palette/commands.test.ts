@@ -186,6 +186,21 @@ describe("buildCommands", () => {
     expect(setThemePreference).toHaveBeenCalledWith("light");
   });
 
+  it("switches plan mode in place and ticks the mode in force", () => {
+    const ctx = context({
+      settings: settingsMap(setting({ key: "conversation.collaboration_mode", value: "execute" })),
+    });
+    const commands = buildCommands(ctx, ROUTES);
+    const modes = commands.filter((c) => c.id.startsWith("mode:"));
+    expect(modes.filter((c) => c.active).map((c) => c.id)).toEqual(["mode:execute"]);
+
+    // Typing the word finds it first, ahead of chats that share its letters.
+    const first = rank([...commands, { id: "x", label: "Pelican chat", run: () => {} }], "plan")[0];
+    expect(first?.id).toBe("mode:plan");
+    first!.run();
+    expect(ctx.saveSetting).toHaveBeenCalledWith("conversation.collaboration_mode", "plan");
+  });
+
   it("survives a settings snapshot that has not loaded yet", () => {
     const commands = buildCommands(context({ settings: undefined, searching: true }), ROUTES);
     expect(commands.some((c) => c.id === "action:new")).toBe(true);

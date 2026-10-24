@@ -94,7 +94,7 @@ afterEach(() => {
 
 /** The pill itself, found by the one label that never changes. */
 function pill() {
-  return screen.queryByRole("button", { name: "Model and thinking level" });
+  return screen.queryByRole("button", { name: "Model, thinking level and mode" });
 }
 
 /** Opens the menu the way a user does. */
@@ -176,6 +176,27 @@ describe("ModelPill", () => {
     expect(save).toHaveBeenCalledWith("llm.thinking", "high");
   });
 
+  it("switches the mode under the daemon's own key", () => {
+    stored["conversation.collaboration_mode"] = "execute";
+    render(<ModelPill />);
+    openMenu();
+    fireEvent.click(item("Plan"));
+    expect(save).toHaveBeenCalledWith("conversation.collaboration_mode", "plan");
+  });
+
+  it("says on the pill when plan mode is on, at every width", () => {
+    stored["conversation.collaboration_mode"] = "execute";
+    render(<ModelPill />);
+    expect(pill()!.textContent).not.toContain("Plan");
+    cleanup();
+
+    stored["conversation.collaboration_mode"] = "plan";
+    device.mobile = true;
+    render(<ModelPill />);
+    expect(pill()!.textContent).toContain("Plan");
+    expect(pill()!.getAttribute("aria-describedby")).toBeTruthy();
+  });
+
   it("closes the menu once a choice is made", () => {
     render(<ModelPill />);
     openMenu();
@@ -237,15 +258,19 @@ describe("ModelPill", () => {
     const menu = screen.getByRole("menu");
     fireEvent.keyDown(menu, { key: "ArrowDown" });
     expect(document.activeElement).toBe(item(/Haiku/));
-    // Past the last model into the thinking levels, then round to the top.
+    // Past the last model into the thinking levels, on through the modes,
+    // then round to the top.
     fireEvent.keyDown(menu, { key: "ArrowDown" });
     expect(document.activeElement).toBe(item("Off"));
     fireEvent.keyDown(menu, { key: "End" });
-    expect(document.activeElement).toBe(item("Adaptive"));
-    fireEvent.keyDown(menu, { key: "ArrowRight" });
-    expect(document.activeElement).toBe(item(/Opus 5/));
+    expect(document.activeElement).toBe(item("Plan"));
+    fireEvent.keyDown(menu, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(item("Execute"));
     fireEvent.keyDown(menu, { key: "ArrowUp" });
     expect(document.activeElement).toBe(item("Adaptive"));
+    fireEvent.keyDown(menu, { key: "End" });
+    fireEvent.keyDown(menu, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(item(/Opus 5/));
     fireEvent.keyDown(menu, { key: "Home" });
     expect(document.activeElement).toBe(item(/Opus 5/));
   });
@@ -274,7 +299,7 @@ describe("ModelPill", () => {
     // old model with nothing anywhere to say the switch did not take.
     saveError = { message: "connection refused" };
     render(<ModelPill />);
-    expect(screen.getByRole("alert").textContent).toContain("Could not change the model");
+    expect(screen.getByRole("alert").textContent).toContain("Could not save the change");
   });
 
   it("clears a stale failure when the menu is reopened", () => {

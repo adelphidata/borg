@@ -61,6 +61,15 @@ export const THINKING_OPTIONS: SettingOption[] = [
   { value: "adaptive", desc: "Borg decides per question." },
 ];
 
+/** The setting that holds the collaboration mode. */
+export const MODE_KEY = "conversation.collaboration_mode";
+
+/** The collaboration modes, for Settings, the composer and the `/` menu. */
+export const MODE_OPTIONS: SettingOption[] = [
+  { value: "execute", desc: "Borg acts. The default." },
+  { value: "plan", desc: "Read-only. Borg proposes, you approve." },
+];
+
 export const basicSettings: BasicSetting[] = [
   {
     id: "name",
@@ -88,12 +97,9 @@ export const basicSettings: BasicSetting[] = [
   },
   {
     id: "mode",
-    key: "conversation.collaboration_mode",
+    key: MODE_KEY,
     name: "Mode",
-    options: [
-      { value: "execute", desc: "Borg acts. The default." },
-      { value: "plan", desc: "Read-only. Borg proposes, you approve." },
-    ],
+    options: MODE_OPTIONS,
   },
   {
     id: "appearance",
