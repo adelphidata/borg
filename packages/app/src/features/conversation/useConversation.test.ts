@@ -38,6 +38,16 @@ describe("reduceEvent — text", () => {
     expect(cells.filter((c) => c.kind === "assistant")).toHaveLength(2);
   });
 
+  it("drops the blank reply a model streams before its first tool call, as a reload would", () => {
+    const cells = fold([
+      { textDelta: { text: "\n\n" } },
+      { usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 } },
+      { toolExecuting: { toolCallId: "t1", name: "fs_read", argsJson: "{}" } },
+      { textDelta: { text: "done" } },
+    ]);
+    expect(cells.map((c) => c.kind)).toEqual(["usage", "tool", "assistant"]);
+  });
+
   it("turns the marker a failed stream sends live into a notice, as a reload would", () => {
     // `finish_text_only_turn` streams the marker as a delta of its own.
     const cells = fold([

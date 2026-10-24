@@ -140,6 +140,19 @@ export interface PlanStep {
   status: string;
 }
 
+/**
+ * Drops a reply that holds only whitespace. A model often streams a newline or
+ * two before its first tool call, then reports that call's usage; a reload
+ * skips such a row, so live does too.
+ */
+function dropBlankAssistant(cells: Cell[]): Cell[] {
+  let i = cells.length - 1;
+  while (i >= 0 && cells[i]!.kind === "usage") i -= 1;
+  const reply = cells[i];
+  if (reply?.kind !== "assistant" || reply.text.trim() !== "") return cells;
+  return [...cells.slice(0, i), ...cells.slice(i + 1)];
+}
+
 function appendAssistant(cells: Cell[], text: string, now: number): Cell[] {
   const last = cells[cells.length - 1];
   if (last && last.kind === "assistant") {
@@ -265,7 +278,7 @@ export function reduceEvent(
   }
   if (event.toolExecuting) {
     return [
-      ...base,
+      ...dropBlankAssistant(base),
       {
         kind: "tool",
         id: event.toolExecuting.toolCallId,
