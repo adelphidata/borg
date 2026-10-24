@@ -605,7 +605,8 @@ fn display_cron_5field(expr: &str) -> String {
 }
 
 /// The zone that `borg cron add` stores when the zone of the host is not
-/// known. A cron schedule with this value runs in UTC.
+/// known. A cron schedule with this value runs on the clock of the host,
+/// read from the system offset rather than a zone name.
 const CRON_JOB_FALLBACK_TIMEZONE: &str = "local";
 
 /// The zone that `borg cron add` stores: the IANA zone of the host, so that
@@ -619,7 +620,9 @@ fn cron_job_timezone() -> String {
 
 fn cron_job_timezone_from(host_zone: Option<String>) -> String {
     host_zone.unwrap_or_else(|| {
-        tracing::warn!("the timezone of the host is not known; the cron job will run in UTC");
+        tracing::warn!(
+            "the timezone name of the host is not known; the cron job will run on the system clock"
+        );
         CRON_JOB_FALLBACK_TIMEZONE.to_string()
     })
 }
@@ -819,20 +822,24 @@ mod tests {
         );
         assert_eq!(cron_job_timezone_from(None), CRON_JOB_FALLBACK_TIMEZONE);
 
-        // 08:00 in Tokyo is 23:00 UTC. The fallback runs at 08:00 UTC.
-        let hour_utc = |zone: &str| {
-            use chrono::Timelike;
+        // 08:00 in Tokyo is 23:00 UTC. The fallback runs at 08:00 on the
+        // system clock of the host.
+        use chrono::Timelike;
+        let next_run = |zone: &str| {
             let ts = cortex::tasks::calculate_next_run("cron", "0 0 8 * * * *", zone)
                 .expect("resolves")
                 .expect("has a next run");
-            chrono::DateTime::from_timestamp(ts, 0)
-                .expect("valid timestamp")
-                .hour()
+            chrono::DateTime::from_timestamp(ts, 0).expect("valid timestamp")
         };
         assert_eq!(
-            hour_utc(&cron_job_timezone_from(Some("Asia/Tokyo".to_string()))),
+            next_run(&cron_job_timezone_from(Some("Asia/Tokyo".to_string()))).hour(),
             23
         );
-        assert_eq!(hour_utc(&cron_job_timezone_from(None)), 8);
+        assert_eq!(
+            next_run(&cron_job_timezone_from(None))
+                .with_timezone(&chrono::Local)
+                .hour(),
+            8
+        );
     }
 }
