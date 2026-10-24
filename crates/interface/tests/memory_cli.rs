@@ -8,8 +8,9 @@
 //! not be found until the nightly repair sweep re-indexed it.
 //!
 //! The embedding cache is seeded with a vector for each piece of text the
-//! write embeds, so indexing never reaches the network. Daemon auto-start goes
-//! to a stub that exits at once, so no real `borgd` starts.
+//! write embeds, so indexing never reaches the network. No real `borgd`
+//! starts: auto-start goes to a stub that exits at once, and
+//! `BORG_ACP_NO_AUTOSPAWN` stops `connect_or_spawn` from starting one.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -22,6 +23,7 @@ fn borg(home: &std::path::Path, stub: &std::path::Path, args: &[&str]) -> String
         .args(args)
         .env("BORG_HOME", home)
         .env("BORG_DAEMON_BIN", stub)
+        .env("BORG_ACP_NO_AUTOSPAWN", "1")
         .env("BORG_KEK_PASSPHRASE", "memory-cli-test-passphrase")
         .env(KEY_ENV, "not-a-real-key")
         .output()
