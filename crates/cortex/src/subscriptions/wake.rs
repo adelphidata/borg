@@ -10,10 +10,13 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use tokio::sync::Notify;
 
+use crate::config::SubscriptionsConfig;
+
 static WAKE: OnceLock<Arc<Notify>> = OnceLock::new();
 static TAPPED_CHANNELS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 static STORM_NOTICES: OnceLock<Mutex<Vec<StormNotice>>> = OnceLock::new();
 static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static LIVE_SETTINGS: OnceLock<RwLock<Option<SubscriptionsConfig>>> = OnceLock::new();
 
 /// Distinct subscriptions remembered as "seen" between two drains.
 const MAX_SEEN: usize = 256;
@@ -132,9 +135,52 @@ pub fn is_channel_tapped(channel: &str) -> bool {
     }
 }
 
+fn live() -> &'static RwLock<Option<SubscriptionsConfig>> {
+    LIVE_SETTINGS.get_or_init(|| RwLock::new(None))
+}
+
+/// Publish the daemon's current `subscriptions.*` settings. The gateway is
+/// built once from the settings it started with and a settings change does
+/// not rebuild it, so the endpoint and the channel tap read these instead.
+/// The dispatcher publishes on every pass and on every settings change.
+pub fn set_live_settings(settings: &SubscriptionsConfig) {
+    let next = Some(settings.clone());
+    match live().write() {
+        Ok(mut guard) => *guard = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+/// The settings last published by [`set_live_settings`]. `None` before the
+/// dispatcher runs (a gateway on its own, tests): the caller keeps its own.
+pub fn live_settings() -> Option<SubscriptionsConfig> {
+    match live().read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_settings_are_the_last_ones_published() {
+        let mut settings = SubscriptionsConfig {
+            enabled: false,
+            ingest_burst: 7,
+            ..Default::default()
+        };
+        set_live_settings(&settings);
+        let live = live_settings().expect("published");
+        assert_eq!((live.enabled, live.ingest_burst), (false, 7));
+        settings.enabled = true;
+        set_live_settings(&settings);
+        assert!(
+            live_settings().expect("published").enabled,
+            "replaced, not kept"
+        );
+    }
 
     #[test]
     fn tapped_channel_set_is_replaced_not_merged() {

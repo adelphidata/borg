@@ -23,6 +23,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use cortex::config::SubscriptionsConfig;
 use cortex::db::{Database, IngestLimits, InsertOutcome, NewSubscriptionEvent, SubscriptionRow};
 use cortex::security::secrets_resolve::SecretRef;
 use cortex::subscriptions::filter::{EventView, Filter};
@@ -52,12 +53,29 @@ const SECRET_TTL: Duration = Duration::from_secs(60);
 pub struct EventsState {
     /// Opens a DB connection per request.
     pub db_open: crate::DbOpener,
-    /// `subscriptions.enabled` when the router was built.
+    /// `subscriptions.enabled` when the router was built. This and the two
+    /// below give way to the daemon's live settings; see [`EventsState::under`].
     pub enabled: bool,
     /// The ingest budget.
     pub limits: IngestLimits,
     /// Bytes of payload stored.
     pub payload_max_bytes: usize,
+}
+
+impl EventsState {
+    /// This state under the daemon's current settings. The router is built
+    /// once, when the gateway starts, and a settings change does not rebuild
+    /// it, so turning subscriptions off or on, or changing a limit, reaches
+    /// the endpoint through `live`. Without it (a gateway on its own) the
+    /// copy taken at build time stands.
+    fn under(mut self, live: Option<&SubscriptionsConfig>) -> Self {
+        if let Some(live) = live {
+            self.enabled = live.enabled;
+            self.limits = ingest::limits(live);
+            self.payload_max_bytes = live.payload_max_bytes;
+        }
+        self
+    }
 }
 
 /// Build the router.
@@ -259,6 +277,7 @@ async fn events_handler(
             &format!("The body is larger than {MAX_BODY_BYTES} bytes."),
         );
     }
+    let state = state.under(wake::live_settings().as_ref());
     if !state.enabled {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -563,6 +582,32 @@ mod tests {
             payload_max_bytes: 64 * 1024,
         };
         (router(state), db, sub.id, tmp)
+    }
+
+    #[test]
+    fn the_daemons_live_settings_replace_the_copy_taken_at_build() {
+        let opener: crate::DbOpener =
+            Arc::new(|| Box::pin(async { Err(anyhow::anyhow!("not opened")) }));
+        let built = EventsState {
+            db_open: opener,
+            enabled: true,
+            limits: TEST_LIMITS,
+            payload_max_bytes: 10,
+        };
+        let live = SubscriptionsConfig {
+            enabled: false,
+            ingest_burst: 7,
+            payload_max_bytes: 99,
+            ..Default::default()
+        };
+        let under = built.clone().under(Some(&live));
+        assert!(!under.enabled, "turned off after the gateway started");
+        assert_eq!(under.limits.per_minute, 7);
+        assert_eq!(under.payload_max_bytes, 99);
+        let own = built.under(None);
+        assert!(own.enabled);
+        assert_eq!(own.limits.per_minute, TEST_LIMITS.per_minute);
+        assert_eq!(own.payload_max_bytes, 10);
     }
 
     fn post(id: &str, headers: &[(&str, &str)], body: &str) -> Request<Body> {

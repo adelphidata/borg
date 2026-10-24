@@ -12,6 +12,9 @@
 //! 4. Auth through the assembled stack: a paused subscription keeps
 //!    nothing, a redelivery is a duplicate, a wrong key or a forged GitHub
 //!    signature is refused, and GitHub's `ping` passes without a run.
+//! 5. The gateway keeps the settings it started with, so turning
+//!    subscriptions off in the app leaves the endpoint storing events, and
+//!    turning them on leaves it refusing them, until a restart.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -188,6 +191,67 @@ async fn a_webhook_event_wakes_borg_in_the_subscription_session() {
     assert_eq!(runs.len(), 1, "one event, one run: {runs:?}");
 
     stop.cancel();
+    h.shutdown().await;
+}
+
+/// Wait until the dispatcher has published `enabled` to the gateway.
+async fn live_enabled_is(enabled: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while cortex::subscriptions::wake::live_settings().map(|s| s.enabled) != Some(enabled) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dispatcher did not publish enabled={enabled} well before its 15 s tick"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_subscriptions_switch_reaches_a_gateway_that_is_already_running() {
+    // The gateway is built with subscriptions on.
+    let h = common::boot_gateway(true).await;
+    let db = Database::open().await.unwrap();
+    let (id, key) = subscription(&db, "custom").await;
+    manage::set_active(&db, &id, true).await.unwrap();
+    common::register_stub_for_session(
+        &cortex::subscriptions::session_key(&id),
+        vec![
+            AgentEvent::TextDelta("Checked.".into()),
+            AgentEvent::TurnComplete,
+        ],
+    );
+    let url = h.url(&format!("/v1/events/{id}"));
+    let bearer = format!("Bearer {key}");
+    let auth = [("authorization", bearer.as_str())];
+
+    let mut off = Config::default();
+    off.subscriptions.enabled = false;
+    let (tx, rx) = tokio::sync::watch::channel(off);
+    let cancel = CancellationToken::new();
+    let run = borgd::subscriptions::run_dispatcher(
+        common::shared_executor(),
+        rx,
+        SubscriptionBus::new(),
+        cancel.clone(),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let dispatcher = tokio::spawn(run);
+
+    live_enabled_is(false).await;
+    let (code, reply) = post(&url, &auth, r#"{"id":"while-off"}"#).await;
+    assert_eq!(code, 503, "turned off in the app: {reply}");
+
+    tx.send_replace(Config::default());
+    live_enabled_is(true).await;
+    let (code, reply) = post(&url, &auth, r#"{"id":"while-on"}"#).await;
+    assert_eq!(code, 202, "turned back on: {reply}");
+    let event_id = reply["event_id"].as_str().expect("event id").to_string();
+    assert_eq!(finished(&db, &event_id).await.status, "succeeded");
+    let events = db.list_subscription_events(&id, 10).await.unwrap();
+    assert_eq!(events.len(), 1, "nothing was kept while off: {events:?}");
+
+    cancel.cancel();
+    dispatcher.await.unwrap().unwrap();
     h.shutdown().await;
 }
 

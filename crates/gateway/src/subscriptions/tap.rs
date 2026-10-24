@@ -36,6 +36,17 @@ const BUSY_TIMEOUT_MS: u64 = 2_000;
 static SLOTS: Semaphore = Semaphore::const_new(MAX_IN_FLIGHT);
 static LAST_FULL_WARN: AtomicI64 = AtomicI64::new(0);
 
+/// `config` with the daemon's live `subscriptions.*` settings when it
+/// publishes them: the gateway keeps the settings it started with, so a
+/// change made later reaches the tap only this way.
+fn under_live(config: &Config, live: Option<cortex::config::SubscriptionsConfig>) -> Config {
+    let mut config = config.clone();
+    if let Some(live) = live {
+        config.subscriptions = live;
+    }
+    config
+}
+
 /// Copy `inbound` to matching channel subscriptions, in the background.
 ///
 /// `config` is the route-resolved config (binding overrides applied), the
@@ -49,7 +60,11 @@ pub fn on_channel_message(
     session_key: &str,
     config: &Config,
 ) {
-    if !config.subscriptions.enabled || !wake::is_channel_tapped(channel) {
+    if !wake::is_channel_tapped(channel) {
+        return;
+    }
+    let config = under_live(config, wake::live_settings());
+    if !config.subscriptions.enabled {
         return;
     }
     let Ok(permit) = SLOTS.try_acquire() else {
@@ -69,7 +84,7 @@ pub fn on_channel_message(
         session_key: Some(session_key.to_string()),
     };
     let channel = channel.to_string();
-    let config = Arc::new(config.clone());
+    let config = Arc::new(config);
     tokio::spawn(async move {
         let _slot = SlotGuard;
         let db = match Database::open_with_timeout(BUSY_TIMEOUT_MS).await {
@@ -171,6 +186,30 @@ mod tests {
     use super::*;
     use cortex::db::NewSubscription;
     use cortex::pairing::DmPolicy;
+
+    #[test]
+    fn the_daemons_live_settings_win_over_the_ones_the_gateway_started_with() {
+        let mut started = Config::default();
+        started.subscriptions.enabled = false;
+        started.gateway.dm_policy = DmPolicy::Open;
+        let live = cortex::config::SubscriptionsConfig {
+            enabled: true,
+            max_pending: 3,
+            ..Default::default()
+        };
+        let config = under_live(&started, Some(live));
+        assert!(
+            config.subscriptions.enabled,
+            "turned on after the gateway started"
+        );
+        assert_eq!(config.subscriptions.max_pending, 3);
+        assert_eq!(
+            config.gateway.dm_policy,
+            DmPolicy::Open,
+            "only subscriptions.* changes"
+        );
+        assert!(!under_live(&started, None).subscriptions.enabled);
+    }
 
     fn inbound(text: &str, reaction: Option<&str>) -> InboundMessage {
         serde_json::from_value(json!({

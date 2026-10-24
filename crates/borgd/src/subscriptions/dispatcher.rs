@@ -79,9 +79,13 @@ impl Dispatcher {
         let mut cap_logged_at: i64 = 0;
         // Subscriptions whose last run was deferred, until when.
         let mut held_back: HashMap<String, Instant> = HashMap::new();
+        // A settings change starts a pass now, so the gateway's endpoint and
+        // tap hear it at once instead of on the next tick.
+        let mut config_changes = self.config_rx.clone();
         loop {
             liveness.fetch_add(1, Ordering::Relaxed);
             let config = self.config_rx.borrow().clone();
+            wake::set_live_settings(&config.subscriptions);
             self.drain_notices(&db, &config).await;
             match db.tapped_subscription_channels().await {
                 Ok(channels) => wake::set_tapped_channels(channels),
@@ -126,6 +130,7 @@ impl Dispatcher {
                     }
                 }
                 _ = notify.notified() => tokio::time::sleep(DEBOUNCE).await,
+                Ok(()) = config_changes.changed() => {}
                 _ = tokio::time::sleep(TICK) => {}
             }
         }
