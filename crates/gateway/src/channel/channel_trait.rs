@@ -282,15 +282,6 @@ pub async fn dispatch_webhook(
             session_key,
             response_context,
         } => {
-            // Subscriptions see the message before any command handling, so
-            // "react when someone says X" works whether or not Borg replies.
-            crate::subscriptions::tap::on_channel_message(
-                channel.names()[0],
-                channel.bot_mention().as_deref(),
-                &inbound,
-                &session_key,
-                ctx.config,
-            );
             let channel = channel.clone();
             let config = ctx.config.clone();
             let health = ctx.health.clone();

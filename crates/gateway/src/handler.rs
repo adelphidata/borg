@@ -1117,6 +1117,17 @@ async fn invoke_agent_inner(
         .get("addressed_to_bot")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Subscriptions see every message the adapter let through, mentioned or
+    // not, before activation decides whether Borg itself answers. The tap
+    // applies this route's sender check before it stores anything.
+    crate::subscriptions::tap::on_channel_message(
+        channel_name,
+        bot_identifier,
+        pre_addressed,
+        inbound,
+        &build_session_key(inbound, &route.binding_id),
+        config,
+    );
     let (should_respond, cleaned_text) = check_activation(
         &inbound.text,
         inbound.peer_kind.as_deref(),

@@ -89,7 +89,20 @@ pub fn verify(
     if let Some(result) = verify_native(scheme, headers, body, secrets, now_unix) {
         return result;
     }
+    // Once the user pasted the provider's signing secret, its signature is
+    // required: accepting the bare key instead would skip the timestamp
+    // check and let a replayed request through.
+    if scheme.provider_issues_secret() && secrets.signing_secret.is_some() {
+        return Err(AuthError::Missing);
+    }
     verify_key(headers, secrets.key)
+}
+
+/// Whether `ts` is outside the tolerance around `now`. `abs_diff` because
+/// `ts` comes from the sender before the signature is checked: a
+/// subtraction could overflow on a crafted value.
+fn stale(now: i64, ts: i64, tolerance: i64) -> bool {
+    now.abs_diff(ts) > tolerance.unsigned_abs()
 }
 
 /// `None` when the scheme's signature header is absent (fall back to the key).
@@ -162,7 +175,7 @@ fn stripe(secret: &str, sig: &str, body: &[u8], now: i64) -> Result<(), AuthErro
         }
     }
     let ts = ts.ok_or(AuthError::Malformed("Stripe-Signature"))?;
-    if (now - ts).abs() > SIGNATURE_TOLERANCE_SECS {
+    if stale(now, ts, SIGNATURE_TOLERANCE_SECS) {
         return Err(AuthError::Stale);
     }
     let mut signed = format!("{ts}.").into_bytes();
@@ -190,7 +203,7 @@ fn svix(
     let ts: i64 = ts_text
         .parse()
         .map_err(|_| AuthError::Malformed("svix-timestamp"))?;
-    if (now - ts).abs() > SIGNATURE_TOLERANCE_SECS {
+    if stale(now, ts, SIGNATURE_TOLERANCE_SECS) {
         return Err(AuthError::Stale);
     }
     let key = STANDARD
@@ -220,7 +233,9 @@ fn linear_fresh(body: &[u8], now: i64) -> Result<(), AuthError> {
         .ok()
         .and_then(|v| v.get("webhookTimestamp")?.as_i64());
     match ts {
-        Some(ms) if (now * 1000 - ms).abs() > LINEAR_TOLERANCE_MS => Err(AuthError::Stale),
+        Some(ms) if stale(now.saturating_mul(1000), ms, LINEAR_TOLERANCE_MS) => {
+            Err(AuthError::Stale)
+        }
         _ => Ok(()),
     }
 }
@@ -316,6 +331,55 @@ mod tests {
             verify(AuthScheme::Github, &h, b"{}", secrets(None), NOW),
             Err(AuthError::BadSignature)
         );
+    }
+
+    #[test]
+    fn a_pasted_signing_secret_makes_the_signature_required() {
+        let bearer = headers(&[("authorization", format!("Bearer {KEY}"))]);
+        for scheme in [
+            AuthScheme::Stripe,
+            AuthScheme::Sentry,
+            AuthScheme::Pagerduty,
+            AuthScheme::Linear,
+            AuthScheme::Svix,
+        ] {
+            assert_eq!(
+                verify(scheme, &bearer, b"{}", secrets(Some("whsec_x")), NOW),
+                Err(AuthError::Missing),
+                "{scheme:?}"
+            );
+        }
+        // GitHub signs with Borg's own key, so the key stays accepted.
+        assert_eq!(
+            verify(AuthScheme::Github, &bearer, b"{}", secrets(Some("gh")), NOW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn crafted_timestamps_are_stale_not_a_crash() {
+        for t in [i64::MIN, i64::MAX] {
+            let h = headers(&[("stripe-signature", format!("t={t},v1=00"))]);
+            assert_eq!(
+                verify(AuthScheme::Stripe, &h, b"{}", secrets(Some("whsec_x")), NOW),
+                Err(AuthError::Stale)
+            );
+            let svix_h = headers(&[
+                ("svix-id", "msg_1".to_string()),
+                ("svix-timestamp", t.to_string()),
+                ("svix-signature", "v1,AAAA".to_string()),
+            ]);
+            assert_eq!(
+                verify(
+                    AuthScheme::Svix,
+                    &svix_h,
+                    b"{}",
+                    secrets(Some("whsec_eA==")),
+                    NOW
+                ),
+                Err(AuthError::Stale)
+            );
+        }
     }
 
     #[test]

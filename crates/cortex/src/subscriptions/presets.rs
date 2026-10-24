@@ -321,8 +321,9 @@ fn sentry(h: HeaderFn<'_>, v: &Value) -> Normalized {
     };
     Normalized {
         kind: Some(format!("{resource}.{action}")),
-        dedup_key: h("request-id")
-            .or_else(|| s(v, "data.event.event_id"))
+        // From the signed body only: `Request-ID` is a header the signature
+        // does not cover, so a replay could mint a new one at will.
+        dedup_key: s(v, "data.event.event_id")
             .or_else(|| s(v, "data.issue.id").map(|id| format!("{id}:{action}"))),
         summary,
         handshake: resource == "installation",
@@ -420,7 +421,11 @@ fn github(h: HeaderFn<'_>, v: &Value) -> Normalized {
     };
     Normalized {
         kind: Some(kind),
-        dedup_key: h("x-github-delivery"),
+        // None: the endpoint dedups on a hash of the body. GitHub signs only
+        // the body, so `X-GitHub-Delivery` (and the event name) could be
+        // rewritten on a replayed request; a real redelivery is byte-identical
+        // and still lands as a duplicate.
+        dedup_key: None,
         summary,
         handshake: event == "ping",
     }
@@ -447,7 +452,7 @@ fn github_text(v: &Value) -> Option<String> {
     )
 }
 
-fn linear(h: HeaderFn<'_>, v: &Value) -> Normalized {
+fn linear(_: HeaderFn<'_>, v: &Value) -> Normalized {
     let kind = match (s(v, "type"), s(v, "action")) {
         (Some(t), Some(a)) => Some(format!("{}.{a}", t.to_ascii_lowercase())),
         (Some(t), None) => Some(t.to_ascii_lowercase()),
@@ -460,13 +465,10 @@ fn linear(h: HeaderFn<'_>, v: &Value) -> Normalized {
     };
     Normalized {
         kind,
-        dedup_key: h("linear-delivery").or_else(|| {
-            Some(format!(
-                "{}:{}",
-                s(v, "webhookId")?,
-                s(v, "webhookTimestamp")?
-            ))
-        }),
+        // Signed body fields, not the unsigned `Linear-Delivery` header.
+        dedup_key: s(v, "webhookId")
+            .zip(s(v, "webhookTimestamp"))
+            .map(|(id, ts)| format!("{id}:{ts}")),
         summary,
         handshake: false,
     }
@@ -936,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn github_pull_request_maps_kind_summary_and_delivery_id() {
+    fn github_pull_request_maps_kind_and_summary() {
         let p = get("github").unwrap();
         let h = headers(&[
             ("X-GitHub-Event", "pull_request"),
@@ -944,7 +946,10 @@ mod tests {
         ]);
         let n = p.normalize(&h, &p.sample());
         assert_eq!(n.kind.as_deref(), Some("pull_request.opened"));
-        assert_eq!(n.dedup_key.as_deref(), Some("d-1"));
+        assert_eq!(
+            n.dedup_key, None,
+            "the endpoint dedups GitHub on the signed body"
+        );
         assert_eq!(
             n.summary,
             "PR #42 opened: Fix login redirect loop (octo/app)"
@@ -1026,10 +1031,17 @@ mod tests {
                 "{id}"
             );
         }
+        // Unsigned headers never pick the dedup key: a replay could mint a
+        // new one at will.
         let sentry = get("sentry").unwrap();
-        let with_request_id =
-            sentry.normalize(&headers(&[("Request-ID", "r-9")]), &sentry.sample());
-        assert_eq!(with_request_id.dedup_key.as_deref(), Some("r-9"));
+        let replayed = sentry.normalize(&headers(&[("Request-ID", "r-9")]), &sentry.sample());
+        assert_eq!(replayed.dedup_key.as_deref(), Some("4501:created"));
+        let linear = get("linear").unwrap();
+        let replayed = linear.normalize(&headers(&[("Linear-Delivery", "new")]), &linear.sample());
+        assert_eq!(
+            replayed.dedup_key.as_deref(),
+            Some("000042e3:1792800000000")
+        );
     }
 
     #[test]
