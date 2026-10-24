@@ -342,7 +342,7 @@ async fn events_handler(
         }
         return not_accepted(
             &sub.status,
-            "This subscription paused itself after a burst, so the event was not kept. Resume it in Borg.",
+            "This subscription paused itself, so the event was not kept. Resume it in Borg.",
         );
     }
 

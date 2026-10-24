@@ -124,7 +124,7 @@ impl Source {
 pub mod status {
     /// Events are accepted and run.
     pub const ACTIVE: &str = "active";
-    /// The user paused it; the endpoint answers 409.
+    /// The user paused it; the endpoint keeps no event (200, not accepted).
     pub const PAUSED: &str = "paused";
     /// It paused itself after a burst or a run of failures; only a
     /// deliberate resume clears it.

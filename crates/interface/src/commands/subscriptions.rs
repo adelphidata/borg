@@ -93,7 +93,7 @@ fn status_words(status: &str) -> &str {
     match status {
         "active" => "on",
         "paused" => "paused",
-        "storm" => "paused itself after a burst",
+        "storm" => "paused itself",
         other => other,
     }
 }
@@ -191,11 +191,7 @@ mod tests {
         failed.last_run_status = "failed".into();
         failed.last_event_at_unix = 1_700_000_000;
         let lines = list_lines(&[sub("sub_a", "Sentry errors", "storm"), failed]);
-        assert!(
-            lines[1].contains("paused itself after a burst"),
-            "{}",
-            lines[1]
-        );
+        assert!(lines[1].contains("paused itself"), "{}", lines[1]);
         assert!(
             lines[1].trim_end().ends_with('-'),
             "no event yet: {}",
