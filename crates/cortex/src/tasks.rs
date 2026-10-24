@@ -343,8 +343,10 @@ fn resolve_schedule_zone(timezone: &str) -> ScheduleZone {
 ///
 /// `timezone` applies to cron and one-shot schedules: an IANA zone name
 /// (e.g. `"America/New_York"`) reads the wall-clock times in that zone,
-/// `"UTC"` in UTC, and `""` / `"local"` in the host's zone — so the
-/// built-in "daily at 03:00" runs at 03:00 on the user's clock. An
+/// `"UTC"` in UTC, and `"local"` in the host's zone — so the built-in
+/// "daily at 03:00" runs at 03:00 on the user's clock. A cron row with `""`
+/// keeps the UTC it always ran in: nothing writes `""` now, and moving old
+/// rows by the host's offset would shift them without notice. An
 /// unparseable zone falls back to the host's zone with a `tracing::warn!`.
 pub fn calculate_next_run(
     schedule_type: &str,
@@ -354,7 +356,12 @@ pub fn calculate_next_run(
     match schedule_type {
         SCHEDULE_TYPE_CRON => {
             let schedule = parse_cron_schedule(schedule_expr)?;
-            let next = match resolve_schedule_zone(timezone) {
+            let zone = if timezone.is_empty() {
+                ScheduleZone::Utc
+            } else {
+                resolve_schedule_zone(timezone)
+            };
+            let next = match zone {
                 ScheduleZone::Named(tz) => schedule.upcoming(tz).next().map(|t| t.timestamp()),
                 ScheduleZone::Utc => schedule.upcoming(Utc).next().map(|t| t.timestamp()),
                 ScheduleZone::Local => schedule.upcoming(Local).next().map(|t| t.timestamp()),
@@ -1280,19 +1287,25 @@ mod tests {
     #[test]
     fn cron_wall_clock_is_read_in_the_named_zone() {
         // The built-in tasks are stored as "local": "daily at 03:00" must run
-        // at 03:00 on the host's clock, not at 03:00 UTC. "" means the same;
-        // an explicit "UTC" and an IANA name keep their own zone.
+        // at 03:00 on the host's clock, not at 03:00 UTC. An explicit "UTC",
+        // an old row with "", and an IANA name keep their own zone.
         use chrono::Timelike;
         let hour_in = |tz: &str| {
             calculate_next_run("cron", "0 0 3 * * *", tz)
                 .unwrap()
                 .unwrap()
         };
-        for tz in ["local", "Local", ""] {
+        for tz in ["local", "Local"] {
             let at = Local.timestamp_opt(hour_in(tz), 0).unwrap();
             assert_eq!(at.hour(), 3, "{tz:?} must fire at 03:00 host time");
         }
-        assert_eq!(Utc.timestamp_opt(hour_in("UTC"), 0).unwrap().hour(), 3);
+        for tz in ["UTC", ""] {
+            assert_eq!(
+                Utc.timestamp_opt(hour_in(tz), 0).unwrap().hour(),
+                3,
+                "{tz:?}"
+            );
+        }
         let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
         assert_eq!(
             tokyo
