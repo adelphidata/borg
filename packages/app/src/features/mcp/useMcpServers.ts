@@ -1,4 +1,5 @@
 import type { admin } from "@borg/client";
+import { useEffect } from "react";
 import { useMutation, useQuery, type QueryResult } from "../../lib/useDaemon";
 
 /** The transports a server can speak, in the order the form offers them. */
@@ -132,6 +133,23 @@ export function emptySpec(transport: Transport = "stdio"): admin.McpServerSpec {
   };
 }
 
+/** How often the list refetches while a server is still coming up. */
+export const SETTLE_POLL_MS = 1500;
+
+/**
+ * True while an enabled server has not reached a resting state yet: the
+ * daemon starts servers in the background after a write, so the label would
+ * otherwise sit on "Not started" until the page is reloaded.
+ */
+export function settling(list: admin.McpServerList | undefined): boolean {
+  if (!list?.mcpEnabled) return false;
+  return list.servers.some(
+    (s) =>
+      (s.spec?.enabled ?? true) &&
+      (s.state === "not-started" || s.state === "starting" || s.state === "reconnecting"),
+  );
+}
+
 export interface McpServers {
   query: QueryResult<admin.McpServerList>;
   /** Create (or with `overwrite`, replace) a server from a spec. */
@@ -159,6 +177,14 @@ export interface McpServers {
 export function useMcpServers(deps: unknown[] = []): McpServers {
   const query = useQuery((borg) => borg.admin.listMcpServers({}), deps);
   const refresh = { onSuccess: () => query.refetch() };
+
+  const { refetch } = query;
+  const busy = settling(query.data);
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(refetch, SETTLE_POLL_MS);
+    return () => clearInterval(id);
+  }, [busy, refetch]);
 
   const put = useMutation(
     (

@@ -3,6 +3,7 @@ import {
   formatKeyValues,
   joinCommandLine,
   parseKeyValues,
+  settling,
   splitCommandLine,
   stateTone,
   stateWords,
@@ -80,5 +81,26 @@ describe("state vocabulary", () => {
     // An unknown label is shown as the daemon sent it rather than hidden.
     expect(stateWords("something-new")).toBe("something-new");
     expect(stateTone({ state: "something-new" })).toBe("idle");
+  });
+});
+
+describe("settling", () => {
+  const entry = (state: string, enabled = true) =>
+    ({ name: state, state, spec: { enabled } }) as never;
+  const list = (mcpEnabled: boolean, ...servers: never[]) => ({ mcpEnabled, servers }) as never;
+
+  it("is true while an enabled server is still coming up", () => {
+    for (const state of ["not-started", "starting", "reconnecting"]) {
+      expect(settling(list(true, entry("connected"), entry(state)))).toBe(true);
+    }
+  });
+
+  it("is false once every server rests, when MCP is off, or for a switched-off server", () => {
+    expect(settling(undefined)).toBe(false);
+    expect(settling(list(true, entry("connected"), entry("degraded"), entry("auth-failed")))).toBe(
+      false,
+    );
+    expect(settling(list(false, entry("not-started")))).toBe(false);
+    expect(settling(list(true, entry("not-started", false)))).toBe(false);
   });
 });
