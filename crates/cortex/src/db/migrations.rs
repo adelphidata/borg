@@ -264,6 +264,21 @@ impl Database {
         Ok(())
     }
 
+    /// Subscriptions (`subscriptions`, `subscription_events`). The tables are
+    /// in `SCHEMA_SQL`, and `migrate_v1` re-emits that baseline whenever the
+    /// stamp moves, so an existing database gains them on this bump; this
+    /// step only asserts they arrived, so a squash that drops them fails here
+    /// instead of at the first webhook.
+    pub(super) async fn migrate_v8(&self) -> Result<()> {
+        for table in ["subscriptions", "subscription_events"] {
+            anyhow::ensure!(
+                self.table_exists(table).await?,
+                "migration v8: `{table}` missing after the baseline"
+            );
+        }
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -285,6 +300,18 @@ impl Database {
             }
         }
         changed
+    }
+
+    /// Whether a table named `table` exists.
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params!(table),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     /// Whether `table` currently has a column named `column`.
@@ -1237,6 +1264,56 @@ CREATE TABLE IF NOT EXISTS webhook_definitions (
     revoked_at   INTEGER
 );
 
+-- Subscriptions: outside events that wake the agent -----------------------
+-- `subscription_events` is the durable queue: a producer inserts a `pending`
+-- row and pokes the dispatcher; nothing about the event lives only in memory.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    auth_scheme         TEXT NOT NULL,
+    secret_ref          TEXT,
+    signing_secret_ref  TEXT,
+    filter              TEXT NOT NULL DEFAULT '{{}}',
+    instruction         TEXT NOT NULL,
+    delivery_channel    TEXT,
+    delivery_target     TEXT,
+    status              TEXT NOT NULL DEFAULT 'paused',
+    rate_limit_per_hour INTEGER NOT NULL,
+    timeout_secs        INTEGER NOT NULL,
+    dropped_count       INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    last_event_at       INTEGER,
+    last_run_status     TEXT,
+    last_error          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS subscription_events (
+    id                TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    kind              TEXT,
+    dedup_key         TEXT,
+    summary           TEXT NOT NULL,
+    payload           TEXT NOT NULL,
+    payload_truncated INTEGER NOT NULL DEFAULT 0,
+    origin            TEXT,
+    status            TEXT NOT NULL,
+    run_id            TEXT,
+    received_at       INTEGER NOT NULL,
+    started_at        INTEGER,
+    finished_at       INTEGER,
+    duration_ms       INTEGER,
+    result            TEXT,
+    error             TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_events_dedup
+    ON subscription_events(subscription_id, dedup_key) WHERE dedup_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sub_events_sub_time
+    ON subscription_events(subscription_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sub_events_status ON subscription_events(status);
+
 CREATE TABLE IF NOT EXISTS providers (
     id              TEXT PRIMARY KEY,
     category        TEXT NOT NULL,
@@ -1571,6 +1648,9 @@ mod tests {
             "memory_entries",
             "goals",
             "goal_gates",
+            "subscriptions",
+            "subscription_events",
+            "idx_sub_events_dedup",
             "apns_device_tokens",
             "apns_device_tokens_active",
             "idx_sessions_created_at",
@@ -1594,6 +1674,28 @@ mod tests {
             Database::CURRENT_VERSION
         );
         db.run_migrations().await.unwrap();
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION
+        );
+    }
+
+    /// A v7 database has no subscription tables. The bump must add them,
+    /// or the first webhook fails with "no such table" on every existing
+    /// install while fresh test databases pass.
+    #[tokio::test]
+    async fn a_v7_database_gains_the_subscription_tables() {
+        let db = Database::test_db().await;
+        db.conn
+            .execute_batch("DROP TABLE subscription_events; DROP TABLE subscriptions;")
+            .await
+            .expect("drop to simulate a v7 database");
+        db.set_meta("schema_version", "7").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        assert!(db.table_exists("subscriptions").await.unwrap());
+        assert!(db.table_exists("subscription_events").await.unwrap());
         assert_eq!(
             db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION

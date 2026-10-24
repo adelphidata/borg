@@ -24,6 +24,7 @@ mod session_heartbeat;
 mod sessions;
 mod settings;
 mod skill_audit;
+mod subscriptions;
 mod tasks;
 mod usage;
 mod vitals;
@@ -46,6 +47,10 @@ pub use redaction_audit::RedactionAuditRow;
 pub use session_heartbeat::{SessionHeartbeat, MIN_HEARTBEAT_INTERVAL_SECS};
 pub use sessions::{MessageFtsHit, SessionEventDraft};
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
+pub use subscriptions::{
+    IngestLimits, InsertOutcome, NewSubscription, NewSubscriptionEvent, SubscriptionEventRow,
+    SubscriptionRow, SubscriptionUpdate,
+};
 pub use vitals::PendingCelebration;
 pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};
 
@@ -1182,7 +1187,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 7;
+    const CURRENT_VERSION: u32 = 8;
 
     /// True when the stamp matches this binary exactly, so migrations can be
     /// skipped.
@@ -1261,8 +1266,9 @@ impl Database {
         self.migrate_v5().await?;
         self.migrate_v6().await?;
         self.migrate_v7().await?;
+        self.migrate_v8().await?;
         const _: () = assert!(
-            Database::CURRENT_VERSION == 7,
+            Database::CURRENT_VERSION == 8,
             "add the new migrate_vN call above and bump this constant",
         );
 
