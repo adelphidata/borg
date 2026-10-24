@@ -6,6 +6,7 @@
 //! poke the dispatcher in `borgd`, which runs the agent.
 
 pub mod routes;
+pub mod tap;
 pub mod verify;
 
 pub use routes::{router, EventsState, ENDPOINT_PREFIX};
