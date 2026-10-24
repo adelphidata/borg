@@ -1088,7 +1088,7 @@ pub struct ConversationConfig {
     pub compaction_marker_tokens: usize,
     /// Maximum characters from the transcript sent to the LLM summarizer.
     pub max_transcript_chars: usize,
-    /// Active collaboration mode (default, execute, or plan).
+    /// Active collaboration mode (execute or plan).
     #[serde(default)]
     pub collaboration_mode: CollaborationMode,
     /// When true, progressively degrade old tool results to save tokens.

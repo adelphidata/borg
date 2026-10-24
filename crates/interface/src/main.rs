@@ -105,7 +105,8 @@ enum Commands {
         /// Output raw JSON instead of streaming text
         #[arg(long, short)]
         json: bool,
-        /// Collaboration mode: default, execute, plan
+        /// Switch the collaboration mode (execute or plan) before the message
+        /// is sent. Like /mode, it applies to every session.
         #[arg(long, short)]
         mode: Option<String>,
     },

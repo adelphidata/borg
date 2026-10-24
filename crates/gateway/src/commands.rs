@@ -357,9 +357,9 @@ pub async fn try_handle_command(
         Command::Voice => handle_voice(db, config, channel_name, channel_id, args).await,
         // Handled out-of-band in the caller; see `is_cancel_command`.
         Command::Cancel => return None,
-        Command::Mode => handle_mode(db, config, session_id, args).await,
+        Command::Mode => handle_mode(db, config, args).await,
         Command::Plan => {
-            return handle_plan(db, session_id, args).await;
+            return handle_plan(db, args).await;
         }
         Command::Compact => handle_compact(db, session_id, args).await,
         Command::Undo => handle_undo(db, session_id).await,
@@ -537,28 +537,30 @@ fn format_doctor_report(report: &cortex::doctor::DiagnosticReport) -> String {
     lines.join("\n")
 }
 
-async fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> String {
-    let mode_key = format!("gw:mode:{session_id}");
+/// The setting `/mode` and `/plan` change. Every client reads the same one,
+/// so a chat switch applies to the TUI and the apps too.
+const MODE_KEY: &str = "conversation.collaboration_mode";
+
+/// Store `mode` and push it to the running agents, so the next turn uses it.
+async fn store_mode(db: &Database, mode: cortex::config::CollaborationMode) -> anyhow::Result<()> {
+    db.set_setting(MODE_KEY, &mode.to_string()).await?;
+    cortex::config_watcher::reload_now().await;
+    Ok(())
+}
+
+async fn handle_mode(db: &Database, config: &Config, args: &str) -> String {
     if args.is_empty() {
-        let current = db
-            .get_setting(&mode_key)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| config.conversation.collaboration_mode.to_string());
-        return format!("Collaboration mode: {current}\nUsage: /mode <default|execute|plan>");
+        let current = config.conversation.collaboration_mode;
+        return format!("Collaboration mode: {current}\nUsage: /mode <execute|plan>");
     }
-    let mode = args.trim().to_ascii_lowercase();
-    match mode.as_str() {
-        "default" | "execute" | "plan" => {
-            if let Err(e) = db.set_setting(&mode_key, &mode).await {
-                warn!("Failed to set mode: {e}");
-                return "Failed to set mode.".to_string();
-            }
-            format!("Switched to {mode} mode.")
-        }
-        _ => "Invalid mode. Choose: default, execute, plan".to_string(),
+    let Ok(mode) = args.trim().parse::<cortex::config::CollaborationMode>() else {
+        return "Invalid mode. Choose: execute, plan".to_string();
+    };
+    if let Err(e) = store_mode(db, mode).await {
+        warn!("Failed to set mode: {e}");
+        return "Failed to set mode.".to_string();
     }
+    format!("Switched to {mode} mode for all conversations.")
 }
 
 async fn handle_voice(
@@ -775,17 +777,15 @@ async fn dispatch_voice_channel_via_handle(
 
 /// Handle `/plan [message]`. Returns `Some(response)` for bare `/plan`,
 /// `None` for `/plan <message>` (pass-through to agent after setting mode).
-async fn handle_plan(db: &Database, session_id: &str, args: &str) -> Option<String> {
-    let mode_key = format!("gw:mode:{session_id}");
-    if let Err(e) = db.set_setting(&mode_key, "plan").await {
+async fn handle_plan(db: &Database, args: &str) -> Option<String> {
+    if let Err(e) = store_mode(db, cortex::config::CollaborationMode::Plan).await {
         warn!("Failed to set plan mode: {e}");
         return Some("Failed to enter plan mode.".to_string());
     }
     if args.is_empty() {
         Some("Entered plan mode. Send your message to begin planning.".to_string())
     } else {
-        // Pass through to agent — the mode override in handler.rs will
-        // pick up the setting we just wrote.
+        // Pass through: the agent reloads the stored mode at turn start.
         None
     }
 }
@@ -1693,33 +1693,30 @@ mod tests {
     async fn handle_mode_shows_sets_and_validates() {
         let db = gateway_test_db().await;
         let config = Config::default();
-        let sid = "mode-session";
 
-        let show = handle_mode(&db, &config, sid, "").await;
+        let show = handle_mode(&db, &config, "").await;
         assert!(show.starts_with("Collaboration mode: "), "{show}");
-        assert!(
-            show.contains("Usage: /mode <default|execute|plan>"),
-            "{show}"
-        );
+        assert!(show.contains("Usage: /mode <execute|plan>"), "{show}");
 
         assert_eq!(
-            handle_mode(&db, &config, sid, "plan").await,
-            "Switched to plan mode."
+            handle_mode(&db, &config, "plan").await,
+            "Switched to plan mode for all conversations."
         );
+        // The setting every agent reads, not a per-chat key nothing reads.
         assert_eq!(
-            db.get_setting("gw:mode:mode-session")
-                .await
-                .unwrap()
-                .as_deref(),
+            db.get_setting(MODE_KEY).await.unwrap().as_deref(),
             Some("plan")
         );
-        // The show path must now reflect the DB override, not the config.
-        let show = handle_mode(&db, &config, sid, "").await;
-        assert!(show.starts_with("Collaboration mode: plan"), "{show}");
 
+        for bad in ["yolo", "default"] {
+            assert_eq!(
+                handle_mode(&db, &config, bad).await,
+                "Invalid mode. Choose: execute, plan"
+            );
+        }
         assert_eq!(
-            handle_mode(&db, &config, sid, "yolo").await,
-            "Invalid mode. Choose: default, execute, plan"
+            db.get_setting(MODE_KEY).await.unwrap().as_deref(),
+            Some("plan")
         );
     }
 
@@ -1767,27 +1764,22 @@ mod tests {
         let db = gateway_test_db().await;
 
         // Bare /plan: respond directly, mode persisted.
-        let out = handle_plan(&db, "plan-session", "").await;
+        let out = handle_plan(&db, "").await;
         assert_eq!(
             out.as_deref(),
             Some("Entered plan mode. Send your message to begin planning.")
         );
         assert_eq!(
-            db.get_setting("gw:mode:plan-session")
-                .await
-                .unwrap()
-                .as_deref(),
+            db.get_setting(MODE_KEY).await.unwrap().as_deref(),
             Some("plan")
         );
 
         // /plan <message>: mode persisted, message passes through (None).
-        let out = handle_plan(&db, "plan-session2", "design the schema").await;
+        db.set_setting(MODE_KEY, "execute").await.unwrap();
+        let out = handle_plan(&db, "design the schema").await;
         assert!(out.is_none(), "with a message /plan must pass through");
         assert_eq!(
-            db.get_setting("gw:mode:plan-session2")
-                .await
-                .unwrap()
-                .as_deref(),
+            db.get_setting(MODE_KEY).await.unwrap().as_deref(),
             Some("plan")
         );
     }

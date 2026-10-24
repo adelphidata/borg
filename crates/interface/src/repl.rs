@@ -61,13 +61,25 @@ pub(crate) fn runtime_degradation_warnings(config: &Config) -> Vec<String> {
 pub async fn one_shot(
     message: &str,
     json_output: bool,
-    _mode: Option<&str>,
+    mode: Option<&str>,
     workspace: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    // Checked before the daemon is reached, so a typo costs no turn.
+    let mode = mode
+        .map(str::parse::<cortex::config::CollaborationMode>)
+        .transpose()?;
     let client = connect_or_spawn()
         .await
         .context("connect to borgd for one-shot")?;
     let mut session_client = client.clone();
+    if let Some(mode) = mode {
+        // The daemon's tool gate reads only its own settings, so the switch
+        // goes through it, the same way the TUI's /mode does.
+        session_client
+            .set_setting("conversation.collaboration_mode", &mode.to_string())
+            .await
+            .context("switch the collaboration mode")?;
+    }
     let (session_id, _last_seq) = session_client
         .open_session_with_workspace(None, workspace.as_deref(), None, false)
         .await
@@ -267,6 +279,19 @@ mod drain_one_shot_tests {
             category: "budget".to_string(),
             text: "Warning: 90% of monthly token budget used".to_string(),
         }
+    }
+
+    /// A bad `--mode` is refused before any daemon is reached: no session
+    /// is opened and no turn is spent on it.
+    #[tokio::test]
+    async fn a_bad_ask_mode_is_refused_before_the_daemon() {
+        let err = one_shot("hello", false, Some("default"), None)
+            .await
+            .expect_err("`default` is not a mode");
+        assert!(
+            err.to_string().contains("Unknown collaboration mode"),
+            "{err:#}"
+        );
     }
 
     /// Spec: the JSON envelope holds the text of the attempt that

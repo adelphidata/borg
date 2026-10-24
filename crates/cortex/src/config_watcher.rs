@@ -12,6 +12,26 @@ use crate::db::Database;
 /// interval is cheap. In-process changes are delivered immediately via `notify()`.
 const POLL_INTERVAL_SECS: u64 = 3;
 
+/// The notify channel of the first watcher this process started. In-process
+/// writers that hold no watcher handle (the gateway's chat commands) use it
+/// through [`reload_now`].
+static PROCESS_NOTIFY: std::sync::OnceLock<mpsc::Sender<Config>> = std::sync::OnceLock::new();
+
+/// Push the stored settings to this process's watcher now, so the next turn
+/// sees a write without waiting for the poll. Best-effort: with no watcher,
+/// or a full queue, the poll picks the write up.
+pub async fn reload_now() {
+    let Some(tx) = PROCESS_NOTIFY.get() else {
+        return;
+    };
+    match Config::load_from_db().await {
+        Ok(config) => {
+            let _ = tx.try_send(config);
+        }
+        Err(e) => warn!("settings changed but config reload failed: {e}"),
+    }
+}
+
 /// Watches the settings database for changes and broadcasts validated updates.
 ///
 /// Holds a single persistent `Database` connection instead of re-opening on
@@ -28,6 +48,7 @@ impl ConfigWatcher {
         let (config_tx, config_rx) = watch::channel(initial_config);
         let (stop_tx, stop_rx) = oneshot::channel();
         let (notify_tx, notify_rx) = mpsc::channel::<Config>(4);
+        let _ = PROCESS_NOTIFY.set(notify_tx.clone());
 
         tokio::spawn(async move {
             poll_loop(config_tx, stop_rx, notify_rx).await;
