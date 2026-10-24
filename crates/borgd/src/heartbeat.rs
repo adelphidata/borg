@@ -74,6 +74,9 @@ pub(crate) async fn collect_heartbeat_response(
     let deadline = Instant::now() + timeout;
     let mut response = String::new();
     let mut error = None;
+    // Text after a tool call is a new assistant message: it starts a new
+    // paragraph instead of running on from the one before it.
+    let mut after_tool = false;
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -95,7 +98,14 @@ pub(crate) async fn collect_heartbeat_response(
                 };
             }
             Ok(Some(AgentEvent::TextDelta(delta))) => {
+                if after_tool && !response.is_empty() && !response.ends_with('\n') {
+                    response.push_str("\n\n");
+                }
+                after_tool = false;
                 response.push_str(&delta);
+            }
+            Ok(Some(AgentEvent::ToolResult { .. })) => {
+                after_tool = true;
             }
             Ok(Some(AgentEvent::Error(e))) => {
                 error.get_or_insert(e);
@@ -1402,6 +1412,33 @@ mod tests {
         assert!(
             !cancel.is_cancelled(),
             "clean channel close must not cancel the turn"
+        );
+    }
+
+    /// Spec: text written after a tool call is its own paragraph, not glued
+    /// to the sentence before the call ("…available.I could not…").
+    #[tokio::test]
+    async fn collect_heartbeat_response_separates_messages_around_a_tool_call() {
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        for event in [
+            AgentEvent::TextDelta("I'll check the repo.".into()),
+            AgentEvent::ToolResult {
+                tool_call_id: "c1".into(),
+                name: "run_shell".into(),
+                result: "ok".into(),
+                images: Vec::new(),
+            },
+            AgentEvent::TextDelta("Nothing is ".into()),
+            AgentEvent::TextDelta("wrong.".into()),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let outcome =
+            collect_heartbeat_response(rx, CancellationToken::new(), Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            CollectOutcome::Completed("I'll check the repo.\n\nNothing is wrong.".into())
         );
     }
 
