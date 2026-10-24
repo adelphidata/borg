@@ -342,6 +342,41 @@ describe("SettingDetailPage for a count", () => {
   });
 });
 
+describe("SettingDetailPage for an on/off value", () => {
+  const flag = (category = "default") => ({
+    ...entry("evolution.enabled", "true", category),
+    kind: "bool",
+  });
+
+  it("offers On and Off instead of a free field, and saves the pick", async () => {
+    const daemon = fakeDaemon({ GetSettings: { entries: [flag()] }, SetSetting: {} });
+    mount("/settings/key/evolution.enabled", daemon);
+    await waitFor(() => expect(screen.getByText("Off")).toBeTruthy());
+    expect(screen.queryByDisplayValue("true")).toBeNull();
+    expect(screen.queryByText("Reset to default")).toBeNull();
+
+    click(screen.getByText("Off"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "SetSetting")?.request).toEqual({
+        key: "evolution.enabled",
+        value: "false",
+      }),
+    );
+  });
+
+  it("keeps the reset for a value that was changed", async () => {
+    const daemon = fakeDaemon({ GetSettings: { entries: [flag("db")] }, UnsetSetting: {} });
+    mount("/settings/key/evolution.enabled", daemon);
+    await waitFor(() => expect(screen.getByText("Reset to default")).toBeTruthy());
+    click(screen.getByText("Reset to default"));
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UnsetSetting")?.request).toEqual({
+        key: "evolution.enabled",
+      }),
+    );
+  });
+});
+
 describe("SettingDetailPage for a JSON value", () => {
   const JSON_REGISTRY = [
     entry("security.blocked_paths", '[".ssh",".aws"]', "db"),

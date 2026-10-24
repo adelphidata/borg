@@ -72,6 +72,12 @@ function SaveError({ message }: { message: string | undefined }) {
   );
 }
 
+/** An on/off key takes only these two; a free field would accept anything. */
+const BOOL_OPTIONS: SettingOption[] = [
+  { value: "true", label: "On" },
+  { value: "false", label: "Off" },
+];
+
 function OptionPicker({
   options,
   value,
@@ -658,6 +664,20 @@ export function SettingDetailPage() {
                   disabled={saving}
                   onPick={(v) => v !== entry.value && void save(entry.key, v)}
                 />
+              ) : entry.kind === "bool" ? (
+                <div className="flex flex-col items-start gap-3">
+                  <div className="self-stretch">
+                    <OptionPicker
+                      options={BOOL_OPTIONS}
+                      value={entry.value}
+                      disabled={saving}
+                      onPick={(v) => v !== entry.value && void save(entry.key, v)}
+                    />
+                  </div>
+                  {entry.overridden && (
+                    <Pill onClick={() => !saving && void clear(entry.key)}>Reset to default</Pill>
+                  )}
+                </div>
               ) : (
                 <ShapedValueEditor
                   label={title}
