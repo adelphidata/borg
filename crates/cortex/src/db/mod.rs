@@ -51,7 +51,7 @@ pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use libsql::{Builder, Cipher, Connection, EncryptionConfig};
+use libsql::{Builder, Cipher, Connection, EncryptionConfig, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -291,10 +291,8 @@ pub struct Database {
     /// [`crate::evolution::keychain::default_keystore`]; tests inject an
     /// in-memory store so they don't touch the real OS keychain.
     evolution_keystore_override: Mutex<Option<Box<dyn crate::evolution::keychain::KeyStore>>>,
-    /// True when this handle was opened via [`open_readonly`]. A debug-only
-    /// guard catches accidental writes through a read-only handle; libsql's
-    /// high-level builder doesn't expose `SQLITE_OPEN_READ_ONLY`, so the
-    /// daemon remains the single writer by convention.
+    /// True when this handle was opened via [`open_readonly`], whose
+    /// connection SQLite opened with `SQLITE_OPEN_READ_ONLY`.
     read_only: bool,
 }
 
@@ -382,12 +380,9 @@ impl Database {
 
     /// Get a reference to the underlying connection. Cheap to clone if the
     /// caller needs an owned handle for an async task — libsql's `Connection`
-    /// is internally `Arc`'d.
+    /// is internally `Arc`'d. On an [`open_readonly`](Self::open_readonly)
+    /// handle SQLite itself refuses writes.
     pub fn conn(&self) -> &Connection {
-        debug_assert!(
-            !self.read_only,
-            "mutating call through a read-only Database handle; daemon is the single writer"
-        );
         &self.conn
     }
 
@@ -501,20 +496,18 @@ impl Database {
         Self::open_at_inner(path, Self::DEFAULT_BUSY_TIMEOUT_MS, None, false).await
     }
 
-    /// Open the database read-only. Skips writes — intended for read-only
-    /// consumers (e.g. the CLI reading config/settings) that must not race
-    /// the daemon's writer. libsql has no `SQLITE_OPEN_READ_ONLY` opt
-    /// exposed on its high-level builder, so the read-only contract is
-    /// enforced by:
-    ///   1. Skipping migrations + settings seeding + HMAC-salt init (all
-    ///      writes that the daemon already performed).
-    ///   2. A `read_only` flag carried on the handle that fires a
-    ///      `debug_assert!` from [`conn()`](Self::conn).
-    /// CLI processes never execute mutating SQL through this handle today;
-    /// the assert exists to catch a future regression early.
+    /// Open the database read-only, for consumers (e.g. the CLI reading
+    /// config/settings) that must not race the daemon's writer. The
+    /// connection is opened with `SQLITE_OPEN_READ_ONLY`, so any write fails
+    /// in SQLite; migrations, settings seeding and HMAC-salt creation are
+    /// skipped (the daemon already did them). The stored HMAC salt is still
+    /// read, so integrity chains verify through this handle.
     #[instrument(skip_all)]
     pub async fn open_readonly() -> Result<Self> {
-        let path = Self::db_path()?;
+        Self::open_readonly_at(&Self::db_path()?).await
+    }
+
+    async fn open_readonly_at(path: &Path) -> Result<Self> {
         // libsql's `Builder::new_local` creates the file if missing, which
         // breaks `load_from_db`'s expectation that a missing DB fails here
         // and falls through to the writer path (which runs migrations).
@@ -526,23 +519,32 @@ impl Database {
                 path.display()
             );
         }
-        let conn = Self::build_connection(&path, None).await?;
+        let conn = Self::build_connection(path, None, true).await?;
         conn.busy_timeout(Duration::from_millis(Self::DEFAULT_BUSY_TIMEOUT_MS))
             .context("set busy_timeout on read-only handle")?;
-        Ok(Self {
+        let mut db = Self {
             conn,
             hmac_salt: Vec::new(),
             evolution_signing_key: Mutex::new(None),
             evolution_keystore_override: Mutex::new(None),
             read_only: true,
-        })
+        };
+        let stored = db.get_meta("hmac_salt").await?;
+        if let Some(salt) = stored.as_deref().and_then(parse_hmac_salt) {
+            db.hmac_salt = salt;
+        }
+        Ok(db)
     }
 
     /// Build a fresh `libsql::Connection`. `key` opts into SQLCipher
     /// (AES-256-CBC) at-rest encryption — pass `None` for an unencrypted
     /// database.
-    async fn build_connection(path: &Path, key: Option<&[u8]>) -> Result<Connection> {
-        if let Some(parent) = path.parent() {
+    async fn build_connection(
+        path: &Path,
+        key: Option<&[u8]>,
+        read_only: bool,
+    ) -> Result<Connection> {
+        if let Some(parent) = path.parent().filter(|_| !read_only) {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create_dir_all({})", parent.display()))?;
@@ -553,6 +555,9 @@ impl Database {
             .with_context(|| format!("non-UTF-8 db path: {}", path.display()))?;
 
         let mut builder = Builder::new_local(path_str);
+        if read_only {
+            builder = builder.flags(OpenFlags::SQLITE_OPEN_READ_ONLY);
+        }
         if let Some(k) = key {
             builder = builder.encryption_config(EncryptionConfig::new(
                 Cipher::Aes256Cbc,
@@ -564,7 +569,9 @@ impl Database {
             .build()
             .await
             .with_context(|| format!("libsql build at {}", path.display()))?;
-        Self::set_file_permissions(path);
+        if !read_only {
+            Self::set_file_permissions(path);
+        }
         db.connect()
             .with_context(|| format!("libsql connect at {}", path.display()))
     }
@@ -575,7 +582,7 @@ impl Database {
         key: Option<&[u8]>,
         read_only: bool,
     ) -> Result<Self> {
-        let conn = Self::build_connection(path, key).await?;
+        let conn = Self::build_connection(path, key, false).await?;
         Self::init_connection_inner(conn, busy_timeout_ms, read_only).await
     }
 
@@ -1138,16 +1145,8 @@ impl Database {
     /// Stored in the meta table so it persists across restarts but is unique per install.
     async fn get_or_create_hmac_salt(&self) -> Result<Vec<u8>> {
         if let Some(hex) = self.get_meta("hmac_salt").await? {
-            if hex.len() == 64 {
-                let bytes: Result<Vec<u8>, _> = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-                    .collect();
-                if let Ok(b) = bytes {
-                    if b.len() == 32 {
-                        return Ok(b);
-                    }
-                }
+            if let Some(salt) = parse_hmac_salt(&hex) {
+                return Ok(salt);
             }
             tracing::warn!("integrity: stored hmac_salt is corrupted, regenerating");
         }
@@ -1385,7 +1384,7 @@ impl Database {
     /// interface) can share the same fixture without re-implementing it.
     #[allow(clippy::expect_used)]
     pub async fn test_db() -> Self {
-        let conn = Self::build_connection(Path::new(":memory:"), None)
+        let conn = Self::build_connection(Path::new(":memory:"), None, false)
             .await
             .expect("open in-memory db");
         let db = Self::init_connection_inner(conn, Self::DEFAULT_BUSY_TIMEOUT_MS, false)
@@ -1465,6 +1464,72 @@ mod macos_durability_tests {
 /// Durability-pragma tests that assert the *live* connection state, not the
 /// SQL string — they fail if the pragma is dropped, mistyped, or applied
 /// after the connection is handed out.
+/// Decode the stored hex HMAC salt; `None` unless it is 32 bytes of hex.
+fn parse_hmac_salt(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() != 64 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    /// The CLI reads through this handle while the daemon writes: reads must
+    /// work, writes must fail in SQLite, and HMAC keys must match the
+    /// writer's so integrity chains verify.
+    #[tokio::test]
+    async fn read_only_handle_reads_refuses_writes_and_shares_the_hmac_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("borg.db");
+        let writer = Database::open_at(&path).await.unwrap();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('ro_marker', 'seen')",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+
+        let reader = Database::open_readonly_at(&path).await.unwrap();
+        let mut rows = reader
+            .conn()
+            .query("SELECT value FROM settings WHERE key = 'ro_marker'", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("marker row");
+        assert_eq!(row.get::<String>(0).unwrap(), "seen");
+
+        let write = reader
+            .conn()
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('ro_write', 'x')",
+                libsql::params![],
+            )
+            .await;
+        assert!(write.is_err(), "a read-only handle must refuse writes");
+
+        assert_eq!(
+            reader.derive_hmac_key(b"bond"),
+            writer.derive_hmac_key(b"bond"),
+            "the reader must derive the writer's HMAC keys"
+        );
+    }
+
+    #[test]
+    fn hmac_salt_parses_only_32_hex_bytes() {
+        assert_eq!(parse_hmac_salt(&"ab".repeat(32)), Some(vec![0xab; 32]));
+        assert_eq!(parse_hmac_salt(&"ab".repeat(31)), None);
+        assert_eq!(parse_hmac_salt(&"zz".repeat(32)), None);
+        assert_eq!(parse_hmac_salt(&"é".repeat(32)), None);
+    }
+}
+
 #[cfg(test)]
 mod synchronous_pragma_tests {
     use super::*;
