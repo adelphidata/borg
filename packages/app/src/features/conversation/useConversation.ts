@@ -10,6 +10,7 @@ import {
 } from "../../lib/useDaemon";
 import { parseArgCommand, runArgCommand } from "./argCommands";
 import { splitAttachments } from "./attachments";
+import { adoptConversationUrl } from "./conversationUrl";
 import { draftKeyFor, moveDraft } from "./draftStore";
 import { awaitingInput as awaitingInputOf, retirePrompts } from "./queuedTurn";
 import { createTurnClock } from "./turnClock";
@@ -811,7 +812,7 @@ export function useConversation(target: string | undefined): Conversation {
       .getState({ sessionId })
       .then((live) => {
         if (forGeneration !== generation.current) return;
-        if (live.agentSessionId) agentSessionId.current = live.agentSessionId;
+        if (live.agentSessionId) learnedAgentSessionId(live.agentSessionId);
         if (live.title) setTitle(live.title);
       })
       .catch((error: unknown) => console.warn("reading the conversation title failed", error));
@@ -824,6 +825,11 @@ export function useConversation(target: string | undefined): Conversation {
    * sends, and the turn-end title read that would learn it comes too late for a
    * daemon that restarts mid-turn: the reopen would have nothing to resume by.
    */
+  const learnedAgentSessionId = (id: string) => {
+    agentSessionId.current = id;
+    if (target === "new") adoptConversationUrl(id);
+  };
+
   const learnAgentSessionId = () => {
     if (!sessionId || agentSessionId.current) return;
     const forGeneration = generation.current;
@@ -831,7 +837,7 @@ export function useConversation(target: string | undefined): Conversation {
       .getState({ sessionId })
       .then((live) => {
         if (forGeneration !== generation.current || agentSessionId.current) return;
-        agentSessionId.current = live.agentSessionId;
+        learnedAgentSessionId(live.agentSessionId);
       })
       .catch((error: unknown) => console.warn("reading the conversation id failed", error));
   };
