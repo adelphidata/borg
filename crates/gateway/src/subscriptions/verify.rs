@@ -265,11 +265,16 @@ fn verify_key(headers: &HeaderMap, key: &str) -> Result<(), AuthError> {
         return Err(AuthError::BadKey);
     }
     let auth = header(headers, "authorization").ok_or(AuthError::Missing)?;
-    let presented = if let Some(token) = auth.strip_prefix("Bearer ") {
-        token.trim().to_string()
-    } else if let Some(b64) = auth.strip_prefix("Basic ") {
+    // The scheme name is case-insensitive (RFC 7235); the credential is not.
+    let (scheme, credential) = auth
+        .trim()
+        .split_once(' ')
+        .ok_or(AuthError::Malformed("Authorization"))?;
+    let presented = if scheme.eq_ignore_ascii_case("Bearer") {
+        credential.trim().to_string()
+    } else if scheme.eq_ignore_ascii_case("Basic") {
         let decoded = STANDARD
-            .decode(b64.trim())
+            .decode(credential.trim())
             .map_err(|_| AuthError::Malformed("Authorization"))?;
         let text = String::from_utf8(decoded).map_err(|_| AuthError::Malformed("Authorization"))?;
         // The key is the password; the user name is ignored.
@@ -427,6 +432,12 @@ mod tests {
                 "{scheme:?}"
             );
         }
+        let lower = headers(&[("authorization", format!("bearer {KEY}"))]);
+        assert_eq!(
+            verify(AuthScheme::Bearer, &lower, b"{}", secrets(None), NOW),
+            Ok(()),
+            "the scheme name is case-insensitive"
+        );
         let wrong = headers(&[("authorization", "Bearer nope".into())]);
         assert_eq!(
             verify(AuthScheme::Bearer, &wrong, b"{}", secrets(None), NOW),
