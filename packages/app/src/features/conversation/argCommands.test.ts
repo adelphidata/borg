@@ -21,16 +21,22 @@ describe("parseArgCommand", () => {
       "/heartbeat every 15m Check  the deploy",
       { kind: "heartbeat", op: Op.OP_SET, prompt: "Check  the deploy", intervalSecs: 900 },
     ],
+    ["/mode plan", { kind: "mode", mode: "plan" }],
+    ["/mode Execute", { kind: "mode", mode: "execute" }],
   ])("reads %j", (text, want) => {
     expect(parseArgCommand(text)).toEqual(want);
   });
 
-  it.each(["/goal edit", "/heartbeat every soon Check", "/heartbeat every 10m", "/hb nonsense"])(
-    "answers %j with usage instead of guessing",
-    (text) => {
-      expect(parseArgCommand(text)?.kind).toBe("usage");
-    },
-  );
+  it.each([
+    "/goal edit",
+    "/heartbeat every soon Check",
+    "/heartbeat every 10m",
+    "/hb nonsense",
+    "/mode",
+    "/mode fast",
+  ])("answers %j with usage instead of guessing", (text) => {
+    expect(parseArgCommand(text)?.kind).toBe("usage");
+  });
 
   it.each(["/goals are nice", "what is my /goal", "/tmp/goal", "hello"])(
     "leaves %j to be sent as a message",
@@ -56,6 +62,28 @@ describe("parseIntervalSecs", () => {
 });
 
 describe("runArgCommand", () => {
+  it("switches the mode through the setting the mode switch uses", async () => {
+    const daemon = fakeDaemon({ SetSetting: {} });
+    const borg = createBorgClient(daemon.transport);
+    expect(await runArgCommand(borg, "c", { kind: "mode", mode: "execute" })).toBe(
+      "Execute mode is on. Borg acts.",
+    );
+    expect(daemon.calls[0]).toMatchObject({
+      method: "SetSetting",
+      request: { key: "conversation.collaboration_mode", value: "execute" },
+    });
+
+    const saved: string[] = [];
+    const save = async (key: string, value: string) => (saved.push(`${key}=${value}`), true);
+    expect(await runArgCommand(borg, "c", { kind: "mode", mode: "plan" }, save)).toContain(
+      "Plan mode is on.",
+    );
+    expect(saved).toEqual(["conversation.collaboration_mode=plan"]);
+    expect(await runArgCommand(borg, "c", { kind: "mode", mode: "plan" }, async () => false)).toBe(
+      "That did not work: the mode did not change.",
+    );
+  });
+
   it("sets the goal on the session it was given, never the daemon's latest", async () => {
     const daemon = fakeDaemon({
       SetGoal: { present: true, objective: "Ship it", status: "active" },

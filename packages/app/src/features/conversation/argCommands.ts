@@ -1,7 +1,9 @@
 import { admin, type BorgClient } from "@borg/client";
+import { MODE_KEY } from "../settings/catalog";
 
 /**
- * Slash commands that take words after them: `/goal …` and `/heartbeat …`.
+ * Slash commands that take words after them: `/goal …`, `/heartbeat …` and
+ * `/mode …`.
  *
  * The `/` menu runs one-word commands; these carry an objective or a prompt,
  * so the menu never matches them and they used to go to the model as prose —
@@ -21,10 +23,14 @@ export type ArgCommand =
       prompt: string;
       intervalSecs: number;
     }
+  | { kind: "mode"; mode: "plan" | "execute" }
   | { kind: "usage"; text: string };
 
 export const GOAL_USAGE =
   "Use /goal <what to finish> to set a goal, or /goal pause, resume or clear to manage it.";
+
+export const MODE_USAGE =
+  "Use /mode plan to have Borg propose changes and make none, or /mode execute to let it act.";
 
 export const HEARTBEAT_USAGE =
   "Use /heartbeat every <interval> <prompt>, for example: /heartbeat every 15m Check the deploy. " +
@@ -44,10 +50,22 @@ export function parseIntervalSecs(raw: string): number | undefined {
  * case it is ordinary text and is sent as usual.
  */
 export function parseArgCommand(text: string): ArgCommand | undefined {
-  const m = /^\/(goal|heartbeat|hb)(?:\s+([\s\S]*))?$/.exec(text.trim());
+  const m = /^\/(goal|heartbeat|hb|mode)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!m) return undefined;
   const rest = (m[2] ?? "").trim();
+  if (m[1] === "mode") return parseMode(rest);
   return m[1] === "goal" ? parseGoal(rest) : parseHeartbeat(rest);
+}
+
+/**
+ * `/mode plan` and `/mode execute`: the spelling chat channels use, and the one
+ * Borg itself suggests, so it works here too rather than reaching the model.
+ */
+function parseMode(rest: string): ArgCommand {
+  const mode = rest.toLowerCase();
+  return mode === "plan" || mode === "execute"
+    ? { kind: "mode", mode }
+    : { kind: "usage", text: MODE_USAGE };
 }
 
 function parseGoal(rest: string): ArgCommand {
@@ -131,17 +149,29 @@ function describeHeartbeat(
  * Runs `cmd` against the conversation's agent session and returns the line to
  * show. A daemon refusal comes back as text too: the user asked for something
  * and needs to see that it did not happen.
+ *
+ * `save` writes a setting; the app passes its settings store so the mode
+ * switch beside the model follows at once.
  */
 export async function runArgCommand(
   borg: BorgClient,
   agentSessionId: string,
   cmd: ArgCommand,
+  save: (key: string, value: string) => Promise<boolean> = async (key, value) => {
+    await borg.admin.setSetting({ key, value });
+    return true;
+  },
 ): Promise<string> {
   const sessionId = agentSessionId;
   try {
     switch (cmd.kind) {
       case "usage":
         return cmd.text;
+      case "mode":
+        if (!(await save(MODE_KEY, cmd.mode))) return "That did not work: the mode did not change.";
+        return cmd.mode === "plan"
+          ? "Plan mode is on. Borg proposes changes and makes none."
+          : "Execute mode is on. Borg acts.";
       case "goal-terminal-only":
         return "Goal budgets and quality gates are set from the terminal: run `borg`, then /goal.";
       case "goal-show":

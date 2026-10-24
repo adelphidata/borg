@@ -669,7 +669,7 @@ export interface Conversation {
   streamOutageSustained: boolean;
   send: (text: string, attachments?: Attachment[]) => void;
   /**
-   * Runs `/goal …` or `/heartbeat …` here and answers in the transcript.
+   * Runs `/goal …`, `/heartbeat …` or `/mode …` here and answers in the transcript.
    * False when the text is not such a command.
    */
   runCommand: (text: string) => boolean;
@@ -755,7 +755,10 @@ export function useConversation(target: string | undefined): Conversation {
    * mid-conversation. The ids are those calls still running.
    */
   const refetchSettings = useRef<(() => void) | undefined>(undefined);
-  refetchSettings.current = useOptionalSettings()?.settings.refetch;
+  const settingsStore = useOptionalSettings();
+  refetchSettings.current = settingsStore?.settings.refetch;
+  // `/mode` writes through the store, so the mode switch follows at once.
+  const saveSetting = settingsStore?.save;
   const nameSaves = useRef(new Set<string>());
   /**
    * Counts opens. Work that outlives a render — a title read, a reopen —
@@ -1124,7 +1127,7 @@ export function useConversation(target: string | undefined): Conversation {
   );
 
   /**
-   * Runs `/goal …` or `/heartbeat …` against this conversation and answers
+   * Runs `/goal …`, `/heartbeat …` or `/mode …` against this conversation and answers
    * with a notice. False when `text` is not one of them, so the caller sends
    * it as an ordinary message.
    */
@@ -1149,11 +1152,11 @@ export function useConversation(target: string | undefined): Conversation {
           answer("Borg could not find this conversation. Try again in a moment.");
           return;
         }
-        answer(await runArgCommand(borg, agentId, cmd));
+        answer(await runArgCommand(borg, agentId, cmd, saveSetting));
       })();
       return true;
     },
-    [borg, sessionId],
+    [borg, sessionId, saveSetting],
   );
 
   /**
