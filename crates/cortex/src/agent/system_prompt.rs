@@ -229,7 +229,6 @@ impl Agent {
 
         system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
 
-        system.push_str(Self::build_reply_tags_section());
         system.push_str(&self.build_messaging_section());
         system.push_str(&Self::build_silent_reply_section());
         system.push_str(Self::build_media_attachment_section());
@@ -533,16 +532,6 @@ impl Agent {
     /// Build the heartbeat ack protocol section.
     pub(super) fn build_heartbeat_section(&self) -> String {
         build_heartbeat_protocol(&self.config)
-    }
-
-    /// Build the reply tags section for message threading.
-    pub(super) fn build_reply_tags_section() -> &'static str {
-        "\n<reply_tags>\n\
-        To request a native reply/quote on supported messaging channels, include one tag in your reply:\n\
-        - [[reply_to_current]] replies to the triggering message. Must be the very first token (no leading text/newlines).\n\
-        - Prefer [[reply_to_current]]. Use [[reply_to:<id>]] only when an id was explicitly provided.\n\
-        Tags are stripped before sending; support depends on the channel.\n\
-        </reply_tags>\n"
     }
 
     /// Build the messaging/channel routing guidance section.

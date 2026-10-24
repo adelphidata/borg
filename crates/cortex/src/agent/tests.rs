@@ -31,6 +31,17 @@ fn extract_build_system_prompt_body() -> &'static str {
     &SYSTEM_PROMPT_RS_SRC[start..end]
 }
 
+/// No channel turns `[[reply_to_current]]` into a native reply, and nothing
+/// strips it, so a prompt that offers the tag puts it in front of every
+/// reader. The prompt must not offer it until a channel handles it.
+#[test]
+fn system_prompt_does_not_offer_reply_tags() {
+    assert!(
+        !SYSTEM_PROMPT_RS_SRC.contains("[[reply_to"),
+        "the system prompt offers reply tags that no channel handles"
+    );
+}
+
 #[test]
 fn build_system_prompt_environment_is_after_security_policy() {
     let body = extract_build_system_prompt_body();
@@ -2281,23 +2292,6 @@ fn silent_reply_section_embeds_the_live_token() {
         section.contains(constants::SILENT_REPLY_TOKEN),
         "silent-reply section must embed the live SILENT_REPLY_TOKEN ({:?}): {section}",
         constants::SILENT_REPLY_TOKEN
-    );
-}
-
-#[test]
-fn reply_tags_section_documents_reply_to_current() {
-    let section = Agent::build_reply_tags_section();
-    assert!(
-        section.contains("<reply_tags>"),
-        "missing open tag: {section}"
-    );
-    assert!(
-        section.contains("[[reply_to_current]]"),
-        "reply-tags section must document the [[reply_to_current]] tag: {section}"
-    );
-    assert!(
-        section.contains("the very first token"),
-        "reply-tags section must state the first-token constraint: {section}"
     );
 }
 
