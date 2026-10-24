@@ -131,9 +131,13 @@ export function findBasicSetting(id: string): BasicSetting | undefined {
   return basicSettings.find((s) => s.id === id);
 }
 
-/** Where a raw registry key's own editor lives. */
+/**
+ * Where a registry key's editor lives: its curated page when Settings has one
+ * (a picker with plain names), else the raw key's own editor.
+ */
 export function settingPath(key: string): string {
-  return `/settings/key/${encodeURIComponent(key)}`;
+  const basic = basicSettings.find((s) => s.key === key);
+  return basic ? `/settings/${basic.id}` : `/settings/key/${encodeURIComponent(key)}`;
 }
 
 /** One fold under Advanced: a plain-words bucket over several key prefixes. */

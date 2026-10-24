@@ -125,7 +125,7 @@ describe("buildCommands", () => {
     expect(row?.detail).toBeUndefined();
     row?.run();
     expect(saveSetting).not.toHaveBeenCalled();
-    expect(navigate).toHaveBeenCalledWith("/settings/key/llm.thinking");
+    expect(navigate).toHaveBeenCalledWith("/settings/thinking");
   });
 
   it("does not treat a bool-kinded setting with a non-boolean value as a toggle", () => {
