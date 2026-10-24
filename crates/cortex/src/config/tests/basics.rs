@@ -389,4 +389,23 @@ fn a_bad_setting_value_names_what_it_takes() {
         err.to_string(),
         "llm.temperature takes a number, not \"x\"."
     );
+    let err = parse_value::<u8>("300", "k").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "k takes a whole number from 0 to 255, not \"300\"."
+    );
+    for bad in ["0", "abc"] {
+        let err = parse_nonzero::<u32>(bad, "max_tokens").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("max_tokens takes a whole number greater than 0, not \"{bad}\".")
+        );
+    }
+    for bad in ["3", "hot"] {
+        let err = parse_range::<f32>(bad, "temperature", 0.0, 2.0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("temperature takes a number from 0 to 2, not \"{bad}\".")
+        );
+    }
 }

@@ -317,7 +317,9 @@ where
 /// wrong inside it, not what to type instead.
 fn expected<T>() -> Option<&'static str> {
     match std::any::type_name::<T>() {
-        "u8" | "u16" | "u32" | "u64" | "usize" => Some("a whole number of 0 or more"),
+        "u8" => Some("a whole number from 0 to 255"),
+        "u16" => Some("a whole number from 0 to 65535"),
+        "u32" | "u64" | "usize" => Some("a whole number of 0 or more"),
         "i8" | "i16" | "i32" | "i64" | "isize" => Some("a whole number"),
         "f32" | "f64" => Some("a number"),
         "bool" => Some("true or false"),
@@ -329,11 +331,12 @@ pub fn parse_nonzero<T: FromStr + Default + PartialEq>(value: &str, key: &str) -
 where
     T::Err: std::fmt::Display,
 {
-    let v = parse_value::<T>(value, key)?;
-    if v == T::default() {
-        anyhow::bail!("{key} must be greater than 0");
+    // Every caller is an unsigned count, so one line covers both a bad word
+    // and a 0.
+    match value.parse::<T>() {
+        Ok(v) if v != T::default() => Ok(v),
+        _ => anyhow::bail!("{key} takes a whole number greater than 0, not \"{value}\"."),
     }
-    Ok(v)
 }
 
 pub fn parse_range<T: FromStr + PartialOrd + std::fmt::Display>(
@@ -345,11 +348,10 @@ pub fn parse_range<T: FromStr + PartialOrd + std::fmt::Display>(
 where
     T::Err: std::fmt::Display,
 {
-    let v = parse_value::<T>(value, key)?;
-    if v < min || v > max {
-        anyhow::bail!("{key} must be between {min} and {max}");
+    match value.parse::<T>() {
+        Ok(v) if v >= min && v <= max => Ok(v),
+        _ => anyhow::bail!("{key} takes a number from {min} to {max}, not \"{value}\"."),
     }
-    Ok(v)
 }
 
 impl Config {
