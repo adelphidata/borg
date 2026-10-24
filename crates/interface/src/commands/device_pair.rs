@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use borgd::pairing::device::client as pair_client;
-use identity::{KekStore, KeychainStore};
+use identity::KekStore;
 use qrcodegen::{QrCode, QrCodeEcc};
 use std::path::PathBuf;
 
@@ -120,7 +120,7 @@ pub async fn run_complete(code: &str, device_label: &str, socket: Option<PathBuf
         .await
         .context("pairing handshake")?;
 
-    let kek = KeychainStore::new();
+    let kek = crate::daemon_client::keychain();
     kek.put(CA_CERT_ACCOUNT, result.ca_cert_pem.as_bytes())
         .context("stash CA cert in keychain")?;
     kek.put(CLIENT_CERT_KEY_ACCOUNT, result.client_cert_pem.as_bytes())

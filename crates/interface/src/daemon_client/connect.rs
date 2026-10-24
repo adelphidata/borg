@@ -32,7 +32,15 @@ const TLS_SERVER_NAME: &str = "localhost";
 /// presents a clear "run `borg device pair` first" message rather than a
 /// generic TLS handshake error.
 pub async fn connect_tcp(addr: SocketAddr) -> Result<DaemonClient> {
-    connect_tcp_with_kek(addr, &KeychainStore::new()).await
+    connect_tcp_with_kek(addr, &keychain()).await
+}
+
+/// The OS keychain store for this CLI's data dir, so it reads the accounts
+/// the daemon on the same `BORG_HOME` wrote.
+pub fn keychain() -> KeychainStore {
+    let home =
+        cortex::paths::resolve_borg_home_readonly(None).unwrap_or_else(|_| PathBuf::from(".borg"));
+    KeychainStore::for_home(&home, cortex::paths::default_borg_home().as_deref())
 }
 
 /// Like [`connect_tcp`] but with a caller-provided `KekStore` — used by the
@@ -123,7 +131,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     // unauthenticated connections (bootstrap UDS, tests) intentionally fall
     // through. Real failures are surfaced via tracing::warn! (log + continue
     // for this fire-and-forget path).
-    let kek = KeychainStore::new();
+    let kek = keychain();
     match client.ensure_cert_fresh(&kek).await {
         Ok(true) => tracing::info!("client cert silently renewed"),
         Ok(false) => {}

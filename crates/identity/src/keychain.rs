@@ -15,7 +15,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -37,35 +37,63 @@ pub trait KekStore: Send + Sync {
 }
 
 /// Concrete `KekStore` backed by the OS keychain via `keyring`.
+///
+/// The keychain is one per OS user, but a data dir is not: a second daemon on
+/// another `BORG_HOME` would otherwise write the same accounts and replace the
+/// CA of the first. A store made with [`KeychainStore::for_home`] for any dir
+/// other than the default suffixes each account with a short hash of that dir.
+/// The default dir keeps the bare names, so existing installs keep their keys.
 #[derive(Debug, Default)]
-pub struct KeychainStore;
+pub struct KeychainStore {
+    scope: Option<String>,
+}
 
 impl KeychainStore {
-    /// New OS-keychain-backed store.
+    /// New OS-keychain-backed store with the bare account names.
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
-    fn entry(account: &str) -> Result<keyring_core::Entry, PkiError> {
+    /// Store for the data dir `home`. Bare account names when `home` is
+    /// `default_home`, else names scoped to `home`.
+    pub fn for_home(home: &Path, default_home: Option<&Path>) -> Self {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let home = canonical(home);
+        if default_home.is_some_and(|d| canonical(d) == home) {
+            return Self::new();
+        }
+        let digest = Sha256::digest(home.as_os_str().as_encoded_bytes());
+        let scope = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        Self { scope: Some(scope) }
+    }
+
+    fn account(&self, account: &str) -> String {
+        match &self.scope {
+            Some(scope) => format!("{account}@{scope}"),
+            None => account.to_string(),
+        }
+    }
+
+    fn entry(&self, account: &str) -> Result<keyring_core::Entry, PkiError> {
         // Registers the platform store on first use; the result is only a
         // hint, since a store installed directly (the mock in tests, or a
         // host without a Secret Service) is what the entry resolves against.
         let _ = keyring::Entry::store_status();
-        keyring_core::Entry::new(SERVICE, account)
+        keyring_core::Entry::new(SERVICE, &self.account(account))
             .map_err(|e| PkiError::Keychain(format!("entry({account}): {e}")))
     }
 }
 
 impl KekStore for KeychainStore {
     fn put(&self, account: &str, secret: &[u8]) -> Result<(), PkiError> {
-        let entry = Self::entry(account)?;
+        let entry = self.entry(account)?;
         entry
             .set_secret(secret)
             .map_err(|e| PkiError::Keychain(format!("set_secret({account}): {e}")))
     }
 
     fn get(&self, account: &str) -> Result<Vec<u8>, PkiError> {
-        let entry = Self::entry(account)?;
+        let entry = self.entry(account)?;
         entry.get_secret().map_err(|e| match e {
             keyring_core::Error::NoEntry => PkiError::NotFound(account.to_string()),
             other => PkiError::Keychain(format!("get_secret({account}): {other}")),
@@ -73,7 +101,7 @@ impl KekStore for KeychainStore {
     }
 
     fn delete(&self, account: &str) -> Result<(), PkiError> {
-        let entry = Self::entry(account)?;
+        let entry = self.entry(account)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring_core::Error::NoEntry) => Ok(()),
@@ -433,6 +461,32 @@ mod tests {
             Err(PkiError::NotFound(a)) => assert_eq!(a, account),
             other => panic!("expected NotFound for an absent entry, got {other:?}"),
         }
+    }
+
+    /// The default data dir keeps the bare account names an existing install
+    /// stored its keys under; any other dir gets its own names, the same each
+    /// time, so two daemons on one OS user never replace each other's keys.
+    #[test]
+    fn keychain_accounts_are_scoped_to_a_non_default_home() {
+        let default = tempfile::tempdir().expect("tempdir");
+        let other = tempfile::tempdir().expect("tempdir");
+        let bare = KeychainStore::for_home(default.path(), Some(default.path()));
+        assert_eq!(bare.account("ca-key"), "ca-key");
+        assert_eq!(KeychainStore::new().account("ca-key"), "ca-key");
+
+        let scoped = KeychainStore::for_home(other.path(), Some(default.path()));
+        let name = scoped.account("ca-key");
+        assert!(
+            name.starts_with("ca-key@") && name.len() == "ca-key@".len() + 12,
+            "{name}"
+        );
+        let again = KeychainStore::for_home(other.path(), Some(default.path()));
+        assert_eq!(again.account("ca-key"), name);
+        let third = tempfile::tempdir().expect("tempdir");
+        let elsewhere = KeychainStore::for_home(third.path(), Some(default.path()));
+        assert_ne!(elsewhere.account("ca-key"), name);
+        let unknown_default = KeychainStore::for_home(other.path(), None);
+        assert_eq!(unknown_default.account("ca-key"), name);
     }
 
     /// A read error other than NotFound (here: EISDIR from opening a

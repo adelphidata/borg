@@ -101,9 +101,7 @@ pub fn resolve_borg_home(override_path: Option<&Path>) -> Result<PathBuf> {
     } else if let Some(p) = std::env::var_os(BORG_HOME_ENV) {
         PathBuf::from(p)
     } else {
-        dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".borg")
+        default_borg_home().context("could not determine home directory")?
     };
     if !home.exists() {
         std::fs::create_dir_all(&home)
@@ -134,9 +132,12 @@ pub fn resolve_borg_home_readonly(override_path: Option<&Path>) -> Result<PathBu
     if let Some(p) = std::env::var_os(BORG_HOME_ENV) {
         return Ok(PathBuf::from(p));
     }
-    Ok(dirs::home_dir()
-        .context("could not determine home directory")?
-        .join(".borg"))
+    default_borg_home().context("could not determine home directory")
+}
+
+/// `~/.borg` — the data dir used when no override or `$BORG_HOME` is set.
+pub fn default_borg_home() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".borg"))
 }
 
 /// Compose a subdirectory path under `home`.

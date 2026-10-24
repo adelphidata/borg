@@ -110,9 +110,11 @@ pub async fn build_kek_store(
 /// The OS keychain store, behind the [`DEV_CACHE_ENV`] copy when a debug build
 /// is asked for one. A cache that will not open is skipped, not fatal: the
 /// daemon then boots the way it would without it.
-#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 fn keychain_store(borg_home: &Path) -> Arc<dyn KekStore> {
-    let keychain: Arc<dyn KekStore> = Arc::new(KeychainStore::new());
+    let keychain: Arc<dyn KekStore> = Arc::new(KeychainStore::for_home(
+        borg_home,
+        paths::default_borg_home().as_deref(),
+    ));
     #[cfg(debug_assertions)]
     if let Some(passphrase) = std::env::var(DEV_CACHE_ENV).ok().filter(|v| !v.is_empty()) {
         let path = paths::subdir(borg_home, BorgSubdir::Secrets).join("dev-kek-cache.enc");
