@@ -47,7 +47,7 @@ export function sessionRowActions({
           },
         ]
       : []),
-    { id: "export", label: "Export…", onSelect: () => onExport("md") },
+    { id: "export", label: "Export as Markdown", onSelect: () => onExport("md") },
     // The same slot either way: a row never grows an action, it changes the one
     // it has, so the menu is the same shape wherever the conversation sits.
     archived

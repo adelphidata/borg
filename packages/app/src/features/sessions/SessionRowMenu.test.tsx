@@ -20,7 +20,7 @@ describe("sessionRowActions", () => {
   it("is the one list both the kebab and a right-click render", () => {
     // The point of the shared builder: two gestures, never two sets of choices.
     const actions = sessionRowActions(handlers());
-    expect(actions.map((a) => a.label)).toEqual(["Rename", "Export…", "Archive"]);
+    expect(actions.map((a) => a.label)).toEqual(["Rename", "Export as Markdown", "Archive"]);
   });
 
   it("exports markdown, the format the row's label promises", () => {
@@ -34,7 +34,7 @@ describe("sessionRowActions", () => {
   it("offers Pin after Rename when the caller can pin, and Unpin once pinned", () => {
     const onPin = vi.fn();
     const loose = sessionRowActions({ ...handlers(), onPin });
-    expect(loose.map((a) => a.label)).toEqual(["Rename", "Pin", "Export…", "Archive"]);
+    expect(loose.map((a) => a.label)).toEqual(["Rename", "Pin", "Export as Markdown", "Archive"]);
     loose.find((a) => a.id === "pin")!.onSelect();
     expect(onPin).toHaveBeenLastCalledWith(true);
 
@@ -133,7 +133,7 @@ describe("the kebab", () => {
     render(<SessionRowMenu {...handlers()} />);
     fireEvent.click(screen.getByLabelText("Conversation actions"));
     const items = screen.getAllByRole("menuitem").map((el) => el.textContent?.trim());
-    expect(items).toEqual(["Rename", "Export…", "Archive"]);
+    expect(items).toEqual(["Rename", "Export as Markdown", "Archive"]);
   });
 
   it("shuts again when the kebab is pressed a second time", () => {
