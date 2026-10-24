@@ -1061,6 +1061,7 @@ fn build_router(
         .with_state(state)
         .merge(build_openai_compat_router(config))
         .merge(build_generic_webhook_router(config))
+        .merge(build_subscription_events_router(config))
         .merge(build_mcp_http_router(config))
         .merge(web_surface)
 }
@@ -1136,6 +1137,18 @@ fn build_generic_webhook_router(config: &Config) -> Router {
         db_open: db_open_factory(),
         gate: build_ingress_gate(config),
         sink: crate::generic_webhook::arc_sink(),
+    })
+}
+
+/// Mount the subscription endpoint (`POST /v1/events/{id}`). Each request
+/// authenticates against its own subscription's key or provider signature.
+fn build_subscription_events_router(config: &Config) -> Router {
+    use crate::subscriptions::{router, EventsState};
+    router(EventsState {
+        db_open: db_open_factory(),
+        enabled: config.subscriptions.enabled,
+        limits: cortex::subscriptions::ingest::limits(&config.subscriptions),
+        payload_max_bytes: config.subscriptions.payload_max_bytes,
     })
 }
 

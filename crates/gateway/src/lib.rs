@@ -72,6 +72,8 @@ pub mod session_executor;
 pub mod session_queue;
 pub mod signal;
 pub mod slack;
+/// Subscription endpoint (`/v1/events/{id}`) and channel tap.
+pub mod subscriptions;
 /// Panic-isolating respawn wrapper for the long-running channel loops.
 pub mod supervised_loop;
 pub mod teams;
