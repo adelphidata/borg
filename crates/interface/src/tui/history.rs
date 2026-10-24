@@ -970,7 +970,10 @@ impl HistoryCell {
             }
             HistoryCell::Heartbeat { text } => {
                 let mut spans = vec![Span::styled("[heartbeat] ", theme::code_style())];
-                spans.extend(style_inline_backticks(text, Style::default()));
+                spans.extend(style_inline_backticks(
+                    strip_reply_directive_prefix(text),
+                    Style::default(),
+                ));
                 vec![Line::from(spans)]
             }
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),

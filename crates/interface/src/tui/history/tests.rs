@@ -1150,6 +1150,24 @@ fn reply_directive_prefix_is_hidden_from_assistant_render() {
     assert!(rendered.contains("Hello there"));
 }
 
+#[test]
+fn reply_directive_prefix_is_hidden_from_heartbeat_render() {
+    // Heartbeat replies come from the same model and prompt as chat turns, so
+    // they open with the reply tag just as often.
+    let cell = HistoryCell::Heartbeat {
+        text: "[[reply_to_current]]Firewall is off".to_string(),
+    };
+    let rendered = flatten_plain(&cell.render(60, None));
+    assert!(
+        !rendered.contains("[[reply_to_current]]"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("[heartbeat] Firewall is off"),
+        "got: {rendered}"
+    );
+}
+
 fn shell_tool_result(output: &str, collapsed: bool) -> HistoryCell {
     HistoryCell::ToolResult {
         output: output.to_string(),
