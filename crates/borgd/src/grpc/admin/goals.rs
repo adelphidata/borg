@@ -118,20 +118,18 @@ pub(super) async fn mutate_session_heartbeat(
                             .await?,
                     );
                 }
-                let hb = db
-                    .set_session_heartbeat(&session_id, prompt, req.interval_secs)
+                // The detail under the report shows the interval and the
+                // next fire, in the units the user typed.
+                db.set_session_heartbeat(&session_id, prompt, req.interval_secs)
                     .await?;
-                format!("set — every {}s", hb.interval_secs)
+                "set".to_string()
             }
             Op::Pause => match db.set_session_heartbeat_paused(&session_id, true).await? {
                 Some(_) => "paused".to_string(),
                 None => "no heartbeat set".to_string(),
             },
             Op::Resume => match db.set_session_heartbeat_paused(&session_id, false).await? {
-                Some(hb) => format!(
-                    "resumed — next fire in {}s",
-                    hb.seconds_until_due(now_unix())
-                ),
+                Some(_) => "resumed".to_string(),
                 None => "no heartbeat set".to_string(),
             },
             Op::Clear => {

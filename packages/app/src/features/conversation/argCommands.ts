@@ -111,7 +111,7 @@ export function formatInterval(secs: number): string {
 
 /**
  * The heartbeat as it now stands. The daemon's own `report` is a terse
- * terminal echo ("set — every 120s"); the state below already says it.
+ * terminal echo ("set", "paused"); the state below says the rest.
  */
 function describeHeartbeat(
   op: admin.SessionHeartbeatMutation_Op,

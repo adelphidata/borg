@@ -1314,7 +1314,7 @@ impl App<'_> {
             GoalSubcommand::Clear => {
                 let report = match self.rpc_clear_goal() {
                     Ok(()) => "/goal: cleared".to_string(),
-                    Err(e) => format!("/goal: clear failed — {e}"),
+                    Err(e) => format!("/goal: clear failed — {}", daemon_reason(&e)),
                 };
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
@@ -1325,7 +1325,7 @@ impl App<'_> {
                         format!("/goal: paused — \"{}\"", detail.objective)
                     }
                     Ok(_) => "/goal: no active goal to pause".to_string(),
-                    Err(e) => format!("/goal: pause failed — {e}"),
+                    Err(e) => format!("/goal: pause failed — {}", daemon_reason(&e)),
                 };
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
@@ -1336,7 +1336,7 @@ impl App<'_> {
                         format!("/goal: resumed — \"{}\"", detail.objective)
                     }
                     Ok(_) => "/goal: no paused goal to resume".to_string(),
-                    Err(e) => format!("/goal: resume failed — {e}"),
+                    Err(e) => format!("/goal: resume failed — {}", daemon_reason(&e)),
                 };
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
@@ -1380,7 +1380,7 @@ impl App<'_> {
                         };
                         format!("/goal: budget set to {shown}")
                     }
-                    Err(e) => format!("/goal: budget change failed — {e}"),
+                    Err(e) => format!("/goal: budget change failed — {}", daemon_reason(&e)),
                 };
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
@@ -1408,7 +1408,7 @@ impl App<'_> {
                 // agent's next prompt build picks up the new `<goal_context>`.
                 let report = match self.rpc_set_goal_replace(&trimmed, budget) {
                     Ok(detail) => format!("/goal: set — \"{}\"", detail.objective),
-                    Err(e) => format!("/goal: set failed — {e}"),
+                    Err(e) => format!("/goal: set failed — {}", daemon_reason(&e)),
                 };
                 self.push_system_message(report);
                 Ok(AppAction::Continue)
@@ -2151,7 +2151,7 @@ pub(super) fn parse_heartbeat_subcommand(rest: &str) -> HeartbeatSubcommand {
         "" | "status" => return HeartbeatSubcommand::Status,
         "pause" => return HeartbeatSubcommand::Pause,
         "resume" => return HeartbeatSubcommand::Resume,
-        "clear" => return HeartbeatSubcommand::Clear,
+        "clear" | "off" => return HeartbeatSubcommand::Clear,
         _ => {}
     }
     let Some(after) = rest.strip_prefix("every ") else {
@@ -2173,6 +2173,23 @@ pub(super) fn parse_heartbeat_subcommand(rest: &str) -> HeartbeatSubcommand {
     HeartbeatSubcommand::Set {
         interval_secs,
         prompt,
+    }
+}
+
+/// The daemon's own reason from an RPC error, without the
+/// `<Op> failed (<Code>): <handler>: ` frame `rpc_err` puts around it. The
+/// frame is for logs; in the transcript it reads as a crash.
+fn daemon_reason(e: &anyhow::Error) -> String {
+    let text = e.to_string();
+    let Some((frame, reason)) = text.split_once("): ") else {
+        return text;
+    };
+    if !frame.contains(" failed (") {
+        return text;
+    }
+    match reason.split_once(": ") {
+        Some((handler, rest)) if !handler.contains(' ') => rest.to_string(),
+        _ => reason.to_string(),
     }
 }
 
@@ -2598,6 +2615,29 @@ mod tests {
     use super::*;
     use crate::tui::app::{parse_export_destination, ExportDestination};
     use cortex::types::Role;
+
+    #[test]
+    fn heartbeat_off_clears_like_clear() {
+        assert_eq!(
+            parse_heartbeat_subcommand("off"),
+            HeartbeatSubcommand::Clear
+        );
+        assert_eq!(
+            parse_heartbeat_subcommand("clear"),
+            HeartbeatSubcommand::Clear
+        );
+    }
+
+    #[test]
+    fn a_goal_rpc_failure_shows_only_the_daemon_reason() {
+        let e = anyhow::anyhow!(
+            "Admin.SetGoal{{SetBudget}} failed (FailedPrecondition): set_goal: no goal set for this session"
+        );
+        assert_eq!(daemon_reason(&e), "no goal set for this session");
+        // Not an RPC frame: the text stays as it is.
+        let e = anyhow::anyhow!("connection refused: daemon down");
+        assert_eq!(daemon_reason(&e), "connection refused: daemon down");
+    }
 
     /// Spec: the destination is optional, so every pre-existing `/export` and
     /// `/export <fmt>` spelling must still mean "write the suggested filename
