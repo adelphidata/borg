@@ -172,10 +172,9 @@ impl SessionsPopup {
             .unwrap_or_default();
         let title: String = session.title.chars().take(40).collect();
         let pin = if session.pinned { '*' } else { ' ' };
-        format!(
-            " {pin} {title:<40} {} messages  {date}",
-            session.message_count
-        )
+        let count = session.message_count;
+        let noun = if count == 1 { "message" } else { "messages" };
+        format!(" {pin} {title:<40} {count} {noun}  {date}")
     }
 
     pub fn render(&self, frame: &mut Frame) {

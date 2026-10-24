@@ -227,3 +227,17 @@ fn hidden_popup_ignores_keys() {
     let result = popup.handle_key(key(KeyCode::Enter));
     assert!(result.is_none());
 }
+
+#[test]
+fn row_label_counts_one_message_in_the_singular() {
+    let one = SessionSummary {
+        message_count: 1,
+        ..make_session("s1", "Short")
+    };
+    let two = SessionSummary {
+        message_count: 2,
+        ..make_session("s2", "Longer")
+    };
+    assert!(SessionsPopup::row_label(&one).contains(" 1 message "));
+    assert!(SessionsPopup::row_label(&two).contains(" 2 messages "));
+}
