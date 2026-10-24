@@ -375,3 +375,60 @@ describe("SchedulesPage creation", () => {
     expect(screen.queryByPlaceholderText("Name")).toBeNull();
   });
 });
+
+describe("SchedulesPage editing", () => {
+  it("opens a task's own values, the cron as the five fields a person types", async () => {
+    const daemon = fakeDaemon({ ...listing([task()]), UpdateScheduledTask: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Edit")).toBeTruthy());
+
+    click("Edit");
+    expect(screen.getByPlaceholderText("Name")).toHaveProperty("value", "Morning briefing");
+    expect(screen.getByDisplayValue("summarise my mail")).toBeTruthy();
+    expect(screen.getByDisplayValue("0 8 * * *")).toBeTruthy();
+  });
+
+  it("saves the changes and leaves the stored time zone alone", async () => {
+    const daemon = fakeDaemon({ ...listing([task()]), UpdateScheduledTask: {} });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Edit")).toBeTruthy());
+    click("Edit");
+    fireEvent.change(screen.getByPlaceholderText("Name"), { target: { value: " Briefing " } });
+    fireEvent.change(screen.getByDisplayValue("0 8 * * *"), { target: { value: "0 9 * * 1-5" } });
+    click("Save");
+
+    await waitFor(() =>
+      expect(daemon.calls.find((c) => c.method === "UpdateScheduledTask")?.request).toEqual({
+        id: "t1",
+        name: "Briefing",
+        prompt: "summarise my mail",
+        scheduleType: "cron",
+        scheduleExpr: "0 9 * * 1-5",
+        timezone: "",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("Save")).toBeNull());
+  });
+
+  it("keeps the edit open when the daemon rejects it", async () => {
+    const daemon = fakeDaemon({
+      ...listing([task()]),
+      UpdateScheduledTask: new BorgError(INVALID_ARGUMENT, "invalid cron expression"),
+    });
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Edit")).toBeTruthy());
+    click("Edit");
+    fireEvent.change(screen.getByDisplayValue("0 8 * * *"), { target: { value: "nope" } });
+    click("Save");
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("invalid cron"));
+    expect(screen.getByDisplayValue("nope")).toBeTruthy();
+  });
+
+  it("offers no edit on a task Borg runs for itself", async () => {
+    const daemon = fakeDaemon(listing([task({ name: "Heartbeat", system: true })]));
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Heartbeat")).toBeTruthy());
+    expect(screen.queryByText("Edit")).toBeNull();
+  });
+});

@@ -17,6 +17,7 @@ import { useQuery } from "../../lib/useDaemon";
 import {
   SCHEDULE_TYPES,
   describeSchedule,
+  editableExpr,
   relativeTime,
   useSchedules,
   type ScheduleType,
@@ -38,22 +39,20 @@ function NewSchedule({
   onCreate,
 }: {
   /** Resolves true when the task was stored; false leaves the form as it is. */
-  onCreate: (task: ReturnType<typeof draftOf>) => Promise<boolean>;
+  onCreate: (task: NewScheduleDraft) => Promise<boolean>;
 }) {
   const [open, setOpen] = useState(false);
-  const [name, setName] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [scheduleType, setScheduleType] = useState<ScheduleType>("cron");
-  const [scheduleExpr, setScheduleExpr] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const ready = name.trim() !== "" && prompt.trim() !== "" && scheduleExpr.trim() !== "";
+  // Remounting the form on each open is what empties it after a create.
+  const [opens, setOpens] = useState(0);
 
   if (!open) {
     return (
       <button
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          setOpens((n) => n + 1);
+          setOpen(true);
+        }}
         className="mb-5 flex w-full cursor-pointer items-center justify-center gap-2 rounded-[10px] border border-line border-dashed bg-transparent py-3 text-[12.5px] leading-none text-ink3 hover:border-neon hover:text-ink2"
       >
         <PlusIcon size={14} /> New scheduled task
@@ -61,11 +60,57 @@ function NewSchedule({
     );
   }
 
+  return (
+    <ScheduleForm
+      key={opens}
+      className="mb-5"
+      submitLabel="Create"
+      savingLabel="Creating…"
+      onCancel={() => setOpen(false)}
+      onSubmit={(task) =>
+        onCreate(task).then((stored) => {
+          if (stored) setOpen(false);
+          return stored;
+        })
+      }
+    />
+  );
+}
+
+type NewScheduleDraft = ReturnType<typeof draftOf>;
+
+/** The name, prompt and schedule of a task, for a new one or an edit. */
+function ScheduleForm({
+  initial,
+  className = "",
+  submitLabel,
+  savingLabel,
+  onSubmit,
+  onCancel,
+}: {
+  initial?: NewScheduleDraft;
+  className?: string;
+  submitLabel: string;
+  savingLabel: string;
+  /** Resolves true when the task was stored; false leaves the form as it is. */
+  onSubmit: (task: NewScheduleDraft) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [prompt, setPrompt] = useState(initial?.prompt ?? "");
+  const [scheduleType, setScheduleType] = useState<ScheduleType>(initial?.scheduleType ?? "cron");
+  const [scheduleExpr, setScheduleExpr] = useState(initial?.scheduleExpr ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const ready = name.trim() !== "" && prompt.trim() !== "" && scheduleExpr.trim() !== "";
+
   const field =
     "w-full rounded-[9px] border border-field bg-surface2 px-3 py-2 text-[13px] text-ink outline-none select-text placeholder:text-ink3 focus:border-focus";
 
   return (
-    <div className="mb-5 flex flex-col gap-3 rounded-[10px] border border-line bg-surface2 p-4">
+    <div
+      className={`flex flex-col gap-3 rounded-[10px] border border-line bg-surface2 p-4 ${className}`}
+    >
       <input
         autoFocus
         className={field}
@@ -108,7 +153,7 @@ function NewSchedule({
         </div>
       </div>
       <div className="flex justify-end gap-2">
-        <Pill square onClick={() => setOpen(false)}>
+        <Pill square onClick={onCancel}>
           Cancel
         </Pill>
         <Pill
@@ -117,24 +162,22 @@ function NewSchedule({
           disabled={!ready || saving}
           onClick={() => {
             setSaving(true);
-            void onCreate(draftOf(name, prompt, scheduleType, scheduleExpr))
-              .then((stored) => {
-                // A rejected schedule keeps the form — and everything typed
-                // into it — so the expression can be corrected in place.
-                if (!stored) return;
-                setOpen(false);
-                setName("");
-                setPrompt("");
-                setScheduleExpr("");
-              })
-              .finally(() => setSaving(false));
+            // A rejected schedule keeps the form — and everything typed into
+            // it — so the expression can be corrected in place.
+            void onSubmit(draftOf(name, prompt, scheduleType, scheduleExpr)).finally(() =>
+              setSaving(false),
+            );
           }}
         >
-          {saving ? "Creating…" : "Create"}
+          {saving ? savingLabel : submitLabel}
         </Pill>
       </div>
     </div>
   );
+}
+
+function asScheduleType(type: string): ScheduleType {
+  return (SCHEDULE_TYPES as readonly string[]).includes(type) ? (type as ScheduleType) : "cron";
 }
 
 function draftOf(name: string, prompt: string, scheduleType: ScheduleType, scheduleExpr: string) {
@@ -226,6 +269,7 @@ function TaskRow({
   onPause,
   onResume,
   onRunNow,
+  onEdit,
   onDelete,
 }: {
   task: adminPb.ScheduledTask;
@@ -234,6 +278,7 @@ function TaskRow({
   onPause: () => void;
   onResume: () => void;
   onRunNow: () => void;
+  onEdit: () => void;
   onDelete: () => void;
 }) {
   const paused = task.status === "paused";
@@ -269,7 +314,13 @@ function TaskRow({
           </Pill>
         )}
         {/* Borg's own loops (heartbeat, maintenance…) can be paused, not
-            deleted: a deleted one stays gone until the next migration. */}
+            edited or deleted: a deleted one stays gone until the next
+            migration, and their prompts are what the loop runs on. */}
+        {!task.system && (
+          <Pill square onClick={onEdit}>
+            Edit
+          </Pill>
+        )}
         {!task.system && (
           <button
             type="button"
@@ -298,6 +349,7 @@ export function SchedulesPage() {
   const location = useLocation();
   const schedules = useSchedules([location.key]);
   const [open, setOpen] = useState<string>();
+  const [editing, setEditing] = useState<string>();
 
   return (
     <PageChrome title="Scheduled" mobileBrandHeader>
@@ -318,18 +370,41 @@ export function SchedulesPage() {
                   Nothing scheduled yet.
                 </div>
               )}
-              {tasks.map((task) => (
-                <TaskRow
-                  key={task.id}
-                  task={task}
-                  expanded={open === task.id}
-                  onToggle={() => setOpen((id) => (id === task.id ? undefined : task.id))}
-                  onPause={() => void schedules.pause(task.id)}
-                  onResume={() => void schedules.resume(task.id)}
-                  onRunNow={() => void schedules.runNow(task.id)}
-                  onDelete={() => void schedules.remove(task.id)}
-                />
-              ))}
+              {tasks.map((task) =>
+                editing === task.id ? (
+                  <ScheduleForm
+                    key={task.id}
+                    initial={{
+                      name: task.name,
+                      prompt: task.prompt,
+                      scheduleType: asScheduleType(task.scheduleType),
+                      scheduleExpr: editableExpr(task.scheduleType, task.scheduleExpr),
+                    }}
+                    submitLabel="Save"
+                    savingLabel="Saving…"
+                    onCancel={() => setEditing(undefined)}
+                    onSubmit={(draft) =>
+                      schedules.update(task.id, draft).then((r) => {
+                        if (r === undefined) return false;
+                        setEditing(undefined);
+                        return true;
+                      })
+                    }
+                  />
+                ) : (
+                  <TaskRow
+                    key={task.id}
+                    task={task}
+                    expanded={open === task.id}
+                    onToggle={() => setOpen((id) => (id === task.id ? undefined : task.id))}
+                    onPause={() => void schedules.pause(task.id)}
+                    onResume={() => void schedules.resume(task.id)}
+                    onRunNow={() => void schedules.runNow(task.id)}
+                    onEdit={() => setEditing(task.id)}
+                    onDelete={() => void schedules.remove(task.id)}
+                  />
+                ),
+              )}
             </div>
           )}
         </DaemonState>

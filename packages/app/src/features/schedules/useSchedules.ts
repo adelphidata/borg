@@ -36,6 +36,25 @@ export function intervalSeconds(expr: string): number | null {
   return value * scale;
 }
 
+/**
+ * A stored cron expression as crontab fields. The daemon stores 6 (seconds
+ * first) or 7 (plus year) fields; both are dropped when they are the
+ * defaults, so the rest reads as the five-field line a person typed.
+ */
+export function crontabFields(expr: string): string[] {
+  let fields = expr.trim().split(/\s+/);
+  if (fields.length === 7 && fields[6] === "*") fields = fields.slice(0, 6);
+  if (fields.length === 6 && fields[0] === "0") fields = fields.slice(1);
+  return fields;
+}
+
+/** The schedule as the form shows it for editing. */
+export function editableExpr(type: string, expr: string): string {
+  if (type !== "cron") return expr;
+  const fields = crontabFields(expr);
+  return fields.length === 5 ? fields.join(" ") : expr;
+}
+
 /** Renders a schedule the way a person would say it. */
 export function describeSchedule(type: string, expr: string): string {
   if (type === "interval") {
@@ -67,11 +86,7 @@ function weekdayIndex(field: string): number | null {
  * parses them: crontab numbering, 1-5 is Monday to Friday.
  */
 export function describeCron(expr: string): string {
-  let fields = expr.trim().split(/\s+/);
-  // The daemon stores 6 (seconds first) or 7 (plus year) fields; drop both
-  // when they are the defaults, so the rest reads as a crontab line.
-  if (fields.length === 7 && fields[6] === "*") fields = fields.slice(0, 6);
-  if (fields.length === 6 && fields[0] === "0") fields = fields.slice(1);
+  const fields = crontabFields(expr);
   if (fields.length !== 5) return expr;
   const [min, hour, dom, mon, dow] = fields as [string, string, string, string, string];
   const crontab = fields.join(" ");
@@ -127,6 +142,8 @@ export function relativeTime(unix: number, now: number): string {
 export interface Schedules {
   query: QueryResult<adminPb.ScheduledTask[]>;
   create: (task: NewSchedule) => Promise<unknown>;
+  /** Rewrites a task's name, prompt and schedule; its zone stays as stored. */
+  update: (id: string, task: NewSchedule) => Promise<unknown>;
   remove: (id: string) => Promise<unknown>;
   pause: (id: string) => Promise<unknown>;
   resume: (id: string) => Promise<unknown>;
@@ -177,6 +194,19 @@ export function useSchedules(deps: unknown[] = []): Schedules {
       }),
     refresh,
   );
+  const updateMutation = useMutation(
+    (borg, vars: { id: string; task: NewSchedule }) =>
+      borg.admin.updateScheduledTask({
+        id: vars.id,
+        name: vars.task.name,
+        prompt: vars.task.prompt,
+        scheduleType: vars.task.scheduleType,
+        scheduleExpr: vars.task.scheduleExpr,
+        // Empty leaves the stored zone alone.
+        timezone: "",
+      }),
+    refresh,
+  );
   const deleteMutation = useMutation(
     (borg, id: string) => borg.admin.deleteScheduledTask({ id }),
     refresh,
@@ -197,12 +227,14 @@ export function useSchedules(deps: unknown[] = []): Schedules {
   return {
     query,
     create: (task) => createMutation.run(task),
+    update: (id, task) => updateMutation.run({ id, task }),
     remove: (id) => deleteMutation.run(id),
     pause: (id) => pauseMutation.run(id),
     resume: (id) => resumeMutation.run(id),
     runNow: (id) => runNowMutation.run(id),
     error: (
       createMutation.error ??
+      updateMutation.error ??
       deleteMutation.error ??
       pauseMutation.error ??
       resumeMutation.error ??

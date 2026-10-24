@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeSchedule, intervalSeconds, relativeTime } from "./useSchedules";
+import { describeSchedule, editableExpr, intervalSeconds, relativeTime } from "./useSchedules";
 
 describe("describeSchedule", () => {
   it("says intervals in the largest whole unit that fits", () => {
@@ -97,5 +97,18 @@ describe("relativeTime", () => {
 
   it("shows a dash when there is no next run at all", () => {
     expect(relativeTime(0, now)).toBe("—");
+  });
+});
+
+describe("editableExpr", () => {
+  it("shows a stored cron as its five crontab fields", () => {
+    expect(editableExpr("cron", "0 0 8 * * 1-5")).toBe("0 8 * * 1-5");
+    expect(editableExpr("cron", "0 30 9 * * * *")).toBe("30 9 * * *");
+  });
+
+  it("keeps what it cannot shorten, and every other kind, as stored", () => {
+    expect(editableExpr("cron", "15 0 8 * * *")).toBe("15 0 8 * * *");
+    expect(editableExpr("interval", "30m")).toBe("30m");
+    expect(editableExpr("once", "2026-08-10T09:00")).toBe("2026-08-10T09:00");
   });
 });
