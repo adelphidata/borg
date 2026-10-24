@@ -28,7 +28,7 @@ pub(crate) fn run_export(
     // tonic error and lets the format-rejection unit test stay synchronous.
     let _ = ExportFormat::from_str(format)?;
 
-    let resp = tokio::runtime::Handle::current().block_on(async {
+    let resp = crate::async_bridge::block_on(async {
         let mut client = connect_or_spawn().await?;
         client.export_session(session_id, format, no_redact).await
     })?;
