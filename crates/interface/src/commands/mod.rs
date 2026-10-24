@@ -43,6 +43,23 @@ pub(crate) fn short_id(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
 
+/// The id to print for `id` in a listing of `all`: its first 8 characters,
+/// lengthened until no other listed id shares them, so the printed id always
+/// resolves through [`resolve_unique_prefix`]. Built-in rows share a long
+/// common prefix (`00000000-0000-4000-8000-…`), where a flat 8-character cut
+/// prints the same unusable id on every row.
+pub(crate) fn listed_id<'a>(id: &'a str, all: &[&str]) -> &'a str {
+    let mut len = 8.min(id.len());
+    while len < id.len()
+        && all
+            .iter()
+            .any(|other| *other != id && other.starts_with(&id[..len]))
+    {
+        len += 1;
+    }
+    &id[..len]
+}
+
 pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     cortex::util::truncate::truncate_to_width(s, max)
 }
@@ -177,7 +194,32 @@ mod print_lines_tests {
 
 #[cfg(test)]
 mod resolve_prefix_tests {
-    use super::resolve_unique_prefix;
+    use super::{listed_id, resolve_unique_prefix};
+
+    /// Every printed id must resolve back to its own row, and a random-UUID
+    /// row keeps the usual 8-character id.
+    #[test]
+    fn listed_ids_resolve_back_to_their_own_row() {
+        let all = [
+            "00000000-0000-4000-8000-5ec041700001",
+            "00000000-0000-4000-8000-5ec041700002",
+            "00000000-0000-4000-8000-da1175000002",
+            "3f2a9c1e-7b44-4c1a-9e0d-2b6f1c8a7d10",
+        ];
+        let printed: Vec<&str> = all.iter().map(|id| listed_id(id, &all)).collect();
+        assert_eq!(printed[3], "3f2a9c1e");
+        assert_eq!(printed[2], "00000000-0000-4000-8000-d");
+        for (id, shown) in all.iter().zip(&printed) {
+            let pool = all.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                resolve_unique_prefix("tasks", shown, pool)
+                    .unwrap()
+                    .as_deref(),
+                Some(*id),
+                "printed id {shown} must resolve to {id}"
+            );
+        }
+    }
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use protocols::admin::ScheduledTaskCreate;
 
-use super::{format_ts, short_id, truncate_str, TS_FMT};
+use super::{format_ts, listed_id, short_id, truncate_str, TS_FMT};
 use crate::async_bridge::block_on;
 use crate::daemon_client::connect_or_spawn;
 
@@ -305,8 +305,11 @@ pub(crate) fn run_tasks_list() -> Result<()> {
     if tasks.is_empty() {
         println!("No scheduled tasks.");
     } else {
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let id_width = ids.iter().map(|id| listed_id(id, &ids).len()).max();
+        let id_width = id_width.unwrap_or(8);
         println!(
-            "{:8}  {:20}  {:8}  {:8}  {:20}  NEXT RUN",
+            "{:id_width$}  {:20}  {:8}  {:8}  {:20}  NEXT RUN",
             "ID", "NAME", "TYPE", "STATUS", "SCHEDULE"
         );
         for task in &tasks {
@@ -316,8 +319,8 @@ pub(crate) fn run_tasks_list() -> Result<()> {
                 "-".to_string()
             };
             println!(
-                "{:8}  {:20}  {:8}  {:8}  {:20}  {}",
-                short_id(&task.id),
+                "{:id_width$}  {:20}  {:8}  {:8}  {:20}  {}",
+                listed_id(&task.id, &ids),
                 truncate_str(&task.name, 20),
                 task.schedule_type,
                 task.status,
@@ -571,6 +574,7 @@ pub(crate) fn run_cron_list() -> Result<()> {
         "ID", "STATUS", "SCHEDULE", "COMMAND"
     );
     println!("{}", "-".repeat(90));
+    let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     for job in &cron_jobs {
         let next = if job.next_run_unix > 0 {
             format_ts(job.next_run_unix, TS_FMT)
@@ -580,7 +584,7 @@ pub(crate) fn run_cron_list() -> Result<()> {
         let sched_display = display_cron_5field(&job.schedule_expr);
         println!(
             "{:<10} {:<8} {:<20} {:<30} {}",
-            short_id(&job.id),
+            listed_id(&job.id, &ids),
             job.status,
             sched_display,
             truncate_str(&job.prompt, 28),
