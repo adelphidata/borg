@@ -192,7 +192,22 @@ impl StepKind {
             Self::Agents => checks::runtime::check_agents(config, checks).await,
             Self::Security => checks::security::check_config_security(config, checks),
             Self::SupplyChain => checks::security::check_supply_chain(config, checks),
-            Self::HostAudit => crate::host_audit::run_host_security_checks(checks),
+            // The audit shells out and waits on each command with a sleep
+            // loop; the OS update check alone can take seconds. On a runtime
+            // worker that wait stalls every task queued behind it, the gateway's
+            // requests included, so it runs on the blocking pool.
+            Self::HostAudit => {
+                let found = tokio::task::spawn_blocking(|| {
+                    let mut found = Vec::new();
+                    crate::host_audit::run_host_security_checks(&mut found);
+                    found
+                })
+                .await;
+                match found {
+                    Ok(found) => checks.extend(found),
+                    Err(e) => tracing::warn!("host audit did not finish: {e}"),
+                }
+            }
         }
     }
 }
