@@ -2876,3 +2876,31 @@ fn tab_inside_paste_burst_is_pasted_not_bound() {
         );
     }
 }
+
+#[test]
+fn mode_usage_lists_only_modes_that_mode_accepts() {
+    let mut app = make_app();
+    let _ = app.handle_submit("/mode").unwrap();
+    let usage = app
+        .cells
+        .iter()
+        .find_map(|c| match c {
+            HistoryCell::System { text } => text
+                .lines()
+                .find_map(|l| l.strip_prefix("Usage: /mode <"))
+                .map(|rest| rest.trim_end_matches('>').to_string()),
+            _ => None,
+        })
+        .expect("/mode prints its usage");
+    for mode in usage.split('|') {
+        let _ = app.handle_submit(&format!("/mode {mode}")).unwrap();
+        let rejected = app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::System { text } if text.starts_with("Error:")));
+        assert!(
+            !rejected,
+            "/mode usage lists `{mode}`, but /mode rejects it"
+        );
+    }
+}

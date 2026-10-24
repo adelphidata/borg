@@ -660,7 +660,7 @@ impl App<'_> {
     fn cmd_mode_show(&mut self) -> Result<AppAction> {
         let current = self.config.conversation.collaboration_mode;
         self.push_system_message(format!(
-            "Current collaboration mode: {current}\nUsage: /mode <default|execute|plan>"
+            "Current collaboration mode: {current}\nUsage: /mode <execute|plan>"
         ));
         Ok(AppAction::Continue)
     }
