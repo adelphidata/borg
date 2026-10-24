@@ -15,18 +15,18 @@ export function Chevron({ open }: { open: boolean }) {
   );
 }
 
-/** A count pill beside a fold's title: neon for state, alert for trouble. */
+/** A count pill beside a fold's title: neon for state, warn for something to set up. */
 export function FoldBadge({
   tone = "neon",
   children,
 }: {
-  tone?: "neon" | "alert";
+  tone?: "neon" | "warn";
   children: ReactNode;
 }) {
   return (
     <span
       className={`flex-none rounded-full px-2 py-[3px] text-[10.5px] leading-none font-medium ${
-        tone === "alert" ? "bg-alert-soft text-alert" : "bg-nav-on-bg text-neon-ink"
+        tone === "warn" ? "bg-warn-soft text-warn" : "bg-nav-on-bg text-neon-ink"
       }`}
     >
       {children}

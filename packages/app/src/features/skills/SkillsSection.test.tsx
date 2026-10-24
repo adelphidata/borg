@@ -155,7 +155,8 @@ describe("SkillsSection", () => {
     await waitFor(() => expect(fold("Core")).toBeTruthy());
     // The fold hides each row's note, so the fold itself says what needs a look.
     expect(within(fold("Core")).getByText("3 on")).toBeTruthy();
-    expect(within(fold("Core")).getByText("1 needs setup")).toBeTruthy();
+    // Setup is a warning to act on, not an error, so the badge is warn and not alert.
+    expect(within(fold("Core")).getByText("1 needs setup").className).toContain("text-warn");
     expect(fold("Core").textContent).toMatch(/4$/);
     // Nothing on, nothing to flag.
     expect(fold("Utilities").textContent).not.toMatch(/ on|setup/);
@@ -165,7 +166,7 @@ describe("SkillsSection", () => {
     expect(always.disabled).toBe(true);
     expect(screen.getByText("Always on")).toBeTruthy();
     // The row names what is missing instead of only saying something is.
-    expect(screen.getByText("Needs aws and AWS_PROFILE")).toBeTruthy();
+    expect(screen.getByText("Needs aws and AWS_PROFILE").className).toContain("text-warn");
     expect(screen.queryByText(/icalBuddy/)).toBeNull();
     expect(
       screen.getByRole("switch", { name: "Enable calendar" }).getAttribute("aria-checked"),

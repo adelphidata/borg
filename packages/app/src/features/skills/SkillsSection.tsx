@@ -100,7 +100,7 @@ function SkillRow({
         {note && (
           <div
             className={`mt-[3px] text-[11px] leading-[1.4] ${
-              skill.mandatory ? "text-ink3" : "text-alert"
+              skill.mandatory ? "text-ink3" : "text-warn"
             }`}
           >
             {note}
@@ -155,7 +155,7 @@ function SkillFold({
         (missing > 0 || on > 0) && (
           <>
             {missing > 0 && (
-              <FoldBadge tone="alert">
+              <FoldBadge tone="warn">
                 {missing} {missing === 1 ? "needs" : "need"} setup
               </FoldBadge>
             )}

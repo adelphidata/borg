@@ -191,7 +191,7 @@ function Existing({
             {entry.category && <> · {entry.category}</>}
             {entry.mandatory && <> · always on</>}
             {entry.enabled && entry.needs.length > 0 && (
-              <span className="text-alert"> · needs setup</span>
+              <span className="text-warn"> · needs setup</span>
             )}
           </div>
         </div>

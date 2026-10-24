@@ -35,6 +35,10 @@
   --navOnInk: #2f5400;
   --alert: #c4304e;
   --alertSoft: rgba(196, 48, 78, 0.1);
+  /* Warn marks something to set up, not a failure. The text holds 4.5:1 on
+     every surface and on its own soft pill. */
+  --warn: #7a5200;
+  --warnSoft: rgba(214, 160, 0, 0.18);
   --glow: none;
   --plateGlow: none;
   --barTrack: rgba(12, 16, 13, 0.08);
@@ -58,6 +62,8 @@
   --navOnInk: #b4ff00;
   --alert: #ff4d6d;
   --alertSoft: rgba(255, 77, 109, 0.1);
+  --warn: #f0b429;
+  --warnSoft: rgba(240, 180, 41, 0.12);
   --glow: 0 0 18px rgba(180, 255, 0, 0.35);
   --plateGlow: 0 0 60px -14px rgba(180, 255, 0, 0.22);
   --barTrack: rgba(233, 239, 227, 0.1);
@@ -82,6 +88,8 @@
   --color-nav-on-ink: var(--navOnInk);
   --color-alert: var(--alert);
   --color-alert-soft: var(--alertSoft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warnSoft);
   --color-bar-track: var(--barTrack);
 }
 
