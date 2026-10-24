@@ -106,7 +106,7 @@ causes the events it listens to. In the order an event meets them:
 
 | Guard | Default | Setting |
 |---|---|---|
-| Burst cap per subscription (429 past it, counted as dropped) | 120 events/min | `subscriptions.ingest_burst` |
+| Burst cap per subscription (429 past it; every refusal is added to the dropped count within a second) | 120 events/min | `subscriptions.ingest_burst` |
 | Dedup on the provider's event id or the body hash | on | — |
 | Storm breaker: pause itself past this many events in 10 min | 300 | `subscriptions.storm_threshold` |
 | Waiting events per subscription (later ones kept as "queue full", not run) | 200 | `subscriptions.max_pending` |
@@ -133,10 +133,14 @@ nothing needed attention; it is recorded and not delivered.
 
 - **Only here** (default): the subscription's conversation.
 - **A channel**: Slack, Telegram or Discord with a target, prefixed with the
-  subscription's name.
+  subscription's name. The app offers only the channels whose credential is
+  set on this machine.
 - **Reply where it came from**: channel sources only. Borg answers in the
   Slack thread (or chat) the message came from. A test has no conversation to
-  reply to, so its result stays in the subscription's conversation.
+  reply to, so its result stays in the subscription's conversation. Asked
+  for in chat on another source, "origin" means that chat when Borg can post
+  to it; from a chat it cannot post to (iMessage, Signal, …) results stay in
+  the subscription's conversation and Borg says so.
 
 ## The `subscribe` tool
 
