@@ -26,7 +26,11 @@ fn an_unknown_task_id_fails_the_command() {
         .output()
         .expect("run borg");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "exited {} for an unknown task", out.status);
+    assert!(
+        !out.status.success(),
+        "exited {} for an unknown task",
+        out.status
+    );
     assert!(
         stderr.contains("Task not found: nosuchtask"),
         "stderr does not name the id:\n{stderr}"
