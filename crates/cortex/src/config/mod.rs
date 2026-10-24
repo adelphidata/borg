@@ -306,9 +306,23 @@ pub fn parse_value<T: FromStr>(value: &str, key: &str) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
-    value
-        .parse()
-        .map_err(|e: T::Err| anyhow::anyhow!("Invalid value for {key}: {e}"))
+    value.parse().map_err(|e: T::Err| match expected::<T>() {
+        Some(kind) => anyhow::anyhow!("{key} takes {kind}, not \"{value}\"."),
+        None => anyhow::anyhow!("Invalid value for {key}: {e}"),
+    })
+}
+
+/// What a value of `T` looks like, in words, for the common setting types.
+/// The parser's own error ("invalid digit found in string") says what went
+/// wrong inside it, not what to type instead.
+fn expected<T>() -> Option<&'static str> {
+    match std::any::type_name::<T>() {
+        "u8" | "u16" | "u32" | "u64" | "usize" => Some("a whole number of 0 or more"),
+        "i8" | "i16" | "i32" | "i64" | "isize" => Some("a whole number"),
+        "f32" | "f64" => Some("a number"),
+        "bool" => Some("true or false"),
+        _ => None,
+    }
 }
 
 pub fn parse_nonzero<T: FromStr + Default + PartialEq>(value: &str, key: &str) -> Result<T>

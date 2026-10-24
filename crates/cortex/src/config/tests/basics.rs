@@ -370,3 +370,17 @@ fn apply_setting_telemetry_tracing_is_user_settable() {
         .expect("telemetry.tracing_enabled is a registered bool setting");
     assert!(cfg.telemetry.tracing_enabled);
 }
+
+/// A bad value says what to type instead, not what went wrong in the parser.
+#[test]
+fn a_bad_setting_value_names_what_it_takes() {
+    let err = parse_value::<u64>("abc", "agents.delegate_timeout_secs").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "agents.delegate_timeout_secs takes a whole number of 0 or more, not \"abc\"."
+    );
+    let err = parse_value::<bool>("maybe", "web.enabled").unwrap_err();
+    assert_eq!(err.to_string(), "web.enabled takes true or false, not \"maybe\".");
+    let err = parse_value::<f64>("x", "llm.temperature").unwrap_err();
+    assert_eq!(err.to_string(), "llm.temperature takes a number, not \"x\".");
+}

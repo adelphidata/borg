@@ -360,7 +360,7 @@ impl Admin for AdminSvc {
         resolver
             .set(&req.key, &req.value)
             .await
-            .map_err(|e| TStatus::invalid_argument(format!("set `{}` failed: {e}", req.key)))?;
+            .map_err(|e| TStatus::invalid_argument(e.to_string()))?;
         let renamed = match previous_name {
             Some((named, old)) => named.rename_in_memory(old, &req.value).await,
             None => Ok(()),
@@ -381,7 +381,7 @@ impl Admin for AdminSvc {
         resolver
             .unset(&key)
             .await
-            .map_err(|e| TStatus::invalid_argument(format!("unset `{key}` failed: {e}")))?;
+            .map_err(|e| TStatus::invalid_argument(e.to_string()))?;
         let renamed = match previous_name {
             Some((named, old)) => named.rename_in_memory(old, "").await,
             None => Ok(()),
