@@ -42,7 +42,8 @@ pub trait KekStore: Send + Sync {
 /// another `BORG_HOME` would otherwise write the same accounts and replace the
 /// CA of the first. A store made with [`KeychainStore::for_home`] for any dir
 /// other than the default suffixes each account with a short hash of that dir.
-/// The default dir keeps the bare names, so existing installs keep their keys.
+/// The default dir keeps the bare names, and a scoped store copies a bare
+/// entry it lacks on first read, so existing installs keep their keys.
 #[derive(Debug, Default)]
 pub struct KeychainStore {
     scope: Option<String>,
@@ -93,11 +94,18 @@ impl KekStore for KeychainStore {
     }
 
     fn get(&self, account: &str) -> Result<Vec<u8>, PkiError> {
-        let entry = self.entry(account)?;
-        entry.get_secret().map_err(|e| match e {
-            keyring_core::Error::NoEntry => PkiError::NotFound(account.to_string()),
-            other => PkiError::Keychain(format!("get_secret({account}): {other}")),
-        })
+        match read_secret(&self.entry(account)?, account) {
+            // A home that stored its keys before accounts were scoped still
+            // has them under the bare name; copy them over once.
+            Err(PkiError::NotFound(_)) if self.scope.is_some() => {
+                let secret = read_secret(&Self::new().entry(account)?, account)?;
+                if let Err(e) = self.put(account, &secret) {
+                    tracing::warn!("keychain: could not copy {account} to its scoped name: {e}");
+                }
+                Ok(secret)
+            }
+            other => other,
+        }
     }
 
     fn delete(&self, account: &str) -> Result<(), PkiError> {
@@ -108,6 +116,13 @@ impl KekStore for KeychainStore {
             Err(e) => Err(PkiError::Keychain(format!("delete({account}): {e}"))),
         }
     }
+}
+
+fn read_secret(entry: &keyring_core::Entry, account: &str) -> Result<Vec<u8>, PkiError> {
+    entry.get_secret().map_err(|e| match e {
+        keyring_core::Error::NoEntry => PkiError::NotFound(account.to_string()),
+        other => PkiError::Keychain(format!("get_secret({account}): {other}")),
+    })
 }
 
 /// In-memory `KekStore` for tests and CI hosts without a working keychain.
@@ -460,6 +475,14 @@ mod tests {
         match store.get(account) {
             Err(PkiError::NotFound(a)) => assert_eq!(a, account),
             other => panic!("expected NotFound for an absent entry, got {other:?}"),
+        }
+        // A scoped store that finds neither its own entry nor the bare one
+        // from before scoping reports the same NotFound.
+        let home = tempfile::tempdir().expect("tempdir");
+        let scoped = KeychainStore::for_home(home.path(), None);
+        match scoped.get(account) {
+            Err(PkiError::NotFound(a)) => assert_eq!(a, account),
+            other => panic!("expected NotFound for an absent scoped entry, got {other:?}"),
         }
     }
 
