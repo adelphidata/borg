@@ -688,6 +688,15 @@ export interface Conversation {
   refreshContext: () => void;
 }
 
+/** What a compaction someone asked for did, in one line. */
+export function compactNotice(beforeTokens: number, afterTokens: number): string {
+  if (afterTokens >= beforeTokens) {
+    return "Nothing to compact yet. The conversation is still short enough to keep whole.";
+  }
+  const fmt = (n: number) => n.toLocaleString("en-US");
+  return `Compacted the conversation from about ${fmt(beforeTokens)} to ${fmt(afterTokens)} tokens.`;
+}
+
 /**
  * One conversation with the daemon.
  *
@@ -1234,7 +1243,17 @@ export function useConversation(target: string | undefined): Conversation {
 
   const compactMutation = useMutation(
     (borg) => (sessionId ? borg.session.compact({ sessionId }) : Promise.resolve(undefined)),
-    { onSuccess: () => refreshContext() },
+    {
+      onSuccess: (result) => {
+        refreshContext();
+        // The daemon raises no event for a compaction someone asked for; the
+        // counts it answers with are the only word that it happened.
+        if (result) {
+          const text = compactNotice(Number(result.beforeTokens), Number(result.afterTokens));
+          setCells((prev) => [...prev, { kind: "notice", text, at: Date.now() }]);
+        }
+      },
+    },
   );
   const forkMutation = useMutation((borg) =>
     sessionId ? borg.session.fork({ sessionId }) : Promise.resolve(undefined),

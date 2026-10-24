@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { session as sessionPb } from "@borg/client";
 import {
+  compactNotice,
   contextUsed,
   historyCells,
   reduceEvent,
@@ -662,5 +663,17 @@ describe("retryTarget", () => {
     // have no message to send.
     expect(retryTarget([{ kind: "error", text: "boom", at: 0 }])).toBeUndefined();
     expect(retryTarget([])).toBeUndefined();
+  });
+});
+
+describe("compactNotice", () => {
+  it("names the before and after sizes when history shrank", () => {
+    expect(compactNotice(12_400, 3_100)).toBe(
+      "Compacted the conversation from about 12,400 to 3,100 tokens.",
+    );
+  });
+
+  it("says nothing was compacted when the size did not drop", () => {
+    expect(compactNotice(800, 800)).toMatch(/^Nothing to compact yet/);
   });
 });

@@ -177,7 +177,7 @@ pub trait SessionBackend: Send + Sync + 'static {
     // implements them. Daemon RPC handlers translate `unsupported` into a
     // gRPC `unimplemented` status so callers can render a clean message.
 
-    /// Compact conversation history. Returns `(dropped, after_tokens)`.
+    /// Compact conversation history. Returns `(before_tokens, after_tokens)`.
     async fn compact(&self) -> anyhow::Result<(usize, usize)> {
         Err(anyhow::anyhow!("compact not supported by this backend"))
     }
