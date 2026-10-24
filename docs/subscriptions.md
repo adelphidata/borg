@@ -163,6 +163,10 @@ after a day; the budgets and breakers still count them until then.
   the sandbox. Revealing or replacing a key is recorded in the activity log,
   and the key is not shown if that record fails.
 - An unauthenticated request learns only whether the subscription exists.
+- The burst cap counts requests before it checks the key, so a flood never
+  reaches the database. The cost: someone who has the URL but not the key
+  can use up a minute's slots, and those refusals add to the dropped count.
+  Keep the URL as private as the key.
 - Keep filters narrow. Every match wakes Borg and uses model usage, and
   inbound email is written by strangers.
 
