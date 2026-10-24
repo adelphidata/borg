@@ -137,6 +137,24 @@ export function emptySpec(transport: Transport = "stdio"): admin.McpServerSpec {
 export const SETTLE_POLL_MS = 1500;
 
 /**
+ * Refetches before the poll gives up, about a minute. A server that keeps
+ * reconnecting (a bad URL behind backoff) would otherwise keep the page
+ * asking for as long as it is open; any write refetches anyway.
+ */
+export const SETTLE_POLL_LIMIT = 40;
+
+/** Refetch every {@link SETTLE_POLL_MS}, at most {@link SETTLE_POLL_LIMIT} times. Returns the stop. */
+export function pollWhileSettling(refetch: () => void): () => void {
+  let left = SETTLE_POLL_LIMIT;
+  const id = setInterval(() => {
+    refetch();
+    left -= 1;
+    if (left <= 0) clearInterval(id);
+  }, SETTLE_POLL_MS);
+  return () => clearInterval(id);
+}
+
+/**
  * True while an enabled server has not reached a resting state yet: the
  * daemon starts servers in the background after a write, so the label would
  * otherwise sit on "Not started" until the page is reloaded.
@@ -180,11 +198,7 @@ export function useMcpServers(deps: unknown[] = []): McpServers {
 
   const { refetch } = query;
   const busy = settling(query.data);
-  useEffect(() => {
-    if (!busy) return;
-    const id = setInterval(refetch, SETTLE_POLL_MS);
-    return () => clearInterval(id);
-  }, [busy, refetch]);
+  useEffect(() => (busy ? pollWhileSettling(refetch) : undefined), [busy, refetch]);
 
   const put = useMutation(
     (

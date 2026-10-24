@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatKeyValues,
   joinCommandLine,
   parseKeyValues,
+  pollWhileSettling,
+  SETTLE_POLL_LIMIT,
+  SETTLE_POLL_MS,
   settling,
   splitCommandLine,
   stateTone,
@@ -102,5 +105,29 @@ describe("settling", () => {
     );
     expect(settling(list(false, entry("not-started")))).toBe(false);
     expect(settling(list(true, entry("not-started", false)))).toBe(false);
+  });
+});
+
+describe("pollWhileSettling", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stops after its limit, so a server stuck reconnecting does not poll forever", () => {
+    vi.useFakeTimers();
+    const refetch = vi.fn();
+    pollWhileSettling(refetch);
+    vi.advanceTimersByTime(SETTLE_POLL_MS * (SETTLE_POLL_LIMIT + 10));
+    expect(refetch).toHaveBeenCalledTimes(SETTLE_POLL_LIMIT);
+  });
+
+  it("stops at once when the caller stops it", () => {
+    vi.useFakeTimers();
+    const refetch = vi.fn();
+    const stop = pollWhileSettling(refetch);
+    vi.advanceTimersByTime(SETTLE_POLL_MS * 2);
+    stop();
+    vi.advanceTimersByTime(SETTLE_POLL_MS * 5);
+    expect(refetch).toHaveBeenCalledTimes(2);
   });
 });
