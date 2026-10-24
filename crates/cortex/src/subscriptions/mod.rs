@@ -156,17 +156,24 @@ pub fn cap_payload(payload: &serde_json::Value, max_bytes: usize) -> (String, bo
     if text.len() <= max_bytes {
         return (text, false);
     }
-    // The head is re-escaped inside the wrapper, so leave room for that.
+    // The head is re-escaped inside the wrapper, which can grow it up to six
+    // times (a control character becomes `\u0000`), so shrink until it fits.
     let mut end = (max_bytes / 2).min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+    loop {
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let capped = serde_json::json!({
+            "_truncated": true,
+            "_original_bytes": text.len(),
+            "_head": &text[..end],
+        })
+        .to_string();
+        if capped.len() <= max_bytes || end == 0 {
+            return (capped, true);
+        }
+        end /= 2;
     }
-    let capped = serde_json::json!({
-        "_truncated": true,
-        "_original_bytes": text.len(),
-        "_head": &text[..end],
-    });
-    (capped.to_string(), true)
 }
 
 #[cfg(test)]
@@ -206,7 +213,17 @@ mod tests {
     }
 
     #[test]
-    fn source_round_trips_and_only_endpoint_sources_need_a_key() {
+    fn payloads_that_grow_when_escaped_still_fit_the_cap() {
+        for blob in ["\"".repeat(10_000), "\u{1}".repeat(10_000)] {
+            let (text, cut) = cap_payload(&serde_json::json!({ "blob": blob }), 2048);
+            assert!(cut);
+            assert!(text.len() <= 2048, "stored {} bytes", text.len());
+            serde_json::from_str::<serde_json::Value>(&text).expect("still JSON");
+        }
+    }
+
+    #[test]
+    fn source_round_trips_through_its_stored_form() {
         for s in [
             Source::Webhook,
             Source::Channel,
@@ -216,7 +233,5 @@ mod tests {
             assert_eq!(Source::parse(s.as_str()), Some(s));
         }
         assert_eq!(Source::parse("cron"), None);
-        assert!(Source::Webhook.uses_endpoint() && Source::Email.uses_endpoint());
-        assert!(!Source::Channel.uses_endpoint() && !Source::Internal.uses_endpoint());
     }
 }

@@ -163,6 +163,10 @@ impl Preset {
     /// Map a payload onto kind, dedup key and summary.
     pub fn normalize(&self, headers: HeaderFn<'_>, payload: &Value) -> Normalized {
         let mut n = (self.normalize)(headers, payload);
+        // Kinds come from sender-controlled fields (a custom `kind`, GitHub's
+        // `X-GitHub-Event`, which its signature does not cover) and appear in
+        // the prompt's overview, so they are reduced to a safe token.
+        n.kind = n.kind.as_deref().map(clean_kind).filter(|k| !k.is_empty());
         if n.summary.trim().is_empty() {
             n.summary = format!("{} event", self.label);
         }
@@ -208,6 +212,22 @@ fn basic_auth_url(url: &str, key: &str) -> String {
     }
 }
 
+/// Lowercase, keep `[a-z0-9._-]`, turn anything else into `_`, cap at 64.
+fn clean_kind(kind: &str) -> String {
+    kind.trim()
+        .chars()
+        .take(64)
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Collapse whitespace and cut to `max` characters.
 fn one_line(s: &str, max: usize) -> String {
     let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -225,6 +245,14 @@ fn s(v: &Value, path: &str) -> Option<String> {
 
 fn first(v: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|p| s(v, p))
+}
+
+/// The first of `paths` whose value is a severity word, so an unreadable
+/// first field ("SEV-1") falls through to the next one.
+fn first_severity(v: &Value, paths: &[&str]) -> Option<Severity> {
+    paths
+        .iter()
+        .find_map(|p| s(v, p).and_then(|w| Severity::from_word(&w)))
 }
 
 fn none_severity(_: &Value) -> Option<Severity> {
@@ -247,13 +275,18 @@ pub fn get(id: &str) -> Option<&'static Preset> {
 
 // ── Alerts ──────────────────────────────────────────────────────────────
 
+/// Datadog's `$ALERT_TRANSITION` as a kind: `Re-Triggered` is still a
+/// trigger, `No Data` becomes `no_data`.
+fn datadog_transition(v: &Value) -> String {
+    let t = s(v, "transition")
+        .unwrap_or_else(|| "event".to_string())
+        .to_ascii_lowercase();
+    t.strip_prefix("re-").unwrap_or(&t).replace(' ', "_")
+}
+
 fn datadog(_: HeaderFn<'_>, v: &Value) -> Normalized {
-    let transition = s(v, "transition").map(|t| t.to_ascii_lowercase());
     Normalized {
-        kind: Some(format!(
-            "alert.{}",
-            transition.as_deref().unwrap_or("event")
-        )),
+        kind: Some(format!("alert.{}", datadog_transition(v))),
         dedup_key: s(v, "id"),
         summary: first(v, &["title", "message"]).unwrap_or_default(),
         handshake: false,
@@ -261,10 +294,12 @@ fn datadog(_: HeaderFn<'_>, v: &Value) -> Normalized {
 }
 
 fn datadog_severity(v: &Value) -> Option<Severity> {
-    if s(v, "transition").is_some_and(|t| t.eq_ignore_ascii_case("recovered")) {
-        return Some(Severity::Info);
+    match datadog_transition(v).as_str() {
+        "recovered" => Some(Severity::Info),
+        "warn" | "no_data" => Some(Severity::Warning),
+        // `$ALERT_PRIORITY` is empty unless the monitor sets one.
+        _ => first_severity(v, &["priority"]).or(Some(Severity::Error)),
     }
-    s(v, "priority").and_then(|p| Severity::from_word(&p))
 }
 
 fn sentry(h: HeaderFn<'_>, v: &Value) -> Normalized {
@@ -295,7 +330,7 @@ fn sentry(h: HeaderFn<'_>, v: &Value) -> Normalized {
 }
 
 fn sentry_severity(v: &Value) -> Option<Severity> {
-    first(v, &["data.issue.level", "data.event.level"]).and_then(|l| Severity::from_word(&l))
+    first_severity(v, &["data.issue.level", "data.event.level"])
 }
 
 fn pagerduty(_: HeaderFn<'_>, v: &Value) -> Normalized {
@@ -317,8 +352,7 @@ fn pagerduty(_: HeaderFn<'_>, v: &Value) -> Normalized {
 }
 
 fn pagerduty_severity(v: &Value) -> Option<Severity> {
-    first(v, &["event.data.priority.summary", "event.data.urgency"])
-        .and_then(|w| Severity::from_word(&w))
+    first_severity(v, &["event.data.priority.summary", "event.data.urgency"])
 }
 
 // ── Code ────────────────────────────────────────────────────────────────
@@ -457,11 +491,10 @@ fn stripe(_: HeaderFn<'_>, v: &Value) -> Normalized {
         .unwrap_or_default()
         .to_uppercase();
     let summary = match amount {
-        Some(cents) => format!(
-            "{} {object}: {}.{:02} {currency}",
+        Some(minor) => format!(
+            "{} {object}: {} {currency}",
             kind.as_deref().unwrap_or("event"),
-            cents / 100,
-            (cents % 100).abs()
+            stripe_amount(minor, &currency)
         ),
         None => format!("{} {object}", kind.as_deref().unwrap_or("event")),
     };
@@ -471,6 +504,21 @@ fn stripe(_: HeaderFn<'_>, v: &Value) -> Normalized {
         summary,
         handshake: false,
     }
+}
+
+/// Stripe amounts are in the currency's smallest unit; a few currencies have
+/// no minor unit at all.
+fn stripe_amount(minor: i64, currency: &str) -> String {
+    const ZERO_DECIMAL: &[&str] = &[
+        "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF", "UGX", "VND", "VUV",
+        "XAF", "XOF", "XPF",
+    ];
+    if ZERO_DECIMAL.contains(&currency) {
+        return minor.to_string();
+    }
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.unsigned_abs();
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }
 
 // ── Custom ──────────────────────────────────────────────────────────────
@@ -486,7 +534,7 @@ fn custom(h: HeaderFn<'_>, v: &Value) -> Normalized {
 }
 
 fn custom_severity(v: &Value) -> Option<Severity> {
-    first(v, &["severity", "level", "priority"]).and_then(|w| Severity::from_word(&w))
+    first_severity(v, &["severity", "level", "priority"])
 }
 
 fn custom_text(v: &Value) -> Option<String> {
@@ -529,9 +577,19 @@ fn agentmail_text(v: &Value) -> Option<String> {
 // ── Channels and Borg ───────────────────────────────────────────────────
 
 fn channel(_: HeaderFn<'_>, v: &Value) -> Normalized {
+    let kind = s(v, "kind").unwrap_or_else(|| "message".to_string());
+    // Message ids are only unique within a chat (Telegram counts per chat),
+    // and a reaction carries the id of the message it reacts to.
+    let dedup_key = s(v, "message_id").map(|id| {
+        format!(
+            "{}:{kind}:{}:{id}",
+            s(v, "channel_id").unwrap_or_default(),
+            s(v, "reaction").unwrap_or_default()
+        )
+    });
     Normalized {
-        kind: s(v, "kind").or_else(|| Some("message".to_string())),
-        dedup_key: s(v, "message_id"),
+        kind: Some(kind),
+        dedup_key,
         summary: s(v, "text").unwrap_or_default(),
         handshake: false,
     }
@@ -559,8 +617,10 @@ fn borg_severity(v: &Value) -> Option<Severity> {
     })
 }
 
-const ALERT_FIELDS: &[&str] = &["kinds", "severity"];
-const CHANNEL_FIELDS: &[&str] = &["channel", "phrase", "mention", "reaction", "sender"];
+// `filter_fields` entries are `Filter` field names, so the form writes exactly
+// the keys the filter reads.
+const ALERT_FIELDS: &[&str] = &["kinds", "severity_min"];
+const CHANNEL_FIELDS: &[&str] = &["channel_id", "phrase", "mention_only", "reaction", "sender"];
 
 static PRESETS: &[Preset] = &[
     Preset {
@@ -570,7 +630,7 @@ static PRESETS: &[Preset] = &[
         group: "Alerts",
         source: Source::Webhook,
         auth: AuthScheme::Bearer,
-        kinds: &["alert.triggered", "alert.recovered", "alert.warn", "alert.no data"],
+        kinds: &["alert.triggered", "alert.recovered", "alert.warn", "alert.no_data"],
         filter_fields: ALERT_FIELDS,
         sender_steps: &[
             "In Datadog, open Integrations → Webhooks and add a webhook.",
@@ -648,7 +708,7 @@ static PRESETS: &[Preset] = &[
             "check_suite.completed",
             "release.published",
         ],
-        filter_fields: &["kinds", "repos", "branch", "labels", "author", "drafts"],
+        filter_fields: &["kinds", "repos", "branch", "labels", "author", "exclude_drafts"],
         sender_steps: &[
             "In GitHub, open the repository (or organization) → Settings → Webhooks → Add webhook.",
             "Set Payload URL to {url}.",
@@ -671,7 +731,7 @@ static PRESETS: &[Preset] = &[
         source: Source::Webhook,
         auth: AuthScheme::Linear,
         kinds: &["issue.create", "issue.update", "comment.create"],
-        filter_fields: &["kinds", "severity"],
+        filter_fields: ALERT_FIELDS,
         sender_steps: &[
             "In Linear, open Settings → API → Webhooks and create a webhook.",
             "Set URL to {url} and pick the data change events.",
@@ -823,7 +883,7 @@ static PRESETS: &[Preset] = &[
         source: Source::Webhook,
         auth: AuthScheme::Bearer,
         kinds: &[],
-        filter_fields: &["kinds", "severity"],
+        filter_fields: ALERT_FIELDS,
         sender_steps: &[
             "POST JSON to {url} with the header Authorization: Bearer {key}.",
             "Optional fields Borg understands: id (dedup), kind, title, severity, text.",
@@ -1012,5 +1072,113 @@ mod tests {
             assert!(a.provider_issues_secret(), "{a:?}");
             assert_eq!(AuthScheme::parse(a.as_str()), Some(a));
         }
+    }
+
+    #[test]
+    fn filter_fields_name_real_filter_keys() {
+        use super::super::filter::{FieldEquals, Filter};
+        let full = Filter {
+            kinds: vec!["k".into()],
+            phrase: Some("p".into()),
+            mention_only: true,
+            channel_id: Some("c".into()),
+            sender: Some("s".into()),
+            reaction: Some("r".into()),
+            severity_min: Some(Severity::Error),
+            repos: vec!["o/r".into()],
+            branch: Some("main".into()),
+            labels: vec!["bug".into()],
+            author: Some("a".into()),
+            exclude_drafts: true,
+            field_equals: vec![FieldEquals {
+                path: "x".into(),
+                value: json!(1),
+            }],
+        };
+        let keys = serde_json::to_value(&full).unwrap();
+        for p in all() {
+            for field in p.filter_fields {
+                assert!(
+                    keys.get(field).is_some(),
+                    "{}: `{field}` is not a filter key",
+                    p.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kinds_from_senders_are_reduced_to_a_safe_token() {
+        let p = get("custom").unwrap();
+        let n = p.normalize(&|_| None, &json!({"kind": "  Push Event!\n<b>"}));
+        assert_eq!(n.kind.as_deref(), Some("push_event___b_"));
+        let long = p.normalize(&|_| None, &json!({"kind": "a".repeat(200)}));
+        assert_eq!(long.kind.map(|k| k.len()), Some(64));
+    }
+
+    #[test]
+    fn datadog_retriggers_and_no_data_map_to_stable_kinds() {
+        let p = get("datadog").unwrap();
+        let cases = [
+            ("Triggered", "alert.triggered", Severity::Error),
+            ("Re-Triggered", "alert.triggered", Severity::Error),
+            ("Recovered", "alert.recovered", Severity::Info),
+            ("Warn", "alert.warn", Severity::Warning),
+            ("Re-Warn", "alert.warn", Severity::Warning),
+            ("No Data", "alert.no_data", Severity::Warning),
+        ];
+        for (transition, kind, severity) in cases {
+            let v = json!({"transition": transition, "priority": ""});
+            assert_eq!(
+                p.normalize(&|_| None, &v).kind.as_deref(),
+                Some(kind),
+                "{transition}"
+            );
+            assert!(p.kinds.contains(&kind), "{kind} is not offered in the form");
+            assert_eq!(p.severity(&v), Some(severity), "{transition}");
+        }
+    }
+
+    #[test]
+    fn pagerduty_falls_back_to_urgency_when_priority_is_unreadable() {
+        let p = get("pagerduty").unwrap();
+        let v =
+            json!({"event": {"data": {"priority": {"summary": "SEV-custom"}, "urgency": "high"}}});
+        assert_eq!(p.severity(&v), Some(Severity::Critical));
+        let none = json!({"event": {"data": {"urgency": "low"}}});
+        assert_eq!(p.severity(&none), Some(Severity::Info));
+    }
+
+    #[test]
+    fn channel_dedup_keys_are_scoped_to_the_chat_and_the_kind() {
+        let p = get("telegram").unwrap();
+        let key = |v: Value| p.normalize(&|_| None, &v).dedup_key;
+        let a = key(json!({"kind": "message", "channel_id": "-1", "message_id": "981"}));
+        let b = key(json!({"kind": "message", "channel_id": "-2", "message_id": "981"}));
+        let r1 = key(
+            json!({"kind": "reaction", "channel_id": "-1", "message_id": "981", "reaction": "eyes"}),
+        );
+        let r2 = key(
+            json!({"kind": "reaction", "channel_id": "-1", "message_id": "981", "reaction": "fire"}),
+        );
+        assert_ne!(a, b, "same message id in two chats");
+        assert_ne!(a, r1, "a reaction to a message is not the message");
+        assert_ne!(r1, r2, "two reactions to one message");
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn stripe_amounts_respect_zero_decimal_currencies_and_sign() {
+        let p = get("stripe").unwrap();
+        let summary = |amount: i64, currency: &str| {
+            p.normalize(
+                &|_| None,
+                &json!({"type": "charge.refunded", "data": {"object": {"id": "ch_1", "amount": amount, "currency": currency}}}),
+            )
+            .summary
+        };
+        assert_eq!(summary(4999, "usd"), "charge.refunded ch_1: 49.99 USD");
+        assert_eq!(summary(500, "jpy"), "charge.refunded ch_1: 500 JPY");
+        assert_eq!(summary(-5, "eur"), "charge.refunded ch_1: -0.05 EUR");
     }
 }

@@ -19,14 +19,20 @@ pub struct FieldEquals {
 }
 
 /// A subscription's filter. Stored as JSON in `subscriptions.filter`.
+///
+/// Unknown keys are refused: a misspelt field (`severity` for
+/// `severity_min`) would otherwise be dropped silently and leave a filter
+/// that matches every event.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Filter {
     /// Event kinds to react to. An entry matches the kind itself or any kind
     /// under it: `pull_request` matches `pull_request.opened`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
     /// Case-insensitive text the message, email body or summary must contain.
+    /// Either one is enough: an email's subject is in the summary, its body
+    /// in the text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phrase: Option<String>,
     /// Channel sources: only messages that mention Borg.
@@ -125,8 +131,10 @@ impl Filter {
             return true;
         };
         let needle = phrase.to_lowercase();
-        let haystack = event.text.unwrap_or(event.summary).to_lowercase();
-        haystack.contains(&needle)
+        event.summary.to_lowercase().contains(&needle)
+            || event
+                .text
+                .is_some_and(|t| t.to_lowercase().contains(&needle))
     }
 
     fn channel_ok(&self, payload: &Value) -> bool {
@@ -166,7 +174,16 @@ impl Filter {
         if let Some(branch) = self.branch.as_deref() {
             let target = text("ref")
                 .map(|r| r.strip_prefix("refs/heads/").unwrap_or(r))
-                .or_else(|| text("pull_request.base.ref"));
+                .or_else(|| {
+                    [
+                        "pull_request.base.ref",
+                        "workflow_run.head_branch",
+                        "check_suite.head_branch",
+                        "check_run.check_suite.head_branch",
+                    ]
+                    .into_iter()
+                    .find_map(text)
+                });
             if target != Some(branch) {
                 return false;
             }
@@ -196,7 +213,7 @@ impl Filter {
 }
 
 /// Every label name on the event: the issue's or PR's labels plus the label
-/// just added or removed.
+/// just added. A label just removed is not one the item has.
 fn github_labels(payload: &Value) -> Vec<&str> {
     let mut out = Vec::new();
     for path in ["pull_request.labels", "issue.labels"] {
@@ -204,8 +221,13 @@ fn github_labels(payload: &Value) -> Vec<&str> {
             out.extend(list.iter().filter_map(|l| l.get("name")?.as_str()));
         }
     }
+    let removed = payload.get("action").and_then(Value::as_str) == Some("unlabeled");
     if let Some(name) = lookup(payload, "label.name").and_then(Value::as_str) {
-        out.push(name);
+        if removed {
+            out.retain(|n| *n != name);
+        } else {
+            out.push(name);
+        }
     }
     out
 }
@@ -263,6 +285,11 @@ mod tests {
     #[test]
     fn an_unreadable_filter_matches_nothing_and_an_empty_one_everything() {
         assert_eq!(Filter::parse("not json"), None);
+        assert_eq!(
+            Filter::parse(r#"{"severity":"error"}"#),
+            None,
+            "a misspelt key must not become an empty, match-all filter"
+        );
         assert_eq!(Filter::parse(""), Some(Filter::default()));
         let payload = json!({});
         assert!(Filter::default().matches(&view(None, &payload)));
@@ -278,6 +305,9 @@ mod tests {
         });
         let push = json!({"ref": "refs/heads/release", "repository": {"full_name": "octo/app"}});
         let slack = json!({"text": "Needs REPRO on checkout", "channel_id": "C1", "sender": "U9", "mentioned": false});
+        let ci = json!({"workflow_run": {"head_branch": "main", "conclusion": "failure"}});
+        let unlabeled =
+            json!({"action": "unlabeled", "label": {"name": "wontfix"}, "issue": {"labels": []}});
 
         let cases: Vec<(&str, Filter, Option<&str>, &Value, bool)> = vec![
             (
@@ -421,6 +451,36 @@ mod tests {
                 false,
             ),
             (
+                "phrase found in the summary when the text lacks it",
+                Filter {
+                    phrase: Some("summary".into()),
+                    ..Default::default()
+                },
+                None,
+                &slack,
+                true,
+            ),
+            (
+                "branch of a CI run",
+                Filter {
+                    branch: Some("main".into()),
+                    ..Default::default()
+                },
+                Some("workflow_run.completed"),
+                &ci,
+                true,
+            ),
+            (
+                "removed label does not count",
+                Filter {
+                    labels: vec!["wontfix".into()],
+                    ..Default::default()
+                },
+                None,
+                &unlabeled,
+                false,
+            ),
+            (
                 "mention required",
                 Filter {
                     mention_only: true,
@@ -500,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_json_round_trips_and_omits_unset_fields() {
+    fn stored_json_omits_unset_fields() {
         let f = Filter {
             kinds: vec!["push".into()],
             branch: Some("main".into()),

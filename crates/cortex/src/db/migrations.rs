@@ -1283,6 +1283,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     rate_limit_per_hour INTEGER NOT NULL,
     timeout_secs        INTEGER NOT NULL,
     dropped_count       INTEGER NOT NULL DEFAULT 0,
+    accepting_since     INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL,
     last_event_at       INTEGER,
