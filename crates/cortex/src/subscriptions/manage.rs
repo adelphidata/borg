@@ -6,7 +6,7 @@
 //! a sentence for the user. Any other error is a fault in Borg (a locked
 //! database, an unreadable key), and callers report it as one.
 
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 
 use anyhow::{Context, Result};
 
@@ -63,17 +63,14 @@ static TUNNEL_URL: RwLock<Option<String>> = RwLock::new(None);
 /// that names the address the internet can reach.
 pub fn set_tunnel_url(url: Option<String>) {
     let url = url.filter(|u| !u.trim().is_empty());
-    match TUNNEL_URL.write() {
-        Ok(mut g) => *g = url,
-        Err(poisoned) => *poisoned.into_inner() = url,
-    }
+    *TUNNEL_URL.write().unwrap_or_else(PoisonError::into_inner) = url;
 }
 
 fn tunnel_url() -> Option<String> {
-    match TUNNEL_URL.read() {
-        Ok(g) => g.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    TUNNEL_URL
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// The endpoint of subscription `id`: `gateway.public_url` when the user set

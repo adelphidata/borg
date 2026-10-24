@@ -12,7 +12,7 @@
 //! because waiting a minute does fix it.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -155,10 +155,7 @@ impl Gate {
 
     fn admit(&self, id: &str, now: i64, per_minute: u32) -> Admit {
         let cap = per_minute.saturating_mul(2).max(10);
-        let mut windows = match self.windows.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
         if windows.len() >= GATE_MAX_IDS && !windows.contains_key(id) {
             windows.retain(|_, w| now - w.started < 60);
             if windows.len() >= GATE_MAX_IDS {
@@ -188,10 +185,7 @@ impl Gate {
 
     /// The refusals gathered for `id` since the last write, for the counter.
     fn take_dropped(&self, id: &str) -> i64 {
-        let mut windows = match self.windows.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
         windows.get_mut(id).map_or(0, |w| {
             w.flush_pending = false;
             std::mem::take(&mut w.dropped)
@@ -202,10 +196,7 @@ impl Gate {
     /// a provider's unwanted events (pushes to other branches) must not use
     /// up the budget of the ones the subscription wants.
     fn refund(&self, id: &str) {
-        let mut windows = match self.windows.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(w) = windows.get_mut(id) {
             w.count = w.count.saturating_sub(1);
         }
@@ -238,10 +229,7 @@ async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> 
     };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        let guard = match cache.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((at, value)) = guard.get(&text) {
             if at.elapsed() < SECRET_TTL {
                 return Ok(Some(value.clone()));
@@ -254,10 +242,7 @@ async fn resolve_secret(json_ref: Option<String>) -> Result<Option<String>, ()> 
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
-    let mut guard = match cache.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.len() >= GATE_MAX_IDS {
         guard.clear();
     }

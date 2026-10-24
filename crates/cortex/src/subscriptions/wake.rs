@@ -6,7 +6,7 @@
 //! one dispatcher tick, and nothing is lost.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use tokio::sync::Notify;
 
@@ -47,10 +47,9 @@ pub fn report_storm(subscription_id: &str, events_in_window: i64) {
         events_in_window,
     };
     {
-        let mut guard = match storm_notices().lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = storm_notices()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if guard.len() < MAX_STORM_NOTICES {
             guard.push(notice);
         }
@@ -60,10 +59,9 @@ pub fn report_storm(subscription_id: &str, events_in_window: i64) {
 
 /// Take every pending storm notice.
 pub fn take_storm_notices() -> Vec<StormNotice> {
-    let mut guard = match storm_notices().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = storm_notices()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     std::mem::take(&mut *guard)
 }
 
@@ -77,10 +75,7 @@ fn seen() -> &'static Mutex<HashSet<String>> {
 /// while the subscription is still paused. A set, so a burst costs one entry.
 pub fn report_seen(subscription_id: &str) {
     {
-        let mut guard = match seen().lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = seen().lock().unwrap_or_else(PoisonError::into_inner);
         if guard.len() < MAX_SEEN || guard.contains(subscription_id) {
             guard.insert(subscription_id.to_string());
         }
@@ -90,10 +85,7 @@ pub fn report_seen(subscription_id: &str) {
 
 /// Take every subscription reported as seen since the last call.
 pub fn take_seen() -> Vec<String> {
-    let mut guard = match seen().lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut guard = seen().lock().unwrap_or_else(PoisonError::into_inner);
     guard.drain().collect()
 }
 
@@ -121,18 +113,15 @@ fn tapped() -> &'static RwLock<HashSet<String>> {
 /// reply path.
 pub fn set_tapped_channels(channels: impl IntoIterator<Item = String>) {
     let next: HashSet<String> = channels.into_iter().collect();
-    match tapped().write() {
-        Ok(mut guard) => *guard = next,
-        Err(poisoned) => *poisoned.into_inner() = next,
-    }
+    *tapped().write().unwrap_or_else(PoisonError::into_inner) = next;
 }
 
 /// Whether any active subscription listens on `channel`.
 pub fn is_channel_tapped(channel: &str) -> bool {
-    match tapped().read() {
-        Ok(guard) => guard.contains(channel),
-        Err(poisoned) => poisoned.into_inner().contains(channel),
-    }
+    tapped()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(channel)
 }
 
 fn live() -> &'static RwLock<Option<SubscriptionsConfig>> {
@@ -145,19 +134,16 @@ fn live() -> &'static RwLock<Option<SubscriptionsConfig>> {
 /// The dispatcher publishes on every pass and on every settings change.
 pub fn set_live_settings(settings: &SubscriptionsConfig) {
     let next = Some(settings.clone());
-    match live().write() {
-        Ok(mut guard) => *guard = next,
-        Err(poisoned) => *poisoned.into_inner() = next,
-    }
+    *live().write().unwrap_or_else(PoisonError::into_inner) = next;
 }
 
 /// The settings last published by [`set_live_settings`]. `None` before the
 /// dispatcher runs (a gateway on its own, tests): the caller keeps its own.
 pub fn live_settings() -> Option<SubscriptionsConfig> {
-    match live().read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    live()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 #[cfg(test)]
