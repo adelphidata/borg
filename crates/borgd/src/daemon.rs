@@ -516,6 +516,7 @@ async fn start_orchestrator_extras(
                 process_registry: Some(process_registry.clone()),
                 goal_bus: Some(handles.goal_bus),
                 tunnel_supervisor: Some(tunnel_sup),
+                subscription_bus: Some(handles.subscription_bus),
             }
         }
         Err(e) => {
@@ -531,6 +532,7 @@ async fn start_orchestrator_extras(
                 process_registry: Some(process_registry.clone()),
                 goal_bus: Some(goal_bus.clone()),
                 tunnel_supervisor: None,
+                subscription_bus: None,
             }
         }
     }

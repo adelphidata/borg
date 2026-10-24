@@ -220,6 +220,32 @@ service Admin {
   rpc SubscribeAgentTreeEvents(SessionRef) returns (stream AgentTreeEvent);
   rpc ListAgentSnapshots(SessionRef) returns (AgentSnapshotList);
   rpc GetAgentSnapshot(AgentSnapshotRefRequest) returns (AgentList);
+
+  // Subscriptions: an event from a source (a webhook, a channel message,
+  // inbound email, Borg itself) wakes Borg with an instruction. The daemon
+  // owns the rows, the event ledger and the dispatcher; the apps and the
+  // `subscribe` tool share one implementation (`cortex::subscriptions::manage`).
+  rpc ListSubscriptionPresets(Empty) returns (SubscriptionPresetList);
+  rpc ListSubscriptions(Empty) returns (SubscriptionList);
+  // Row, endpoint, sender steps (key masked) and recent events.
+  rpc GetSubscription(SubscriptionRef) returns (SubscriptionDetail);
+  // New subscriptions start paused unless `active` is set. Returns the key
+  // in clear once; it can be read again only through RevealSubscriptionKey.
+  rpc CreateSubscription(SubscriptionSpec) returns (SubscriptionCreated);
+  rpc UpdateSubscription(SubscriptionChange) returns (Subscription);
+  rpc DeleteSubscription(SubscriptionRef) returns (Empty);
+  // `active = true` is Resume: it also clears a storm pause.
+  rpc SetSubscriptionStatus(SubscriptionStatusRequest) returns (Subscription);
+  // Recorded in the activity log.
+  rpc RevealSubscriptionKey(SubscriptionRef) returns (SubscriptionKey);
+  // The old key stops working at once.
+  rpc RotateSubscriptionKey(SubscriptionRef) returns (SubscriptionKey);
+  // Queue the source's sample event through the real path. It runs even
+  // while the subscription is paused.
+  rpc TestSubscription(SubscriptionRef) returns (SubscriptionEvent);
+  rpc ListSubscriptionEvents(SubscriptionEventsRequest) returns (SubscriptionEventList);
+  // Live activity: first event seen, run started and finished, paused itself.
+  rpc SubscribeSubscriptionActivity(Empty) returns (stream SubscriptionActivityEvent);
 }
 
 // Sub-agent control messages
@@ -1338,4 +1364,140 @@ message HandoffStatusReply {
   string target_platform = 2;
   string error = 3;
   int64 requested_at_unix = 4;
+}
+
+// ── Subscriptions ──────────────────────────────────────────────────────────
+
+message SubscriptionPreset {
+  string id = 1;              // "github", "sentry", "slack", "custom", …
+  string label = 2;
+  string blurb = 3;
+  string group = 4;           // "Alerts", "Code", "Messages", …
+  string source = 5;          // webhook | channel | email | internal
+  string auth_scheme = 6;
+  // The provider shows a signing secret the user pastes into Borg (Stripe,
+  // Sentry, PagerDuty, Linear). GitHub signs with Borg's own key instead.
+  bool takes_signing_secret = 7;
+  repeated string kinds = 8;          // event kinds the source sends
+  repeated string filter_fields = 9;  // filter keys that make sense here
+  string default_name = 10;
+  string default_instruction = 11;
+  string sample_payload = 12;         // JSON, for previews and Test
+}
+message SubscriptionPresetList { repeated SubscriptionPreset presets = 1; }
+
+message SubscriptionEndpoint {
+  string url = 1;   // empty for sources without an endpoint
+  // A service on the internet can reach it (a tunnel or gateway.public_url).
+  bool public = 2;
+  string hint = 3;  // what to do when it is not public, in plain words
+}
+
+message Subscription {
+  string id = 1;
+  string name = 2;
+  string source = 3;
+  string provider = 4;
+  string status = 5;            // active | paused | storm
+  string filter_json = 6;
+  string instruction = 7;
+  string delivery_channel = 8;  // empty = the subscription's session only
+  string delivery_target = 9;
+  uint32 rate_limit_per_hour = 10;
+  uint32 timeout_secs = 11;
+  uint64 dropped_count = 12;    // events refused during bursts or a pause
+  int64 created_at_unix = 13;
+  int64 updated_at_unix = 14;
+  int64 last_event_at_unix = 15; // 0 = no event yet
+  string last_run_status = 16;
+  string last_error = 17;
+  bool has_signing_secret = 18;
+  string session_key = 19;      // the conversation its runs land in
+  SubscriptionEndpoint endpoint = 20;
+}
+message SubscriptionList { repeated Subscription subscriptions = 1; }
+message SubscriptionRef { string id = 1; }
+
+message SubscriptionEvent {
+  string id = 1;
+  string subscription_id = 2;
+  string kind = 3;
+  string summary = 4;
+  string status = 5;    // pending | running | succeeded | failed | skipped | silent
+  string run_id = 6;    // shared by every event digested into one run
+  int64 received_at_unix = 7;
+  int64 started_at_unix = 8;
+  int64 finished_at_unix = 9;
+  int64 duration_ms = 10;
+  string result = 11;
+  string error = 12;
+  string payload = 13;  // JSON, cut to 16 KiB for display
+  bool payload_truncated = 14;
+}
+message SubscriptionEventList { repeated SubscriptionEvent events = 1; }
+message SubscriptionEventsRequest {
+  string id = 1;
+  uint32 limit = 2;  // 0 = 50
+}
+
+message SubscriptionDetail {
+  Subscription subscription = 1;
+  repeated SubscriptionEvent events = 2;
+  // Sender setup steps with the endpoint filled in and the key masked.
+  repeated string sender_steps = 3;
+  uint32 runs_today = 4;
+}
+
+message SubscriptionSpec {
+  string provider = 1;
+  string name = 2;              // empty = the preset's name
+  string instruction = 3;       // empty = the preset's instruction
+  string filter_json = 4;       // empty = "{}"
+  string delivery_channel = 5;  // empty = session only; "origin" = reply where it came from
+  string delivery_target = 6;
+  string signing_secret = 7;
+  uint32 rate_limit_per_hour = 8;  // 0 = the setting
+  uint32 timeout_secs = 9;         // 0 = the setting
+  bool active = 10;
+}
+message SubscriptionCreated {
+  Subscription subscription = 1;
+  string key = 2;                  // empty for sources without an endpoint
+  repeated string sender_steps = 3; // with the key filled in
+}
+
+// Empty strings and zeros leave a field unchanged. Delivery and the signing
+// secret change only when their `set_` flag is on, so they can be cleared.
+message SubscriptionChange {
+  string id = 1;
+  string name = 2;
+  string filter_json = 3;
+  string instruction = 4;
+  bool set_delivery = 5;
+  string delivery_channel = 6;
+  string delivery_target = 7;
+  uint32 rate_limit_per_hour = 8;
+  uint32 timeout_secs = 9;
+  bool set_signing_secret = 10;
+  string signing_secret = 11;   // empty with set_signing_secret clears it
+}
+
+message SubscriptionStatusRequest {
+  string id = 1;
+  bool active = 2;
+}
+
+message SubscriptionKey {
+  string key = 1;
+  repeated string sender_steps = 2;  // with the key filled in
+}
+
+message SubscriptionActivityEvent {
+  string subscription_id = 1;
+  string kind = 2;     // received | started | finished | storm
+  string run_id = 3;
+  string status = 4;
+  string summary = 5;
+  uint32 event_count = 6;
+  int64 emitted_at_unix = 7;
 }

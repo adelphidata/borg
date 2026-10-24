@@ -84,6 +84,9 @@ pub struct AdminExtras {
     /// Daemon-side owner of the optional public-internet tunnel. The
     /// `TunnelStart`/`Stop`/`Status` RPCs are unwired without it.
     pub tunnel_supervisor: Option<TunnelSupervisor>,
+    /// Bus that `Admin.SubscribeSubscriptionActivity` reads from; the
+    /// subscription dispatcher publishes into it.
+    pub subscription_bus: Option<crate::subscriptions::SubscriptionBus>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -116,6 +119,9 @@ pub fn build_services_with_extras(
     }
     if let Some(bus) = extras.goal_bus {
         admin_svc = admin_svc.with_goal_bus(bus);
+    }
+    if let Some(bus) = extras.subscription_bus {
+        admin_svc = admin_svc.with_subscription_bus(bus);
     }
     if let Some(sup) = extras.tunnel_supervisor {
         admin_svc = admin_svc.with_tunnel_supervisor(sup);

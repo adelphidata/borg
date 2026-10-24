@@ -956,6 +956,26 @@ impl Database {
         Ok(out)
     }
 
+    /// Runs of one subscription started since `since` ("runs today").
+    pub async fn subscription_runs_of_since(
+        &self,
+        subscription_id: &str,
+        since: i64,
+    ) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(DISTINCT run_id) FROM subscription_events \
+                 WHERE subscription_id = ?1 AND run_id IS NOT NULL AND started_at > ?2",
+                params!(subscription_id, since),
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(r) => r.get(0)?,
+            None => 0,
+        })
+    }
+
     /// Runs started since `since` across every subscription (the daily cap).
     pub async fn subscription_runs_since(&self, since: i64) -> Result<i64> {
         let mut rows = self

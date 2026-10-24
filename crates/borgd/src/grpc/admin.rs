@@ -122,6 +122,7 @@ pub struct AdminSvc {
     process_registry: WiredSlot<ProcessRegistry>,
     goal_bus: WiredSlot<GoalEventBus>,
     tunnel_supervisor: WiredSlot<TunnelSupervisor>,
+    subscription_bus: WiredSlot<crate::subscriptions::SubscriptionBus>,
     /// Construction time, so `GetDaemonStatus` can report a real uptime.
     started_at: std::time::Instant,
 }
@@ -139,6 +140,7 @@ impl AdminSvc {
             process_registry: WiredSlot::empty(),
             goal_bus: WiredSlot::empty(),
             tunnel_supervisor: WiredSlot::empty(),
+            subscription_bus: WiredSlot::empty(),
             started_at: std::time::Instant::now(),
         }
     }
@@ -190,6 +192,13 @@ impl AdminSvc {
     /// Wire the daemon's shutdown broadcaster — `Admin.Shutdown` sends `()`.
     pub fn with_shutdown_sender(self, tx: broadcast::Sender<()>) -> Self {
         self.shutdown_tx.set(tx);
+        self
+    }
+
+    /// Wire the subscription activity bus —
+    /// `Admin.SubscribeSubscriptionActivity` reads from it.
+    pub fn with_subscription_bus(self, bus: crate::subscriptions::SubscriptionBus) -> Self {
+        self.subscription_bus.set(bus);
         self
     }
 
@@ -644,6 +653,98 @@ impl Admin for AdminSvc {
         .map_err(|e| TStatus::internal(format!("get_session failed: {e}")))?
         .ok_or_else(|| TStatus::not_found("session not found".to_string()))?;
         Ok(Response::new(detail))
+    }
+
+    // ── Subscriptions ─────────────────────────────────────────────────────
+
+    async fn list_subscription_presets(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<protocols::admin::SubscriptionPresetList>, TStatus> {
+        subscriptions::list_presets().await
+    }
+
+    async fn list_subscriptions(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<protocols::admin::SubscriptionList>, TStatus> {
+        subscriptions::list().await
+    }
+
+    async fn get_subscription(
+        &self,
+        req: Request<protocols::admin::SubscriptionRef>,
+    ) -> Result<Response<protocols::admin::SubscriptionDetail>, TStatus> {
+        subscriptions::get(req).await
+    }
+
+    async fn create_subscription(
+        &self,
+        req: Request<protocols::admin::SubscriptionSpec>,
+    ) -> Result<Response<protocols::admin::SubscriptionCreated>, TStatus> {
+        subscriptions::create(req).await
+    }
+
+    async fn update_subscription(
+        &self,
+        req: Request<protocols::admin::SubscriptionChange>,
+    ) -> Result<Response<protocols::admin::Subscription>, TStatus> {
+        subscriptions::update(req).await
+    }
+
+    async fn delete_subscription(
+        &self,
+        req: Request<protocols::admin::SubscriptionRef>,
+    ) -> Result<Response<Empty>, TStatus> {
+        subscriptions::delete(req).await
+    }
+
+    async fn set_subscription_status(
+        &self,
+        req: Request<protocols::admin::SubscriptionStatusRequest>,
+    ) -> Result<Response<protocols::admin::Subscription>, TStatus> {
+        subscriptions::set_status(req).await
+    }
+
+    async fn reveal_subscription_key(
+        &self,
+        req: Request<protocols::admin::SubscriptionRef>,
+    ) -> Result<Response<protocols::admin::SubscriptionKey>, TStatus> {
+        subscriptions::reveal_key(req).await
+    }
+
+    async fn rotate_subscription_key(
+        &self,
+        req: Request<protocols::admin::SubscriptionRef>,
+    ) -> Result<Response<protocols::admin::SubscriptionKey>, TStatus> {
+        subscriptions::rotate_key(req).await
+    }
+
+    async fn test_subscription(
+        &self,
+        req: Request<protocols::admin::SubscriptionRef>,
+    ) -> Result<Response<protocols::admin::SubscriptionEvent>, TStatus> {
+        subscriptions::test(req).await
+    }
+
+    async fn list_subscription_events(
+        &self,
+        req: Request<protocols::admin::SubscriptionEventsRequest>,
+    ) -> Result<Response<protocols::admin::SubscriptionEventList>, TStatus> {
+        subscriptions::list_events(req).await
+    }
+
+    type SubscribeSubscriptionActivityStream = subscriptions::SubscriptionActivityStream;
+
+    async fn subscribe_subscription_activity(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<Self::SubscribeSubscriptionActivityStream>, TStatus> {
+        let bus = self
+            .subscription_bus
+            .get()
+            .ok_or_else(|| TStatus::failed_precondition("subscription bus not wired"))?;
+        Ok(subscriptions::activity_stream(bus))
     }
 
     // ── Scheduled tasks ───────────────────────────────────────────────────
@@ -1790,6 +1891,7 @@ mod handoff;
 mod helpers;
 mod scheduled_tasks;
 mod setup;
+mod subscriptions;
 use helpers::NameSetting;
 use helpers::{
     approved_sender_row_to_proto, build_primary_pool, credential_pool_to_proto, goal_to_detail,

@@ -83,6 +83,12 @@ impl TunnelSupervisor {
     /// the snapshot's `last_error`, so a UI that only reads `status()`
     /// still sees what went wrong.
     pub async fn apply(&self, config: &TunnelConfig) -> Result<TunnelSnapshot> {
+        let result = self.apply_inner(config).await;
+        note_public_url(&self.inner.lock().await.snapshot);
+        result
+    }
+
+    async fn apply_inner(&self, config: &TunnelConfig) -> Result<TunnelSnapshot> {
         // Hold the lock only for cheap state inspection + handle hand-off.
         // The actual `tunnel.start(...).await` runs unlocked (cloudflared
         // can take 30s, ngrok ~15s); without this split, a concurrent
@@ -190,6 +196,7 @@ impl TunnelSupervisor {
             public_url: String::new(),
             last_error: String::new(),
         };
+        note_public_url(&inner.snapshot);
         Ok(())
     }
 
@@ -205,8 +212,18 @@ impl TunnelSupervisor {
             inner.snapshot.public_url = live_url.unwrap_or_default();
             inner.snapshot.running = alive && !inner.snapshot.public_url.is_empty();
         }
+        note_public_url(&inner.snapshot);
         inner.snapshot.clone()
     }
+}
+
+/// Tell subscriptions which public address reaches the gateway, so every
+/// endpoint the app or the agent shows is one a service on the internet
+/// can post to.
+fn note_public_url(snapshot: &TunnelSnapshot) {
+    let url =
+        (snapshot.running && !snapshot.public_url.is_empty()).then(|| snapshot.public_url.clone());
+    cortex::subscriptions::manage::set_tunnel_url(url);
 }
 
 #[cfg(test)]

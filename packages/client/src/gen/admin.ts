@@ -1546,6 +1546,188 @@ export interface HandoffStatusReply {
   requestedAtUnix: number;
 }
 
+export interface SubscriptionPreset {
+  /** "github", "sentry", "slack", "custom", … */
+  id: string;
+  label: string;
+  blurb: string;
+  /** "Alerts", "Code", "Messages", … */
+  group: string;
+  /** webhook | channel | email | internal */
+  source: string;
+  authScheme: string;
+  /**
+   * The provider shows a signing secret the user pastes into Borg (Stripe,
+   * Sentry, PagerDuty, Linear). GitHub signs with Borg's own key instead.
+   */
+  takesSigningSecret: boolean;
+  /** event kinds the source sends */
+  kinds: string[];
+  /** filter keys that make sense here */
+  filterFields: string[];
+  defaultName: string;
+  defaultInstruction: string;
+  /** JSON, for previews and Test */
+  samplePayload: string;
+}
+
+export interface SubscriptionPresetList {
+  presets: SubscriptionPreset[];
+}
+
+export interface SubscriptionEndpoint {
+  /** empty for sources without an endpoint */
+  url: string;
+  /** A service on the internet can reach it (a tunnel or gateway.public_url). */
+  public: boolean;
+  /** what to do when it is not public, in plain words */
+  hint: string;
+}
+
+export interface Subscription {
+  id: string;
+  name: string;
+  source: string;
+  provider: string;
+  /** active | paused | storm */
+  status: string;
+  filterJson: string;
+  instruction: string;
+  /** empty = the subscription's session only */
+  deliveryChannel: string;
+  deliveryTarget: string;
+  rateLimitPerHour: number;
+  timeoutSecs: number;
+  /** events refused during bursts or a pause */
+  droppedCount: number;
+  createdAtUnix: number;
+  updatedAtUnix: number;
+  /** 0 = no event yet */
+  lastEventAtUnix: number;
+  lastRunStatus: string;
+  lastError: string;
+  hasSigningSecret: boolean;
+  /** the conversation its runs land in */
+  sessionKey: string;
+  endpoint?: SubscriptionEndpoint | undefined;
+}
+
+export interface SubscriptionList {
+  subscriptions: Subscription[];
+}
+
+export interface SubscriptionRef {
+  id: string;
+}
+
+export interface SubscriptionEvent {
+  id: string;
+  subscriptionId: string;
+  kind: string;
+  summary: string;
+  /** pending | running | succeeded | failed | skipped | silent */
+  status: string;
+  /** shared by every event digested into one run */
+  runId: string;
+  receivedAtUnix: number;
+  startedAtUnix: number;
+  finishedAtUnix: number;
+  durationMs: number;
+  result: string;
+  error: string;
+  /** JSON, cut to 16 KiB for display */
+  payload: string;
+  payloadTruncated: boolean;
+}
+
+export interface SubscriptionEventList {
+  events: SubscriptionEvent[];
+}
+
+export interface SubscriptionEventsRequest {
+  id: string;
+  /** 0 = 50 */
+  limit: number;
+}
+
+export interface SubscriptionDetail {
+  subscription?: Subscription | undefined;
+  events: SubscriptionEvent[];
+  /** Sender setup steps with the endpoint filled in and the key masked. */
+  senderSteps: string[];
+  runsToday: number;
+}
+
+export interface SubscriptionSpec {
+  provider: string;
+  /** empty = the preset's name */
+  name: string;
+  /** empty = the preset's instruction */
+  instruction: string;
+  /** empty = "{}" */
+  filterJson: string;
+  /** empty = session only; "origin" = reply where it came from */
+  deliveryChannel: string;
+  deliveryTarget: string;
+  signingSecret: string;
+  /** 0 = the setting */
+  rateLimitPerHour: number;
+  /** 0 = the setting */
+  timeoutSecs: number;
+  active: boolean;
+}
+
+export interface SubscriptionCreated {
+  subscription?:
+    | Subscription
+    | undefined;
+  /** empty for sources without an endpoint */
+  key: string;
+  /** with the key filled in */
+  senderSteps: string[];
+}
+
+/**
+ * Empty strings and zeros leave a field unchanged. Delivery and the signing
+ * secret change only when their `set_` flag is on, so they can be cleared.
+ */
+export interface SubscriptionChange {
+  id: string;
+  name: string;
+  filterJson: string;
+  instruction: string;
+  setDelivery: boolean;
+  deliveryChannel: string;
+  deliveryTarget: string;
+  rateLimitPerHour: number;
+  timeoutSecs: number;
+  setSigningSecret: boolean;
+  /** empty with set_signing_secret clears it */
+  signingSecret: string;
+}
+
+export interface SubscriptionStatusRequest {
+  id: string;
+  active: boolean;
+}
+
+export interface SubscriptionKey {
+  key: string;
+  /** with the key filled in */
+  senderSteps: string[];
+}
+
+export interface SubscriptionActivityEvent {
+  subscriptionId: string;
+  /** received | started | finished | storm */
+  kind: string;
+  runId: string;
+  status: string;
+  summary: string;
+  eventCount: number;
+  emittedAtUnix: number;
+}
+
 function createBaseAgentRef(): AgentRef {
   return { agentId: "" };
 }
@@ -17779,6 +17961,2634 @@ export const HandoffStatusReply: MessageFns<HandoffStatusReply> = {
   },
 };
 
+function createBaseSubscriptionPreset(): SubscriptionPreset {
+  return {
+    id: "",
+    label: "",
+    blurb: "",
+    group: "",
+    source: "",
+    authScheme: "",
+    takesSigningSecret: false,
+    kinds: [],
+    filterFields: [],
+    defaultName: "",
+    defaultInstruction: "",
+    samplePayload: "",
+  };
+}
+
+export const SubscriptionPreset: MessageFns<SubscriptionPreset> = {
+  encode(message: SubscriptionPreset, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.label !== "") {
+      writer.uint32(18).string(message.label);
+    }
+    if (message.blurb !== "") {
+      writer.uint32(26).string(message.blurb);
+    }
+    if (message.group !== "") {
+      writer.uint32(34).string(message.group);
+    }
+    if (message.source !== "") {
+      writer.uint32(42).string(message.source);
+    }
+    if (message.authScheme !== "") {
+      writer.uint32(50).string(message.authScheme);
+    }
+    if (message.takesSigningSecret !== false) {
+      writer.uint32(56).bool(message.takesSigningSecret);
+    }
+    for (const v of message.kinds) {
+      writer.uint32(66).string(v!);
+    }
+    for (const v of message.filterFields) {
+      writer.uint32(74).string(v!);
+    }
+    if (message.defaultName !== "") {
+      writer.uint32(82).string(message.defaultName);
+    }
+    if (message.defaultInstruction !== "") {
+      writer.uint32(90).string(message.defaultInstruction);
+    }
+    if (message.samplePayload !== "") {
+      writer.uint32(98).string(message.samplePayload);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionPreset {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionPreset();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.label = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.blurb = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.group = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.source = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.authScheme = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.takesSigningSecret = reader.bool();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.kinds.push(reader.string());
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.filterFields.push(reader.string());
+            continue;
+          }
+          case 10: {
+            if (tag !== 82) {
+              break;
+            }
+
+            message.defaultName = reader.string();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.defaultInstruction = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.samplePayload = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionPreset {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      label: isSet(object.label) ? globalThis.String(object.label) : "",
+      blurb: isSet(object.blurb) ? globalThis.String(object.blurb) : "",
+      group: isSet(object.group) ? globalThis.String(object.group) : "",
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      authScheme: isSet(object.authScheme)
+        ? globalThis.String(object.authScheme)
+        : isSet(object.auth_scheme)
+        ? globalThis.String(object.auth_scheme)
+        : "",
+      takesSigningSecret: isSet(object.takesSigningSecret)
+        ? globalThis.Boolean(object.takesSigningSecret)
+        : isSet(object.takes_signing_secret)
+        ? globalThis.Boolean(object.takes_signing_secret)
+        : false,
+      kinds: globalThis.Array.isArray(object?.kinds) ? object.kinds.map((e: any) => globalThis.String(e)) : [],
+      filterFields: globalThis.Array.isArray(object?.filterFields)
+        ? object.filterFields.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.filter_fields)
+        ? object.filter_fields.map((e: any) => globalThis.String(e))
+        : [],
+      defaultName: isSet(object.defaultName)
+        ? globalThis.String(object.defaultName)
+        : isSet(object.default_name)
+        ? globalThis.String(object.default_name)
+        : "",
+      defaultInstruction: isSet(object.defaultInstruction)
+        ? globalThis.String(object.defaultInstruction)
+        : isSet(object.default_instruction)
+        ? globalThis.String(object.default_instruction)
+        : "",
+      samplePayload: isSet(object.samplePayload)
+        ? globalThis.String(object.samplePayload)
+        : isSet(object.sample_payload)
+        ? globalThis.String(object.sample_payload)
+        : "",
+    };
+  },
+
+  toJSON(message: SubscriptionPreset): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.label !== "") {
+      obj.label = message.label;
+    }
+    if (message.blurb !== "") {
+      obj.blurb = message.blurb;
+    }
+    if (message.group !== "") {
+      obj.group = message.group;
+    }
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.authScheme !== "") {
+      obj.authScheme = message.authScheme;
+    }
+    if (message.takesSigningSecret !== false) {
+      obj.takesSigningSecret = message.takesSigningSecret;
+    }
+    if (message.kinds?.length) {
+      obj.kinds = message.kinds;
+    }
+    if (message.filterFields?.length) {
+      obj.filterFields = message.filterFields;
+    }
+    if (message.defaultName !== "") {
+      obj.defaultName = message.defaultName;
+    }
+    if (message.defaultInstruction !== "") {
+      obj.defaultInstruction = message.defaultInstruction;
+    }
+    if (message.samplePayload !== "") {
+      obj.samplePayload = message.samplePayload;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionPreset>, I>>(base?: I): SubscriptionPreset {
+    return SubscriptionPreset.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionPreset>, I>>(object: I): SubscriptionPreset {
+    const message = createBaseSubscriptionPreset();
+    message.id = object.id ?? "";
+    message.label = object.label ?? "";
+    message.blurb = object.blurb ?? "";
+    message.group = object.group ?? "";
+    message.source = object.source ?? "";
+    message.authScheme = object.authScheme ?? "";
+    message.takesSigningSecret = object.takesSigningSecret ?? false;
+    message.kinds = object.kinds?.map((e) => e) || [];
+    message.filterFields = object.filterFields?.map((e) => e) || [];
+    message.defaultName = object.defaultName ?? "";
+    message.defaultInstruction = object.defaultInstruction ?? "";
+    message.samplePayload = object.samplePayload ?? "";
+    return message;
+  },
+};
+
+function createBaseSubscriptionPresetList(): SubscriptionPresetList {
+  return { presets: [] };
+}
+
+export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
+  encode(message: SubscriptionPresetList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.presets) {
+      SubscriptionPreset.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionPresetList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionPresetList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.presets.push(SubscriptionPreset.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionPresetList {
+    return {
+      presets: globalThis.Array.isArray(object?.presets)
+        ? object.presets.map((e: any) => SubscriptionPreset.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SubscriptionPresetList): unknown {
+    const obj: any = {};
+    if (message.presets?.length) {
+      obj.presets = message.presets.map((e) => SubscriptionPreset.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionPresetList>, I>>(base?: I): SubscriptionPresetList {
+    return SubscriptionPresetList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionPresetList>, I>>(object: I): SubscriptionPresetList {
+    const message = createBaseSubscriptionPresetList();
+    message.presets = object.presets?.map((e) => SubscriptionPreset.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSubscriptionEndpoint(): SubscriptionEndpoint {
+  return { url: "", public: false, hint: "" };
+}
+
+export const SubscriptionEndpoint: MessageFns<SubscriptionEndpoint> = {
+  encode(message: SubscriptionEndpoint, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.url !== "") {
+      writer.uint32(10).string(message.url);
+    }
+    if (message.public !== false) {
+      writer.uint32(16).bool(message.public);
+    }
+    if (message.hint !== "") {
+      writer.uint32(26).string(message.hint);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionEndpoint {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionEndpoint();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.url = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.public = reader.bool();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.hint = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionEndpoint {
+    return {
+      url: isSet(object.url) ? globalThis.String(object.url) : "",
+      public: isSet(object.public) ? globalThis.Boolean(object.public) : false,
+      hint: isSet(object.hint) ? globalThis.String(object.hint) : "",
+    };
+  },
+
+  toJSON(message: SubscriptionEndpoint): unknown {
+    const obj: any = {};
+    if (message.url !== "") {
+      obj.url = message.url;
+    }
+    if (message.public !== false) {
+      obj.public = message.public;
+    }
+    if (message.hint !== "") {
+      obj.hint = message.hint;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionEndpoint>, I>>(base?: I): SubscriptionEndpoint {
+    return SubscriptionEndpoint.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionEndpoint>, I>>(object: I): SubscriptionEndpoint {
+    const message = createBaseSubscriptionEndpoint();
+    message.url = object.url ?? "";
+    message.public = object.public ?? false;
+    message.hint = object.hint ?? "";
+    return message;
+  },
+};
+
+function createBaseSubscription(): Subscription {
+  return {
+    id: "",
+    name: "",
+    source: "",
+    provider: "",
+    status: "",
+    filterJson: "",
+    instruction: "",
+    deliveryChannel: "",
+    deliveryTarget: "",
+    rateLimitPerHour: 0,
+    timeoutSecs: 0,
+    droppedCount: 0,
+    createdAtUnix: 0,
+    updatedAtUnix: 0,
+    lastEventAtUnix: 0,
+    lastRunStatus: "",
+    lastError: "",
+    hasSigningSecret: false,
+    sessionKey: "",
+    endpoint: undefined,
+  };
+}
+
+export const Subscription: MessageFns<Subscription> = {
+  encode(message: Subscription, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.source !== "") {
+      writer.uint32(26).string(message.source);
+    }
+    if (message.provider !== "") {
+      writer.uint32(34).string(message.provider);
+    }
+    if (message.status !== "") {
+      writer.uint32(42).string(message.status);
+    }
+    if (message.filterJson !== "") {
+      writer.uint32(50).string(message.filterJson);
+    }
+    if (message.instruction !== "") {
+      writer.uint32(58).string(message.instruction);
+    }
+    if (message.deliveryChannel !== "") {
+      writer.uint32(66).string(message.deliveryChannel);
+    }
+    if (message.deliveryTarget !== "") {
+      writer.uint32(74).string(message.deliveryTarget);
+    }
+    if (message.rateLimitPerHour !== 0) {
+      writer.uint32(80).uint32(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      writer.uint32(88).uint32(message.timeoutSecs);
+    }
+    if (message.droppedCount !== 0) {
+      writer.uint32(96).uint64(message.droppedCount);
+    }
+    if (message.createdAtUnix !== 0) {
+      writer.uint32(104).int64(message.createdAtUnix);
+    }
+    if (message.updatedAtUnix !== 0) {
+      writer.uint32(112).int64(message.updatedAtUnix);
+    }
+    if (message.lastEventAtUnix !== 0) {
+      writer.uint32(120).int64(message.lastEventAtUnix);
+    }
+    if (message.lastRunStatus !== "") {
+      writer.uint32(130).string(message.lastRunStatus);
+    }
+    if (message.lastError !== "") {
+      writer.uint32(138).string(message.lastError);
+    }
+    if (message.hasSigningSecret !== false) {
+      writer.uint32(144).bool(message.hasSigningSecret);
+    }
+    if (message.sessionKey !== "") {
+      writer.uint32(154).string(message.sessionKey);
+    }
+    if (message.endpoint !== undefined) {
+      SubscriptionEndpoint.encode(message.endpoint, writer.uint32(162).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Subscription {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscription();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.source = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.provider = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.status = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.filterJson = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.instruction = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 66) {
+              break;
+            }
+
+            message.deliveryChannel = reader.string();
+            continue;
+          }
+          case 9: {
+            if (tag !== 74) {
+              break;
+            }
+
+            message.deliveryTarget = reader.string();
+            continue;
+          }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.rateLimitPerHour = reader.uint32();
+            continue;
+          }
+          case 11: {
+            if (tag !== 88) {
+              break;
+            }
+
+            message.timeoutSecs = reader.uint32();
+            continue;
+          }
+          case 12: {
+            if (tag !== 96) {
+              break;
+            }
+
+            message.droppedCount = longToNumber(reader.uint64());
+            continue;
+          }
+          case 13: {
+            if (tag !== 104) {
+              break;
+            }
+
+            message.createdAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.updatedAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 15: {
+            if (tag !== 120) {
+              break;
+            }
+
+            message.lastEventAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 16: {
+            if (tag !== 130) {
+              break;
+            }
+
+            message.lastRunStatus = reader.string();
+            continue;
+          }
+          case 17: {
+            if (tag !== 138) {
+              break;
+            }
+
+            message.lastError = reader.string();
+            continue;
+          }
+          case 18: {
+            if (tag !== 144) {
+              break;
+            }
+
+            message.hasSigningSecret = reader.bool();
+            continue;
+          }
+          case 19: {
+            if (tag !== 154) {
+              break;
+            }
+
+            message.sessionKey = reader.string();
+            continue;
+          }
+          case 20: {
+            if (tag !== 162) {
+              break;
+            }
+
+            message.endpoint = SubscriptionEndpoint.decode(reader, reader.uint32());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): Subscription {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      source: isSet(object.source) ? globalThis.String(object.source) : "",
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      filterJson: isSet(object.filterJson)
+        ? globalThis.String(object.filterJson)
+        : isSet(object.filter_json)
+        ? globalThis.String(object.filter_json)
+        : "",
+      instruction: isSet(object.instruction) ? globalThis.String(object.instruction) : "",
+      deliveryChannel: isSet(object.deliveryChannel)
+        ? globalThis.String(object.deliveryChannel)
+        : isSet(object.delivery_channel)
+        ? globalThis.String(object.delivery_channel)
+        : "",
+      deliveryTarget: isSet(object.deliveryTarget)
+        ? globalThis.String(object.deliveryTarget)
+        : isSet(object.delivery_target)
+        ? globalThis.String(object.delivery_target)
+        : "",
+      rateLimitPerHour: isSet(object.rateLimitPerHour)
+        ? globalThis.Number(object.rateLimitPerHour)
+        : isSet(object.rate_limit_per_hour)
+        ? globalThis.Number(object.rate_limit_per_hour)
+        : 0,
+      timeoutSecs: isSet(object.timeoutSecs)
+        ? globalThis.Number(object.timeoutSecs)
+        : isSet(object.timeout_secs)
+        ? globalThis.Number(object.timeout_secs)
+        : 0,
+      droppedCount: isSet(object.droppedCount)
+        ? globalThis.Number(object.droppedCount)
+        : isSet(object.dropped_count)
+        ? globalThis.Number(object.dropped_count)
+        : 0,
+      createdAtUnix: isSet(object.createdAtUnix)
+        ? globalThis.Number(object.createdAtUnix)
+        : isSet(object.created_at_unix)
+        ? globalThis.Number(object.created_at_unix)
+        : 0,
+      updatedAtUnix: isSet(object.updatedAtUnix)
+        ? globalThis.Number(object.updatedAtUnix)
+        : isSet(object.updated_at_unix)
+        ? globalThis.Number(object.updated_at_unix)
+        : 0,
+      lastEventAtUnix: isSet(object.lastEventAtUnix)
+        ? globalThis.Number(object.lastEventAtUnix)
+        : isSet(object.last_event_at_unix)
+        ? globalThis.Number(object.last_event_at_unix)
+        : 0,
+      lastRunStatus: isSet(object.lastRunStatus)
+        ? globalThis.String(object.lastRunStatus)
+        : isSet(object.last_run_status)
+        ? globalThis.String(object.last_run_status)
+        : "",
+      lastError: isSet(object.lastError)
+        ? globalThis.String(object.lastError)
+        : isSet(object.last_error)
+        ? globalThis.String(object.last_error)
+        : "",
+      hasSigningSecret: isSet(object.hasSigningSecret)
+        ? globalThis.Boolean(object.hasSigningSecret)
+        : isSet(object.has_signing_secret)
+        ? globalThis.Boolean(object.has_signing_secret)
+        : false,
+      sessionKey: isSet(object.sessionKey)
+        ? globalThis.String(object.sessionKey)
+        : isSet(object.session_key)
+        ? globalThis.String(object.session_key)
+        : "",
+      endpoint: isSet(object.endpoint) ? SubscriptionEndpoint.fromJSON(object.endpoint) : undefined,
+    };
+  },
+
+  toJSON(message: Subscription): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.source !== "") {
+      obj.source = message.source;
+    }
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.status !== "") {
+      obj.status = message.status;
+    }
+    if (message.filterJson !== "") {
+      obj.filterJson = message.filterJson;
+    }
+    if (message.instruction !== "") {
+      obj.instruction = message.instruction;
+    }
+    if (message.deliveryChannel !== "") {
+      obj.deliveryChannel = message.deliveryChannel;
+    }
+    if (message.deliveryTarget !== "") {
+      obj.deliveryTarget = message.deliveryTarget;
+    }
+    if (message.rateLimitPerHour !== 0) {
+      obj.rateLimitPerHour = Math.round(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      obj.timeoutSecs = Math.round(message.timeoutSecs);
+    }
+    if (message.droppedCount !== 0) {
+      obj.droppedCount = Math.round(message.droppedCount);
+    }
+    if (message.createdAtUnix !== 0) {
+      obj.createdAtUnix = Math.round(message.createdAtUnix);
+    }
+    if (message.updatedAtUnix !== 0) {
+      obj.updatedAtUnix = Math.round(message.updatedAtUnix);
+    }
+    if (message.lastEventAtUnix !== 0) {
+      obj.lastEventAtUnix = Math.round(message.lastEventAtUnix);
+    }
+    if (message.lastRunStatus !== "") {
+      obj.lastRunStatus = message.lastRunStatus;
+    }
+    if (message.lastError !== "") {
+      obj.lastError = message.lastError;
+    }
+    if (message.hasSigningSecret !== false) {
+      obj.hasSigningSecret = message.hasSigningSecret;
+    }
+    if (message.sessionKey !== "") {
+      obj.sessionKey = message.sessionKey;
+    }
+    if (message.endpoint !== undefined) {
+      obj.endpoint = SubscriptionEndpoint.toJSON(message.endpoint);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<Subscription>, I>>(base?: I): Subscription {
+    return Subscription.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<Subscription>, I>>(object: I): Subscription {
+    const message = createBaseSubscription();
+    message.id = object.id ?? "";
+    message.name = object.name ?? "";
+    message.source = object.source ?? "";
+    message.provider = object.provider ?? "";
+    message.status = object.status ?? "";
+    message.filterJson = object.filterJson ?? "";
+    message.instruction = object.instruction ?? "";
+    message.deliveryChannel = object.deliveryChannel ?? "";
+    message.deliveryTarget = object.deliveryTarget ?? "";
+    message.rateLimitPerHour = object.rateLimitPerHour ?? 0;
+    message.timeoutSecs = object.timeoutSecs ?? 0;
+    message.droppedCount = object.droppedCount ?? 0;
+    message.createdAtUnix = object.createdAtUnix ?? 0;
+    message.updatedAtUnix = object.updatedAtUnix ?? 0;
+    message.lastEventAtUnix = object.lastEventAtUnix ?? 0;
+    message.lastRunStatus = object.lastRunStatus ?? "";
+    message.lastError = object.lastError ?? "";
+    message.hasSigningSecret = object.hasSigningSecret ?? false;
+    message.sessionKey = object.sessionKey ?? "";
+    message.endpoint = (object.endpoint !== undefined && object.endpoint !== null)
+      ? SubscriptionEndpoint.fromPartial(object.endpoint)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseSubscriptionList(): SubscriptionList {
+  return { subscriptions: [] };
+}
+
+export const SubscriptionList: MessageFns<SubscriptionList> = {
+  encode(message: SubscriptionList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.subscriptions) {
+      Subscription.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.subscriptions.push(Subscription.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionList {
+    return {
+      subscriptions: globalThis.Array.isArray(object?.subscriptions)
+        ? object.subscriptions.map((e: any) => Subscription.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SubscriptionList): unknown {
+    const obj: any = {};
+    if (message.subscriptions?.length) {
+      obj.subscriptions = message.subscriptions.map((e) => Subscription.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionList>, I>>(base?: I): SubscriptionList {
+    return SubscriptionList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionList>, I>>(object: I): SubscriptionList {
+    const message = createBaseSubscriptionList();
+    message.subscriptions = object.subscriptions?.map((e) => Subscription.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSubscriptionRef(): SubscriptionRef {
+  return { id: "" };
+}
+
+export const SubscriptionRef: MessageFns<SubscriptionRef> = {
+  encode(message: SubscriptionRef, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionRef {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionRef();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionRef {
+    return { id: isSet(object.id) ? globalThis.String(object.id) : "" };
+  },
+
+  toJSON(message: SubscriptionRef): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionRef>, I>>(base?: I): SubscriptionRef {
+    return SubscriptionRef.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionRef>, I>>(object: I): SubscriptionRef {
+    const message = createBaseSubscriptionRef();
+    message.id = object.id ?? "";
+    return message;
+  },
+};
+
+function createBaseSubscriptionEvent(): SubscriptionEvent {
+  return {
+    id: "",
+    subscriptionId: "",
+    kind: "",
+    summary: "",
+    status: "",
+    runId: "",
+    receivedAtUnix: 0,
+    startedAtUnix: 0,
+    finishedAtUnix: 0,
+    durationMs: 0,
+    result: "",
+    error: "",
+    payload: "",
+    payloadTruncated: false,
+  };
+}
+
+export const SubscriptionEvent: MessageFns<SubscriptionEvent> = {
+  encode(message: SubscriptionEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.subscriptionId !== "") {
+      writer.uint32(18).string(message.subscriptionId);
+    }
+    if (message.kind !== "") {
+      writer.uint32(26).string(message.kind);
+    }
+    if (message.summary !== "") {
+      writer.uint32(34).string(message.summary);
+    }
+    if (message.status !== "") {
+      writer.uint32(42).string(message.status);
+    }
+    if (message.runId !== "") {
+      writer.uint32(50).string(message.runId);
+    }
+    if (message.receivedAtUnix !== 0) {
+      writer.uint32(56).int64(message.receivedAtUnix);
+    }
+    if (message.startedAtUnix !== 0) {
+      writer.uint32(64).int64(message.startedAtUnix);
+    }
+    if (message.finishedAtUnix !== 0) {
+      writer.uint32(72).int64(message.finishedAtUnix);
+    }
+    if (message.durationMs !== 0) {
+      writer.uint32(80).int64(message.durationMs);
+    }
+    if (message.result !== "") {
+      writer.uint32(90).string(message.result);
+    }
+    if (message.error !== "") {
+      writer.uint32(98).string(message.error);
+    }
+    if (message.payload !== "") {
+      writer.uint32(106).string(message.payload);
+    }
+    if (message.payloadTruncated !== false) {
+      writer.uint32(112).bool(message.payloadTruncated);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionEvent {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionEvent();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.subscriptionId = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.kind = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.summary = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.status = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.runId = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.receivedAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.startedAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 9: {
+            if (tag !== 72) {
+              break;
+            }
+
+            message.finishedAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.durationMs = longToNumber(reader.int64());
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.result = reader.string();
+            continue;
+          }
+          case 12: {
+            if (tag !== 98) {
+              break;
+            }
+
+            message.error = reader.string();
+            continue;
+          }
+          case 13: {
+            if (tag !== 106) {
+              break;
+            }
+
+            message.payload = reader.string();
+            continue;
+          }
+          case 14: {
+            if (tag !== 112) {
+              break;
+            }
+
+            message.payloadTruncated = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionEvent {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      subscriptionId: isSet(object.subscriptionId)
+        ? globalThis.String(object.subscriptionId)
+        : isSet(object.subscription_id)
+        ? globalThis.String(object.subscription_id)
+        : "",
+      kind: isSet(object.kind) ? globalThis.String(object.kind) : "",
+      summary: isSet(object.summary) ? globalThis.String(object.summary) : "",
+      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      runId: isSet(object.runId)
+        ? globalThis.String(object.runId)
+        : isSet(object.run_id)
+        ? globalThis.String(object.run_id)
+        : "",
+      receivedAtUnix: isSet(object.receivedAtUnix)
+        ? globalThis.Number(object.receivedAtUnix)
+        : isSet(object.received_at_unix)
+        ? globalThis.Number(object.received_at_unix)
+        : 0,
+      startedAtUnix: isSet(object.startedAtUnix)
+        ? globalThis.Number(object.startedAtUnix)
+        : isSet(object.started_at_unix)
+        ? globalThis.Number(object.started_at_unix)
+        : 0,
+      finishedAtUnix: isSet(object.finishedAtUnix)
+        ? globalThis.Number(object.finishedAtUnix)
+        : isSet(object.finished_at_unix)
+        ? globalThis.Number(object.finished_at_unix)
+        : 0,
+      durationMs: isSet(object.durationMs)
+        ? globalThis.Number(object.durationMs)
+        : isSet(object.duration_ms)
+        ? globalThis.Number(object.duration_ms)
+        : 0,
+      result: isSet(object.result) ? globalThis.String(object.result) : "",
+      error: isSet(object.error) ? globalThis.String(object.error) : "",
+      payload: isSet(object.payload) ? globalThis.String(object.payload) : "",
+      payloadTruncated: isSet(object.payloadTruncated)
+        ? globalThis.Boolean(object.payloadTruncated)
+        : isSet(object.payload_truncated)
+        ? globalThis.Boolean(object.payload_truncated)
+        : false,
+    };
+  },
+
+  toJSON(message: SubscriptionEvent): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.subscriptionId !== "") {
+      obj.subscriptionId = message.subscriptionId;
+    }
+    if (message.kind !== "") {
+      obj.kind = message.kind;
+    }
+    if (message.summary !== "") {
+      obj.summary = message.summary;
+    }
+    if (message.status !== "") {
+      obj.status = message.status;
+    }
+    if (message.runId !== "") {
+      obj.runId = message.runId;
+    }
+    if (message.receivedAtUnix !== 0) {
+      obj.receivedAtUnix = Math.round(message.receivedAtUnix);
+    }
+    if (message.startedAtUnix !== 0) {
+      obj.startedAtUnix = Math.round(message.startedAtUnix);
+    }
+    if (message.finishedAtUnix !== 0) {
+      obj.finishedAtUnix = Math.round(message.finishedAtUnix);
+    }
+    if (message.durationMs !== 0) {
+      obj.durationMs = Math.round(message.durationMs);
+    }
+    if (message.result !== "") {
+      obj.result = message.result;
+    }
+    if (message.error !== "") {
+      obj.error = message.error;
+    }
+    if (message.payload !== "") {
+      obj.payload = message.payload;
+    }
+    if (message.payloadTruncated !== false) {
+      obj.payloadTruncated = message.payloadTruncated;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionEvent>, I>>(base?: I): SubscriptionEvent {
+    return SubscriptionEvent.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionEvent>, I>>(object: I): SubscriptionEvent {
+    const message = createBaseSubscriptionEvent();
+    message.id = object.id ?? "";
+    message.subscriptionId = object.subscriptionId ?? "";
+    message.kind = object.kind ?? "";
+    message.summary = object.summary ?? "";
+    message.status = object.status ?? "";
+    message.runId = object.runId ?? "";
+    message.receivedAtUnix = object.receivedAtUnix ?? 0;
+    message.startedAtUnix = object.startedAtUnix ?? 0;
+    message.finishedAtUnix = object.finishedAtUnix ?? 0;
+    message.durationMs = object.durationMs ?? 0;
+    message.result = object.result ?? "";
+    message.error = object.error ?? "";
+    message.payload = object.payload ?? "";
+    message.payloadTruncated = object.payloadTruncated ?? false;
+    return message;
+  },
+};
+
+function createBaseSubscriptionEventList(): SubscriptionEventList {
+  return { events: [] };
+}
+
+export const SubscriptionEventList: MessageFns<SubscriptionEventList> = {
+  encode(message: SubscriptionEventList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.events) {
+      SubscriptionEvent.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionEventList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionEventList();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.events.push(SubscriptionEvent.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionEventList {
+    return {
+      events: globalThis.Array.isArray(object?.events)
+        ? object.events.map((e: any) => SubscriptionEvent.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SubscriptionEventList): unknown {
+    const obj: any = {};
+    if (message.events?.length) {
+      obj.events = message.events.map((e) => SubscriptionEvent.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionEventList>, I>>(base?: I): SubscriptionEventList {
+    return SubscriptionEventList.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionEventList>, I>>(object: I): SubscriptionEventList {
+    const message = createBaseSubscriptionEventList();
+    message.events = object.events?.map((e) => SubscriptionEvent.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseSubscriptionEventsRequest(): SubscriptionEventsRequest {
+  return { id: "", limit: 0 };
+}
+
+export const SubscriptionEventsRequest: MessageFns<SubscriptionEventsRequest> = {
+  encode(message: SubscriptionEventsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.limit !== 0) {
+      writer.uint32(16).uint32(message.limit);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionEventsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionEventsRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.limit = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionEventsRequest {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      limit: isSet(object.limit) ? globalThis.Number(object.limit) : 0,
+    };
+  },
+
+  toJSON(message: SubscriptionEventsRequest): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.limit !== 0) {
+      obj.limit = Math.round(message.limit);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionEventsRequest>, I>>(base?: I): SubscriptionEventsRequest {
+    return SubscriptionEventsRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionEventsRequest>, I>>(object: I): SubscriptionEventsRequest {
+    const message = createBaseSubscriptionEventsRequest();
+    message.id = object.id ?? "";
+    message.limit = object.limit ?? 0;
+    return message;
+  },
+};
+
+function createBaseSubscriptionDetail(): SubscriptionDetail {
+  return { subscription: undefined, events: [], senderSteps: [], runsToday: 0 };
+}
+
+export const SubscriptionDetail: MessageFns<SubscriptionDetail> = {
+  encode(message: SubscriptionDetail, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscription !== undefined) {
+      Subscription.encode(message.subscription, writer.uint32(10).fork()).join();
+    }
+    for (const v of message.events) {
+      SubscriptionEvent.encode(v!, writer.uint32(18).fork()).join();
+    }
+    for (const v of message.senderSteps) {
+      writer.uint32(26).string(v!);
+    }
+    if (message.runsToday !== 0) {
+      writer.uint32(32).uint32(message.runsToday);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionDetail {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionDetail();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.subscription = Subscription.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.events.push(SubscriptionEvent.decode(reader, reader.uint32()));
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.senderSteps.push(reader.string());
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.runsToday = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionDetail {
+    return {
+      subscription: isSet(object.subscription) ? Subscription.fromJSON(object.subscription) : undefined,
+      events: globalThis.Array.isArray(object?.events)
+        ? object.events.map((e: any) => SubscriptionEvent.fromJSON(e))
+        : [],
+      senderSteps: globalThis.Array.isArray(object?.senderSteps)
+        ? object.senderSteps.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.sender_steps)
+        ? object.sender_steps.map((e: any) => globalThis.String(e))
+        : [],
+      runsToday: isSet(object.runsToday)
+        ? globalThis.Number(object.runsToday)
+        : isSet(object.runs_today)
+        ? globalThis.Number(object.runs_today)
+        : 0,
+    };
+  },
+
+  toJSON(message: SubscriptionDetail): unknown {
+    const obj: any = {};
+    if (message.subscription !== undefined) {
+      obj.subscription = Subscription.toJSON(message.subscription);
+    }
+    if (message.events?.length) {
+      obj.events = message.events.map((e) => SubscriptionEvent.toJSON(e));
+    }
+    if (message.senderSteps?.length) {
+      obj.senderSteps = message.senderSteps;
+    }
+    if (message.runsToday !== 0) {
+      obj.runsToday = Math.round(message.runsToday);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionDetail>, I>>(base?: I): SubscriptionDetail {
+    return SubscriptionDetail.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionDetail>, I>>(object: I): SubscriptionDetail {
+    const message = createBaseSubscriptionDetail();
+    message.subscription = (object.subscription !== undefined && object.subscription !== null)
+      ? Subscription.fromPartial(object.subscription)
+      : undefined;
+    message.events = object.events?.map((e) => SubscriptionEvent.fromPartial(e)) || [];
+    message.senderSteps = object.senderSteps?.map((e) => e) || [];
+    message.runsToday = object.runsToday ?? 0;
+    return message;
+  },
+};
+
+function createBaseSubscriptionSpec(): SubscriptionSpec {
+  return {
+    provider: "",
+    name: "",
+    instruction: "",
+    filterJson: "",
+    deliveryChannel: "",
+    deliveryTarget: "",
+    signingSecret: "",
+    rateLimitPerHour: 0,
+    timeoutSecs: 0,
+    active: false,
+  };
+}
+
+export const SubscriptionSpec: MessageFns<SubscriptionSpec> = {
+  encode(message: SubscriptionSpec, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.provider !== "") {
+      writer.uint32(10).string(message.provider);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.instruction !== "") {
+      writer.uint32(26).string(message.instruction);
+    }
+    if (message.filterJson !== "") {
+      writer.uint32(34).string(message.filterJson);
+    }
+    if (message.deliveryChannel !== "") {
+      writer.uint32(42).string(message.deliveryChannel);
+    }
+    if (message.deliveryTarget !== "") {
+      writer.uint32(50).string(message.deliveryTarget);
+    }
+    if (message.signingSecret !== "") {
+      writer.uint32(58).string(message.signingSecret);
+    }
+    if (message.rateLimitPerHour !== 0) {
+      writer.uint32(64).uint32(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      writer.uint32(72).uint32(message.timeoutSecs);
+    }
+    if (message.active !== false) {
+      writer.uint32(80).bool(message.active);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionSpec {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionSpec();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.provider = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.instruction = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.filterJson = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.deliveryChannel = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.deliveryTarget = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.signingSecret = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.rateLimitPerHour = reader.uint32();
+            continue;
+          }
+          case 9: {
+            if (tag !== 72) {
+              break;
+            }
+
+            message.timeoutSecs = reader.uint32();
+            continue;
+          }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.active = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionSpec {
+    return {
+      provider: isSet(object.provider) ? globalThis.String(object.provider) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      instruction: isSet(object.instruction) ? globalThis.String(object.instruction) : "",
+      filterJson: isSet(object.filterJson)
+        ? globalThis.String(object.filterJson)
+        : isSet(object.filter_json)
+        ? globalThis.String(object.filter_json)
+        : "",
+      deliveryChannel: isSet(object.deliveryChannel)
+        ? globalThis.String(object.deliveryChannel)
+        : isSet(object.delivery_channel)
+        ? globalThis.String(object.delivery_channel)
+        : "",
+      deliveryTarget: isSet(object.deliveryTarget)
+        ? globalThis.String(object.deliveryTarget)
+        : isSet(object.delivery_target)
+        ? globalThis.String(object.delivery_target)
+        : "",
+      signingSecret: isSet(object.signingSecret)
+        ? globalThis.String(object.signingSecret)
+        : isSet(object.signing_secret)
+        ? globalThis.String(object.signing_secret)
+        : "",
+      rateLimitPerHour: isSet(object.rateLimitPerHour)
+        ? globalThis.Number(object.rateLimitPerHour)
+        : isSet(object.rate_limit_per_hour)
+        ? globalThis.Number(object.rate_limit_per_hour)
+        : 0,
+      timeoutSecs: isSet(object.timeoutSecs)
+        ? globalThis.Number(object.timeoutSecs)
+        : isSet(object.timeout_secs)
+        ? globalThis.Number(object.timeout_secs)
+        : 0,
+      active: isSet(object.active) ? globalThis.Boolean(object.active) : false,
+    };
+  },
+
+  toJSON(message: SubscriptionSpec): unknown {
+    const obj: any = {};
+    if (message.provider !== "") {
+      obj.provider = message.provider;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.instruction !== "") {
+      obj.instruction = message.instruction;
+    }
+    if (message.filterJson !== "") {
+      obj.filterJson = message.filterJson;
+    }
+    if (message.deliveryChannel !== "") {
+      obj.deliveryChannel = message.deliveryChannel;
+    }
+    if (message.deliveryTarget !== "") {
+      obj.deliveryTarget = message.deliveryTarget;
+    }
+    if (message.signingSecret !== "") {
+      obj.signingSecret = message.signingSecret;
+    }
+    if (message.rateLimitPerHour !== 0) {
+      obj.rateLimitPerHour = Math.round(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      obj.timeoutSecs = Math.round(message.timeoutSecs);
+    }
+    if (message.active !== false) {
+      obj.active = message.active;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionSpec>, I>>(base?: I): SubscriptionSpec {
+    return SubscriptionSpec.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionSpec>, I>>(object: I): SubscriptionSpec {
+    const message = createBaseSubscriptionSpec();
+    message.provider = object.provider ?? "";
+    message.name = object.name ?? "";
+    message.instruction = object.instruction ?? "";
+    message.filterJson = object.filterJson ?? "";
+    message.deliveryChannel = object.deliveryChannel ?? "";
+    message.deliveryTarget = object.deliveryTarget ?? "";
+    message.signingSecret = object.signingSecret ?? "";
+    message.rateLimitPerHour = object.rateLimitPerHour ?? 0;
+    message.timeoutSecs = object.timeoutSecs ?? 0;
+    message.active = object.active ?? false;
+    return message;
+  },
+};
+
+function createBaseSubscriptionCreated(): SubscriptionCreated {
+  return { subscription: undefined, key: "", senderSteps: [] };
+}
+
+export const SubscriptionCreated: MessageFns<SubscriptionCreated> = {
+  encode(message: SubscriptionCreated, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscription !== undefined) {
+      Subscription.encode(message.subscription, writer.uint32(10).fork()).join();
+    }
+    if (message.key !== "") {
+      writer.uint32(18).string(message.key);
+    }
+    for (const v of message.senderSteps) {
+      writer.uint32(26).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionCreated {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionCreated();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.subscription = Subscription.decode(reader, reader.uint32());
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.senderSteps.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionCreated {
+    return {
+      subscription: isSet(object.subscription) ? Subscription.fromJSON(object.subscription) : undefined,
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      senderSteps: globalThis.Array.isArray(object?.senderSteps)
+        ? object.senderSteps.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.sender_steps)
+        ? object.sender_steps.map((e: any) => globalThis.String(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SubscriptionCreated): unknown {
+    const obj: any = {};
+    if (message.subscription !== undefined) {
+      obj.subscription = Subscription.toJSON(message.subscription);
+    }
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.senderSteps?.length) {
+      obj.senderSteps = message.senderSteps;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionCreated>, I>>(base?: I): SubscriptionCreated {
+    return SubscriptionCreated.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionCreated>, I>>(object: I): SubscriptionCreated {
+    const message = createBaseSubscriptionCreated();
+    message.subscription = (object.subscription !== undefined && object.subscription !== null)
+      ? Subscription.fromPartial(object.subscription)
+      : undefined;
+    message.key = object.key ?? "";
+    message.senderSteps = object.senderSteps?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseSubscriptionChange(): SubscriptionChange {
+  return {
+    id: "",
+    name: "",
+    filterJson: "",
+    instruction: "",
+    setDelivery: false,
+    deliveryChannel: "",
+    deliveryTarget: "",
+    rateLimitPerHour: 0,
+    timeoutSecs: 0,
+    setSigningSecret: false,
+    signingSecret: "",
+  };
+}
+
+export const SubscriptionChange: MessageFns<SubscriptionChange> = {
+  encode(message: SubscriptionChange, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.name !== "") {
+      writer.uint32(18).string(message.name);
+    }
+    if (message.filterJson !== "") {
+      writer.uint32(26).string(message.filterJson);
+    }
+    if (message.instruction !== "") {
+      writer.uint32(34).string(message.instruction);
+    }
+    if (message.setDelivery !== false) {
+      writer.uint32(40).bool(message.setDelivery);
+    }
+    if (message.deliveryChannel !== "") {
+      writer.uint32(50).string(message.deliveryChannel);
+    }
+    if (message.deliveryTarget !== "") {
+      writer.uint32(58).string(message.deliveryTarget);
+    }
+    if (message.rateLimitPerHour !== 0) {
+      writer.uint32(64).uint32(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      writer.uint32(72).uint32(message.timeoutSecs);
+    }
+    if (message.setSigningSecret !== false) {
+      writer.uint32(80).bool(message.setSigningSecret);
+    }
+    if (message.signingSecret !== "") {
+      writer.uint32(90).string(message.signingSecret);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionChange {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionChange();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.name = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.filterJson = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.instruction = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.setDelivery = reader.bool();
+            continue;
+          }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.deliveryChannel = reader.string();
+            continue;
+          }
+          case 7: {
+            if (tag !== 58) {
+              break;
+            }
+
+            message.deliveryTarget = reader.string();
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.rateLimitPerHour = reader.uint32();
+            continue;
+          }
+          case 9: {
+            if (tag !== 72) {
+              break;
+            }
+
+            message.timeoutSecs = reader.uint32();
+            continue;
+          }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.setSigningSecret = reader.bool();
+            continue;
+          }
+          case 11: {
+            if (tag !== 90) {
+              break;
+            }
+
+            message.signingSecret = reader.string();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionChange {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      name: isSet(object.name) ? globalThis.String(object.name) : "",
+      filterJson: isSet(object.filterJson)
+        ? globalThis.String(object.filterJson)
+        : isSet(object.filter_json)
+        ? globalThis.String(object.filter_json)
+        : "",
+      instruction: isSet(object.instruction) ? globalThis.String(object.instruction) : "",
+      setDelivery: isSet(object.setDelivery)
+        ? globalThis.Boolean(object.setDelivery)
+        : isSet(object.set_delivery)
+        ? globalThis.Boolean(object.set_delivery)
+        : false,
+      deliveryChannel: isSet(object.deliveryChannel)
+        ? globalThis.String(object.deliveryChannel)
+        : isSet(object.delivery_channel)
+        ? globalThis.String(object.delivery_channel)
+        : "",
+      deliveryTarget: isSet(object.deliveryTarget)
+        ? globalThis.String(object.deliveryTarget)
+        : isSet(object.delivery_target)
+        ? globalThis.String(object.delivery_target)
+        : "",
+      rateLimitPerHour: isSet(object.rateLimitPerHour)
+        ? globalThis.Number(object.rateLimitPerHour)
+        : isSet(object.rate_limit_per_hour)
+        ? globalThis.Number(object.rate_limit_per_hour)
+        : 0,
+      timeoutSecs: isSet(object.timeoutSecs)
+        ? globalThis.Number(object.timeoutSecs)
+        : isSet(object.timeout_secs)
+        ? globalThis.Number(object.timeout_secs)
+        : 0,
+      setSigningSecret: isSet(object.setSigningSecret)
+        ? globalThis.Boolean(object.setSigningSecret)
+        : isSet(object.set_signing_secret)
+        ? globalThis.Boolean(object.set_signing_secret)
+        : false,
+      signingSecret: isSet(object.signingSecret)
+        ? globalThis.String(object.signingSecret)
+        : isSet(object.signing_secret)
+        ? globalThis.String(object.signing_secret)
+        : "",
+    };
+  },
+
+  toJSON(message: SubscriptionChange): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.name !== "") {
+      obj.name = message.name;
+    }
+    if (message.filterJson !== "") {
+      obj.filterJson = message.filterJson;
+    }
+    if (message.instruction !== "") {
+      obj.instruction = message.instruction;
+    }
+    if (message.setDelivery !== false) {
+      obj.setDelivery = message.setDelivery;
+    }
+    if (message.deliveryChannel !== "") {
+      obj.deliveryChannel = message.deliveryChannel;
+    }
+    if (message.deliveryTarget !== "") {
+      obj.deliveryTarget = message.deliveryTarget;
+    }
+    if (message.rateLimitPerHour !== 0) {
+      obj.rateLimitPerHour = Math.round(message.rateLimitPerHour);
+    }
+    if (message.timeoutSecs !== 0) {
+      obj.timeoutSecs = Math.round(message.timeoutSecs);
+    }
+    if (message.setSigningSecret !== false) {
+      obj.setSigningSecret = message.setSigningSecret;
+    }
+    if (message.signingSecret !== "") {
+      obj.signingSecret = message.signingSecret;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionChange>, I>>(base?: I): SubscriptionChange {
+    return SubscriptionChange.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionChange>, I>>(object: I): SubscriptionChange {
+    const message = createBaseSubscriptionChange();
+    message.id = object.id ?? "";
+    message.name = object.name ?? "";
+    message.filterJson = object.filterJson ?? "";
+    message.instruction = object.instruction ?? "";
+    message.setDelivery = object.setDelivery ?? false;
+    message.deliveryChannel = object.deliveryChannel ?? "";
+    message.deliveryTarget = object.deliveryTarget ?? "";
+    message.rateLimitPerHour = object.rateLimitPerHour ?? 0;
+    message.timeoutSecs = object.timeoutSecs ?? 0;
+    message.setSigningSecret = object.setSigningSecret ?? false;
+    message.signingSecret = object.signingSecret ?? "";
+    return message;
+  },
+};
+
+function createBaseSubscriptionStatusRequest(): SubscriptionStatusRequest {
+  return { id: "", active: false };
+}
+
+export const SubscriptionStatusRequest: MessageFns<SubscriptionStatusRequest> = {
+  encode(message: SubscriptionStatusRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.id !== "") {
+      writer.uint32(10).string(message.id);
+    }
+    if (message.active !== false) {
+      writer.uint32(16).bool(message.active);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionStatusRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionStatusRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.id = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.active = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionStatusRequest {
+    return {
+      id: isSet(object.id) ? globalThis.String(object.id) : "",
+      active: isSet(object.active) ? globalThis.Boolean(object.active) : false,
+    };
+  },
+
+  toJSON(message: SubscriptionStatusRequest): unknown {
+    const obj: any = {};
+    if (message.id !== "") {
+      obj.id = message.id;
+    }
+    if (message.active !== false) {
+      obj.active = message.active;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionStatusRequest>, I>>(base?: I): SubscriptionStatusRequest {
+    return SubscriptionStatusRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionStatusRequest>, I>>(object: I): SubscriptionStatusRequest {
+    const message = createBaseSubscriptionStatusRequest();
+    message.id = object.id ?? "";
+    message.active = object.active ?? false;
+    return message;
+  },
+};
+
+function createBaseSubscriptionKey(): SubscriptionKey {
+  return { key: "", senderSteps: [] };
+}
+
+export const SubscriptionKey: MessageFns<SubscriptionKey> = {
+  encode(message: SubscriptionKey, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    for (const v of message.senderSteps) {
+      writer.uint32(18).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionKey {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionKey();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.key = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.senderSteps.push(reader.string());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionKey {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      senderSteps: globalThis.Array.isArray(object?.senderSteps)
+        ? object.senderSteps.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.sender_steps)
+        ? object.sender_steps.map((e: any) => globalThis.String(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SubscriptionKey): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.senderSteps?.length) {
+      obj.senderSteps = message.senderSteps;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionKey>, I>>(base?: I): SubscriptionKey {
+    return SubscriptionKey.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionKey>, I>>(object: I): SubscriptionKey {
+    const message = createBaseSubscriptionKey();
+    message.key = object.key ?? "";
+    message.senderSteps = object.senderSteps?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseSubscriptionActivityEvent(): SubscriptionActivityEvent {
+  return { subscriptionId: "", kind: "", runId: "", status: "", summary: "", eventCount: 0, emittedAtUnix: 0 };
+}
+
+export const SubscriptionActivityEvent: MessageFns<SubscriptionActivityEvent> = {
+  encode(message: SubscriptionActivityEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.subscriptionId !== "") {
+      writer.uint32(10).string(message.subscriptionId);
+    }
+    if (message.kind !== "") {
+      writer.uint32(18).string(message.kind);
+    }
+    if (message.runId !== "") {
+      writer.uint32(26).string(message.runId);
+    }
+    if (message.status !== "") {
+      writer.uint32(34).string(message.status);
+    }
+    if (message.summary !== "") {
+      writer.uint32(42).string(message.summary);
+    }
+    if (message.eventCount !== 0) {
+      writer.uint32(48).uint32(message.eventCount);
+    }
+    if (message.emittedAtUnix !== 0) {
+      writer.uint32(56).int64(message.emittedAtUnix);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SubscriptionActivityEvent {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseSubscriptionActivityEvent();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.subscriptionId = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.kind = reader.string();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.runId = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.status = reader.string();
+            continue;
+          }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.summary = reader.string();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.eventCount = reader.uint32();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.emittedAtUnix = longToNumber(reader.int64());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): SubscriptionActivityEvent {
+    return {
+      subscriptionId: isSet(object.subscriptionId)
+        ? globalThis.String(object.subscriptionId)
+        : isSet(object.subscription_id)
+        ? globalThis.String(object.subscription_id)
+        : "",
+      kind: isSet(object.kind) ? globalThis.String(object.kind) : "",
+      runId: isSet(object.runId)
+        ? globalThis.String(object.runId)
+        : isSet(object.run_id)
+        ? globalThis.String(object.run_id)
+        : "",
+      status: isSet(object.status) ? globalThis.String(object.status) : "",
+      summary: isSet(object.summary) ? globalThis.String(object.summary) : "",
+      eventCount: isSet(object.eventCount)
+        ? globalThis.Number(object.eventCount)
+        : isSet(object.event_count)
+        ? globalThis.Number(object.event_count)
+        : 0,
+      emittedAtUnix: isSet(object.emittedAtUnix)
+        ? globalThis.Number(object.emittedAtUnix)
+        : isSet(object.emitted_at_unix)
+        ? globalThis.Number(object.emitted_at_unix)
+        : 0,
+    };
+  },
+
+  toJSON(message: SubscriptionActivityEvent): unknown {
+    const obj: any = {};
+    if (message.subscriptionId !== "") {
+      obj.subscriptionId = message.subscriptionId;
+    }
+    if (message.kind !== "") {
+      obj.kind = message.kind;
+    }
+    if (message.runId !== "") {
+      obj.runId = message.runId;
+    }
+    if (message.status !== "") {
+      obj.status = message.status;
+    }
+    if (message.summary !== "") {
+      obj.summary = message.summary;
+    }
+    if (message.eventCount !== 0) {
+      obj.eventCount = Math.round(message.eventCount);
+    }
+    if (message.emittedAtUnix !== 0) {
+      obj.emittedAtUnix = Math.round(message.emittedAtUnix);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<SubscriptionActivityEvent>, I>>(base?: I): SubscriptionActivityEvent {
+    return SubscriptionActivityEvent.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<SubscriptionActivityEvent>, I>>(object: I): SubscriptionActivityEvent {
+    const message = createBaseSubscriptionActivityEvent();
+    message.subscriptionId = object.subscriptionId ?? "";
+    message.kind = object.kind ?? "";
+    message.runId = object.runId ?? "";
+    message.status = object.status ?? "";
+    message.summary = object.summary ?? "";
+    message.eventCount = object.eventCount ?? 0;
+    message.emittedAtUnix = object.emittedAtUnix ?? 0;
+    return message;
+  },
+};
+
 /**
  * Admin surfaces lifecycle, settings, and the data-access RPCs that replace
  * direct DB reads from the TUI popups.
@@ -18715,6 +21525,121 @@ export const AdminDefinition = {
       requestStream: false,
       responseType: AgentList as typeof AgentList,
       responseStream: false,
+      options: {},
+    },
+    /**
+     * Subscriptions: an event from a source (a webhook, a channel message,
+     * inbound email, Borg itself) wakes Borg with an instruction. The daemon
+     * owns the rows, the event ledger and the dispatcher; the apps and the
+     * `subscribe` tool share one implementation (`cortex::subscriptions::manage`).
+     */
+    listSubscriptionPresets: {
+      name: "ListSubscriptionPresets",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SubscriptionPresetList as typeof SubscriptionPresetList,
+      responseStream: false,
+      options: {},
+    },
+    listSubscriptions: {
+      name: "ListSubscriptions",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SubscriptionList as typeof SubscriptionList,
+      responseStream: false,
+      options: {},
+    },
+    /** Row, endpoint, sender steps (key masked) and recent events. */
+    getSubscription: {
+      name: "GetSubscription",
+      requestType: SubscriptionRef as typeof SubscriptionRef,
+      requestStream: false,
+      responseType: SubscriptionDetail as typeof SubscriptionDetail,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * New subscriptions start paused unless `active` is set. Returns the key
+     * in clear once; it can be read again only through RevealSubscriptionKey.
+     */
+    createSubscription: {
+      name: "CreateSubscription",
+      requestType: SubscriptionSpec as typeof SubscriptionSpec,
+      requestStream: false,
+      responseType: SubscriptionCreated as typeof SubscriptionCreated,
+      responseStream: false,
+      options: {},
+    },
+    updateSubscription: {
+      name: "UpdateSubscription",
+      requestType: SubscriptionChange as typeof SubscriptionChange,
+      requestStream: false,
+      responseType: Subscription as typeof Subscription,
+      responseStream: false,
+      options: {},
+    },
+    deleteSubscription: {
+      name: "DeleteSubscription",
+      requestType: SubscriptionRef as typeof SubscriptionRef,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    /** `active = true` is Resume: it also clears a storm pause. */
+    setSubscriptionStatus: {
+      name: "SetSubscriptionStatus",
+      requestType: SubscriptionStatusRequest as typeof SubscriptionStatusRequest,
+      requestStream: false,
+      responseType: Subscription as typeof Subscription,
+      responseStream: false,
+      options: {},
+    },
+    /** Recorded in the activity log. */
+    revealSubscriptionKey: {
+      name: "RevealSubscriptionKey",
+      requestType: SubscriptionRef as typeof SubscriptionRef,
+      requestStream: false,
+      responseType: SubscriptionKey as typeof SubscriptionKey,
+      responseStream: false,
+      options: {},
+    },
+    /** The old key stops working at once. */
+    rotateSubscriptionKey: {
+      name: "RotateSubscriptionKey",
+      requestType: SubscriptionRef as typeof SubscriptionRef,
+      requestStream: false,
+      responseType: SubscriptionKey as typeof SubscriptionKey,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Queue the source's sample event through the real path. It runs even
+     * while the subscription is paused.
+     */
+    testSubscription: {
+      name: "TestSubscription",
+      requestType: SubscriptionRef as typeof SubscriptionRef,
+      requestStream: false,
+      responseType: SubscriptionEvent as typeof SubscriptionEvent,
+      responseStream: false,
+      options: {},
+    },
+    listSubscriptionEvents: {
+      name: "ListSubscriptionEvents",
+      requestType: SubscriptionEventsRequest as typeof SubscriptionEventsRequest,
+      requestStream: false,
+      responseType: SubscriptionEventList as typeof SubscriptionEventList,
+      responseStream: false,
+      options: {},
+    },
+    /** Live activity: first event seen, run started and finished, paused itself. */
+    subscribeSubscriptionActivity: {
+      name: "SubscribeSubscriptionActivity",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: SubscriptionActivityEvent as typeof SubscriptionActivityEvent,
+      responseStream: true,
       options: {},
     },
   },

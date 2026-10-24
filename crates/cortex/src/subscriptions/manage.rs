@@ -246,9 +246,15 @@ pub async fn update(
     let Some(row) = db.get_subscription(id).await? else {
         return Ok(None);
     };
+    let preset = presets::get(&row.provider)
+        .with_context(|| format!("There is no \"{}\" source.", row.provider))?;
+    if matches!(change.signing_secret_ref, Some(Some(_))) && !preset.auth.provider_issues_secret() {
+        bail!(
+            "{} does not issue a signing secret. Borg checks its events with the subscription's own key.",
+            preset.label
+        );
+    }
     if change.delivery_channel.is_some() || change.delivery_target.is_some() {
-        let preset = presets::get(&row.provider)
-            .with_context(|| format!("There is no \"{}\" source.", row.provider))?;
         let channel = change
             .delivery_channel
             .clone()
@@ -407,6 +413,30 @@ mod tests {
             github.row.signing_secret_ref.is_none(),
             "GitHub signs with Borg's key"
         );
+    }
+
+    #[tokio::test]
+    async fn a_signing_secret_change_is_refused_where_the_provider_issues_none() {
+        let db = Database::test_db().await;
+        let config = Config::default();
+        let github = create(&db, &config, &spec("github")).await.unwrap();
+        let change = SubscriptionUpdate {
+            signing_secret_ref: signing_secret_change(Some("abc")).unwrap(),
+            ..Default::default()
+        };
+        assert!(update(&db, &github.row.id, &change).await.is_err());
+        let stripe = create(&db, &config, &spec("stripe")).await.unwrap();
+        let updated = update(&db, &stripe.row.id, &change).await.unwrap().unwrap();
+        assert!(updated.signing_secret_ref.is_some());
+        let cleared = SubscriptionUpdate {
+            signing_secret_ref: signing_secret_change(Some("")).unwrap(),
+            ..Default::default()
+        };
+        let updated = update(&db, &stripe.row.id, &cleared)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(updated.signing_secret_ref.is_none());
     }
 
     #[test]
