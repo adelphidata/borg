@@ -76,6 +76,8 @@ export function SubscriptionsSection({ subs }: { subs: Subscriptions }) {
   const settings = useOptionalSettings();
   const [adding, setAdding] = useState<{ preset?: string }>();
   const [confirm, setConfirm] = useState<string>();
+  // The settings error slot is shared; only a press here earns its message here.
+  const [turnOnTried, setTurnOnTried] = useState(false);
   const { setActive, remove } = subs;
   const failure = (setActive.error ?? remove.error)?.message;
   const off =
@@ -102,34 +104,46 @@ export function SubscriptionsSection({ subs }: { subs: Subscriptions }) {
         )
       }
     >
+      {off && (
+        <div className="mb-3 flex flex-col gap-1.5">
+          <div className="flex items-center gap-3 text-[12.5px] leading-[1.45] text-ink2">
+            <span className="min-w-0 flex-1">Subscriptions are off, so no event wakes Borg.</span>
+            <Pill
+              square
+              variant="primary"
+              disabled={settings.saving}
+              onClick={() => {
+                setTurnOnTried(true);
+                void settings.save("subscriptions.enabled", "true");
+              }}
+            >
+              {settings.saving ? "Turning on…" : "Turn on"}
+            </Pill>
+          </div>
+          {turnOnTried && settings.saveError && (
+            <div role="alert" className={ERROR_LINE}>
+              {settings.saveError.message}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Outside the listing's load state on purpose: the Connect card holds a
+          key the daemon shows only once, and a read that fails while borgd
+          restarts must not take the card, and the key, with it. */}
+      {adding && subs.last && (
+        <NewSubscription
+          presets={subs.last.presets}
+          subs={subs}
+          initialPreset={adding.preset}
+          onClose={() => setAdding(undefined)}
+          onOpen={(id) => navigate(subscriptionPath(id))}
+        />
+      )}
+
       <DaemonState query={subs.query} label="your subscriptions">
         {(data) => (
           <>
-            {off && (
-              <div className="mb-3 flex items-center gap-3 text-[12.5px] leading-[1.45] text-ink2">
-                <span className="min-w-0 flex-1">
-                  Subscriptions are off, so no event wakes Borg.
-                </span>
-                <Pill
-                  square
-                  variant="primary"
-                  onClick={() => void settings.save("subscriptions.enabled", "true")}
-                >
-                  Turn on
-                </Pill>
-              </div>
-            )}
-
-            {adding && (
-              <NewSubscription
-                presets={data.presets}
-                subs={subs}
-                initialPreset={adding.preset}
-                onClose={() => setAdding(undefined)}
-                onOpen={(id) => navigate(subscriptionPath(id))}
-              />
-            )}
-
             {failure && (
               <div role="alert" className={`mb-3 ${ERROR_LINE}`}>
                 {failure}

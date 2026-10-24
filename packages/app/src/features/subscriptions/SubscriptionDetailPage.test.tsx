@@ -1,15 +1,26 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { Route, Routes, useLocation } from "react-router-dom";
-import { BorgError } from "@borg/client";
+import { Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { BorgError, GrpcStatus } from "@borg/client";
 import type { admin } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
 import { PRESETS, PUBLIC_URL, emitActivity, event, subscription } from "../../test/subscriptions";
 import { clearNotice, pendingNotice } from "../../lib/notice";
 import { SubscriptionDetailPage, runsOf } from "./SubscriptionDetailPage";
+import { TEST_POLL_MS } from "./useSubscriptions";
 
 function Where() {
   return <span data-testid="path">{useLocation().pathname}</span>;
+}
+
+/** A link elsewhere on screen, the way the palette or a toast would move the route. */
+function GoTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      Go
+    </button>
+  );
 }
 
 function detail(
@@ -63,7 +74,10 @@ async function ready() {
   await waitFor(() => expect(screen.getByText("Recent events")).toBeTruthy());
 }
 
-afterEach(() => clearNotice());
+afterEach(() => {
+  clearNotice();
+  vi.useRealTimers();
+});
 
 describe("runsOf", () => {
   it("groups events by the run that handled them, keeping waiting events apart", () => {
@@ -207,7 +221,7 @@ describe("SubscriptionDetailPage", () => {
     });
     // What was typed stays, so it can be fixed.
     expect((screen.getByLabelText("How serious") as HTMLSelectElement).value).toBe("critical");
-    click(screen.getByRole("button", { name: "Discard" }));
+    click(screen.getByRole("button", { name: "Discard when" }));
     expect((screen.getByLabelText("How serious") as HTMLSelectElement).value).toBe("");
   });
 
@@ -234,7 +248,7 @@ describe("SubscriptionDetailPage", () => {
     const daemon = daemonWith(detail(), { UpdateSubscription: subscription() });
     mount(daemon);
     await ready();
-    click(screen.getByRole("button", { name: "Slack" }));
+    click(screen.getByRole("radio", { name: "Slack" }));
     type(screen.getByLabelText("Who gets it on Slack"), "C0123");
     click(screen.getByRole("button", { name: "Save where it reports" }));
     await waitFor(() =>
@@ -253,13 +267,23 @@ describe("SubscriptionDetailPage", () => {
     });
     mount(daemon);
     await ready();
-    expect(screen.getByLabelText("URL").textContent).toBe(PUBLIC_URL);
+    expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL);
     expect(screen.getByText("Hidden. Reveal it to copy it again.")).toBeTruthy();
     click(screen.getByRole("button", { name: "Reveal key" }));
     await waitFor(() => expect(screen.getByLabelText("Key")).toBeTruthy());
     expect(requestOf(daemon, "RevealSubscriptionKey")).toEqual({ id: "sub_1" });
-    click(screen.getByRole("button", { name: "Show key" }));
-    expect(screen.getByLabelText("Key").textContent).toBe("bsk_old");
+    // Revealed on request: the key and the steps both show it.
+    const key = screen.getByLabelText("Key") as HTMLInputElement;
+    expect(key.type).toBe("text");
+    expect(key.value).toBe("bsk_old");
+    click(screen.getByRole("button", { name: "How to set it up in Datadog" }));
+    const steps = () => screen.getByRole("list", { name: "Set up Datadog" }).textContent;
+    expect(steps()).toContain("bsk_old");
+    // One Hide covers both, so the mask means something.
+    click(screen.getByRole("button", { name: "Hide key" }));
+    expect(key.type).toBe("password");
+    expect(steps()).not.toContain("bsk_old");
+    expect(steps()).toContain("YOUR_KEY");
 
     click(screen.getByRole("button", { name: "Replace key" }));
     expect(screen.getByText(/The old one stops working at once/)).toBeTruthy();
@@ -268,9 +292,13 @@ describe("SubscriptionDetailPage", () => {
 
     click(screen.getByRole("button", { name: "Replace key" }));
     click(screen.getByRole("button", { name: "Replace" }));
-    await waitFor(() => expect(screen.getByLabelText("Key").textContent).toBe("bsk_new"));
-    // The steps open with the new key in them, since the sender needs it now.
-    expect(screen.getByRole("list", { name: "Set up Datadog" }).textContent).toContain("bsk_new");
+    await waitFor(() =>
+      expect((screen.getByLabelText("Key") as HTMLInputElement).value).toBe("bsk_new"),
+    );
+    // The steps stay open, masked until Show, like the key above them.
+    expect(steps()).not.toContain("bsk_new");
+    click(screen.getByRole("button", { name: "Show key" }));
+    expect(steps()).toContain("bsk_new");
     expect(pendingNotice()?.message).toBe("Key replaced. Paste the new one into Datadog.");
   });
 
@@ -318,7 +346,7 @@ describe("SubscriptionDetailPage", () => {
     );
     await ready();
     expect(screen.queryByText("Endpoint")).toBeNull();
-    expect(screen.getByRole("button", { name: "Reply where it came from" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Reply where it came from" })).toBeTruthy();
   });
 
   it("turns on the tunnel for an address only this computer can reach, then re-reads", async () => {
@@ -334,7 +362,7 @@ describe("SubscriptionDetailPage", () => {
     click(screen.getByRole("button", { name: "Turn on" }));
     await waitFor(() => expect(screen.queryByText(hint)).toBeNull());
     expect(reads(daemon)).toBe(before + 1);
-    expect(screen.getByLabelText("URL").textContent).toBe(PUBLIC_URL);
+    expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL);
   });
 
   it("shows Running… for a test until the stream says it finished", async () => {
@@ -424,7 +452,7 @@ describe("SubscriptionDetailPage", () => {
     expect(screen.getByLabelText("Subscription name")).toBeTruthy();
   });
 
-  it("keeps the limits and counts behind Advanced", async () => {
+  it("keeps the limits and counts behind Advanced, and sends only real counts", async () => {
     const daemon = daemonWith(detail({ droppedCount: 12 }), {
       UpdateSubscription: subscription({ rateLimitPerHour: 10 }),
     });
@@ -436,22 +464,161 @@ describe("SubscriptionDetailPage", () => {
     expect(
       screen.getByText("Events dropped in bursts or while paused").nextElementSibling?.textContent,
     ).toBe("12");
+    const save = () => screen.getByRole("button", { name: "Save limits" }) as HTMLButtonElement;
+    // The daemon reads 0 as "leave it alone": a 0 or a word must not look saved.
+    for (const bad of ["0", "nonsense", ""]) {
+      type(screen.getByLabelText("Stop a run after (seconds)"), bad);
+      expect(save().disabled).toBe(true);
+      expect(screen.getByText("Use whole numbers above zero.")).toBeTruthy();
+    }
+    click(screen.getByRole("button", { name: "Discard limits" }));
+    expect((screen.getByLabelText("Stop a run after (seconds)") as HTMLInputElement).value).toBe(
+      "300",
+    );
     type(screen.getByLabelText("Runs per hour, at most"), "10");
-    type(screen.getByLabelText("Stop a run after (seconds)"), "nonsense");
-    click(screen.getByRole("button", { name: "Save limits" }));
+    type(screen.getByLabelText("Stop a run after (seconds)"), "120");
+    expect(screen.queryByText("Use whole numbers above zero.")).toBeNull();
+    click(save());
     await waitFor(() =>
       expect(requestOf(daemon, "UpdateSubscription")).toMatchObject({
         rateLimitPerHour: 10,
-        // Not a number: left alone rather than sent as a zero-second timeout.
-        timeoutSecs: 0,
+        timeoutSecs: 120,
       }),
     );
   });
 
-  it("says so when the subscription is gone", async () => {
-    mount(daemonWith({ events: [], senderSteps: [], runsToday: 0 }));
+  it("will not save a blank instruction, which the daemon would read as no change", async () => {
+    const daemon = daemonWith(detail(), { UpdateSubscription: subscription() });
+    mount(daemon);
+    await ready();
+    type(screen.getByLabelText("Instruction"), "   ");
+    const save = screen.getByRole("button", { name: "Save instruction" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(screen.getByText(/An instruction cannot be empty/)).toBeTruthy();
+    click(save);
+    expect(daemon.calls.some((c) => c.method === "UpdateSubscription")).toBe(false);
+  });
+
+  it("renames from Advanced too, for a screen with no title bar", async () => {
+    const daemon = daemonWith(detail(), {
+      UpdateSubscription: subscription({ name: "Prod alerts" }),
+    });
+    mount(daemon);
+    await ready();
+    click(screen.getByRole("button", { name: "Advanced" }));
+    const name = screen.getByLabelText("Name") as HTMLInputElement;
+    expect(name.value).toBe("Datadog alerts");
+    type(name, " ");
+    expect((screen.getByRole("button", { name: "Save name" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    type(name, " Prod alerts ");
+    click(screen.getByRole("button", { name: "Save name" }));
+    await waitFor(() =>
+      expect(requestOf(daemon, "UpdateSubscription")).toMatchObject({
+        name: "Prod alerts",
+        instruction: "",
+      }),
+    );
+  });
+
+  it("says a refusal under the section that caused it, not under the signing secret", async () => {
+    const refusal = "An instruction can be at most 4000 characters.";
+    const daemon = daemonWith(detail({ provider: "sentry", status: "paused" }), {
+      UpdateSubscription: new BorgError(INVALID_ARGUMENT as never, refusal),
+    });
+    mount(daemon);
+    await ready();
+    type(screen.getByLabelText("Instruction"), "x".repeat(5000));
+    click(screen.getByRole("button", { name: "Save instruction" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(refusal));
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    const secret = screen.getByLabelText("Signing secret").closest("div")!.parentElement!;
+    expect(within(secret).queryByText(refusal)).toBeNull();
+    // Nor does the secret's button read "Saving…" while another section saves.
+    expect(within(secret).getByRole("button", { name: "Save secret" })).toBeTruthy();
+  });
+
+  it("shows a refused Enable word for word", async () => {
+    const refusal = "Paste the signing secret from Sentry first, then enable it.";
+    const daemon = daemonWith(detail({ provider: "sentry", status: "paused" }), {
+      SetSubscriptionStatus: new BorgError(INVALID_ARGUMENT as never, refusal),
+    });
+    mount(daemon);
+    await ready();
+    click(screen.getByRole("button", { name: "Enable" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(refusal));
+    expect(requestOf(daemon, "SetSubscriptionStatus")).toEqual({ id: "sub_1", active: true });
+    expect(pendingNotice()).toBeUndefined();
+  });
+
+  it("starts fresh when the link moves to another subscription", async () => {
+    const other = subscription({ id: "sub_2", name: "Other alerts" });
+    const daemon = daemonWith(undefined, {
+      RevealSubscriptionKey: { key: "bsk_first", senderSteps: ["Bearer bsk_first"] },
+    });
+    daemon.answer("GetSubscription", (req: unknown) =>
+      (req as { id: string }).id === "sub_2" ? detail(other) : detail(),
+    );
+    renderApp(
+      <>
+        <Routes>
+          <Route path="/connections/subscriptions/:id" element={<SubscriptionDetailPage />} />
+        </Routes>
+        <Routes>
+          <Route path="*" element={<GoTo to="/connections/subscriptions/sub_2" />} />
+        </Routes>
+      </>,
+      { daemon, route: "/connections/subscriptions/sub_1" },
+    );
+    await ready();
+    click(screen.getByRole("button", { name: "Reveal key" }));
+    await waitFor(() => expect(screen.getByLabelText("Key")).toBeTruthy());
+    type(screen.getByLabelText("Instruction"), "half typed");
+
+    click(screen.getByRole("button", { name: "Go" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Other alerts" })).toBeTruthy());
+    // The first subscription's key and draft stay with the first subscription.
+    expect(screen.queryByLabelText("Key")).toBeNull();
+    expect(screen.getByText("Hidden. Reveal it to copy it again.")).toBeTruthy();
+    expect((screen.getByLabelText("Instruction") as HTMLTextAreaElement).value).toBe(
+      other.instruction,
+    );
+  });
+
+  it("says calmly that a deleted subscription is gone", async () => {
+    mount(daemonWith(new BorgError(GrpcStatus.NotFound, "That subscription no longer exists.")));
     await waitFor(() =>
       expect(screen.getByText("This subscription no longer exists.")).toBeTruthy(),
     );
+    // Not an outage: no "Could not load" box.
+    expect(screen.queryByText(/Could not load/)).toBeNull();
+  });
+
+  it("ends Running… from a later re-read when no finished frame ever arrives", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const pendingTest = event({ id: "evt_t", kind: "test", status: "pending", runId: "" });
+    const daemon = daemonWith(detail(), { TestSubscription: pendingTest });
+    mount(daemon);
+    await ready();
+    daemon.answer("GetSubscription", detail({}, { events: [pendingTest] }));
+    click(screen.getByRole("button", { name: "Send a test event" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Running…" })).toBeTruthy());
+
+    daemon.answer(
+      "GetSubscription",
+      detail({}, { events: [{ ...pendingTest, status: "succeeded", runId: "run_t" }] }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TEST_POLL_MS);
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Send a test event" })).toBeTruthy(),
+    );
+  });
+
+  it("still reports a real outage as one", async () => {
+    mount(daemonWith(new BorgError(GrpcStatus.Unavailable, "down")));
+    await waitFor(() => expect(screen.getByText("Could not load this subscription.")).toBeTruthy());
   });
 });

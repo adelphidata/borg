@@ -15,9 +15,12 @@ import {
   SigningSecretField,
 } from "./SubscriptionFields";
 import {
+  SETTLED_EVENT,
   changeOf,
   filterJsonOf,
   stepsWithKey,
+  stepsWithoutKey,
+  usePollWhile,
   useSubscriptionWrites,
   useTunnel,
   type FilterDraft,
@@ -151,7 +154,7 @@ function Configure({
           />
           <DeliveryPicker
             source={preset.source}
-            channels={subs.query.state === "ready" ? subs.query.data.deliveryChannels : []}
+            channels={subs.last?.deliveryChannels ?? []}
             channel={delivery.channel}
             target={delivery.target}
             onChange={setDelivery}
@@ -221,10 +224,15 @@ export function ConnectCard({
   const sub = created.subscription!;
   const label = preset?.label ?? sub.provider;
   const [endpoint, setEndpoint] = useState(sub.endpoint);
+  // Kept with the key in clear; what is shown depends on `keyShown`.
   const [steps, setSteps] = useState(created.senderSteps);
-  const placeholder = subs.query.state === "ready" ? subs.query.data.keyPlaceholder : "";
+  const placeholder = subs.last?.keyPlaceholder ?? "";
+  // One Show for the key field and the steps: a masked key above and the same
+  // key in clear below would make the mask mean nothing.
+  const [keyShown, setKeyShown] = useState(false);
   const [secretSaved, setSecretSaved] = useState(sub.hasSigningSecret);
-  const [tested, setTested] = useState<number>();
+  const [tested, setTested] = useState<{ id: string; finishedBefore: number }>();
+  const [testSettled, setTestSettled] = useState(false);
   const heard = subs.activity[sub.id] ?? { received: 0, finished: 0 };
 
   // The endpoint is worked out when it is read, so a tunnel that has just come
@@ -253,7 +261,20 @@ export function ConnectCard({
 
   const url = endpoint?.url ?? "";
   const waiting = !!preset?.takesSigningSecret && !secretSaved;
-  const testRunning = tested !== undefined && heard.finished <= tested;
+  const testRunning =
+    tested !== undefined && !testSettled && heard.finished <= tested.finishedBefore;
+  // The stream ends the wait the moment the run finishes; a re-read ends it
+  // when the stream missed that frame (a reconnect, a lagging subscriber).
+  const testCheck = useMutation((borg) =>
+    borg.admin.listSubscriptionEvents({ id: sub.id, limit: 20 }),
+  );
+  usePollWhile(testRunning, () => {
+    void testCheck.run(undefined).then((list) => {
+      const mine = list?.events.find((e) => e.id === tested?.id);
+      if (mine && SETTLED_EVENT.has(mine.status)) setTestSettled(true);
+    });
+  });
+  const shownSteps = keyShown ? steps : stepsWithoutKey(steps, created.key, placeholder);
 
   return (
     <div className="flex flex-col gap-5">
@@ -272,11 +293,24 @@ export function ConnectCard({
       {url !== "" && (
         <>
           <CopyField label="URL" value={url} />
-          {created.key !== "" && <CopyField label="Key" value={created.key} secret />}
+          {created.key !== "" && (
+            <CopyField
+              label="Key"
+              value={created.key}
+              secret
+              shown={keyShown}
+              onShownChange={setKeyShown}
+            />
+          )}
           <Reachability endpoint={endpoint} tunnel={tunnel} />
+          {reread.error && (
+            <div role="alert" className={ERROR_LINE}>
+              Could not read the new address: {reread.error.message}
+            </div>
+          )}
           {steps.length > 0 && (
             <Block label={`In ${label}`}>
-              <StepList steps={steps} label={`Set up ${label}`} />
+              <StepList steps={shownSteps} label={`Set up ${label}`} />
             </Block>
           )}
           {preset?.takesSigningSecret && (
@@ -334,8 +368,12 @@ export function ConnectCard({
           square
           disabled={test.pending || testRunning}
           onClick={() => {
-            const before = heard.finished;
-            void test.run(sub.id).then((event) => event && setTested(before));
+            const finishedBefore = heard.finished;
+            void test.run(sub.id).then((event) => {
+              if (!event) return;
+              setTestSettled(false);
+              setTested({ id: event.id, finishedBefore });
+            });
           }}
         >
           {test.pending || testRunning ? "Running…" : "Send a test event"}

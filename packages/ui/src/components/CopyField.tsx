@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { CopyIcon } from "./icons";
 import { SECTION_LABEL } from "./pageClasses";
 
@@ -12,28 +12,41 @@ type CopyState = "idle" | "copied" | "failed";
  * A value someone has to paste somewhere else — a URL, a key — with its own
  * copy button.
  *
- * The value is in monospace and selectable, so copying by hand still works
- * where `navigator.clipboard` does not exist (an insecure origin, which is the
- * gateway-served page on a LAN address). There the button says it could not
- * copy instead of claiming it did.
+ * The value sits in a read-only field named by the label above it, so it can
+ * be selected and copied by hand where `navigator.clipboard` does not exist
+ * (an insecure origin, which is the gateway-served page on a LAN address).
+ * There the button says it could not copy instead of claiming it did.
  *
  * `secret` hides the value behind dots until Show is pressed. Copy still copies
- * the real value: hiding is about the screen, not the clipboard.
+ * the real value: hiding is about the screen, not the clipboard. Pass `shown`
+ * and `onShownChange` when one Show control has to cover more than this field
+ * (setup steps with the same key in them).
  */
 export function CopyField({
   label,
   value,
   secret = false,
+  shown: shownProp,
+  onShownChange,
   actions,
 }: {
   /** Shown above the value, and names the buttons: "Copy url", "Show key". */
   label: string;
   value: string;
   secret?: boolean;
+  /** Controlled Show state; omit to let the field keep its own. */
+  shown?: boolean;
+  onShownChange?: (shown: boolean) => void;
   /** Extra controls at the end of the row, e.g. "Replace key". */
   actions?: ReactNode;
 }) {
-  const [shown, setShown] = useState(false);
+  const id = useId();
+  const [ownShown, setOwnShown] = useState(false);
+  const shown = shownProp ?? ownShown;
+  const setShown = (next: boolean) => {
+    if (shownProp === undefined) setOwnShown(next);
+    onShownChange?.(next);
+  };
   // Keyed by the value it was copied from: a field that is handed a new value
   // (a replaced key) must not still read "Copied" for one nobody copied.
   const [copy, setCopy] = useState<{ of: string; state: CopyState }>();
@@ -65,20 +78,26 @@ export function CopyField({
 
   return (
     <div>
-      <div className={SECTION_LABEL}>{label}</div>
+      <label htmlFor={id} className={`block ${SECTION_LABEL}`}>
+        {label}
+      </label>
       <div className="flex flex-wrap items-center gap-2">
-        <code
-          aria-label={label}
-          className="min-w-0 flex-1 rounded-[10px] border border-line2 bg-surface2 px-3 py-2.5 font-mono text-[12px] leading-[1.45] [overflow-wrap:anywhere] text-ink select-all"
-        >
-          {hidden ? "•".repeat(Math.min(Math.max(value.length, 8), 24)) : value}
-        </code>
+        <input
+          id={id}
+          readOnly
+          type={hidden ? "password" : "text"}
+          value={value}
+          spellCheck={false}
+          autoComplete="off"
+          onFocus={(e) => e.currentTarget.select()}
+          className="min-w-0 flex-1 rounded-[10px] border border-line2 bg-surface2 px-3 py-2.5 font-mono text-[12px] leading-[1.45] text-ink outline-none focus:border-focus"
+        />
         {secret && (
           <button
             type="button"
             className={button}
             aria-label={`${shown ? "Hide" : "Show"} ${name}`}
-            onClick={() => setShown((s) => !s)}
+            onClick={() => setShown(!shown)}
           >
             {shown ? "Hide" : "Show"}
           </button>

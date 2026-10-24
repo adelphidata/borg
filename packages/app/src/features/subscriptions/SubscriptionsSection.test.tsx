@@ -211,4 +211,43 @@ describe("SubscriptionsSection writes", () => {
       }),
     );
   });
+
+  it("holds Turn on while it saves, and says why when the save is refused", async () => {
+    let finish: (value: unknown) => void = () => {};
+    const daemon = fakeDaemon({
+      ...listing([subscription()]),
+      GetSettings: {
+        entries: [
+          {
+            key: "subscriptions.enabled",
+            value: "false",
+            category: "db",
+            label: "Let subscriptions wake Borg",
+            kind: "bool",
+            group: "Subscriptions",
+          },
+        ],
+      },
+      SetSetting: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    mount(daemon, true);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Turn on" })).toBeTruthy());
+    // Nothing pressed yet: nothing to report.
+    expect(screen.queryByRole("alert")).toBeNull();
+    click(screen.getByRole("button", { name: "Turn on" }));
+    const pending = await screen.findByRole("button", { name: "Turning on…" });
+    expect((pending as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => finish({}));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Turn on" })).toBeTruthy());
+
+    // The fake keeps answering "off", so the offer stays; the next press is refused.
+    const refusal = "The settings database is locked. Try again in a moment.";
+    daemon.answer("SetSetting", new BorgError(INVALID_ARGUMENT as never, refusal));
+    click(screen.getByRole("button", { name: "Turn on" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(refusal));
+  });
 });

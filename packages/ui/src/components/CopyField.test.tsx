@@ -41,19 +41,41 @@ describe("CopyField", () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     setClipboard({ writeText });
     render(<CopyField label="Key" value="bsk_live_123" secret />);
-    expect(screen.queryByText("bsk_live_123")).toBeNull();
+    const field = screen.getByLabelText("Key") as HTMLInputElement;
+    expect(field.type).toBe("password");
     await press(screen.getByRole("button", { name: "Copy key" }));
     expect(writeText).toHaveBeenCalledWith("bsk_live_123");
     fireEvent.click(screen.getByRole("button", { name: "Show key" }));
-    expect(screen.getByText("bsk_live_123")).toBeTruthy();
+    expect(field.type).toBe("text");
+    expect(field.value).toBe("bsk_live_123");
     fireEvent.click(screen.getByRole("button", { name: "Hide key" }));
-    expect(screen.queryByText("bsk_live_123")).toBeNull();
+    expect(field.type).toBe("password");
   });
 
-  it("shows a plain value as it is, with no Show button", () => {
+  it("lets the caller own Show, so one control can cover the key elsewhere too", () => {
+    const onShownChange = vi.fn();
+    const { rerender } = render(
+      <CopyField label="Key" value="k" secret shown={false} onShownChange={onShownChange} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show key" }));
+    expect(onShownChange).toHaveBeenCalledWith(true);
+    // Still hidden: the caller decides.
+    expect((screen.getByLabelText("Key") as HTMLInputElement).type).toBe("password");
+    rerender(<CopyField label="Key" value="k" secret shown onShownChange={onShownChange} />);
+    expect((screen.getByLabelText("Key") as HTMLInputElement).type).toBe("text");
+    fireEvent.click(screen.getByRole("button", { name: "Hide key" }));
+    expect(onShownChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("names the value by its label and shows a plain value as it is, with no Show button", () => {
     render(<CopyField label="URL" value="http://localhost:7860/v1/events/sub_1" />);
-    expect(screen.getByText("http://localhost:7860/v1/events/sub_1")).toBeTruthy();
+    const field = screen.getByRole("textbox", { name: "URL" }) as HTMLInputElement;
+    expect(field.value).toBe("http://localhost:7860/v1/events/sub_1");
+    expect(field.readOnly).toBe(true);
     expect(screen.queryByRole("button", { name: /Show/ })).toBeNull();
+    // Where the clipboard is missing, a click selects it all for copying by hand.
+    fireEvent.focus(field);
+    expect([field.selectionStart, field.selectionEnd]).toEqual([0, field.value.length]);
   });
 
   it("says it could not copy where there is no clipboard, instead of claiming it did", async () => {

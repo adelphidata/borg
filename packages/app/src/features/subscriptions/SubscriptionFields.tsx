@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { Pill, SECTION_LABEL, TEXT_FIELD } from "@borg/ui";
 import type { admin } from "@borg/client";
@@ -166,24 +166,43 @@ export function FilterEditor({
   const [more, setMore] = useState(false);
   const shown = fields.filter((f, i) => i < PRIMARY_FIELDS || more || isSet(draft[f]));
   const folded = fields.length - shown.length;
+  const rows = useRef(new Map<string, HTMLDivElement>());
+  /** The first condition the fold revealed; focus lands on it, not on <body>. */
+  const [reveal, setReveal] = useState<string>();
+  useEffect(() => {
+    if (!reveal) return;
+    rows.current.get(reveal)?.querySelector<HTMLElement>("input, select, button")?.focus();
+    setReveal(undefined);
+  }, [reveal]);
 
   return (
     <div className="flex flex-col gap-4">
       {shown.map((field) => (
-        <FilterField
+        <div
           key={field}
-          field={field}
-          kinds={preset.kinds}
-          value={draft[field]}
-          onChange={(value) => onChange({ ...draft, [field]: value })}
-        />
+          ref={(el) => {
+            if (el) rows.current.set(field, el);
+            else rows.current.delete(field);
+          }}
+        >
+          <FilterField
+            field={field}
+            kinds={preset.kinds}
+            value={draft[field]}
+            onChange={(value) => onChange({ ...draft, [field]: value })}
+          />
+        </div>
       ))}
+      {/* A one-way "show the rest": the button goes once pressed, so it is not
+          a toggle and carries no expanded state. */}
       {folded > 0 && (
         <button
           type="button"
-          aria-expanded={false}
           className={`${ROW_BUTTON} gap-2 p-0 text-[12px] leading-none text-ink2 hover:text-ink`}
-          onClick={() => setMore(true)}
+          onClick={() => {
+            setMore(true);
+            setReveal(fields.find((f) => !shown.includes(f)));
+          }}
         >
           <Chevron open={false} />
           More conditions
@@ -234,16 +253,43 @@ export function DeliveryPicker({
     channel !== "" && channel !== ORIGIN_DELIVERY
       ? { id: channel, label: channelLabel(channel) }
       : undefined;
+  const pick = (id: string) => onChange({ channel: id, target: id === channel ? target : "" });
   return (
     <div className="flex flex-col gap-3">
-      <div role="group" aria-label="Where it reports" className="flex flex-wrap gap-1.5">
+      {/* One choice of several: a radio group, so arrow keys move the choice
+          and Tab leaves the group, the way a native radio set behaves. */}
+      <div
+        role="radiogroup"
+        aria-label="Where it reports"
+        className="flex flex-wrap gap-1.5"
+        onKeyDown={(e) => {
+          const step =
+            e.key === "ArrowRight" || e.key === "ArrowDown"
+              ? 1
+              : e.key === "ArrowLeft" || e.key === "ArrowUp"
+                ? -1
+                : 0;
+          if (step === 0) return;
+          e.preventDefault();
+          const at = Math.max(
+            0,
+            options.findIndex((o) => o.id === channel),
+          );
+          const next = options[(at + step + options.length) % options.length]!;
+          pick(next.id);
+          const radios = e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]');
+          radios[options.indexOf(next)]?.focus();
+        }}
+      >
         {options.map((o) => (
           <Pill
             key={o.id || "here"}
-            aria-pressed={channel === o.id}
+            role="radio"
+            aria-checked={channel === o.id}
+            tabIndex={channel === o.id ? 0 : -1}
             variant={channel === o.id ? "primary" : "default"}
             sizeClasses="px-3 py-1.5 text-[11.5px]"
-            onClick={() => onChange({ channel: o.id, target: o.id === channel ? target : "" })}
+            onClick={() => pick(o.id)}
           >
             {o.label}
           </Pill>

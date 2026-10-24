@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes, useLocation } from "react-router-dom";
-import { BorgError } from "@borg/client";
+import { BorgError, GrpcStatus } from "@borg/client";
 import { INVALID_ARGUMENT, fakeDaemon, renderApp } from "../../test/harness";
 import { PUBLIC_URL, emitActivity, listing, subscription } from "../../test/subscriptions";
 import { clearNotice, pendingNotice } from "../../lib/notice";
 import { SubscriptionsSection } from "./SubscriptionsSection";
-import { TUNNEL_POLL_MS, useSubscriptions } from "./useSubscriptions";
+import { TEST_POLL_MS, TUNNEL_POLL_MS, useSubscriptions } from "./useSubscriptions";
 
 function Section() {
   return <SubscriptionsSection subs={useSubscriptions()} />;
@@ -111,15 +111,23 @@ describe("NewSubscription: picking and creating", () => {
     });
 
     // The same card now says what to paste where.
-    await waitFor(() => expect(screen.getByLabelText("URL").textContent).toBe(PUBLIC_URL));
-    expect(screen.queryByText(KEY)).toBeNull();
-    click(screen.getByRole("button", { name: "Show key" }));
-    expect(screen.getByLabelText("Key").textContent).toBe(KEY);
-    const steps = within(screen.getByRole("list", { name: "Set up Datadog" })).getAllByRole(
-      "listitem",
+    await waitFor(() =>
+      expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL),
     );
-    expect(steps).toHaveLength(2);
-    expect(steps[1]!.textContent).toContain(`Bearer ${KEY}`);
+    // Hidden until Show, in the field and in the steps alike.
+    const key = screen.getByLabelText("Key") as HTMLInputElement;
+    expect(key.type).toBe("password");
+    const stepTexts = () =>
+      within(screen.getByRole("list", { name: "Set up Datadog" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent ?? "");
+    expect(stepTexts()).toHaveLength(2);
+    expect(stepTexts().join(" ")).not.toContain(KEY);
+    expect(stepTexts()[1]).toContain("Bearer YOUR_KEY");
+    click(screen.getByRole("button", { name: "Show key" }));
+    expect(key.type).toBe("text");
+    expect(key.value).toBe(KEY);
+    expect(stepTexts()[1]).toContain(`Bearer ${KEY}`);
     expect(pendingNotice()?.message).toBe("Created “Datadog alerts”");
   });
 
@@ -187,12 +195,12 @@ describe("NewSubscription: picking and creating", () => {
     const daemon = fakeDaemon({ ...listing([]), CreateSubscription: created() });
     mount(daemon);
     await pick("Datadog");
-    const where = screen.getByRole("group", { name: "Where it reports" });
-    expect(within(where).queryByRole("button", { name: "Reply where it came from" })).toBeNull();
+    const where = screen.getByRole("radiogroup", { name: "Where it reports" });
+    expect(within(where).queryByRole("radio", { name: "Reply where it came from" })).toBeNull();
     expect(
-      within(where).getByRole("button", { name: "Only here" }).getAttribute("aria-pressed"),
+      within(where).getByRole("radio", { name: "Only here" }).getAttribute("aria-checked"),
     ).toBe("true");
-    click(within(where).getByRole("button", { name: "Telegram" }));
+    click(within(where).getByRole("radio", { name: "Telegram" }));
     type(screen.getByLabelText("Who gets it on Telegram"), " 12345 ");
     click(screen.getByRole("button", { name: "Create" }));
     await waitFor(() => expect(requestOf(daemon, "CreateSubscription")).toBeTruthy());
@@ -204,7 +212,7 @@ describe("NewSubscription: picking and creating", () => {
     click(screen.getByRole("button", { name: "Keep it paused" }));
     click(screen.getByText("Add subscription"));
     click(screen.getByRole("button", { name: /^Slack/ }));
-    expect(screen.getByRole("button", { name: "Reply where it came from" })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Reply where it came from" })).toBeTruthy();
   });
 
   it("offers only the channels that are set up on this machine", async () => {
@@ -215,10 +223,10 @@ describe("NewSubscription: picking and creating", () => {
     });
     mount(daemon);
     await pick("Datadog");
-    const where = screen.getByRole("group", { name: "Where it reports" });
-    expect(within(where).getByRole("button", { name: "Slack" })).toBeTruthy();
-    expect(within(where).queryByRole("button", { name: "Telegram" })).toBeNull();
-    expect(within(where).queryByRole("button", { name: "Discord" })).toBeNull();
+    const where = screen.getByRole("radiogroup", { name: "Where it reports" });
+    expect(within(where).getByRole("radio", { name: "Slack" })).toBeTruthy();
+    expect(within(where).queryByRole("radio", { name: "Telegram" })).toBeNull();
+    expect(within(where).queryByRole("radio", { name: "Discord" })).toBeNull();
   });
 
   it("sends a changed name, and the preset's own name as empty", async () => {
@@ -297,17 +305,21 @@ describe("NewSubscription: the Connect card", () => {
     await pick("Datadog");
     click(screen.getByRole("button", { name: "Create" }));
     await waitFor(() => expect(screen.getByText(hint)).toBeTruthy());
-    expect(screen.getByLabelText("URL").textContent).toBe(local);
+    expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(local);
 
     click(screen.getByRole("button", { name: "Turn on" }));
-    await waitFor(() => expect(screen.getByLabelText("URL").textContent).toBe(PUBLIC_URL));
+    await waitFor(() =>
+      expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL),
+    );
     expect(daemon.calls.some((c) => c.method === "TunnelStart")).toBe(true);
     expect(screen.queryByText(hint)).toBeNull();
-    // The re-read masks the key; the one this card holds goes back into the steps.
-    const steps = within(screen.getByRole("list", { name: "Set up Datadog" })).getAllByRole(
-      "listitem",
-    );
-    expect(steps[1]!.textContent).toContain(`Bearer ${KEY}`);
+    // The re-read masks the key; the one this card holds goes back in on Show.
+    const second = () =>
+      within(screen.getByRole("list", { name: "Set up Datadog" })).getAllByRole("listitem")[1]!
+        .textContent;
+    expect(second()).toContain("Bearer YOUR_KEY");
+    click(screen.getByRole("button", { name: "Show key" }));
+    expect(second()).toContain(`Bearer ${KEY}`);
   });
 
   it("waits for a tunnel that is still coming up", async () => {
@@ -338,7 +350,9 @@ describe("NewSubscription: the Connect card", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(TUNNEL_POLL_MS * 2);
     });
-    await waitFor(() => expect(screen.getByLabelText("URL").textContent).toBe(PUBLIC_URL));
+    await waitFor(() =>
+      expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL),
+    );
     expect(status).toHaveBeenCalledTimes(2);
   });
 
@@ -464,5 +478,143 @@ describe("NewSubscription: the Connect card", () => {
     click(screen.getByRole("button", { name: "Enable" }));
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(refusal));
     expect(screen.getByLabelText("URL")).toBeTruthy();
+  });
+});
+
+describe("NewSubscription: staying put through trouble", () => {
+  it("keeps the Connect card and its one-time key when a re-read fails", async () => {
+    const daemon = fakeDaemon({ ...listing([]), CreateSubscription: created() });
+    mount(daemon);
+    await pick("Datadog");
+    click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(screen.getByLabelText("Key")).toBeTruthy());
+
+    // borgd restarts; the next re-read fails.
+    daemon.answer("ListSubscriptions", new BorgError(GrpcStatus.Unavailable, "down"));
+    emitActivity(daemon, { subscriptionId: "sub_other", kind: "finished" });
+    await waitFor(() =>
+      expect(screen.getByText("Could not load your subscriptions.")).toBeTruthy(),
+    );
+
+    // The card, and the key the daemon will not show in clear again, are still there.
+    expect((screen.getByLabelText("Key") as HTMLInputElement).value).toBe(KEY);
+    expect((screen.getByLabelText("URL") as HTMLInputElement).value).toBe(PUBLIC_URL);
+    expect(screen.getByText("Listening for the first event…")).toBeTruthy();
+  });
+
+  it("does not re-read on a reconnect attempt, only on a frame", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const daemon = fakeDaemon(listing([]));
+    mount(daemon);
+    await waitFor(() => expect(screen.getByText("Add subscription")).toBeTruthy());
+    const reads = () => daemon.calls.filter((c) => c.method === "ListSubscriptions").length;
+    const before = reads();
+
+    const first = daemon.streams.filter((s) => s.method === "SubscribeSubscriptionActivity");
+    act(() => first.at(-1)!.handlers.onError?.(new BorgError(GrpcStatus.Unavailable, "down")));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000);
+    });
+    // It dialled again, and asking the daemon for the list was not part of that.
+    expect(
+      daemon.streams.filter((s) => s.method === "SubscribeSubscriptionActivity").length,
+    ).toBeGreaterThan(first.length);
+    expect(reads()).toBe(before);
+
+    emitActivity(daemon, { subscriptionId: "sub_1", kind: "received" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(reads()).toBe(before + 1);
+  });
+
+  it("ends Running… from a re-read when the stream missed the finished frame", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const daemon = fakeDaemon({
+      ...listing([]),
+      CreateSubscription: created(),
+      TestSubscription: { id: "evt_t", kind: "test", status: "pending" },
+      ListSubscriptionEvents: { events: [{ id: "evt_t", kind: "test", status: "pending" }] },
+    });
+    mount(daemon);
+    await pick("Datadog");
+    click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(screen.getByLabelText("URL")).toBeTruthy());
+    click(screen.getByRole("button", { name: "Send a test event" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Running…" })).toBeTruthy());
+
+    // Still running at the first look; done at the next. No frame ever arrives.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TEST_POLL_MS);
+    });
+    expect(screen.getByRole("button", { name: "Running…" })).toBeTruthy();
+    daemon.answer("ListSubscriptionEvents", {
+      events: [{ id: "evt_t", kind: "test", status: "succeeded" }],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(TEST_POLL_MS);
+    });
+    await waitFor(() => expect(screen.getByText(/Test finished/)).toBeTruthy());
+    expect(requestOf(daemon, "ListSubscriptionEvents")).toEqual({ id: "sub_1", limit: 20 });
+  });
+
+  it("says so when the address cannot be re-read after the tunnel starts", async () => {
+    const daemon = fakeDaemon({
+      ...listing([]),
+      CreateSubscription: created({
+        endpoint: { url: "http://localhost:7860/v1/events/sub_1", public: false, hint: "local" },
+      }),
+      TunnelStart: { provider: "cloudflare", running: true, publicUrl: "https://t", error: "" },
+      GetSubscription: new BorgError(GrpcStatus.Unavailable, "Borg is restarting"),
+    });
+    mount(daemon);
+    await pick("Datadog");
+    click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(screen.getByText("local")).toBeTruthy());
+    click(screen.getByRole("button", { name: "Turn on" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Could not read the new address: Borg is restarting",
+      ),
+    );
+  });
+});
+
+describe("NewSubscription: keyboard and screen readers", () => {
+  it("moves the single delivery choice with the arrow keys, one tab stop for the group", async () => {
+    mount(fakeDaemon(listing([])));
+    await pick("Datadog");
+    const where = screen.getByRole("radiogroup", { name: "Where it reports" });
+    const radios = within(where).getAllByRole("radio");
+    expect(radios.map((r) => r.tabIndex)).toEqual([0, -1, -1, -1]);
+    act(() => radios[0]!.focus());
+    fireEvent.keyDown(radios[0]!, { key: "ArrowRight" });
+    const slack = within(where).getByRole("radio", { name: "Slack" });
+    expect(slack.getAttribute("aria-checked")).toBe("true");
+    expect(document.activeElement).toBe(slack);
+    expect(screen.getByLabelText("Who gets it on Slack")).toBeTruthy();
+    // Back past the start wraps to the end.
+    fireEvent.keyDown(slack, { key: "ArrowLeft" });
+    fireEvent.keyDown(within(where).getByRole("radio", { name: "Only here" }), {
+      key: "ArrowUp",
+    });
+    expect(within(where).getByRole("radio", { name: "Discord" }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+    // Other keys are left alone.
+    fireEvent.keyDown(within(where).getByRole("radio", { name: "Discord" }), { key: "a" });
+    expect(within(where).getByRole("radio", { name: "Discord" }).getAttribute("aria-checked")).toBe(
+      "true",
+    );
+  });
+
+  it("puts focus on the first condition More conditions reveals", async () => {
+    mount(fakeDaemon(listing([])));
+    await pick("GitHub");
+    const more = screen.getByRole("button", { name: "More conditions" });
+    expect(more.hasAttribute("aria-expanded")).toBe(false);
+    act(() => more.focus());
+    click(more);
+    expect(document.activeElement).toBe(screen.getByLabelText("Branch"));
   });
 });

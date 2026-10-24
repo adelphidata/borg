@@ -1,5 +1,5 @@
 import type { BannerAlert } from "@borg/ui";
-import type { admin } from "@borg/client";
+import { BorgError, GrpcStatus, type admin } from "@borg/client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { plural } from "../../lib/format";
 import {
@@ -37,6 +37,51 @@ export function stepsWithKey(steps: readonly string[], key: string, placeholder:
   return key === "" || placeholder === ""
     ? [...steps]
     : steps.map((s) => s.split(placeholder).join(key));
+}
+
+/**
+ * Steps that carry `key` in clear (right after create), with the key swapped
+ * back to the daemon's placeholder — for while the key itself is hidden.
+ */
+export function stepsWithoutKey(
+  steps: readonly string[],
+  key: string,
+  placeholder: string,
+): string[] {
+  return key === "" ? [...steps] : steps.map((s) => s.split(key).join(placeholder || "••••"));
+}
+
+/** Event statuses after which nothing more happens to the event. */
+export const SETTLED_EVENT: ReadonlySet<string> = new Set([
+  "succeeded",
+  "failed",
+  "skipped",
+  "silent",
+]);
+
+/** How often a screen re-reads while a test event it sent is still running. */
+export const TEST_POLL_MS = 3_000;
+/** Re-reads before the wait ends on its own, about two minutes. */
+export const TEST_POLL_LIMIT = 40;
+
+/**
+ * Calls `tick` every {@link TEST_POLL_MS} while `active`, at most
+ * {@link TEST_POLL_LIMIT} times. The live stream normally ends a wait; this is
+ * what ends it when the stream dropped the frame.
+ */
+export function usePollWhile(active: boolean, tick: () => void): void {
+  const tickRef = useRef(tick);
+  tickRef.current = tick;
+  useEffect(() => {
+    if (!active) return;
+    let left = TEST_POLL_LIMIT;
+    const id = setInterval(() => {
+      tickRef.current();
+      left -= 1;
+      if (left <= 0) clearInterval(id);
+    }, TEST_POLL_MS);
+    return () => clearInterval(id);
+  }, [active]);
 }
 
 /** True for a source that has an address a service posts to. */
@@ -225,8 +270,13 @@ export const ACTIVITY_REFRESH_MS = 250;
 
 /**
  * Counts the live activity per subscription and calls `refresh` once a burst
- * of frames has passed. A reconnect re-reads too: whatever happened while the
- * stream was down is in the rows, not in the frames.
+ * of frames has passed.
+ *
+ * A reconnect attempt is not a reason to re-read: the stream reports "open"
+ * the moment it subscribes, before the daemon has answered, so re-reading
+ * then asks a daemon that may still be down — and the failed read would
+ * replace the screen with an outage notice. The first frame after a
+ * reconnect re-reads like any other frame.
  */
 export function useSubscriptionActivity(
   refresh: () => void,
@@ -245,7 +295,7 @@ export function useSubscriptionActivity(
     timer.current = setTimeout(() => refreshRef.current(), ACTIVITY_REFRESH_MS);
   }, []);
 
-  const stream = useRetryingServerStream<admin.SubscriptionActivityEvent>(
+  useRetryingServerStream<admin.SubscriptionActivityEvent>(
     (borg, handlers) => borg.admin.subscribeSubscriptionActivity({}, handlers),
     (event) => {
       if (!matchesRef.current(event.subscriptionId)) return;
@@ -262,14 +312,6 @@ export function useSubscriptionActivity(
       schedule();
     },
   );
-
-  // The first open is the mount, which has just read; only a re-open is news.
-  const wasOpen = useRef(true);
-  useEffect(() => {
-    const open = stream.status === "open";
-    if (open && !wasOpen.current) schedule();
-    wasOpen.current = open;
-  }, [stream.status, schedule]);
 
   return heard;
 }
@@ -312,6 +354,12 @@ export interface SubscriptionsData {
 
 export interface Subscriptions extends SubscriptionWrites {
   query: QueryResult<SubscriptionsData>;
+  /**
+   * The last answer that arrived. A read that fails later (a daemon restart)
+   * turns `query` into an error, but a card holding a key shown only once
+   * must keep standing on this.
+   */
+  last: SubscriptionsData | undefined;
   activity: Activity;
 }
 
@@ -329,15 +377,18 @@ export function useSubscriptions(deps: unknown[] = []): Subscriptions {
       keyPlaceholder: presets.keyPlaceholder ?? "",
     };
   }, deps);
+  const last = useRef<SubscriptionsData>(undefined);
+  if (query.state === "ready") last.current = query.data;
   const activity = useSubscriptionActivity(query.refetch);
-  return { query, activity, ...useSubscriptionWrites(query.refetch) };
+  return { query, last: last.current, activity, ...useSubscriptionWrites(query.refetch) };
 }
 
 export interface SubscriptionDetailData {
   detail: admin.SubscriptionDetail;
-  sub: admin.Subscription | undefined;
+  sub: admin.Subscription;
   preset: admin.SubscriptionPreset | undefined;
   deliveryChannels: string[];
+  keyPlaceholder: string;
 }
 
 export interface SubscriptionView extends SubscriptionWrites {
@@ -354,11 +405,15 @@ export function useSubscription(id: string): SubscriptionView {
         borg.admin.listSubscriptionPresets({}),
       ]);
       const sub = detail.subscription;
+      // The daemon answers NotFound for a missing row; an empty answer means
+      // the same, so the page has one "gone" path rather than two.
+      if (!sub) throw new BorgError(GrpcStatus.NotFound, "That subscription no longer exists.");
       return {
         detail,
         sub,
-        preset: presets.presets.find((p) => p.id === sub?.provider),
+        preset: presets.presets.find((p) => p.id === sub.provider),
         deliveryChannels: presets.deliveryChannels ?? [],
+        keyPlaceholder: presets.keyPlaceholder ?? "",
       };
     },
     [id],

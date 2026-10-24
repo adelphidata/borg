@@ -18,7 +18,7 @@ import {
   useIsMobile,
   type DotTone,
 } from "@borg/ui";
-import type { admin } from "@borg/client";
+import { GrpcStatus, type admin } from "@borg/client";
 import { Chevron, ROW_BUTTON } from "../../components/CategoryFold";
 import { DaemonState } from "../../components/DaemonState";
 import { formatElapsed } from "../../lib/format";
@@ -40,16 +40,16 @@ import {
   filterDraftOf,
   filterJsonOf,
   hasEndpoint,
+  SETTLED_EVENT,
+  stepsWithoutKey,
   toneOf,
+  usePollWhile,
   useSubscription,
   useTunnel,
   wordsOf,
   type FilterDraft,
   type SubscriptionView,
 } from "./useSubscriptions";
-
-/** Event statuses after which nothing more happens to the event. */
-const SETTLED = new Set(["succeeded", "failed", "skipped", "silent"]);
 
 const EVENT_WORDS: Record<string, string> = {
   pending: "Waiting",
@@ -117,6 +117,7 @@ function Editable({
   dirty,
   saving,
   error,
+  invalid,
   onSave,
   onDiscard,
   children,
@@ -125,6 +126,8 @@ function Editable({
   dirty: boolean;
   saving: boolean;
   error: string | undefined;
+  /** Why the typed value cannot be saved; Save stays off while it is set. */
+  invalid?: string;
   onSave: () => void;
   onDiscard: () => void;
   children: ReactNode;
@@ -138,18 +141,19 @@ function Editable({
             {error}
           </div>
         )}
+        {dirty && invalid && <div className={HELP_LINE}>{invalid}</div>}
         {dirty && (
           <div className="flex gap-2">
             <Pill
               square
               variant="primary"
-              disabled={saving}
+              disabled={saving || invalid !== undefined}
               onClick={onSave}
               aria-label={`Save ${label.toLowerCase()}`}
             >
               {saving ? "Saving…" : "Save"}
             </Pill>
-            <Pill square onClick={onDiscard}>
+            <Pill square onClick={onDiscard} aria-label={`Discard ${label.toLowerCase()}`}>
               Discard
             </Pill>
           </div>
@@ -228,19 +232,36 @@ function EndpointSection({
   sub,
   preset,
   steps,
+  placeholder,
   view,
+  secret,
 }: {
   sub: admin.Subscription;
   preset: admin.SubscriptionPreset | undefined;
+  /** As the daemon reads them: the key masked. */
   steps: string[];
+  placeholder: string;
   view: SubscriptionView;
+  /** The signing secret's own save, so another section's refusal is not said here. */
+  secret: {
+    pending: boolean;
+    error: string | undefined;
+    save: (secret: string) => Promise<boolean>;
+  };
 }) {
   const label = preset?.label ?? sub.provider;
   const [shown, setShown] = useState<admin.SubscriptionKey>();
+  // One Show for the key and the steps that carry it.
+  const [keyShown, setKeyShown] = useState(false);
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [howTo, setHowTo] = useState(false);
   const tunnel = useTunnel(view.query.refetch);
-  const { reveal, rotate, update } = view;
+  const { reveal, rotate } = view;
+  const currentSteps = !shown
+    ? steps
+    : keyShown
+      ? shown.senderSteps
+      : stepsWithoutKey(shown.senderSteps, shown.key, placeholder);
   const keyError = (reveal.error ?? rotate.error)?.message;
 
   const replace = (
@@ -254,7 +275,14 @@ function EndpointSection({
       <div className="flex flex-col gap-4">
         <CopyField label="URL" value={sub.endpoint?.url ?? ""} />
         {shown ? (
-          <CopyField label="Key" value={shown.key} secret actions={replace} />
+          <CopyField
+            label="Key"
+            value={shown.key}
+            secret
+            shown={keyShown}
+            onShownChange={setKeyShown}
+            actions={replace}
+          />
         ) : (
           <div>
             <div className={SECTION_LABEL}>Key</div>
@@ -265,7 +293,14 @@ function EndpointSection({
               <Pill
                 square
                 disabled={reveal.pending}
-                onClick={() => void reveal.run(sub.id).then((k) => k && setShown(k))}
+                onClick={() =>
+                  void reveal.run(sub.id).then((k) => {
+                    if (!k) return;
+                    // Asked for in so many words: show it, and Hide covers both.
+                    setShown(k);
+                    setKeyShown(true);
+                  })
+                }
               >
                 {reveal.pending ? "Revealing…" : "Reveal key"}
               </Pill>
@@ -289,6 +324,7 @@ function EndpointSection({
                 void rotate.run(sub.id).then((k) => {
                   if (!k) return;
                   setShown(k);
+                  setKeyShown(false);
                   setHowTo(true);
                   showNotice(`Key replaced. Paste the new one into ${label}.`);
                 });
@@ -304,7 +340,7 @@ function EndpointSection({
           </div>
         )}
         <Reachability endpoint={sub.endpoint} tunnel={tunnel} />
-        {(shown?.senderSteps ?? steps).length > 0 && (
+        {currentSteps.length > 0 && (
           <div>
             <button
               type="button"
@@ -317,7 +353,7 @@ function EndpointSection({
             </button>
             {howTo && (
               <div className="mt-3">
-                <StepList steps={shown?.senderSteps ?? steps} label={`Set up ${label}`} />
+                <StepList steps={currentSteps} label={`Set up ${label}`} />
               </div>
             )}
           </div>
@@ -326,13 +362,9 @@ function EndpointSection({
           <SigningSecretField
             provider={label}
             saved={sub.hasSigningSecret}
-            pending={update.pending}
-            error={update.error?.message}
-            onSave={(secret) =>
-              update
-                .run(changeOf(sub.id, { setSigningSecret: true, signingSecret: secret }))
-                .then((stored) => stored !== undefined)
-            }
+            pending={secret.pending}
+            error={secret.error}
+            onSave={secret.save}
           />
         )}
       </div>
@@ -340,10 +372,16 @@ function EndpointSection({
   );
 }
 
-/** A typed count, or 0 ("leave it alone") for anything that is not a positive number. */
-function countOf(text: string): number {
-  const n = Number.parseInt(text, 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
+/**
+ * A typed count, or undefined for anything that is not a whole number above
+ * zero. The daemon reads 0 as "leave it alone", so a 0 must never be sent as
+ * if it were a value.
+ */
+function countOf(text: string): number | undefined {
+  const t = text.trim();
+  if (!/^[0-9]+$/.test(t)) return undefined;
+  const n = Number.parseInt(t, 10);
+  return n > 0 ? n : undefined;
 }
 
 function Advanced({
@@ -352,26 +390,32 @@ function Advanced({
   saving,
   error,
   onSave,
+  nameSaving,
+  nameError,
+  onSaveName,
 }: {
   sub: admin.Subscription;
   runsToday: number;
   saving: boolean;
   error: string | undefined;
   onSave: (change: admin.SubscriptionChange, settle: () => void) => void;
+  nameSaving: boolean;
+  nameError: string | undefined;
+  onSaveName: (change: admin.SubscriptionChange, settle: () => void) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const name = useDraft(sub.name);
   const limits = useDraft({
     rate: String(sub.rateLimitPerHour),
     timeout: String(sub.timeoutSecs),
   });
-  const save = () =>
-    onSave(
-      changeOf(sub.id, {
-        rateLimitPerHour: countOf(limits.draft.rate),
-        timeoutSecs: countOf(limits.draft.timeout),
-      }),
-      limits.settle,
-    );
+  const rate = countOf(limits.draft.rate);
+  const timeout = countOf(limits.draft.timeout);
+  const limitsInvalid = rate === undefined || timeout === undefined;
+  const save = () => {
+    if (rate === undefined || timeout === undefined) return;
+    onSave(changeOf(sub.id, { rateLimitPerHour: rate, timeoutSecs: timeout }), limits.settle);
+  };
   return (
     <section>
       <button
@@ -385,6 +429,23 @@ function Advanced({
       </button>
       {open && (
         <div className="mt-4 flex flex-col gap-4">
+          {/* Here as well as the page title: a phone has no title bar to rename from. */}
+          <Editable
+            label="Name"
+            dirty={name.dirty}
+            saving={nameSaving}
+            error={nameError}
+            invalid={name.draft.trim() === "" ? "A name cannot be empty." : undefined}
+            onDiscard={name.discard}
+            onSave={() => onSaveName(changeOf(sub.id, { name: name.draft.trim() }), name.settle)}
+          >
+            <input
+              aria-label="Name"
+              className={`${TEXT_FIELD} w-full`}
+              value={name.draft}
+              onChange={(e) => name.set(e.target.value)}
+            />
+          </Editable>
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-2">
               <span className="text-[12px] leading-none text-ink2">Runs per hour, at most</span>
@@ -412,12 +473,15 @@ function Advanced({
               {error}
             </div>
           )}
+          {limits.dirty && limitsInvalid && (
+            <div className={HELP_LINE}>Use whole numbers above zero.</div>
+          )}
           {limits.dirty && (
             <div className="flex gap-2">
-              <Pill square variant="primary" disabled={saving} onClick={save}>
+              <Pill square variant="primary" disabled={saving || limitsInvalid} onClick={save}>
                 {saving ? "Saving…" : "Save limits"}
               </Pill>
-              <Pill square onClick={limits.discard}>
+              <Pill square onClick={limits.discard} aria-label="Discard limits">
                 Discard
               </Pill>
             </div>
@@ -439,6 +503,7 @@ function Detail({
   sub,
   preset,
   channels,
+  placeholder,
   view,
   renameError,
 }: {
@@ -447,6 +512,8 @@ function Detail({
   preset: admin.SubscriptionPreset | undefined;
   /** Delivery channels set up on this machine. */
   channels: readonly string[];
+  /** What the daemon writes in the steps in place of the key. */
+  placeholder: string;
   view: SubscriptionView;
   /** Why the last rename from the page title was refused. */
   renameError: string | undefined;
@@ -463,7 +530,10 @@ function Detail({
 
   const write = (section: string, change: admin.SubscriptionChange, settle: () => void) => {
     setEditing(section);
-    void update.run(change).then((stored) => stored && settle());
+    return update.run(change).then((stored) => {
+      if (stored) settle();
+      return stored !== undefined;
+    });
   };
   const sectionError = (section: string) =>
     editing === section ? update.error?.message : undefined;
@@ -479,7 +549,10 @@ function Detail({
     test.pending ||
     (testRun !== undefined &&
       view.activity.finished <= testRun.finishedBefore &&
-      !(testEvent && SETTLED.has(testEvent.status)));
+      !(testEvent && SETTLED_EVENT.has(testEvent.status)));
+  // The finished frame normally ends the wait; a re-read ends it if the
+  // stream dropped that frame.
+  usePollWhile(testing && !test.pending, view.query.refetch);
   const runs = runsOf(detail.events);
   const label = preset?.label ?? sub.provider;
   const headerError = renameError ?? (setActive.error ?? test.error ?? remove.error)?.message;
@@ -591,9 +664,14 @@ function Detail({
         dirty={instruction.dirty}
         saving={update.pending && editing === "instruction"}
         error={sectionError("instruction")}
+        invalid={
+          instruction.draft.trim() === ""
+            ? "An instruction cannot be empty. Discard to keep the one it has."
+            : undefined
+        }
         onDiscard={instruction.discard}
         onSave={() =>
-          write(
+          void write(
             "instruction",
             changeOf(sub.id, { instruction: instruction.draft.trim() }),
             instruction.settle,
@@ -617,7 +695,7 @@ function Detail({
           error={sectionError("when")}
           onDiscard={filter.discard}
           onSave={() =>
-            write(
+            void write(
               "when",
               changeOf(sub.id, { filterJson: filterJsonOf(filter.draft, preset.filterFields) }),
               filter.settle,
@@ -635,7 +713,7 @@ function Detail({
         error={sectionError("delivery")}
         onDiscard={delivery.discard}
         onSave={() =>
-          write(
+          void write(
             "delivery",
             changeOf(sub.id, {
               setDelivery: true,
@@ -656,7 +734,23 @@ function Detail({
       </Editable>
 
       {hasEndpoint(sub) && (
-        <EndpointSection sub={sub} preset={preset} steps={detail.senderSteps} view={view} />
+        <EndpointSection
+          sub={sub}
+          preset={preset}
+          steps={detail.senderSteps}
+          placeholder={placeholder}
+          view={view}
+          secret={{
+            pending: update.pending && editing === "secret",
+            error: sectionError("secret"),
+            save: (secret) =>
+              write(
+                "secret",
+                changeOf(sub.id, { setSigningSecret: true, signingSecret: secret }),
+                () => {},
+              ),
+          }}
+        />
       )}
 
       <Block label="Recent events">
@@ -678,7 +772,10 @@ function Detail({
         runsToday={detail.runsToday}
         saving={update.pending && editing === "limits"}
         error={sectionError("limits")}
-        onSave={(change, settle) => write("limits", change, settle)}
+        onSave={(change, settle) => void write("limits", change, settle)}
+        nameSaving={update.pending && editing === "name"}
+        nameError={sectionError("name")}
+        onSaveName={(change, settle) => void write("name", change, settle)}
       />
     </>
   );
@@ -686,8 +783,14 @@ function Detail({
 
 /** One subscription: what it listens for, what Borg does, and what has happened. */
 export function SubscriptionDetailPage() {
-  const isMobile = useIsMobile();
   const { id = "" } = useParams();
+  // Keyed by id: going from one subscription to another must not carry the
+  // first one's revealed key, typed drafts or pending test over.
+  return <SubscriptionPage key={id} id={id} />;
+}
+
+function SubscriptionPage({ id }: { id: string }) {
+  const isMobile = useIsMobile();
   const view = useSubscription(id);
   const { query } = view;
   const sub = query.state === "ready" ? query.data.sub : undefined;
@@ -705,24 +808,26 @@ export function SubscriptionDetailPage() {
       <div className={scrollCol(isMobile, "px-[38px] py-[34px]")}>
         <div className={DETAIL_COL}>
           <BackLink to="/connections" label="Connections" />
-          <DaemonState query={query} label="this subscription">
-            {(data) =>
-              data.sub ? (
+          {/* Deleted elsewhere, or an old link: not an outage, so no red box. */}
+          {query.state === "error" && query.error.code === GrpcStatus.NotFound ? (
+            <div className="text-[13.5px] leading-[1.6] text-ink3">
+              This subscription no longer exists.
+            </div>
+          ) : (
+            <DaemonState query={query} label="this subscription">
+              {(data) => (
                 <Detail
                   detail={data.detail}
                   sub={data.sub}
                   preset={data.preset}
                   channels={data.deliveryChannels}
+                  placeholder={data.keyPlaceholder}
                   view={view}
                   renameError={rename.error?.message}
                 />
-              ) : (
-                <div className="text-[13.5px] leading-[1.6] text-ink3">
-                  This subscription no longer exists.
-                </div>
-              )
-            }
-          </DaemonState>
+              )}
+            </DaemonState>
+          )}
         </div>
       </div>
     </PageChrome>
