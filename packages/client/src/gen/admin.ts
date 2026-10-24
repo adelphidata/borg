@@ -1573,6 +1573,13 @@ export interface SubscriptionPreset {
 
 export interface SubscriptionPresetList {
   presets: SubscriptionPreset[];
+  /**
+   * Channels a run's report can go to on this machine: the ones delivery
+   * supports that also have their credential set.
+   */
+  deliveryChannels: string[];
+  /** The text setup steps carry in place of a key that is no longer shown. */
+  keyPlaceholder: string;
 }
 
 export interface SubscriptionEndpoint {
@@ -18250,13 +18257,19 @@ export const SubscriptionPreset: MessageFns<SubscriptionPreset> = {
 };
 
 function createBaseSubscriptionPresetList(): SubscriptionPresetList {
-  return { presets: [] };
+  return { presets: [], deliveryChannels: [], keyPlaceholder: "" };
 }
 
 export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
   encode(message: SubscriptionPresetList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     for (const v of message.presets) {
       SubscriptionPreset.encode(v!, writer.uint32(10).fork()).join();
+    }
+    for (const v of message.deliveryChannels) {
+      writer.uint32(18).string(v!);
+    }
+    if (message.keyPlaceholder !== "") {
+      writer.uint32(26).string(message.keyPlaceholder);
     }
     return writer;
   },
@@ -18282,6 +18295,22 @@ export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
             message.presets.push(SubscriptionPreset.decode(reader, reader.uint32()));
             continue;
           }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.deliveryChannels.push(reader.string());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.keyPlaceholder = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -18299,6 +18328,16 @@ export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
       presets: globalThis.Array.isArray(object?.presets)
         ? object.presets.map((e: any) => SubscriptionPreset.fromJSON(e))
         : [],
+      deliveryChannels: globalThis.Array.isArray(object?.deliveryChannels)
+        ? object.deliveryChannels.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.delivery_channels)
+        ? object.delivery_channels.map((e: any) => globalThis.String(e))
+        : [],
+      keyPlaceholder: isSet(object.keyPlaceholder)
+        ? globalThis.String(object.keyPlaceholder)
+        : isSet(object.key_placeholder)
+        ? globalThis.String(object.key_placeholder)
+        : "",
     };
   },
 
@@ -18306,6 +18345,12 @@ export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
     const obj: any = {};
     if (message.presets?.length) {
       obj.presets = message.presets.map((e) => SubscriptionPreset.toJSON(e));
+    }
+    if (message.deliveryChannels?.length) {
+      obj.deliveryChannels = message.deliveryChannels;
+    }
+    if (message.keyPlaceholder !== "") {
+      obj.keyPlaceholder = message.keyPlaceholder;
     }
     return obj;
   },
@@ -18316,6 +18361,8 @@ export const SubscriptionPresetList: MessageFns<SubscriptionPresetList> = {
   fromPartial<I extends Exact<DeepPartial<SubscriptionPresetList>, I>>(object: I): SubscriptionPresetList {
     const message = createBaseSubscriptionPresetList();
     message.presets = object.presets?.map((e) => SubscriptionPreset.fromPartial(e)) || [];
+    message.deliveryChannels = object.deliveryChannels?.map((e) => e) || [];
+    message.keyPlaceholder = object.keyPlaceholder ?? "";
     return message;
   },
 };

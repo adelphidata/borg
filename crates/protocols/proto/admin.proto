@@ -1384,7 +1384,14 @@ message SubscriptionPreset {
   string default_instruction = 11;
   string sample_payload = 12;         // JSON, for previews and Test
 }
-message SubscriptionPresetList { repeated SubscriptionPreset presets = 1; }
+message SubscriptionPresetList {
+  repeated SubscriptionPreset presets = 1;
+  // Channels a run's report can go to on this machine: the ones delivery
+  // supports that also have their credential set.
+  repeated string delivery_channels = 2;
+  // The text setup steps carry in place of a key that is no longer shown.
+  string key_placeholder = 3;
+}
 
 message SubscriptionEndpoint {
   string url = 1;   // empty for sources without an endpoint

@@ -161,9 +161,23 @@ fn steps_with(row: &SubscriptionRow, config: &Config, key: &str) -> Vec<String> 
 }
 
 pub(super) async fn list_presets() -> Result<Response<SubscriptionPresetList>, TStatus> {
+    let (_, config) = open().await?;
     Ok(Response::new(SubscriptionPresetList {
         presets: presets::all().iter().map(preset_to_pb).collect(),
+        delivery_channels: deliverable(|env| config.resolve_credential_or_env(env).is_some()),
+        key_placeholder: manage::KEY_PLACEHOLDER.to_string(),
     }))
+}
+
+/// The delivery channels a send could succeed on: supported and with their
+/// credential set. Offering one without its credential makes a route that
+/// fails on every run.
+fn deliverable(has_credential: impl Fn(&str) -> bool) -> Vec<String> {
+    manage::DELIVERY_CHANNELS
+        .iter()
+        .filter(|c| crate::channel_delivery::precheck(c, &has_credential).is_ok())
+        .map(|c| (*c).to_string())
+        .collect()
 }
 
 pub(super) async fn list() -> Result<Response<SubscriptionList>, TStatus> {
@@ -407,6 +421,13 @@ mod tests {
 
     fn by_id(id: &str) -> Request<SubscriptionRef> {
         Request::new(SubscriptionRef { id: id.to_string() })
+    }
+
+    #[test]
+    fn only_channels_with_a_credential_are_offered_for_delivery() {
+        assert_eq!(deliverable(|env| env == "SLACK_BOT_TOKEN"), vec!["slack"]);
+        assert!(deliverable(|_| false).is_empty());
+        assert_eq!(deliverable(|_| true).len(), manage::DELIVERY_CHANNELS.len());
     }
 
     #[tokio::test]
