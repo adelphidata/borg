@@ -316,7 +316,8 @@ export function McpServerForm({
                 ["maxTools", "Tool cap", "32"],
               ] as const
             ).map(([key, label, placeholder]) => (
-              <div key={key}>
+              // Bottom-aligned, so a label that wraps keeps its field in line.
+              <div key={key} className="flex flex-col justify-end">
                 <label className={LABEL} htmlFor={`mcp-${key}`}>
                   {label}
                 </label>
