@@ -167,18 +167,18 @@ impl Dispatcher {
         while runs.len() < max {
             let now = chrono::Utc::now().timestamp();
             let today = db.subscription_runs_since(now - DAY_SECS).await?;
-            if today >= i64::from(config.subscriptions.max_runs_per_day) {
-                if now - *cap_logged_at >= 3600 {
-                    tracing::warn!(
-                        "subscriptions: {today} runs in the last day reached subscriptions.max_runs_per_day; events wait"
-                    );
-                    *cap_logged_at = now;
-                }
-                return Ok(());
+            // Past the daily cap only a test event runs: the user pressed
+            // Test to see what a run does, and that answer cannot wait a day.
+            let capped = today >= i64::from(config.subscriptions.max_runs_per_day);
+            if capped && now - *cap_logged_at >= 3600 {
+                tracing::warn!(
+                    "subscriptions: {today} runs in the last day reached subscriptions.max_runs_per_day; events wait"
+                );
+                *cap_logged_at = now;
             }
             let run_id = new_id(RUN_ID_PREFIX);
             let Some(lead) = db
-                .claim_next_subscription_event_except(&run_id, now, &busy)
+                .claim_next_subscription_event_except(&run_id, now, &busy, capped)
                 .await?
             else {
                 return Ok(());
@@ -770,12 +770,45 @@ mod tests {
         let running = start(host.clone(), config);
         assert!(eventually(|| host.turn_count() == 1).await);
         tokio::time::sleep(Duration::from_millis(600)).await;
-        stop(running).await;
         assert_eq!(host.turn_count(), 1, "the second run waits for tomorrow");
         let mut all = statuses(&db, &a).await;
         all.extend(statuses(&db, &b).await);
         all.sort();
         assert_eq!(all, vec!["pending", "succeeded"]);
+
+        // Test still answers past the cap, and the real event still waits.
+        let test = db
+            .insert_subscription_test_event(&b, "Test: b", "{}")
+            .await
+            .unwrap();
+        wake::poke();
+        assert!(
+            eventually(|| host.turn_count() == 2).await,
+            "a test runs past the daily cap"
+        );
+        let mut test_status = String::new();
+        for _ in 0..100 {
+            test_status = db
+                .get_subscription_event(&test.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if test_status != "pending" && test_status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop(running).await;
+        assert_eq!(test_status, "succeeded");
+        let mut all = statuses(&db, &a).await;
+        all.extend(statuses(&db, &b).await);
+        all.sort();
+        assert_eq!(
+            all,
+            vec!["pending", "succeeded", "succeeded"],
+            "the real event of b still waits for tomorrow"
+        );
     }
 
     #[tokio::test]

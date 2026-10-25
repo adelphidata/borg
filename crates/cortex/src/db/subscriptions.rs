@@ -731,30 +731,33 @@ impl Database {
         run_id: &str,
         now: i64,
     ) -> Result<Option<SubscriptionEventRow>> {
-        self.claim_next_subscription_event_except(run_id, now, &[])
+        self.claim_next_subscription_event_except(run_id, now, &[], false)
             .await
     }
 
     /// [`Self::claim_next_subscription_event`], passing over the
     /// subscriptions in `skip` (their session is busy), so one subscription
-    /// the user is chatting in does not hold up the others.
+    /// the user is chatting in does not hold up the others. With
+    /// `tests_only`, only a test event is claimed: the daily cap holds the
+    /// real events back, and a test must still show what a run does.
     pub async fn claim_next_subscription_event_except(
         &self,
         run_id: &str,
         now: i64,
         skip: &[String],
+        tests_only: bool,
     ) -> Result<Option<SubscriptionEventRow>> {
         let skip = serde_json::to_string(skip).context("encode skip list")?;
         // Most passes find nothing (a run is in flight, the budget is spent).
         // Look first without the write lock, which every producer's insert
         // also needs, and take it only when there is something to claim.
-        if self.runnable_lead(now, &skip).await?.is_none() {
+        if self.runnable_lead(now, &skip, tests_only).await?.is_none() {
             return Ok(None);
         }
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = async {
             // Again under the lock: another claimer may have taken it.
-            let Some(id) = self.runnable_lead(now, &skip).await? else {
+            let Some(id) = self.runnable_lead(now, &skip, tests_only).await? else {
                 return anyhow::Ok(None);
             };
             self.conn
@@ -772,13 +775,19 @@ impl Database {
     }
 
     /// The id of the oldest runnable event, if any.
-    async fn runnable_lead(&self, now: i64, skip_json: &str) -> Result<Option<String>> {
+    async fn runnable_lead(
+        &self,
+        now: i64,
+        skip_json: &str,
+        tests_only: bool,
+    ) -> Result<Option<String>> {
         let mut rows = self
             .conn
             .query(
                 "SELECT e.id FROM subscription_events e \
                      JOIN subscriptions s ON s.id = e.subscription_id \
                      WHERE e.status = 'pending' AND (s.status = 'active' OR e.kind = 'test') \
+                     AND (?3 = 0 OR e.kind = 'test') \
                      AND NOT EXISTS (SELECT 1 FROM subscription_events r \
                          WHERE r.subscription_id = e.subscription_id AND r.status = 'running') \
                      AND (e.kind = 'test' OR \
@@ -788,7 +797,7 @@ impl Database {
                          < s.rate_limit_per_hour) \
                      AND e.subscription_id NOT IN (SELECT value FROM json_each(?2)) \
                      ORDER BY e.received_at, e.id LIMIT 1",
-                params!(now - 3600, skip_json),
+                params!(now - 3600, skip_json, i64::from(tests_only)),
             )
             .await?;
         Ok(match rows.next().await? {
@@ -1392,7 +1401,12 @@ mod tests {
             .await
             .unwrap();
         let lead = db
-            .claim_next_subscription_event_except("run_1", 100, std::slice::from_ref(&busy.id))
+            .claim_next_subscription_event_except(
+                "run_1",
+                100,
+                std::slice::from_ref(&busy.id),
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1854,6 +1868,44 @@ mod tests {
             .unwrap()
             .expect("a test runs even when the hour's budget is spent");
         assert_eq!(lead.kind.as_deref(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn a_tests_only_claim_passes_over_the_real_events_in_front_of_the_test() {
+        let db = Database::test_db().await;
+        let s = sub(&db, status::ACTIVE).await;
+        db.insert_subscription_event(&event(&s.id, Some("real"), 10), LIMITS)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_next_subscription_event_except("run_none", 5_000, &[], true)
+            .await
+            .unwrap()
+            .is_none());
+        let test = db
+            .insert_subscription_test_event(&s.id, "Test: x", "{}")
+            .await
+            .unwrap();
+        let lead = db
+            .claim_next_subscription_event_except("run_t", 5_000, &[], true)
+            .await
+            .unwrap()
+            .expect("the test is claimed");
+        assert_eq!(lead.id, test.id);
+        assert_eq!(
+            db.get_subscription_event(&lead.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        let real = db.list_subscription_events(&s.id, 10).await.unwrap();
+        assert!(
+            real.iter()
+                .any(|e| e.dedup_key.as_deref() == Some("real") && e.status == "pending"),
+            "the real event waits: {real:?}"
+        );
     }
 
     #[tokio::test]

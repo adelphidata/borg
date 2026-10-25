@@ -112,7 +112,7 @@ causes the events it listens to. In the order an event meets them:
 | Waiting events per subscription (later ones kept as "queue full", not run) | 200 | `subscriptions.max_pending` |
 | One run at a time per subscription; waiting events join it as a digest | up to 50 per run | — |
 | Runs per subscription per hour (events wait past it) | 60 | `subscriptions.default_rate_limit_per_hour`, per subscription |
-| Runs per day, all subscriptions (events wait past it) | 500 | `subscriptions.max_runs_per_day` |
+| Runs per day, all subscriptions (events wait past it; a *Test* still runs) | 500 | `subscriptions.max_runs_per_day` |
 | Runs at once, separate from scheduled tasks | 2 | `subscriptions.max_concurrent` |
 | Failure breaker: pause itself after this many failed runs in a row | 5 | `subscriptions.storm_failures` |
 | Tool steps per run, sub-agents included | 40 | `subscriptions.max_steps` |
