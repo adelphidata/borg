@@ -120,6 +120,11 @@ const THROTTLE_MARKERS: &[&str] = &[
 /// off (a throttle), as opposed to a genuine outage.
 const SLOW_DOWN_CODE: &str = "slow_down";
 
+/// Structured code a provider sends when the requested model id does not
+/// exist or the account cannot use it. Some providers send it with 400 or 403
+/// instead of 404, and some send it in a stream `error` frame.
+const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
 const RATE_LIMIT_NEEDLES: &[&str] = &[
     " 429 ",
     "(429)",
@@ -320,6 +325,11 @@ pub(super) fn body_indicates_billing_exhaustion(body: &str) -> bool {
 /// throttling this client, so it is a rate limit, not an outage.
 pub(super) fn body_indicates_slow_down(body: &str) -> bool {
     body_has_code(body, &[SLOW_DOWN_CODE], &[])
+}
+
+/// True when a body carries the `model_not_found` code, whatever its status.
+pub(super) fn body_indicates_model_not_found(body: &str) -> bool {
+    body_has_code(body, &[MODEL_NOT_FOUND_CODE], &[])
 }
 
 pub(super) fn body_indicates_context_overflow(body: &str) -> bool {

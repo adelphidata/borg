@@ -12,8 +12,9 @@ use classify::{
     body_indicates_billing_exhaustion, body_indicates_cloudflare_block,
     body_indicates_content_policy, body_indicates_context_overflow,
     body_indicates_expired_credential, body_indicates_image_unsupported,
-    body_indicates_malformed_tool_call, body_indicates_no_allowed_providers,
-    body_indicates_server_injected_param, body_indicates_slow_down, body_mentions_model,
+    body_indicates_malformed_tool_call, body_indicates_model_not_found,
+    body_indicates_no_allowed_providers, body_indicates_server_injected_param,
+    body_indicates_slow_down, body_mentions_model,
 };
 
 pub use classify::{affordable_max_tokens, classify_402, classify_error_text};
@@ -346,6 +347,20 @@ pub(crate) fn classify_stream_error_frame(data: &str, provider: &str) -> LlmErro
         return classify_status(status, data, provider);
     }
 
+    // Decided from the structured code, not from text: the shared text
+    // classifier also reads whole error strings, where the token can sit in
+    // an unrelated body.
+    if body_indicates_model_not_found(data) {
+        return LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} stream error (model not found): {}",
+                sanitize_body(data)
+            ),
+            reason: FailoverReason::ModelNotFound,
+            status: None,
+        };
+    }
+
     let message = frame["error"]["message"]
         .as_str()
         .or_else(|| frame["error"].as_str())
@@ -511,6 +526,15 @@ pub(crate) fn classify_status(
                 status: Some(status.as_u16()),
             }
         }
+        // The code is authoritative whatever status carries it: a 400 would
+        // otherwise read as `Format` and a 403 as `AuthPermanent`, so the
+        // turn would either retry a model id that never resolves or skip the
+        // fallback slot that runs a different model.
+        400 | 403 | 404 if body_indicates_model_not_found(body) => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned {status} (model not found): {safe}"),
+            reason: FailoverReason::ModelNotFound,
+            status: Some(status.as_u16()),
+        },
         403 if body_indicates_cloudflare_block(body) => {
             // A Cloudflare edge block (restricted region, flagged VPN/proxy, or
             // a WAF rule) is not a credential problem — rotating keys or trying
@@ -1556,6 +1580,55 @@ mod tests {
         // model slug went stale.
         assert!(err.is_fast_fail());
         assert!(err.should_fallback());
+    }
+
+    /// Spec: the `model_not_found` code decides the reason on 400, 403 and
+    /// 404 alike. A 400 must not read as `Format` and a 403 must not read as
+    /// `AuthPermanent`, which would skip the fallback slot.
+    #[test]
+    fn model_not_found_code_is_model_not_found_on_every_status() {
+        let body = r#"{"error":{"code":"model_not_found","message":"no access to gpt-x"}}"#;
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+        ] {
+            let err = classify_status(status, body, Provider::OpenAi);
+            assert_eq!(err.reason(), FailoverReason::ModelNotFound, "{status}");
+            assert!(err.is_fast_fail(), "{status}");
+            assert!(err.should_fallback(), "{status}");
+            assert_eq!(
+                classify_error_text(&err.to_string()),
+                Some(FailoverReason::ModelNotFound),
+                "{status}"
+            );
+        }
+    }
+
+    /// Spec: a different structured code keeps the status's own reason, so
+    /// prose that only names a model does not become `ModelNotFound`.
+    #[test]
+    fn other_codes_keep_their_status_reason() {
+        let body = r#"{"error":{"code":"invalid_value","message":"model_not_found is not a valid field"}}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::Format);
+        let err = classify_status(reqwest::StatusCode::FORBIDDEN, body, Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        // The rendered error keeps its marker's reason too.
+        assert_eq!(
+            classify_error_text(&err.to_string()),
+            Some(FailoverReason::AuthPermanent)
+        );
+    }
+
+    /// Spec: a stream `error` frame with no status and the code ends the
+    /// turn as `ModelNotFound`, not as a retryable `Unknown`.
+    #[test]
+    fn stream_error_frame_with_model_not_found_code_is_fatal() {
+        let frame = r#"{"error":{"code":"model_not_found","message":"The requested model does not exist."}}"#;
+        let err = classify_stream_error_frame(frame, "openai");
+        assert!(matches!(err, LlmError::Fatal { .. }), "{err:?}");
+        assert_eq!(err.reason(), FailoverReason::ModelNotFound);
     }
 
     #[test]
