@@ -776,9 +776,15 @@ mod tests {
         all.sort();
         assert_eq!(all, vec!["pending", "succeeded"]);
 
-        // Test still answers past the cap, and the real event still waits.
+        // Test still answers past the cap, on the subscription whose real
+        // event waits, and that event still waits.
+        let waiting = if statuses(&db, &a).await == ["pending"] {
+            &a
+        } else {
+            &b
+        };
         let test = db
-            .insert_subscription_test_event(&b, "Test: b", "{}")
+            .insert_subscription_test_event(waiting, "Test", "{}")
             .await
             .unwrap();
         wake::poke();
@@ -801,13 +807,19 @@ mod tests {
         }
         stop(running).await;
         assert_eq!(test_status, "succeeded");
-        let mut all = statuses(&db, &a).await;
-        all.extend(statuses(&db, &b).await);
-        all.sort();
+        let mut beside_the_test: Vec<String> = db
+            .list_subscription_events(waiting, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.id != test.id)
+            .map(|e| e.status)
+            .collect();
+        beside_the_test.sort();
         assert_eq!(
-            all,
-            vec!["pending", "succeeded", "succeeded"],
-            "the real event of b still waits for tomorrow"
+            beside_the_test,
+            vec!["pending"],
+            "the real event beside the test still waits for tomorrow"
         );
     }
 
