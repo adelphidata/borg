@@ -105,7 +105,35 @@ async-trait = "0.1"
 rand = "0.10"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 wasmparser = "0.262"
-wasmtime = "50"
+# Every default feature except `cache`: plugins never configure wasmtime's
+# on-disk compile cache, and it is the only path that pulls in zstd 0.13.
+wasmtime = { version = "50", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
