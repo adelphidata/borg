@@ -1007,7 +1007,10 @@ mod tests {
             "/model/anthropic.claude-3-7-sonnet-20250219-v1%3A0/converse"
         );
         // An already-escaped segment is escaped again, per non-S3 SigV4.
-        assert_eq!(canonical_uri("/model/a%3Ab/converse"), "/model/a%253Ab/converse");
+        assert_eq!(
+            canonical_uri("/model/a%3Ab/converse"),
+            "/model/a%253Ab/converse"
+        );
         assert_eq!(canonical_uri(""), "/");
         assert_eq!(canonical_uri("/"), "/");
     }
@@ -1070,10 +1073,16 @@ mod tests {
             br#"{"contentBlockIndex":1,"delta":{"text":"Hi"},"p":"ab"}"#,
         );
         buffer.extend(frame(
-            &[(":exception-type", "throttlingException"), (":message-type", "exception")],
+            &[
+                (":exception-type", "throttlingException"),
+                (":message-type", "exception"),
+            ],
             br#"{"message":"slow down"}"#,
         ));
-        buffer.extend(frame(&[(":event-type", "messageStop")], br#"{"stopReason":"end_turn"}"#));
+        buffer.extend(frame(
+            &[(":event-type", "messageStop")],
+            br#"{"stopReason":"end_turn"}"#,
+        ));
 
         let mut take = || {
             let payload = try_take_eventstream_payload(&mut buffer).unwrap().unwrap();
