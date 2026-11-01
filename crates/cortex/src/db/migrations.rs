@@ -529,12 +529,7 @@ impl Database {
             params!(
                 nightly_task_id,
                 "Nightly Memory Consolidation",
-                "Review today's sessions and extract durable information into long-term memory. \
-                 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
-                 Never duplicate information already in existing memory entries. \
-                 Save only facts a user message or a tool result supports: never infer traits, goals, or habits the transcript does not state, \
-                 and never turn a one-off request into a standing preference unless the user said 'always' or stated a like/dislike. \
-                 When in doubt, leave it out.",
+                crate::memory::consolidation::NIGHTLY_PROMPT,
                 "cron",
                 NIGHTLY_CRON,
                 "local",
@@ -544,6 +539,19 @@ impl Database {
                 allowed_tools.clone(),
             ),
         ).await?;
+
+        // The runner uses the constant, so the row's prompt is display-only;
+        // keep an existing row in step with it rather than showing the text
+        // of whichever release first seeded it.
+        self.conn
+            .execute(
+                "UPDATE scheduled_tasks SET prompt = ?1 WHERE id = ?2 AND prompt != ?1",
+                params!(
+                    crate::memory::consolidation::NIGHTLY_PROMPT,
+                    nightly_task_id
+                ),
+            )
+            .await?;
 
         const WEEKLY_CRON: &str = "0 0 4 * * 7";
         let next_weekly = crate::tasks::calculate_next_run("cron", WEEKLY_CRON, "local")?;

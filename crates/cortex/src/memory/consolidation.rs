@@ -57,7 +57,7 @@ If the transcript is too sparse to support a real identity, do not call write_me
 
 const IDENTITY_BACKFILL_PROMPT_PREFIX: &str = "Recent session transcripts (most recent first):";
 
-const NIGHTLY_PROMPT: &str = "Review today's sessions and extract durable information into long-term memory. \
+pub(crate) const NIGHTLY_PROMPT: &str = "Review today's sessions and extract durable information into long-term memory. \
 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
 Never duplicate information already in existing memory entries. \
 Save only facts a user message or a tool result supports: never infer traits, goals, or habits the transcript does not state, \
