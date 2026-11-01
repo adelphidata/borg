@@ -244,7 +244,11 @@ pub fn format_friendly_error(raw: &str) -> String {
         }
 
         ErrorCategory::Timeout => {
-            "The request to the AI provider timed out. Please try again.".to_string()
+            "The request to the AI provider timed out. A slow model will time out \
+             again on retry: raise `llm.request_timeout_ms` (whole request) or \
+             `llm.stream_chunk_timeout_secs` (gap between streamed chunks) with \
+             `borg settings set <key> <value>`."
+                .to_string()
         }
 
         ErrorCategory::ImageUnsupported => {

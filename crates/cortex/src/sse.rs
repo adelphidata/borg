@@ -168,7 +168,10 @@ where
                     }
                     Err(_) => {
                         return Err(LlmError::Retryable {
-                            source: anyhow::anyhow!("No data received for {chunk_timeout_secs}s"),
+                            source: anyhow::anyhow!(
+                                "No data received for {chunk_timeout_secs}s (raise \
+                                 llm.stream_chunk_timeout_secs for a slow model)"
+                            ),
                             retry_after: None,
                             reason: FailoverReason::Timeout,
                             status: None,

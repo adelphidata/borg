@@ -2265,7 +2265,10 @@ impl LlmClient {
                         Ok(None) => return Ok(crate::sse::StreamEnd::Eof),
                         Err(_) => {
                             return Err(LlmError::Retryable {
-                                source: anyhow::anyhow!("No Bedrock stream data received for {chunk_timeout_secs}s"),
+                                source: anyhow::anyhow!(
+                                    "No Bedrock stream data received for {chunk_timeout_secs}s \
+                                     (raise llm.stream_chunk_timeout_secs for a slow model)"
+                                ),
                                 retry_after: None,
                                 reason: FailoverReason::Timeout,
                                 status: None,
@@ -3272,7 +3275,8 @@ impl LlmClient {
                     Err(_) => {
                         return Err(LlmError::Retryable {
                             source: anyhow::anyhow!(
-                                "Request to {} timed out after {}ms",
+                                "Request to {} timed out after {}ms (raise llm.request_timeout_ms \
+                                 for a slow model)",
                                 self.provider,
                                 self.llm_config.request_timeout_ms
                             ),
