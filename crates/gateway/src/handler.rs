@@ -205,11 +205,36 @@ pub(crate) fn inbound_addressed_to_bot(
     let Some(bot) = bot_identifier.map(|b| b.trim_start_matches('@')) else {
         return false;
     };
-    inbound
+    if bot.is_empty() {
+        return false;
+    }
+    // A reply to this bot's own message, or a `/cmd@this_bot` command.
+    ["reply_to_bot_username", "command_bot_username"]
+        .iter()
+        .any(|key| {
+            inbound
+                .metadata
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|u| u.eq_ignore_ascii_case(bot))
+        })
+}
+
+/// The text the agent sees for `inbound`: the quoted message the adapter
+/// recorded (one `> author: text` line), then the cleaned text. Applied only
+/// here, after activation and command parsing have run on the bare text, so a
+/// quote can neither hide a slash command nor trip the mention gate; and
+/// after media enrichment, so a voice reply's transcript keeps its quote.
+pub(crate) fn with_quoted_context(inbound: &InboundMessage, cleaned_text: String) -> String {
+    match inbound
         .metadata
-        .get("reply_to_bot_username")
+        .get(crate::telegram::parse::QUOTED_CONTEXT_KEY)
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|u| !bot.is_empty() && u.eq_ignore_ascii_case(bot))
+        .filter(|q| !q.trim().is_empty())
+    {
+        Some(quote) => format!("{quote}\n{cleaned_text}"),
+        None => cleaned_text,
+    }
 }
 
 pub fn check_activation(
@@ -1226,7 +1251,7 @@ async fn invoke_agent_inner(
             channel_name,
             inbound,
             config,
-            cleaned_text,
+            with_quoted_context(inbound, cleaned_text),
         )
         .await;
 

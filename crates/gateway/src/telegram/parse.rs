@@ -86,25 +86,45 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
             filename: format!("photo_{}.jpg", largest.file_unique_id),
         });
 
-    let (mut text, audio_ref, input_kind) = derive_message_text(msg)?;
+    let (text, audio_ref, input_kind) = derive_message_text(msg)?;
 
     let mut metadata = serde_json::Map::new();
     // A slash command is addressed to the bot by definition, mention or not.
-    // Checked before any quote is prepended so the quote can't mask it.
-    if text.trim_start().starts_with('/') {
-        metadata.insert(
-            "addressed_to_bot".to_string(),
-            serde_json::Value::Bool(true),
-        );
+    // Telegram's `/cmd@username` form names its target bot: that one is
+    // recorded for the handler to compare, since the parser does not know
+    // this bot's own username, and a command for another bot stays
+    // unaddressed.
+    match command_target(&text) {
+        CommandTarget::NotACommand => {}
+        CommandTarget::Any => {
+            metadata.insert(
+                "addressed_to_bot".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        CommandTarget::Bot(username) => {
+            metadata.insert(
+                "command_bot_username".to_string(),
+                serde_json::Value::String(username),
+            );
+        }
     }
     if let Some(quoted) = quoted_message(msg) {
+        // The quote travels as metadata, not as a prefix on the text: a
+        // prefix would hide a slash command from the command parser, let a
+        // `@bot` inside the quoted message trip mention activation, and be
+        // lost when a voice reply's transcript replaces the text. The
+        // handler prepends it once the turn is bound for the agent.
         if let Some(quote_text) = quoted_text(quoted) {
             let author = quoted
                 .from
                 .as_ref()
                 .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
                 .unwrap_or_else(|| "someone".to_string());
-            text = format!("> {author}: {quote_text}\n{text}");
+            metadata.insert(
+                QUOTED_CONTEXT_KEY.to_string(),
+                serde_json::Value::String(format!("> {author}: {quote_text}")),
+            );
         }
         if let Some(username) = quoted
             .from
@@ -151,6 +171,30 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
         photo: photo_ref,
         input_kind,
     })
+}
+
+/// Metadata key carrying a quoted message as one `> author: text` line.
+pub(crate) const QUOTED_CONTEXT_KEY: &str = "quoted_context";
+
+/// Who a leading slash command is for.
+enum CommandTarget {
+    NotACommand,
+    /// `/cmd` with no `@username` suffix: any bot in the chat.
+    Any,
+    /// `/cmd@username`: the named bot only.
+    Bot(String),
+}
+
+fn command_target(text: &str) -> CommandTarget {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('/') {
+        return CommandTarget::NotACommand;
+    }
+    let word = trimmed.split_whitespace().next().unwrap_or_default();
+    match word.split_once('@') {
+        Some((_, username)) if !username.is_empty() => CommandTarget::Bot(username.to_string()),
+        _ => CommandTarget::Any,
+    }
 }
 
 /// The message this one quotes, when it is a real quote.
@@ -1170,7 +1214,13 @@ mod tests {
             "and the tests?",
         );
         let msg = parse_update(&update).unwrap().inbound;
-        assert_eq!(msg.text, "> borg_bot: the deploy finished\nand the tests?");
+        assert_eq!(msg.text, "and the tests?");
+        assert_eq!(
+            msg.metadata
+                .get(QUOTED_CONTEXT_KEY)
+                .and_then(|v| v.as_str()),
+            Some("> borg_bot: the deploy finished")
+        );
         assert_eq!(
             msg.metadata
                 .get("reply_to_bot_username")
@@ -1188,8 +1238,46 @@ mod tests {
             "sure",
         );
         let msg = parse_update(&update).unwrap().inbound;
-        assert_eq!(msg.text, "> Bob: lunch?\nsure");
+        assert_eq!(msg.text, "sure");
+        assert_eq!(
+            msg.metadata
+                .get(QUOTED_CONTEXT_KEY)
+                .and_then(|v| v.as_str()),
+            Some("> Bob: lunch?")
+        );
         assert!(msg.metadata.get("reply_to_bot_username").is_none());
+    }
+
+    #[test]
+    fn a_reply_with_a_slash_command_keeps_the_command_first() {
+        // The quote must not sit in front of `/stop`: the command parser
+        // reads the first word of the text.
+        let update = reply_update(
+            serde_json::json!({ "id": 7, "first_name": "Borg", "username": "borg_bot", "is_bot": true }),
+            "working on it",
+            "/stop",
+        );
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "/stop");
+        assert_eq!(
+            msg.metadata
+                .get("addressed_to_bot")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_command_for_a_named_bot_records_the_target_instead_of_addressing() {
+        let update = text_update("/start@weather_bot now");
+        let msg = parse_update(&update).unwrap().inbound;
+        assert!(msg.metadata.get("addressed_to_bot").is_none());
+        assert_eq!(
+            msg.metadata
+                .get("command_bot_username")
+                .and_then(|v| v.as_str()),
+            Some("weather_bot")
+        );
     }
 
     #[test]
