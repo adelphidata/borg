@@ -336,8 +336,10 @@ impl SessionExecutor for DaemonSessionExecutor {
     }
 
     async fn cancel(&self, session_key: &str) -> bool {
+        // The gateway's `/stop`: an explicit stop ends the session's
+        // sub-agents as well as the turn.
         if let Some(host) = self.registry.get(session_key) {
-            host.cancel_turn().await;
+            host.stop().await;
             true
         } else {
             false

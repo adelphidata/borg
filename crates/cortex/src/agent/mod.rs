@@ -2198,6 +2198,14 @@ impl Agent {
         }
     }
 
+    /// End every background sub-agent this session spawned. An explicit
+    /// stop (`/stop`), not a turn interrupt, which leaves them running.
+    pub fn stop_sub_agents(&mut self) {
+        if let Some(ref mut ctrl) = self.agent_control {
+            ctrl.shutdown_all();
+        }
+    }
+
     /// Hand the model the sub-agents that finished since the last iteration
     /// and that no `wait_for_agent` call collected, as one user-role notice
     /// ([`crate::multi_agent::completion_notice`] says why not a tool row).

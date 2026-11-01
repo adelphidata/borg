@@ -259,9 +259,23 @@ impl SessionHost {
     }
 
     /// Cancel the in-flight turn (if any). No-op when between turns.
+    /// Background sub-agents keep running: a turn interrupt is not a stop.
     pub async fn cancel_turn(&self) {
         let token = self.inner.turn_state.lock().await.cancel.clone();
         token.cancel();
+    }
+
+    /// Explicit stop: cancel the in-flight turn and end the session's
+    /// background sub-agents.
+    pub async fn stop(&self) {
+        self.cancel_turn().await;
+        if let Err(e) = self.inner.backend.stop_sub_agents().await {
+            tracing::warn!(
+                session_id = %self.inner.session_id,
+                error = %e,
+                "turn cancelled, but its sub-agents could not be stopped"
+            );
+        }
     }
 
     /// Cancel the in-flight turn AND drop every parked prompt. Invoked when

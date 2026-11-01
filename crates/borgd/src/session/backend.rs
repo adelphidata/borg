@@ -197,6 +197,11 @@ pub trait SessionBackend: Send + Sync + 'static {
             "clear_history not supported by this backend"
         ))
     }
+    /// End the session's background sub-agents. Backends without any
+    /// simply succeed.
+    async fn stop_sub_agents(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Drop the most recent assistant turn. Returns # messages removed.
     fn undo(&self) -> anyhow::Result<usize> {
         Err(anyhow::anyhow!("undo not supported by this backend"))
@@ -734,6 +739,17 @@ impl SessionBackend for AgentBackend {
     fn clear_history(&self) -> anyhow::Result<()> {
         let mut agent = lock_agent(&self.agent);
         agent.clear_history();
+        Ok(())
+    }
+
+    async fn stop_sub_agents(&self) -> anyhow::Result<()> {
+        // Called right after the turn was cancelled; the lock frees once the
+        // turn unwinds. Bounded so a turn that is slow to let go cannot hang
+        // the `/stop` reply.
+        let mut agent = tokio::time::timeout(std::time::Duration::from_secs(10), self.agent.lock())
+            .await
+            .map_err(|_| anyhow::anyhow!("the turn did not release the agent within 10s"))?;
+        agent.stop_sub_agents();
         Ok(())
     }
 
