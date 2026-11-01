@@ -853,31 +853,24 @@ fn custom_synthesize(
         ],
     );
 
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(&cmd_str)
         // Non-interactive: the command reads its text from the rendered
         // argument, not stdin. Inheriting ours would let it swallow the
         // operator's keystrokes or block until the timeout below.
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .context("spawn custom tts")?;
-    let started = std::time::Instant::now();
-    loop {
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("custom tts timed out after {timeout:?}");
+        .stdin(std::process::Stdio::null());
+    // Own process group, so a timeout ends the synthesiser `sh` started and
+    // not just `sh` itself.
+    crate::util::process_tree::spawn_in_own_group_std(&mut cmd);
+    let mut child = cmd.spawn().context("spawn custom tts")?;
+    match crate::util::process_tree::wait_or_kill_group(&mut child, timeout) {
+        Ok(status) if status.success() => {}
+        Ok(status) => bail!("custom tts exited with {:?}", status.code()),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            bail!("custom tts timed out after {timeout:?}")
         }
-        match child.try_wait()? {
-            Some(status) => {
-                if !status.success() {
-                    bail!("custom tts exited with {:?}", status.code());
-                }
-                break;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
+        Err(e) => return Err(e).context("wait for custom tts"),
     }
     std::fs::read(out_file.path()).context("read custom tts output")
 }

@@ -486,7 +486,7 @@ fn custom_transcribe(
     model: &str,
     timeout: Duration,
 ) -> Result<String> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
 
     // Same trust boundary as `CustomTtsProvider`'s voice id — reuse the
@@ -522,37 +522,35 @@ fn custom_transcribe(
         ],
     );
 
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(&cmd_str)
         // Non-interactive: the audio path is passed as an argument.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn custom stt")?;
+        .stderr(Stdio::piped());
+    // Own process group, so a timeout ends the transcriber `sh` started and
+    // not just `sh` itself — a whisper-style CLI would otherwise keep running
+    // as an orphan after its parent was killed.
+    crate::util::process_tree::spawn_in_own_group_std(&mut cmd);
+    let mut child = cmd.spawn().context("spawn custom stt")?;
 
-    let started = std::time::Instant::now();
-    let status = loop {
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("custom stt timed out after {timeout:?}");
+    // Drain both pipes while the child runs. Reading them only after exit
+    // deadlocks any transcriber whose output passes the pipe buffer (such
+    // CLIs log heavily to stderr), which then looks like a timeout.
+    let stdout_reader = child.stdout.take().map(drain_pipe);
+    let stderr_reader = child.stderr.take().map(drain_pipe);
+
+    let status = match crate::util::process_tree::wait_or_kill_group(&mut child, timeout) {
+        Ok(status) => status,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            bail!("custom stt timed out after {timeout:?}")
         }
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
+        Err(e) => return Err(e).context("wait for custom stt"),
     };
 
-    let mut stdout = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        s.read_to_string(&mut stdout)?;
-    }
-    let mut stderr = String::new();
-    if let Some(mut s) = child.stderr.take() {
-        s.read_to_string(&mut stderr)?;
-    }
+    let stdout = stdout_reader.map(join_drained).unwrap_or_default();
+    let stderr = stderr_reader.map(join_drained).unwrap_or_default();
 
     if !status.success() {
         bail!(
@@ -571,6 +569,29 @@ fn custom_transcribe(
         bail!("custom stt produced empty transcript");
     }
     Ok(transcript.to_string())
+}
+
+/// Read a child's pipe to the end on its own thread.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<std::io::Result<String>> {
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        pipe.read_to_string(&mut buf).map(|_| buf)
+    })
+}
+
+/// Collect a [`drain_pipe`] thread's output; an unreadable pipe reads as
+/// empty rather than failing a transcription that already finished.
+fn join_drained(handle: std::thread::JoinHandle<std::io::Result<String>>) -> String {
+    match handle.join() {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            warn!("custom stt pipe was unreadable: {e}");
+            String::new()
+        }
+        Err(_) => String::new(),
+    }
 }
 
 /// Parse Deepgram JSON response to extract transcript text.
