@@ -92,8 +92,15 @@ pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
             // One live copy only. An entry left in the fallback file by an
             // earlier keychain outage would otherwise keep an old secret in
             // plaintext on disk, and `read()` would hand it back the next
-            // time the keychain is unreadable.
-            remove_from_file(service, account)?;
+            // time the keychain is unreadable. The keychain write already
+            // succeeded, so a fallback file that cannot be read or written
+            // is a warning, not a failed store.
+            if let Err(e) = remove_from_file(service, account) {
+                tracing::warn!(
+                    "credential stored in the keychain, but its stale copy could not be removed \
+                     from the fallback file: {e:#}"
+                );
+            }
             return Ok(());
         }
         Err(e) => {
