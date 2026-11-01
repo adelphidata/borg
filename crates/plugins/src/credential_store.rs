@@ -87,21 +87,53 @@ fn save_file(file: &CredentialsFile) -> Result<()> {
 /// Store a credential, falling back to the on-disk file at mode 0600 if the
 /// keychain is unavailable.
 pub fn store(service: &str, account: &str, value: &str) -> Result<()> {
-    if let Err(e) = keychain::store(service, account, value) {
-        tracing::warn!(
+    match keychain::store(service, account, value) {
+        Ok(()) => {
+            // One live copy only. An entry left in the fallback file by an
+            // earlier keychain outage would otherwise keep an old secret in
+            // plaintext on disk, and `read()` would hand it back the next
+            // time the keychain is unreadable.
+            remove_from_file(service, account)?;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(
             "Keychain store failed for service={service} account={account}, falling back to file: {e}"
         );
-        // `read()` consults the keychain first, so a stale entry left from an
-        // earlier store would shadow the value written to the file below.
-        keychain::remove(service, account);
-        let mut file = load_file()?;
-        file.services
-            .entry(service.to_string())
-            .or_default()
-            .insert(account.to_string(), value.to_string());
-        save_file(&file)?;
+            // `read()` consults the keychain first, so a stale entry left from an
+            // earlier store would shadow the value written to the file below.
+            keychain::remove(service, account);
+            let mut file = load_file()?;
+            file.services
+                .entry(service.to_string())
+                .or_default()
+                .insert(account.to_string(), value.to_string());
+            save_file(&file)?;
+        }
     }
     Ok(())
+}
+
+/// Drop `account` under `service` from the fallback file, pruning an empty
+/// service map. A missing entry is a no-op; a missing file is `Ok`.
+fn remove_from_file(service: &str, account: &str) -> Result<()> {
+    let mut file = load_file()?;
+    let removed = file
+        .services
+        .get_mut(service)
+        .map(|m| m.remove(account).is_some())
+        .unwrap_or(false);
+    if !removed {
+        return Ok(());
+    }
+    if file
+        .services
+        .get(service)
+        .is_some_and(std::collections::BTreeMap::is_empty)
+    {
+        file.services.remove(service);
+    }
+    save_file(&file)
 }
 
 /// Read a credential. Tries the OS keychain first, then the fallback file.
@@ -230,30 +262,8 @@ pub fn check(service: &str, account: &str) -> bool {
 /// Remove a credential from both backends.
 pub fn remove(service: &str, account: &str) {
     keychain::remove(service, account);
-    let mut file = match load_file() {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("Failed to load credentials file during remove: {e}");
-            return;
-        }
-    };
-    let removed = file
-        .services
-        .get_mut(service)
-        .map(|m| m.remove(account).is_some())
-        .unwrap_or(false);
-    if !removed {
-        return;
-    }
-    if file
-        .services
-        .get(service)
-        .is_some_and(std::collections::BTreeMap::is_empty)
-    {
-        file.services.remove(service);
-    }
-    if let Err(e) = save_file(&file) {
-        tracing::warn!("Failed to save credentials file after remove: {e}");
+    if let Err(e) = remove_from_file(service, account) {
+        tracing::warn!("Failed to remove {service}/{account} from the credentials file: {e}");
     }
 }
 
@@ -578,6 +588,39 @@ mod tests {
             "credential must be durably written to the fallback file"
         );
         assert_eq!(read("svc-fallback", "acct"), Some("sekrit".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keychain_store_success_purges_the_fallback_file_copy() {
+        // One live copy only: an entry left in the plaintext fallback file by
+        // an earlier keychain outage must go once the keychain write lands,
+        // or the old secret stays on disk and `read()` hands it back the next
+        // time the keychain is unreadable.
+        let _lock = env_lock();
+        let _shim = crate::test_support::KeychainShim::fake_helper("cat >/dev/null; exit 0");
+
+        file_only_store("svc-purge", "acct", "stale-plaintext").unwrap();
+        file_only_store("svc-purge", "other", "keep-me").unwrap();
+
+        store("svc-purge", "acct", "fresh").expect("keychain store succeeds");
+
+        let file = load_file().unwrap();
+        assert!(
+            file.services
+                .get("svc-purge")
+                .and_then(|m| m.get("acct"))
+                .is_none(),
+            "stale plaintext copy must be removed after a keychain write: {file:?}"
+        );
+        assert_eq!(
+            file.services
+                .get("svc-purge")
+                .and_then(|m| m.get("other"))
+                .map(String::as_str),
+            Some("keep-me"),
+            "sibling accounts stay intact"
+        );
     }
 
     #[cfg(unix)]
