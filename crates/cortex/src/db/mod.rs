@@ -1192,14 +1192,30 @@ impl Database {
     /// True when the stamp matches this binary exactly, so migrations can be
     /// skipped.
     ///
-    /// Deliberately `==`, not `>=`. The chain was squashed from 16 steps to
-    /// one, so developer databases still carry a stamp of 16 — under `>=`
-    /// every future migration would be skipped on those machines with no
-    /// error at all, surfacing much later as "no such column". Any stamp that
-    /// is not ours means "re-emit the baseline", which is safe because
-    /// `migrate_v1` is entirely `CREATE … IF NOT EXISTS`.
+    /// Deliberately `==`, not `>=`: a stamp below ours means "run the
+    /// missing steps", and a stamp above ours is refused by
+    /// [`Self::refuse_newer_stamp`] rather than treated as current — under
+    /// `>=` every future migration would be skipped on such a database with
+    /// no error at all, surfacing much later as "no such column".
     fn stamp_is_current(stamp: u32) -> bool {
         stamp == Self::CURRENT_VERSION
+    }
+
+    /// A database stamped by a newer borg is not ours to migrate. Re-running
+    /// the chain over it would write our lower version over the stamp, and
+    /// the next upgrade would then replay the newer steps — with their
+    /// one-time data changes — a second time. Fail closed instead and say
+    /// what to do.
+    fn refuse_newer_stamp(stamp: u32) -> Result<()> {
+        if stamp > Self::CURRENT_VERSION {
+            anyhow::bail!(
+                "this borg is older than your data: the database schema is version {stamp} \
+                 but this binary knows version {}. Upgrade borg (`borg update`) or restore \
+                 a backup made by the older version (`borg backup`).",
+                Self::CURRENT_VERSION
+            );
+        }
+        Ok(())
     }
 
     async fn run_migrations(&self) -> Result<()> {
@@ -1215,6 +1231,7 @@ impl Database {
             .await?;
 
         let current = self.schema_version().await?;
+        Self::refuse_newer_stamp(current)?;
         if Self::stamp_is_current(current) {
             return Ok(());
         }
@@ -1255,6 +1272,7 @@ impl Database {
         // acquire the writer in turn, and the second runs `CREATE TABLE …`
         // against tables the first just created.
         let current = self.schema_version().await?;
+        Self::refuse_newer_stamp(current)?;
         if Self::stamp_is_current(current) {
             return Ok(());
         }
@@ -1399,6 +1417,45 @@ impl Database {
             .expect("init test db");
         db.set_evolution_keystore(Box::new(crate::evolution::keychain::InMemoryKeyStore::new()));
         db
+    }
+}
+
+#[cfg(test)]
+mod schema_stamp_tests {
+    use super::*;
+
+    /// A downgrade must not re-migrate: the newer stamp is refused with the
+    /// upgrade-or-restore hint, and the stamp is left exactly as found.
+    #[tokio::test]
+    async fn newer_stamp_refuses_to_migrate() {
+        let db = Database::test_db().await;
+        let newer = Database::CURRENT_VERSION + 1;
+        db.set_meta("schema_version", &newer.to_string())
+            .await
+            .expect("stamp a newer version");
+        let err = db
+            .run_migrations()
+            .await
+            .expect_err("a newer stamp must be refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("older than your data"), "{text}");
+        assert!(text.contains(&format!("version {newer}")), "{text}");
+        assert!(text.contains("borg update"), "{text}");
+        assert_eq!(db.schema_version().await.expect("stamp"), newer);
+    }
+
+    #[tokio::test]
+    async fn current_and_older_stamps_still_open() {
+        let db = Database::test_db().await;
+        db.run_migrations().await.expect("current stamp is a no-op");
+        db.set_meta("schema_version", "1").await.expect("stamp v1");
+        db.run_migrations()
+            .await
+            .expect("older stamp migrates forward");
+        assert_eq!(
+            db.schema_version().await.expect("stamp"),
+            Database::CURRENT_VERSION
+        );
     }
 }
 
