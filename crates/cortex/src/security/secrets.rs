@@ -219,6 +219,53 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         (r"\bsk-[A-Za-z0-9]{32,}", "API Key", false, None),
         (r"\bgsk_[A-Za-z0-9]{32,}", "Groq API Key", false, None),
         (r"\bxai-[A-Za-z0-9]{32,}", "xAI API Key", false, None),
+        // Vendor-prefixed keys the generic `sk-` family cannot reach. `\b`
+        // keeps a word that merely ends in the prefix out, and each floor is
+        // the vendor's real body length (or close to it) so short placeholders
+        // stay readable. `ctx7sk-` needs its own entry: the `sk-` sits after a
+        // word char, so the `\bsk-` pattern above never sees it.
+        (
+            r"\bctx7sk-[A-Za-z0-9_-]{20,}",
+            "Context7 API Key",
+            false,
+            None,
+        ),
+        (r"\bntn_[A-Za-z0-9]{30,}", "Notion Token", false, None),
+        (r"\bfc-[A-Za-z0-9]{24,}", "Firecrawl API Key", false, None),
+        (r"\bhf_[A-Za-z0-9]{30,}", "Hugging Face Token", false, None),
+        (r"\bnpm_[A-Za-z0-9]{30,}", "npm Token", false, None),
+        (r"\bpypi-[A-Za-z0-9_-]{40,}", "PyPI Token", false, None),
+        (
+            r"\bdo[po]_v1_[A-Za-z0-9]{40,}",
+            "DigitalOcean Token",
+            false,
+            None,
+        ),
+        (
+            r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
+            "SendGrid API Key",
+            false,
+            None,
+        ),
+        (r"\btvly-[A-Za-z0-9_-]{20,}", "Tavily API Key", false, None),
+        (
+            r"\bpplx-[A-Za-z0-9]{30,}",
+            "Perplexity API Key",
+            false,
+            None,
+        ),
+        (r"\br8_[A-Za-z0-9]{30,}", "Replicate Token", false, None),
+        (r"\bfw_[A-Za-z0-9]{30,}", "Fireworks API Key", false, None),
+        (r"\bfpk_[A-Za-z0-9]{30,}", "Fireworks API Key", false, None),
+        (
+            r"\bbb_live_[A-Za-z0-9_-]{20,}",
+            "BrowserBase API Key",
+            false,
+            None,
+        ),
+        // Langfuse keys are `pk-lf-`/`sk-lf-` + a hyphenated uuid; the
+        // hyphens keep `sk-lf-` out of the generic `sk-` pattern.
+        (r"\b[ps]k-lf-[A-Za-z0-9-]{30,}", "Langfuse Key", false, None),
         (
             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
             "JWT",
@@ -785,6 +832,71 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendor_prefixed_keys_are_masked_by_label() {
+        // Built at run time so the source never holds a scanner-shaped literal.
+        let do_token = format!("dop_v1_{}", "0123456789abcdef".repeat(4));
+        let cases = [
+            ("ctx7sk-abcdefghijklmnopqrstuvwxyz0123", "Context7 API Key"),
+            (
+                "ntn_abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+                "Notion Token",
+            ),
+            ("fc-0123456789abcdef0123456789abcdef", "Firecrawl API Key"),
+            (
+                "hf_abcdefghijklmnopqrstuvwxyz01234567",
+                "Hugging Face Token",
+            ),
+            ("npm_abcdefghijklmnopqrstuvwxyz0123456789", "npm Token"),
+            (
+                "pypi-AgEIcHlwaS5vcmcCJGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MDEyMzQ1Njc4",
+                "PyPI Token",
+            ),
+            (do_token.as_str(), "DigitalOcean Token"),
+            (
+                "SG.abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK",
+                "SendGrid API Key",
+            ),
+            ("tvly-abcdefghijklmnopqrstuvwxyz0123", "Tavily API Key"),
+            (
+                "pplx-abcdefghijklmnopqrstuvwxyz0123456789",
+                "Perplexity API Key",
+            ),
+            ("r8_abcdefghijklmnopqrstuvwxyz01234567", "Replicate Token"),
+            ("fw_abcdefghijklmnopqrstuvwxyz01234567", "Fireworks API Key"),
+            (
+                "fpk_abcdefghijklmnopqrstuvwxyz01234567",
+                "Fireworks API Key",
+            ),
+            ("bb_live_abcdefghijklmnopqrstuvwxyz", "BrowserBase API Key"),
+            ("sk-lf-0123abcd-4567-89ef-0123-456789abcdef", "Langfuse Key"),
+            ("pk-lf-0123abcd-4567-89ef-0123-456789abcdef", "Langfuse Key"),
+        ];
+        for (token, label) in cases {
+            let out = redact_secrets(&format!("key is {token} ok"));
+            assert!(
+                out.contains(&format!("[REDACTED {label}]")),
+                "{token} should be labeled {label}, got: {out}"
+            );
+            assert!(!out.contains(token), "{token} survived redaction: {out}");
+        }
+    }
+
+    #[test]
+    fn vendor_prefixes_need_a_word_boundary_and_a_real_body() {
+        // A word that merely ends in the prefix, and a short placeholder,
+        // both stay readable.
+        for text in [
+            "traffic-abcdefghijklmnopqrstuvwxyz0123456",
+            "fc-REPLACEME",
+            "ntn_placeholder",
+            "see hf_ docs",
+            "my-ctx7sk-short",
+        ] {
+            assert_eq!(redact_secrets(text), text, "{text} must not be masked");
+        }
+    }
 
     #[test]
     fn redacts_aws_key() {
