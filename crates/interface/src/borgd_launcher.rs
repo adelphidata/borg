@@ -238,6 +238,61 @@ async fn wait_for_daemon(timeout: Duration) -> bool {
     false
 }
 
+/// Outcome of waiting on a daemon this process just spawned.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnWait {
+    /// The UDS answered.
+    Ready,
+    /// The child exited before its UDS came up. Carries the exit status.
+    Exited(std::process::ExitStatus),
+    /// Neither happened within the deadline.
+    TimedOut,
+}
+
+/// [`wait_for_daemon`] for a child we hold a handle to: a daemon that dies
+/// during startup (bad config, locked DB, port in use) is reported with its
+/// exit status rather than a generic "never became reachable".
+///
+/// An exit does not end the wait by itself. Two clients can start at once,
+/// both spawn `borgd`, and the loser of the PID lock exits non-zero while the
+/// winner is still binding its socket. The UDS is polled until the deadline
+/// either way; the exit only changes what a miss reports.
+async fn wait_for_spawned_daemon<F>(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    mut reachable: impl FnMut() -> F,
+) -> SpawnWait
+where
+    F: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    let mut exited = None;
+    let mut poll_failed = false;
+    while start.elapsed() < timeout {
+        if reachable().await {
+            return SpawnWait::Ready;
+        }
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some(status),
+                Ok(None) => {}
+                // Losing the handle must not hide a daemon that does come up;
+                // keep the plain readiness poll. Logged once, not per tick.
+                Err(e) if !poll_failed => {
+                    poll_failed = true;
+                    tracing::debug!(error = %e, "cannot poll spawned borgd; waiting on its UDS");
+                }
+                Err(_) => {}
+            }
+        }
+        tokio::time::sleep(daemon_client::SOCKET_POLL_INTERVAL).await;
+    }
+    match exited {
+        Some(status) => SpawnWait::Exited(status),
+        None => SpawnWait::TimedOut,
+    }
+}
+
 /// Directory a freshly spawned `borgd` should start in, or `None` to inherit.
 ///
 /// Anchoring to the data dir matters because `borgd` outlives the client that
@@ -316,16 +371,23 @@ pub async fn ensure_running() -> Result<()> {
         .stderr(std::process::Stdio::null());
     prepare_daemon_command(&mut cmd);
     detach_from_console(&mut cmd);
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawning {}", binary.display()))?;
 
-    if wait_for_daemon(DIRECT_SPAWN_READY_TIMEOUT).await {
-        Ok(())
-    } else {
-        anyhow::bail!(
+    // The handle is dropped without `wait` on success on purpose: borgd
+    // outlives this client, and reaping it here would mean blocking on it.
+    match wait_for_spawned_daemon(&mut child, DIRECT_SPAWN_READY_TIMEOUT, daemon_reachable).await {
+        SpawnWait::Ready => Ok(()),
+        SpawnWait::Exited(status) => anyhow::bail!(
+            "spawned {} but it exited ({status}) before its UDS came up; \
+             run `borgd` in a terminal to see why",
+            binary.display()
+        ),
+        SpawnWait::TimedOut => anyhow::bail!(
             "spawned {} but its UDS never became reachable",
             binary.display()
-        )
+        ),
     }
 }
 
@@ -1197,6 +1259,75 @@ fn stop_systemd() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon that dies at startup and whose socket never answers must be
+    /// reported with its exit status, not as a vague "never became reachable".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_daemon_exit_is_reported_with_its_status() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn sh");
+        let outcome =
+            wait_for_spawned_daemon(&mut child, Duration::from_millis(300), || async { false })
+                .await;
+        let SpawnWait::Exited(status) = outcome else {
+            panic!("expected Exited, got {outcome:?}");
+        };
+        assert_eq!(status.code(), Some(3));
+    }
+
+    /// Two clients racing to start the daemon: ours loses the PID lock and
+    /// exits, but the winner's socket comes up moments later. That is a
+    /// success, not an error, so the wait must keep polling after the exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_daemon_lost_start_race_still_succeeds_when_the_winner_answers() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .expect("spawn sh");
+        let _ = child.wait();
+        let start = std::time::Instant::now();
+        let outcome = wait_for_spawned_daemon(&mut child, Duration::from_secs(5), || async move {
+            start.elapsed() > Duration::from_millis(150)
+        })
+        .await;
+        assert_eq!(outcome, SpawnWait::Ready);
+    }
+
+    /// A live child plus a reachable socket is the normal path and must not be
+    /// mistaken for an exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_daemon_that_answers_is_ready() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let outcome =
+            wait_for_spawned_daemon(&mut child, Duration::from_secs(5), || async { true }).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(outcome, SpawnWait::Ready);
+    }
+
+    /// A live child whose socket never answers still hits the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_daemon_that_hangs_times_out() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let outcome =
+            wait_for_spawned_daemon(&mut child, Duration::from_millis(200), || async { false })
+                .await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(outcome, SpawnWait::TimedOut);
+    }
 
     /// The daemon must never be spawned into the client's current directory.
     /// It outlives the client and treats its cwd as the default workspace, so

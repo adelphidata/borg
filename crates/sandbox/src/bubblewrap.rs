@@ -353,6 +353,11 @@ fn push_write_bind(args: &mut Vec<String>, path: &str) {
 /// Make `path` unreadable inside the sandbox by overlaying it: an empty tmpfs
 /// for directories, a read-only bind of `/dev/null` for regular files. Skips
 /// non-existent paths — bwrap errors on a mount target that doesn't exist.
+///
+/// Any other inspection failure (an unsearchable parent, a symlink loop) keeps
+/// the deny: the path may well exist, so it is masked with a tmpfs. bwrap then
+/// either hides it or refuses the whole spawn — both are closed outcomes,
+/// whereas dropping the entry would silently expose what the policy denied.
 fn hide_path(args: &mut Vec<String>, path: &str) {
     let p = Path::new(path);
     match std::fs::symlink_metadata(p) {
@@ -368,11 +373,29 @@ fn hide_path(args: &mut Vec<String>, path: &str) {
                 path.to_string(),
             ]);
         }
-        Err(_) => {
+        Err(e) if path_is_absent(&e) => {
             // Path doesn't exist — nothing to hide, and mounting over a missing
             // target would make bwrap fail the whole spawn.
         }
+        Err(e) => {
+            tracing::warn!(
+                path,
+                error = %e,
+                "sandbox: could not inspect a denied path; masking it with a tmpfs \
+                 (bwrap refuses the spawn if the target turns out to be a file)"
+            );
+            args.extend(["--tmpfs".to_string(), path.to_string()]);
+        }
     }
+}
+
+/// True when a metadata error means the path (or a component of it) does not
+/// exist, as opposed to existing but being uninspectable.
+fn path_is_absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Shadow every unix socket at `path`, or directly inside it, with `/dev/null`.
@@ -391,8 +414,21 @@ fn hide_path(args: &mut Vec<String>, path: &str) {
 fn hide_sockets(args: &mut Vec<String>, path: &str) {
     use std::os::unix::fs::FileTypeExt;
     let p = Path::new(path);
-    let Ok(meta) = std::fs::symlink_metadata(p) else {
-        return;
+    let meta = match std::fs::symlink_metadata(p) {
+        Ok(meta) => meta,
+        Err(e) if path_is_absent(&e) => return,
+        Err(e) => {
+            // Fail closed, as for an unlistable directory below: a socket we
+            // cannot see may still be live.
+            tracing::warn!(
+                path,
+                error = %e,
+                "sandbox: could not inspect a write-denied path; masking it with a tmpfs \
+                 (bwrap refuses the spawn if the target turns out to be a file)"
+            );
+            args.extend(["--tmpfs".to_string(), path.to_string()]);
+            return;
+        }
     };
     if meta.file_type().is_socket() {
         hide_path(args, path);
@@ -792,6 +828,75 @@ mod tests {
             read_bind_idx < tmpfs_idx,
             "hide must be emitted after fs_read bind"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninspectable_deny_read_path_is_masked_rather_than_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        // A deny_read entry under a directory we cannot search cannot be
+        // stat'ed. That is not "absent": dropping the overlay would expose the
+        // file to the sandbox. The deny must survive as a tmpfs mask.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir(&dir).unwrap();
+        let secret = dir.join("secret.db");
+        std::fs::write(&secret, b"secret").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(&secret).is_ok() {
+            // Running as root: permissions do not stop the lookup.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let secret_s = secret.to_string_lossy().into_owned();
+        let mut args = Vec::new();
+        hide_path(&mut args, &secret_s);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(args, vec!["--tmpfs".to_string(), secret_s]);
+    }
+
+    #[test]
+    fn absent_deny_read_path_is_still_skipped() {
+        // bwrap refuses a mount over a missing target, so a deny for a path
+        // that does not exist must stay a no-op — both for a missing
+        // component (ENOENT) and for a path routed through a regular file
+        // (ENOTDIR), which is equally absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope").join("secret.db");
+        let mut args = Vec::new();
+        hide_path(&mut args, &missing.to_string_lossy());
+        assert!(args.is_empty(), "{args:?}");
+
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let through_file = file.join("child");
+        let mut args = Vec::new();
+        hide_path(&mut args, &through_file.to_string_lossy());
+        assert!(args.is_empty(), "ENOTDIR must be a skip: {args:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninspectable_write_denied_path_is_masked_rather_than_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        // Same fail-closed rule for the socket overlay: a write-denied path we
+        // cannot stat may hold a live socket, so it is masked whole.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir(&dir).unwrap();
+        let inner = dir.join("sockets");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(&inner).is_ok() {
+            // Running as root: permissions do not stop the lookup.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let inner_s = inner.to_string_lossy().into_owned();
+        let mut args = Vec::new();
+        hide_sockets(&mut args, &inner_s);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(args, vec!["--tmpfs".to_string(), inner_s]);
     }
 
     #[test]
