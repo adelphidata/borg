@@ -631,7 +631,9 @@ impl Database {
         let mut claimed = Vec::with_capacity(tasks.len());
         for task in tasks {
             if self.has_live_run_in_tx(&task, now).await? {
-                tracing::info!(
+                // `debug`: this repeats on every scheduler tick for as long
+                // as the run lasts.
+                tracing::debug!(
                     task = %task.id,
                     "task is due but its previous run is still live; it fires once that run settles"
                 );
