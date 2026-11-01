@@ -495,6 +495,10 @@ pub struct Agent {
     /// path stays ungated, so a real overflow still surfaces a hard error
     /// rather than silently stalling.
     pub(super) compaction_outage: Option<prompt_assembly::CompactionOutage>,
+    /// Set once the user has been told that the `[compaction]` override
+    /// failed and the primary model summarized instead; one notice per
+    /// session is enough.
+    pub(super) compaction_override_rescue_announced: bool,
     /// Cross-turn stale-stream circuit breaker: counts consecutive streams
     /// killed as stale/timed out with nothing usable received, and
     /// short-circuits turns once tripped. See
@@ -658,6 +662,7 @@ impl Agent {
             // `None` would re-probe a known-dead summarizer on every one of
             // them and the cooldown would never elapse.
             compaction_outage: prompt_assembly::load_compaction_outage(),
+            compaction_override_rescue_announced: false,
             stream_health: stream_handler::StreamHealth::new(),
             prompt_cache_scope: None,
         }
@@ -1048,7 +1053,7 @@ impl Agent {
         }
         let target = self.effective_history_budget().min(before / 2);
         let (dropped, failure) = self
-            .run_compaction_with_fallback(target)
+            .run_compaction_with_fallback(target, None)
             .await
             .context("could not start the summarizer")?;
         let failed = (dropped == 0).then(|| match &failure {
@@ -2262,7 +2267,9 @@ impl Agent {
         let iterative =
             crate::conversation::extract_last_compaction_summary(&self.history).is_some();
 
-        let (dropped, failure) = self.run_compaction_with_fallback(target).await?;
+        let (dropped, failure) = self
+            .run_compaction_with_fallback(target, Some(event_tx))
+            .await?;
         // Fold the outcome into the outage latch. This path reports its own
         // context-overflow error below, so it suppresses the generic notice by
         // passing no channel — the message here is strictly more specific.

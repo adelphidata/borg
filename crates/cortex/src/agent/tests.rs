@@ -335,6 +335,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         active_failover_identity: None,
         compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
         compaction_outage: None,
+        compaction_override_rescue_announced: false,
         stream_health: super::stream_handler::StreamHealth::new(),
         prompt_cache_scope: None,
     }
@@ -753,7 +754,7 @@ async fn compaction_usage_counts_against_the_token_budget() {
     fill_history(&mut agent);
 
     let (dropped, failure) = agent
-        .run_compaction_with_fallback(400)
+        .run_compaction_with_fallback(400, None)
         .await
         .expect("clients build");
     assert!(
@@ -783,7 +784,7 @@ async fn a_compaction_retry_on_the_primary_model_counts_too() {
     fill_history(&mut agent);
 
     let (dropped, _) = agent
-        .run_compaction_with_fallback(400)
+        .run_compaction_with_fallback(400, None)
         .await
         .expect("clients build");
     assert_eq!(dropped, 0, "a filtered summary drops nothing");

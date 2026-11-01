@@ -74,6 +74,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         active_failover_identity: None,
         compaction_strikes: super::prompt_assembly::CompactionStrikes::new(),
         compaction_outage: None,
+        compaction_override_rescue_announced: false,
         stream_health: super::stream_handler::StreamHealth::new(),
         prompt_cache_scope: None,
     }

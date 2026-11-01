@@ -1026,7 +1026,9 @@ goals, or habits the conversation does not state. When unsure, leave it out.
             // Whether this pass updates a prior summary (UX hint only).
             let iterative = extract_last_compaction_summary(&self.history).is_some();
 
-            let (dropped_count, failure) = self.run_compaction_with_fallback(max_hist).await?;
+            let (dropped_count, failure) = self
+                .run_compaction_with_fallback(max_hist, Some(event_tx))
+                .await?;
 
             self.record_compaction_outcome(dropped_count, failure, Some(event_tx))
                 .await;
@@ -1223,9 +1225,16 @@ goals, or habits the conversation does not state. When unsure, leave it out.
     /// manual `/compact` — goes through here, so none of them can lose the
     /// fallback on its own. Errors are client-construction failures only (no
     /// provider, no key); summarizer failures come back as the failure class.
+    ///
+    /// A rescue by the primary is reported to the user once per session
+    /// through `event_tx` (`SystemNotice`, category `compaction`): the
+    /// override's failure would otherwise be visible only in the log, and a
+    /// dead `[compaction]` endpoint would keep paying for a failed call before
+    /// every compaction. `None` (manual `/compact`, tests) only logs.
     pub(super) async fn run_compaction_with_fallback(
         &mut self,
         target: usize,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Result<(usize, Option<SummarizeFailure>)> {
         let compaction_config = compaction_llm_config(&self.config);
         let mut compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
@@ -1237,12 +1246,37 @@ goals, or habits the conversation does not state. When unsure, leave it out.
         {
             return Ok((dropped, failure));
         }
+        let override_failure = failure;
         warn!(
             "compaction via [compaction] override made no progress; retrying with the primary model"
         );
         let mut primary_llm = self.make_llm_client_from_config(&self.config).await?;
         let outcome = self.run_llm_compaction(target, &mut primary_llm).await;
         self.record_side_call_usage(&mut primary_llm).await;
+        if outcome.0 > 0 && !self.compaction_override_rescue_announced {
+            if let Some(event_tx) = event_tx {
+                self.compaction_override_rescue_announced = true;
+                let override_model = compaction_config.llm.model.clone();
+                let why = match override_failure {
+                    Some(SummarizeFailure::Persistent(category)) => {
+                        format!("it was rejected ({category})")
+                    }
+                    Some(SummarizeFailure::Transient) => "it returned no summary".to_string(),
+                    None => "it made no progress".to_string(),
+                };
+                let _ = event_tx
+                    .send(AgentEvent::SystemNotice {
+                        category: "compaction".to_string(),
+                        text: format!(
+                            "The [compaction] override model ({override_model}) could not \
+                             summarize this conversation: {why}. The main model summarized \
+                             instead. Check the override's model name, key, or endpoint; \
+                             this notice is shown once per session."
+                        ),
+                    })
+                    .await;
+            }
+        }
         Ok(outcome)
     }
 
