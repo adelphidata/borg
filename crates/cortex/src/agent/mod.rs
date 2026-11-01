@@ -1465,7 +1465,11 @@ impl Agent {
             self.maybe_reload_config();
 
             if cancel.is_cancelled() {
-                self.shutdown_sub_agents();
+                // Only this turn ends. A background sub-agent is independent
+                // of the turn that spawned it: it keeps running and its
+                // report is collected by a later turn
+                // (`drain_sub_agent_completions`). Sub-agents end with the
+                // session (`AgentControl` cancels them on drop).
                 // Best-effort: receiver (UI) may have dropped during cancellation.
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
                 return Ok(());
@@ -2186,13 +2190,6 @@ impl Agent {
                 });
                 self.reload_config(new_config);
             }
-        }
-    }
-
-    /// Shut down all sub-agents (called on cancellation).
-    fn shutdown_sub_agents(&mut self) {
-        if let Some(ref mut ctrl) = self.agent_control {
-            ctrl.shutdown_all();
         }
     }
 
