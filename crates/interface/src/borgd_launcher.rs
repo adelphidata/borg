@@ -38,9 +38,12 @@ const DIRECT_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_START_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on waiting for a stopped daemon to release its socket during restart.
-/// Bounded so a wedged daemon that never closes its socket still lets the
-/// restart proceed rather than hanging the CLI indefinitely.
-const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded so a wedged daemon that never closes its socket turns into an
+/// error rather than hanging the CLI indefinitely. Must outlast the daemon's
+/// own shutdown: it keeps its listeners up for a few seconds of grace and then
+/// drains open sessions, so a desktop or browser stream held open through an
+/// update takes well over five seconds to let go of the socket.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const LAUNCHD_PLIST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
