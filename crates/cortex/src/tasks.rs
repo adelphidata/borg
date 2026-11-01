@@ -1966,10 +1966,11 @@ mod tests {
         }
     }
 
-    /// A one-shot task run by hand is consumed by that run: leaving it
-    /// active with a future `next_run` would make the reminder fire twice.
+    /// A one-shot task run by hand before its time is an extra run: the
+    /// reminder itself still fires at the time it was set for. Consuming it
+    /// here is what made "run it now to check it works" cancel the reminder.
     #[tokio::test]
-    async fn run_now_completes_a_once_task() {
+    async fn run_now_keeps_a_future_once_fire() {
         let db = Database::test_db().await;
         let now = Utc::now().timestamp();
         seed_recurring(&db, "rn-once", SCHEDULE_TYPE_ONCE, "later", now + 3600).await;
@@ -1981,8 +1982,78 @@ mod tests {
             .await
             .expect("query")
             .expect("row");
+        assert_eq!(row.status, TASK_STATUS_ACTIVE);
+        assert_eq!(row.next_run, Some(now + 3600));
+        assert!(!row.run_now_requested, "the manual run fires exactly once");
+
+        // The real fire still consumes the one-shot.
+        db.complete_task_run(claimed[0].run_id, 1, Some("ok"), None)
+            .await
+            .expect("settle the manual run");
+        let claimed = db.claim_due_tasks(now + 3600).await.expect("claim");
+        assert!(claimed.iter().any(|c| c.task.id == "rn-once"));
+        let row = db
+            .get_task_by_id("rn-once")
+            .await
+            .expect("query")
+            .expect("row");
         assert_eq!(row.status, TASK_STATUS_COMPLETED);
         assert_eq!(row.next_run, None);
+    }
+
+    /// A fire that lands while the previous run is still in flight waits:
+    /// nothing is claimed, the schedule is not advanced, and a pending
+    /// run-now stays armed. Once the run settles, the task fires once.
+    #[tokio::test]
+    async fn a_due_task_with_a_live_run_waits_for_it() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        seed_recurring(&db, "live", SCHEDULE_TYPE_INTERVAL, "1h", now - 5).await;
+        let first = db.claim_due_tasks(now).await.expect("first claim");
+        assert_eq!(first.len(), 1);
+
+        // Due again (and asked for by hand) while the first run is live.
+        db.update_task_next_run("live", Some(now + 10))
+            .await
+            .expect("make it due again");
+        run_task_now(&db, "live").await.expect("run now");
+        let second = db.claim_due_tasks(now + 10).await.expect("second claim");
+        assert!(second.is_empty(), "a live run blocks the next claim");
+        let row = db
+            .get_task_by_id("live")
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.next_run, Some(now + 10), "nothing advanced");
+        assert!(row.run_now_requested, "the manual request stays armed");
+
+        db.complete_task_run(first[0].run_id, 1, Some("ok"), None)
+            .await
+            .expect("settle the first run");
+        let third = db.claim_due_tasks(now + 10).await.expect("third claim");
+        assert_eq!(third.len(), 1, "fires once the live run settles");
+        let row = db
+            .get_task_by_id("live")
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(row.next_run.is_some_and(|n| n > now + 10));
+        assert!(!row.run_now_requested);
+    }
+
+    /// A `running` row older than the task's timeout plus grace is a corpse
+    /// from a killed daemon, not a live run, and does not block the task.
+    #[tokio::test]
+    async fn a_stale_running_row_does_not_block_a_claim() {
+        let db = Database::test_db().await;
+        let now = Utc::now().timestamp();
+        // 60s timeout (seed_recurring) + 10 min grace, well exceeded.
+        seed_recurring(&db, "corpse", SCHEDULE_TYPE_INTERVAL, "1h", now - 5).await;
+        db.start_task_run("corpse", now - 2 * 3600)
+            .await
+            .expect("stale running row");
+        let claimed = db.claim_due_tasks(now).await.expect("claim");
+        assert_eq!(claimed.len(), 1, "a corpse row never blocks");
     }
 
     /// A task that is both manually requested and naturally due is one run,

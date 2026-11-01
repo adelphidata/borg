@@ -11,6 +11,11 @@ use libsql::params;
 const CONSECUTIVE_FAILURE_WINDOW: i64 = 64;
 
 /// Column list shared by all scheduled-task SELECT queries.
+/// Slack past a task's timeout before a `running` row stops counting as a
+/// run in flight (see `Database::live_run_floor`). Covers the time between
+/// the executor's timeout firing and the run row being settled.
+const LIVE_RUN_GRACE_SECS: i64 = 10 * 60;
+
 const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, bypass_quiet_hours_once, min_interval_secs, last_response_hash, model, model_provider, monitor_mode, last_pre_run_hash, continuity, run_now_requested, failure_delivery_channel, failure_delivery_target";
 
 /// Returns true if `pid` is alive on this host: it exists and is not a
@@ -589,6 +594,15 @@ impl Database {
     /// A task with `run_now_requested` set is claimed too. When it is not
     /// otherwise due, its `next_run` is left alone — the manual run is extra,
     /// not a reschedule — and the flag is cleared so it fires exactly once.
+    /// That holds for a one-shot as well: running a reminder by hand to test
+    /// it keeps the real fire.
+    ///
+    /// A task whose previous run is still live is not claimed: nothing is
+    /// advanced and a pending run-now stays armed, so the fire happens once
+    /// that run settles instead of colliding with it (a prompt task's second
+    /// turn on the same conversation would only come back cancelled and be
+    /// recorded as a failure). See [`Self::live_run_floor`] for what counts
+    /// as live.
     pub async fn claim_due_tasks(&self, now: i64) -> Result<Vec<ClaimedTask>> {
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = self.claim_due_tasks_inner(now).await;
@@ -616,11 +630,18 @@ impl Database {
 
         let mut claimed = Vec::with_capacity(tasks.len());
         for task in tasks {
-            // A manual run of a recurring task is extra, not a reschedule:
-            // advancing here is what moved a daily 09:00 task to 14:00 for
-            // good. A one-shot is still consumed by its manual run.
+            if self.has_live_run_in_tx(&task, now).await? {
+                tracing::info!(
+                    task = %task.id,
+                    "task is due but its previous run is still live; it fires once that run settles"
+                );
+                continue;
+            }
+            // A manual run is extra, not a reschedule: advancing here is
+            // what moved a daily 09:00 task to 14:00 for good, and what made
+            // a test run of a reminder cancel the reminder itself.
             let scheduled_fire = task.next_run.is_some_and(|n| n <= now);
-            if scheduled_fire || task.schedule_type == crate::tasks::SCHEDULE_TYPE_ONCE {
+            if scheduled_fire {
                 self.advance_next_run_in_tx(&task).await?;
             }
             if task.run_now_requested {
@@ -657,6 +678,31 @@ impl Database {
 
         self.conn.execute_batch("COMMIT").await?;
         Ok(claimed)
+    }
+
+    /// Earliest `started_at` a `running` row may carry and still count as a
+    /// run in flight: the task's own timeout plus a grace period. A daemon
+    /// killed mid-run leaves its row behind until the stale-run sweep heals
+    /// it; an unbounded check would let that corpse block the task forever.
+    fn live_run_floor(task: &ScheduledTaskRow, now: i64) -> i64 {
+        let timeout_secs = (task.timeout_ms / 1000).max(0);
+        now - timeout_secs - LIVE_RUN_GRACE_SECS
+    }
+
+    /// Whether `task` has a run still in flight, per [`Self::live_run_floor`].
+    async fn has_live_run_in_tx(&self, task: &ScheduledTaskRow, now: i64) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM task_runs WHERE task_id = ?1 AND status = ?2 AND started_at >= ?3 LIMIT 1",
+                params!(
+                    task.id.clone(),
+                    crate::tasks::RUN_STATUS_RUNNING,
+                    Self::live_run_floor(task, now)
+                ),
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     /// Advance a task's next_run inside an already-open transaction. Inlined
