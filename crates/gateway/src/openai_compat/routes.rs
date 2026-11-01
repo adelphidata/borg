@@ -86,7 +86,7 @@ async fn authenticate_with_db(headers: &HeaderMap, db: &Database) -> Result<Prin
         .strip_prefix("Bearer ")
         .ok_or_else(|| auth_error("Authorization header must use Bearer scheme"))?;
 
-    let row = tokens::verify(db, token)
+    let row = tokens::verify_for(db, token, tokens::Surface::OpenAiCompat)
         .await
         .map_err(|_| auth_error("invalid client token"))?;
     Ok(PrincipalId::new(format!("token:{}", row.label)))

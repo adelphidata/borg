@@ -8,10 +8,13 @@ use crate::DbOpener;
 
 /// Bearer-token gate for the browser's gRPC-Web mount.
 ///
-/// Reuses the same `client_tokens` rows as the OpenAI-compat and MCP surfaces
-/// (`borg token issue` mints one), so the browser is authenticated exactly like
-/// every other network client. The unix socket needs no equivalent — its file
-/// permissions are the boundary — which is why only this path is gated.
+/// Reuses the same `client_tokens` rows as the OpenAI-compat and MCP surfaces,
+/// so the browser is authenticated exactly like every other network client,
+/// but the row must carry the `webui` scope (`borg web` issues one): the Admin
+/// service behind this mount has write RPCs that a token handed to a chat
+/// client or MCP host must not reach. The unix socket needs no equivalent —
+/// its file permissions are the boundary — which is why only this path is
+/// gated.
 pub async fn require_client_token(
     State(db_open): State<DbOpener>,
     request: Request,
@@ -32,12 +35,11 @@ pub async fn require_client_token(
         return (StatusCode::SERVICE_UNAVAILABLE, "auth backend unavailable").into_response();
     };
 
-    // TODO(scopes): `TokenRow.scopes` is not enforced anywhere yet. Once it is,
-    // require a `webui` scope here — the Admin service behind this mount has
-    // write RPCs that a read-only token should not reach.
-    match tokens::verify(&db, &token).await {
+    match tokens::verify_for(&db, &token, tokens::Surface::WebUi).await {
         Ok(_) => next.run(request).await,
-        Err(_) => unauthenticated("invalid or revoked client token"),
+        Err(_) => unauthenticated(
+            "invalid or revoked client token, or one without the webui scope (run `borg web`)",
+        ),
     }
 }
 

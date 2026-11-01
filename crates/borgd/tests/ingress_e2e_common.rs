@@ -296,7 +296,7 @@ async fn wait_for_health(base_url: &str) {
 /// the bearer header should carry.
 pub async fn issue_token(label: &str) -> String {
     let db = cortex::db::Database::open().await.expect("open db");
-    let issued = cortex::auth::tokens::issue(&db, label, "e2e_test")
+    let issued = cortex::auth::tokens::issue(&db, label, "openai_compat,mcp,webui")
         .await
         .expect("issue token");
     issued.plaintext

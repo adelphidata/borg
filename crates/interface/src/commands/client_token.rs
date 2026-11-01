@@ -15,8 +15,9 @@ pub(crate) enum ClientTokenAction {
     Issue {
         /// Human-readable label, unique per install (e.g. `chatbox-laptop`).
         label: String,
-        /// Optional comma-separated scopes. Reserved for future use;
-        /// v1 has no scope enforcement.
+        /// Comma-separated surfaces the token may reach: `openai_compat`,
+        /// `mcp`, `webui`. Empty grants the chat and MCP surfaces but not
+        /// the browser UI, whose Admin service has write RPCs.
         #[arg(long, default_value = "")]
         scopes: String,
     },

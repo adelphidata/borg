@@ -63,7 +63,7 @@ async fn authenticate(headers: &HeaderMap, state: &McpHttpState) -> Result<(), R
     let token = auth
         .strip_prefix("Bearer ")
         .ok_or_else(|| auth_error("Authorization header must use Bearer scheme"))?;
-    tokens::verify(&db, token)
+    tokens::verify_for(&db, token, tokens::Surface::Mcp)
         .await
         .map_err(|_| auth_error("invalid client token"))?;
     Ok(())

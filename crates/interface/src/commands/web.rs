@@ -106,7 +106,7 @@ pub(crate) async fn run_web(no_open: bool) -> Result<()> {
     let label = web_token_label(now_ms);
     let label = label.as_str();
     let issued = client
-        .issue_client_token(label, "")
+        .issue_client_token(label, cortex::auth::tokens::Surface::WebUi.scope())
         .await
         .context("issuing a client token for the web UI")?;
     let url = sign_in_url(&config.gateway.host, config.gateway.port, &issued.plaintext)?;

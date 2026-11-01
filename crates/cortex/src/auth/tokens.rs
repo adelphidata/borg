@@ -1,6 +1,9 @@
 //! Bearer-token issuance, verification, and revocation.
 //!
-//! Used by the OpenAI-compat HTTP surface and the MCP HTTP transport.
+//! Used by the OpenAI-compat HTTP surface, the MCP HTTP transport, and the
+//! browser UI's gRPC-Web mount. A token's `scopes` column names the surfaces
+//! it may reach (see [`Surface`]); the Admin service behind the browser mount
+//! has write RPCs, so it needs an explicit `webui` scope.
 //! Tokens are 32 random bytes, base64url-encoded; only the
 //! SHA-256 hash is persisted. Plaintext is shown to the issuer once at
 //! creation and is never recoverable thereafter — same model as
@@ -20,6 +23,72 @@ use crate::db::Database;
 /// Length of the random portion of a token, in bytes (256 bits of entropy).
 const TOKEN_BYTES: usize = 32;
 
+/// A network surface a client token can authenticate to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// `/v1/*` OpenAI-compatible chat API.
+    OpenAiCompat,
+    /// Streamable-HTTP MCP transport.
+    Mcp,
+    /// Browser UI: the gRPC-Web mount that exposes the Admin service.
+    WebUi,
+}
+
+impl Surface {
+    /// The scope name stored in `client_tokens.scopes`.
+    pub fn scope(self) -> &'static str {
+        match self {
+            Self::OpenAiCompat => "openai_compat",
+            Self::Mcp => "mcp",
+            Self::WebUi => "webui",
+        }
+    }
+
+    /// Every surface, for validation and help text.
+    pub const ALL: [Surface; 3] = [Self::OpenAiCompat, Self::Mcp, Self::WebUi];
+
+    /// Whether an empty scope list grants this surface. Only the browser UI
+    /// is withheld: it reaches Admin write RPCs (`SetSetting` on `security.*`
+    /// included), which a token handed to a third-party chat client or MCP
+    /// host must never be able to call.
+    fn granted_by_empty_scopes(self) -> bool {
+        !matches!(self, Self::WebUi)
+    }
+}
+
+/// Check a comma-separated scope list against the known surface names.
+/// Empty is valid (see [`TokenRow::scopes`]); an unknown name is refused at
+/// issue time rather than silently granting nothing.
+pub fn validate_scopes(scopes: &str) -> Result<()> {
+    for scope in scopes.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if !Surface::ALL.iter().any(|s| s.scope() == scope) {
+            let known = Surface::ALL
+                .iter()
+                .map(|s| s.scope())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(anyhow!("unknown token scope `{scope}` (known: {known})"));
+        }
+    }
+    Ok(())
+}
+
+impl TokenRow {
+    /// Whether this token may authenticate to `surface`.
+    pub fn permits(&self, surface: Surface) -> bool {
+        let mut scopes = self
+            .scopes
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .peekable();
+        if scopes.peek().is_none() {
+            return surface.granted_by_empty_scopes();
+        }
+        scopes.any(|s| s == surface.scope())
+    }
+}
+
 /// One row in `client_tokens`.
 #[derive(Debug, Clone)]
 pub struct TokenRow {
@@ -27,9 +96,10 @@ pub struct TokenRow {
     pub id: i64,
     /// Human-readable label (e.g. `"chatbox-laptop"`). Unique.
     pub label: String,
-    /// Comma-separated scopes. v1 has no scope enforcement; the field
-    /// exists so future surfaces can restrict tokens to read-only MCP,
-    /// chat-only OpenAI-compat, etc. without a schema migration.
+    /// Comma-separated [`Surface`] scopes. Empty means every surface
+    /// except the browser UI: tokens issued before scopes were enforced
+    /// keep their OpenAI-compat and MCP access, but the Admin service
+    /// behind the browser mount needs an explicit `webui` scope.
     pub scopes: String,
     /// Unix seconds when the token was issued.
     pub created_at: i64,
@@ -63,6 +133,7 @@ pub async fn issue(db: &Database, label: &str, scopes: &str) -> Result<IssuedTok
     if label.trim().is_empty() {
         return Err(anyhow!("token label must not be empty"));
     }
+    validate_scopes(scopes)?;
 
     let plaintext = generate_plaintext();
     let hash = hash_token(&plaintext);
@@ -97,6 +168,24 @@ pub async fn issue(db: &Database, label: &str, scopes: &str) -> Result<IssuedTok
     })
 }
 
+/// [`verify`], then check the token's scopes cover `surface`.
+///
+/// A live token without the scope fails with the same generic error as an
+/// unknown one: the surface learns nothing it could not learn by guessing.
+pub async fn verify_for(db: &Database, plaintext: &str, surface: Surface) -> Result<TokenRow> {
+    let row = verify(db, plaintext).await?;
+    if !row.permits(surface) {
+        tracing::warn!(
+            label = %row.label,
+            scopes = %row.scopes,
+            surface = surface.scope(),
+            "client token refused: its scopes do not cover this surface"
+        );
+        return Err(anyhow!("invalid client token"));
+    }
+    Ok(row)
+}
+
 /// Verify a plaintext token against the DB.
 ///
 /// On success, bumps `last_used_at` to "now" and returns the row.
@@ -106,6 +195,9 @@ pub async fn issue(db: &Database, label: &str, scopes: &str) -> Result<IssuedTok
 ///
 /// The two error paths return the same generic error string to avoid
 /// disclosing whether a presented token ever existed (anti-enumeration).
+///
+/// Surfaces must call [`verify_for`] so scopes are enforced; this is the
+/// scope-blind primitive.
 pub async fn verify(db: &Database, plaintext: &str) -> Result<TokenRow> {
     let hash = hash_token(plaintext);
     let now = chrono::Utc::now().timestamp();
