@@ -56,6 +56,8 @@ pub struct TelegramMessage {
     pub audio: Option<Audio>,
     /// Attached voice message.
     pub voice: Option<Voice>,
+    /// Attached video note (a round "circle" video clip).
+    pub video_note: Option<VideoNote>,
     /// Attached sticker.
     pub sticker: Option<Sticker>,
     /// The original message this message is a reply to.
@@ -176,6 +178,22 @@ pub struct Voice {
     pub file_id: String,
     /// Unique file identifier that stays the same across re-uploads.
     pub file_unique_id: String,
+    /// Duration in seconds.
+    pub duration: i32,
+    /// File size in bytes.
+    pub file_size: Option<i64>,
+}
+
+/// A Telegram video note: a short round video recorded in the client. It is
+/// always MP4 with an audio track, so it transcribes like a voice message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VideoNote {
+    /// Identifier for downloading the file.
+    pub file_id: String,
+    /// Unique file identifier that stays the same across re-uploads.
+    pub file_unique_id: String,
+    /// Video width and height (video notes are square).
+    pub length: i32,
     /// Duration in seconds.
     pub duration: i32,
     /// File size in bytes.

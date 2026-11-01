@@ -86,7 +86,43 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
             filename: format!("photo_{}.jpg", largest.file_unique_id),
         });
 
-    let (text, audio_ref, input_kind) = derive_message_text(msg)?;
+    let (mut text, audio_ref, input_kind) = derive_message_text(msg)?;
+
+    let mut metadata = serde_json::Map::new();
+    // A slash command is addressed to the bot by definition, mention or not.
+    // Checked before any quote is prepended so the quote can't mask it.
+    if text.trim_start().starts_with('/') {
+        metadata.insert(
+            "addressed_to_bot".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(quoted) = quoted_message(msg) {
+        if let Some(quote_text) = quoted_text(quoted) {
+            let author = quoted
+                .from
+                .as_ref()
+                .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
+                .unwrap_or_else(|| "someone".to_string());
+            text = format!("> {author}: {quote_text}\n{text}");
+        }
+        if let Some(username) = quoted
+            .from
+            .as_ref()
+            .filter(|u| u.is_bot)
+            .and_then(|u| u.username.as_deref())
+        {
+            metadata.insert(
+                "reply_to_bot_username".to_string(),
+                serde_json::Value::String(username.to_string()),
+            );
+        }
+    }
+    let metadata = if metadata.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(metadata)
+    };
 
     let sender_id = msg
         .from
@@ -108,13 +144,61 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
             thread_ts: None,
             attachments: Vec::new(),
             reaction: None,
-            metadata: serde_json::Value::Null,
+            metadata,
             peer_kind,
         },
         audio: audio_ref,
         photo: photo_ref,
         input_kind,
     })
+}
+
+/// The message this one quotes, when it is a real quote.
+///
+/// Telegram attaches `reply_to_message` to every message in a forum topic,
+/// pointing at the topic's creation service message (the root anchor). That
+/// is routing, not a quote, so it is ignored: either the anchor is the
+/// `forum_topic_created` event itself, or it is the topic's root id.
+fn quoted_message(msg: &TelegramMessage) -> Option<&TelegramMessage> {
+    let quoted = msg.reply_to_message.as_deref()?;
+    if quoted.forum_topic_created.is_some() {
+        return None;
+    }
+    if msg.is_topic_message && msg.message_thread_id == Some(quoted.message_id) {
+        return None;
+    }
+    Some(quoted)
+}
+
+/// Readable text of a quoted message: its text or caption, else a short
+/// media label. Binary spill is dropped the same way as on the live message.
+fn quoted_text(quoted: &TelegramMessage) -> Option<String> {
+    let text = quoted
+        .text
+        .as_deref()
+        .or(quoted.caption.as_deref())
+        .filter(|t| !t.is_empty() && !is_binary_content(t));
+    if let Some(text) = text {
+        return Some(text.to_string());
+    }
+    let label = if quoted.photo.is_some() {
+        "[Photo]"
+    } else if quoted.document.is_some() {
+        "[Document]"
+    } else if quoted.video.is_some() {
+        "[Video]"
+    } else if quoted.audio.is_some() {
+        "[Audio]"
+    } else if quoted.voice.is_some() {
+        "[Voice message]"
+    } else if quoted.video_note.is_some() {
+        "[Video note]"
+    } else if quoted.sticker.is_some() {
+        "[Sticker]"
+    } else {
+        return None;
+    };
+    Some(label.to_string())
 }
 
 /// Derive the session-relevant thread id for a Telegram message.
@@ -235,6 +319,21 @@ fn derive_message_text(
         };
         return Some((
             "[Voice message]".to_string(),
+            Some(audio_ref),
+            TelegramInputKind::Voice,
+        ));
+    }
+    if let Some(note) = msg.video_note.as_ref() {
+        // A video note is spoken content in a round clip; its audio track
+        // goes through the same transcription lane as a voice message, and
+        // the placeholder stands in when transcription is off.
+        let audio_ref = TelegramAudioRef {
+            file_id: note.file_id.clone(),
+            mime_type: "video/mp4".to_string(),
+            duration: note.duration,
+        };
+        return Some((
+            "[Video note]".to_string(),
             Some(audio_ref),
             TelegramInputKind::Voice,
         ));
@@ -1039,5 +1138,123 @@ mod tests {
 
         let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "[Video]");
+    }
+
+    fn reply_update(reply_from: serde_json::Value, reply_text: &str, text: &str) -> Update {
+        serde_json::from_value(serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 60,
+                "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                "chat": { "id": -100123, "type": "supergroup" },
+                "date": 1700000000,
+                "message_thread_id": 59,
+                "reply_to_message": {
+                    "message_id": 59,
+                    "from": reply_from,
+                    "chat": { "id": -100123, "type": "supergroup" },
+                    "date": 1699999000,
+                    "text": reply_text
+                },
+                "text": text
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reply_to_bot_records_its_username_and_quotes_the_text() {
+        let update = reply_update(
+            serde_json::json!({ "id": 7, "first_name": "Borg", "username": "borg_bot", "is_bot": true }),
+            "the deploy finished",
+            "and the tests?",
+        );
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "> borg_bot: the deploy finished\nand the tests?");
+        assert_eq!(
+            msg.metadata
+                .get("reply_to_bot_username")
+                .and_then(|v| v.as_str()),
+            Some("borg_bot")
+        );
+        assert!(msg.metadata.get("addressed_to_bot").is_none());
+    }
+
+    #[test]
+    fn reply_to_a_human_quotes_without_bot_metadata() {
+        let update = reply_update(
+            serde_json::json!({ "id": 8, "first_name": "Bob", "is_bot": false }),
+            "lunch?",
+            "sure",
+        );
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "> Bob: lunch?\nsure");
+        assert!(msg.metadata.get("reply_to_bot_username").is_none());
+    }
+
+    #[test]
+    fn slash_command_is_addressed_even_without_mention() {
+        let update = text_update("  /status now");
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(
+            msg.metadata
+                .get("addressed_to_bot")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let update = text_update("status please");
+        let msg = parse_update(&update).unwrap().inbound;
+        assert!(msg.metadata.is_null());
+    }
+
+    #[test]
+    fn forum_topic_root_anchor_is_not_quoted() {
+        let update: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 61,
+                "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
+                "date": 1700000000,
+                "message_thread_id": 5,
+                "is_topic_message": true,
+                "reply_to_message": {
+                    "message_id": 5,
+                    "from": { "id": 7, "first_name": "Borg", "username": "borg_bot", "is_bot": true },
+                    "chat": { "id": -100123, "type": "supergroup", "is_forum": true },
+                    "date": 1699999000,
+                    "forum_topic_created": { "name": "Ops", "icon_color": 0 }
+                },
+                "text": "topic message"
+            }
+        }))
+        .unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "topic message");
+        assert!(msg.metadata.is_null());
+    }
+
+    #[test]
+    fn video_note_returns_audio_ref_for_transcription() {
+        let update: Update = serde_json::from_value(serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 62,
+                "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                "chat": { "id": 42, "type": "private" },
+                "date": 1700000000,
+                "video_note": {
+                    "file_id": "vn1", "file_unique_id": "u9", "length": 240, "duration": 7
+                }
+            }
+        }))
+        .unwrap();
+        let parsed = parse_update(&update).expect("a video note must never be dropped");
+        assert_eq!(parsed.inbound.text, "[Video note]");
+        let audio = parsed.audio.expect("video note carries an audio ref");
+        assert_eq!(audio.file_id, "vn1");
+        assert_eq!(audio.mime_type, "video/mp4");
+        assert_eq!(audio.duration, 7);
+        assert_eq!(parsed.input_kind, TelegramInputKind::Voice);
     }
 }
