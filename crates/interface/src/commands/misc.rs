@@ -168,17 +168,48 @@ pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
             // meant to prevent.
             if let cortex::update::DaemonUpdate::Installed(_) = daemon {
                 println!("Restarting the daemon...");
-                match crate::borgd_launcher::restart_service().await {
-                    Ok(()) => println!("Daemon restarted on {to}."),
-                    Err(e) => {
-                        tracing::warn!("daemon restart after update failed: {e:#}");
-                        println!("Could not restart the daemon ({e}). Run `borg restart`.");
-                    }
+                if let Err(e) = crate::borgd_launcher::restart_service().await {
+                    tracing::warn!("daemon restart after update failed: {e:#}");
+                    anyhow::bail!("Could not restart the daemon ({e:#}). Run `borg restart`.");
                 }
+                // A restart that came back `Ok` is not proof the new build is
+                // the one answering: the daemon the client now reaches is
+                // asked for its version and held to the one just installed.
+                let running = daemon_version_after_restart().await?;
+                check_restarted_daemon_version(&running, &to)?;
+                println!("Daemon restarted on {to}.");
             }
         }
     }
     Ok(())
+}
+
+/// The version the daemon reports after a restart. Failing to ask is an
+/// error, not a shrug: the update's whole point was to get the new build
+/// running, and "restarted" must not be printed on a guess.
+async fn daemon_version_after_restart() -> Result<String> {
+    let mut client = crate::daemon_client::connect(None)
+        .await
+        .context("connect to the restarted daemon to confirm its version")?;
+    let status = client
+        .get_daemon_status()
+        .await
+        .context("Admin.GetDaemonStatus on the restarted daemon")?;
+    Ok(status.version)
+}
+
+/// Holds the daemon the client reaches to the version just installed. A
+/// mismatch usually means another `borgd` (an older one on PATH, or a
+/// service unit pointing at a different binary) answered the restart.
+fn check_restarted_daemon_version(running: &str, installed: &str) -> Result<()> {
+    if running == installed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "The daemon restarted, but it reports version {running}, not {installed}. \
+         Another borgd binary is answering: check `which borgd` and the service unit, \
+         then run `borg restart`."
+    )
 }
 
 pub(crate) async fn run_poke() -> Result<()> {
@@ -423,4 +454,23 @@ pub(crate) fn delete_data_dir(data_dir: &std::path::Path) -> Result<()> {
         std::fs::remove_dir_all(data_dir)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod restarted_daemon_version_tests {
+    use super::check_restarted_daemon_version;
+
+    #[test]
+    fn matching_version_passes() {
+        check_restarted_daemon_version("0.3.0", "0.3.0").expect("same build");
+    }
+
+    #[test]
+    fn mismatch_names_both_versions_and_is_an_error() {
+        let err = check_restarted_daemon_version("0.2.9", "0.3.0").expect_err("different build");
+        let text = err.to_string();
+        assert!(text.contains("0.2.9"), "{text}");
+        assert!(text.contains("0.3.0"), "{text}");
+        assert!(text.contains("borg restart"), "{text}");
+    }
 }

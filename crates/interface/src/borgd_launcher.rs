@@ -412,17 +412,31 @@ pub async fn stop_service() -> Result<()> {
     platform_stop()
 }
 
-/// Restart the daemon: stop (best-effort), wait for the UDS to drop, then
-/// ensure a fresh instance is up. Without the wait, `ensure_running` could
-/// observe the old daemon's still-open socket and short-circuit.
+/// Restart the daemon: stop it, wait for the UDS to drop, then ensure a
+/// fresh instance is up. Without the wait, `ensure_running` could observe
+/// the old daemon's still-open socket and short-circuit.
+///
+/// A daemon that was running and could not be stopped, or one still
+/// answering on its socket after the drain window, is an error: carrying on
+/// would hand back `Ok` while the old process keeps serving, which is the
+/// exact outcome a restart exists to rule out. A daemon that was not
+/// running to begin with is simply started.
 pub async fn restart_service() -> Result<()> {
+    let was_running = daemon_reachable().await;
     if let Err(e) = stop_service().await {
-        tracing::warn!("Stop during restart failed: {e}");
+        if was_running {
+            return Err(e.context("the running daemon could not be stopped"));
+        }
+        tracing::warn!("Stop during restart failed (daemon was not reachable): {e}");
     }
     let drain_deadline = std::time::Instant::now() + RESTART_DRAIN_TIMEOUT;
-    while std::time::Instant::now() < drain_deadline {
-        if !daemon_reachable().await {
-            break;
+    while daemon_reachable().await {
+        if std::time::Instant::now() >= drain_deadline {
+            anyhow::bail!(
+                "the old daemon is still answering on its socket {}s after being told to stop; \
+                 stop it by hand (`borg service stop`) and start it again",
+                RESTART_DRAIN_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(daemon_client::SOCKET_POLL_INTERVAL).await;
     }
