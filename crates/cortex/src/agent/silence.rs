@@ -66,6 +66,30 @@ pub fn is_silent_interactive(text: &str) -> bool {
     is_marker_only(text.trim())
 }
 
+/// Drop a silence marker the model appended beneath a real answer.
+///
+/// The prompt says the marker must never follow content, but models still
+/// close a reply with it ("Here's the summary.\n\n<SILENT>"). Interactive
+/// lanes deliver such a reply (see [`is_silent_interactive`]), so without
+/// this pass the recipient sees the protocol token verbatim. Only a marker
+/// standing alone on the last non-empty line is removed; a marker inside a
+/// line is prose and stays. A marker-only reply is returned unchanged so the
+/// suppression check above keeps its say.
+pub fn strip_trailing_silence_marker(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let Some(last_line_start) = trimmed.rfind('\n').map(|i| i + 1) else {
+        return text.to_string();
+    };
+    if !is_marker_only(trimmed[last_line_start..].trim()) {
+        return text.to_string();
+    }
+    let body = trimmed[..last_line_start].trim_end();
+    if body.is_empty() {
+        return text.to_string();
+    }
+    body.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +148,39 @@ mod tests {
             "the answer is 42",
         ] {
             assert!(!is_silent_interactive(s), "{s:?} should deliver");
+        }
+    }
+
+    #[test]
+    fn trailing_marker_under_real_text_is_stripped() {
+        for (input, expected) in [
+            ("Here's the answer.\n\n<SILENT>", "Here's the answer."),
+            ("Here's the answer.\n[SILENT]\n", "Here's the answer."),
+            (
+                "line one\nline two\n  HEARTBEAT_OK.  ",
+                "line one\nline two",
+            ),
+            ("done\n<SILENT>!", "done"),
+        ] {
+            assert_eq!(strip_trailing_silence_marker(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn marker_inside_a_line_or_alone_is_kept() {
+        for s in [
+            "",
+            "the answer is 42",
+            "[SILENT]",
+            "  <SILENT>  ",
+            "\n\n[SILENT]\n",
+            "status=[SILENT]",
+            "we discussed the <SILENT> token today",
+            "done <SILENT>",
+            "<SILENT>\nhere is the summary",
+            "intro\n[SILENT]\nreal content follows",
+        ] {
+            assert_eq!(strip_trailing_silence_marker(s), s, "{s:?}");
         }
     }
 }

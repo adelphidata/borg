@@ -183,6 +183,35 @@ fn build_retry_policy(channel: &RegisteredChannel) -> RetryPolicy {
 /// addressed the bot (e.g. it stripped the bot's mention token during parsing,
 /// or the platform delivered a dedicated mention event) — the token is no
 /// longer present in `text`, so a substring search here cannot find it.
+/// Whether the adapter already decided this message addressed the bot.
+///
+/// Adapters that strip the mention token (Slack) or see an `app_mention`
+/// set `addressed_to_bot` directly. Adapters that only know the replied-to
+/// sender (Telegram) record `reply_to_bot_username`; it counts as addressing
+/// the bot when it names the bot behind `bot_identifier` (`@name`, compared
+/// case-insensitively), so a reply to the bot's own message needs no mention.
+pub(crate) fn inbound_addressed_to_bot(
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> bool {
+    if inbound
+        .metadata
+        .get("addressed_to_bot")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(bot) = bot_identifier.map(|b| b.trim_start_matches('@')) else {
+        return false;
+    };
+    inbound
+        .metadata
+        .get("reply_to_bot_username")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|u| !bot.is_empty() && u.eq_ignore_ascii_case(bot))
+}
+
 pub fn check_activation(
     text: &str,
     peer_kind: Option<&str>,
@@ -449,11 +478,7 @@ pub(crate) async fn cancel_in_flight_turn(
         inbound.peer_kind.as_deref(),
     );
     let config = &route.config;
-    let pre_addressed = inbound
-        .metadata
-        .get("addressed_to_bot")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
     let (should_respond, _) = check_activation(
         &inbound.text,
         inbound.peer_kind.as_deref(),
@@ -1112,11 +1137,7 @@ async fn invoke_agent_inner(
     );
     let config = &route.config;
 
-    let pre_addressed = inbound
-        .metadata
-        .get("addressed_to_bot")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
     // Subscriptions see every message the adapter let through, mentioned or
     // not, before activation decides whether Borg itself answers. The tap
     // applies this route's sender check before it stores anything.
@@ -1275,6 +1296,11 @@ async fn invoke_agent_inner(
         info!("Channel '{channel_name}': silence marker reply — suppressing delivery");
         return Ok((String::new(), session_id));
     }
+
+    // A marker the model appended beneath a real answer is a protocol token
+    // the recipient must not see. The stored transcript keeps the raw text;
+    // only the delivered copy loses the marker.
+    response_text = cortex::agent::silence::strip_trailing_silence_marker(&response_text);
 
     if response_text.is_empty() {
         response_text = "(no response)".to_string();
@@ -1586,6 +1612,22 @@ mod tests {
             metadata: serde_json::Value::Null,
             peer_kind: None,
         }
+    }
+
+    #[test]
+    fn reply_to_the_bot_counts_as_addressing_it() {
+        let mut msg = inbound("42", None);
+        assert!(!inbound_addressed_to_bot(&msg, Some("@borg_bot")));
+
+        msg.metadata = serde_json::json!({ "reply_to_bot_username": "Borg_Bot" });
+        assert!(inbound_addressed_to_bot(&msg, Some("@borg_bot")));
+        // A reply to some other bot in the group is not for us.
+        assert!(!inbound_addressed_to_bot(&msg, Some("@other_bot")));
+        // Without a known bot identity the reply proves nothing.
+        assert!(!inbound_addressed_to_bot(&msg, None));
+
+        msg.metadata = serde_json::json!({ "addressed_to_bot": true });
+        assert!(inbound_addressed_to_bot(&msg, None));
     }
 
     #[test]
