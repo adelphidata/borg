@@ -92,8 +92,9 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
 /// is dropped here, and a list left with nothing permits no catalog tool at
 /// all rather than widening back to "everything" — an empty policy allow
 /// list means unrestricted, which is the opposite of what the task asked.
-/// Tools without a catalog group (MCP, plugins, runtime tools) follow the
-/// policy's usual rule and are only removed by an explicit deny.
+/// The list is exhaustive: tools without a catalog group (MCP, plugins,
+/// runtime tools) are withheld too unless named, where the policy's usual
+/// rule would let them through.
 fn restrict_task_tools(mut config: Config, task: &cortex::db::ScheduledTaskRow) -> Config {
     let Some(raw) = task.allowed_tools.as_deref() else {
         return config;
@@ -107,6 +108,9 @@ fn restrict_task_tools(mut config: Config, task: &cortex::db::ScheduledTaskRow) 
     if names.is_empty() {
         return config;
     }
+    // Non-catalog names cannot be checked against the operator policy by
+    // name (it only knows them through an explicit deny), so the filter
+    // below keeps a listed MCP or plugin tool unless the policy denies it.
     let mut kept: Vec<String> = names
         .into_iter()
         .filter(|name| cortex::tool::policy::is_permitted(name, &config.tools.policy, false))
@@ -120,6 +124,7 @@ fn restrict_task_tools(mut config: Config, task: &cortex::db::ScheduledTaskRow) 
         kept.push(NO_CATALOG_TOOLS.to_string());
     }
     config.tools.policy.allow = kept;
+    config.tools.policy.allow_is_exhaustive = true;
     config
 }
 
@@ -2850,6 +2855,21 @@ mod scheduled_model_tests {
         assert!(permitted(&config, "read_file"));
         assert!(!permitted(&config, "web_fetch"));
         assert!(!permitted(&config, "schedule"));
+    }
+
+    #[test]
+    fn allowed_tools_binds_mcp_and_plugin_tools_too() {
+        let config = restrict_task_tools(Config::default(), &task_with_tools(Some("read_file")));
+        assert!(permitted(&config, "read_file"));
+        assert!(
+            !permitted(&config, "mcp__github__create_issue"),
+            "a non-catalog tool outside the list must be withheld"
+        );
+        let config = restrict_task_tools(
+            Config::default(),
+            &task_with_tools(Some("read_file, mcp__github__create_issue")),
+        );
+        assert!(permitted(&config, "mcp__github__create_issue"));
     }
 
     #[test]

@@ -39,6 +39,9 @@ fn expand_entries(entries: &[String]) -> HashSet<String> {
 pub struct ResolvedPolicy {
     allowed_groups: HashSet<ToolGroup>,
     explicit_allow: Option<HashSet<String>>,
+    /// `allow` binds non-catalog tools too (see
+    /// `ToolPolicyConfig::allow_is_exhaustive`).
+    allow_is_exhaustive: bool,
     explicit_deny: HashSet<String>,
     subagent_deny: HashSet<String>,
 }
@@ -50,6 +53,7 @@ impl ResolvedPolicy {
         Self {
             allowed_groups: profile.groups(),
             explicit_allow: (!policy.allow.is_empty()).then(|| expand_entries(&policy.allow)),
+            allow_is_exhaustive: policy.allow_is_exhaustive,
             explicit_deny: expand_entries(&policy.deny),
             subagent_deny: expand_entries(&policy.subagent_deny),
         }
@@ -57,7 +61,8 @@ impl ResolvedPolicy {
 
     /// Whether `name` is usable under this policy. `is_subagent` adds the
     /// `subagent_deny` layer. User/MCP/plugin tools (no catalog group) pass
-    /// the profile and allow layers; only an explicit deny removes them.
+    /// the profile and allow layers unless the allow list is exhaustive;
+    /// otherwise only an explicit deny removes them.
     pub fn permits(&self, name: &str, is_subagent: bool) -> bool {
         let group = tool_group(name);
 
@@ -68,9 +73,10 @@ impl ResolvedPolicy {
             }
         }
 
-        // 2. Explicit allow: a catalog tool must be listed; user tools pass.
+        // 2. Explicit allow: a catalog tool must be listed; user tools pass
+        //    unless the list is exhaustive.
         if let Some(allow_set) = &self.explicit_allow {
-            if group.is_some() && !allow_set.contains(name) {
+            if (group.is_some() || self.allow_is_exhaustive) && !allow_set.contains(name) {
                 return false;
             }
         }
@@ -132,6 +138,23 @@ mod tests {
 
     fn make_tool(name: &str) -> ToolDefinition {
         ToolDefinition::new(name, "test", json!({"type": "object", "properties": {}}))
+    }
+
+    #[test]
+    fn exhaustive_allow_binds_non_catalog_tools() {
+        let policy = ToolPolicyConfig {
+            allow: vec!["read_file".to_string()],
+            allow_is_exhaustive: true,
+            ..ToolPolicyConfig::default()
+        };
+        assert!(is_permitted("read_file", &policy, false));
+        assert!(!is_permitted("mcp__github__create_issue", &policy, false));
+        assert!(!is_permitted("run_shell", &policy, false));
+        let lenient = ToolPolicyConfig {
+            allow: vec!["read_file".to_string()],
+            ..ToolPolicyConfig::default()
+        };
+        assert!(is_permitted("mcp__github__create_issue", &lenient, false));
     }
 
     fn default_policy() -> ToolPolicyConfig {
@@ -355,6 +378,7 @@ mod tests {
             allow: vec![],
             deny: vec![],
             subagent_deny: vec![],
+            ..ToolPolicyConfig::default()
         };
         let filtered = filter_tools(tools, &policy);
         assert_eq!(filtered.len(), 3);
@@ -580,6 +604,7 @@ mod tests {
                 allow: to_vec(c.allow),
                 deny: to_vec(c.deny),
                 subagent_deny: to_vec(c.subagent_deny),
+                ..ToolPolicyConfig::default()
             };
             let predicate = is_permitted(c.name, &policy, c.is_subagent);
             let tools = vec![make_tool(c.name)];

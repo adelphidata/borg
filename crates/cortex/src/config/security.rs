@@ -92,6 +92,11 @@ pub struct ToolPolicyConfig {
     pub profile: String,
     /// Explicit allow list (supports `group:xxx` references). Empty = all allowed.
     pub allow: Vec<String>,
+    /// When set, `allow` also binds tools without a catalog group (MCP,
+    /// plugin, and runtime tools), which otherwise pass the allow layer and
+    /// are removed only by an explicit deny. A scheduled task's
+    /// `allowed_tools` sets this so the list means exactly what it says.
+    pub allow_is_exhaustive: bool,
     /// Explicit deny list (supports `group:xxx` references). Deny always wins.
     pub deny: Vec<String>,
     /// Tools denied to subagents.
@@ -103,6 +108,7 @@ impl Default for ToolPolicyConfig {
         Self {
             profile: "full".to_string(),
             allow: Vec::new(),
+            allow_is_exhaustive: false,
             deny: Vec::new(),
             subagent_deny: vec!["schedule".to_string(), "browser".to_string()],
         }
