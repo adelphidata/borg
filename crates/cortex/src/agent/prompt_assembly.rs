@@ -696,7 +696,8 @@ When there IS signal worth saving, extract structured information:
 
 ## User Preferences
 - Corrections, repeated requests, or explicit preferences that should become defaults
-- Evidence > implication format: 'user said/did X -> suggests they want Y by default'
+- Only what the user stated or showed. A one-off request is not a standing preference \
+unless the user said 'always', 'from now on', or stated a like/dislike.
 
 ## Decisions & Facts
 - Decisions made, identifiers (preserve exactly), facts learned about the codebase or environment
@@ -713,6 +714,8 @@ Rules:
 - Preserve exact identifiers, paths, commands, and error messages verbatim.
 - Never store tokens, keys, passwords, or secrets.
 - Overindex on user messages (requests, corrections, interruptions) over assistant messages.
+- Save only facts a user message or a tool result supports. Never infer traits, \
+goals, or habits the conversation does not state. When unsure, leave it out.
 - Omit any section that has no entries.";
 
         let flush_messages = vec![
