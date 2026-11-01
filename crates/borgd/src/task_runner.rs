@@ -83,6 +83,50 @@ fn resolve_scheduled_model(mut config: Config, task: &cortex::db::ScheduledTaskR
     config
 }
 
+/// Narrows the turn's tool policy to the task's `allowed_tools` list, so a
+/// task created with a restriction runs with that restriction instead of
+/// every tool the session would otherwise have. The list is comma-separated
+/// tool names (or `group:` references, as the policy's own allow list takes).
+///
+/// The operator's policy stays the outer bound: a name it already withholds
+/// is dropped here, and a list left with nothing permits no catalog tool at
+/// all rather than widening back to "everything" — an empty policy allow
+/// list means unrestricted, which is the opposite of what the task asked.
+/// Tools without a catalog group (MCP, plugins, runtime tools) follow the
+/// policy's usual rule and are only removed by an explicit deny.
+fn restrict_task_tools(mut config: Config, task: &cortex::db::ScheduledTaskRow) -> Config {
+    let Some(raw) = task.allowed_tools.as_deref() else {
+        return config;
+    };
+    let names: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return config;
+    }
+    let mut kept: Vec<String> = names
+        .into_iter()
+        .filter(|name| cortex::tool::policy::is_permitted(name, &config.tools.policy, false))
+        .collect();
+    if kept.is_empty() {
+        tracing::warn!(
+            task = %task.id,
+            allowed_tools = %raw,
+            "task's allowed_tools names no tool the operator's policy permits; the run gets no catalog tools"
+        );
+        kept.push(NO_CATALOG_TOOLS.to_string());
+    }
+    config.tools.policy.allow = kept;
+    config
+}
+
+/// An allow-list entry that matches no tool. Listing it keeps the policy's
+/// allow layer engaged when a task's `allowed_tools` resolves to nothing.
+const NO_CATALOG_TOOLS: &str = "__no_catalog_tools__";
+
 /// What a run needs resolved before it can execute. Built inside the spawned
 /// task, under `catch_unwind`, so a panic here settles the run row instead of
 /// unwinding the dispatcher and leaving the batch's rows `running`.
@@ -97,12 +141,15 @@ async fn prepare_run(config: Config, task: &cortex::db::ScheduledTaskRow) -> Run
     // Resolve the model this run uses before anything reads `config.llm`:
     // every downstream client (prompt, heartbeat, consolidation) builds from
     // this config, so overriding here covers all of them at one seam.
-    let config = resolve_scheduled_model(config, task);
+    let config = restrict_task_tools(resolve_scheduled_model(config, task), task);
     // A prompt task's turn rebuilds its agent from the live config, so the
-    // same resolution travels with the turn as a pin.
+    // same resolution — and the task's tool allowlist — travels with the
+    // turn as a pin.
     let model_pin = {
         let task = task.clone();
-        cortex::agent::ConfigPin::new(move |config| resolve_scheduled_model(config, &task))
+        cortex::agent::ConfigPin::new(move |config| {
+            restrict_task_tools(resolve_scheduled_model(config, &task), &task)
+        })
     };
     let task_prompt = match task.id.as_str() {
         cortex::daily_summary::DAILY_SUMMARY_TASK_ID => {
@@ -2780,6 +2827,68 @@ mod scheduled_model_tests {
             failure_delivery_channel: None,
             failure_delivery_target: None,
         }
+    }
+
+    fn task_with_tools(allowed: Option<&str>) -> cortex::db::ScheduledTaskRow {
+        let mut task = task_with_pin(None, None);
+        task.allowed_tools = allowed.map(str::to_string);
+        task
+    }
+
+    fn permitted(config: &Config, name: &str) -> bool {
+        cortex::tool::policy::is_permitted(name, &config.tools.policy, false)
+    }
+
+    #[test]
+    fn allowed_tools_narrows_the_turn_policy() {
+        let config = restrict_task_tools(
+            Config::default(),
+            &task_with_tools(Some("run_shell, read_file")),
+        );
+        assert_eq!(config.tools.policy.allow, vec!["run_shell", "read_file"]);
+        assert!(permitted(&config, "run_shell"));
+        assert!(permitted(&config, "read_file"));
+        assert!(!permitted(&config, "web_fetch"));
+        assert!(!permitted(&config, "schedule"));
+    }
+
+    #[test]
+    fn no_allowed_tools_leaves_the_policy_alone() {
+        for raw in [None, Some(""), Some(" , ")] {
+            let config = restrict_task_tools(Config::default(), &task_with_tools(raw));
+            assert!(config.tools.policy.allow.is_empty(), "{raw:?}");
+            assert!(permitted(&config, "web_fetch"), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_tools_cannot_exceed_the_operator_policy() {
+        let mut base = Config::default();
+        base.tools.policy.deny = vec!["run_shell".to_string()];
+        let config = restrict_task_tools(base, &task_with_tools(Some("run_shell,read_file")));
+        assert_eq!(config.tools.policy.allow, vec!["read_file"]);
+        assert!(!permitted(&config, "run_shell"));
+    }
+
+    #[test]
+    fn allowed_tools_with_nothing_permitted_opens_no_tool() {
+        let mut base = Config::default();
+        base.tools.policy.deny = vec!["run_shell".to_string()];
+        let config = restrict_task_tools(base, &task_with_tools(Some("run_shell")));
+        assert!(!permitted(&config, "run_shell"));
+        assert!(!permitted(&config, "read_file"));
+        assert!(!permitted(&config, "web_fetch"));
+    }
+
+    #[test]
+    fn the_pin_carries_the_tool_restriction() {
+        let task = task_with_tools(Some("read_file"));
+        let pin = cortex::agent::ConfigPin::new(move |config| {
+            restrict_task_tools(resolve_scheduled_model(config, &task), &task)
+        });
+        let config = pin.apply(Config::default());
+        assert!(permitted(&config, "read_file"));
+        assert!(!permitted(&config, "run_shell"));
     }
 
     fn config_with(model: &str, fleet: Option<&str>) -> Config {
