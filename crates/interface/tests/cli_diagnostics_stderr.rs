@@ -81,8 +81,12 @@ fn non_tui_diagnostics_go_to_stderr_not_stdout() {
     );
 
     let marker = "Auto-start borgd:";
+    // The stub exits at once, so the launcher reports its exit status; a
+    // stub that lingered would get the "never became reachable" form.
     assert!(
-        stderr.contains(marker) && stderr.contains("never became reachable"),
+        stderr.contains(marker)
+            && (stderr.contains("before its UDS came up")
+                || stderr.contains("never became reachable")),
         "expected the launcher warning on stderr; stderr:\n{stderr}\nstdout:\n{stdout}"
     );
     assert!(

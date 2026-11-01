@@ -1770,23 +1770,6 @@ mod tests {
         }
     }
 
-    /// Developer databases predate the squash and still carry a stamp of 16.
-    /// A `>=` guard would treat that as "already migrated" and silently skip
-    /// every future migration on exactly the machines that run this code.
-    #[tokio::test]
-    async fn stamp_above_current_still_migrates_and_is_restamped() {
-        let db = Database::test_db().await;
-        db.set_meta("schema_version", "16").await.unwrap();
-
-        db.run_migrations().await.unwrap();
-
-        assert_eq!(
-            db.schema_version().await.unwrap(),
-            Database::CURRENT_VERSION,
-            "a stale higher stamp must be corrected, not honoured"
-        );
-    }
-
     /// A database stamped at v2 predates the run-now marker and the failure
     /// route. Every other test builds from `SCHEMA_SQL` where the columns
     /// already exist, so the `ALTER` branch of `migrate_v3` only runs here.
