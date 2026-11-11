@@ -2859,17 +2859,51 @@ fn bang_mid_message_is_a_normal_user_message() {
     // A `contains('!')` implementation fails this — and would silently turn
     // ordinary prose into shell commands.
     let mut app = make_app();
-    for input in [
-        "tell me about !important",
-        "what does foo!() do?",
-        "wow!",
-        " !leading-space-first",
-    ] {
+    for input in ["tell me about !important", "what does foo!() do?", "wow!"] {
         assert!(
             app.try_handle_command(input).is_none(),
             "{input:?} must reach the LLM as a message"
         );
     }
+}
+
+/// Only a `!` in column 0 enters shell mode. Submission trims the line, so
+/// whitespace before the `!` — what editing away a leading word leaves — must
+/// be judged before trimming, or the prose runs as a shell command.
+#[test]
+fn submitted_bang_must_sit_in_column_zero() {
+    let mut app = make_app();
+    match app.handle_submit("!ls -la\n").unwrap() {
+        AppAction::ExecShell { command } => assert_eq!(command, "ls -la"),
+        _ => panic!("a column-0 `!` runs its command"),
+    }
+
+    for input in [" !important: ship it", "\t!! urgent"] {
+        let mut app = make_app();
+        let action = app.handle_submit(input).unwrap();
+        assert!(
+            !matches!(action, AppAction::ExecShell { .. }),
+            "{input:?} must not run as a shell command"
+        );
+        assert!(
+            app.cells
+                .iter()
+                .any(|c| matches!(c, HistoryCell::User { text } if text == input)),
+            "{input:?} must reach the model as a message"
+        );
+    }
+
+    // Through the composer, whose Enter used to trim the `!` into column 0.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = make_app();
+    app.composer.set_text(" !important: ship it");
+    let action = app
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !matches!(action, AppAction::ExecShell { .. }),
+        "a typed spaced `!` must not run as a shell command"
+    );
 }
 
 #[test]

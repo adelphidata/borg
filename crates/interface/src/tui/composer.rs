@@ -454,14 +454,17 @@ impl<'a> Composer<'a> {
                 }
 
                 let text: String = self.textarea.lines().join("\n");
-                let trimmed = text.trim().to_string();
+                let trimmed = text.trim();
                 if trimmed.is_empty() {
                     return None;
                 }
-                self.history.push_persistent(&trimmed);
+                self.history.push_persistent(trimmed);
+                // Leading whitespace is kept: submission must see whether a
+                // `!` sits in column 0 before deciding on shell mode.
+                let submitted = text.trim_end().to_string();
                 self.textarea.select_all();
                 self.textarea.cut();
-                Some(trimmed)
+                Some(submitted)
             }
             (KeyCode::Enter, m)
                 if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) =>
