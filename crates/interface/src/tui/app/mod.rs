@@ -405,7 +405,7 @@ pub enum AppAction {
     ForkSession,
     ClearHistory,
     /// Purge terminal scrollback + visible screen without touching daemon
-    /// conversation state. Used by Ctrl+L.
+    /// conversation state or the Ctrl+T transcript. Used by Ctrl+L.
     ClearTranscript,
     UndoLastTurn,
     /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
