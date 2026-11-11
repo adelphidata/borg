@@ -498,22 +498,8 @@ async fn submodule_work_is_saved(worktree_path: &Path, repo_root: &Path) -> Resu
     let top = worktree_path
         .canonicalize()
         .with_context(|| format!("resolving {}", worktree_path.display()))?;
-    // `$toplevel/$sm_path` is absolute, quoted, and NUL-terminated, so a
-    // repository-chosen submodule path cannot split or inject anything.
-    let listing = run_git(
-        &[
-            "submodule",
-            "foreach",
-            "--quiet",
-            "--recursive",
-            r#"printf '%s/%s\0' "$toplevel" "$sm_path""#,
-        ],
-        &top,
-    )
-    .await
-    .context("listing the worktree's submodules")?;
-    for submodule in listing.split('\0').filter(|p| !p.is_empty()) {
-        let dir = PathBuf::from(submodule);
+    for dir in initialized_submodules(&top).await? {
+        let submodule = dir.display();
         let rel = dir
             .strip_prefix(&top)
             .with_context(|| format!("submodule {submodule} lies outside the worktree"))?;
@@ -592,23 +578,56 @@ fn occupied_by(cwd: &Path, worktree_path: &Path) -> Option<std::path::PathBuf> {
     cwd.starts_with(&target).then_some(cwd)
 }
 
-/// Whether `worktree_path` has staged, unstaged, or untracked changes.
+/// Whether `worktree_path`, or any initialized submodule in it, has staged,
+/// unstaged, or untracked changes.
 async fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool> {
     if !worktree_path.exists() {
         // Its directory is gone, so there is nothing to lose by removing the
         // administrative entry.
         return Ok(false);
     }
-    // `--ignore-submodules=none` so a repository's `submodule.<name>.ignore`
-    // cannot hide edits inside a submodule; it is also the check git itself
-    // makes before removing a worktree.
-    let status = run_git_neutralized(
-        &["status", "--porcelain", "--ignore-submodules=none"],
-        worktree_path,
+    // A submodule reads its own config, so a status that descends into one
+    // would run any filter driver it names that the superproject's discovery
+    // never saw. Each checkout is scanned on its own instead, so its filters
+    // are discovered and neutralized there. An explicit `--ignore-submodules`
+    // also overrides a repository's `submodule.<name>.ignore`, so a submodule
+    // moved to another commit still counts.
+    let mut checkouts = vec![worktree_path.to_path_buf()];
+    checkouts.extend(initialized_submodules(worktree_path).await?);
+    for dir in &checkouts {
+        let status =
+            run_git_neutralized(&["status", "--porcelain", "--ignore-submodules=dirty"], dir)
+                .await
+                .with_context(|| format!("checking status of {}", dir.display()))?;
+        if !status.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Every initialized submodule under `dir`, nested ones included, as the
+/// absolute paths git reports.
+async fn initialized_submodules(dir: &Path) -> Result<Vec<PathBuf>> {
+    // `$toplevel/$sm_path` is absolute, quoted, and NUL-terminated, so a
+    // repository-chosen submodule path cannot split or inject anything.
+    let listing = run_git(
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            r#"printf '%s/%s\0' "$toplevel" "$sm_path""#,
+        ],
+        dir,
     )
     .await
-    .with_context(|| format!("checking status of {}", worktree_path.display()))?;
-    Ok(!status.trim().is_empty())
+    .with_context(|| format!("listing the submodules of {}", dir.display()))?;
+    Ok(listing
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect())
 }
 
 /// Drop administrative entries whose checkout directory no longer exists.
@@ -1719,6 +1738,66 @@ branch refs/heads/side
                 }
             }
             assert!(repo.join("a.txt").exists(), "{case}: main checkout intact");
+        }
+    }
+
+    /// A submodule's own config can name a filter driver the superproject's
+    /// discovery never reads. Checking the worktree for uncommitted work must
+    /// not run it, and a clean worktree must still be removed. Uncommitted
+    /// edits inside the submodule must still block removal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_never_runs_a_submodule_content_filter() {
+        use crate::git::test_support::{arm_evil_local_filter, git, touch_forward};
+        for dirty in [false, true] {
+            let (tmp, repo, root) = fixture();
+            let sub = tmp.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            init_repo(&sub);
+            let sub_url = sub.to_string_lossy().to_string();
+            let file_ok = ["-c", "protocol.file.allow=always"];
+            git(
+                &repo,
+                &[&file_ok[..], &["submodule", "add", "-q", &sub_url, "sm"]].concat(),
+            );
+            git(&repo, &["commit", "-qm", "add submodule"]);
+            let wt = add(
+                &repo,
+                &root,
+                &AddOptions {
+                    name: "withsub".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            git(
+                &wt.path,
+                &[&file_ok[..], &["submodule", "update", "--init", "-q"]].concat(),
+            );
+            let sm = wt.path.join("sm");
+            let sentinel = arm_evil_local_filter(&sm, tmp.path());
+            touch_forward(&sm.join("a.txt"));
+            if dirty {
+                std::fs::write(sm.join("b.txt"), "untracked\n").unwrap();
+            }
+
+            let result = remove(&repo, &root, "withsub", false).await;
+            assert!(
+                !sentinel.exists(),
+                "dirty={dirty}: a submodule clean filter ran during remove"
+            );
+            if dirty {
+                let err = result.expect_err("an untracked submodule file is work to lose");
+                assert!(
+                    format!("{err:#}").contains("uncommitted changes"),
+                    "{err:#}"
+                );
+                assert!(wt.path.exists());
+            } else {
+                result.unwrap_or_else(|e| panic!("a clean worktree must remove: {e:#}"));
+                assert!(!wt.path.exists());
+            }
         }
     }
 }
