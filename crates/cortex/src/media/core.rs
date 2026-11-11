@@ -174,11 +174,7 @@ pub fn compress_image_bytes(
 fn compress_decoded_image(bytes: &[u8], max_bytes: usize) -> Result<(String, String)> {
     let engine = base64::engine::general_purpose::STANDARD;
 
-    let img = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|e| anyhow::anyhow!("failed to guess image format: {e}"))?
-        .decode()
-        .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?;
+    let img = decode_upright(bytes)?;
 
     // Grid search: dimensions × quality
     for &dim in DIMENSION_STEPS {
@@ -206,6 +202,31 @@ fn compress_decoded_image(bytes: &[u8], max_bytes: usize) -> Result<(String, Str
         .map_err(|e| anyhow::anyhow!("JPEG encode failed: {e}"))?;
     let b64 = engine.encode(buf.into_inner());
     Ok((b64, "image/jpeg".to_string()))
+}
+
+/// Decode `bytes` with the camera's orientation tag applied to the pixels.
+///
+/// Re-encoding writes no EXIF, so a photo stored on its side and tagged to be
+/// displayed rotated would otherwise reach the model on its side.
+fn decode_upright(bytes: &[u8]) -> Result<image::DynamicImage> {
+    use image::{metadata::Orientation, ImageDecoder};
+    let mut decoder = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| anyhow::anyhow!("failed to guess image format: {e}"))?
+        .into_decoder()
+        .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?;
+    // The allocation guard `ImageReader::decode` applies before decoding.
+    image::Limits::default()
+        .reserve(decoder.total_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?;
+    let orientation = decoder.orientation().unwrap_or_else(|e| {
+        warn!("reading image orientation failed; leaving it as stored: {e}");
+        Orientation::NoTransforms
+    });
+    let mut img = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
 /// True when `mime_type` names a video container Gemini accepts via inline_data.
@@ -510,5 +531,42 @@ mod tests {
         // Small image should pass through unchanged
         assert_eq!(data, b64);
         assert_eq!(mime, "image/jpeg");
+    }
+
+    /// A camera stores a portrait photo landscape and tags it to be shown
+    /// rotated. The decode that feeds re-encoding must apply that tag, and an
+    /// untagged image must come out as stored.
+    #[test]
+    fn decode_upright_applies_the_exif_orientation() {
+        use image::ImageEncoder;
+        // Big-endian TIFF holding one IFD entry: Orientation (0x0112), SHORT.
+        let exif = |orientation: u8| -> Vec<u8> {
+            let mut tiff = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+            tiff.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0]);
+            tiff
+        };
+        // (EXIF orientation, expected decoded width × height); stored 64 × 32.
+        for (tag, want) in [(None, (64, 32)), (Some(6), (32, 64)), (Some(3), (64, 32))] {
+            let mut jpeg = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg);
+            if let Some(tag) = tag {
+                encoder.set_exif_metadata(exif(tag)).unwrap();
+            }
+            // Left half black, right half white, so a rotation is visible.
+            let pixels: Vec<u8> = (0..32 * 64)
+                .flat_map(|i| [if i % 64 < 32 { 0 } else { 255 }; 3])
+                .collect();
+            encoder
+                .write_image(&pixels, 64, 32, image::ExtendedColorType::Rgb8)
+                .unwrap();
+
+            let img = decode_upright(&jpeg).unwrap();
+            assert_eq!((img.width(), img.height()), want, "orientation {tag:?}");
+            if tag == Some(3) {
+                // 180°: the white half now sits on the left.
+                let left = img.to_luma8().get_pixel(4, 16).0[0];
+                assert!(left > 200, "orientation 3 must turn the image over");
+            }
+        }
     }
 }
