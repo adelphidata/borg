@@ -1277,30 +1277,35 @@ fn try_paste_clipboard_image(composer: &mut Composer) -> bool {
     }
 
     if let Ok(text) = clipboard.get_text() {
-        let trimmed = text.trim();
-        let path = std::path::Path::new(trimmed);
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_lower = ext.to_lowercase();
-            const IMG_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif"];
-            if IMG_EXTS.contains(&ext_lower.as_str()) && path.exists() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    let mime = match ext_lower.as_str() {
-                        "png" => "image/png",
-                        "jpg" | "jpeg" => "image/jpeg",
-                        "gif" => "image/gif",
-                        "webp" => "image/webp",
-                        "bmp" => "image/bmp",
-                        "heic" | "heif" => "image/heic",
-                        _ => "application/octet-stream",
-                    };
-                    composer.add_image(bytes, mime.to_string());
-                    return true;
-                }
-            }
+        if let Some((bytes, mime)) = read_pasted_image_path(&text) {
+            composer.add_image(bytes, mime.to_string());
+            return true;
         }
     }
 
     false
+}
+
+/// The image `text` names, with its MIME type, when `text` is the path of a
+/// regular image file within the attachment size cap. Anything else pastes as
+/// text: a FIFO or device that merely ends in `.png` would block its first
+/// read, and this runs on the TUI's input loop.
+fn read_pasted_image_path(text: &str) -> Option<(Vec<u8>, &'static str)> {
+    let path = std::path::Path::new(text.trim());
+    let mime = match path.extension()?.to_str()?.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "heic" | "heif" => "image/heic",
+        _ => return None,
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > cortex::constants::MAX_IMAGE_FILE_SIZE as u64 {
+        return None;
+    }
+    Some((std::fs::read(path).ok()?, mime))
 }
 
 /// Convert raw RGBA pixel data to PNG bytes.

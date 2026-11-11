@@ -2022,6 +2022,43 @@ fn ctrl_l_emits_clear_transcript_action() {
     assert!(app.pending_scrollback.is_empty());
 }
 
+/// A pasted path becomes an image attachment only when it names a regular
+/// image file within the size cap. A FIFO named like an image would block the
+/// input loop on its first read, so it — like an oversized file — must paste
+/// as plain text, and return at once.
+#[cfg(unix)]
+#[test]
+fn pasted_image_path_attaches_only_regular_files_within_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let photo = tmp.path().join("photo.PNG");
+    std::fs::write(&photo, b"png bytes").unwrap();
+    let fifo = tmp.path().join("pipe.png");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let huge = tmp.path().join("huge.jpg");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(cortex::constants::MAX_IMAGE_FILE_SIZE as u64 + 1)
+        .unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, b"text").unwrap();
+
+    let pasted = format!("  {}\n", photo.display());
+    assert_eq!(
+        read_pasted_image_path(&pasted),
+        Some((b"png bytes".to_vec(), "image/png"))
+    );
+    for path in [&fifo, &huge, &notes, &tmp.path().join("missing.png")] {
+        assert_eq!(
+            read_pasted_image_path(&path.display().to_string()),
+            None,
+            "{} must paste as text",
+            path.display()
+        );
+    }
+}
+
 /// Ctrl+L clears the screen, not the conversation: earlier exchanges stay in
 /// the transcript Ctrl+T pages through, and output still streaming into the
 /// live viewport keeps its place.
