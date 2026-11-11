@@ -1124,7 +1124,16 @@ impl<'a> App<'a> {
             Some(s) => s.as_str(),
             None => input,
         };
-        if expanded_owned.is_none() {
+        // Shell mode needs its `!` in column 0. Whitespace before it is what
+        // editing away a leading word tends to leave, so that line stays a
+        // message for the model.
+        let spaced_bang = !input.starts_with('!') && input.trim_start().starts_with('!');
+        let input = if spaced_bang {
+            input
+        } else {
+            input.trim_start()
+        };
+        if expanded_owned.is_none() && !spaced_bang {
             if let Some(result) = self.try_handle_command(input.trim()) {
                 return result;
             }
