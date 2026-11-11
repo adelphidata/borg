@@ -279,8 +279,11 @@ impl Transport for GeminiTransport {
 /// so the unit tests can exercise it end-to-end without spawning the
 /// transport.
 fn build_gemini_request(request: &TransportRequest<'_>) -> Value {
+    // A `functionCall` turn needs its `functionResponse` turn; a resumed
+    // history can carry a call the session log never answered.
+    let answered = super::anthropic::answer_unanswered_tool_calls(request.messages);
     let (contents, system_instruction) =
-        build_contents_and_system(request.messages, ReplayShape::for_model(request.model));
+        build_contents_and_system(&answered, ReplayShape::for_model(request.model));
 
     let mut body = json!({
         "contents": contents,
@@ -1381,6 +1384,28 @@ mod tests {
             reasoning_content: None,
             reasoning_model: None,
         }
+    }
+
+    /// A resumed history can carry a call the session log never answered.
+    /// Gemini rejects a `functionCall` turn with no `functionResponse` turn
+    /// after it, so the request must supply one before the next message.
+    #[test]
+    fn build_request_answers_a_call_the_log_never_answered() {
+        let msgs = vec![
+            Message::user("go"),
+            assistant_call("call_1", "run_shell"),
+            Message::user("next"),
+        ];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&msgs, None, &cfg));
+
+        let contents = body["contents"].as_array().unwrap();
+        let fr = &contents[2]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "run_shell", "{body}");
+        assert_eq!(
+            fr["response"]["content"],
+            crate::constants::TOOL_INTERRUPTED_NO_RESULT
+        );
     }
 
     /// The model-turn part carrying the replayed `functionCall`, and the
