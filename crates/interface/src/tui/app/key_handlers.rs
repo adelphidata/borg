@@ -511,13 +511,13 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+L — clear visual transcript
+        // Ctrl+L — clear the screen. `cells` is the transcript Ctrl+T pages
+        // through, so it keeps every earlier exchange; only what is queued for
+        // the terminal goes, and a fresh header starts the cleared display.
         if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.cells.clear();
-            self.cells_emitted = 0;
             self.pending_scrollback.clear();
             self.banner_emitted = false;
-            self.toast_info("Transcript cleared");
+            self.toast_info("Screen cleared — Ctrl+T shows earlier messages");
             return Ok(AppAction::ClearTranscript);
         }
 

@@ -2022,6 +2022,34 @@ fn ctrl_l_emits_clear_transcript_action() {
     assert!(app.pending_scrollback.is_empty());
 }
 
+/// Ctrl+L clears the screen, not the conversation: earlier exchanges stay in
+/// the transcript Ctrl+T pages through, and output still streaming into the
+/// live viewport keeps its place.
+#[test]
+fn ctrl_l_keeps_earlier_exchanges_for_the_transcript_pager() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = make_app();
+    app.cells.push(HistoryCell::User {
+        text: "before the clear".to_string(),
+    });
+    app.flush_cell_range_to_scrollback(0, 1, 80);
+    app.push_system_message("still live".to_string());
+
+    let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+    app.handle_key(key).expect("ctrl+l handled");
+
+    assert!(
+        matches!(&app.cells[0], HistoryCell::User { text } if text == "before the clear"),
+        "the earlier exchange must survive for Ctrl+T"
+    );
+    assert_eq!(app.cells.len(), 2, "the live cell keeps its place");
+    assert_eq!(app.cells_emitted, 1, "only the live cell is left to draw");
+    assert!(
+        !app.banner_emitted,
+        "the cleared display starts with a header"
+    );
+}
+
 // --- Popup vs Streaming: paste/key must never leak to composer ---
 
 #[test]
