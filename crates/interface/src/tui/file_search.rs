@@ -160,9 +160,14 @@ fn walk_fuzzy(query: &str, cwd: &Path, blocked_paths: &[String]) -> Vec<FileMatc
         .hidden(true)
         .build();
 
-    let mut out = Vec::new();
+    // Files whose own name matches are ranked ahead of files that match only
+    // through a directory, before the cap applies: in walk order, a directory
+    // named like the query would fill every slot and hide the files actually
+    // named like it. The walk stops once enough names match.
+    let mut by_name: Vec<(NameMatch, FileMatch)> = Vec::new();
+    let mut by_dir: Vec<FileMatch> = Vec::new();
     for entry in walker.flatten() {
-        if out.len() >= MAX_RESULTS {
+        if by_name.len() >= MAX_RESULTS {
             break;
         }
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -176,15 +181,50 @@ fn walk_fuzzy(query: &str, cwd: &Path, blocked_paths: &[String]) -> Vec<FileMatc
         if is_blocked(path, blocked_paths) {
             continue;
         }
-        if query_lower.is_empty() || rel.to_lowercase().contains(&query_lower) {
-            out.push(FileMatch {
-                display: rel.to_string(),
-                full_path: path.to_path_buf(),
-                is_dir: false,
-            });
+        let found = || FileMatch {
+            display: rel.to_string(),
+            full_path: path.to_path_buf(),
+            is_dir: false,
+        };
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if let Some(rank) = NameMatch::of(&name, &query_lower) {
+            by_name.push((rank, found()));
+        } else if by_dir.len() < MAX_RESULTS && rel.to_lowercase().contains(&query_lower) {
+            by_dir.push(found());
         }
     }
-    out
+    // Stable, so walk order holds within a rank.
+    by_name.sort_by_key(|(rank, _)| *rank);
+    by_name
+        .into_iter()
+        .map(|(_, found)| found)
+        .chain(by_dir)
+        .take(MAX_RESULTS)
+        .collect()
+}
+
+/// How a file's own name matches a bare-name query, strongest first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NameMatch {
+    Exact,
+    Prefix,
+    Contains,
+}
+
+impl NameMatch {
+    /// Both sides already lowercased. An empty query is a prefix of every
+    /// name, so it lists files in walk order.
+    fn of(name: &str, query: &str) -> Option<Self> {
+        if name == query {
+            Some(Self::Exact)
+        } else if name.starts_with(query) {
+            Some(Self::Prefix)
+        } else if name.contains(query) {
+            Some(Self::Contains)
+        } else {
+            None
+        }
+    }
 }
 
 fn walk_path(query: &str, cwd: &Path, blocked_paths: &[String]) -> Vec<FileMatch> {
@@ -280,6 +320,48 @@ mod tests {
                 Err(_) => return None,
             }
         }
+    }
+
+    /// A directory named like the query must not crowd the files named like
+    /// it out of the capped list: those rank first — exact name, then prefix,
+    /// then contains — and directory-only matches fill what is left.
+    #[test]
+    fn fuzzy_walk_ranks_filename_matches_above_directory_matches() {
+        let tmp = TempDir::new().unwrap();
+        let crowd = tmp.path().join("viewmodels");
+        fs::create_dir(&crowd).unwrap();
+        for i in 0..MAX_RESULTS + 10 {
+            fs::write(crowd.join(format!("item{i}.rs")), "x").unwrap();
+        }
+        let lib = tmp.path().join("lib");
+        fs::create_dir(&lib).unwrap();
+        for name in [
+            "ChatViewModel.kt",
+            "viewmodel_test.rs",
+            "viewmodel",
+            "other.rs",
+        ] {
+            fs::write(lib.join(name), "x").unwrap();
+        }
+
+        let found = run_walk("ViewModel", tmp.path(), &[]);
+        let names: Vec<String> = found
+            .iter()
+            .map(|m| {
+                m.full_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names[..3],
+            ["viewmodel", "viewmodel_test.rs", "ChatViewModel.kt"],
+            "{names:?}"
+        );
+        assert_eq!(found.len(), MAX_RESULTS, "directory matches fill the rest");
+        assert!(found[3..].iter().all(|m| m.full_path.starts_with(&crowd)));
     }
 
     #[tokio::test]
