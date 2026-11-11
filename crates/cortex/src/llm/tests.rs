@@ -2703,6 +2703,85 @@ fn repair_unions_tool_calls_when_merging_assistants() {
     assert_eq!(repaired[0].tool_calls.as_ref().unwrap().len(), 2);
 }
 
+/// A daemon stopped mid-tool leaves calls the session log never answered.
+/// Each must get a synthetic result directly after the results its turn did
+/// get — before the next message — while a call answered anywhere, even out
+/// of place, gets no second result.
+#[test]
+fn repair_answers_tool_calls_the_log_never_answered() {
+    let two_calls = Message {
+        tool_calls: Some(vec![
+            repair_asst_tool_call("call_1")
+                .tool_calls
+                .unwrap()
+                .remove(0),
+            repair_asst_tool_call("call_2")
+                .tool_calls
+                .unwrap()
+                .remove(0),
+        ]),
+        ..repair_asst_tool_call("call_1")
+    };
+    /// `(role, tool_call_id)` of each message, in order.
+    type Shape<'a> = Vec<(Role, Option<&'a str>)>;
+    // (case, history, expected shape after repair)
+    let cases: Vec<(&str, Vec<Message>, Shape)> = vec![
+        (
+            "second of two calls unanswered",
+            vec![
+                Message::user("a"),
+                two_calls,
+                Message::tool_result("call_1", "r1"),
+                Message::user("continue"),
+            ],
+            vec![
+                (Role::User, None),
+                (Role::Assistant, None),
+                (Role::Tool, Some("call_1")),
+                (Role::Tool, Some("call_2")),
+                (Role::User, None),
+            ],
+        ),
+        (
+            "history ends on the call",
+            vec![Message::user("a"), repair_asst_tool_call("call_1")],
+            vec![
+                (Role::User, None),
+                (Role::Assistant, None),
+                (Role::Tool, Some("call_1")),
+            ],
+        ),
+        (
+            "answered out of place",
+            vec![
+                repair_asst_tool_call("call_1"),
+                Message::user("steer"),
+                Message::tool_result("call_1", "late"),
+            ],
+            vec![
+                (Role::Assistant, None),
+                (Role::User, None),
+                (Role::Tool, Some("call_1")),
+            ],
+        ),
+    ];
+    for (case, history, expected) in cases {
+        let repaired = repair_message_sequence(&history);
+        let shape: Shape = repaired
+            .iter()
+            .map(|m| (m.role.clone(), m.tool_call_id.as_deref()))
+            .collect();
+        assert_eq!(shape, expected, "{case}");
+        let synthetic = repaired
+            .iter()
+            .filter(|m| m.text_content() == Some(crate::constants::TOOL_INTERRUPTED_NO_RESULT))
+            .count();
+        let original = history.iter().filter(|m| m.role == Role::Tool).count();
+        let added = expected.iter().filter(|(r, _)| *r == Role::Tool).count() - original;
+        assert_eq!(synthetic, added, "{case}: only the gaps get the stub");
+    }
+}
+
 #[test]
 fn repair_leaves_well_formed_history_unchanged() {
     // The common case: a valid live-loop history must pass through untouched so

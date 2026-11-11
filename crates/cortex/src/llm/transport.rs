@@ -1509,8 +1509,10 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
     let mut bedrock_messages = Vec::new();
     let mut system_blocks = Vec::new();
 
-    // Same Claude image ceiling as the native route; outgoing copy only.
-    let outgoing = super::anthropic::retire_excess_images(request.messages);
+    // Converse, like the native route, rejects a `toolUse` with no
+    // `toolResult`; then the same Claude image ceiling. Outgoing copy only.
+    let answered = super::anthropic::answer_unanswered_tool_calls(request.messages);
+    let outgoing = super::anthropic::retire_excess_images(&answered);
     for message in outgoing.iter() {
         match message.role {
             Role::System => {
@@ -3150,6 +3152,32 @@ mod tests {
                 "empty content array would 400 at Converse; body: {body}"
             );
         }
+    }
+
+    /// A resumed history can carry a call the session log never answered,
+    /// and Converse rejects a `toolUse` with no `toolResult` after it.
+    #[test]
+    fn bedrock_answers_a_tool_call_the_log_never_answered() {
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![crate::types::ToolCall {
+            id: "call_7".to_string(),
+            call_type: "function".to_string(),
+            function: crate::types::FunctionCall {
+                name: "run_shell".to_string(),
+                arguments: r#"{"command":"pwd"}"#.to_string(),
+            },
+        }]);
+        let messages = vec![Message::user("go"), call, Message::user("next")];
+        let body = build_bedrock_request(&bedrock_request(&messages));
+
+        let results: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block["toolResult"]["toolUseId"].as_str())
+            .collect();
+        assert_eq!(results, vec!["call_7"], "{body}");
     }
 
     #[test]

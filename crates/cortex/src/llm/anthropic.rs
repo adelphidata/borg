@@ -48,7 +48,7 @@ pub(super) fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
 /// OpenAI-compatible providers (DeepSeek, Kimi, OpenRouter, …). Live turns are
 /// already well-formed — the live loop substitutes synthetic tool results at
 /// dispatch — so this guards histories reconstructed from the session log or
-/// carried across a provider fallback, where three invalid shapes arise and
+/// carried across a provider fallback, where four invalid shapes arise and
 /// 400 the request:
 ///
 /// 1. **Duplicate `tool_call_id`** — a resumed or merged history can repeat an
@@ -64,11 +64,77 @@ pub(super) fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
 /// 3. **Consecutive `assistant` turns** — two adjacent assistant messages with
 ///    no intervening tool/user message (an interrupted turn re-appended on
 ///    resume). Coalesced into one: text joined, `tool_calls` unioned.
+/// 4. **Unanswered tool call** — see [`answer_unanswered_tool_calls`].
 ///
 /// A well-formed history is returned unchanged — every pass is a no-op on it.
 pub(super) fn repair_message_sequence(messages: &[Message]) -> Vec<Message> {
     let coalesced = coalesce_consecutive_assistants(messages);
-    prune_tool_call_ids(&coalesced)
+    let pruned = prune_tool_call_ids(&coalesced);
+    match answer_unanswered_tool_calls(&pruned) {
+        std::borrow::Cow::Borrowed(_) => pruned,
+        std::borrow::Cow::Owned(answered) => answered,
+    }
+}
+
+/// Give each assistant `tool_call` that no `tool` message answers a synthetic
+/// result, placed after the results its turn did get.
+///
+/// The loop persists a step's assistant message before running its tools and
+/// each result as it finishes, so a daemon stopped mid-tool leaves a call the
+/// session log never answers. Every provider rejects that history, so the
+/// resumed session would fail on every later request. A call answered
+/// anywhere, even out of place, is left alone: a second result would trade the
+/// gap for a duplicate id. Borrowed back unchanged when nothing is missing.
+pub(super) fn answer_unanswered_tool_calls(
+    messages: &[Message],
+) -> std::borrow::Cow<'_, [Message]> {
+    use std::collections::HashSet;
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    fn calls(m: &Message) -> &[crate::types::ToolCall] {
+        match (&m.role, &m.tool_calls) {
+            (Role::Assistant, Some(calls)) => calls,
+            _ => &[],
+        }
+    }
+    let unanswered = |m: &Message| -> Vec<String> {
+        calls(m)
+            .iter()
+            .filter(|c| !answered.contains(c.id.as_str()))
+            .map(|c| c.id.clone())
+            .collect()
+    };
+    if messages
+        .iter()
+        .flat_map(calls)
+        .all(|c| answered.contains(c.id.as_str()))
+    {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    let mut out = Vec::with_capacity(messages.len() + 1);
+    let mut pending: Vec<String> = Vec::new();
+    let answer = |pending: &mut Vec<String>, out: &mut Vec<Message>| {
+        for id in pending.drain(..) {
+            tracing::debug!(id = %id, "repair: answering a tool call the log never answered");
+            out.push(Message::tool_result(
+                id,
+                crate::constants::TOOL_INTERRUPTED_NO_RESULT,
+            ));
+        }
+    };
+    for m in messages {
+        if m.role != Role::Tool {
+            answer(&mut pending, &mut out);
+        }
+        out.push(m.clone());
+        pending.extend(unanswered(m));
+    }
+    answer(&mut pending, &mut out);
+    std::borrow::Cow::Owned(out)
 }
 
 /// True if `m`'s content is plain text or empty (not multimodal `Parts`). Only

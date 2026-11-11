@@ -630,6 +630,12 @@ pub const TOOL_SKIPPED_BY_HOOK: &str = "[tool call skipped by hook]";
 /// Tool result stored when the user cancels the turn before a call runs.
 pub const TOOL_CANCELLED_BY_USER: &str = "[tool call cancelled by user]";
 
+/// Tool result supplied on the wire for a call the session log never
+/// answered — the daemon stopped while it ran.
+pub const TOOL_INTERRUPTED_NO_RESULT: &str =
+    "[tool call interrupted before it returned a result — \
+     its effects are unknown; check them before running it again]";
+
 // ── Image generation ──────────────────────────────────────────────
 
 /// Timeout in seconds for image generation API requests.
