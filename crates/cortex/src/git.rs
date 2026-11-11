@@ -834,9 +834,16 @@ async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
                 let _entry = InFlightEntry(scan_key.clone());
                 // `status` runs a repository's clean filter on any file whose
                 // stat data changed, so it is a filter-executing command.
-                run_git_neutralized(&["status", "--porcelain"], &scan_key)
-                    .await
-                    .map_err(|e| e.to_string())
+                // It must also stay out of submodule checkouts: each reads its
+                // own config, which filter discovery here never sees, so a
+                // scan there would run any filter a submodule names. `dirty`
+                // still reports a submodule that moved to another commit.
+                run_git_neutralized(
+                    &["status", "--porcelain", "--ignore-submodules=dirty"],
+                    &scan_key,
+                )
+                .await
+                .map_err(|e| e.to_string())
             });
             let future: BoxedStatusFuture = Box::pin(async move {
                 handle
@@ -862,9 +869,10 @@ async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
 /// before and after a second edit to a file that is already modified or
 /// untracked, which is the normal state of a worktree during a goal loop, so
 /// the listed paths are also stat-ed. It still cannot see edits to ignored
-/// files, inputs outside the repository, or files inside an untracked
-/// directory. An equal fingerprint therefore never proves that a check would
-/// give the same result, and no caller may skip work because of it.
+/// files, inputs outside the repository, files inside an untracked
+/// directory, or uncommitted edits inside a submodule. An equal fingerprint
+/// therefore never proves that a check would give the same result, and no
+/// caller may skip work because of it.
 ///
 /// Deliberately not a content hash of the worktree: this runs at every goal
 /// turn boundary, and two bounded git probes plus a stat per dirty path are
@@ -1295,6 +1303,27 @@ pub(crate) mod test_support {
         std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
         git(dir, &["add", ".gitattributes"]);
         git(dir, &["commit", "-qm", "attributes"]);
+        configure_evil_filter(dir, sentinel_dir)
+    }
+
+    /// [`arm_evil_content_filter`] through the repository's own
+    /// `info/attributes` instead of a commit, so the checkout stays clean and
+    /// it works in a submodule clone that has no identity. Armed in a
+    /// submodule, it lives in config the superproject never reads.
+    pub fn arm_evil_local_filter(dir: &Path, sentinel_dir: &Path) -> PathBuf {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "{dir:?} is not a git checkout");
+        let git_dir = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+        std::fs::create_dir_all(git_dir.join("info")).unwrap();
+        std::fs::write(git_dir.join("info/attributes"), "* filter=evil\n").unwrap();
+        configure_evil_filter(dir, sentinel_dir)
+    }
+
+    fn configure_evil_filter(dir: &Path, sentinel_dir: &Path) -> PathBuf {
         let sentinel = sentinel_dir.join("PWNED");
         let cmd = format!("touch '{}'; cat", sentinel.display());
         git(dir, &["config", "filter.evil.smudge", &cmd]);
@@ -2963,6 +2992,46 @@ mod tests {
             !sentinel.exists(),
             "a repo-configured clean filter ran during git status"
         );
+    }
+
+    /// A submodule reads its own config, which the superproject's filter
+    /// discovery never sees. The scan must not descend into the submodule's
+    /// checkout and run a filter armed there, yet must still notice the
+    /// submodule moving to a commit the superproject does not record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_scan_never_runs_a_submodule_clean_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, sub) = (tmp.path().join("repo"), tmp.path().join("sub"));
+        for dir in [&repo, &sub] {
+            std::fs::create_dir(dir).unwrap();
+            init_repo_with_commit(dir);
+        }
+        let file_ok = ["-c", "protocol.file.allow=always"];
+        let sub_url = sub.to_string_lossy().to_string();
+        test_support::git(
+            &repo,
+            &[&file_ok[..], &["submodule", "add", "-q", &sub_url, "sm"]].concat(),
+        );
+        test_support::git(&repo, &["commit", "-qm", "add submodule"]);
+        let sm = repo.join("sm");
+        let sentinel = test_support::arm_evil_local_filter(&sm, tmp.path());
+        test_support::touch_forward(&sm.join("a.txt"));
+
+        let status = git_status_porcelain(&repo).await;
+        assert_eq!(status, Ok(String::new()), "content is unchanged");
+        assert!(
+            !sentinel.exists(),
+            "a submodule-configured clean filter ran during git status"
+        );
+
+        let who = ["-c", "user.email=t@borg.test", "-c", "user.name=borg-test"];
+        test_support::git(
+            &sm,
+            &[&who[..], &["commit", "-q", "--allow-empty", "-m", "moved"]].concat(),
+        );
+        let status = git_status_porcelain(&repo).await;
+        assert_eq!(status, Ok("M sm".to_string()), "the moved submodule shows");
     }
 
     /// A repository's own `includeIf` can load filters discovery never saw,
