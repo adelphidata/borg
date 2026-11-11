@@ -32,14 +32,15 @@ ignore = [
     # elliptic-curve 0.14; no davey/openmls release takes it yet. Drop this
     # when songbird's chain moves, or voice is dropped.
     "RUSTSEC-2026-0387", # crypto-bigint: timing variability in constant-time ops
-    # zip 8 reaches the graph only through anydoc and calamine (document
-    # text extraction), and every release of both still requires `zip ^8`.
-    # All three bugs live in `ZipArchive::extract` / `ZipStreamReader::extract`
-    # writing to disk; neither crate calls them — they read entries into
-    # memory. Drop these once anydoc/calamine move to zip >= 9.
+    # zip 8 reaches the graph only through anydoc (document text extraction),
+    # and every anydoc release still requires `zip ^8`. All four bugs live in
+    # `ZipArchive::extract` / `ZipStreamReader::extract` writing to disk;
+    # anydoc never calls them — it reads entries into memory. Drop these once
+    # anydoc moves to zip >= 9.
     "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extract
     "RUSTSEC-2026-0368", # zip: extract creates symlinks escaping the destination
     "RUSTSEC-2026-0369", # zip: extract applies permissions through symlinks
+    "RUSTSEC-2026-0429", # zip: extract aborts on a symlink entry with a huge size
 ]
 
 [licenses]
