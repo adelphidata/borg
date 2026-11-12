@@ -28,6 +28,9 @@ const CREDENTIAL_KEY_SUFFIXES: &[&str] = &[
     "accesstoken",
     "secretkey",
     "key",
+    "pwd",
+    "passwd",
+    "sshpass",
 ];
 
 /// True at a word-start boundary inside an identifier: the key's edge, after
@@ -141,6 +144,42 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             r"(?i:\bBearer)[ \t]+([A-Za-z0-9._~+/-]{16,}=*)",
             "Bearer Token",
             true,
+            None,
+        ),
+        // A private key block: PEM (`RSA`/`EC`/`DSA`/`OPENSSH`/`ENCRYPTED`/
+        // PKCS#8) and PGP (`PGP PRIVATE KEY BLOCK`). The secret is the body,
+        // so the mask runs from BEGIN through the matching END marker. A block
+        // cut off before its END (a truncated `cat`, a log line) masks the
+        // armor headers and every base64 run of 16+ chars that follows — short
+        // enough to cover a 64-col PEM line, long enough that prose after a
+        // bare BEGIN line stays readable. `\\[rn]` lets both forms span a key
+        // embedded as a JSON string with escaped newlines.
+        //
+        // Runs right after Bearer: a vendor pattern that matched inside the
+        // base64 body first would leave a `[REDACTED …]` marker that ends the
+        // truncated-block run early and leaks the rest of the body.
+        (
+            r"(?s)-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----(?:.*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|(?:(?:\s|\\[rn])*[A-Za-z][A-Za-z-]*:[ \t][^\r\n\\]*)*(?:(?:\s|\\[rn])*[A-Za-z0-9+/=]{16,})*)",
+            "Private Key",
+            false,
+            None,
+        ),
+        // PuTTY `.ppk` key file: the `Private-Lines: N` count is followed by
+        // the private blob, one base64 line each. Only the blob is masked —
+        // the public lines, comment and MAC are not secret. Every masked line
+        // must be whole (`$`), so the `Private-MAC:` line that follows is
+        // never nibbled.
+        (
+            r"(?mR)Private-Lines:[ \t]*\d+\r?\n((?:[A-Za-z0-9+/=]+\r?\n)*[A-Za-z0-9+/=]+)$",
+            "PuTTY Private Key",
+            true,
+            None,
+        ),
+        // age identities: a bech32 body (uppercase) behind a fixed prefix.
+        (
+            r"\bAGE-SECRET-KEY-1[0-9A-Z]{50,}",
+            "age Secret Key",
+            false,
             None,
         ),
         // AWS key IDs share a 4-letter prefix + 16 base32 chars. Beyond the
@@ -269,12 +308,6 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         (
             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
             "JWT",
-            false,
-            None,
-        ),
-        (
-            r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----",
-            "Private Key",
             false,
             None,
         ),
@@ -446,11 +479,14 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // masked on every sink. It matches neither `KEY` (that's "KEK") nor the
         // `password|passwd|pwd` value patterns above, so without it the KEK
         // passphrase leaked through redaction entirely.
+        // `_PWD`/`_PASSWD` and `SSHPASS` cover the client env vars that carry a
+        // bare password (`MYSQL_PWD`, `SSHPASS` for `sshpass -e`). The
+        // underscore is required: the shell's own `PWD`/`OLDPWD` are paths.
         // The post-match validator rejects keys that merely EMBED a keyword
         // (`turkey=`, `mypassword=` prose shapes) — the keyword must sit at a
         // word boundary in the key. See `credential_assignment_key_is_real`.
         (
-            r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|APIKEY|API_KEY))\s*=\s*(\S{8,})",
+            r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|APIKEY|API_KEY|_PWD|_PASSWD|SSHPASS))\s*=\s*(\S{8,})",
             "Credential Assignment",
             true,
             Some(credential_assignment_key_is_real as fn(&str) -> bool),
@@ -788,6 +824,9 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     // Opaque (no vendor prefix) so this sample exercises the Bearer pattern
     // itself rather than a narrower one that happens to match first.
     "Bearer AbCdEf0123456789OpaqueToken",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtestkeybodytestkeybody\n-----END RSA PRIVATE KEY-----",
+    "Private-Lines: 1\nAAAAIQCtestprivatekeybodytestprivatekeybody\n",
+    "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
     "AKIAIOSFODNN7EXAMPLE",
     "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
     "github_pat_11AAAAAAA0aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
@@ -802,7 +841,6 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
     "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdefghijklmnopqrstuvwxyz",
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-    "-----BEGIN RSA PRIVATE KEY-----",
     "xoxb-1234567890-abcdefghijklmnopqrstuvwx",
     "xapp-1-A012345678BCDEFGHIJ",
     "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX",
@@ -1098,10 +1136,106 @@ mod tests {
     }
 
     #[test]
-    fn redacts_private_key() {
-        let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAK...";
-        let result = redact_secrets(input);
-        assert!(result.contains("[REDACTED Private Key]"));
+    fn private_key_blocks_are_masked_body_and_all() {
+        // (input, body fragments that must not survive, text that must)
+        let body = "MIIEpAIBAAKCAQEA0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL";
+        let tail = "QW1hc2tlZHRhaWxsaW5lb2Z0aGVrZXlib2R5";
+        let cases: Vec<(String, Vec<&str>, Vec<&str>)> = vec![
+            (
+                format!("before\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n{tail}\n-----END RSA PRIVATE KEY-----\nafter"),
+                vec![body, tail, "END RSA"],
+                vec!["before\n", "\nafter"],
+            ),
+            (
+                format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----"),
+                vec![body],
+                vec![],
+            ),
+            (
+                format!("-----BEGIN ENCRYPTED PRIVATE KEY-----\n{body}\n-----END ENCRYPTED PRIVATE KEY-----"),
+                vec![body],
+                vec![],
+            ),
+            (
+                format!("-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG v2\n\n{body}\n=AbCd\n-----END PGP PRIVATE KEY BLOCK-----"),
+                vec![body, "GnuPG"],
+                vec![],
+            ),
+            // A key embedded as a JSON string with escaped newlines.
+            (
+                format!(r#"{{"key": "-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"}}"#),
+                vec![body],
+                vec![r#"{"key": ""#],
+            ),
+            // Truncated before END: the armor headers and body still go.
+            (
+                format!("-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00FF\n\n{body}\n{tail}"),
+                vec![body, tail, "DEK-Info"],
+                vec![],
+            ),
+        ];
+        for (input, gone, kept) in cases {
+            let out = redact_secrets(&input);
+            assert!(out.contains("[REDACTED Private Key]"), "not masked: {out}");
+            for g in gone {
+                assert!(!out.contains(g), "{g:?} survived: {out}");
+            }
+            for k in kept {
+                assert!(out.contains(k), "{k:?} lost: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_private_key_header_leaves_following_prose_alone() {
+        let out = redact_secrets(
+            "Look for the -----BEGIN RSA PRIVATE KEY----- line, then check the permissions.",
+        );
+        assert_eq!(
+            out,
+            "Look for the [REDACTED Private Key] line, then check the permissions."
+        );
+    }
+
+    #[test]
+    fn putty_private_lines_are_masked_without_the_mac() {
+        let ppk = "PuTTY-User-Key-File-3: ssh-ed25519\r\nEncryption: none\r\nComment: me@host\r\nPublic-Lines: 2\r\nAAAAC3NzaC1lZDI1NTE5AAAAIPublicPart\r\nMoreOfThePublicKey\r\nPrivate-Lines: 2\r\nAAAAIFirstPrivateLineOfTheKey0123456789\r\nSecondPrivateLine=\r\nPrivate-MAC: 0a1b2c3d\r\n";
+        let out = redact_secrets(ppk);
+        assert!(!out.contains("FirstPrivateLine"), "{out}");
+        assert!(!out.contains("SecondPrivateLine"), "{out}");
+        assert!(
+            out.contains(
+                "Private-Lines: 2\r\n[REDACTED PuTTY Private Key]\r\nPrivate-MAC: 0a1b2c3d"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("AAAAC3NzaC1lZDI1NTE5AAAAIPublicPart"), "{out}");
+    }
+
+    #[test]
+    fn age_secret_keys_are_masked() {
+        let key = format!(
+            "AGE-SECRET-KEY-1{}",
+            "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L".repeat(2)
+        );
+        let out = redact_secrets(&format!("# identity\n{key}\n"));
+        assert_eq!(out, "# identity\n[REDACTED age Secret Key]\n");
+    }
+
+    #[test]
+    fn client_password_env_vars_are_masked_but_shell_paths_are_not() {
+        for (input, value) in [
+            ("MYSQL_PWD=hunter2trustno1", "hunter2trustno1"),
+            ("export SSHPASS=hunter2trustno1", "hunter2trustno1"),
+            ("REDIS_PASSWD=hunter2trustno1", "hunter2trustno1"),
+            ("mysql_pwd=hunter2trustno1", "hunter2trustno1"),
+        ] {
+            let out = redact_secrets(input);
+            assert!(!out.contains(value), "{input} leaked: {out}");
+            assert!(out.contains("=[REDACTED"), "{input} lost its key: {out}");
+        }
+        let env = "OLDPWD=/home/alice/projects/borg";
+        assert_eq!(redact_secrets(env), env);
     }
 
     #[test]
