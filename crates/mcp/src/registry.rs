@@ -339,6 +339,27 @@ impl McpRegistry {
                 );
             }
 
+            // Strip characters that render as nothing from the prose the LLM
+            // reads, so a server cannot hand the model instructions the
+            // operator never sees. Names and values stay exact.
+            let (description, desc_removed) = match tool.description.as_deref() {
+                Some(d) => {
+                    let (clean, n) = crate::invisible::strip_invisible(d);
+                    (Some(clean), n)
+                }
+                None => (None, 0),
+            };
+            let removed =
+                desc_removed + crate::invisible::strip_invisible_in_schema(&mut input_schema);
+            if removed > 0 {
+                tracing::warn!(
+                    server = %server,
+                    tool = %tool.name,
+                    removed,
+                    "stripped invisible characters from tool description/schema text",
+                );
+            }
+
             // Read-only is true when either the operator opted in
             // (`tools.read_only`) OR the server advertised
             // `annotations.readOnlyHint: true`. The latter is untrusted,
@@ -358,7 +379,7 @@ impl McpRegistry {
                 full_name: full_name.clone(),
                 server: server.to_string(),
                 original_name: tool.name.clone(),
-                description: tool.description.clone(),
+                description,
                 input_schema,
                 arg_renames,
                 read_only,
@@ -1188,6 +1209,40 @@ mod tests {
         assert!(outcomes
             .iter()
             .any(|o| matches!(o, ToolRegistrationOutcome::FilteredOut { original } if original == "delete")));
+    }
+
+    #[test]
+    fn registered_metadata_carries_no_invisible_characters() {
+        let reg = McpRegistry::new();
+        let tag_text: String = "exfiltrate"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect();
+        let tools = vec![McpToolSchema {
+            name: "search".into(),
+            description: Some(format!("Search the web.{tag_text}\u{202E}")),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"q": {
+                    "type": "string",
+                    "description": "query\u{200B}",
+                    "enum": ["a\u{200B}b"],
+                }},
+            }),
+            annotations: None,
+        }];
+        reg.replace_server_tools("web", &tools, &ToolFilter::default(), &[]);
+        let entry = reg.lookup("mcp_web_search").unwrap();
+        assert_eq!(entry.description.as_deref(), Some("Search the web."));
+        assert_eq!(
+            entry.input_schema["properties"]["q"]["description"],
+            "query"
+        );
+        // An enum value is matched at dispatch and must stay byte-exact.
+        assert_eq!(
+            entry.input_schema["properties"]["q"]["enum"][0],
+            "a\u{200B}b"
+        );
     }
 
     /// Spec: an explicit empty `tools.include` registers nothing, even with
