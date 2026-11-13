@@ -5,13 +5,13 @@
     "": {
       "name": "borg-workspace",
       "devDependencies": {
-        "@bufbuild/buf": "latest",
-        "@stryker-mutator/core": "latest",
-        "@stryker-mutator/vitest-runner": "latest",
-        "@vitest/coverage-v8": "latest",
-        "prettier": "latest",
-        "ts-proto": "latest",
-        "typescript": "latest",
+        "@bufbuild/buf": "^1.75.0",
+        "@stryker-mutator/core": "^10.1.1",
+        "@stryker-mutator/vitest-runner": "^10.1.1",
+        "@vitest/coverage-v8": "5.1.0",
+        "prettier": "^3.10.1",
+        "ts-proto": "^2.18.5",
+        "typescript": "^7.0.2",
       },
     },
     "apps/desktop": {

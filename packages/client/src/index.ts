@@ -19,6 +19,7 @@ export { SERVICES, WEB_SERVICES } from "./services.js";
 export type { ServiceName } from "./services.js";
 
 export * as admin from "./gen/admin.js";
+export * as meetings from "./gen/meetings.js";
 export * as pki from "./gen/pki.js";
 export * as session from "./gen/session.js";
 export * as status from "./gen/status.js";

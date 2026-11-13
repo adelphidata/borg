@@ -46,6 +46,7 @@ export {
   CopyIcon,
   GearIcon,
   InfoIcon,
+  MeetingsIcon,
   MicIcon,
   MoonIcon,
   MoreIcon,

@@ -104,7 +104,7 @@ function NavItem({ route }: { route: AppRoute }) {
           {route.hasAlert && (
             <>
               <span className="flex-1" />
-              <span className="h-1.5 w-1.5 flex-none rounded-full bg-alert" />
+              <StatusDot tone={route.alertTone ?? "alert"} />
             </>
           )}
           {isActive && <Brackets />}

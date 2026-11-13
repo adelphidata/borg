@@ -30,6 +30,15 @@ export const CHANNELS = {
   bootStatus: "borg:native:boot:status", // main → renderer
   bootRead: "borg:native:boot:read", // renderer → main, the status so far
   bootRetry: "borg:native:boot:retry", // renderer → main
+
+  // A route for the main window: a panel asking for its meeting's page.
+  openPath: "borg:native:open-path", // main → renderer, carries a route path
+  revealPath: "borg:native:reveal-path", // renderer → main, raise the main window at a path
+
+  // Meetings. The daemon notices the call; the shell owns the two panels.
+  meetingDetection: "borg:native:meeting:detection", // main → renderer, WireMeetingDetection | null
+  meetingDetectionRead: "borg:native:meeting:detection:read", // renderer → main, the detection so far
+  meetingOpenPanel: "borg:native:meeting:open-panel", // renderer → main, carries a meeting id
 } as const;
 
 /** A gRPC failure flattened to structured-cloneable data. */
@@ -85,4 +94,11 @@ export interface WireUpdateStatus {
   version?: string;
   percent?: number;
   message?: string;
+}
+
+/** Mirrors `MeetingDetection` in `@borg/app`. */
+export interface WireMeetingDetection {
+  sourceApp: string;
+  calendarEventId?: string;
+  calendarTitle?: string;
 }

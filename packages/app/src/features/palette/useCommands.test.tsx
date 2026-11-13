@@ -22,6 +22,7 @@ vi.mock("react-router-dom", () => ({ useNavigate: () => vi.fn() }));
 // The real module pulls in every page component; only the row shape matters.
 vi.mock("../../routes", () => ({
   routes: [{ id: "settings", path: "/settings", label: "Settings" }],
+  visibleRoutes: (all: unknown[]) => all,
 }));
 
 vi.mock("@borg/ui", () => ({

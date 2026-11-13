@@ -438,6 +438,10 @@ define_settings! {
 
         // ── Per-session goals (/goal) ──
         "goals.enabled" => goals.enabled, parsed(bool);
+        "meetings.enabled" => meetings.enabled, parsed(bool);
+        "meetings.dir" => meetings.dir, opt_string;
+        "meetings.keep_audio" => meetings.keep_audio, parsed(bool);
+        "meetings.ask_before_recording" => meetings.ask_before_recording, parsed(bool);
         "goals.default_token_budget" => goals.default_token_budget, opt_parsed(i64);
         "goals.max_token_budget" => goals.max_token_budget, opt_parsed(i64);
         "goals.gate_timeout_ms" => goals.gate_timeout_ms, parsed(u64);
@@ -593,6 +597,30 @@ define_settings! {
                 s.browser.browser_use_api_key = None;
             } else {
                 s.browser.browser_use_api_key = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        // meetings.calendar.ics_url: the feed address is a credential, so it
+        // is a JSON SecretRef like the browser keys (empty clears).
+        "meetings.calendar.ics_url" => |s, key, value| {
+            if value.is_empty() {
+                s.meetings.calendar.ics_url = None;
+            } else {
+                s.meetings.calendar.ics_url = Some(
+                    serde_json::from_str(value)
+                        .with_context(|| format!("Invalid JSON for {key}"))?,
+                );
+            }
+            Ok(format!("{key} = (set)"))
+        };
+        "meetings.calendar.google" => |s, key, value| {
+            if value.is_empty() {
+                s.meetings.calendar.google = None;
+            } else {
+                s.meetings.calendar.google = Some(
                     serde_json::from_str(value)
                         .with_context(|| format!("Invalid JSON for {key}"))?,
                 );
@@ -902,6 +930,12 @@ define_settings! {
         "browser.browser_use_api_key" => |c| c.browser.browser_use_api_key.as_ref()
             .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
+        "meetings.calendar.ics_url" => |c| c.meetings.calendar.ics_url.as_ref()
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
+            .unwrap_or_default();
+        "meetings.calendar.google" => |c| c.meetings.calendar.google.as_ref()
+            .map(crate::security::secrets_resolve::SecretRef::display_value)
+            .unwrap_or_default();
         "browser.firecrawl_api_key" => |c| c.browser.firecrawl_api_key.as_ref()
             .map(crate::security::secrets_resolve::SecretRef::display_value)
             .unwrap_or_default();
@@ -1035,6 +1069,14 @@ define_settings! {
         "voice.max_wait_secs" => "No-speech timeout (s)", Float, "Voice";
         "voice.no_speech_limit" => "Silent-cycle limit", Uint, "Voice";
         "voice.sample_rate_hz" => "Sample rate (Hz)", Uint, "Voice";
+
+        // — Meetings — recording happens in the desktop app; these rows are
+        // the feature's whole configuration on every surface.
+        "meetings.enabled" => "Take notes in meetings (desktop app)", Bool, "Meetings";
+        "meetings.ask_before_recording" => "Ask before recording", Bool, "Meetings";
+        "meetings.keep_audio" => "Keep audio files", Bool, "Meetings";
+        "meetings.dir" => "Meetings folder", Text, "Meetings";
+        "meetings.calendar.ics_url" => "Calendar ICS link", Secret, "Meetings";
 
         // — Channels — only rows for channels with credentials configured
         // are shown; the popup filters at render time. Registry entries

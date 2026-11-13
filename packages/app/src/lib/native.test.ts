@@ -17,4 +17,11 @@ describe("NO_NATIVE", () => {
   it("ignores a retry rather than throwing at a caller that cannot know", () => {
     expect(() => NO_NATIVE.boot.retry()).not.toThrow();
   });
+
+  it("tells a meeting panel there is no call to show, rather than leaving it waiting", () => {
+    // The panel renders nothing until it hears; silence would be a blank box.
+    const seen: unknown[] = [];
+    NO_NATIVE.meetings.onDetection((d) => seen.push(d));
+    expect(seen).toEqual([null]);
+  });
 });

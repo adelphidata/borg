@@ -9,7 +9,7 @@ import {
   type Unsubscribe,
 } from "@borg/client";
 import { PlatformProvider, type Platform } from "../lib/platform";
-import type { NativeBridge } from "../lib/native";
+import type { MeetingDetection, NativeBridge } from "../lib/native";
 
 /**
  * One place to stand a feature up against a fake daemon.
@@ -95,17 +95,26 @@ export function fakeNative(): NativeBridge & {
   badges: number[];
   dictationHotkeys: string[];
   revealed: string[];
+  revealedPaths: string[];
+  openedPanels: string[];
   hidden: number;
   emitMenuCommand(action: string): void;
   emitActivateSession(sessionId: string): void;
+  emitOpenPath(path: string): void;
+  emitDetection(detection: MeetingDetection | null): void;
 } {
   const menuHandlers: ((action: string) => void)[] = [];
   const activateHandlers: ((sessionId: string) => void)[] = [];
+  const openPathHandlers: ((path: string) => void)[] = [];
+  const detectionHandlers: ((detection: MeetingDetection | null) => void)[] = [];
+  let detection: MeetingDetection | null = null;
   const bridge = {
     notifications: [] as { title: string; body: string }[],
     badges: [] as number[],
     dictationHotkeys: [] as string[],
     revealed: [] as string[],
+    revealedPaths: [] as string[],
+    openedPanels: [] as string[],
     hidden: 0,
     onMenuCommand(handler: (action: string) => void) {
       menuHandlers.push(handler);
@@ -120,6 +129,24 @@ export function fakeNative(): NativeBridge & {
     },
     revealSession(sessionId: string) {
       bridge.revealed.push(sessionId);
+    },
+    onOpenPath(handler: (path: string) => void) {
+      openPathHandlers.push(handler);
+      return () => openPathHandlers.splice(openPathHandlers.indexOf(handler), 1);
+    },
+    revealPath(path: string) {
+      bridge.revealedPaths.push(path);
+    },
+    // Replays the current detection on subscribe, as the shell does.
+    meetings: {
+      onDetection(handler: (detection: MeetingDetection | null) => void) {
+        detectionHandlers.push(handler);
+        handler(detection);
+        return () => detectionHandlers.splice(detectionHandlers.indexOf(handler), 1);
+      },
+      openPanel(meetingId: string) {
+        bridge.openedPanels.push(meetingId);
+      },
     },
     hideWindow() {
       bridge.hidden += 1;
@@ -146,6 +173,13 @@ export function fakeNative(): NativeBridge & {
     },
     emitActivateSession(sessionId: string) {
       for (const handler of [...activateHandlers]) handler(sessionId);
+    },
+    emitOpenPath(path: string) {
+      for (const handler of [...openPathHandlers]) handler(path);
+    },
+    emitDetection(next: MeetingDetection | null) {
+      detection = next;
+      for (const handler of [...detectionHandlers]) handler(next);
     },
   };
   return bridge as never;

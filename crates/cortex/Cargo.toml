@@ -72,6 +72,9 @@ nucleo-matcher = "0.3"
 portable-pty = "0.9"
 cpal = "0.18"
 hound = "3.5"
+# Meeting notes: ICS calendar feeds and their recurrence rules.
+icalendar = { version = "0.17", default-features = false, features = ["parser"] }
+rrule = "0.14"
 # Edge TTS — Microsoft's free TTS endpoint (used by as the default
 # provider). Adds WSS + tungstenite + rustls but no API key required.
 # default-features=false avoids the blocking `ureq` path; we drive the

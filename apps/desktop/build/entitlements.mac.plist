@@ -11,5 +11,8 @@
        inbound listener is ever opened. -->
   <key>com.apple.security.network.client</key>
   <true/>
+  <!-- Meeting notes record the microphone; the hardened runtime blocks it otherwise. -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
 </dict>
 </plist>

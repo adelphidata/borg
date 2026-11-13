@@ -54,6 +54,20 @@ interface SharedState {
     invocations: { channel: string; args: unknown[] }[];
     replies: Map<string, (...args: unknown[]) => unknown>;
   };
+  mediaState: MediaState;
+}
+
+/** System audio, screens and the macOS permission prompts. */
+export interface MediaState {
+  /** What `session.defaultSession.setDisplayMediaRequestHandler` was last given. */
+  displayMediaHandler: ((request: unknown, callback: (streams: unknown) => void) => void) | null;
+  displayMediaOptions: unknown;
+  /** What `desktopCapturer.getSources` resolves with; an Error rejects. */
+  sources: unknown[] | Error;
+  /** What `systemPreferences.askForMediaAccess` resolves with; an Error rejects. */
+  mediaAccess: boolean | Error;
+  /** Every media type `askForMediaAccess` was asked about, in order. */
+  mediaAccessAsks: string[];
 }
 
 type StubRect = { x: number; y: number; width: number; height: number };
@@ -95,6 +109,13 @@ const shared: SharedState = ((globalThis as Record<string, unknown>).__borgElect
   shortcutState: { registered: new Map(), available: true },
   contextBridgeState: { exposed: new Map() },
   rendererState: { listeners: new Map(), invocations: [], replies: new Map() },
+  mediaState: {
+    displayMediaHandler: null,
+    displayMediaOptions: undefined,
+    sources: [],
+    mediaAccess: true,
+    mediaAccessAsks: [],
+  },
 }) as SharedState;
 
 export interface StubWindow {
@@ -106,8 +127,11 @@ export interface StubWindow {
   bounds: { x: number; y: number; width: number; height: number };
   sent: { channel: string; args: unknown[] }[];
   listeners: Map<string, ((...args: unknown[]) => void)[]>;
+  /** What `webContents.isLoading()` reports. */
+  loading: boolean;
   webContents: {
     isDestroyed(): boolean;
+    isLoading(): boolean;
     send(channel: string, ...args: unknown[]): void;
     /** Handler installed by `setWindowOpenHandler`, if any. */
     windowOpenHandler?: (details: { url: string }) => { action: string };
@@ -128,7 +152,15 @@ export interface StubWindow {
   getBounds(): { x: number; y: number; width: number; height: number };
   setBounds(bounds: { x: number; y: number; width: number; height: number }): void;
   show(): void;
+  /** Shows without taking focus; counted so a test can tell it from `show`. */
+  showInactive: Mock<() => void>;
   hide(): void;
+  /**
+   * Asks the window to close, as the user clicking its close button does:
+   * emits `close` with a preventable event and, unless it was prevented,
+   * destroys the window and emits `closed`.
+   */
+  close(): void;
   /** Spies, so a test can assert the code focused or restored — or didn't. */
   focus: Mock<() => void>;
   reload: Mock<() => void>;
@@ -154,8 +186,10 @@ export function makeWindow(overrides: Partial<StubWindow> = {}): StubWindow {
     bounds: { x: 0, y: 0, width: 1240, height: 800 },
     sent: [],
     listeners: new Map(),
+    loading: false,
     webContents: {
       isDestroyed: () => win.destroyed,
+      isLoading: () => win.loading,
       send: (channel: string, ...args: unknown[]) => win.sent.push({ channel, args }),
       setWindowOpenHandler: (handler) => {
         win.webContents.windowOpenHandler = handler;
@@ -201,8 +235,22 @@ export function makeWindow(overrides: Partial<StubWindow> = {}): StubWindow {
     show: () => {
       win.visible = true;
     },
+    showInactive: vi.fn(() => {
+      win.visible = true;
+    }),
     hide: () => {
       win.visible = false;
+    },
+    close: () => {
+      let prevented = false;
+      win.emit("close", {
+        preventDefault: () => {
+          prevented = true;
+        },
+      });
+      if (prevented) return;
+      win.destroyed = true;
+      win.emit("closed");
     },
     focus: vi.fn(),
     reload: vi.fn(),
@@ -461,6 +509,34 @@ export function pushToRenderer(channel: string, ...args: unknown[]) {
   for (const listener of rendererState.listeners.get(channel) ?? []) listener({}, ...args);
 }
 
+export const mediaState = shared.mediaState;
+
+export const session = {
+  defaultSession: {
+    setDisplayMediaRequestHandler: vi.fn(
+      (handler: MediaState["displayMediaHandler"], options?: unknown) => {
+        mediaState.displayMediaHandler = handler;
+        mediaState.displayMediaOptions = options;
+      },
+    ),
+  },
+};
+
+export const desktopCapturer = {
+  getSources: vi.fn(async (_options: unknown) => {
+    if (mediaState.sources instanceof Error) throw mediaState.sources;
+    return mediaState.sources;
+  }),
+};
+
+export const systemPreferences = {
+  askForMediaAccess: vi.fn(async (mediaType: string) => {
+    mediaState.mediaAccessAsks.push(mediaType);
+    if (mediaState.mediaAccess instanceof Error) throw mediaState.mediaAccess;
+    return mediaState.mediaAccess;
+  }),
+};
+
 /** Reset every piece of shared state between tests. */
 export function resetElectron() {
   windows.length = 0;
@@ -488,5 +564,10 @@ export function resetElectron() {
   rendererState.listeners.clear();
   rendererState.invocations.length = 0;
   rendererState.replies.clear();
+  mediaState.displayMediaHandler = null;
+  mediaState.displayMediaOptions = undefined;
+  mediaState.sources = [];
+  mediaState.mediaAccess = true;
+  mediaState.mediaAccessAsks.length = 0;
   vi.clearAllMocks();
 }

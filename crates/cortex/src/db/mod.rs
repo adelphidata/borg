@@ -1,6 +1,7 @@
 mod activity;
 mod audit_chain;
 mod audit_writer;
+mod calendar_events;
 mod delivery;
 pub(crate) mod device_pairing;
 pub mod doctor_squelch;
@@ -10,6 +11,7 @@ mod handoff;
 mod issue_state;
 mod maintenance;
 pub mod mcp_catalog_cache;
+mod meetings;
 mod memory;
 mod meta;
 mod migrations;
@@ -41,6 +43,7 @@ pub use audit_writer::{audit_events, install_global_audit, try_emit_global, Audi
 pub use device_pairing::{hash_pairing_code, ConsumeOutcome};
 pub use goals::{GoalAccountingOutcome, GoalGate, GoalUpdate};
 pub use issue_state::IssueStateRow;
+pub use meetings::{MeetingRow, MeetingSearchHit, NewMeeting, SegmentRow};
 pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use redaction_audit::RedactionAuditRow;
@@ -1187,7 +1190,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 8;
+    const CURRENT_VERSION: u32 = 9;
 
     /// True when the stamp matches this binary exactly, so migrations can be
     /// skipped.
@@ -1285,8 +1288,9 @@ impl Database {
         self.migrate_v6().await?;
         self.migrate_v7().await?;
         self.migrate_v8().await?;
+        self.migrate_v9().await?;
         const _: () = assert!(
-            Database::CURRENT_VERSION == 8,
+            Database::CURRENT_VERSION == 9,
             "add the new migrate_vN call above and bump this constant",
         );
 

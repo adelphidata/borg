@@ -66,6 +66,13 @@ mdns-sd = "0.21"
 hostname = "0.4"
 which = { workspace = true }
 
+# Meeting detection reads which apps hold the microphone from CoreAudio's
+# process objects. Pre-generated bindings (no bindgen), already in the lock
+# through cpal.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString"] }
+
 [features]
 # Exposes `borgd::session::scripted` (ScriptedBackend + ScriptedFactory) to
 # downstream crates' integration tests. Off in production binaries so a real

@@ -11,7 +11,8 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
-import { routes } from "../../routes";
+import { routes, visibleRoutes } from "../../routes";
+import { meetingsEnabled } from "../meetings/meetingsEnabled";
 import {
   effectiveModel,
   modelLabel,
@@ -53,7 +54,9 @@ export function SettingsPage() {
               reached from here. On desktop the sidebar already lists them. */}
           {isMobile && (
             <div className="mb-6">
-              {routes
+              {visibleRoutes(routes, {
+                meetings: meetingsEnabled(settings.state === "ready" ? settings.data : undefined),
+              })
                 .filter((r) => r.nav?.tabBar === false)
                 .map((route) => (
                   <button

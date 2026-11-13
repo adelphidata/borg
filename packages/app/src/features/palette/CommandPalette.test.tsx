@@ -86,6 +86,28 @@ describe("CommandPalette", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("offers Go to Meetings only while Meetings is on", async () => {
+    const off = mount();
+    open();
+    type("go to");
+    await waitFor(() => expect(rows().some((r) => r?.startsWith("Go to Connections"))).toBe(true));
+    expect(rows().some((r) => r?.includes("Go to Meetings"))).toBe(false);
+    off.unmount();
+
+    const meetingsOn = {
+      ...SETTINGS.GetSettings.entries[0]!,
+      key: "meetings.enabled",
+      value: "true",
+      label: "",
+      kind: "",
+      group: "",
+    };
+    mount(fakeDaemon({ ...SETTINGS, GetSettings: { entries: [meetingsOn] } }));
+    open();
+    type("go to");
+    await waitFor(() => expect(rows().some((r) => r?.includes("Go to Meetings"))).toBe(true));
+  });
+
   it("opens with a usable list rather than a spinner", async () => {
     // The settings registry is already loaded by the provider.
     mount();

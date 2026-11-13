@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   ArchiveIcon,
@@ -15,7 +15,7 @@ import {
   useTheme,
 } from "@borg/ui";
 import { dispatchKeybind, installKeybinds, isMacPlatform, useKeybind } from "./lib/keybinds";
-import { QUICK_ENTRY_HASH } from "./lib/chords";
+import { MEETING_DETECTED_HASH, MEETING_PANEL_HASH, QUICK_ENTRY_HASH } from "./lib/chords";
 import { readSidebarCollapsed, writeSidebarCollapsed } from "./lib/sidebarCollapsed";
 import {
   clearNotice,
@@ -33,7 +33,14 @@ import {
   rowTitle,
   subscribeDrafts,
 } from "./features/conversation/draftStore";
+import { CalendarPage } from "./features/connections/CalendarPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
+import { MeetingDetailPage } from "./features/meetings/MeetingDetailPage";
+import { MeetingDetectedPage } from "./features/meetings/MeetingDetectedPage";
+import { MeetingPanelPage, panelMeetingId } from "./features/meetings/MeetingPanelPage";
+import { meetingsEnabled } from "./features/meetings/meetingsEnabled";
+import { useMeetingEventsFeed, useMeetingsVersion } from "./features/meetings/useMeetingEvents";
+import { MeetingsSettingsPage } from "./features/settings/MeetingsSettingsPage";
 import { ProviderKeysPage } from "./features/settings/ProviderKeysPage";
 import { McpServerDetailPage } from "./features/mcp/McpServerDetailPage";
 import { SkillDetailPage } from "./features/skills/SkillDetailPage";
@@ -71,7 +78,7 @@ import { SettingsProvider, useSettings } from "./lib/settings";
 import { PlatformProvider, useNative, type Platform } from "./lib/platform";
 import { useBorg, useMutation, useQuery } from "./lib/useDaemon";
 import type { admin } from "@borg/client";
-import { routes } from "./routes";
+import { routes, visibleRoutes } from "./routes";
 
 /**
  * Installs the keyboard layer and lets the native shell drive it.
@@ -91,6 +98,8 @@ function KeyboardLayer() {
     () => native.onActivateSession((sessionId) => navigate(`/c/${sessionId}`)),
     [native, navigate],
   );
+  // A meeting panel asking the main window to show its meeting.
+  useEffect(() => native.onOpenPath((path) => navigate(path)), [native, navigate]);
 
   useKeybind("new-conversation", () => navigate("/c/new"));
   useKeybind("open-settings", () => navigate("/settings"));
@@ -111,6 +120,12 @@ function Shell({ platform }: { platform: Platform }) {
   const navigate = useNavigate();
   const location = useLocation();
   const pops = usePopCount();
+  const { settings } = useSettings();
+  const meetingsOn = meetingsEnabled(settings.state === "ready" ? settings.data : undefined);
+  // One meetings feed for the whole app; every meetings view reads the
+  // counter it bumps, the unread dot below included.
+  useMeetingEventsFeed(meetingsOn);
+  const meetingsVersion = useMeetingsVersion();
   // Re-fetched on every navigation so fresh conversations and cleared
   // warnings appear without a reload.
   // A write on the conversations page must renew this list too — the two
@@ -275,7 +290,7 @@ function Shell({ platform }: { platform: Platform }) {
   // Unreachable daemon lights nothing — the pages say it better.
   const alerts = useQuery(
     async (borg) => {
-      const [warnings, pairings, subscriptions] = await Promise.all([
+      const [warnings, pairings, subscriptions, meetings] = await Promise.all([
         borg.admin.getPersistentWarnings({}),
         borg.admin.listPairingRequests({}),
         // A daemon from before subscriptions has no such call; that must not
@@ -284,22 +299,31 @@ function Shell({ platform }: { platform: Platform }) {
           console.warn("subscription alerts unavailable", error);
           return { subscriptions: [] };
         }),
+        // Same for a daemon from before meetings.
+        borg.meetings.getMeetingsStatus({}).catch((error: unknown) => {
+          console.warn("meeting status unavailable", error);
+          return { unreadCount: 0 };
+        }),
       ]);
       return {
         health: warnings.warnings.length > 0,
         connections:
           pairings.requests.some((r) => r.status === "pending") ||
           subscriptions.subscriptions.some(needsAttention),
+        meetings: meetings.unreadCount > 0,
       };
     },
-    [location.key],
+    [location.key, meetingsVersion],
   );
-  const navRoutes = routes.map((r) => ({
+  // A finished summary nobody has opened is news, not a fault: green.
+  const navRoutes = visibleRoutes(routes, { meetings: meetingsOn }).map((r) => ({
     ...r,
     hasAlert:
       alerts.state === "ready" &&
       ((r.id === "health" && alerts.data.health) ||
-        (r.id === "connections" && alerts.data.connections)),
+        (r.id === "connections" && alerts.data.connections) ||
+        (r.id === "meetings" && alerts.data.meetings)),
+    alertTone: r.id === "meetings" ? ("unread" as const) : undefined,
   }));
 
   return (
@@ -386,11 +410,16 @@ function Shell({ platform }: { platform: Platform }) {
             />
             {/* The static segments outrank the generic kind/name route,
                 which serves channels (and sends an old provider link to Settings). */}
+            <Route path="/connections/calendar" element={<CalendarPage />} />
             <Route path="/connections/mcp/:name" element={<McpServerDetailPage />} />
             <Route path="/connections/subscriptions/:id" element={<SubscriptionDetailPage />} />
             <Route path="/connections/skills/:name" element={<SkillDetailPage />} />
             <Route path="/connections/:kind/:name" element={<ConnectionDetailPage />} />
             <Route path="/settings/voice" element={<VoiceSettingsPage />} />
+            <Route path="/settings/meetings" element={<MeetingsSettingsPage />} />
+            {/* Registered whether or not Meetings is on: a link to a past
+                meeting keeps working after the feature is turned off. */}
+            <Route path="/meetings/:id" element={<MeetingDetailPage />} />
             <Route path="/settings/provider/:name" element={<ProviderKeysPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
             <Route path="/settings/:id" element={<SettingDetailPage />} />
@@ -463,12 +492,32 @@ function isQuickEntry(): boolean {
 }
 
 /**
+ * The desktop's meeting windows, read from the hash the same way: the
+ * "Meeting detected" pop-up and a meeting's notes panel. Each is a single
+ * screen with no router, no onboarding gate and no settings fetch.
+ */
+function meetingWindow(): ReactNode | undefined {
+  const hash = window.location.hash;
+  if (hash.startsWith(MEETING_DETECTED_HASH)) return <MeetingDetectedPage />;
+  const id = panelMeetingId(hash);
+  return id ? <MeetingPanelPage meetingId={id} /> : undefined;
+}
+
+/**
  * The whole Borg product, shared verbatim by `apps/desktop` and `apps/web`.
  *
  * Surfaces differ only in the `platform` they pass: the transport used to reach
  * borgd, and whether the window needs a custom title-bar drag strip.
  */
 export function BorgApp({ platform }: { platform: Platform }) {
+  const meeting = meetingWindow();
+  if (meeting) {
+    return (
+      <PlatformProvider platform={platform}>
+        <ThemeProvider>{meeting}</ThemeProvider>
+      </PlatformProvider>
+    );
+  }
   if (isQuickEntry()) {
     return (
       <PlatformProvider platform={platform}>

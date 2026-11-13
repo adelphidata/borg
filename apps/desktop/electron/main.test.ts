@@ -13,12 +13,17 @@ const borgIpc = vi.hoisted(() => ({ dispose: vi.fn() }));
 const nativeIpc = vi.hoisted(() => ({ dispose: vi.fn() }));
 const updater = vi.hoisted(() => ({ dispose: vi.fn() }));
 const quickEntry = vi.hoisted(() => ({ dispose: vi.fn() }));
+const meetings = vi.hoisted(() => ({ dispose: vi.fn() }));
+/** The one node transport main builds; no socket is involved. */
+const transport = vi.hoisted(() => ({ unary: vi.fn(), serverStream: vi.fn(), close: vi.fn() }));
 const spies = vi.hoisted(() => ({
   registerBoot: vi.fn(),
   registerBorgIpc: vi.fn(),
   registerNativeIpc: vi.fn(),
   registerUpdater: vi.fn(),
   registerQuickEntry: vi.fn(),
+  registerMeetings: vi.fn(),
+  createNodeTransport: vi.fn(),
   installApplicationMenu: vi.fn(),
   trackWindowState: vi.fn(),
   loadWindowState: vi.fn(),
@@ -54,6 +59,18 @@ vi.mock("./quick-entry", () => ({
   registerQuickEntry: (...args: unknown[]) => {
     spies.registerQuickEntry(...args);
     return quickEntry;
+  },
+}));
+vi.mock("./meetings", () => ({
+  registerMeetings: (...args: unknown[]) => {
+    spies.registerMeetings(...args);
+    return meetings;
+  },
+}));
+vi.mock("@borg/client/node", () => ({
+  createNodeTransport: (...args: unknown[]) => {
+    spies.createNodeTransport(...args);
+    return transport;
   },
 }));
 vi.mock("./menu", () => ({
@@ -121,7 +138,7 @@ const restores: Array<() => void> = [];
 
 beforeEach(() => {
   for (const spy of Object.values(spies)) spy.mockClear();
-  for (const subsystem of [boot, borgIpc, nativeIpc, updater, quickEntry]) {
+  for (const subsystem of [boot, borgIpc, nativeIpc, updater, quickEntry, meetings, transport]) {
     for (const fn of Object.values(subsystem)) fn.mockClear();
   }
 });
@@ -302,9 +319,48 @@ describe("main process launch", () => {
   it("tears every subsystem down on quit", async () => {
     restores.push(await launch());
     stub.emitApp("will-quit");
-    for (const subsystem of [boot, borgIpc, nativeIpc, updater, quickEntry]) {
+    for (const subsystem of [boot, borgIpc, nativeIpc, updater, quickEntry, meetings]) {
       expect(subsystem.dispose).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("closes the daemon channel at quit, after everything that uses it", async () => {
+    restores.push(await launch());
+    expect(transport.close).not.toHaveBeenCalled();
+    stub.emitApp("will-quit");
+    expect(transport.close).toHaveBeenCalledTimes(1);
+    const closedAt = transport.close.mock.invocationCallOrder[0];
+    expect(borgIpc.dispose.mock.invocationCallOrder[0]).toBeLessThan(closedAt);
+    expect(meetings.dispose.mock.invocationCallOrder[0]).toBeLessThan(closedAt);
+  });
+
+  it("shares one daemon channel between the renderer bridge and the meetings feed", async () => {
+    restores.push(await launch());
+    expect(spies.createNodeTransport).toHaveBeenCalledTimes(1);
+    expect(spies.registerBorgIpc).toHaveBeenCalledWith({ transport });
+
+    // The meetings client rides that same channel: its stream goes out on it.
+    const [{ client }] = spies.registerMeetings.mock.calls[0] as [
+      { client: { meetings: { subscribeMeetingEvents: (r: unknown, h: unknown) => void } } },
+    ];
+    client.meetings.subscribeMeetingEvents({}, { onMessage: () => {} });
+    expect(transport.serverStream).toHaveBeenCalledWith(
+      "borg.meetings.v1.Meetings/SubscribeMeetingEvents",
+      {},
+      expect.anything(),
+    );
+  });
+
+  it("wires meetings to the app bundle and the preload", async () => {
+    restores.push(await launch({ dev: true }));
+    expect(spies.registerMeetings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        isDev: true,
+        devServerUrl: "http://localhost:5173",
+        indexHtml: INDEX_HTML,
+        preload: path.join(APP_ROOT, "dist-electron", "preload.js"),
+      }),
+    );
   });
 
   it("restores a maximized window only once it is ready to show", async () => {
@@ -325,74 +381,26 @@ describe("main process launch", () => {
 });
 
 describe("window security", () => {
+  // The rules themselves are `harden.test.ts`; this is that the main window
+  // gets them.
   it("never opens an in-app window", async () => {
     restores.push(await launch());
     expect(openHandler()({ url: "https://example.com" })).toEqual({ action: "deny" });
     expect(stub.externalOpens).toEqual(["https://example.com"]);
   });
 
-  it("hands only http and https to the OS", async () => {
-    // file:, smb:, and custom schemes reaching openExternal is a local-code
-    // execution route.
+  it("keeps navigation on the bundle", async () => {
     restores.push(await launch());
-    for (const url of [
-      "file:///etc/passwd",
-      "smb://share/x",
-      "borg://run",
-      "javascript:alert(1)",
-    ]) {
-      openHandler()({ url });
-    }
-    expect(stub.externalOpens).toEqual([]);
-
-    openHandler()({ url: "http://example.com" });
-    expect(stub.externalOpens).toEqual(["http://example.com"]);
+    expect(
+      navigate(`${pathToFileURL(INDEX_HTML).href}#/settings`).preventDefault,
+    ).not.toHaveBeenCalled();
+    expect(navigate("https://evil.example.com").preventDefault).toHaveBeenCalled();
   });
 
-  it("ignores an unparseable URL rather than throwing in the handler", async () => {
-    restores.push(await launch());
-    expect(() => openHandler()({ url: "not a url" })).not.toThrow();
-    expect(stub.externalOpens).toEqual([]);
-  });
-
-  it("allows navigation within the packaged app", async () => {
-    restores.push(await launch());
-    const event = navigate(`${pathToFileURL(INDEX_HTML).href}#/settings`);
-    expect(event.preventDefault).not.toHaveBeenCalled();
-  });
-
-  it("blocks any other local file, not just a different app", async () => {
-    // A prefix check would let every file:// path under the app root count as
-    // internal.
-    restores.push(await launch());
-    const event = navigate(pathToFileURL(path.join(APP_ROOT, "dist", "evil.html")).href);
-    expect(event.preventDefault).toHaveBeenCalled();
-  });
-
-  it("blocks an external site and sends it to the browser instead", async () => {
-    restores.push(await launch());
-    const event = navigate("https://evil.example.com");
-    expect(event.preventDefault).toHaveBeenCalled();
-    expect(stub.externalOpens).toEqual(["https://evil.example.com"]);
-  });
-
-  it("allows navigation within the dev server's origin", async () => {
+  it("keeps navigation on the dev server's origin in dev", async () => {
     restores.push(await launch({ dev: true }));
-    const event = navigate("http://localhost:5173/#/usage");
-    expect(event.preventDefault).not.toHaveBeenCalled();
-  });
-
-  it("blocks another port on the same host in dev", async () => {
-    // localhost:51737 is a different origin, however local it looks.
-    restores.push(await launch({ dev: true }));
-    const event = navigate("http://localhost:51737/");
-    expect(event.preventDefault).toHaveBeenCalled();
-  });
-
-  it("blocks an unparseable navigation target", async () => {
-    restores.push(await launch());
-    const event = navigate("http://[::");
-    expect(event.preventDefault).toHaveBeenCalled();
+    expect(navigate("http://localhost:5173/#/usage").preventDefault).not.toHaveBeenCalled();
+    expect(navigate("http://localhost:51737/").preventDefault).toHaveBeenCalled();
   });
 });
 

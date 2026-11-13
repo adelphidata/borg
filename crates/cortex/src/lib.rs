@@ -118,6 +118,8 @@ pub mod maintenance;
 pub mod mcp_clients;
 /// Multimodal I/O: parsing/compression (core), image gen, TTS, understanding.
 pub mod media;
+/// Meeting notes: transcripts, the user's notes and summaries.
+pub mod meetings;
 /// Memory loading with token budget and semantic search.
 pub mod memory;
 /// Client-side `@path` mention expansion for the TUI composer.

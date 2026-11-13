@@ -55,6 +55,11 @@ mac:
   entitlementsInherit: build/entitlements.mac.plist
   # Signed when a Developer ID is available; unsigned local builds still work.
   notarize: true
+  # Meetings: the notes panel records the microphone ("Me") and the system
+  # audio ("Them"). macOS refuses both without a reason string in Info.plist.
+  extendInfo:
+    NSMicrophoneUsageDescription: Borg listens to your meetings to take notes.
+    NSAudioCaptureUsageDescription: Borg records the other side of your meetings to take notes.
 
 win:
   target:

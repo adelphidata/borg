@@ -3,6 +3,7 @@ import {
   Archive,
   ArrowUp,
   CalendarClock,
+  CalendarDays,
   Check,
   ChevronDown,
   ChevronRight,
@@ -97,6 +98,8 @@ export const PinIcon = lucide(Pin, 14);
 export const UnpinIcon = lucide(PinOff, 14);
 export const NewChatIcon = lucide(SquarePen, 14);
 export const ScheduleIcon = lucide(CalendarClock, 16);
+/** Meetings. A plain calendar page: the clock-on-a-calendar is Scheduled's. */
+export const MeetingsIcon = lucide(CalendarDays, 16);
 export const UsageIcon = lucide(Wallet, 16);
 export const AgentsIcon = lucide(ListTree, 16);
 export const SunIcon = lucide(Sun, 15);

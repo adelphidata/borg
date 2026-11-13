@@ -48,6 +48,17 @@
   --frameShadow: 0 1px 2px rgba(12, 16, 13, 0.05), 0 18px 44px -18px rgba(12, 16, 13, 0.22);
   /* What the scrollbar thumb is tinted with; its shades are derived below. */
   --scrollTint: var(--ink);
+  /* Text on a solid neon fill; neon is bright in both themes, so this is dark in both. */
+  --onNeon: #0c100d;
+  /* The bar beside a calendar event in the Meetings "Coming up" card. */
+  --meetingBar: #2a9d8f;
+  /* The red dot after the month on today's row of "Coming up". */
+  --today: #e5484d;
+  /* Pastel tiles behind a past meeting's initial, rotated per row. */
+  --avatar1: #e4dcf7;
+  --avatar2: #d8e6fb;
+  --avatar3: #d6f0dc;
+  --avatar4: #f8ecc6;
   /* Native controls, and anything left unstyled, follow the theme. */
   color-scheme: light;
 }
@@ -76,6 +87,13 @@
   --barTrack: rgba(233, 239, 227, 0.1);
   --frameShadow: 0 0 0 1px rgba(180, 255, 0, 0.07), 0 30px 80px -30px rgba(0, 0, 0, 0.9);
   --scrollTint: var(--neon);
+  --onNeon: #050706;
+  --meetingBar: #3cc2b1;
+  --today: #ff5c61;
+  --avatar1: #3a3150;
+  --avatar2: #2a3a52;
+  --avatar3: #283f2f;
+  --avatar4: #4a4126;
   color-scheme: dark;
 }
 
@@ -113,10 +131,19 @@
   --color-bar-track: var(--barTrack);
   --color-scroll-track: var(--scrollTrack);
   --color-scroll-thumb: var(--scrollThumb);
+  --color-on-neon: var(--onNeon);
+  --color-meeting-bar: var(--meetingBar);
+  --color-today: var(--today);
+  --color-avatar-1: var(--avatar1);
+  --color-avatar-2: var(--avatar2);
+  --color-avatar-3: var(--avatar3);
+  --color-avatar-4: var(--avatar4);
 }
 
 @theme {
   --font-sans: "Space Grotesk", system-ui, sans-serif;
+  /* The Meetings page's "Coming up" heading; the system serif, nothing to load. */
+  --font-serif: "New York", "Iowan Old Style", Georgia, ui-serif, serif;
   /* The pre-Tailwind stylesheet transitioned with the CSS default curve. */
   --default-transition-timing-function: ease;
   --animate-bpulse: bpulse 2.6s ease-in-out infinite;

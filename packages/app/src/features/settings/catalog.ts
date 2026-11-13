@@ -190,6 +190,15 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
     },
   },
   {
+    id: "meetings",
+    name: "Meetings",
+    prefixes: ["meetings"],
+    page: {
+      path: "/settings/meetings",
+      name: "Meetings",
+    },
+  },
+  {
     id: "tools",
     name: "Tools & Skills",
     prefixes: ["tools", "skills", "scripts", "mcp", "plugins", "hooks", "computer_use"],

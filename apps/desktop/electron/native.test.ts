@@ -244,6 +244,62 @@ describe("registerNativeIpc", () => {
     expect(() => invoke(CHANNELS.revealSession, {}, "sess-7")).not.toThrow();
   });
 
+  describe("revealing a path", () => {
+    const opened = (win: ReturnType<typeof makeWindow>) =>
+      win.sent.filter((s) => s.channel === CHANNELS.openPath).map((s) => s.args[0]);
+
+    it("raises the main window and opens the path there, not in the panel that asked", () => {
+      const main = makeWindow({ minimized: true, visible: false });
+      const panel = makeWindow();
+      windows.push(main, panel);
+      registerNativeIpc(() => main as never);
+
+      invoke(CHANNELS.revealPath, { sender: senderOf(panel) }, "/meetings/m1");
+      expect(main.visible).toBe(true);
+      expect(main.restore).toHaveBeenCalled();
+      expect(main.focus).toHaveBeenCalled();
+      expect(opened(main)).toEqual(["/meetings/m1"]);
+      expect(panel.sent).toEqual([]);
+    });
+
+    it("builds the main window again when it was closed, and sends once its page is up", () => {
+      // macOS keeps the app running with no window; "Open in Borg" from a
+      // meeting panel must still land somewhere.
+      let main: ReturnType<typeof makeWindow> | null = null;
+      const reopen = vi.fn(() => {
+        main = makeWindow({ loading: true });
+        windows.push(main);
+      });
+      registerNativeIpc(() => main as never, reopen);
+
+      invoke(CHANNELS.revealPath, {}, "/meetings/m1");
+      expect(reopen).toHaveBeenCalledTimes(1);
+      // A page still loading has no listener yet; the path waits for it.
+      expect(opened(main!)).toEqual([]);
+      main!.loading = false;
+      main!.webContents.emit("did-finish-load");
+      expect(opened(main!)).toEqual(["/meetings/m1"]);
+      // Once, not on every later load.
+      main!.webContents.emit("did-finish-load");
+      expect(opened(main!)).toEqual(["/meetings/m1"]);
+    });
+
+    it("drops a path whose window was destroyed before its page finished loading", () => {
+      const main = makeWindow({ loading: true });
+      windows.push(main);
+      registerNativeIpc(() => main as never);
+      invoke(CHANNELS.revealPath, {}, "/meetings/m1");
+      main.destroy();
+      expect(() => main.webContents.emit("did-finish-load")).not.toThrow();
+      expect(opened(main)).toEqual([]);
+    });
+
+    it("does nothing when no main window can be had", () => {
+      registerNativeIpc(() => null);
+      expect(() => invoke(CHANNELS.revealPath, {}, "/meetings/m1")).not.toThrow();
+    });
+  });
+
   it("hides the window that asked to be hidden", () => {
     const main = makeWindow();
     const panel = makeWindow();
@@ -297,6 +353,7 @@ describe("registerNativeIpc", () => {
     for (const channel of [
       CHANNELS.notify,
       CHANNELS.revealSession,
+      CHANNELS.revealPath,
       CHANNELS.hideWindow,
       CHANNELS.setBadge,
       CHANNELS.dictationHotkey,

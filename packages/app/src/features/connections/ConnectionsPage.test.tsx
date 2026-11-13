@@ -7,6 +7,7 @@ import { fakeDaemon, renderApp } from "../../test/harness";
 import { ConnectionsPage } from "./ConnectionsPage";
 import { badgeOf } from "./useConnections";
 import { subscription } from "../../test/subscriptions";
+import { status } from "../../test/meetings";
 
 const media = installMatchMedia(() => false);
 const mobile = media.controller("(max-width: 700px)");
@@ -207,5 +208,49 @@ describe("ConnectionsPage", () => {
     } finally {
       mobile.set(false);
     }
+  });
+});
+
+describe("ConnectionsPage calendar", () => {
+  const groups = () => screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+
+  it("leads with the calendar once Meetings is on, waiting to be connected", async () => {
+    mount(fakeDaemon({ ...EMPTY, ...TELEGRAM, GetMeetingsStatus: status() }));
+    await waitFor(() => expect(screen.getByText("telegram")).toBeTruthy());
+    await waitFor(() => expect(groups()[0]).toBe("Calendar"));
+    const card = screen.getByRole("button", { name: /Calendar/ });
+    expect(card.textContent).toContain("Not connected");
+    expect(card.querySelector(".bg-ink3")).not.toBeNull();
+  });
+
+  it("names a connected Google account with a healthy dot, even with Meetings off", async () => {
+    mount(
+      fakeDaemon({
+        ...EMPTY,
+        GetMeetingsStatus: status({
+          enabled: false,
+          calendar: { connected: true, kind: "google", accountLabel: "me@example.com" },
+        }),
+      }),
+    );
+    const card = await screen.findByRole("button", { name: /Google Calendar/ });
+    expect(card.textContent).toContain("me@example.com");
+    expect(card.textContent).toContain("GC");
+    expect(card.querySelector(".bg-neon")).not.toBeNull();
+  });
+
+  it("shows no calendar while Meetings is off and nothing is connected", async () => {
+    mount(fakeDaemon({ ...EMPTY, ...TELEGRAM, GetMeetingsStatus: status({ enabled: false }) }));
+    await waitFor(() => expect(screen.getByText("telegram")).toBeTruthy());
+    expect(groups()).not.toContain("Calendar");
+  });
+
+  it("opens the calendar page from the card", async () => {
+    mount(fakeDaemon({ ...EMPTY, GetMeetingsStatus: status() }));
+    const card = await screen.findByRole("button", { name: /Calendar/ });
+    act(() => card.click());
+    await waitFor(() =>
+      expect(screen.getByTestId("path").textContent).toBe("/connections/calendar"),
+    );
   });
 });

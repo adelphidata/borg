@@ -45,6 +45,19 @@ export interface BootStatus {
   canRetry: boolean;
 }
 
+/**
+ * A call the daemon noticed, as the desktop shell hands it to the
+ * "Meeting detected" panel. Mirrors `meetings.Detected`, flattened so it
+ * crosses IPC as plain data.
+ */
+export interface MeetingDetection {
+  /** "Zoom", "Teams", "Chrome"… */
+  sourceApp: string;
+  /** The calendar event the call lines up with, when there is one. */
+  calendarEventId?: string;
+  calendarTitle?: string;
+}
+
 export interface NativeBridge {
   /**
    * Menu items and global hotkeys arrive here as keybind action ids, so a
@@ -56,6 +69,13 @@ export interface NativeBridge {
   onActivateSession(handler: (sessionId: string) => void): () => void;
   /** Brings the main window forward and opens `sessionId` there. */
   revealSession(sessionId: string): void;
+  /**
+   * A route the main window should show, sent by the shell — a meeting panel
+   * asking for its meeting's page, say.
+   */
+  onOpenPath(handler: (path: string) => void): () => void;
+  /** Brings the main window forward and navigates it to `path`. */
+  revealPath(path: string): void;
   /** Dismisses the window this renderer is in. Used by the quick-entry panel. */
   hideWindow(): void;
   /** Dock/taskbar badge. 0 clears it. */
@@ -78,6 +98,16 @@ export interface NativeBridge {
     /** Quits and relaunches into the downloaded version. */
     install(): void;
   };
+  meetings: {
+    /**
+     * The call the "Meeting detected" panel is about: pushed at once with
+     * whatever the shell already knows (null for nothing), then on every
+     * change.
+     */
+    onDetection(handler: (detection: MeetingDetection | null) => void): () => void;
+    /** Opens the floating notes panel for a meeting that has started. */
+    openPanel(meetingId: string): void;
+  };
 }
 
 const noop = () => {};
@@ -89,6 +119,8 @@ export const NO_NATIVE: NativeBridge = {
   notify: noop,
   onActivateSession: unsubscribe,
   revealSession: noop,
+  onOpenPath: unsubscribe,
+  revealPath: noop,
   hideWindow: noop,
   setBadgeCount: noop,
   setDictationHotkey: noop,
@@ -106,5 +138,14 @@ export const NO_NATIVE: NativeBridge = {
     subscribe: unsubscribe,
     check: noop,
     install: noop,
+  },
+  // Nothing detects calls in a browser tab, and there is no panel to open:
+  // the Meetings page there lists and reads, it does not record.
+  meetings: {
+    onDetection: (handler) => {
+      handler(null);
+      return noop;
+    },
+    openPanel: noop,
   },
 };

@@ -91,6 +91,10 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
         tool_names::UPDATE_GOAL,
         "Mark this session's goal complete",
     ),
+    (
+        tool_names::MEETINGS,
+        "Read the user's recorded meetings: notes, summaries, transcripts",
+    ),
 ];
 
 /// Build the core tool definitions sent to the LLM.
@@ -466,6 +470,27 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     ));
     }
 
+    // Recorded meetings. Gated by `meetings.enabled`: an install that never
+    // turned meetings on pays no schema for them.
+    if config.meetings.enabled {
+        defs.push(ToolDefinition::new(
+            tool_names::MEETINGS,
+            "Read the user's recorded meetings (calls Borg took notes in). action='list' returns recent meetings newest first; action='search' finds a meeting by words in its title, the user's notes, the summary or the transcript; action='get' returns one meeting's notes, summary and transcript (\"Me\" is the user, \"Them\" everyone else). Use it whenever the user asks about a meeting, a call, or what someone said or decided.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "get", "search"]},
+                    "id": {"type": "string", "description": "Meeting id (mtg_…), for get."},
+                    "query": {"type": "string", "description": "Words to find, for search."},
+                    "limit": {"type": "integer", "description": "Rows for list/search (default 10, max 50)."},
+                    "max_chars": {"type": "integer", "description": "Transcript budget for get (default 20000)."}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        ));
+    }
+
     defs
 }
 
@@ -806,6 +831,7 @@ mod tests {
         config.telephony.provider = "twilio".into();
         config.image_gen.enabled = true;
         config.goals.enabled = true;
+        config.meetings.enabled = true;
         // Defaults on only on macOS; its summary must still match on Linux.
         config.computer_use.enabled = true;
         // Turn on MCP tool-search deferral so `search_tools` is produced and

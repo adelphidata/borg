@@ -6,7 +6,8 @@ import { useQuery } from "../../lib/useDaemon";
 import { useSettings } from "../../lib/settings";
 import { isBlankSession, rowTitle } from "../conversation/draftStore";
 import { isSessionUnread, markAllSessionsRead } from "../sessions/unreadStore";
-import { routes } from "../../routes";
+import { routes, visibleRoutes } from "../../routes";
+import { meetingsEnabled } from "../meetings/meetingsEnabled";
 import { buildCommands } from "./commands";
 import type { Command } from "./score";
 import { noteSkillUse, readSkillRecency } from "./skillRecency";
@@ -186,7 +187,9 @@ export function useCommands({
               setThemePreference: setPreference,
               searching,
             },
-            routes,
+            // Navigation commands for what the nav shows: no "Go to Meetings"
+            // while the feature is off.
+            visibleRoutes(routes, { meetings: meetingsEnabled(effective) }),
           ),
     // `active` gates the build itself: a closed palette and a composer with no
     // `/` in it render no rows, and building ~500 of them on every settings

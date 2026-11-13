@@ -15,6 +15,15 @@
  */
 export const QUICK_ENTRY_HASH = "#/quick";
 
+/** Hash the "Meeting detected" panel loads. Same contract as `QUICK_ENTRY_HASH`. */
+export const MEETING_DETECTED_HASH = "#/meeting-detected";
+
+/**
+ * Prefix of the hash a meeting's notes panel loads; the meeting id follows,
+ * URL-encoded: `#/meeting-panel/<id>`.
+ */
+export const MEETING_PANEL_HASH = "#/meeting-panel/";
+
 /**
  * The desktop app's system-wide key for the quick-entry panel. It lives here
  * so the settings page can warn when the dictation key is set to the same

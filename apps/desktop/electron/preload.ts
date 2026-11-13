@@ -5,6 +5,7 @@ import {
   type StreamEvent,
   type UnaryReply,
   type WireBootStatus,
+  type WireMeetingDetection,
   type WireNotification,
   type WireTransport,
   type WireUpdateStatus,
@@ -61,6 +62,47 @@ function subscribe<T>(channel: string, handler: (payload: T) => void): () => voi
 }
 
 /**
+ * Subscribes to a push channel whose current value the shell also keeps, and
+ * replays that value first: a window created after the fact would otherwise
+ * never hear it. The reply can land after the caller has gone (a reload
+ * mid-flight) or never come at all (handlers torn down on quit), so neither
+ * outcome may escape here.
+ */
+function subscribeWithReplay<T>(
+  channel: string,
+  readChannel: string,
+  handler: (payload: T) => void,
+): () => void {
+  let live = true;
+  const detach = subscribe<T>(channel, handler);
+  void ipcRenderer
+    .invoke(readChannel)
+    .then((payload: T) => {
+      if (live) handler(payload);
+    })
+    .catch(() => {});
+  return () => {
+    live = false;
+    detach();
+  };
+}
+
+/**
+ * Routes the shell asks the main window to show.
+ *
+ * Listened for from the moment the page loads, not from the moment the app
+ * subscribes: the app mounts its listener only once the daemon has answered,
+ * and a path sent to a window that has just been rebuilt arrives before that.
+ * The latest unheard path waits for the first subscriber.
+ */
+const pathHandlers = new Set<(path: string) => void>();
+let unheardPath: string | undefined;
+ipcRenderer.on(CHANNELS.openPath, (_event: unknown, path: string) => {
+  if (pathHandlers.size === 0) unheardPath = path;
+  else for (const handler of [...pathHandlers]) handler(path);
+});
+
+/**
  * The native shell, exposed alongside the transport rather than inside it.
  *
  * This is the only sanctioned widening of `window.borg`: it carries no Node
@@ -77,6 +119,20 @@ const native: NativeBridge = {
   revealSession: (sessionId) => {
     void ipcRenderer.invoke(CHANNELS.revealSession, sessionId);
   },
+  onOpenPath: (handler) => {
+    pathHandlers.add(handler);
+    if (unheardPath !== undefined) {
+      const path = unheardPath;
+      unheardPath = undefined;
+      handler(path);
+    }
+    return () => {
+      pathHandlers.delete(handler);
+    };
+  },
+  revealPath: (path) => {
+    void ipcRenderer.invoke(CHANNELS.revealPath, path);
+  },
   hideWindow: () => {
     void ipcRenderer.invoke(CHANNELS.hideWindow);
   },
@@ -87,24 +143,10 @@ const native: NativeBridge = {
     void ipcRenderer.invoke(CHANNELS.dictationHotkey, accelerator);
   },
   boot: {
-    subscribe: (handler) => {
-      let live = true;
-      const detach = subscribe<WireBootStatus>(CHANNELS.bootStatus, handler);
-      // Replay whatever the shell has already decided: a window created after
-      // the daemon came up would otherwise never hear a thing. The reply can
-      // land after the caller has gone (a reload mid-flight) or never come at
-      // all (handlers torn down on quit), so neither outcome may escape here.
-      void ipcRenderer
-        .invoke(CHANNELS.bootRead)
-        .then((status: WireBootStatus) => {
-          if (live) handler(status);
-        })
-        .catch(() => {});
-      return () => {
-        live = false;
-        detach();
-      };
-    },
+    // Replay whatever the shell has already decided: a window created after
+    // the daemon came up would otherwise never hear a thing.
+    subscribe: (handler) =>
+      subscribeWithReplay<WireBootStatus>(CHANNELS.bootStatus, CHANNELS.bootRead, handler),
     retry: () =>
       ipcRenderer.invoke(CHANNELS.bootRetry).then(
         () => {},
@@ -115,6 +157,19 @@ const native: NativeBridge = {
     subscribe: (handler) => subscribe<WireUpdateStatus>(CHANNELS.updateStatus, handler),
     check: () => void ipcRenderer.invoke(CHANNELS.updateCheck),
     install: () => void ipcRenderer.invoke(CHANNELS.updateInstall),
+  },
+  meetings: {
+    // The detected panel is built on the first detection, so the detection
+    // that built it has usually been sent before its page could listen.
+    onDetection: (handler) =>
+      subscribeWithReplay<WireMeetingDetection | null>(
+        CHANNELS.meetingDetection,
+        CHANNELS.meetingDetectionRead,
+        handler,
+      ),
+    openPanel: (meetingId) => {
+      void ipcRenderer.invoke(CHANNELS.meetingOpenPanel, meetingId);
+    },
   },
 };
 

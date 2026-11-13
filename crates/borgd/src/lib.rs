@@ -33,6 +33,7 @@ pub mod grpc_web;
 pub mod heartbeat;
 pub mod heartbeat_augmenters;
 pub(crate) mod maintenance;
+pub mod meetings;
 pub mod orchestrator;
 pub mod pairing;
 pub mod pidlock;
