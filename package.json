@@ -13,11 +13,11 @@
   },
   "devDependencies": {
     "@bufbuild/buf": "^1.75.0",
-    "@stryker-mutator/core": "^10.0.0",
-    "@stryker-mutator/vitest-runner": "^10.0.0",
-    "@vitest/coverage-v8": "5.0.5",
-    "prettier": "^3.9.10",
-    "ts-proto": "^2.18.1",
+    "@stryker-mutator/core": "^10.1.1",
+    "@stryker-mutator/vitest-runner": "^10.1.1",
+    "@vitest/coverage-v8": "5.1.0",
+    "prettier": "^3.10.1",
+    "ts-proto": "^2.18.5",
     "typescript": "^7.0.2"
   },
   "trustedDependencies": [

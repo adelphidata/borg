@@ -27,7 +27,7 @@ wasmtime = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-wasm-encoder = "0.262"
+wasm-encoder = "0.263"
 # Watchdog timeout for wasmtime-driven tests. Without this, a hung
 # test (e.g. an EpochTimer drop racing with the ticker thread) blocks
 # `cargo test` indefinitely instead of failing the offending test.

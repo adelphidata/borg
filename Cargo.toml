@@ -32,7 +32,7 @@ reqwest = { version = "0.13", default-features = false, features = ["stream", "j
 eventsource-stream = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1.1"
+toml = "1.2"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 anyhow = "1"
@@ -71,7 +71,7 @@ unicode-normalization = "0.1"
 unicode-width = "0.2"
 regex = "1"
 libsql = { version = "0.10", default-features = false, features = ["core", "encryption"] }
-roaring = "0.11"
+roaring = "0.12"
 scraper = "0.29"
 pdf-extract = "0.12"
 anydoc = "0.2.4"
@@ -104,7 +104,7 @@ base64 = "0.23"
 async-trait = "0.1"
 rand = "0.10"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
-wasmparser = "0.262"
+wasmparser = "0.263"
 # Every default feature except `cache`: plugins never configure wasmtime's
 # on-disk compile cache, and it is the only path that pulls in zstd 0.13.
 wasmtime = { version = "50", default-features = false, features = [

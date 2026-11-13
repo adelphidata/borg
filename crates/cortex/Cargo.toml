@@ -133,6 +133,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 libc = { workspace = true }
 wiremock = "0.6"
 libsql = { workspace = true }
-wasm-encoder = "0.262"
+wasm-encoder = "0.263"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry = { workspace = true, features = ["testing"] }
