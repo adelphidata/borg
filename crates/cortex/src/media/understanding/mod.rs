@@ -64,7 +64,15 @@ impl AudioTranscriber {
         if !config.audio.enabled {
             return None;
         }
+        Self::from_models(config)
+    }
 
+    /// Build the `audio.models` chain whether or not `audio.enabled` is on.
+    ///
+    /// For callers with their own switch: meeting notes share the dictation
+    /// chain, but turning dictation off must not stop a meeting from being
+    /// transcribed. Returns None when no provider in the chain can run.
+    pub fn from_models(config: &Config) -> Option<Self> {
         let audio = &config.audio;
         // Cloned, not built: every provider entry below shares the one
         // connection pool, and per-request budgets are applied on the request.

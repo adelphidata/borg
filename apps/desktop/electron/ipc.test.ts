@@ -3,13 +3,12 @@ import { CHANNELS, type StreamEvent, type UnaryReply } from "./channels";
 
 vi.mock("electron", () => import("./test/electron-stub"));
 
-/** The node transport, replaced so no unix socket is involved. */
-const transport = vi.hoisted(() => ({
+/** The node transport main hands in, replaced so no unix socket is involved. */
+const transport = {
   unary: vi.fn(),
   serverStream: vi.fn(),
   close: vi.fn(),
-}));
-vi.mock("@borg/client/node", () => ({ createNodeTransport: () => transport }));
+};
 
 const { handlers, invoke, makeWindow, resetElectron, windows } =
   await import("./test/electron-stub");
@@ -36,7 +35,7 @@ const streamed = () =>
 describe("registerBorgIpc unary", () => {
   it("returns the daemon's reply", async () => {
     transport.unary.mockResolvedValue({ sessions: [] });
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
 
     const reply = (await invoke(CHANNELS.unary, event(), "Sessions/List", {
       limit: 5,
@@ -50,7 +49,7 @@ describe("registerBorgIpc unary", () => {
     // An Error instance loses its gRPC status through structured clone, so the
     // renderer would see a generic failure and could not branch on the code.
     transport.unary.mockRejectedValue(new BorgError(7, "permission denied", "Sessions/List"));
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
 
     const reply = (await invoke(CHANNELS.unary, event(), "Sessions/List", {})) as UnaryReply;
     expect(reply).toEqual({ ok: false, error: { code: 7, message: "permission denied" } });
@@ -59,7 +58,7 @@ describe("registerBorgIpc unary", () => {
 
   it("reports a non-gRPC failure as internal rather than losing it", async () => {
     transport.unary.mockRejectedValue(new Error("socket closed"));
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
 
     const reply = (await invoke(CHANNELS.unary, event(), "Sessions/List", {})) as UnaryReply;
     expect(reply).toEqual({ ok: false, error: { code: 13, message: "socket closed" } });
@@ -68,7 +67,7 @@ describe("registerBorgIpc unary", () => {
 
   it("survives a thrown non-Error", async () => {
     transport.unary.mockRejectedValue("kaboom");
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
 
     const reply = (await invoke(CHANNELS.unary, event(), "Sessions/List", {})) as UnaryReply;
     expect(reply).toEqual({ ok: false, error: { code: 13, message: "kaboom" } });
@@ -94,7 +93,7 @@ describe("registerBorgIpc streams", () => {
   }
 
   it("forwards each message to the window that opened the stream", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream } = openStream();
 
     stream.onMessage({ turn: 1 });
@@ -107,7 +106,7 @@ describe("registerBorgIpc streams", () => {
   });
 
   it("carries the stream id, so two streams on one window stay apart", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const first = openStream("s0");
     const second = openStream("s1");
 
@@ -118,7 +117,7 @@ describe("registerBorgIpc streams", () => {
   });
 
   it("sends the error as data and ends the stream", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream } = openStream();
 
     stream.onError(new BorgError(14, "unavailable", "Sessions/Watch"));
@@ -130,7 +129,7 @@ describe("registerBorgIpc streams", () => {
   });
 
   it("sends completion", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream } = openStream();
 
     stream.onComplete();
@@ -140,7 +139,7 @@ describe("registerBorgIpc streams", () => {
 
   it("says nothing to a window that has already gone", () => {
     // A reload destroys the sender while the daemon is mid-stream.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream } = openStream();
     win.destroy();
 
@@ -150,7 +149,7 @@ describe("registerBorgIpc streams", () => {
   });
 
   it("cancels the stream the renderer asks it to", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { cancel } = openStream();
 
     invoke(CHANNELS.streamCancel, event(), "s0");
@@ -159,7 +158,7 @@ describe("registerBorgIpc streams", () => {
   });
 
   it("ignores a cancel for a stream that already ended", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream, cancel } = openStream();
 
     stream.onComplete();
@@ -171,7 +170,7 @@ describe("registerBorgIpc streams", () => {
   it("does not cancel again on dispose a stream the renderer already cancelled", () => {
     // streamCancel must also drop the map entry; a leftover entry would be
     // cancelled a second time on quit.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { cancel } = openStream();
 
     invoke(CHANNELS.streamCancel, event(), "s0");
@@ -182,7 +181,7 @@ describe("registerBorgIpc streams", () => {
   it("dispose is idempotent: a second dispose cancels nothing again", () => {
     // Window reload and app quit can both tear the bridge down; the map must
     // be emptied by the first pass so the second finds nothing to cancel.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { cancel } = openStream();
 
     ipc.dispose();
@@ -193,7 +192,7 @@ describe("registerBorgIpc streams", () => {
   it("does not cancel a finished stream on dispose", () => {
     // The map is the leak guard: an entry left behind after completion would be
     // cancelled again on quit.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { handlers: stream, cancel } = openStream();
     stream.onError(new Error("gone"));
 
@@ -201,15 +200,31 @@ describe("registerBorgIpc streams", () => {
     expect(cancel).not.toHaveBeenCalled();
   });
 
-  it("cancels what is still live, closes the transport, and drops every handler", () => {
+  it("cancels what is still live and drops its own handlers", () => {
     // Without this, a window reload leaks subscriptions into the daemon.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const { cancel } = openStream();
 
     ipc.dispose();
     expect(cancel).toHaveBeenCalledTimes(1);
-    expect(transport.close).toHaveBeenCalledTimes(1);
-    for (const channel of Object.values(CHANNELS)) expect(handlers.has(channel)).toBe(false);
+    for (const channel of [CHANNELS.unary, CHANNELS.streamOpen, CHANNELS.streamCancel]) {
+      expect(handlers.has(channel)).toBe(false);
+    }
+  });
+
+  it("leaves the transport open: main owns it, and the meetings feed still rides it", () => {
+    const ipc = registerBorgIpc({ transport: transport as never });
+    ipc.dispose();
+    expect(transport.close).not.toHaveBeenCalled();
+  });
+
+  it("leaves other modules' handlers alone on dispose", () => {
+    // Dispose order at quit is not fixed; dropping a neighbour's handler would
+    // make its own dispose, or a late renderer call, behave differently.
+    const neighbour = vi.fn();
+    handlers.set(CHANNELS.meetingOpenPanel, neighbour);
+    registerBorgIpc({ transport: transport as never }).dispose();
+    expect(handlers.get(CHANNELS.meetingOpenPanel)).toBe(neighbour);
   });
 });
 
@@ -232,7 +247,7 @@ describe("registerBorgIpc when the page goes away", () => {
   ])("closes every stream the page opened when %s", (_name, leave) => {
     // A page that dies never cancels its own streams: without this the
     // daemon subscriptions stay open until the app quits.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const a = open("load-1:s0");
     const b = open("load-1:s1");
 
@@ -244,7 +259,7 @@ describe("registerBorgIpc when the page goes away", () => {
   });
 
   it("closes the previous page's streams when a reloaded page opens its first", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const a = open("load-1:s0");
     const b = open("load-1:s1");
 
@@ -259,7 +274,7 @@ describe("registerBorgIpc when the page goes away", () => {
   it("keeps the streams of a page whose navigation was blocked", () => {
     // A file dropped on the page starts a navigation the window then refuses;
     // the page lives on, so its streams must too.
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const a = open("load-1:s0");
 
     win.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
@@ -269,7 +284,7 @@ describe("registerBorgIpc when the page goes away", () => {
   });
 
   it("never hands the new page an event or a cancel meant for the old one", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const old = open("load-1:s0");
     const fresh = open("load-2:s0");
 
@@ -287,7 +302,7 @@ describe("registerBorgIpc when the page goes away", () => {
   });
 
   it("does not pile up page listeners across reloads and crashes", () => {
-    const ipc = registerBorgIpc();
+    const ipc = registerBorgIpc({ transport: transport as never });
     const count = () =>
       [...win.webContents.listeners.values()].reduce((n, list) => n + list.length, 0);
     open("load-0:s0");

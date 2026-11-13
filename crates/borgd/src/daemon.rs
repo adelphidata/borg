@@ -517,6 +517,7 @@ async fn start_orchestrator_extras(
                 goal_bus: Some(handles.goal_bus),
                 tunnel_supervisor: Some(tunnel_sup),
                 subscription_bus: Some(handles.subscription_bus),
+                meetings: Some(handles.meetings),
             }
         }
         Err(e) => {
@@ -533,6 +534,7 @@ async fn start_orchestrator_extras(
                 goal_bus: Some(goal_bus.clone()),
                 tunnel_supervisor: None,
                 subscription_bus: None,
+                meetings: None,
             }
         }
     }
@@ -885,6 +887,7 @@ async fn serve_transports(
             .add_service(services.capability.clone())
             .add_service(services.telemetry.clone())
             .add_service(services.voice.clone())
+            .add_service(services.meetings.clone())
             .add_service(PkiServer::new(PkiSvc::new(
                 pki_db.clone(),
                 audit.clone(),
@@ -946,6 +949,10 @@ async fn serve_transports(
             ))
             .add_service(InterceptedService::new(
                 services.voice.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.meetings.clone(),
                 interceptor.clone(),
             ))
             .add_service(InterceptedService::new(tcp_pki, interceptor));

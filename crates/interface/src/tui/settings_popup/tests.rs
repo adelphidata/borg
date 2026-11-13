@@ -1031,3 +1031,44 @@ fn wants_text_input_only_in_editing_mode() {
         "Editing a value buffer must claim text input so `/` is preserved"
     );
 }
+
+#[test]
+fn a_secret_row_other_than_the_llm_key_saves_as_a_literal_and_clears_when_empty() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut popup = SettingsPopup::new();
+    let mut cfg = Config::default();
+    open(&mut popup, &cfg);
+    popup.selected = popup
+        .entries
+        .iter()
+        .position(|e| e.key == "meetings.calendar.ics_url")
+        .expect("the Meetings ICS row is in the popup");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+    for (typed, want) in [
+        (
+            " https://cal.example.com/a.ics ",
+            Some("https://cal.example.com/a.ics"),
+        ),
+        ("", None),
+    ] {
+        popup.handle_key(enter, &mut cfg).unwrap();
+        if let EditMode::Editing { ref mut buffer } = popup.mode {
+            buffer.clear();
+            buffer.push_str(typed);
+        }
+        let action = popup.handle_key(enter, &mut cfg).unwrap();
+        assert!(
+            matches!(action, Some(AppAction::UpdateSetting { ref key, .. }) if key == "meetings.calendar.ics_url"),
+            "typed {typed:?}: status {:?}",
+            popup.status_message
+        );
+        let got = cfg
+            .meetings
+            .calendar
+            .ics_url
+            .as_ref()
+            .map(|s| s.resolve().unwrap());
+        assert_eq!(got.as_deref(), want, "typed {typed:?}");
+    }
+}

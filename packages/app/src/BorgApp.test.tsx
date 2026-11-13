@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { installMatchMedia } from "@borg/ui/test/matchMedia";
 import { BorgError, GrpcStatus } from "@borg/client";
 import { BorgApp } from "./BorgApp";
-import { QUICK_ENTRY_HASH } from "./lib/chords";
+import { MEETING_DETECTED_HASH, MEETING_PANEL_HASH, QUICK_ENTRY_HASH } from "./lib/chords";
 import { dispatchKeybind } from "./lib/keybinds";
 import { clearNotice } from "./lib/notice";
 import { sessionsChanged } from "./features/sessions/sessionsVersion";
@@ -11,6 +11,7 @@ import { STORAGE_KEYS } from "@borg/ui";
 import { fakeDaemon, fakeNative } from "./test/harness";
 import { setupStatus } from "./test/setupStatus";
 import { subscription } from "./test/subscriptions";
+import { entry, fullMeeting, status as meetingsStatus } from "./test/meetings";
 import type { Platform } from "./lib/platform";
 
 const media = installMatchMedia(() => false);
@@ -630,5 +631,122 @@ describe("BorgApp gates", () => {
     expect(screen.getByPlaceholderText("Ask Borg anything")).toBeTruthy();
     expect(screen.queryByText("Chats")).toBeNull();
     expect(daemon.calls.some((c) => c.method === "GetOnboardingState")).toBe(false);
+  });
+
+  it("is the meeting pop-up and nothing else at the meeting-detected route", async () => {
+    window.location.hash = MEETING_DETECTED_HASH;
+    const daemon = fakeDaemon({ ...BASE, GetMeetingsStatus: meetingsStatus() });
+    const { native } = mount(daemon);
+    act(() => native.emitDetection({ sourceApp: "Zoom" }));
+    expect(screen.getByText("Meeting detected")).toBeTruthy();
+    expect(screen.queryByText("Chats")).toBeNull();
+    expect(daemon.calls.some((c) => c.method === "GetOnboardingState")).toBe(false);
+  });
+
+  it("is a meeting's notes panel at the meeting-panel route", async () => {
+    window.location.hash = `${MEETING_PANEL_HASH}m1`;
+    const daemon = fakeDaemon({
+      ...BASE,
+      GetMeeting: fullMeeting({ id: "m1", title: "Board prep", state: "done" }),
+    });
+    mount(daemon);
+    expect(await screen.findByText("Board prep")).toBeTruthy();
+    expect(daemon.calls.find((c) => c.method === "GetMeeting")!.request).toEqual({ id: "m1" });
+    expect(screen.queryByText("Chats")).toBeNull();
+  });
+});
+
+describe("BorgApp meetings", () => {
+  const MEETINGS_ON = {
+    ...BASE,
+    GetSettings: { entries: [entry("meetings.enabled", "true")] },
+    GetMeetingsStatus: meetingsStatus(),
+    ListMeetings: { meetings: [] },
+  };
+  const navLabels = () =>
+    screen
+      .getAllByRole("link")
+      .map((l) => l.textContent)
+      .filter((t) => ["Chats", "Meetings", "Connections", "Scheduled"].includes(t ?? ""));
+  const meetingsLink = () => screen.getByRole("link", { name: /Meetings/ });
+
+  it("keeps Meetings out of the sidebar while the feature is off", async () => {
+    mount();
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(screen.queryByRole("link", { name: /Meetings/ })).toBeNull();
+  });
+
+  it("lists Meetings directly under Chats when it is on", async () => {
+    mount(fakeDaemon(MEETINGS_ON));
+    await waitFor(() => expect(meetingsLink()).toBeTruthy());
+    expect(navLabels()).toEqual(["Chats", "Meetings", "Connections", "Scheduled"]);
+  });
+
+  it("marks Meetings with a green dot while a finished summary is unread, and only then", async () => {
+    const quiet = mount(fakeDaemon(MEETINGS_ON));
+    await waitFor(() => expect(meetingsLink()).toBeTruthy());
+    await waitFor(() =>
+      expect(quiet.daemon.calls.some((c) => c.method === "GetMeetingsStatus")).toBe(true),
+    );
+    expect(meetingsLink().querySelector(".bg-neon")).toBeNull();
+    quiet.unmount();
+
+    mount(fakeDaemon({ ...MEETINGS_ON, GetMeetingsStatus: meetingsStatus({ unreadCount: 2 }) }));
+    await waitFor(() => expect(meetingsLink().querySelector(".bg-neon")).not.toBeNull());
+    expect(meetingsLink().querySelector(".bg-alert")).toBeNull();
+  });
+
+  it("subscribes to meeting events only while the feature is on", async () => {
+    const off = mount();
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    expect(off.daemon.streams.some((s) => s.method === "SubscribeMeetingEvents")).toBe(false);
+    off.unmount();
+
+    const on = mount(fakeDaemon(MEETINGS_ON));
+    await waitFor(() =>
+      expect(on.daemon.streams.some((s) => s.method === "SubscribeMeetingEvents")).toBe(true),
+    );
+  });
+
+  it("re-reads the unread count when a summary lands", async () => {
+    const { daemon } = mount(fakeDaemon(MEETINGS_ON));
+    await waitFor(() =>
+      expect(daemon.streams.some((s) => s.method === "SubscribeMeetingEvents")).toBe(true),
+    );
+    daemon.answer("GetMeetingsStatus", meetingsStatus({ unreadCount: 1 }));
+    act(() =>
+      daemon.streams
+        .find((s) => s.method === "SubscribeMeetingEvents")!
+        .handlers.onMessage({ summaryReady: { id: "m1" } } as never),
+    );
+    await waitFor(() => expect(meetingsLink().querySelector(".bg-neon")).not.toBeNull());
+  });
+
+  it("keeps the other dots on a daemon that has no meetings service", async () => {
+    const { GetMeetingsStatus: _gone, ...older } = MEETINGS_ON;
+    mount(fakeDaemon({ ...older, GetPersistentWarnings: { warnings: ["Sandbox: missing"] } }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("link", { name: /Health/ }).querySelector(".bg-alert"),
+      ).not.toBeNull(),
+    );
+  });
+
+  it("goes where a meeting panel asks the main window to go", async () => {
+    const { native } = mount(
+      fakeDaemon({
+        ...MEETINGS_ON,
+        GetMeeting: fullMeeting({
+          id: "m1",
+          title: "Quarterly planning",
+          startedAt: 1_700_000_000,
+        }),
+        MarkMeetingRead: {},
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
+    act(() => native.emitOpenPath("/meetings/m1"));
+    expect(await screen.findByPlaceholderText("Add your thoughts…")).toBeTruthy();
+    expect(screen.getAllByText("Quarterly planning").length).toBeGreaterThan(0);
   });
 });

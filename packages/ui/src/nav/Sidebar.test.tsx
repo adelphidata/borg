@@ -108,6 +108,23 @@ describe("Sidebar nav", () => {
     expect(link("Chat").querySelector(".bg-alert")).toBeNull();
   });
 
+  it("draws an unread dot green, not red", () => {
+    // A finished meeting summary is news, not a fault: the same dot slot,
+    // in the colour the rest of the app uses for "new here".
+    renderNavAt("/", [
+      route({ id: "chat", path: "/", label: "Chat" }),
+      route({
+        id: "meetings",
+        path: "/meetings",
+        label: "Meetings",
+        hasAlert: true,
+        alertTone: "unread",
+      }),
+    ]);
+    expect(link("Meetings").querySelector(".bg-neon")).not.toBeNull();
+    expect(link("Meetings").querySelector(".bg-alert")).toBeNull();
+  });
+
   it("keeps each route in its own section, primary above secondary", () => {
     renderNavAt("/");
     // Cross-wired section filtering would reorder or duplicate rows.

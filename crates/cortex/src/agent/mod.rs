@@ -2049,7 +2049,7 @@ impl Agent {
     /// Persist one call's usage to the token-usage table and reconcile it
     /// against the budget. Takes no agent, so the title generator, which runs
     /// after the turn on its own client, records its call the same way.
-    pub(super) async fn log_usage(db: &Database, usage: &UsageData, session_id: Option<&str>) {
+    pub(crate) async fn log_usage(db: &Database, usage: &UsageData, session_id: Option<&str>) {
         let total = usage.prompt_tokens + usage.completion_tokens;
         if total == 0 {
             return;

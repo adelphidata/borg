@@ -303,6 +303,19 @@ impl Database {
         Ok(())
     }
 
+    /// Meetings (`meetings`, `meeting_segments`, `calendar_events`). Same
+    /// shape as v8: the baseline re-emits `SCHEMA_SQL` on the stamp bump, so
+    /// this step only asserts the tables arrived.
+    pub(super) async fn migrate_v9(&self) -> Result<()> {
+        for table in ["meetings", "meeting_segments", "calendar_events"] {
+            anyhow::ensure!(
+                self.table_exists(table).await?,
+                "migration v9: `{table}` missing after the baseline"
+            );
+        }
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -1627,6 +1640,62 @@ CREATE TABLE IF NOT EXISTS credential_suppressions (
     suppressed_at_ms INTEGER NOT NULL,
     PRIMARY KEY (provider, source_kind, source_value)
 );
+
+-- Meetings: notes for calls the user is in --------------------------------
+-- state: recording | finalizing | done | failed. dir: the meeting's folder.
+-- summary_md stays NULL until a summary is written; error is set only when
+-- the summary failed. unread marks a finished summary nobody opened yet.
+CREATE TABLE IF NOT EXISTS meetings (
+    id                TEXT PRIMARY KEY,
+    title             TEXT NOT NULL DEFAULT '',
+    state             TEXT NOT NULL DEFAULT 'recording',
+    source_app        TEXT NOT NULL DEFAULT '',
+    calendar_event_id TEXT NOT NULL DEFAULT '',
+    attendees_json    TEXT NOT NULL DEFAULT '[]',
+    started_at        INTEGER NOT NULL,
+    ended_at          INTEGER,
+    dir               TEXT NOT NULL,
+    notes             TEXT NOT NULL DEFAULT '',
+    summary_md        TEXT,
+    unread            INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at);
+CREATE INDEX IF NOT EXISTS idx_meetings_state ON meetings(state);
+
+-- One row per transcribed chunk. track: mic | system. The UNIQUE key makes a
+-- retried push idempotent.
+CREATE TABLE IF NOT EXISTS meeting_segments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    meeting_id TEXT NOT NULL,
+    track      TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    start_ms   INTEGER NOT NULL,
+    end_ms     INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    UNIQUE(meeting_id, track, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_meeting_segments_order
+    ON meeting_segments(meeting_id, start_ms);
+
+-- Cached calendar events. id: "google:<id>", "ics:<uid>", or
+-- "ics:<uid>:<occurrence start>" for an expanded recurrence. source: google |
+-- ics. provider: meet | zoom | teams | ''.
+CREATE TABLE IF NOT EXISTS calendar_events (
+    id             TEXT PRIMARY KEY,
+    source         TEXT NOT NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    start_unix     INTEGER NOT NULL,
+    end_unix       INTEGER NOT NULL,
+    all_day        INTEGER NOT NULL DEFAULT 0,
+    attendees_json TEXT NOT NULL DEFAULT '[]',
+    join_url       TEXT NOT NULL DEFAULT '',
+    provider       TEXT NOT NULL DEFAULT '',
+    synced_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_unix);
 "#
     )
 });

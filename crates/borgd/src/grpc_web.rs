@@ -33,5 +33,6 @@ pub fn build_grpc_web_router(services: &Services) -> Router {
         .add_service(web.layer(services.session.clone()))
         .add_service(web.layer(services.telemetry.clone()))
         .add_service(web.layer(services.voice.clone()))
+        .add_service(web.layer(services.meetings.clone()))
         .into_axum_router()
 }

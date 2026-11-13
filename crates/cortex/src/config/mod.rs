@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod mcp_store;
 pub mod mcp_supply_chain;
 pub mod media;
+pub mod meetings;
 pub mod process_registry;
 pub mod security;
 pub mod subscriptions;
@@ -58,6 +59,7 @@ pub use loop_guard::*;
 pub use maintenance::*;
 pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
+pub use meetings::{MeetingsCalendarConfig, MeetingsConfig};
 pub use process_registry::*;
 pub use security::*;
 pub use subscriptions::*;
@@ -206,6 +208,9 @@ pub struct Config {
     /// Per-session goal subsystem tunables.
     #[serde(default)]
     pub goals: GoalsConfig,
+    /// Meeting notes: detection, recording, transcripts and summaries.
+    #[serde(default)]
+    pub meetings: MeetingsConfig,
     /// Subprocess process registry — orphan thresholds and auto-reap
     /// whitelist. Consumed by the maintenance sweep.
     #[serde(default)]

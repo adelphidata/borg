@@ -41,6 +41,7 @@ pub(crate) mod generate_image;
 pub(crate) mod get_goal;
 pub(crate) mod list;
 pub(crate) mod list_dir;
+pub(crate) mod meetings;
 pub(crate) mod memory_search;
 pub(crate) mod multi_agent;
 pub(crate) mod phone_call;
@@ -69,6 +70,7 @@ pub(crate) use generate_image::GenerateImageArgs;
 pub(crate) use get_goal::GetGoalArgs;
 pub(crate) use list::ListArgs;
 pub(crate) use list_dir::ListDirArgs;
+pub(crate) use meetings::MeetingsArgs;
 pub(crate) use memory_search::MemorySearchArgs;
 pub(crate) use multi_agent::MultiAgentArgs;
 pub(crate) use phone_call::PhoneCallArgs;
@@ -147,6 +149,9 @@ pub(crate) enum Tool {
     GetGoal(GetGoalArgs),
     CreateGoal(CreateGoalArgs),
     UpdateGoal(UpdateGoalArgs),
+
+    // Meetings
+    Meetings(MeetingsArgs),
 
     // Multi-agent
     SpawnAgent(MultiAgentArgs),
@@ -240,6 +245,9 @@ impl Tool {
             tn::CREATE_GOAL => Tool::CreateGoal(from(tn::CREATE_GOAL, args)?),
             tn::UPDATE_GOAL => Tool::UpdateGoal(from(tn::UPDATE_GOAL, args)?),
 
+            // Meetings
+            tn::MEETINGS => Tool::Meetings(from(tn::MEETINGS, args)?),
+
             // Multi-agent
             tn::SPAWN_AGENT => Tool::SpawnAgent(from(tn::SPAWN_AGENT, args)?),
             tn::SEND_TO_AGENT => Tool::SendToAgent(from(tn::SEND_TO_AGENT, args)?),
@@ -286,6 +294,7 @@ impl Tool {
             Tool::GetGoal(_) => tn::GET_GOAL,
             Tool::CreateGoal(_) => tn::CREATE_GOAL,
             Tool::UpdateGoal(_) => tn::UPDATE_GOAL,
+            Tool::Meetings(_) => tn::MEETINGS,
             Tool::SpawnAgent(_) => tn::SPAWN_AGENT,
             Tool::SendToAgent(_) => tn::SEND_TO_AGENT,
             Tool::WaitForAgent(_) => tn::WAIT_FOR_AGENT,
@@ -316,7 +325,9 @@ impl Tool {
             | Tool::VisionAnalyze(_)
             | Tool::VideoAnalyze(_) => true,
 
-            Tool::WriteMemory(_)
+            // Read-only, but the parallel dispatcher has no arm for it.
+            Tool::Meetings(_)
+            | Tool::WriteMemory(_)
             | Tool::CreateChannel(_)
             | Tool::RunShell(_)
             | Tool::List(_)
@@ -367,7 +378,8 @@ impl Tool {
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
             | Tool::VisionAnalyze(_)
-            | Tool::VideoAnalyze(_) => true,
+            | Tool::VideoAnalyze(_)
+            | Tool::Meetings(_) => true,
 
             Tool::ComputerUse(args) => computer_use::action_allowed_in_plan_mode(&args.action),
             Tool::Subscribe(args) => crate::tool_handlers::subscribe::is_read_action(&args.0),
@@ -434,6 +446,7 @@ impl Tool {
             | Tool::CloseAgent(_)
             | Tool::ManageRoles(_) => ToolGroup::Agents,
             Tool::GetGoal(_) | Tool::CreateGoal(_) | Tool::UpdateGoal(_) => ToolGroup::Goals,
+            Tool::Meetings(_) => ToolGroup::Meetings,
         }
     }
 }
@@ -467,6 +480,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::VIDEO_ANALYZE,
             tn::COMPUTER_USE,
             tn::SUBSCRIBE,
+            tn::MEETINGS,
         ],
     )
 }
@@ -608,6 +622,7 @@ mod tests {
             (tn::GET_GOAL, json!({})),
             (tn::CREATE_GOAL, json!({"objective":"o"})),
             (tn::UPDATE_GOAL, json!({"status":"complete"})),
+            (tn::MEETINGS, json!({"action":"list"})),
         ];
         for (name, args) in cases {
             let parsed = Tool::parse(name, args.clone())
@@ -711,6 +726,7 @@ mod tests {
             (tn::GET_GOAL, json!({})),
             (tn::CREATE_GOAL, json!({"objective":"o"})),
             (tn::UPDATE_GOAL, json!({"status":"complete"})),
+            (tn::MEETINGS, json!({"action":"list"})),
         ]
     }
 
@@ -722,6 +738,8 @@ mod tests {
         // blocked in Plan mode (the agent runs them in Execute only).
         assert!(!allowed_in_plan_mode_name(tn::CREATE_GOAL));
         assert!(!allowed_in_plan_mode_name(tn::UPDATE_GOAL));
+        // meetings only reads.
+        assert!(allowed_in_plan_mode_name(tn::MEETINGS));
     }
 
     #[test]

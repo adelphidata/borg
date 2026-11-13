@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/telemetry.proto",
         "proto/pki.proto",
         "proto/voice.proto",
+        "proto/meetings.proto",
     ];
     // Without these, edits to .proto files don't trigger codegen on
     // incremental builds and downstream crates compile against stale stubs.

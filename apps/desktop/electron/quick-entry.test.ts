@@ -163,6 +163,21 @@ describe("registerQuickEntry", () => {
     panel.dispose();
   });
 
+  it("is hardened like the main window: no in-app windows, no navigating away", () => {
+    // It loads the same bundle, so a link in a reply it shows is the same risk.
+    const panel = registerQuickEntry(OPTIONS);
+    press();
+    const window = stub.constructedWindows[0];
+    expect(window.webContents.windowOpenHandler!({ url: "file:///etc/passwd" })).toEqual({
+      action: "deny",
+    });
+    const event = { preventDefault: vi.fn() };
+    window.webContents.emit("will-navigate", event, "https://evil.example.com");
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(stub.externalOpens).toEqual(["https://evil.example.com"]);
+    panel.dispose();
+  });
+
   it("gives up the hotkey and the window on dispose", () => {
     const panel = registerQuickEntry(OPTIONS);
     press();

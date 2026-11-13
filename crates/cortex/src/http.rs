@@ -182,6 +182,8 @@ mod tests {
         const EXEMPT: &[&str] = &[
             // Installs an SSRF-guarding DNS resolver.
             "src/web.rs",
+            // Calendar feeds: the same resolver, plus a per-hop redirect check.
+            "src/meetings/calendar/ics.rs",
             // Redirects disabled: the endpoint guard validates only the first URL.
             "src/memory/provider/mod.rs",
             // Cross-host-safe redirect policy for provider credentials.

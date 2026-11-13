@@ -34,6 +34,8 @@ pub enum ToolGroup {
     Agents,
     /// Per-session goal management tools.
     Goals,
+    /// Recorded meetings: notes, summaries, transcripts.
+    Meetings,
 }
 
 /// Primary tools per group — derived from the typed [`crate::tool::Tool`]
@@ -88,6 +90,8 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     (crate::tool::names::GET_GOAL, ToolGroup::Goals),
     (crate::tool::names::CREATE_GOAL, ToolGroup::Goals),
     (crate::tool::names::UPDATE_GOAL, ToolGroup::Goals),
+    // Meetings
+    (crate::tool::names::MEETINGS, ToolGroup::Meetings),
 ];
 
 impl ToolGroup {
@@ -106,6 +110,7 @@ impl ToolGroup {
             "integration" => Some(Self::Integration),
             "agents" => Some(Self::Agents),
             "goals" => Some(Self::Goals),
+            "meetings" => Some(Self::Meetings),
             _ => None,
         }
     }
@@ -125,6 +130,7 @@ impl ToolGroup {
             Self::Integration => "Integration",
             Self::Agents => "Agents",
             Self::Goals => "Goals",
+            Self::Meetings => "Meetings",
         }
     }
 
@@ -219,6 +225,20 @@ impl ToolGroup {
             ],
             Self::Integration => &[
                 "email", "gmail", "calendar", "notion", "linear", "slack", "discord",
+            ],
+            // "meeting" also catches the "Ask anything" turn the Meetings
+            // page sends, which names the meeting and its id.
+            Self::Meetings => &[
+                "meeting",
+                "standup",
+                "stand-up",
+                "transcript",
+                "1:1",
+                "one-on-one",
+                "sync-up",
+                "the call",
+                "that call",
+                "on the call",
             ],
             Self::Agents => &[
                 "agent",
@@ -345,6 +365,7 @@ impl ToolProfile {
                 ToolGroup::Discovery,
                 ToolGroup::Integration,
                 ToolGroup::Scheduling,
+                ToolGroup::Meetings,
             ]
             .into_iter()
             .collect(),
@@ -360,6 +381,7 @@ impl ToolProfile {
                 ToolGroup::Desktop,
                 ToolGroup::Integration,
                 ToolGroup::Agents,
+                ToolGroup::Meetings,
             ]
             .into_iter()
             .collect(),
@@ -381,6 +403,7 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
     ToolGroup::Integration,
     ToolGroup::Agents,
     ToolGroup::Goals,
+    ToolGroup::Meetings,
 ];
 
 /// Aliases — tools that share a group with a primary tool but are not listed
@@ -533,9 +556,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_full_includes_all_11_groups() {
+    fn profile_full_includes_all_12_groups() {
         let groups = ToolProfile::Full.groups();
-        assert_eq!(groups.len(), 11);
+        assert_eq!(groups.len(), 12);
+        assert!(groups.contains(&ToolGroup::Meetings));
     }
 
     #[test]
@@ -616,7 +640,8 @@ mod tests {
 
     #[test]
     fn all_groups_constant_has_all_variants() {
-        assert_eq!(ALL_GROUPS.len(), 12);
+        assert_eq!(ALL_GROUPS.len(), 13);
+        assert!(ALL_GROUPS.contains(&ToolGroup::Meetings));
         assert!(ALL_GROUPS.contains(&ToolGroup::Memory));
         assert!(ALL_GROUPS.contains(&ToolGroup::Fs));
         assert!(ALL_GROUPS.contains(&ToolGroup::Runtime));
@@ -822,7 +847,33 @@ mod tests {
             ToolDefinition::new("gmail", "Gmail", schema.clone()),
             ToolDefinition::new("spawn_agent", "Spawn agent", schema.clone()),
             ToolDefinition::new("computer_use", "Computer use", schema.clone()),
+            ToolDefinition::new("meetings", "Meetings", schema.clone()),
         ]
+    }
+
+    #[test]
+    fn questions_about_a_call_load_the_meetings_tool_and_code_work_does_not() {
+        let has_meetings = |message: &str| {
+            filter_tools_by_relevance(
+                make_test_tools(),
+                message,
+                &HashSet::new(),
+                &ToolProfile::Full.groups(),
+            )
+            .iter()
+            .any(|t| t.function.name == "meetings")
+        };
+        for message in [
+            "what did we decide in standup?",
+            "Summarise my 1:1 with Jae",
+            "who was on the call this morning",
+            "What were the action items?\n\n(About the meeting \"Tiger Sync\", meeting id mtg_1.)",
+        ] {
+            assert!(has_meetings(message), "{message}");
+        }
+        for message in ["fix the parser bug", "schedule a reminder for 5pm"] {
+            assert!(!has_meetings(message), "{message}");
+        }
     }
 
     /// The regression this group exists for: a request for a screenshot of
@@ -916,6 +967,7 @@ mod tests {
             tool_names::GET_GOAL,
             tool_names::CREATE_GOAL,
             tool_names::UPDATE_GOAL,
+            tool_names::MEETINGS,
         ];
 
         for name in &constants {

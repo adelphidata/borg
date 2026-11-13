@@ -1,4 +1,5 @@
 import { AdminDefinition } from "./gen/admin.js";
+import { MeetingsDefinition } from "./gen/meetings.js";
 import { PkiDefinition } from "./gen/pki.js";
 import { SessionDefinition } from "./gen/session.js";
 import { StatusDefinition } from "./gen/status.js";
@@ -14,6 +15,7 @@ import { VoiceDefinition } from "./gen/voice.js";
  */
 export const SERVICES = {
   admin: AdminDefinition,
+  meetings: MeetingsDefinition,
   pki: PkiDefinition,
   session: SessionDefinition,
   status: StatusDefinition,
@@ -26,6 +28,7 @@ export type ServiceName = keyof typeof SERVICES;
 /** Services reachable from the browser. `pki` bootstraps pairing over the socket only. */
 export const WEB_SERVICES = [
   "admin",
+  "meetings",
   "session",
   "status",
   "telemetry",

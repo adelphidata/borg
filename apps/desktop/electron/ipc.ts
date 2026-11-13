@@ -1,6 +1,5 @@
 import { ipcMain, type WebContents } from "electron";
-import { createNodeTransport } from "@borg/client/node";
-import { BorgError, type Unsubscribe } from "@borg/client";
+import { BorgError, type BorgTransport, type Unsubscribe } from "@borg/client";
 import { CHANNELS, type StreamEvent, type WireError } from "./channels";
 
 /**
@@ -21,9 +20,13 @@ export function loadOf(id: string): string {
   return colon < 0 ? "" : id.slice(0, colon);
 }
 
-export function registerBorgIpc(): { dispose(): void } {
-  const transport = createNodeTransport();
-
+/**
+ * `transport` is the main process's one channel to borgd, shared with the
+ * meetings watcher. Its owner closes it at quit; this only stops using it.
+ */
+export function registerBorgIpc({ transport }: { transport: BorgTransport }): {
+  dispose(): void;
+} {
   /**
    * In-flight server streams per window, and the page load that opened them,
    * so the renderer can cancel and unload cleanly.
@@ -109,8 +112,9 @@ export function registerBorgIpc(): { dispose(): void } {
   return {
     dispose() {
       for (const sender of [...pages.keys()]) closePage(sender);
-      transport.close();
-      for (const channel of Object.values(CHANNELS)) ipcMain.removeHandler(channel);
+      for (const channel of [CHANNELS.unary, CHANNELS.streamOpen, CHANNELS.streamCancel]) {
+        ipcMain.removeHandler(channel);
+      }
     },
   };
 }

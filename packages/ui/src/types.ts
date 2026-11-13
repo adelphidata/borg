@@ -1,5 +1,6 @@
 import type { ComponentType } from "react";
 import type { IconProps } from "./components/icons";
+import type { DotTone } from "./components/StatusDot";
 
 /**
  * One navigable destination. Apps own the route list; `@borg/ui` only renders it.
@@ -17,8 +18,14 @@ export interface AppRoute {
   page: ComponentType;
   /** Sidebar section: primary sits above the divider, secondary below */
   section: "primary" | "secondary";
-  /** Red attention dot next to the nav label */
+  /** Attention dot next to the nav label */
   hasAlert?: boolean;
+  /**
+   * What the dot says. `alert` (red, the default) is something to fix;
+   * `unread` (green) is something new to read, such as a finished meeting
+   * summary.
+   */
+  alertTone?: Extract<DotTone, "alert" | "unread">;
   /**
    * Where this route is reachable from. A route the sidebar already covers
    * another way — the conversation list, which the sidebar shows inline — is

@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BorgTransport } from "@borg/client";
 import type { NativeBridge } from "@borg/app";
-import { CHANNELS, type StreamEvent, type WireBootStatus, type WireTransport } from "./channels";
+import {
+  CHANNELS,
+  type StreamEvent,
+  type WireBootStatus,
+  type WireMeetingDetection,
+  type WireTransport,
+} from "./channels";
 
 vi.mock("electron", () => import("./test/electron-stub"));
 
@@ -251,6 +257,116 @@ describe("native bridge", () => {
     stopMenu();
     pushToRenderer(CHANNELS.menuCommand, "open-settings");
     expect(onMenu).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("native path bridge", () => {
+  /**
+   * The preload as a page load runs it: its own module, evaluated now. The
+   * path listener is installed at load, so these tests need a load that
+   * happens after the stub was reset.
+   */
+  let loads = 0;
+  const freshPreload = async (): Promise<NativeBridge> => {
+    vi.resetModules();
+    await import(`./preload?load=${loads++}`);
+    return (contextBridgeState.exposed.get("borg") as ExposedBorg).native;
+  };
+
+  it("asks the shell to raise the main window at a path", async () => {
+    const native = await freshPreload();
+    native.revealPath("/meetings/m1");
+    expect(invocations(CHANNELS.revealPath).at(-1)?.args).toEqual(["/meetings/m1"]);
+  });
+
+  it("delivers a path to the app, and stops after unsubscribe", async () => {
+    const native = await freshPreload();
+    const onPath = vi.fn();
+    const stop = native.onOpenPath(onPath);
+    pushToRenderer(CHANNELS.openPath, "/meetings/m1");
+    expect(onPath).toHaveBeenCalledWith("/meetings/m1");
+    stop();
+    pushToRenderer(CHANNELS.openPath, "/meetings/m2");
+    expect(onPath).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a path that arrives before the app listens, and hands over only the latest", async () => {
+    // A window rebuilt for "Open in Borg" gets the path as soon as its page
+    // loads; the app subscribes only once the daemon has answered.
+    const native = await freshPreload();
+    pushToRenderer(CHANNELS.openPath, "/meetings/old");
+    pushToRenderer(CHANNELS.openPath, "/meetings/m1");
+    const onPath = vi.fn();
+    native.onOpenPath(onPath);
+    expect(onPath.mock.calls).toEqual([["/meetings/m1"]]);
+
+    // Handed over once: a second subscriber does not replay it.
+    const later = vi.fn();
+    native.onOpenPath(later);
+    expect(later).not.toHaveBeenCalled();
+  });
+});
+
+describe("native meetings bridge", () => {
+  const detection: WireMeetingDetection = {
+    sourceApp: "Zoom",
+    calendarEventId: "ev1",
+    calendarTitle: "Weekly sync",
+  };
+
+  it("replays the detection the shell already has", async () => {
+    // The detected panel is built by the first detection, so that detection
+    // was sent before its page could listen.
+    rendererState.replies.set(CHANNELS.meetingDetectionRead, () => detection);
+    const borg = await loadPreload();
+    const onDetection = vi.fn();
+    borg.native.meetings.onDetection(onDetection);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onDetection).toHaveBeenCalledWith(detection);
+  });
+
+  it("delivers later detections and their end, and stops after unsubscribe", async () => {
+    const borg = await loadPreload();
+    const onDetection = vi.fn();
+    const stop = borg.native.meetings.onDetection(onDetection);
+    pushToRenderer(CHANNELS.meetingDetection, detection);
+    pushToRenderer(CHANNELS.meetingDetection, null);
+    expect(onDetection.mock.calls).toEqual([[detection], [null]]);
+
+    stop();
+    pushToRenderer(CHANNELS.meetingDetection, detection);
+    expect(onDetection).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops a replay that lands after unsubscribe, and swallows one that fails", async () => {
+    let release!: (d: WireMeetingDetection) => void;
+    rendererState.replies.set(
+      CHANNELS.meetingDetectionRead,
+      () => new Promise<WireMeetingDetection>((resolve) => (release = resolve)),
+    );
+    const borg = await loadPreload();
+    const late = vi.fn();
+    borg.native.meetings.onDetection(late)();
+    release(detection);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(late).not.toHaveBeenCalled();
+
+    rendererState.replies.set(CHANNELS.meetingDetectionRead, () => {
+      throw new Error("no handler registered");
+    });
+    const failed = vi.fn();
+    expect(() => borg.native.meetings.onDetection(failed)).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(failed).not.toHaveBeenCalled();
+  });
+
+  it("asks the shell to open a meeting's panel", async () => {
+    const borg = await loadPreload();
+    borg.native.meetings.openPanel("m1");
+    expect(invocations(CHANNELS.meetingOpenPanel).at(-1)?.args).toEqual(["m1"]);
   });
 });
 

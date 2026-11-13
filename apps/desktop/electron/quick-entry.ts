@@ -2,6 +2,7 @@ import { BrowserWindow, app, globalShortcut, screen } from "electron";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { QUICK_ENTRY_HASH } from "@borg/app/chords";
+import { hardenWebContents } from "./harden";
 
 /**
  * The global capture window.
@@ -64,6 +65,7 @@ export function registerQuickEntry(options: {
       },
     });
 
+    hardenWebContents(created, options);
     // Visible over full-screen apps, which is most of the point of a hotkey.
     created.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     // Clicking away dismisses, the same as Spotlight.

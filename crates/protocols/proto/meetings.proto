@@ -1,0 +1,252 @@
+syntax = "proto3";
+
+package borg.meetings.v1;
+
+// Meetings: notes for calls the user is already in. Nothing joins the call.
+// The desktop app captures the microphone and the system audio and pushes
+// short WAV chunks here; borgd transcribes them, keeps the transcript and the
+// user's notes on disk, and writes a summary when the meeting stops. The
+// calendar (Google or an ICS feed) feeds the "Coming up" view and lets the
+// detector name a meeting. Configuration lives in Admin settings
+// (`meetings.*`, `audio.models`); this service is the feature itself.
+service Meetings {
+  // Whether the feature is on and ready, and what the calendar is.
+  rpc GetMeetingsStatus(Empty) returns (MeetingsStatus);
+  // Recorded meetings, newest first.
+  rpc ListMeetings(ListMeetingsRequest) returns (MeetingList);
+  // One meeting with its transcript, notes and summary.
+  rpc GetMeeting(MeetingId) returns (Meeting);
+  // Begin a meeting. Only one meeting records at a time.
+  rpc StartMeeting(StartMeetingRequest) returns (Meeting);
+  // One chunk of one track. Idempotent per (meeting_id, track, seq), so a
+  // retried push never duplicates text.
+  rpc PushAudio(PushAudioRequest) returns (PushAudioResponse);
+  // Replace the user's notes, and the title when one is given.
+  rpc UpdateNotes(UpdateNotesRequest) returns (Empty);
+  // End recording. The meeting moves to "finalizing"; the summary arrives as
+  // SummaryReady (or SummaryFailed) on SubscribeMeetingEvents.
+  rpc StopMeeting(MeetingId) returns (Meeting);
+  // Remove the meeting and its folder.
+  rpc DeleteMeeting(MeetingId) returns (Empty);
+  // Clear the unread mark a finished summary sets.
+  rpc MarkMeetingRead(MeetingId) returns (Empty);
+  // Cached calendar events that overlap [from_unix, to_unix).
+  rpc ListUpcomingEvents(UpcomingRequest) returns (CalendarEvents);
+  // Connect a calendar. For "google" the reply carries the consent URL to
+  // open; the daemon finishes the sign-in itself and reports it as
+  // CalendarChanged. For "ics" the feed is fetched once to validate it.
+  rpc ConnectCalendar(ConnectCalendarRequest) returns (ConnectCalendarResponse);
+  // Forget the calendar and its cached events.
+  rpc DisconnectCalendar(Empty) returns (Empty);
+  // Live feed of detections, recording progress and summaries.
+  rpc SubscribeMeetingEvents(Empty) returns (stream MeetingEvent);
+}
+
+message Empty {}
+
+message MeetingId {
+  string id = 1;
+}
+
+message CalendarStatus {
+  bool connected = 1;
+  // "google", "ics", or empty when nothing is connected.
+  string kind = 2;
+  // The Google account, or the feed's host.
+  string account_label = 3;
+}
+
+message MeetingsStatus {
+  // `meetings.enabled`.
+  bool enabled = 1;
+  // `audio.models` has a provider that can run now.
+  bool transcription_ready = 2;
+  // This daemon can notice calls on its own (macOS 14 and later).
+  bool detection_supported = 3;
+  CalendarStatus calendar = 4;
+  // Where meeting folders are written.
+  string recordings_dir = 5;
+  // Meetings with a finished summary nobody has opened yet.
+  uint32 unread_count = 6;
+}
+
+message ListMeetingsRequest {
+  // 0 means the default page size.
+  int32 limit = 1;
+  // Only meetings that started before this time; 0 means no bound.
+  int64 before_unix = 2;
+}
+
+message Attendee {
+  string name = 1;
+  string email = 2;
+}
+
+message MeetingSummary {
+  string id = 1;
+  string title = 2;
+  int64 started_at = 3;
+  // 0 while recording.
+  int64 ended_at = 4;
+  // "recording", "finalizing", "done" or "failed".
+  string state = 5;
+  // "Zoom", "Teams", "Chrome"… or empty when started by hand.
+  string source_app = 6;
+  repeated Attendee attendees = 7;
+  bool unread = 8;
+  bool has_summary = 9;
+  string calendar_event_id = 10;
+}
+
+message MeetingList {
+  repeated MeetingSummary meetings = 1;
+}
+
+enum Track {
+  TRACK_UNSPECIFIED = 0;
+  // The user's microphone: "Me".
+  MIC = 1;
+  // Everything the computer plays: "Them".
+  SYSTEM = 2;
+}
+
+message Segment {
+  // "mic" or "system".
+  string track = 1;
+  // Milliseconds from the start of the meeting.
+  int64 start_ms = 2;
+  int64 end_ms = 3;
+  string text = 4;
+}
+
+message Meeting {
+  MeetingSummary summary = 1;
+  repeated Segment segments = 2;
+  string notes = 3;
+  // Empty until the summary is written.
+  string summary_markdown = 4;
+  // Why the summary failed, when state is "failed".
+  string error = 5;
+  // The meeting's folder on disk.
+  string dir = 6;
+}
+
+message StartMeetingRequest {
+  // Empty picks the calendar event's title, then the app's name.
+  string title = 1;
+  string source_app = 2;
+  string calendar_event_id = 3;
+}
+
+message PushAudioRequest {
+  string meeting_id = 1;
+  Track track = 2;
+  // Per-track chunk number, starting at 0.
+  uint32 seq = 3;
+  // Where this chunk starts, in milliseconds from the start of the meeting.
+  int64 offset_ms = 4;
+  // 16-bit PCM WAV; 16 kHz mono is what every transcriber takes best.
+  bytes wav = 5;
+}
+
+message PushAudioResponse {
+  // Text this chunk added; empty when it held only silence.
+  repeated Segment appended = 1;
+}
+
+message UpdateNotesRequest {
+  string meeting_id = 1;
+  string notes = 2;
+  // Set to rename the meeting; absent leaves the title alone.
+  optional string title = 3;
+}
+
+message UpcomingRequest {
+  int64 from_unix = 1;
+  int64 to_unix = 2;
+}
+
+message CalendarEvent {
+  string id = 1;
+  string title = 2;
+  int64 start_unix = 3;
+  int64 end_unix = 4;
+  repeated Attendee attendees = 5;
+  string join_url = 6;
+  // "meet", "zoom", "teams", or empty.
+  string provider = 7;
+  bool all_day = 8;
+}
+
+message CalendarEvents {
+  repeated CalendarEvent events = 1;
+}
+
+message ConnectCalendarRequest {
+  // "google" or "ics".
+  string kind = 1;
+  string ics_url = 2;
+  string google_client_id = 3;
+  string google_client_secret = 4;
+}
+
+message ConnectCalendarResponse {
+  // For "google": the consent page to open. Empty for "ics".
+  string auth_url = 1;
+  // Plain words for the person, success or not.
+  string status_message = 2;
+}
+
+message MeetingEvent {
+  oneof kind {
+    Detected detected = 1;
+    DetectionEnded detection_ended = 2;
+    MeetingStarted started = 3;
+    TranscriptAppended transcript_appended = 4;
+    MeetingStopped stopped = 5;
+    SummaryReady summary_ready = 6;
+    SummaryFailed summary_failed = 7;
+    CalendarChanged calendar_changed = 8;
+  }
+}
+
+// A call appears to have started.
+message Detected {
+  string source_app = 1;
+  // The calendar event it lines up with, if any.
+  optional CalendarEvent calendar_event = 2;
+}
+
+// The call that was detected appears to have ended.
+message DetectionEnded {}
+
+message MeetingStarted {
+  string id = 1;
+  // Started by the daemon because `meetings.ask_before_recording` is off.
+  // The desktop app opens its panel and starts capturing.
+  bool auto_started = 2;
+}
+
+message TranscriptAppended {
+  string meeting_id = 1;
+  repeated Segment segments = 2;
+}
+
+message MeetingStopped {
+  string id = 1;
+}
+
+message SummaryReady {
+  string id = 1;
+}
+
+message SummaryFailed {
+  string id = 1;
+  string message = 2;
+}
+
+message CalendarChanged {
+  bool connected = 1;
+  // Why a Google sign-in did not finish, in plain words. Empty otherwise.
+  string error = 2;
+}

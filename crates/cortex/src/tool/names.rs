@@ -41,6 +41,9 @@ pub const GET_GOAL: &str = "get_goal";
 pub const CREATE_GOAL: &str = "create_goal";
 pub const UPDATE_GOAL: &str = "update_goal";
 
+// ── Meetings ──
+pub const MEETINGS: &str = "meetings";
+
 // ── Filesystem aliases ──
 pub const APPLY_SKILL_PATCH: &str = "apply_skill_patch";
 pub const CREATE_CHANNEL: &str = "create_channel";
@@ -117,6 +120,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     GET_GOAL,
     CREATE_GOAL,
     UPDATE_GOAL,
+    MEETINGS,
 ];
 
 /// Helper macro for action-based tool dispatch.

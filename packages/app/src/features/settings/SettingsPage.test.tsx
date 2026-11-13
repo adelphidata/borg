@@ -319,6 +319,24 @@ describe("SettingsPage", () => {
       await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
       expect(screen.getByText("Scheduled")).toBeTruthy();
       expect(screen.getByText("Usage")).toBeTruthy();
+      // Meetings is one of them only while the feature is on.
+      expect(screen.queryByRole("button", { name: "Meetings" })).toBeNull();
+    } finally {
+      mobile.set(false);
+    }
+  });
+
+  it("reaches Meetings from the mobile list once it is on", async () => {
+    mobile.set(true);
+    try {
+      mount(
+        fakeDaemon({
+          ...DAEMON,
+          GetSettings: { entries: [...REGISTRY, entry("meetings.enabled", "true", "db")] },
+        }),
+      );
+      await waitFor(() => expect(screen.getByText("Provider")).toBeTruthy());
+      expect(screen.getByRole("button", { name: "Meetings" })).toBeTruthy();
     } finally {
       mobile.set(false);
     }

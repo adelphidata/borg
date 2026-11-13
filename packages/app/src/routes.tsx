@@ -1,8 +1,17 @@
-import { ChatIcon, GearIcon, PlugIcon, ScheduleIcon, ShieldIcon, UsageIcon } from "@borg/ui";
+import {
+  ChatIcon,
+  GearIcon,
+  MeetingsIcon,
+  PlugIcon,
+  ScheduleIcon,
+  ShieldIcon,
+  UsageIcon,
+} from "@borg/ui";
 import type { AppRoute } from "@borg/ui";
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { ConnectionsPage } from "./features/connections/ConnectionsPage";
 import { HealthPage } from "./features/health/HealthPage";
+import { MeetingsPage } from "./features/meetings/MeetingsPage";
 import { SchedulesPage } from "./features/schedules/SchedulesPage";
 import { SessionsPage } from "./features/sessions/SessionsPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
@@ -38,6 +47,19 @@ export const routes: AppRoute[] = [
     // be noise. On mobile there is no sidebar, which makes this tab the only
     // route to the conversation list.
     nav: { sidebar: false },
+  },
+  {
+    // Directly under Chats in the sidebar, and only while the feature is on
+    // (see `visibleRoutes`). Off the tab bar: a phone reads meetings, it does
+    // not record them, so it lives under More.
+    id: "meetings",
+    path: "/meetings",
+    label: "Meetings",
+    tabLabel: "Meetings",
+    icon: MeetingsIcon,
+    page: MeetingsPage,
+    section: "primary",
+    nav: { tabBar: false },
   },
   {
     id: "connections",
@@ -89,3 +111,18 @@ export const routes: AppRoute[] = [
     section: "secondary",
   },
 ];
+
+/** What decides which optional routes are on show. */
+export interface RouteVisibility {
+  /** `meetings.enabled`. */
+  meetings: boolean;
+}
+
+/**
+ * The routes to put in navigation. The list above stays static — the router
+ * still serves a hidden route, so a deep link to an old meeting works — and
+ * visibility is decided where the nav is drawn.
+ */
+export function visibleRoutes(all: AppRoute[], visibility: RouteVisibility): AppRoute[] {
+  return all.filter((r) => r.id !== "meetings" || visibility.meetings);
+}

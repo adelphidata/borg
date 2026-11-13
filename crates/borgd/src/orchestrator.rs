@@ -149,6 +149,8 @@ pub struct OrchestratorHandles {
     pub goal_bus: GoalEventBus,
     /// Bus subscribers read for `Admin.SubscribeSubscriptionEvents`.
     pub subscription_bus: crate::subscriptions::SubscriptionBus,
+    /// The meetings bus and the queues its workers read.
+    pub meetings: crate::meetings::MeetingsHandles,
 }
 
 /// Start every long-running subsystem managed by `borgd`. Returns control
@@ -197,6 +199,7 @@ pub async fn start(
     };
 
     let subscription_config_rx = config_rx.clone();
+    let meetings = start_meetings(&shutdown, &supervisor_db, config_rx.clone());
     let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
         config.clone(),
         executor.clone(),
@@ -467,7 +470,92 @@ pub async fn start(
         executor,
         goal_bus,
         subscription_bus,
+        meetings,
     }
+}
+
+/// Start the meetings workers: the summary writer and the calendar sync
+/// everywhere, the call detector where the platform can see who holds the
+/// microphone (macOS 14+).
+fn start_meetings(
+    shutdown: &CancellationToken,
+    db: &DbHandle,
+    config_rx: watch::Receiver<Config>,
+) -> crate::meetings::MeetingsHandles {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (handles, finalize_rx) = crate::meetings::MeetingsHandles::new();
+
+    // Every incarnation of the finalizer shares the one queue, so a restart
+    // after a panic still hears the next StopMeeting.
+    let finalize_queue = crate::meetings::finalizer::FinalizeQueue::new(finalize_rx);
+    let liveness = Arc::new(AtomicU64::new(0));
+    {
+        let bus = handles.bus.clone();
+        let cancel = shutdown.clone();
+        let liveness_for_loop = liveness.clone();
+        spawn_supervised(
+            SupervisorConfig::new("meetings-finalizer").with_liveness(liveness),
+            shutdown.clone(),
+            db.clone(),
+            move || {
+                crate::meetings::finalizer::run(
+                    finalize_queue.clone(),
+                    bus.clone(),
+                    liveness_for_loop.clone(),
+                    cancel.child_token(),
+                )
+            },
+        );
+    }
+
+    let liveness = Arc::new(AtomicU64::new(0));
+    {
+        let bus = handles.bus.clone();
+        let poke = handles.calendar_poke.clone();
+        let cancel = shutdown.clone();
+        let liveness_for_loop = liveness.clone();
+        spawn_supervised(
+            SupervisorConfig::new("calendar-sync").with_liveness(liveness),
+            shutdown.clone(),
+            db.clone(),
+            move || {
+                crate::meetings::calendar_sync::run(
+                    bus.clone(),
+                    poke.clone(),
+                    liveness_for_loop.clone(),
+                    cancel.child_token(),
+                )
+            },
+        );
+    }
+
+    let probe = crate::meetings::detector::platform_probe();
+    if probe.supported() {
+        handles.detection_supported.store(true, Ordering::Relaxed);
+        let liveness = Arc::new(AtomicU64::new(0));
+        let bus = handles.bus.clone();
+        let cancel = shutdown.clone();
+        let liveness_for_loop = liveness.clone();
+        spawn_supervised(
+            SupervisorConfig::new("meetings-detector").with_liveness(liveness),
+            shutdown.clone(),
+            db.clone(),
+            move || {
+                crate::meetings::detector::run(
+                    probe.clone(),
+                    config_rx.clone(),
+                    bus.clone(),
+                    liveness_for_loop.clone(),
+                    cancel.child_token(),
+                )
+            },
+        );
+    } else {
+        tracing::info!(
+            "meeting detection is not available on this system; meetings follow the calendar"
+        );
+    }
+    handles
 }
 
 /// Convenience: drive the orchestrator from a `CancellationToken` until it's

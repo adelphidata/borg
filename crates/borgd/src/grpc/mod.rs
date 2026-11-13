@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod capability;
+pub mod meetings;
 pub mod recordings;
 pub mod session;
 pub mod status;
@@ -16,6 +17,7 @@ use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use crate::tunnel_supervisor::TunnelSupervisor;
 use protocols::admin::admin_server::AdminServer;
 use protocols::capability::capability_server::CapabilityServer;
+use protocols::meetings::meetings_server::MeetingsServer;
 use protocols::session::session_server::SessionServer;
 use protocols::status::status_server::StatusServer;
 use protocols::telemetry::telemetry_server::TelemetryServer;
@@ -36,6 +38,15 @@ pub struct Services {
     pub telemetry: TelemetryServer<telemetry::TelemetrySvc>,
     /// Voice and phone provider catalog plus transcription.
     pub voice: VoiceServer<voice::VoiceSvc>,
+    /// Meeting notes: audio in, transcripts, summaries, the calendar.
+    pub meetings: MeetingsServer<meetings::MeetingsSvc>,
+}
+
+fn meetings_server(
+    handles: crate::meetings::MeetingsHandles,
+) -> MeetingsServer<meetings::MeetingsSvc> {
+    MeetingsServer::new(meetings::MeetingsSvc::new(handles))
+        .max_decoding_message_size(meetings::MAX_CHUNK_BYTES)
 }
 
 fn voice_server() -> VoiceServer<voice::VoiceSvc> {
@@ -58,6 +69,7 @@ pub fn build_services(
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
         voice: voice_server(),
+        meetings: meetings_server(crate::meetings::MeetingsHandles::detached()),
     }
 }
 
@@ -87,6 +99,8 @@ pub struct AdminExtras {
     /// Bus that `Admin.SubscribeSubscriptionActivity` reads from; the
     /// subscription dispatcher publishes into it.
     pub subscription_bus: Option<crate::subscriptions::SubscriptionBus>,
+    /// The meetings bus and worker queues; detached handles without it.
+    pub meetings: Option<crate::meetings::MeetingsHandles>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -126,6 +140,9 @@ pub fn build_services_with_extras(
     if let Some(sup) = extras.tunnel_supervisor {
         admin_svc = admin_svc.with_tunnel_supervisor(sup);
     }
+    let meetings_handles = extras
+        .meetings
+        .unwrap_or_else(crate::meetings::MeetingsHandles::detached);
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin_svc),
@@ -136,5 +153,6 @@ pub fn build_services_with_extras(
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
         telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
         voice: voice_server(),
+        meetings: meetings_server(meetings_handles),
     }
 }

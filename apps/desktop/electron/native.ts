@@ -77,6 +77,25 @@ export function registerNativeIpc(
     if (win) activateSession(win, sessionId);
   });
 
+  // A meeting panel asking for its meeting's page. The main window may have
+  // been closed (macOS keeps the app running), so it is built again first; a
+  // window still loading gets the path once its page is up to hear it.
+  ipcMain.handle(CHANNELS.revealPath, (_event, route: string) => {
+    let win = mainWindow();
+    if (!win || win.isDestroyed()) {
+      reopen();
+      win = mainWindow();
+    }
+    if (!win || win.isDestroyed()) return;
+    raise(win);
+    const shown = win;
+    const send = () => {
+      if (!shown.isDestroyed()) shown.webContents.send(CHANNELS.openPath, route);
+    };
+    if (shown.webContents.isLoading()) shown.webContents.once("did-finish-load", send);
+    else send();
+  });
+
   ipcMain.handle(CHANNELS.hideWindow, (event) => {
     BrowserWindow.fromWebContents(event.sender)?.hide();
   });
@@ -159,6 +178,7 @@ export function registerNativeIpc(
       live.clear();
       ipcMain.removeHandler(CHANNELS.notify);
       ipcMain.removeHandler(CHANNELS.revealSession);
+      ipcMain.removeHandler(CHANNELS.revealPath);
       ipcMain.removeHandler(CHANNELS.hideWindow);
       ipcMain.removeHandler(CHANNELS.setBadge);
     },

@@ -29,6 +29,8 @@ use super::tool_validation::{
 use super::{Agent, AgentEvent};
 
 const GOALS_DISABLED_ERROR: &str = r#"{"error":"goals are disabled"}"#;
+const MEETINGS_DISABLED_ERROR: &str =
+    r#"{"error":"meetings are off; the user can turn them on in Settings → Meetings"}"#;
 const DATABASE_UNAVAILABLE_ERROR: &str = r#"{"error":"database unavailable"}"#;
 
 /// Tools exempt from the builtin wall-clock deadline, by name:
@@ -1003,6 +1005,16 @@ impl Agent {
             }
             crate::tool::Tool::ManageRoles(args) => {
                 crate::tool::multi_agent::handle_manage_roles(args).await
+            }
+            crate::tool::Tool::Meetings(args) => {
+                if !self.config.meetings.enabled {
+                    return Ok(ToolOutput::Text(MEETINGS_DISABLED_ERROR.to_string()));
+                }
+                let guard = self.db_guard().await;
+                match guard.as_ref() {
+                    Some(db) => crate::tool::meetings::handle(args, db).await,
+                    None => Ok(DATABASE_UNAVAILABLE_ERROR.to_string()),
+                }
             }
             crate::tool::Tool::GetGoal(args) => {
                 if !self.config.goals.enabled {

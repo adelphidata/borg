@@ -730,14 +730,30 @@ impl SettingsPopup {
         }
     }
 
-    /// Save a Secret setting (currently only `llm.api_key`) via the keychain
-    /// helper. On success the config's `llm.api_key` is updated so the new key
-    /// takes effect without a restart. On `KeychainUnavailable` the user sees
-    /// an env-var fallback hint.
+    /// Save a Secret setting. `llm.api_key` goes through the keychain helper
+    /// (on success the config's key is updated so it takes effect without a
+    /// restart; on `KeychainUnavailable` the user sees an env-var hint).
+    /// Every other secret row (`meetings.calendar.ics_url`, the browser
+    /// keys) is a JSON `SecretRef` setting: the typed text is stored as a
+    /// literal, and an empty entry clears it.
     fn save_secret(&mut self, config: &mut Config, key: &str, value: &str) -> Option<AppAction> {
         if key != "llm.api_key" {
-            self.status_message = Some((format!("Secret save not wired for {key}"), false));
-            return None;
+            let value = value.trim();
+            let stored = if value.is_empty() {
+                String::new()
+            } else {
+                let secret = cortex::security::secrets_resolve::SecretRef::Literal {
+                    value: value.to_string(),
+                };
+                match serde_json::to_string(&secret) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        self.status_message = Some((format!("Save failed: {e}"), false));
+                        return None;
+                    }
+                }
+            };
+            return self.apply_and_save(config, key, &stored);
         }
 
         let provider_id = config

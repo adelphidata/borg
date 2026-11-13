@@ -1,13 +1,16 @@
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow } from "electron";
 import { QUICK_ENTRY_CHORD, acceleratorForChord } from "@borg/app/chords";
+import { createBorgClient } from "@borg/client";
+import { createNodeTransport } from "@borg/client/node";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { registerBoot } from "./boot";
+import { hardenWebContents } from "./harden";
 import { registerBorgIpc } from "./ipc";
+import { registerMeetings } from "./meetings";
 import { installApplicationMenu } from "./menu";
 import { raise, registerNativeIpc } from "./native";
 import { registerQuickEntry } from "./quick-entry";
-import { isRecoveryReload, RECOVERY_PAGE_URL } from "./recovery";
+import { RECOVERY_PAGE_URL } from "./recovery";
 import { createReloadBudget } from "./reload-budget";
 import { registerUpdater } from "./updater";
 import { loadWindowState, MIN_HEIGHT, MIN_WIDTH, trackWindowState } from "./window-state";
@@ -67,52 +70,19 @@ function createWindow() {
   });
   trackWindowState(win);
 
-  // Security: only hand http(s) URLs to the OS — file:, smb:, custom schemes stay blocked.
-  const openExternally = (url: string) => {
-    try {
-      const { protocol } = new URL(url);
-      if (protocol === "https:" || protocol === "http:") void shell.openExternal(url);
-    } catch {
-      // unparseable URL → not something to hand to the OS
-    }
-  };
-
-  // Security: never spawn in-app windows — external links go to the system browser.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    openExternally(url);
-    return { action: "deny" };
-  });
-
-  // Security: keep top-level navigation inside the app; send anything else to the browser.
-  // Exact origin/file comparison — prefix checks would let localhost:51737 (dev) or any
-  // local file:// path (prod) count as internal.
-  win.webContents.on("will-navigate", (event, url) => {
-    // The recovery page's Reload link. Never a real destination, so it is
-    // stopped here whether or not the page is showing.
-    if (isRecoveryReload(url)) {
-      event.preventDefault();
-      if (recovering) {
-        recovering = false;
-        reloads = createReloadBudget();
-        loadApp();
-      }
-      return;
-    }
-    let internal = false;
-    try {
-      const target = new URL(url);
-      target.search = "";
-      target.hash = "";
-      internal = isDev
-        ? target.origin === new URL(process.env.VITE_DEV_SERVER_URL!).origin
-        : target.href === pathToFileURL(indexHtml).href;
-    } catch {
-      // unparseable URL → treated as external below
-    }
-    if (!internal) {
-      event.preventDefault();
-      openExternally(url);
-    }
+  // Security: no in-app windows, navigation stays on the bundle, and only
+  // http(s) reaches the OS. The recovery page's Reload link starts the app
+  // again with a fresh budget, and only while that page is showing.
+  hardenWebContents(win, {
+    isDev,
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+    indexHtml,
+    onRecoveryReload: () => {
+      if (!recovering) return;
+      recovering = false;
+      reloads = createReloadBudget();
+      loadApp();
+    },
   });
 
   // A renderer that was killed or ran out of memory leaves a blank window
@@ -178,7 +148,10 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
-    const borg = registerBorgIpc();
+    // One channel to borgd for the whole main process: the renderer's calls
+    // ride it through IPC, and the meetings watcher uses it directly.
+    const transport = createNodeTransport();
+    const borg = registerBorgIpc({ transport });
     const native = registerNativeIpc(() => mainWindow, showMainWindow);
     // Start the daemon before anything asks it a question. The window opens
     // immediately either way and shows the wait; nothing here blocks it.
@@ -196,6 +169,13 @@ if (!app.requestSingleInstanceLock()) {
       indexHtml,
       preload: preloadJs,
     });
+    const meetings = registerMeetings({
+      client: createBorgClient(transport),
+      isDev,
+      devServerUrl: process.env.VITE_DEV_SERVER_URL,
+      indexHtml,
+      preload: preloadJs,
+    });
 
     app.once("will-quit", () => {
       boot.dispose();
@@ -203,6 +183,8 @@ if (!app.requestSingleInstanceLock()) {
       native.dispose();
       updater.dispose();
       quickEntry.dispose();
+      meetings.dispose();
+      transport.close();
     });
 
     // A packaged app takes its icon from the bundle. In dev the dock would show
