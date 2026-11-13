@@ -5,6 +5,7 @@ import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp, type UnaryTable } from "../../test/harness";
 import { fullMeeting } from "../../test/meetings";
 import { MeetingDetailPage } from "./MeetingDetailPage";
+import { meetingsChanged } from "./meetingsStore";
 import { NOTES_DEBOUNCE_MS } from "./useNotesDraft";
 
 function Conversation() {
@@ -85,12 +86,57 @@ describe("MeetingDetailPage", () => {
     expect(await screen.findByText(/notes weren't saved: Borg is restarting/)).toBeTruthy();
   });
 
-  it("shows the summary only once there is one", async () => {
+  it("has no summary while the meeting records, and leads with it once Borg writes one", async () => {
+    mount({ GetMeeting: fullMeeting({ state: "recording" }) });
+    await screen.findByPlaceholderText("Add your thoughts…");
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+  });
+
+  it("keeps the notes box in place when the recording stops under someone typing", async () => {
+    const { daemon } = mount({ GetMeeting: fullMeeting({ state: "recording" }) });
+    const box = await screen.findByPlaceholderText("Add your thoughts…");
+    fireEvent.change(box, { target: { value: "half a thought" } });
+    daemon.answer("GetMeeting", fullMeeting({ state: "finalizing" }));
+    act(() => meetingsChanged());
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "My notes" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect((screen.getByPlaceholderText("Add your thoughts…") as HTMLTextAreaElement).value).toBe(
+      "half a thought",
+    );
+  });
+
+  it("offers no summary tab for a finished meeting whose summary came back empty", async () => {
     mount({
-      GetMeeting: fullMeeting({ state: "finalizing", hasSummary: false }),
+      GetMeeting: fullMeeting({ state: "done", hasSummary: true }, { summaryMarkdown: "" }),
+    });
+    await screen.findByPlaceholderText("Add your thoughts…");
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    expect(screen.queryByText(/writing the summary/)).toBeNull();
+  });
+
+  it("keeps the name box focused when a rename is refused, so it can be fixed", async () => {
+    mount({ UpdateNotes: new Error("Borg is restarting") });
+    fireEvent.doubleClick(await screen.findByRole("heading", { name: "Weekly sync" }));
+    const name = screen.getByRole("textbox", { name: "Meeting name" });
+    fireEvent.change(name, { target: { value: "Pricing review" } });
+    fireEvent.keyDown(name, { key: "Enter" });
+    await waitFor(() => expect((name as HTMLInputElement).readOnly).toBe(false));
+    expect(document.activeElement).toBe(name);
+  });
+
+  it("opens on the summary tab while Borg is writing it, with the notes a tab away", async () => {
+    mount({
+      GetMeeting: fullMeeting({ state: "finalizing", hasSummary: false }, { notes: "ship it" }),
     });
     expect(await screen.findByText("Borg is writing the summary…")).toBeTruthy();
-    expect(screen.queryByText("Summary")).toBeNull();
+    expect(screen.getByRole("tab", { name: "Summary" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByPlaceholderText("Add your thoughts…")).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: "My notes" }));
+    expect(
+      ((await screen.findByPlaceholderText("Add your thoughts…")) as HTMLTextAreaElement).value,
+    ).toBe("ship it");
   });
 
   it("renders the summary's bullets", async () => {
@@ -109,7 +155,7 @@ describe("MeetingDetailPage", () => {
     expect(await screen.findByText(/couldn't write the notes: no model configured/)).toBeTruthy();
   });
 
-  it("keeps the transcript folded, then lists who said what and when", async () => {
+  it("keeps the transcript on its own tab, listing who said what and when", async () => {
     mount({
       GetMeeting: fullMeeting(
         {},
@@ -121,9 +167,9 @@ describe("MeetingDetailPage", () => {
         },
       ),
     });
-    const fold = await screen.findByRole("button", { name: /Transcript · 2 lines/ });
+    const tab = await screen.findByRole("tab", { name: "Transcript" });
     expect(screen.queryByText("Can you hear me?")).toBeNull();
-    fireEvent.click(fold);
+    fireEvent.click(tab);
     const rows = screen.getAllByRole("listitem");
     expect(rows.map((r) => r.textContent)).toEqual([
       "0:04MeCan you hear me?",
@@ -169,6 +215,33 @@ describe("MeetingDetailPage", () => {
     expect(text).toContain("meeting id m1");
     act(() => send.handlers.onMessage({} as never));
     expect(await screen.findByText("conversation s9")).toBeTruthy();
+  });
+
+  it("asks a suggested question in one press", async () => {
+    const { daemon } = mount({ Open: { sessionId: "s9", lastEventSeq: 0 } });
+    fireEvent.click(await screen.findByRole("button", { name: "Write a follow-up email" }));
+    await waitFor(() => expect(daemon.streams.some((s) => s.method === "Send")).toBe(true));
+    const text = (daemon.streams.find((s) => s.method === "Send")!.request as { text: string })
+      .text;
+    expect(text).toMatch(/^Write a follow-up email/);
+    expect(text).toContain("meeting id m1");
+  });
+
+  it("shows when the meeting was, how long it ran and who came", async () => {
+    const start = new Date(2026, 10, 12, 16, 0).getTime() / 1000;
+    mount({
+      GetMeeting: fullMeeting({
+        startedAt: start,
+        endedAt: start + 32 * 60,
+        attendees: [
+          { name: "Juan Pérez", email: "" },
+          { name: "", email: "jae@example.com" },
+        ],
+      }),
+    });
+    expect(await screen.findByText("32 min")).toBeTruthy();
+    const people = screen.getByTitle("Juan Pérez, jae@example.com");
+    expect(people.textContent).toBe("2");
   });
 
   it("stays put and says why when the question could not be sent", async () => {

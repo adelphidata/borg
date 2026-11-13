@@ -1,12 +1,20 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
-import { MobileTitle, PageChrome, Pill, scrollCol, useIsMobile } from "@borg/ui";
+import { Link, useNavigate } from "react-router-dom";
+import {
+  MobileTitle,
+  PageChrome,
+  Pill,
+  SETTINGS_SCROLL_DESKTOP_PADDING,
+  scrollCol,
+  useIsMobile,
+} from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { useSettings } from "../../lib/settings";
 import { useTick } from "../../lib/useTick";
 import { useVoiceCatalog } from "../../lib/voice";
 import { useChain } from "../settings/fields";
 import { meetingsEnabled } from "./meetingsEnabled";
+import { eventPath } from "./MeetingEventPage";
 import { addDays, startOfDay } from "./meetingsFormat";
 import { PastMeetings } from "./PastMeetings";
 import { UPCOMING_DAYS, UpcomingCard } from "./UpcomingCard";
@@ -23,8 +31,8 @@ function OffCard() {
   );
   const [busy, setBusy] = useState(false);
   return (
-    <div className="flex flex-col items-start gap-3 rounded-[14px] border border-line2 bg-surface px-5 py-4">
-      <div className="text-[14.5px] leading-[1.4] font-medium text-ink">
+    <div className="flex flex-col items-start gap-3 rounded-[10px] border border-line2 px-4 py-3.5">
+      <div className="text-[13.5px] leading-[1.4] font-medium text-ink">
         Borg can take notes in your calls
       </div>
       <div className="text-[13px] leading-[1.5] text-ink2">
@@ -57,6 +65,7 @@ function Upcoming({ now }: { now: Date }) {
   const from = Math.floor(windowStart.getTime() / 1000);
   const to = Math.floor(addDays(windowStart, UPCOMING_DAYS).getTime() / 1000);
   const events = useUpcomingEvents(from, to);
+  const navigate = useNavigate();
   return (
     <>
       <UpcomingCard
@@ -66,6 +75,7 @@ function Upcoming({ now }: { now: Date }) {
         canGoEarlier={page > 0}
         onEarlier={() => setPage((p) => Math.max(0, p - 1))}
         onLater={() => setPage((p) => p + 1)}
+        onOpenEvent={(e) => navigate(eventPath(e.id))}
       />
       {events.state === "error" && (
         <div className="-mt-5 text-[12.5px] text-alert">
@@ -91,8 +101,8 @@ export function MeetingsPage() {
 
   return (
     <PageChrome title="Meetings">
-      <div className={`${scrollCol(isMobile, "px-[38px] py-[34px]")} bg-canvas`}>
-        <div className="flex max-w-[760px] flex-col gap-8">
+      <div className={scrollCol(isMobile, SETTINGS_SCROLL_DESKTOP_PADDING)}>
+        <div className="flex max-w-[720px] flex-col gap-8">
           <MobileTitle>Meetings</MobileTitle>
           {settings.state === "ready" && !enabled && <OffCard />}
           <DaemonState query={status} label="meetings">

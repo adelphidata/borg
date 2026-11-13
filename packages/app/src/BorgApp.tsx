@@ -37,6 +37,7 @@ import { CalendarPage } from "./features/connections/CalendarPage";
 import { ConnectionDetailPage } from "./features/connections/ConnectionDetailPage";
 import { MeetingDetailPage } from "./features/meetings/MeetingDetailPage";
 import { MeetingDetectedPage } from "./features/meetings/MeetingDetectedPage";
+import { MeetingEventPage } from "./features/meetings/MeetingEventPage";
 import { MeetingPanelPage, panelMeetingId } from "./features/meetings/MeetingPanelPage";
 import { meetingsEnabled } from "./features/meetings/meetingsEnabled";
 import { useMeetingEventsFeed, useMeetingsVersion } from "./features/meetings/useMeetingEvents";
@@ -419,6 +420,7 @@ function Shell({ platform }: { platform: Platform }) {
             <Route path="/settings/meetings" element={<MeetingsSettingsPage />} />
             {/* Registered whether or not Meetings is on: a link to a past
                 meeting keeps working after the feature is turned off. */}
+            <Route path="/meetings/event/:eventId" element={<MeetingEventPage />} />
             <Route path="/meetings/:id" element={<MeetingDetailPage />} />
             <Route path="/settings/provider/:name" element={<ProviderKeysPage />} />
             <Route path="/settings/key/:key" element={<SettingDetailPage />} />
