@@ -279,7 +279,6 @@ describe("the notes panel", () => {
       minWidth: 360,
       alwaysOnTop: true,
       resizable: true,
-      frame: false,
       webPreferences: {
         preload: "/preload.js",
         contextIsolation: true,
@@ -292,6 +291,33 @@ describe("the notes panel", () => {
     expect(panel.webContents.windowOpenHandler!({ url: "https://x.test" })).toEqual({
       action: "deny",
     });
+  });
+
+  it("has a close button: macOS's own over the header, the system frame elsewhere", async () => {
+    try {
+      setPlatform("darwin");
+      register();
+      await invoke(CHANNELS.meetingOpenPanel, {}, "m1");
+      expect(optionsOf(panelFor("m1")!)).toMatchObject({
+        titleBarStyle: "hidden",
+        trafficLightPosition: { x: 14, y: 17 },
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+      });
+      expect(optionsOf(panelFor("m1")!).frame).not.toBe(false);
+      registered!.dispose();
+      registered = undefined;
+
+      setPlatform("linux");
+      register();
+      await invoke(CHANNELS.meetingOpenPanel, {}, "m2");
+      const elsewhere = optionsOf(panelFor("m2")!);
+      expect(elsewhere.frame).not.toBe(false);
+      expect(elsewhere.titleBarStyle).toBeUndefined();
+    } finally {
+      setPlatform(realPlatform);
+    }
   });
 
   it("ignores a request with no meeting id", async () => {

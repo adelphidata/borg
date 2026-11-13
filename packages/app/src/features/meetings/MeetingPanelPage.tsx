@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { meetings } from "@borg/client";
 import { Markdown, Meter, Pill, StatusDot } from "@borg/ui";
 import { MEETING_PANEL_HASH } from "../../lib/chords";
+import { isMacPlatform } from "../../lib/keybinds";
 import { useNative } from "../../lib/platform";
 import { asBorgError, useRetryingServerStream } from "../../lib/useDaemon";
 import { useMeetingCapture } from "./capture/useMeetingCapture";
@@ -25,6 +26,8 @@ export function panelMeetingId(hash: string = window.location.hash): string | un
 
 const DRAG = "[-webkit-app-region:drag]";
 const NO_DRAG = "[-webkit-app-region:no-drag]";
+/** On macOS the window buttons sit at the header's left edge; leave them room. */
+const HEADER_PAD = isMacPlatform() ? "pr-4 pl-[76px]" : "px-4";
 
 /**
  * The floating notes panel (desktop only, `#/meeting-panel/<id>`).
@@ -107,8 +110,10 @@ export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
   const failed = state === "failed" || failure !== undefined;
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-[14px] border border-line bg-surface">
-      <header className={`flex items-center gap-2 border-b border-line2 px-4 py-3 ${DRAG}`}>
+    <div className="flex h-full flex-col overflow-hidden bg-surface">
+      <header
+        className={`flex items-center gap-2 border-b border-line2 py-3 ${HEADER_PAD} ${DRAG}`}
+      >
         <div className="min-w-0 flex-1">
           <div className="truncate text-[14px] leading-[1.3] font-medium text-ink">{title}</div>
           {recording && (
