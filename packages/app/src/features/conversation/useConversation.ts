@@ -994,6 +994,13 @@ export function useConversation(target: string | undefined): Conversation {
     [sessionId, gone, reopens],
   );
 
+  // A redial the daemon answered is the connection back, whether or not this
+  // conversation has anything to say yet: an idle one never will, and the
+  // notice would otherwise outlive the outage it is about.
+  useEffect(() => {
+    if (state.recovered > 0) setStreamError(undefined);
+  }, [state.recovered]);
+
   // A dropped stream leaves the transcript frozen with no explanation. Surface
   // it; `useRetryingServerStream` schedules the resubscribe, and resuming from
   // `lastSeq` means nothing is missed or doubled.

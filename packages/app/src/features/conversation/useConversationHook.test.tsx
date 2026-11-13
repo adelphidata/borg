@@ -616,6 +616,26 @@ describe("useConversation stream health", () => {
     emit(daemon, { textDelta: { text: "back" } as never });
     expect(conv.current.streamError).toBeUndefined();
   });
+
+  it("clears the outage when the daemon answers a redial, before any event", async () => {
+    // A daemon restart keeps the session, so the redial is accepted — and
+    // then nothing arrives, because nobody is talking. The notice must not
+    // sit on a working connection waiting for an event that never comes.
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const daemon = fakeDaemon({ ...OPEN, GetDaemonStatus: {} });
+    const conv = mount(daemon);
+    await ready(conv);
+    const stream = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
+    act(() => stream.handlers.onError?.(new BorgError(GrpcStatus.Unavailable, "socket closed")));
+    await waitFor(() => expect(conv.current.streamError).toBeDefined());
+
+    await waitFor(() =>
+      expect(daemon.streams.filter((s) => s.method === "Stream").length).toBeGreaterThan(1),
+    );
+    await waitFor(() => expect(conv.current.streamError).toBeUndefined());
+    expect(daemon.calls.some((c) => c.method === "GetDaemonStatus")).toBe(true);
+    vi.restoreAllMocks();
+  });
 });
 
 describe("useConversation and the user's name", () => {

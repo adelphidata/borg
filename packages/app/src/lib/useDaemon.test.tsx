@@ -15,16 +15,31 @@ import { useQuery, useRetryingServerStream } from "./useDaemon";
  * A transport whose only job is to hand each subscription's handlers back to
  * the test, so a stream can be failed or fed on demand.
  */
-function fakeTransport() {
-  const subscriptions: StreamHandlers<unknown>[] = [];
-  const transport: BorgTransport = {
-    unary: () => Promise.reject(new BorgError(GrpcStatus.Internal, "not used here")),
-    serverStream: (_method, _request, handlers): Unsubscribe => {
-      subscriptions.push(handlers as StreamHandlers<unknown>);
-      return () => {};
+interface Harness {
+  transport: BorgTransport;
+  subscriptions: StreamHandlers<unknown>[];
+  unaryCalls: string[];
+  /** What the daemon says to a redial's probe; down by default. */
+  probe: () => Promise<unknown>;
+}
+
+function fakeTransport(): Harness {
+  const harness: Harness = {
+    subscriptions: [],
+    unaryCalls: [],
+    probe: () => Promise.reject(new BorgError(GrpcStatus.Unavailable, "down")),
+    transport: {
+      unary: (method) => {
+        harness.unaryCalls.push(String(method));
+        return harness.probe() as never;
+      },
+      serverStream: (_method, _request, handlers): Unsubscribe => {
+        harness.subscriptions.push(handlers as StreamHandlers<unknown>);
+        return () => {};
+      },
     },
   };
-  return { transport, subscriptions };
+  return harness;
 }
 
 function Probe({ onMessage = () => {} }: { onMessage?: () => void }) {
@@ -32,7 +47,12 @@ function Probe({ onMessage = () => {} }: { onMessage?: () => void }) {
     (borg, handlers) => borg.session.stream({ sessionId: "s", sinceEventSeq: 0 }, handlers),
     onMessage,
   );
-  return <div data-testid="state">{state.sustained ? "sustained" : state.status}</div>;
+  return (
+    <div data-testid="state">
+      {state.sustained ? "sustained" : state.status}
+      {state.recovered > 0 ? ` recovered:${state.recovered}` : ""}
+    </div>
+  );
 }
 
 describe("useRetryingServerStream", () => {
@@ -229,6 +249,76 @@ describe("useRetryingServerStream", () => {
       await fire(window, "online");
       await fire(document, "visibilitychange");
       expect(harness.subscriptions).toHaveLength(1);
+    });
+  });
+
+  describe("asks the daemon whether a redial got through", () => {
+    // `open` is set the instant a redial subscribes, and a stream nobody is
+    // talking on then sends nothing. Without a probe, an outage notice would
+    // sit on a working connection until the next event — for an idle
+    // conversation, never.
+    it("counts a redial the daemon answers as the connection coming back", async () => {
+      vi.spyOn(Math, "random").mockReturnValue(0.99);
+      harness.probe = () => Promise.resolve({});
+      const { getByTestId } = mount();
+      expect(harness.unaryCalls).toHaveLength(0);
+
+      await dropAndRetry();
+      expect(harness.subscriptions).toHaveLength(2);
+      expect(harness.unaryCalls).toHaveLength(1);
+      expect(harness.unaryCalls[0]).toContain("GetDaemonStatus");
+      expect(getByTestId("state").textContent).toBe("open recovered:1");
+
+      // The backoff starts over: the next drop redials inside the first window.
+      await drop();
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(3);
+    });
+
+    it("leaves the backoff alone while the daemon stays down", async () => {
+      vi.spyOn(Math, "random").mockReturnValue(0.99);
+      const { getByTestId } = mount();
+      await drop();
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+      expect(harness.unaryCalls).toHaveLength(1);
+      expect(getByTestId("state").textContent).toBe("open");
+
+      // Second failure: still the 2s window a reset would have shrunk to 1s.
+      await drop();
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+      await advance(1_000);
+      expect(harness.subscriptions).toHaveLength(3);
+    });
+
+    it("ignores an answer that lands after the redial has already failed", async () => {
+      vi.spyOn(Math, "random").mockReturnValue(0.99);
+      let answer: (value: unknown) => void = () => {};
+      harness.probe = () => new Promise((resolve) => (answer = resolve));
+      const { getByTestId } = mount();
+      await drop();
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+
+      // The redial dies before its probe is answered.
+      await drop();
+      await act(async () => {
+        answer({});
+      });
+      expect(getByTestId("state").textContent).toBe("error");
+      // Still the 2s window: the stale answer did not reset the count.
+      await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+      await advance(1_000);
+      expect(harness.subscriptions).toHaveLength(3);
+    });
+
+    it("does not probe a stream that has never dropped", async () => {
+      harness.probe = () => Promise.resolve({});
+      mount();
+      await advance(MAX_DELAY_MS);
+      expect(harness.unaryCalls).toHaveLength(0);
     });
   });
 
