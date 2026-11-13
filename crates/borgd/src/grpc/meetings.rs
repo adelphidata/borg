@@ -102,6 +102,8 @@ fn status(e: StoreError) -> TStatus {
             TStatus::failed_precondition(e.to_string())
         }
         StoreError::TranscriptionFailed(_) => TStatus::unavailable(e.to_string()),
+        // Retrying will not help; the message names the fix.
+        StoreError::TranscriptionRefused(_) => TStatus::failed_precondition(e.to_string()),
         StoreError::Invalid(_) => TStatus::invalid_argument(e.to_string()),
         StoreError::Other(err) => {
             // The store's own errors are written for the person; no prefix.

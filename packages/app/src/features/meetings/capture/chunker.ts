@@ -108,6 +108,8 @@ export function firstSeqFor(baseOffsetMs: number, chunkMs = CHUNK_MS): number {
 export interface QueueReport {
   /** A chunk failed twice and was given up on. */
   failed?: boolean;
+  /** Why the last attempt failed, when `failed`. */
+  error?: unknown;
   /** A chunk was dropped because too many were waiting. */
   dropped?: boolean;
   /** A chunk went through, so whatever was wrong has cleared. */
@@ -156,8 +158,8 @@ export class PushQueue<T> {
         try {
           await this.send(item);
           this.report({ delivered: true });
-        } catch {
-          this.report({ failed: true });
+        } catch (error) {
+          this.report({ failed: true, error });
         }
       }
     }

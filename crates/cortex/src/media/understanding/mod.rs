@@ -152,6 +152,9 @@ impl AudioTranscriber {
         }
 
         let mut attempts = Vec::new();
+        // The last provider's own error rides under the summary, so a caller
+        // can still find out why (a rejected key, say) and tell the person.
+        let mut last_error: Option<anyhow::Error> = None;
         // The caller's hint is model-controlled (the `transcribe_audio` tool
         // passes it straight from the LLM), so it is normalised once here
         // before any provider splices it into a URL or form field.
@@ -204,14 +207,19 @@ impl AudioTranscriber {
                         model: entry.model.clone(),
                         outcome: AttemptOutcome::Failed(reason),
                     });
+                    last_error = Some(e);
                 }
             }
         }
 
-        bail!(
+        let summary = format!(
             "All transcription providers failed ({} attempted)",
             attempts.len()
-        )
+        );
+        match last_error {
+            Some(e) => Err(e.context(summary)),
+            None => bail!(summary),
+        }
     }
 }
 

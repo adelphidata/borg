@@ -104,11 +104,12 @@ describe("PushQueue", () => {
 
   it("tries a failed chunk once more, then gives up on it and carries on", async () => {
     const reports: unknown[] = [];
+    const away = new Error("daemon away");
     const attempts: number[] = [];
     const q = new PushQueue<number>(
       async (n) => {
         attempts.push(n);
-        if (n === 0) throw new Error("daemon away");
+        if (n === 0) throw away;
       },
       (r) => reports.push(r),
     );
@@ -116,7 +117,8 @@ describe("PushQueue", () => {
     q.enqueue(1);
     await q.drain();
     expect(attempts).toEqual([0, 0, 1]);
-    expect(reports).toEqual([{ failed: true }, { delivered: true }]);
+    // The failure carries why, so the panel can say it.
+    expect(reports).toEqual([{ failed: true, error: away }, { delivered: true }]);
   });
 
   it("recovers on the retry without reporting a failure", async () => {

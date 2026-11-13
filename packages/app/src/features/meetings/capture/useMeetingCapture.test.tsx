@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, waitFor } from "@testing-library/react";
-import { meetings } from "@borg/client";
+import { BorgError, GrpcStatus, meetings } from "@borg/client";
 import { fakeDaemon, renderApp, type FakeDaemon } from "../../../test/harness";
 import { installFakeAudio, tone, type FakeAudio } from "../../../test/audio";
 import { useMeetingCapture, type MeetingCapture } from "./useMeetingCapture";
@@ -115,6 +115,26 @@ describe("useMeetingCapture", () => {
       [meetings.Track.MIC, 0, 0],
       [meetings.Track.MIC, 0, 0],
     ]);
+    expect(latest.capturing).toBe(true);
+  });
+
+  it("says what the daemon refused a chunk for, so the fix is on screen", async () => {
+    audio = installFakeAudio();
+    const daemon = fakeDaemon({
+      PushAudio: new BorgError(
+        GrpcStatus.FailedPrecondition,
+        "OpenAI rejected the API key. Paste a working key in Settings → Meetings.",
+      ),
+      StopMeeting: {},
+    });
+    mount(daemon);
+    await ready();
+    act(() => audio.contexts[0]!.feed(tone(25)));
+    await waitFor(() =>
+      expect(latest.warning).toBe(
+        "OpenAI rejected the API key. Paste a working key in Settings → Meetings.",
+      ),
+    );
     expect(latest.capturing).toBe(true);
   });
 

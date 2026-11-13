@@ -17,6 +17,41 @@ use crate::meetings::{audio, files, new_meeting_id, transcript, Attendee, Meetin
 /// Chunks shorter than this hold no words worth a request.
 const MIN_CHUNK_MS: i64 = 300;
 
+/// Why the transcriber turned a chunk down, in words the person can act on.
+///
+/// A rejected key and a spent quota do not heal on retry, and the person is
+/// in a call: they need to know which it is and where to fix it, not that
+/// "all providers failed". Those come back as `TranscriptionRefused`; an
+/// outage or an unreachable service, which may pass, as `TranscriptionFailed`.
+fn why_transcription_failed(e: &anyhow::Error) -> StoreError {
+    let Some(http) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::media::HttpStatusError>())
+    else {
+        return StoreError::TranscriptionFailed(format!(
+            "Borg couldn't reach the transcription service: {}.",
+            e.root_cause()
+        ));
+    };
+    let who = crate::media::understanding::providers()
+        .find(|p| p.id == http.label)
+        .map_or(http.label.as_str(), |p| p.label);
+    match http.status.as_u16() {
+        401 | 403 => StoreError::TranscriptionRefused(format!(
+            "{who} rejected the API key. Paste a working key in Settings → Meetings."
+        )),
+        429 => StoreError::TranscriptionRefused(format!(
+            "{who} is refusing requests: too many, or no credit left. Check your {who} account."
+        )),
+        code if code >= 500 => StoreError::TranscriptionFailed(format!(
+            "{who} is having trouble ({code}). Borg tries again with the next chunk."
+        )),
+        code => StoreError::TranscriptionRefused(format!(
+            "{who} couldn't transcribe the audio ({code})."
+        )),
+    }
+}
+
 /// Why a meeting operation was refused. Each maps to one gRPC status, so
 /// callers never match on message text.
 #[derive(Debug, thiserror::Error)]
@@ -36,9 +71,14 @@ pub enum StoreError {
     /// No `audio.models` provider can run.
     #[error("no transcription provider is set up; choose one in Settings → Meetings")]
     TranscriptionUnavailable,
-    /// Every provider in the chain failed for this chunk; retrying may work.
-    #[error("transcription failed: {0}")]
+    /// The provider is down or out of reach for this chunk; the next may
+    /// work. The message is written for the person.
+    #[error("{0}")]
     TranscriptionFailed(String),
+    /// The provider refused the chunk for a reason only the person can fix
+    /// (a rejected key, no credit). The message says what and where.
+    #[error("{0}")]
+    TranscriptionRefused(String),
     /// The request itself is wrong.
     #[error("{0}")]
     Invalid(String),
@@ -232,7 +272,10 @@ pub async fn append_chunk(
         let (text, _attempts) = transcriber
             .transcribe(input.wav, "audio/wav", "chunk.wav", None)
             .await
-            .map_err(|e| StoreError::TranscriptionFailed(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!("meetings: transcription failed: {e:#}");
+                why_transcription_failed(&e)
+            })?;
         if crate::media::voice_capture::is_whisper_hallucination(&text) {
             String::new()
         } else {
@@ -588,6 +631,93 @@ mod tests {
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(f.db.segments_for(&m.id).await.unwrap().len(), 1);
+    }
+
+    /// What the person is told when the provider turns a chunk down. A
+    /// rejected key must say so and name where to fix it, not "all providers
+    /// failed", and is a refusal (retrying cannot help) where an outage is
+    /// not. Nothing is stored, so the chunk can be sent again.
+    #[tokio::test]
+    async fn a_refused_chunk_says_why_in_words_the_person_can_act_on() {
+        for (status, refused, says) in [
+            (
+                401,
+                true,
+                "OpenAI rejected the API key. Paste a working key in Settings → Meetings.",
+            ),
+            (403, true, "OpenAI rejected the API key."),
+            (
+                429,
+                true,
+                "OpenAI is refusing requests: too many, or no credit left.",
+            ),
+            (503, false, "OpenAI is having trouble (503)."),
+            (400, true, "OpenAI couldn't transcribe the audio (400)."),
+        ] {
+            let mut f = fixture().await;
+            let server = whisper(&mut f.config, "").await;
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({ "error": { "code": "invalid_api_key" } }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+            let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+                .await
+                .unwrap();
+            let wav = wav_ms(2_000);
+            let err = append_chunk(
+                &f.db,
+                &f.config,
+                Some(&transcriber),
+                chunk(&m.id, Track::Mic, 0, 0, &wav),
+                1_001,
+            )
+            .await
+            .unwrap_err();
+            let message = match (&err, refused) {
+                (StoreError::TranscriptionRefused(m), true)
+                | (StoreError::TranscriptionFailed(m), false) => m.clone(),
+                _ => panic!("{status}: expected refused={refused}, got {err:?}"),
+            };
+            assert!(message.starts_with(says), "{status}: {message}");
+            assert!(f.db.segments_for(&m.id).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_transcriber_is_named_as_unreachable() {
+        let mut f = fixture().await;
+        let _server = whisper(&mut f.config, "").await;
+        // A port that was free a moment ago: nothing listens there.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        f.config.audio.models[0].base_url = Some(format!("http://127.0.0.1:{port}"));
+        let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        let wav = wav_ms(2_000);
+        let err = append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 0, 0, &wav),
+            1_001,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Borg couldn't reach the transcription service:"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

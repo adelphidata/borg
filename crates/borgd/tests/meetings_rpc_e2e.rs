@@ -133,6 +133,46 @@ fn teardown() {
     unsafe { std::env::remove_var("BORG_HOME") };
 }
 
+/// A key the provider rejects is a refusal the person must fix, not an
+/// outage: the client gets FAILED_PRECONDITION with words that name the
+/// provider and where to paste a new key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_transcription_key_reaches_the_client_as_its_fix() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stt = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": { "code": "invalid_api_key", "message": "Incorrect API key provided" }
+        })))
+        .mount(&stt)
+        .await;
+    let _env = env(true, Some(&stt)).await;
+    let (handles, _finalize_rx) = MeetingsHandles::new();
+    let svc = MeetingsSvc::new(handles);
+    let id = svc
+        .start_meeting(Request::new(StartMeetingRequest::default()))
+        .await
+        .unwrap()
+        .into_inner()
+        .summary
+        .unwrap()
+        .id;
+
+    let refused = svc
+        .push_audio(push(&id, Track::Mic, 0, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "OpenAI rejected the API key. Paste a working key in Settings → Meetings."
+    );
+    teardown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_meeting_records_transcribes_stops_renames_and_deletes() {
     let _g = SERIAL
