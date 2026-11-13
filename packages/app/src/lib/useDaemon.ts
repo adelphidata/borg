@@ -220,6 +220,12 @@ export function useServerStream<T>(
 export type RetryingStreamState = StreamState & {
   /** True once the outage has lasted long enough to stop looking like a blip. */
   sustained: boolean;
+  /**
+   * Counts the redials that found the daemon answering again. A quiet stream
+   * sends nothing to prove it is back, so this is what a notice about the
+   * outage should clear on.
+   */
+  recovered: number;
 };
 
 /**
@@ -236,8 +242,10 @@ export function useRetryingServerStream<T>(
   onMessage: (message: T) => void,
   deps: unknown[] = [],
 ): RetryingStreamState {
+  const borg = useBorg();
   const [attempt, setAttempt] = useState(0);
   const [sustained, setSustained] = useState(false);
+  const [recovered, setRecovered] = useState(0);
   /** Consecutive failures since the last received message; drives the delay. */
   const failures = useRef(0);
   /** Start of the current outage, for escalation. */
@@ -304,5 +312,35 @@ export function useRetryingServerStream<T>(
     };
   }, [state.status, state.error]);
 
-  return useMemo(() => ({ ...state, sustained }), [state, sustained]);
+  // A redial reports `open` the instant it subscribes, which says nothing
+  // about the daemon — and a stream nobody is talking on then sends nothing
+  // to say it is back. Left there, an outage notice would sit on a working
+  // connection until the next event, which for an idle conversation is
+  // never. One cheap call settles it. A daemon still down fails the call,
+  // and the stream's own failure schedules the next redial as before.
+  //
+  // The backoff is deliberately left alone: only data proves *this* stream
+  // works, and a stream the daemon refuses on every open would otherwise be
+  // redialled at full speed by a probe that keeps succeeding.
+  useEffect(() => {
+    if (state.status !== "open" || failures.current === 0) return;
+    let live = true;
+    borg.admin.getDaemonStatus({}).then(
+      () => {
+        // An answer that lands after this redial has already failed says
+        // nothing about the redial now being waited on.
+        if (!live) return;
+        outageSince.current = undefined;
+        setSustained(false);
+        setRecovered((n) => n + 1);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [borg, state.status, attempt]);
+
+  return useMemo(() => ({ ...state, sustained, recovered }), [state, sustained, recovered]);
 }

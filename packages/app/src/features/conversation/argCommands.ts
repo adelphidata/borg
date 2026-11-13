@@ -171,7 +171,7 @@ export async function runArgCommand(
         if (!(await save(MODE_KEY, cmd.mode))) return "That did not work: the mode did not change.";
         return cmd.mode === "plan"
           ? "Plan mode is on. Borg proposes changes and makes none."
-          : "Execute mode is on. Borg acts.";
+          : "Execute mode is on.";
       case "goal-terminal-only":
         return "Goal budgets and quality gates are set from the terminal: run `borg`, then /goal.";
       case "goal-show":

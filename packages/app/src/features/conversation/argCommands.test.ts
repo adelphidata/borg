@@ -66,7 +66,7 @@ describe("runArgCommand", () => {
     const daemon = fakeDaemon({ SetSetting: {} });
     const borg = createBorgClient(daemon.transport);
     expect(await runArgCommand(borg, "c", { kind: "mode", mode: "execute" })).toBe(
-      "Execute mode is on. Borg acts.",
+      "Execute mode is on.",
     );
     expect(daemon.calls[0]).toMatchObject({
       method: "SetSetting",
