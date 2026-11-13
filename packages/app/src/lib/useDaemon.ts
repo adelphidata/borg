@@ -318,6 +318,10 @@ export function useRetryingServerStream<T>(
   // connection until the next event, which for an idle conversation is
   // never. One cheap call settles it. A daemon still down fails the call,
   // and the stream's own failure schedules the next redial as before.
+  //
+  // The backoff is deliberately left alone: only data proves *this* stream
+  // works, and a stream the daemon refuses on every open would otherwise be
+  // redialled at full speed by a probe that keeps succeeding.
   useEffect(() => {
     if (state.status !== "open" || failures.current === 0) return;
     let live = true;
@@ -326,7 +330,6 @@ export function useRetryingServerStream<T>(
         // An answer that lands after this redial has already failed says
         // nothing about the redial now being waited on.
         if (!live) return;
-        failures.current = 0;
         outageSince.current = undefined;
         setSustained(false);
         setRecovered((n) => n + 1);

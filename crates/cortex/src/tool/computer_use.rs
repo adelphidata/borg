@@ -424,7 +424,10 @@ const DRIVER_WINDDOWN: Duration = Duration::from_secs(5);
 /// Capped stderr tail shared between the drain task and error decoration,
 /// plus the drain task itself so a caller building a "driver died" error can
 /// wait for the child's last words first.
-struct StderrTail {
+///
+/// Shared with the Claude CLI backend, which has the same problem: a child
+/// whose stderr nobody reads blocks once the pipe fills.
+pub(crate) struct StderrTail {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     drain: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -439,24 +442,28 @@ impl StderrTail {
     /// error can be formatted before the drain task has been scheduled at all,
     /// and the child's stderr — the only diagnostic a startup exit leaves —
     /// silently goes missing.
-    async fn settle(&self) {
+    pub(crate) async fn settle(&self) {
         let handle = self.drain.lock().await.take();
         if let Some(handle) = handle {
             if tokio::time::timeout(STDERR_SETTLE, handle).await.is_err() {
-                tracing::debug!("cua-driver stderr drain still running after {STDERR_SETTLE:?}");
+                tracing::debug!("child stderr drain still running after {STDERR_SETTLE:?}");
             }
         }
+    }
+
+    /// What the child wrote, trimmed; empty when it said nothing.
+    pub(crate) fn text(&self) -> String {
+        let bytes = self
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).trim().to_string()
     }
 
     /// `" Driver stderr tail: …"` when the driver said anything, empty
     /// otherwise.
     fn suffix(&self) -> String {
-        let bytes = self
-            .buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let text = String::from_utf8_lossy(&bytes);
-        let text = text.trim();
+        let text = self.text();
         if text.is_empty() {
             String::new()
         } else {
@@ -468,7 +475,7 @@ impl StderrTail {
 /// Continuously drain the child's stderr, keeping only the last few KB. The
 /// task ends on its own when the child exits (pipe EOF); errors reading a
 /// dying pipe are expected and only worth a debug line.
-fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
+pub(crate) fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
     use tokio::io::AsyncReadExt;
     const TAIL_CAP: usize = 8 * 1024;
     let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::default();
@@ -489,7 +496,7 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> StderrTail {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("cua-driver stderr drain ended: {e}");
+                    tracing::debug!("child stderr drain ended: {e}");
                     break;
                 }
             }

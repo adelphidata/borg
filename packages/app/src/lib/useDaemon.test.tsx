@@ -269,9 +269,13 @@ describe("useRetryingServerStream", () => {
       expect(harness.unaryCalls[0]).toContain("GetDaemonStatus");
       expect(getByTestId("state").textContent).toBe("open recovered:1");
 
-      // The backoff starts over: the next drop redials inside the first window.
+      // The backoff is not reset: only data proves this stream works, and a
+      // daemon that answers but refuses the stream on every open must not be
+      // redialled at full speed. The second drop still waits out a 2s window.
       await drop();
       await advance(1_100);
+      expect(harness.subscriptions).toHaveLength(2);
+      await advance(1_000);
       expect(harness.subscriptions).toHaveLength(3);
     });
 
