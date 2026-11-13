@@ -156,12 +156,17 @@ impl Drop for SpawnedChild {
 /// argument containing spaces, double quotes, or backslashes per the
 /// Microsoft "Parsing C Command-Line Arguments" rules.
 fn build_command_line(program: &str, args: &[String]) -> Vec<u16> {
-    let mut s = String::new();
-    push_quoted(&mut s, program);
-    for a in args {
-        s.push(' ');
-        push_quoted(&mut s, a);
-    }
+    // `cmd.exe /c SCRIPT` reads its tail with cmd's rules, not the C
+    // runtime's, so it gets its own serialisation.
+    let s = super::cmd_script::cmd_script_command_line(program, args).unwrap_or_else(|| {
+        let mut s = String::new();
+        push_quoted(&mut s, program);
+        for a in args {
+            s.push(' ');
+            push_quoted(&mut s, a);
+        }
+        s
+    });
     OsStr::new(&s)
         .encode_wide()
         .chain(std::iter::once(0))
@@ -495,7 +500,18 @@ mod tests {
         let cl = build_command_line("cmd.exe", &["/c".into(), "echo hello world".into()]);
         // Convert back to String for inspection.
         let s = String::from_utf16(&cl[..cl.len() - 1]).unwrap();
-        assert!(s.contains(r#""echo hello world""#), "got: {s}");
+        assert_eq!(s, r#""cmd.exe" /s /c "echo hello world""#);
+    }
+
+    #[test]
+    fn build_command_line_keeps_cmd_script_quotes_verbatim() {
+        // Spec: a run_shell command carrying quotes reaches cmd.exe exactly
+        // as written. CRT escaping (`\"`) is not cmd syntax and used to
+        // turn `echo "a b"` into `echo \"a b\"`.
+        let script = r#"echo "a b" | findstr "a""#;
+        let cl = build_command_line("cmd.exe", &["/C".into(), script.into()]);
+        let s = String::from_utf16(&cl[..cl.len() - 1]).unwrap();
+        assert_eq!(s, format!(r#""cmd.exe" /s /c "{script}""#));
     }
 
     #[test]
@@ -503,7 +519,7 @@ mod tests {
         // Spec: an arg containing a literal `"` must be escaped per
         // Microsoft's command-line parser rules: doubled backslashes
         // before the embedded quote, then `\"` for the quote itself.
-        let cl = build_command_line("cmd.exe", &[r#"a"b"#.into()]);
+        let cl = build_command_line("tool.exe", &[r#"a"b"#.into()]);
         let s = String::from_utf16(&cl[..cl.len() - 1]).unwrap();
         assert!(s.ends_with(r#""a\"b""#), "got: {s}");
     }

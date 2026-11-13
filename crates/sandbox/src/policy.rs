@@ -218,12 +218,22 @@ fn fail_closed(context: &str, detail: &str) -> SandboxCommand {
 
 fn fail_closed_windows(context: &str, detail: &str) -> SandboxCommand {
     tracing::error!("Windows sandbox refused to run unsandboxed: {context}: {detail}");
+    // The message is interpolated into a cmd script, and `detail` quotes a
+    // config-supplied path. cmd has no `$0`-style out-of-band argument, so
+    // the characters that would end the `echo` and start a command (`&`,
+    // `|`, redirections, `^` escapes, `%` expansions, quotes) are replaced
+    // instead — in the one code path whose whole job is to run nothing.
+    let message = format!("Borg sandbox setup failed: {context}: {detail}");
+    let message: String = message
+        .chars()
+        .map(|c| match c {
+            '&' | '|' | '<' | '>' | '^' | '%' | '!' | '"' | '(' | ')' | '\r' | '\n' | '\0' => '_',
+            other => other,
+        })
+        .collect();
     SandboxCommand {
         program: "cmd.exe".to_string(),
-        args: vec![
-            "/c".to_string(),
-            format!("echo Borg sandbox setup failed: {context}: {detail} 1>&2 && exit 1"),
-        ],
+        args: vec!["/c".to_string(), format!("echo {message} 1>&2 && exit 1")],
         _resources: None,
     }
 }
@@ -672,6 +682,45 @@ mod fail_closed_tests {
         assert!(
             cmd.args.iter().any(|a| a.contains("exit 1")),
             "the stub must exit non-zero: {:?}",
+            cmd.args
+        );
+    }
+
+    /// Spec: a config-supplied path in the refusal message cannot smuggle a
+    /// second command into the cmd script. Every metacharacter that would
+    /// end the `echo` or expand is neutralised; the words survive.
+    #[test]
+    fn the_windows_refusal_stub_neutralises_cmd_metacharacters() {
+        let cmd = fail_closed_windows(
+            "deny rule",
+            r#"C:\x & del /q C:\* | "quoted" %PATH% ^! (y)"#,
+        );
+        let script = &cmd.args[1];
+        for forbidden in ['&', '|', '<', '>', '^', '%', '!', '"', '(', ')'] {
+            let count = script.matches(forbidden).count();
+            // The stub's own ` 1>&2 && exit 1` tail is the only place these
+            // may appear.
+            let allowed = " 1>&2 && exit 1".matches(forbidden).count();
+            assert_eq!(
+                count, allowed,
+                "{forbidden:?} leaked into the script: {script}"
+            );
+        }
+        assert!(
+            script.contains("del /q C:"),
+            "the words must survive: {script}"
+        );
+        assert!(script.ends_with(" 1>&2 && exit 1"), "{script}");
+    }
+
+    #[test]
+    fn the_windows_refusal_stub_keeps_the_plain_message_intact() {
+        let cmd = fail_closed_windows("setup context", "the detail");
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a.contains("Borg sandbox setup failed: setup context: the detail")),
+            "{:?}",
             cmd.args
         );
     }
