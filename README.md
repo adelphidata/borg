@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://github.com/adelphidata/borg">
-    <img src="docs/assets/borg-logo.png" width="212" alt="Borg">
+    <img src="docs/assets/borg-logo.png" width="500" alt="Borg">
   </a>
 </p>
 
@@ -35,11 +35,10 @@
 - **Reaches you where you are.** Chat over Telegram, Slack, Discord, Teams, Google Chat, Signal, WhatsApp, SMS and iMessage.
 - **Works while you sleep.** Scheduled prompts, cron jobs and proactive heartbeat check-ins run from the daemon.
 - **Connects your apps.** Gmail, Outlook, Google Calendar, Notion and Linear plug in from the app, and any MCP server adds more tools.
-- **Skills.** Forty-five built-in skills teach Borg how to use the CLI tools you already have, and you can write your own.
+- **Skills.** Built-in skills teach Borg how to use the CLI tools you already have, and you can write your own.
 - **Meeting notes.** Borg records your calls, transcribes them and writes up the notes, with no bot in the meeting.
 - **Voice and phone.** Talk to Borg, have replies read aloud, and let it place calls.
 - **Computer use.** Borg can look at your screen and click through native apps when you ask it to.
-- **Grows with you.** Borg evolves a specialization from how you actually use it, with levels, vitals and a shareable card.
 - **Heals itself.** Daily maintenance sweeps catch missed runs, stale state and host problems before you do.
 
 <!--
