@@ -59,6 +59,15 @@ pub fn discover_project_docs(
             combined.push_str("\n\n---\n\n");
         }
         if safe_content.len() > remaining_bytes {
+            // The prompt marker below tells the agent; this tells the
+            // operator, who is the one who can shorten the doc.
+            tracing::warn!(
+                path = %path.display(),
+                doc_bytes = safe_content.len(),
+                remaining_budget_bytes = remaining_bytes,
+                budget_bytes = MAX_PROJECT_DOC_BYTES,
+                "Project doc exceeds the project-doc byte budget; truncating it in the system prompt"
+            );
             // Truncate to fit byte budget (find a valid UTF-8 boundary)
             let cut = floor_char_boundary(&safe_content, remaining_bytes);
             let truncated = &safe_content[..cut];
@@ -88,6 +97,11 @@ pub fn discover_project_docs(
 
     if !skipped.is_empty() {
         let names: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        tracing::warn!(
+            skipped = ?names,
+            budget_bytes = MAX_PROJECT_DOC_BYTES,
+            "Project docs left out of the system prompt: the project-doc byte budget was spent on docs above them"
+        );
         combined.push_str(&format!(
             "\n\n---\n\n<!-- SKIPPED for the project-doc budget (more specific to your \
              working directory; read with read_file if you need them): {} -->",
