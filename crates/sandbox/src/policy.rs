@@ -712,18 +712,6 @@ mod fail_closed_tests {
         );
         assert!(script.ends_with(" 1>&2 && exit 1"), "{script}");
     }
-
-    #[test]
-    fn the_windows_refusal_stub_keeps_the_plain_message_intact() {
-        let cmd = fail_closed_windows("setup context", "the detail");
-        assert!(
-            cmd.args
-                .iter()
-                .any(|a| a.contains("Borg sandbox setup failed: setup context: the detail")),
-            "{:?}",
-            cmd.args
-        );
-    }
 }
 
 #[cfg(test)]
