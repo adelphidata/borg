@@ -17,6 +17,7 @@ import {
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { showNotice } from "../../lib/notice";
+import { useNative, usePlatform } from "../../lib/platform";
 import { useTick } from "../../lib/useTick";
 import { useMenuEscape } from "../sessions/SessionRowMenu";
 import { AskBar, Chip, ChipRow, DOC_COL, DocTitle } from "./MeetingDoc";
@@ -24,7 +25,13 @@ import { duration, fullNames, segmentClock, shortDay, timeOfDay } from "./meetin
 import { meetingsChanged } from "./meetingsStore";
 import { NotesEditor } from "./NotesEditor";
 import { TranscriptList } from "./TranscriptList";
-import { useDeleteMeeting, useMeeting, useStopMeeting, type Meeting } from "./useMeetings";
+import {
+  useDeleteMeeting,
+  useMeeting,
+  useResumeMeeting,
+  useStopMeeting,
+  type Meeting,
+} from "./useMeetings";
 import { useNotesDraft, type NotesDraft } from "./useNotesDraft";
 
 /**
@@ -143,7 +150,11 @@ function MeetingView({ id }: { id: string }) {
   const query = useMeeting(id, { markRead: true });
   const draft = useNotesDraft(id, query.state === "ready" ? query.data.notes : undefined);
   const stop = useStopMeeting();
+  const resume = useResumeMeeting();
   const remove = useDeleteMeeting();
+  const native = useNative();
+  // Only the desktop app can record, so only it offers to record more.
+  const canRecord = usePlatform().kind === "desktop";
   const [menuOpen, setMenuOpen] = useState(false);
   useMenuEscape(menuOpen, () => setMenuOpen(false));
   const now = new Date(useTick(60_000, true));
@@ -169,7 +180,20 @@ function MeetingView({ id }: { id: string }) {
         Stop
       </Pill>
     ) : summary ? (
-      <div className="relative">
+      <div className="relative flex items-center gap-2">
+        {canRecord && (summary.state === "done" || summary.state === "failed") && (
+          <Pill
+            sizeClasses="px-3 py-1.5 text-[12px]"
+            disabled={resume.pending}
+            onClick={() =>
+              void resume.run(summary.id).then((r) => {
+                if (r !== undefined) native.meetings.openPanel(summary.id);
+              })
+            }
+          >
+            {resume.pending ? "Resuming…" : "Resume"}
+          </Pill>
+        )}
         <button
           type="button"
           aria-label="Meeting actions"
@@ -210,9 +234,9 @@ function MeetingView({ id }: { id: string }) {
       <div className={scrollCol(isMobile, "px-[38px] pt-[30px]")}>
         <div className={DOC_COL}>
           <BackLink to="/meetings" label="Meetings" />
-          {(stop.error ?? remove.error) && (
+          {(stop.error ?? resume.error ?? remove.error) && (
             <div className="rounded-[10px] border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
-              {(stop.error ?? remove.error)!.message}
+              {(stop.error ?? resume.error ?? remove.error)!.message}
             </div>
           )}
           <DaemonState query={query} label="this meeting">

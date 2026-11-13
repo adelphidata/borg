@@ -98,9 +98,10 @@ fn status(e: StoreError) -> TStatus {
     match e {
         StoreError::NotFound(_) => TStatus::not_found(e.to_string()),
         StoreError::AlreadyRecording => TStatus::already_exists(e.to_string()),
-        StoreError::NotRecording | StoreError::Disabled | StoreError::TranscriptionUnavailable => {
-            TStatus::failed_precondition(e.to_string())
-        }
+        StoreError::NotRecording
+        | StoreError::StillWriting
+        | StoreError::Disabled
+        | StoreError::TranscriptionUnavailable => TStatus::failed_precondition(e.to_string()),
         StoreError::TranscriptionFailed(_) => TStatus::unavailable(e.to_string()),
         // Retrying will not help; the message names the fix.
         StoreError::TranscriptionRefused(_) => TStatus::failed_precondition(e.to_string()),
@@ -358,6 +359,25 @@ impl Meetings for MeetingsSvc {
                 );
             }
         }
+        Ok(Response::new(load_meeting(&db, id).await?))
+    }
+
+    async fn resume_meeting(
+        &self,
+        req: Request<MeetingId>,
+    ) -> Result<Response<PbMeeting>, TStatus> {
+        let id = req.into_inner().id;
+        let id = required_id(&id)?;
+        let (config, db) = deps().await?;
+        let row = store::resume_meeting(&db, &config, id, now_unix())
+            .await
+            .map_err(status)?;
+        // The desktop opens (or keeps) the notes panel on this, which is what
+        // starts capturing again.
+        self.publish(Kind::Started(MeetingStarted {
+            id: row.id.clone(),
+            auto_started: false,
+        }));
         Ok(Response::new(load_meeting(&db, id).await?))
     }
 

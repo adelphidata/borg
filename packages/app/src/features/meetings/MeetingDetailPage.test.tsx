@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Route, Routes, useParams } from "react-router-dom";
 import { BorgError, GrpcStatus } from "@borg/client";
-import { fakeDaemon, renderApp, type UnaryTable } from "../../test/harness";
+import {
+  fakeDaemon,
+  fakeNative,
+  renderApp,
+  type HarnessOptions,
+  type UnaryTable,
+} from "../../test/harness";
 import { fullMeeting } from "../../test/meetings";
 import { MeetingDetailPage } from "./MeetingDetailPage";
 import { meetingsChanged } from "./meetingsStore";
@@ -12,7 +18,7 @@ function Conversation() {
   return <div>conversation {useParams().sessionId}</div>;
 }
 
-function mount(table: UnaryTable = {}) {
+function mount(table: UnaryTable = {}, options: Pick<HarnessOptions, "kind" | "native"> = {}) {
   const daemon = fakeDaemon({
     GetMeeting: fullMeeting({ id: "m1", title: "Weekly sync", startedAt: 1_700_000_000 }),
     MarkMeetingRead: {},
@@ -25,7 +31,7 @@ function mount(table: UnaryTable = {}) {
       <Route path="/meetings" element={<div>the list</div>} />
       <Route path="/c/:sessionId" element={<Conversation />} />
     </Routes>,
-    { daemon, route: "/meetings/m1" },
+    { daemon, route: "/meetings/m1", ...options },
   );
   return { ...view, daemon };
 }
@@ -200,6 +206,42 @@ describe("MeetingDetailPage", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Delete/ }));
     expect(await screen.findByText("the list")).toBeTruthy();
     expect(callsTo(daemon, "DeleteMeeting")).toEqual([{ id: "m1" }]);
+  });
+
+  it("resumes a finished meeting and brings up the notes panel that records it", async () => {
+    const native = fakeNative();
+    const { daemon } = mount(
+      { ResumeMeeting: fullMeeting({ id: "m1", state: "recording" }) },
+      { native },
+    );
+    await screen.findByPlaceholderText("Add your thoughts…");
+    daemon.answer("GetMeeting", fullMeeting({ id: "m1", state: "recording" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await waitFor(() => expect(native.openedPanels).toEqual(["m1"]));
+    expect(callsTo(daemon, "ResumeMeeting")).toEqual([{ id: "m1" }]);
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeTruthy();
+  });
+
+  it("says why a meeting could not resume, and opens no panel", async () => {
+    const native = fakeNative();
+    mount(
+      {
+        ResumeMeeting: new BorgError(
+          GrpcStatus.FailedPrecondition,
+          "Borg is still writing this meeting's notes; resume once they're done",
+        ),
+      },
+      { native },
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    expect(await screen.findByText(/still writing this meeting's notes/)).toBeTruthy();
+    expect(native.openedPanels).toEqual([]);
+  });
+
+  it("offers Resume only where it can record: the desktop app, once the notes are written", async () => {
+    mount({}, { kind: "web" });
+    await screen.findByPlaceholderText("Add your thoughts…");
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
   });
 
   it("asks Borg about the meeting in a new conversation that names it", async () => {

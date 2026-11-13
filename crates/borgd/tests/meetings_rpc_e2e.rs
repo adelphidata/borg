@@ -301,6 +301,88 @@ async fn a_meeting_records_transcribes_stops_renames_and_deletes() {
     teardown();
 }
 
+/// Resume takes a stopped meeting back to recording once its notes are
+/// written: the desktop hears MeetingStarted (which reopens capture), and new
+/// audio joins the same meeting. While the notes are still being written it
+/// is refused with a reason, not silently ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_meeting_resumes_once_its_notes_are_written() {
+    let _g = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stt = whisper("one more thing").await;
+    let env = env(true, Some(&stt)).await;
+    let (handles, _finalize_rx) = MeetingsHandles::new();
+    let mut events = handles.bus.subscribe();
+    let svc = MeetingsSvc::new(handles);
+
+    let id = svc
+        .start_meeting(Request::new(StartMeetingRequest {
+            title: "Standup".into(),
+            source_app: String::new(),
+            calendar_event_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .summary
+        .unwrap()
+        .id;
+    svc.push_audio(push(&id, Track::Mic, 0, 0)).await.unwrap();
+    svc.stop_meeting(Request::new(MeetingId { id: id.clone() }))
+        .await
+        .unwrap();
+
+    let early = svc
+        .resume_meeting(Request::new(MeetingId { id: id.clone() }))
+        .await
+        .unwrap_err();
+    assert_eq!(early.code(), Code::FailedPrecondition);
+    assert!(
+        early.message().contains("still writing"),
+        "{}",
+        early.message()
+    );
+
+    env.db
+        .set_meeting_summary(&id, "Notes", 2_000)
+        .await
+        .unwrap();
+    drain(&mut events);
+    let back = svc
+        .resume_meeting(Request::new(MeetingId { id: id.clone() }))
+        .await
+        .unwrap()
+        .into_inner()
+        .summary
+        .unwrap();
+    assert_eq!(back.state, "recording");
+    assert_eq!(back.ended_at, 0, "no end while recording");
+    let kinds = drain(&mut events);
+    assert!(
+        matches!(kinds.as_slice(), [Kind::Started(m)] if m.id == id && !m.auto_started),
+        "{kinds:?}"
+    );
+
+    let later = svc
+        .push_audio(push(&id, Track::Mic, 90_000, 90_000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(later.appended[0].text, "one more thing");
+    let meeting = svc
+        .get_meeting(Request::new(MeetingId { id: id.clone() }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        meeting.segments.len(),
+        2,
+        "both stretches in one transcript"
+    );
+    teardown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_refusal_has_its_own_status_code() {
     let _g = SERIAL

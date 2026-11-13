@@ -65,6 +65,9 @@ pub enum StoreError {
     /// A second recording while one is running.
     #[error("another meeting is already recording")]
     AlreadyRecording,
+    /// The meeting's notes are still being written; it can't record yet.
+    #[error("Borg is still writing this meeting's notes; resume once they're done")]
+    StillWriting,
     /// `meetings.enabled` is off.
     #[error("meeting notes are turned off; turn them on in Settings → Meetings")]
     Disabled,
@@ -360,6 +363,36 @@ pub async fn stop_meeting(db: &Database, id: &str, now: i64) -> StoreResult<Meet
     if meeting.state == MeetingState::Recording {
         db.set_meeting_state(id, MeetingState::Finalizing, Some(now), None, now)
             .await?;
+    }
+    load(db, id).await
+}
+
+/// Record more of a stopped meeting: it goes back to recording, and new
+/// audio joins the same transcript. The earlier summary stays until the next
+/// stop writes a fresh one from everything. Refused while the notes are still
+/// being written, when the feature is off, or while another meeting records.
+pub async fn resume_meeting(
+    db: &Database,
+    config: &Config,
+    id: &str,
+    now: i64,
+) -> StoreResult<MeetingRow> {
+    if !config.meetings.enabled {
+        return Err(StoreError::Disabled);
+    }
+    let _starting = START_LOCK.lock().await;
+    let meeting = load(db, id).await?;
+    match meeting.state {
+        MeetingState::Recording => return Ok(meeting),
+        MeetingState::Finalizing => return Err(StoreError::StillWriting),
+        MeetingState::Done | MeetingState::Failed => {}
+    }
+    if db.recording_meeting().await?.is_some() {
+        return Err(StoreError::AlreadyRecording);
+    }
+    if !db.reopen_meeting(id, now).await? {
+        // The finalizer moved it between the read and the update.
+        return Err(StoreError::StillWriting);
     }
     load(db, id).await
 }
@@ -1029,6 +1062,103 @@ mod tests {
             finalize_meeting(&f.db, &fake(Ok("x")), &m.id, 1_001).await,
             Err(StoreError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_meeting_records_into_the_same_transcript_and_is_summarised_again() {
+        let mut f = fixture().await;
+        let _server = whisper(&mut f.config, "second half").await;
+        let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        let wav = wav_ms(2_000);
+        append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 0, 0, &wav),
+            1_001,
+        )
+        .await
+        .unwrap();
+        stop_meeting(&f.db, &m.id, 1_010).await.unwrap();
+        finalize_meeting(&f.db, &fake(Err("model is down")), &m.id, 1_011)
+            .await
+            .unwrap();
+
+        let back = resume_meeting(&f.db, &f.config, &m.id, 1_100)
+            .await
+            .unwrap();
+        assert_eq!(back.state, MeetingState::Recording);
+        assert_eq!(back.ended_at, None, "a recording meeting has no end yet");
+        assert_eq!(back.error, None, "the old failure no longer applies");
+        assert_eq!(back.dir, m.dir, "same folder, same transcript");
+
+        let more = append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 100_000, 100_000, &wav),
+            1_101,
+        )
+        .await
+        .unwrap();
+        assert!(!more.replayed);
+        assert_eq!(f.db.segments_for(&m.id).await.unwrap().len(), 2);
+
+        stop_meeting(&f.db, &m.id, 1_200).await.unwrap();
+        let done = finalize_meeting(&f.db, &fake(Ok("All of it")), &m.id, 1_201)
+            .await
+            .unwrap();
+        assert_eq!(done.state, MeetingState::Done);
+        assert_eq!(done.ended_at, Some(1_200));
+        assert_eq!(done.summary_md.as_deref(), Some("All of it"));
+    }
+
+    #[tokio::test]
+    async fn resume_waits_for_the_notes_and_for_the_other_meeting() {
+        let mut f = fixture().await;
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        // Recording already: nothing to do.
+        let same = resume_meeting(&f.db, &f.config, &m.id, 1_001)
+            .await
+            .unwrap();
+        assert_eq!(same.state, MeetingState::Recording);
+
+        stop_meeting(&f.db, &m.id, 1_002).await.unwrap();
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_003).await,
+            Err(StoreError::StillWriting)
+        ));
+        finalize_meeting(&f.db, &fake(Ok("x")), &m.id, 1_004)
+            .await
+            .unwrap();
+
+        let other = start_meeting(&f.db, &f.config, StartParams::default(), 1_005)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_006).await,
+            Err(StoreError::AlreadyRecording)
+        ));
+        stop_meeting(&f.db, &other.id, 1_007).await.unwrap();
+
+        f.config.meetings.enabled = false;
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_008).await,
+            Err(StoreError::Disabled)
+        ));
+        f.config.meetings.enabled = true;
+        assert_eq!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_009)
+                .await
+                .unwrap()
+                .state,
+            MeetingState::Recording
+        );
     }
 
     #[tokio::test]

@@ -56,22 +56,36 @@ describe("PcmChunker", () => {
   it("places a late start's chunks where they sit in the meeting", () => {
     const { c, out } = chunker({ baseOffsetMs: 70_000, firstSeq: firstSeqFor(70_000) });
     c.push(seconds(26));
-    expect(out.map((ch) => [ch.seq, ch.offsetMs])).toEqual([[2, 70_000]]);
+    expect(out.map((ch) => [ch.seq, ch.offsetMs])).toEqual([[70_000, 70_000]]);
   });
 });
 
 describe("firstSeqFor", () => {
-  it("numbers from zero within the first chunk of the meeting", () => {
+  /** Every number a capture starting at `startMs` sends for `ms` of audio, stopped then. */
+  const sent = (startMs: number, ms: number) => {
+    const { c, out } = chunker({ baseOffsetMs: startMs, firstSeq: firstSeqFor(startMs) });
+    c.push(seconds(ms / 1000));
+    c.flush();
+    return out.map((ch) => ch.seq);
+  };
+
+  it("numbers a capture from the meeting's start from zero", () => {
     expect(firstSeqFor(0)).toBe(0);
-    expect(firstSeqFor(1_500)).toBe(0);
   });
 
-  it("starts a reopened capture past every whole chunk an earlier one could have sent", () => {
-    // An earlier capture's chunks all finished before this moment, so the
-    // highest number it can have used is one below floor(offset / 25 s).
-    expect(firstSeqFor(CHUNK_MS)).toBe(1);
-    expect(firstSeqFor(3 * CHUNK_MS - 1)).toBe(2);
-    expect(firstSeqFor(3 * CHUNK_MS)).toBe(3);
+  it("never reuses a number when recording resumes moments after a stop", () => {
+    // 30 s recorded (a whole chunk and a 5 s partial), stopped, resumed 2 s later.
+    const before = sent(0, 30_000);
+    const after = sent(32_000, 30_000);
+    expect(before).toHaveLength(2);
+    expect(Math.min(...after)).toBeGreaterThan(Math.max(...before));
+  });
+
+  it("never reuses a number when a panel reopens mid-chunk", () => {
+    // Three whole chunks, then a reload 1 s into the fourth.
+    const before = sent(0, 3 * CHUNK_MS);
+    const after = sent(3 * CHUNK_MS + 1_000, CHUNK_MS);
+    expect(Math.min(...after)).toBeGreaterThan(Math.max(...before));
   });
 });
 

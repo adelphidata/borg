@@ -264,6 +264,23 @@ impl Database {
         Ok(())
     }
 
+    /// Put a finished meeting back to recording: no end time, no error. Only
+    /// a `done` or `failed` meeting moves, so a summary still being written
+    /// can't land on a meeting that is recording again. Returns whether it
+    /// moved.
+    pub async fn reopen_meeting(&self, id: &str, now: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE meetings SET state = 'recording', ended_at = NULL, error = NULL,
+                    updated_at = ?2
+                 WHERE id = ?1 AND state IN ('done', 'failed')",
+                params!(id, now),
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+
     /// Record activity on a recording meeting without changing anything else.
     pub async fn touch_meeting(&self, id: &str, now: i64) -> Result<()> {
         self.conn
