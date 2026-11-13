@@ -54,7 +54,7 @@ export interface BasicSetting {
  * into offering different answers to the same question.
  */
 export const THINKING_OPTIONS: SettingOption[] = [
-  { value: "off", desc: "Answer straight away." },
+  { value: "off" },
   { value: "low", desc: "A moment's thought." },
   { value: "medium", desc: "Thinks it through." },
   { value: "high", desc: "Slow and deep. For the hard stuff." },
@@ -66,7 +66,7 @@ export const MODE_KEY = "conversation.collaboration_mode";
 
 /** The collaboration modes, for Settings, the composer and the `/` menu. */
 export const MODE_OPTIONS: SettingOption[] = [
-  { value: "execute", desc: "Borg acts. The default." },
+  { value: "execute" },
   { value: "plan", desc: "Read-only. Borg proposes, you approve." },
 ];
 
