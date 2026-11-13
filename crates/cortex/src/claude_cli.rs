@@ -236,6 +236,20 @@ struct CliEvent {
     error: Option<String>,
     #[serde(default)]
     usage: Option<CliUsage>,
+    /// `{"type":"stream_event","event":{...}}` — the raw API event the CLI
+    /// forwards under `--include-partial-messages`.
+    #[serde(default)]
+    event: Option<Box<CliEvent>>,
+    /// `{"type":"assistant","message":{...}}` — a whole message, which is
+    /// all the CLI emits when partial messages are off.
+    #[serde(default)]
+    message: Option<CliMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliMessage {
+    #[serde(default)]
+    content: Vec<ContentBlock>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +262,9 @@ struct ContentBlock {
     name: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// Tool arguments on a complete `tool_use` block.
+    #[serde(default)]
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,13 +291,67 @@ struct CliUsage {
     cache_creation_input_tokens: Option<u64>,
 }
 
+/// How much of the CLI's stderr is kept for the error a failed run reports.
+const STDERR_TAIL_LINES: usize = 20;
+
+/// Whether `event` carries reply content, as opposed to usage or a terminator.
+fn is_content_delta(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextDelta(_)
+            | StreamEvent::ThinkingDelta(_)
+            | StreamEvent::ToolCallDelta { .. }
+    )
+}
+
 /// Parse a single JSONL line into a `StreamEvent`.
 ///
 /// Returns `None` for events we don't care about (system init, content_block_stop, etc.).
 fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
     let event: CliEvent = serde_json::from_str(line).ok()?;
+    event_to_stream(event)
+}
 
+/// The content of a complete `assistant` message, as the deltas it stands for.
+///
+/// Empty for any other line. This is the fallback for a CLI that ignores
+/// `--include-partial-messages` and so never sends a delta: the reply then
+/// arrives in one piece instead of not at all.
+fn parse_assistant_message(line: &str) -> Vec<StreamEvent> {
+    let Ok(event) = serde_json::from_str::<CliEvent>(line) else {
+        return Vec::new();
+    };
+    if event.event_type != "assistant" {
+        return Vec::new();
+    }
+    let Some(message) = event.message else {
+        return Vec::new();
+    };
+    message
+        .content
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block.block_type.as_str() {
+            "text" => block
+                .text
+                .filter(|t| !t.is_empty())
+                .map(StreamEvent::TextDelta),
+            "tool_use" => Some(StreamEvent::ToolCallDelta {
+                index,
+                id: block.id,
+                name: block.name,
+                arguments_delta: block.input.map(|v| v.to_string()).unwrap_or_default(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn event_to_stream(event: CliEvent) -> Option<StreamEvent> {
     match event.event_type.as_str() {
+        // `--include-partial-messages` wraps each raw API event; the inner
+        // one is the shape the arms below already read.
+        "stream_event" => event.event.and_then(|inner| event_to_stream(*inner)),
         "content_block_start" => {
             let block = event.content_block?;
             match block.block_type.as_str() {
@@ -436,6 +507,10 @@ pub async fn stream_claude_cli(
         "--output-format",
         "stream-json",
         "--verbose",
+        // Without this the CLI emits one whole `assistant` message per turn
+        // and no `content_block_delta`s, so nothing streams and the reply
+        // only lands when the turn is over.
+        "--include-partial-messages",
         "--model",
         &cli_model,
         "--permission-mode",
@@ -454,13 +529,30 @@ pub async fn stream_claude_cli(
 
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null()); // Don't capture to avoid pipe buffer deadlock
+    cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| LlmError::Fatal {
         source: anyhow::anyhow!("failed to spawn claude CLI: {e}"),
         reason: FailoverReason::Unknown,
         status: None,
     })?;
+
+    // Drained on its own task so a chatty CLI can never fill the pipe and
+    // stall; only the tail is kept, which is where the CLI puts its reason
+    // for exiting.
+    let stderr_tail = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        })
+    });
 
     // Write user prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
@@ -483,6 +575,9 @@ pub async fn stream_claude_cli(
     })?;
 
     let mut reader = BufReader::new(stdout).lines();
+    // Whether any content arrived as a delta. A complete `assistant` message
+    // repeats what the deltas carried, so it is only read when there were none.
+    let mut saw_delta = false;
 
     loop {
         tokio::select! {
@@ -500,7 +595,15 @@ pub async fn stream_claude_cli(
                         if line.is_empty() {
                             continue;
                         }
-                        if let Some(event) = parse_jsonl_event(line) {
+                        let events = match parse_jsonl_event(line) {
+                            Some(event) => {
+                                saw_delta |= is_content_delta(&event);
+                                vec![event]
+                            }
+                            None if !saw_delta => parse_assistant_message(line),
+                            None => Vec::new(),
+                        };
+                        for event in events {
                             let is_done = matches!(event, StreamEvent::Done);
                             let is_error = matches!(event, StreamEvent::Error(_));
                             if tx.send(event).await.is_err() {
@@ -533,13 +636,26 @@ pub async fn stream_claude_cli(
         status: None,
     })?;
 
+    let stderr = match stderr_tail {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
     if !status.success() {
         let code = status.code().unwrap_or(-1);
+        let detail = if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr.trim())
+        };
         let _ = tx
             .send(StreamEvent::Error(format!(
-                "Claude CLI exited with code {code}"
+                "Claude CLI exited with code {code}{detail}"
             )))
             .await;
+    } else if !saw_delta && !stderr.trim().is_empty() {
+        // A clean exit with no reply is the case nobody can diagnose from
+        // the UI; the CLI usually said why on stderr.
+        warn!(stderr = %stderr.trim(), "claude CLI exited 0 without a reply");
     }
 
     let _ = tx.send(StreamEvent::Done).await;
@@ -723,6 +839,84 @@ mod tests {
     fn parse_text_block_start_empty_text_returns_none() {
         let line = r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#;
         assert!(parse_jsonl_event(line).is_none());
+    }
+
+    #[test]
+    fn parse_stream_event_unwraps_the_api_event() {
+        // `--include-partial-messages` nests every raw API event under
+        // `event`; the text must come out exactly as a bare delta would.
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi there"}},"session_id":"s1","uuid":"u1"}"#;
+        match parse_jsonl_event(line) {
+            Some(StreamEvent::TextDelta(t)) => assert_eq!(t, "Hi there"),
+            other => panic!("expected a text delta, got {other:?}"),
+        }
+        let usage = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":11,"cache_read_input_tokens":5,"cache_creation_input_tokens":7}}}"#;
+        match parse_jsonl_event(usage) {
+            Some(StreamEvent::Usage(u)) => {
+                assert_eq!((u.prompt_tokens, u.completion_tokens), (2, 11));
+                assert_eq!((u.cached_input_tokens, u.cache_creation_tokens), (5, 7));
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_assistant_message_is_not_a_stream_event() {
+        // Read only through the fallback, or a reply would print twice when
+        // the deltas were streamed as well.
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]}}"#;
+        assert!(parse_jsonl_event(line).is_none());
+    }
+
+    #[test]
+    fn assistant_message_fallback_yields_text_and_tool_calls() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Checking."},{"type":"text","text":""},{"type":"tool_use","id":"toolu_1","name":"run_shell","input":{"command":"ls"}}]}}"#;
+        let events = parse_assistant_message(line);
+        assert_eq!(events.len(), 2, "empty text blocks are skipped: {events:?}");
+        match &events[0] {
+            StreamEvent::TextDelta(t) => assert_eq!(t, "Checking."),
+            other => panic!("expected text first, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                assert_eq!(*index, 2);
+                assert_eq!(id.as_deref(), Some("toolu_1"));
+                assert_eq!(name.as_deref(), Some("run_shell"));
+                assert_eq!(arguments_delta, r#"{"command":"ls"}"#);
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_message_fallback_ignores_other_lines() {
+        for line in [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"echo"}]}}"#,
+            "not json",
+        ] {
+            assert!(parse_assistant_message(line).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn content_deltas_are_what_marks_a_reply_as_streamed() {
+        assert!(is_content_delta(&StreamEvent::TextDelta("x".into())));
+        assert!(is_content_delta(&StreamEvent::ThinkingDelta("x".into())));
+        assert!(is_content_delta(&StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: None,
+            arguments_delta: String::new(),
+        }));
+        assert!(!is_content_delta(&StreamEvent::Done));
+        assert!(!is_content_delta(&StreamEvent::Error("x".into())));
     }
 
     #[test]
