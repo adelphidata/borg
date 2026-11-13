@@ -108,6 +108,13 @@ export function useStopMeeting() {
   });
 }
 
+/** Record more of a stopped meeting; the desktop reopens capture on its own. */
+export function useResumeMeeting() {
+  return useMutation((borg, id: string) => borg.meetings.resumeMeeting({ id }), {
+    onSuccess: () => meetingsChanged(),
+  });
+}
+
 export function useDeleteMeeting() {
   return useMutation((borg, id: string) => borg.meetings.deleteMeeting({ id }), {
     onSuccess: () => meetingsChanged(),

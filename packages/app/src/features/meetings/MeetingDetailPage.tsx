@@ -2,128 +2,141 @@ import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   BackLink,
-  DETAIL_COL,
+  ClockIcon,
   Markdown,
+  MeetingsIcon,
   Menu,
   MoreIcon,
   PageChrome,
+  PeopleIcon,
   Pill,
-  SECTION_LABEL,
-  SendIcon,
   StatusDot,
   TrashIcon,
-  isSubmitEnter,
   scrollCol,
   useIsMobile,
 } from "@borg/ui";
 import { DaemonState } from "../../components/DaemonState";
 import { showNotice } from "../../lib/notice";
-import { asBorgError, useBorg } from "../../lib/useDaemon";
+import { useNative, usePlatform } from "../../lib/platform";
 import { useTick } from "../../lib/useTick";
 import { useMenuEscape } from "../sessions/SessionRowMenu";
-import { askAboutMeeting } from "./askAboutMeeting";
-import { meetingMeta, segmentClock } from "./meetingsFormat";
+import { AskBar, Chip, ChipRow, DOC_COL, DocTitle } from "./MeetingDoc";
+import { duration, fullNames, segmentClock, shortDay, timeOfDay } from "./meetingsFormat";
 import { meetingsChanged } from "./meetingsStore";
 import { NotesEditor } from "./NotesEditor";
-import { TranscriptFold } from "./TranscriptFold";
-import { useDeleteMeeting, useMeeting, useStopMeeting, type Meeting } from "./useMeetings";
+import { TranscriptList } from "./TranscriptList";
+import {
+  useDeleteMeeting,
+  useMeeting,
+  useResumeMeeting,
+  useStopMeeting,
+  type Meeting,
+} from "./useMeetings";
 import { useNotesDraft, type NotesDraft } from "./useNotesDraft";
 
-/** The line under the title while the meeting is still live or being written up. */
-function RecordingBanner({ state, startedAt }: { state: string; startedAt: number }) {
+/**
+ * "Listening 4:07" while the meeting records. Once it stops, the Summary tab
+ * says Borg is writing; saying it here too would be the same news twice.
+ */
+function LiveChip({ state, startedAt }: { state: string; startedAt: number }) {
   const now = useTick(1000, state === "recording");
-  if (state === "recording") {
+  if (state !== "recording") return null;
+  return (
+    <Chip icon={<StatusDot tone="busy" />}>
+      Listening
+      <span className="text-ink3 tabular-nums">{segmentClock(now - startedAt * 1000)}</span>
+    </Chip>
+  );
+}
+
+type View = "summary" | "notes" | "transcript";
+
+/** Summary / My notes / Transcript: one document, three ways to read it. */
+function ViewSwitch({
+  views,
+  view,
+  onChange,
+}: {
+  views: { id: View; label: string }[];
+  view: View;
+  onChange: (view: View) => void;
+}) {
+  if (views.length < 2) return null;
+  return (
+    <div role="tablist" className="flex gap-1 border-b border-line2">
+      {views.map((v) => (
+        <button
+          key={v.id}
+          type="button"
+          role="tab"
+          aria-selected={v.id === view}
+          onClick={() => onChange(v.id)}
+          className={`-mb-px cursor-pointer border-0 border-b-2 bg-transparent px-2.5 pt-1 pb-2.5 text-[12.5px] leading-none ${
+            v.id === view
+              ? "border-neon font-medium text-ink"
+              : "border-transparent text-ink3 hover:text-ink"
+          }`}
+        >
+          {v.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SummaryView({ meeting }: { meeting: Meeting }) {
+  const s = meeting.summary!;
+  if (s.hasSummary && meeting.summaryMarkdown !== "") {
     return (
-      <div className="flex items-center gap-2 text-[12.5px] leading-none text-ink2">
-        <StatusDot tone="busy" />
-        Listening
-        <span className="text-ink3 tabular-nums">{segmentClock(now - startedAt * 1000)}</span>
+      <div className="text-[14.5px] leading-[1.7] text-ink select-text">
+        <Markdown>{meeting.summaryMarkdown}</Markdown>
       </div>
     );
   }
-  if (state === "finalizing") {
-    return <div className="text-[12.5px] leading-none text-ink3">Writing notes…</div>;
+  if (s.state === "failed") {
+    return (
+      <div className="rounded-[10px] border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
+        Borg couldn't write the notes{meeting.error ? `: ${meeting.error}` : "."}
+      </div>
+    );
   }
-  return null;
+  return <div className="text-[13.5px] leading-[1.5] text-ink3">Borg is writing the summary…</div>;
 }
 
-/** "Ask anything about this meeting": starts a chat that knows which meeting. */
-function AskBar({ meeting }: { meeting: { id: string; title: string } }) {
-  const borg = useBorg();
-  const navigate = useNavigate();
-  const [question, setQuestion] = useState("");
-  const [asking, setAsking] = useState(false);
-  const [error, setError] = useState<string>();
-  const submit = async () => {
-    if (question.trim() === "" || asking) return;
-    setAsking(true);
-    setError(undefined);
-    try {
-      const sessionId = await askAboutMeeting(borg, question, meeting);
-      navigate(`/c/${sessionId}`);
-    } catch (e) {
-      setError(`Couldn't ask Borg: ${asBorgError(e).message}`);
-      setAsking(false);
-    }
-  };
+/** A summary to show: written, being written, or failed with a reason. */
+function hasSummaryView(meeting: Meeting): boolean {
+  const s = meeting.summary!;
   return (
-    <div className="sticky bottom-0 bg-surface pt-3 pb-1">
-      <div className="flex items-center gap-2 rounded-[14px] border border-line bg-surface2 px-4 py-2.5 shadow-(--frameShadow)">
-        <input
-          aria-label="Ask about this meeting"
-          className="min-w-0 flex-1 border-0 bg-transparent text-[14px] leading-[1.4] text-ink outline-none placeholder:text-ink3"
-          placeholder="Ask anything"
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => {
-            if (isSubmitEnter(e)) {
-              e.preventDefault();
-              void submit();
-            }
-          }}
-        />
-        <button
-          type="button"
-          aria-label="Ask"
-          disabled={asking}
-          onClick={() => void submit()}
-          className="flex h-[27px] w-[27px] flex-none cursor-pointer items-center justify-center rounded-[8px] border-0 bg-neon disabled:opacity-50"
-        >
-          <SendIcon size={13} />
-        </button>
-      </div>
-      {error && <div className="mt-2 text-[12px] leading-[1.45] text-alert">{error}</div>}
-    </div>
+    (s.hasSummary && meeting.summaryMarkdown !== "") ||
+    s.state === "finalizing" ||
+    s.state === "failed"
   );
 }
 
 function MeetingBody({ meeting, draft }: { meeting: Meeting; draft: NotesDraft }) {
   const s = meeting.summary!;
+  const views: { id: View; label: string }[] = [];
+  // The summary leads once there is one, or once Borg is on it.
+  if (hasSummaryView(meeting)) views.push({ id: "summary", label: "Summary" });
+  views.push({ id: "notes", label: "My notes" });
+  if (meeting.segments.length > 0) views.push({ id: "transcript", label: "Transcript" });
+  // The tab is chosen once, when the page opens: a recording that stops
+  // must not pull the notes box away from someone typing in it.
+  const [picked, setPicked] = useState<View>(views[0]!.id);
+  const view = views.find((v) => v.id === picked)?.id ?? views[0]!.id;
+
   return (
     <>
-      <RecordingBanner state={s.state} startedAt={s.startedAt} />
-      <NotesEditor draft={draft} />
-      {s.hasSummary && meeting.summaryMarkdown !== "" ? (
-        <section>
-          <div className={SECTION_LABEL}>Summary</div>
-          <div className="text-[14px] leading-[1.6] text-ink">
-            <Markdown>{meeting.summaryMarkdown}</Markdown>
-          </div>
-        </section>
-      ) : s.state === "finalizing" ? (
-        <div className="text-[13px] leading-[1.5] text-ink3">Borg is writing the summary…</div>
-      ) : s.state === "failed" ? (
-        <div className="rounded-[10px] border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
-          Borg couldn't write the notes{meeting.error ? `: ${meeting.error}` : "."}
-        </div>
-      ) : null}
-      <TranscriptFold segments={meeting.segments} />
+      <ViewSwitch views={views} view={view} onChange={setPicked} />
+      {view === "summary" && <SummaryView meeting={meeting} />}
+      {view === "notes" && <NotesEditor draft={draft} />}
+      {view === "transcript" && <TranscriptList segments={meeting.segments} />}
       <AskBar meeting={{ id: s.id, title: s.title }} />
     </>
   );
 }
 
-/** `/meetings/:id`: one meeting, Granola-style — notes, summary, transcript, ask. */
+/** `/meetings/:id`: one meeting as a document — summary, notes, transcript, ask. */
 export function MeetingDetailPage() {
   const { id = "" } = useParams();
   // Keyed: the notes box belongs to one meeting and must not carry its text
@@ -137,9 +150,14 @@ function MeetingView({ id }: { id: string }) {
   const query = useMeeting(id, { markRead: true });
   const draft = useNotesDraft(id, query.state === "ready" ? query.data.notes : undefined);
   const stop = useStopMeeting();
+  const resume = useResumeMeeting();
   const remove = useDeleteMeeting();
+  const native = useNative();
+  // Only the desktop app can record, so only it offers to record more.
+  const canRecord = usePlatform().kind === "desktop";
   const [menuOpen, setMenuOpen] = useState(false);
   useMenuEscape(menuOpen, () => setMenuOpen(false));
+  const now = new Date(useTick(60_000, true));
 
   const summary = query.state === "ready" ? query.data.summary : undefined;
   const title = summary?.title || "Meeting";
@@ -162,7 +180,20 @@ function MeetingView({ id }: { id: string }) {
         Stop
       </Pill>
     ) : summary ? (
-      <div className="relative">
+      <div className="relative flex items-center gap-2">
+        {canRecord && (summary.state === "done" || summary.state === "failed") && (
+          <Pill
+            sizeClasses="px-3 py-1.5 text-[12px]"
+            disabled={resume.pending}
+            onClick={() =>
+              void resume.run(summary.id).then((r) => {
+                if (r !== undefined) native.meetings.openPanel(summary.id);
+              })
+            }
+          >
+            {resume.pending ? "Resuming…" : "Resume"}
+          </Pill>
+        )}
         <button
           type="button"
           aria-label="Meeting actions"
@@ -195,26 +226,41 @@ function MeetingView({ id }: { id: string }) {
       </div>
     ) : undefined;
 
+  const people = summary ? fullNames(summary.attendees) : [];
+  const length = summary ? duration(summary.startedAt, summary.endedAt) : "";
+
   return (
-    <PageChrome
-      title={title}
-      meta={summary ? meetingMeta(summary) : undefined}
-      onRename={summary ? rename : undefined}
-      renameLabel="Meeting name"
-      headerActions={actions}
-    >
-      <div className={scrollCol(isMobile, "px-[38px] pt-[34px]")}>
-        <div className={DETAIL_COL}>
+    <PageChrome title="Meetings" headerActions={actions}>
+      <div className={scrollCol(isMobile, "px-[38px] pt-[30px]")}>
+        <div className={DOC_COL}>
           <BackLink to="/meetings" label="Meetings" />
-          {(stop.error ?? remove.error) && (
+          {(stop.error ?? resume.error ?? remove.error) && (
             <div className="rounded-[10px] border border-alert bg-alert-soft px-4 py-3 text-[12.5px] leading-[1.45] text-ink2">
-              {(stop.error ?? remove.error)!.message}
+              {(stop.error ?? resume.error ?? remove.error)!.message}
             </div>
           )}
           <DaemonState query={query} label="this meeting">
             {(m) =>
               m.summary ? (
-                <MeetingBody meeting={m} draft={draft} />
+                <>
+                  <div className="flex flex-col gap-3">
+                    <DocTitle title={title} onRename={rename} />
+                    <ChipRow>
+                      <Chip icon={<MeetingsIcon size={13} />}>
+                        {shortDay(new Date(m.summary.startedAt * 1000), now)} ·{" "}
+                        {timeOfDay(m.summary.startedAt)}
+                      </Chip>
+                      {length !== "" && <Chip icon={<ClockIcon />}>{length}</Chip>}
+                      {people.length > 0 && (
+                        <Chip icon={<PeopleIcon />} title={people.join(", ")}>
+                          {people.length}
+                        </Chip>
+                      )}
+                      <LiveChip state={m.summary.state} startedAt={m.summary.startedAt} />
+                    </ChipRow>
+                  </div>
+                  <MeetingBody meeting={m} draft={draft} />
+                </>
               ) : (
                 <div className="text-[14px] text-ink2">That meeting doesn't exist.</div>
               )

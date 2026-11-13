@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleArrowUp,
+  Clock,
   Copy,
   GitBranch,
   Info,
@@ -32,6 +33,8 @@ import {
   SquarePen,
   Sun,
   Trash2,
+  Users,
+  Video,
   Volume2,
   Wallet,
   X,
@@ -100,6 +103,10 @@ export const NewChatIcon = lucide(SquarePen, 14);
 export const ScheduleIcon = lucide(CalendarClock, 16);
 /** Meetings. A plain calendar page: the clock-on-a-calendar is Scheduled's. */
 export const MeetingsIcon = lucide(CalendarDays, 16);
+/** A meeting's people, its time, and the call link on its pages. */
+export const PeopleIcon = lucide(Users, 13);
+export const ClockIcon = lucide(Clock, 13);
+export const VideoIcon = lucide(Video, 14);
 export const UsageIcon = lucide(Wallet, 16);
 export const AgentsIcon = lucide(ListTree, 16);
 export const SunIcon = lucide(Sun, 15);

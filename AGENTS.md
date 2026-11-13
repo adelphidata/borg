@@ -110,6 +110,7 @@ Default view shows the smallest control set that finishes the job; the rest sits
 - Errors name the next action in plain words, never a raw code.
 - Two controls, one outcome → delete one.
 - A fresh install reaches a working conversation with credentials as the only input, no docs.
+- **No filler copy.** Don't add text that narrates the UI or restates the obvious ("Meetings you take notes in show up here", "Your X will appear here", "Borg notices Y on a Mac"). It reads as tacky and talks down to the user. An empty list renders nothing (or one control that acts); a line of copy earns its place only when the user needs it to act or to understand a failure.
 
 ### Mouse Interaction — Hard Invariant
 

@@ -24,8 +24,32 @@ pub(crate) async fn ensure_success(
     }
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    anyhow::bail!("{label} returned {status}: {body}")
+    Err(HttpStatusError {
+        label: label.to_string(),
+        status,
+        body,
+    }
+    .into())
 }
+
+/// A provider answered with an error status. Typed, so a caller can tell a
+/// rejected key from an outage and say which to the person; it still reads
+/// `"<label> returned <status>: <body>"`.
+#[derive(Debug)]
+pub struct HttpStatusError {
+    /// The provider's id, as passed to `ensure_success`.
+    pub label: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} returned {}: {}", self.label, self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
 
 /// Read a response body into memory with a hard byte ceiling enforced
 /// chunk-by-chunk while streaming.

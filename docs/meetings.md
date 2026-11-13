@@ -24,6 +24,10 @@ for one thing: a transcription provider.
 4. **Summary.** The meeting shows "Writing notes…" until the summary lands. A
    green dot then appears next to **Meetings** in the sidebar until you open
    it.
+5. **Resume.** Once the summary is written (or failed), **Resume** in the
+   panel or on the meeting's page records more of the same meeting. New audio
+   joins the same transcript, and the next stop writes the summary again from
+   all of it. Only one meeting records at a time.
 
 With **Ask before recording** turned off, a call that lines up with a
 calendar event starts recording on its own, with no pop-up. A call with no

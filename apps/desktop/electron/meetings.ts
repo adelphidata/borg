@@ -41,6 +41,8 @@ export const DETECTED_MARGIN = 16;
 export const PANEL_WIDTH = 420;
 export const PANEL_HEIGHT = 520;
 export const PANEL_MIN_WIDTH = 360;
+/** Where macOS draws the panel's window buttons: inside its header row. */
+export const PANEL_TRAFFIC_LIGHTS = { x: 14, y: 17 };
 
 /**
  * How soon after an audio-only answer a second display-media request counts
@@ -208,9 +210,20 @@ export function registerMeetings(options: MeetingsOptions): { dispose(): void } 
         height: PANEL_HEIGHT,
         minWidth: PANEL_MIN_WIDTH,
         show: false,
-        frame: false,
         resizable: true,
         alwaysOnTop: true,
+        // A window people can close the usual way: on macOS the traffic
+        // lights sit over the panel's own header (only close does anything
+        // in a panel), elsewhere the system frame carries the close button.
+        ...(process.platform === "darwin"
+          ? {
+              titleBarStyle: "hidden" as const,
+              trafficLightPosition: PANEL_TRAFFIC_LIGHTS,
+              minimizable: false,
+              maximizable: false,
+              fullscreenable: false,
+            }
+          : {}),
         webPreferences: {
           ...webPreferences,
           // The panel hosts the capture; a hidden or covered window must not

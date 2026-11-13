@@ -2,12 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import type { meetings } from "@borg/client";
 import { Markdown, Meter, Pill, StatusDot } from "@borg/ui";
 import { MEETING_PANEL_HASH } from "../../lib/chords";
+import { isMacPlatform } from "../../lib/keybinds";
 import { useNative } from "../../lib/platform";
 import { asBorgError, useRetryingServerStream } from "../../lib/useDaemon";
 import { useMeetingCapture } from "./capture/useMeetingCapture";
 import { meetingsChanged } from "./meetingsStore";
 import { NotesEditor } from "./NotesEditor";
-import { useMeeting } from "./useMeetings";
+import { useMeeting, useResumeMeeting } from "./useMeetings";
 import { useNotesDraft } from "./useNotesDraft";
 
 /** How long after the call seems to end before recording stops by itself. */
@@ -25,6 +26,8 @@ export function panelMeetingId(hash: string = window.location.hash): string | un
 
 const DRAG = "[-webkit-app-region:drag]";
 const NO_DRAG = "[-webkit-app-region:no-drag]";
+/** On macOS the window buttons sit at the header's left edge; leave them room. */
+const HEADER_PAD = isMacPlatform() ? "pr-4 pl-[88px]" : "px-4";
 
 /**
  * The floating notes panel (desktop only, `#/meeting-panel/<id>`).
@@ -33,7 +36,8 @@ const NO_DRAG = "[-webkit-app-region:no-drag]";
  * captures the microphone and the system's audio and streams them to the
  * daemon, and the user types notes beside it. The main process keeps the
  * window alive (hidden) if it is closed mid-meeting, so capture carries on.
- * When the meeting ends it shows "Writing notes…", then the summary.
+ * When the meeting ends it shows "Writing notes…", then the summary, with
+ * Resume to record more of the same meeting.
  */
 export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
   const native = useNative();
@@ -48,6 +52,7 @@ export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
   const [failure, setFailure] = useState<string>();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState<string>();
+  const resume = useResumeMeeting();
 
   const stopRef = useRef(capture.stop);
   stopRef.current = capture.stop;
@@ -105,10 +110,18 @@ export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
 
   const title = summary?.title || "Meeting";
   const failed = state === "failed" || failure !== undefined;
+  const finished = state === "done" || failed;
+
+  const resumeRecording = () => {
+    setFailure(undefined);
+    void resume.run(meetingId);
+  };
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-[14px] border border-line bg-surface">
-      <header className={`flex items-center gap-2 border-b border-line2 px-4 py-3 ${DRAG}`}>
+    <div className="flex h-full flex-col overflow-hidden bg-surface">
+      <header
+        className={`flex items-center gap-2 border-b border-line2 py-3 ${HEADER_PAD} ${DRAG}`}
+      >
         <div className="min-w-0 flex-1">
           <div className="truncate text-[14px] leading-[1.3] font-medium text-ink">{title}</div>
           {recording && (
@@ -129,11 +142,22 @@ export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
             {stopping ? "Stopping…" : "Stop"}
           </Pill>
         )}
+        {finished && (
+          <Pill
+            sizeClasses="px-3 py-1.5 text-[12px]"
+            className={NO_DRAG}
+            disabled={resume.pending}
+            onClick={resumeRecording}
+          >
+            {resume.pending ? "Resuming…" : "Resume"}
+          </Pill>
+        )}
       </header>
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-3">
         {query.state === "error" && (
           <div className="text-[12.5px] text-alert">{query.error.message}</div>
         )}
+        {resume.error && <div className="text-[12.5px] text-alert">{resume.error.message}</div>}
         {recording && (
           <>
             <Meter percent={capture.level * 100} />
@@ -169,7 +193,7 @@ export function MeetingPanelPage({ meetingId }: { meetingId: string }) {
           </div>
         )}
       </div>
-      {(state === "done" || failed) && (
+      {finished && (
         <footer className="border-t border-line2 px-4 py-3">
           <Pill variant="primary" onClick={openInBorg}>
             Open in Borg

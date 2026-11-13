@@ -16,6 +16,10 @@ function Detail() {
   return <div>detail {useParams().id}</div>;
 }
 
+function EventDetail() {
+  return <div>event {useParams().eventId}</div>;
+}
+
 function mount(table: UnaryTable = {}) {
   const daemon = fakeDaemon({
     GetSettings: { entries: [entry("meetings.enabled", "true")] },
@@ -27,6 +31,7 @@ function mount(table: UnaryTable = {}) {
   const view = renderApp(
     <Routes>
       <Route path="/meetings" element={<MeetingsPage />} />
+      <Route path="/meetings/event/:eventId" element={<EventDetail />} />
       <Route path="/meetings/:id" element={<Detail />} />
     </Routes>,
     {
@@ -88,13 +93,30 @@ describe("MeetingsPage", () => {
         ],
       },
     });
-    const title = await screen.findByText("Design review");
-    const row = title.parentElement!.parentElement!;
-    expect(row.querySelector(".bg-meeting-bar")).not.toBeNull();
+    const row = await screen.findByRole("button", { name: /Design review/ });
+    expect(row.querySelector(".bg-neon")).not.toBeNull();
     expect(within(row).getByText(/9:45 – 10:15/)).toBeTruthy();
     expect(within(row).getByText("AM")).toBeTruthy();
-    // Today is listed too, and it is the row with the red dot.
-    expect(container.querySelectorAll(".bg-today")).toHaveLength(1);
+    // Today is listed too, and only today carries the dot.
+    expect(container.querySelectorAll("[aria-label='Today']")).toHaveLength(1);
+  });
+
+  it("opens an upcoming event's own page", async () => {
+    mount({
+      GetMeetingsStatus: connected,
+      ListUpcomingEvents: {
+        events: [
+          event({
+            id: "google:abc/1",
+            title: "Design review",
+            startUnix: at(13, 9, 45),
+            endUnix: at(13, 10, 15),
+          }),
+        ],
+      },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /Design review/ }));
+    expect(await screen.findByText("event google:abc/1")).toBeTruthy();
   });
 
   it("pages the calendar a week at a time, never before this week", async () => {
