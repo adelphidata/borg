@@ -58,17 +58,50 @@ pub trait CredentialSource: Send + Sync {
     /// (or a parallel CLI consumer) sees the new refresh_token. Default impl
     /// is a no-op for sources that don't refresh (`qwen_cli`).
     ///
+    /// `spent_refresh_token` is the token the refresh just consumed. The file
+    /// is only rewritten while it still holds that token: anything else means
+    /// the owning CLI logged in again or logged out since we read it, and
+    /// overwriting would clobber the newer login or resurrect removed
+    /// credentials. That case returns [`WriteBack::SourceChanged`].
+    ///
     /// Best-effort: a write failure logs `warn!` but does not surface as a
     /// refresh error — the in-memory rotation already succeeded.
     fn write_back(
         &self,
         _home: &Path,
-        _access_token: &str,
-        _refresh_token: &str,
-        _expires_at_ms: i64,
-    ) -> anyhow::Result<()> {
-        Ok(())
+        _spent_refresh_token: &str,
+        _rotated: &RotatedTokens<'_>,
+    ) -> anyhow::Result<WriteBack> {
+        Ok(WriteBack::Written)
     }
+}
+
+/// Tokens a successful OAuth refresh produced, as handed to
+/// [`CredentialSource::write_back`].
+#[derive(Debug, Clone, Copy)]
+pub struct RotatedTokens<'a> {
+    /// New access token.
+    pub access_token: &'a str,
+    /// New refresh token (replaces the one the refresh consumed).
+    pub refresh_token: &'a str,
+    /// Wall-clock millis at which the new access token expires.
+    pub expires_at_ms: i64,
+}
+
+/// Outcome of [`CredentialSource::write_back`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBack {
+    /// The rotated tokens were written to the source file.
+    Written,
+    /// The source file no longer holds the refresh token we spent, so it was
+    /// left untouched.
+    SourceChanged,
+}
+
+/// Whether a source file's current refresh token is still the one the pool
+/// spent. A missing or empty token counts as changed (the user logged out).
+fn still_holds(current: Option<&str>, spent: &str) -> bool {
+    current.is_some_and(|t| !t.is_empty() && t == spent)
 }
 
 /// All discoverers, indexed by their stable `name()`. Used by both the pool's
@@ -228,6 +261,69 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["real.json".to_string()], "no temp residue");
+    }
+
+    /// A refresh may only rewrite the source file while it still holds the
+    /// refresh token the refresh spent. A newer login (different token) or a
+    /// logout (no token, or no OAuth block at all) must survive untouched —
+    /// clobbering the first breaks the CLI's session, rewriting the second
+    /// resurrects credentials the user removed.
+    #[test]
+    fn write_back_only_replaces_the_token_it_spent() {
+        let rotated = RotatedTokens {
+            access_token: "new-access",
+            refresh_token: "new-refresh",
+            expires_at_ms: 42,
+        };
+        type FileWith = fn(&str) -> String;
+        let sources: [(&dyn CredentialSource, &str, FileWith); 2] = [
+            (
+                &claude_code::ClaudeCodeSource,
+                ".claude/.credentials.json",
+                |rt| {
+                    format!(
+                        r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"{rt}","expiresAt":1}}}}"#
+                    )
+                },
+            ),
+            (&codex::CodexSource, ".codex/auth.json", |rt| {
+                format!(r#"{{"tokens":{{"access_token":"a","refresh_token":"{rt}"}}}}"#)
+            }),
+        ];
+        for (source, rel, file_with) in sources {
+            let name = source.name();
+            let cases = [
+                ("unchanged file", file_with("spent"), WriteBack::Written),
+                (
+                    "newer login",
+                    file_with("someone-else"),
+                    WriteBack::SourceChanged,
+                ),
+                ("token cleared", file_with(""), WriteBack::SourceChanged),
+                ("logged out", "{}".to_string(), WriteBack::SourceChanged),
+            ];
+            for (case, before, expected) in cases {
+                let home = tempfile::tempdir().unwrap();
+                test_support::write_fixture(home.path(), rel, &before);
+                let outcome = source.write_back(home.path(), "spent", &rotated).unwrap();
+                assert_eq!(outcome, expected, "{name}: {case}");
+                let after = std::fs::read_to_string(home.path().join(rel)).unwrap();
+                match expected {
+                    WriteBack::Written => {
+                        let found = source.discover(home.path()).unwrap();
+                        assert_eq!(found[0].access_token, "new-access", "{name}: {case}");
+                        assert_eq!(
+                            found[0].refresh_token.as_deref(),
+                            Some("new-refresh"),
+                            "{name}: {case}"
+                        );
+                    }
+                    WriteBack::SourceChanged => {
+                        assert_eq!(after, before, "{name}: {case} must leave the file as-is");
+                    }
+                }
+            }
+        }
     }
 }
 

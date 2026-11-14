@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::provider::Provider;
 
-use super::{CredentialSource, DiscoveredCredential};
+use super::{still_holds, CredentialSource, DiscoveredCredential, RotatedTokens, WriteBack};
 
 pub struct CodexSource;
 
@@ -102,27 +102,28 @@ impl CredentialSource for CodexSource {
     fn write_back(
         &self,
         home: &Path,
-        access_token: &str,
-        refresh_token: &str,
-        expires_at_ms: i64,
-    ) -> anyhow::Result<()> {
+        spent_refresh_token: &str,
+        rotated: &RotatedTokens<'_>,
+    ) -> anyhow::Result<WriteBack> {
         let path = codex_auth_path(home);
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("read {} for refresh write-back", path.display()))?;
         let mut parsed: CodexAuthFile = serde_json::from_str(&raw)
             .with_context(|| format!("parse {} for refresh write-back", path.display()))?;
-        let block = parsed.tokens.get_or_insert(Tokens {
-            access_token: String::new(),
-            refresh_token: None,
-            expires_at_ms: None,
-            extra: serde_json::Map::new(),
-        });
-        block.access_token = access_token.to_string();
-        block.refresh_token = Some(refresh_token.to_string());
-        block.expires_at_ms = Some(expires_at_ms);
+        let Some(block) = parsed
+            .tokens
+            .as_mut()
+            .filter(|b| still_holds(b.refresh_token.as_deref(), spent_refresh_token))
+        else {
+            return Ok(WriteBack::SourceChanged);
+        };
+        block.access_token = rotated.access_token.to_string();
+        block.refresh_token = Some(rotated.refresh_token.to_string());
+        block.expires_at_ms = Some(rotated.expires_at_ms);
         let serialized =
             serde_json::to_string_pretty(&parsed).context("serialize rotated OAuth credentials")?;
-        super::write_atomically(&path, &serialized)
+        super::write_atomically(&path, &serialized)?;
+        Ok(WriteBack::Written)
     }
 }
 
