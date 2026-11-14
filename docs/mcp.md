@@ -98,7 +98,7 @@ borg mcp add-preset notion     --preset notion      # then: borg mcp add Notion 
 | `github` | stdio | `npx -y @modelcontextprotocol/server-github` | `GITHUB_PERSONAL_ACCESS_TOKEN=${SECRET:github_pat}` |
 | `notion` | streamable-http | `https://mcp.notion.com/mcp` | operator adds `--auth bearer:${SECRET:notion_token}` after creation |
 
-Presets are templates — adding one writes a config row but does not download, install, or spawn anything. The first time the LLM actually calls a tool from that server, the underlying binary is fetched via `npx`/`uvx` (which themselves enforce signature checks per their own threat models). This staged install is intentional: an operator gets the chance to remove a preset before any third-party code executes.
+Presets are templates — adding one writes a config row, and the daemon's config watcher hot-reloads MCP and starts the server straight away. That start is when `npx`/`uvx` fetch the underlying binary (they enforce signature checks per their own threat models), so third-party code runs as soon as the preset is added, not on the first tool call. Review a preset before adding it; disabling or removing it stops the server.
 
 The `filesystem` preset refuses `$HOME` as the root even when passed explicitly via `--fs-root`. Borg's `security.blocked_paths` defaults backstop sensitive subdirectories at the tool-call boundary, but starting from a dedicated subtree (`~/.borg/mcp/fs-scope` by default) is much less rope.
 
