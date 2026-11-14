@@ -635,7 +635,6 @@ pub struct GitContext {
     pub commit_hash: Option<String>,
     pub recent_commits: Vec<String>,
     pub has_uncommitted_changes: bool,
-    pub remote_url: Option<String>,
 }
 
 /// Find the git repo root by walking up from `cwd`.
@@ -1036,12 +1035,11 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
     let work_dir = repo_root.as_deref().unwrap_or(cwd);
 
     // Run all git commands in parallel — they're independent read-only operations.
-    let (branch, commit_hash, recent_commits_raw, status, remote_url) = tokio::join!(
+    let (branch, commit_hash, recent_commits_raw, status) = tokio::join!(
         run_git(&["branch", "--show-current"], work_dir),
         run_git(&["rev-parse", "--short", "HEAD"], work_dir),
         run_git(&["log", "--oneline", "-5", "--no-decorate"], work_dir),
         git_status_porcelain(work_dir),
-        run_git(&["remote", "get-url", "origin"], work_dir),
     );
 
     GitContext {
@@ -1054,7 +1052,6 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
             .map(|s| s.lines().map(String::from).collect())
             .unwrap_or_default(),
         has_uncommitted_changes: status.map(|s| !s.is_empty()).unwrap_or(false),
-        remote_url: remote_url.ok(),
     }
 }
 
@@ -1573,7 +1570,6 @@ mod tests {
             commit_hash: Some("abc1234".into()),
             recent_commits: vec!["abc1234 Fix bug".into(), "def5678 Add feature".into()],
             has_uncommitted_changes: true,
-            remote_url: Some("https://github.com/user/repo".into()),
         };
         let out = format_git_context(&ctx);
         assert!(out.contains("Git branch: main"));
