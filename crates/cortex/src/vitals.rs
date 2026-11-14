@@ -875,9 +875,9 @@ pub async fn record_sandbox_violation(violation: &sandbox::violation::SandboxVio
 /// The single classify-and-record seam. Callers pass raw subprocess output;
 /// a run the sandbox did not deny classifies to `None` and records nothing,
 /// so this is safe on every path. `context` names the lane in the log line.
-pub async fn note_sandbox_denial(code: Option<i32>, stderr: &str, context: &str) {
+pub async fn note_sandbox_denial(stderr: &str, context: &str) {
     let backend = sandbox::violation::SandboxBackend::current();
-    let Some(violation) = sandbox::violation::classify(backend, code, stderr) else {
+    let Some(violation) = sandbox::violation::classify(backend, stderr) else {
         return;
     };
     tracing::info!(

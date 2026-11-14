@@ -445,8 +445,7 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
 ///
 /// Observability only: the script has already failed by the time this runs.
 async fn note_sandbox_denial(output: &sandbox::runner::ScriptOutput) {
-    crate::vitals::note_sandbox_denial(output.exit_code, &output.stderr, "agent-written tool")
-        .await;
+    crate::vitals::note_sandbox_denial(&output.stderr, "agent-written tool").await;
 }
 
 /// Delete a script: remove DB entry first, then files (safer ordering).
