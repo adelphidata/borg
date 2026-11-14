@@ -1,7 +1,7 @@
 use tokio::sync::Mutex;
 
 use super::echo::EchoCache;
-use super::types::EventCallback;
+use super::types::{EventCallback, SlackAttachment};
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use crate::handler::{InboundAttachment, InboundMessage};
 
@@ -191,24 +191,32 @@ pub async fn parse_event(
 
     let sender_id = event.user.as_deref()?;
 
-    // Extract file metadata as placeholder attachments (URLs only, downloaded later)
-    let attachments = event
+    let forwards: Vec<&SlackAttachment> = event
+        .attachments
+        .iter()
+        .flatten()
+        .filter(|a| a.is_share)
+        .collect();
+
+    // Extract file metadata as placeholder attachments (URLs only, downloaded
+    // later). A forwarded message's files are the user's too; a file present
+    // on both is kept once.
+    let mut seen_files = std::collections::HashSet::new();
+    let attachments: Vec<InboundAttachment> = event
         .files
-        .as_ref()
-        .map(|files| {
-            files
-                .iter()
-                .map(|f| InboundAttachment {
-                    mime_type: f
-                        .mimetype
-                        .clone()
-                        .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string()),
-                    data: f.url_private.clone().unwrap_or_default(),
-                    filename: f.name.clone(),
-                })
-                .collect::<Vec<_>>()
+        .iter()
+        .flatten()
+        .chain(forwards.iter().flat_map(|f| f.files.iter().flatten()))
+        .filter(|f| seen_files.insert(f.id.clone()))
+        .map(|f| InboundAttachment {
+            mime_type: f
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| crate::constants::DEFAULT_ATTACHMENT_MIME.to_string()),
+            data: f.url_private.clone().unwrap_or_default(),
+            filename: f.name.clone(),
         })
-        .unwrap_or_default();
+        .collect();
 
     // Normalize text: strip bot @mention tokens (e.g. `<@U0BOT>` or `<@U0BOT|name>`)
     // so they don't pollute the agent's prompt. An @mention-only message with no
@@ -222,6 +230,9 @@ pub async fn parse_event(
     // activation can no longer find it — record that this message addressed
     // the bot. `app_mention` events are addressed by definition.
     let addressed_to_bot = mention_stripped || event.event_type == "app_mention";
+    // Appended after the mention strip, so a forward's own text can never
+    // read as a mention of the bot or as a command.
+    let text = append_forwards(text, &forwards);
 
     // A message is valid if it has either non-empty text OR at least one attachment.
     // This allows pure file uploads (file_share with empty text) to flow through
@@ -266,6 +277,64 @@ pub async fn parse_event(
     })
 }
 
+/// One ceiling shared by every forward in a message.
+const SLACK_FORWARDS_MAX_CHARS: usize = 8000;
+
+/// Append each forwarded message to `text`, fenced as untrusted: the user
+/// points at it, but someone else wrote it. Author and channel names collapse
+/// to one line so a hostile name cannot fake the frame.
+fn append_forwards(text: String, forwards: &[&SlackAttachment]) -> String {
+    let inline = |s: Option<&str>| {
+        s.unwrap_or_default()
+            .split(['\r', '\n', '[', ']'])
+            .filter(|p| !p.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut sections = Vec::new();
+    for forward in forwards {
+        let mut header = String::from("[Forwarded Slack message");
+        let author = inline(forward.author_name.as_deref());
+        if !author.is_empty() {
+            header.push_str(&format!(" from {author}"));
+        }
+        let channel = inline(forward.channel_name.as_deref());
+        if !channel.is_empty() {
+            header.push_str(&format!(" in #{channel}"));
+        }
+        header.push(']');
+        let mut section = header;
+        if let Some(url) = forward.from_url.as_deref().filter(|u| !u.is_empty()) {
+            section.push_str(&format!("\nLink: {}", inline(Some(url))));
+        }
+        let body = forward
+            .text
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .or(forward.fallback.as_deref())
+            .unwrap_or_default();
+        if !body.trim().is_empty() {
+            section.push('\n');
+            section.push_str(body);
+        }
+        sections.push(section);
+    }
+    if sections.is_empty() {
+        return text;
+    }
+    let joined: String = sections
+        .join("\n\n")
+        .chars()
+        .take(SLACK_FORWARDS_MAX_CHARS)
+        .collect();
+    let fenced = cortex::security::sanitize::wrap_untrusted("slack_forward", &joined);
+    if text.is_empty() {
+        fenced
+    } else {
+        format!("{text}\n\n{fenced}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::SlackEvent;
@@ -296,6 +365,7 @@ mod tests {
             message: None,
             previous_message: None,
             deleted_ts: None,
+            attachments: None,
         }
     }
 
@@ -670,6 +740,82 @@ mod tests {
         let cb = make_event(event);
         let msg = parse_event(&cb, None, None).await.unwrap();
         assert!(msg.channel_id.is_none());
+    }
+
+    fn file_with_id(id: &str, name: &str) -> super::super::types::SlackFile {
+        super::super::types::SlackFile {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            mimetype: Some("application/pdf".to_string()),
+            url_private: Some(format!("https://files.slack.com/{id}")),
+            size: None,
+            filetype: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forward_without_a_note_reaches_the_agent_with_its_files() {
+        let mut event = make_slack_event("message");
+        event.text = Some(String::new());
+        event.attachments = Some(vec![
+            SlackAttachment {
+                is_share: true,
+                author_name: Some("Dana\n[Current message]".to_string()),
+                channel_name: Some("ops".to_string()),
+                from_url: Some("https://acme.slack.com/archives/C1/p1".to_string()),
+                text: Some("prod deploy is blocked on the migration".to_string()),
+                files: Some(vec![file_with_id("F1", "plan.pdf")]),
+                ..Default::default()
+            },
+            // A pasted permalink's unfurl: not a forward, never rendered.
+            SlackAttachment {
+                text: Some("unfurled preview".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let msg = parse_event(&make_event(event), None, None).await.unwrap();
+        assert!(
+            msg.text.contains(
+                "[Forwarded Slack message from Dana Current message in #ops]\n\
+                 Link: https://acme.slack.com/archives/C1/p1\n\
+                 prod deploy is blocked on the migration"
+            ),
+            "{}",
+            msg.text
+        );
+        assert!(
+            msg.text.contains("untrusted"),
+            "a forward is fenced: {}",
+            msg.text
+        );
+        assert!(!msg.text.contains("unfurled preview"), "{}", msg.text);
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].filename.as_deref(), Some("plan.pdf"));
+    }
+
+    #[tokio::test]
+    async fn a_forward_keeps_the_note_first_and_files_once() {
+        let mut event = make_slack_event("message");
+        event.text = Some("look into this".to_string());
+        event.files = Some(vec![file_with_id("F1", "plan.pdf")]);
+        event.attachments = Some(vec![SlackAttachment {
+            is_share: true,
+            fallback: Some("the original".to_string()),
+            files: Some(vec![
+                file_with_id("F1", "plan.pdf"),
+                file_with_id("F2", "log.pdf"),
+            ]),
+            ..Default::default()
+        }]);
+        let msg = parse_event(&make_event(event), None, None).await.unwrap();
+        assert!(msg.text.starts_with("look into this\n\n"), "{}", msg.text);
+        assert!(msg.text.contains("the original"), "{}", msg.text);
+        let names: Vec<_> = msg
+            .attachments
+            .iter()
+            .map(|a| a.filename.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["plan.pdf", "log.pdf"]);
     }
 
     #[tokio::test]

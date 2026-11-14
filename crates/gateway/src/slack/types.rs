@@ -56,6 +56,31 @@ pub struct SlackEvent {
     pub previous_message: Option<NestedSlackMessage>,
     /// Timestamp of the deleted message (for `message_deleted` events).
     pub deleted_ts: Option<String>,
+    /// Legacy attachments. A forwarded message ("Forward message", with or
+    /// without a note) arrives here as an entry flagged `is_share`.
+    #[serde(default)]
+    pub attachments: Option<Vec<SlackAttachment>>,
+}
+
+/// One legacy `attachments[]` entry: the subset a forwarded message carries.
+/// A pasted permalink's unfurl lands here too, but never sets `is_share`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SlackAttachment {
+    /// Set on a forwarded ("shared") message.
+    #[serde(default)]
+    pub is_share: bool,
+    /// Display name of the original message's author.
+    pub author_name: Option<String>,
+    /// Name of the channel the original was posted in, when the bot can see it.
+    pub channel_name: Option<String>,
+    /// Permalink to the original message.
+    pub from_url: Option<String>,
+    /// The original message's text.
+    pub text: Option<String>,
+    /// Plain-text fallback when `text` is absent.
+    pub fallback: Option<String>,
+    /// Files the original message carried.
+    pub files: Option<Vec<SlackFile>>,
 }
 
 /// Inner message payload nested inside a `message_changed` or `message_deleted`
