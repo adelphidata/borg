@@ -27,6 +27,21 @@ impl<'a> App<'a> {
         self.truncate_cells(0);
     }
 
+    /// Leave the conversation on screen for another one (`/new`, `/resume`,
+    /// the sessions picker). Everything typed for the old conversation goes
+    /// with it: a queued follow-up would submit into a conversation it was
+    /// never written for, and a steer still awaiting its receipt would sit in
+    /// the new conversation's pending preview forever, since the receipt
+    /// belongs to the old one.
+    pub fn switch_conversation(&mut self) {
+        self.reset_transcript();
+        self.queued_messages.clear();
+        self.pending_steers.clear();
+        self.session_prompt_tokens = 0;
+        self.session_completion_tokens = 0;
+        self.last_prompt_tokens = 0;
+    }
+
     /// Drop cells from `len` on, keeping the scrollback watermark in range.
     pub fn truncate_cells(&mut self, len: usize) {
         self.cells.truncate(len);

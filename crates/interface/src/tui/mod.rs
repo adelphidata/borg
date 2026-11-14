@@ -1632,10 +1632,7 @@ async fn run_event_loop(
             }
             AppAction::LoadSession { id } => {
                 // Clear existing UI state before loading a new session.
-                app.reset_transcript();
-                app.session_prompt_tokens = 0;
-                app.session_completion_tokens = 0;
-                app.last_prompt_tokens = 0;
+                app.switch_conversation();
                 // Support partial ID matching (prefix) via shared resolver.
                 let load_id = match cortex::session::resolve_session_id(&id) {
                     Ok(meta) => meta.id,
