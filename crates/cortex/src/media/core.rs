@@ -144,6 +144,9 @@ pub fn compress_image(
     // as the JPEG it became — handing back the original container here
     // would undo the conversion.
     if bytes.len() <= max_bytes {
+        if carries_identifying_metadata(&bytes) {
+            return reencode_without_metadata(&bytes, &effective_mime, max_bytes);
+        }
         if effective_mime != mime_type {
             return Ok((engine.encode(&bytes), effective_mime));
         }
@@ -156,17 +159,74 @@ pub fn compress_image(
 /// [`compress_image`] for a caller that already holds the decoded bytes
 /// (and has already validated them): no HEIC handling, no second base64
 /// round-trip. Returns `(base64_data, mime_type)`; passthrough re-encodes
-/// the bytes unchanged when they fit.
+/// the bytes unchanged when they fit and carry no identifying metadata.
 pub fn compress_image_bytes(
     bytes: &[u8],
     mime_type: &str,
     max_bytes: usize,
 ) -> Result<(String, String)> {
     if bytes.len() <= max_bytes {
+        if carries_identifying_metadata(bytes) {
+            return reencode_without_metadata(bytes, mime_type, max_bytes);
+        }
         let engine = base64::engine::general_purpose::STANDARD;
         return Ok((engine.encode(bytes), mime_type.to_string()));
     }
     compress_decoded_image(bytes, max_bytes)
+}
+
+/// Whether the image carries metadata that can identify where, when, or with
+/// what device it was taken: EXIF (GPS coordinates, camera serial, capture
+/// time), XMP, or IPTC. Phone photos almost always carry EXIF, and none of it
+/// helps the model read the picture.
+///
+/// Reads headers only. An image whose headers cannot be parsed reports
+/// `false` and passes through as before — format validation is the caller's
+/// job, and this check must not turn a passthrough into a failure.
+fn carries_identifying_metadata(bytes: &[u8]) -> bool {
+    use image::ImageDecoder;
+    let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format() else {
+        return false;
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return false;
+    };
+    let present = |found: image::ImageResult<Option<Vec<u8>>>| found.ok().flatten().is_some();
+    present(decoder.exif_metadata())
+        || present(decoder.xmp_metadata())
+        || present(decoder.iptc_metadata())
+}
+
+/// Re-encode an image that fits the budget but carries identifying metadata,
+/// so only the pixels reach the provider. The orientation tag is applied to
+/// the pixels first — dropping it would deliver a portrait photo on its side.
+/// PNG stays lossless PNG; everything else becomes a high-quality JPEG. A
+/// re-encode that no longer fits falls through to the size-driven path,
+/// which writes no metadata either.
+fn reencode_without_metadata(
+    bytes: &[u8],
+    mime_type: &str,
+    max_bytes: usize,
+) -> Result<(String, String)> {
+    let img = decode_upright(bytes)?;
+    let mut buf = Cursor::new(Vec::new());
+    let out_mime = if mime_type == "image/png" {
+        img.write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| anyhow::anyhow!("PNG encode failed: {e}"))?;
+        "image/png"
+    } else {
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+        img.to_rgb8()
+            .write_with_encoder(encoder)
+            .map_err(|e| anyhow::anyhow!("JPEG encode failed: {e}"))?;
+        "image/jpeg"
+    };
+    let clean = buf.into_inner();
+    if clean.len() > max_bytes {
+        return compress_decoded_image(bytes, max_bytes);
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    Ok((engine.encode(&clean), out_mime.to_string()))
 }
 
 /// Re-encode `bytes` as a JPEG that fits in `max_bytes`, shrinking
@@ -531,6 +591,78 @@ mod tests {
         // Small image should pass through unchanged
         assert_eq!(data, b64);
         assert_eq!(mime, "image/jpeg");
+    }
+
+    /// An image small enough to pass through must still not carry its EXIF
+    /// (GPS, camera serial) to the provider. The pixels survive upright, PNG
+    /// stays PNG, and an image with no metadata is still sent byte-for-byte.
+    #[test]
+    fn passthrough_images_leave_identifying_metadata_behind() {
+        use image::{ImageDecoder, ImageEncoder};
+        // Big-endian TIFF, one IFD entry: Orientation (0x0112) = 6 (rotate 90).
+        let exif = b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0".to_vec();
+        let pixels: Vec<u8> = (0..32 * 64).flat_map(|i| [(i % 251) as u8; 3]).collect();
+        let encode = |format: &str, with_exif: bool| -> Vec<u8> {
+            let mut out = Vec::new();
+            match format {
+                "image/png" => {
+                    let mut enc = image::codecs::png::PngEncoder::new(&mut out);
+                    if with_exif {
+                        enc.set_exif_metadata(exif.clone()).unwrap();
+                    }
+                    enc.write_image(&pixels, 64, 32, image::ExtendedColorType::Rgb8)
+                        .unwrap();
+                }
+                _ => {
+                    let mut enc = image::codecs::jpeg::JpegEncoder::new(&mut out);
+                    if with_exif {
+                        enc.set_exif_metadata(exif.clone()).unwrap();
+                    }
+                    enc.write_image(&pixels, 64, 32, image::ExtendedColorType::Rgb8)
+                        .unwrap();
+                }
+            }
+            out
+        };
+        let engine = base64::engine::general_purpose::STANDARD;
+        type Entry = fn(&[u8], &str) -> (String, String);
+        let entries: [(&str, Entry); 2] = [
+            ("bytes", |b, m| compress_image_bytes(b, m, 1 << 20).unwrap()),
+            ("base64", |b, m| {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(b);
+                compress_image(&b64, m, 1 << 20).unwrap()
+            }),
+        ];
+        for (entry, run) in entries {
+            for mime in ["image/jpeg", "image/png"] {
+                let tagged = encode(mime, true);
+                assert!(
+                    carries_identifying_metadata(&tagged),
+                    "{entry} {mime} fixture"
+                );
+                let (out_b64, out_mime) = run(&tagged, mime);
+                assert_eq!(out_mime, mime, "{entry}: {mime} keeps its format");
+                let out = engine.decode(out_b64).unwrap();
+                let mut decoder = image::ImageReader::new(Cursor::new(&out))
+                    .with_guessed_format()
+                    .unwrap()
+                    .into_decoder()
+                    .unwrap();
+                assert!(
+                    decoder.exif_metadata().unwrap().is_none(),
+                    "{entry} {mime}: EXIF must be gone"
+                );
+                assert_eq!(decoder.dimensions(), (32, 64), "{entry} {mime}: upright");
+
+                let clean = encode(mime, false);
+                let (out_b64, _) = run(&clean, mime);
+                assert_eq!(
+                    engine.decode(out_b64).unwrap(),
+                    clean,
+                    "{entry} {mime}: untouched"
+                );
+            }
+        }
     }
 
     /// A camera stores a portrait photo landscape and tags it to be shown
