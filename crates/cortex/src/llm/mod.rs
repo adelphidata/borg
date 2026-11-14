@@ -185,7 +185,7 @@ pub(crate) mod vertex;
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
     apply_cache_control_to_message, apply_message_cache_control, build_anthropic_messages,
-    build_cache_control_marker, parse_anthropic_response, repair_message_sequence,
+    build_cache_control_marker, carries_images, parse_anthropic_response, repair_message_sequence,
     sanitize_openai_messages, strip_images,
 };
 pub use cost::{CostEvent, CostEventContext, CostEventSink};
@@ -2833,8 +2833,12 @@ impl LlmClient {
                 // re-send immediately, rather than aborting the turn. Costs no
                 // retry budget: the payload changed, so this is a new request,
                 // not a retry of the failed one.
+                // Only a request that carried images can be an image rejection:
+                // a body that merely quotes the phrase must not mark a vision
+                // model image-incapable for the whole process.
                 if !self.images_rejected
                     && matches!(&result, Err(e) if e.reason() == FailoverReason::ImageUnsupported)
+                    && carries_images(&messages)
                 {
                     self.images_rejected = true;
                     remember_image_rejection(self.provider, &self.llm_config.model);
@@ -3804,8 +3808,12 @@ impl LlmClient {
 
                 // See the streaming path: undeliverable pixels are stripped and
                 // the request re-sent once, instead of failing the turn.
+                // Only a request that carried images can be an image rejection:
+                // a body that merely quotes the phrase must not mark a vision
+                // model image-incapable for the whole process.
                 if !self.images_rejected
                     && matches!(&result, Err(e) if e.reason() == FailoverReason::ImageUnsupported)
+                    && carries_images(&messages)
                 {
                     self.images_rejected = true;
                     remember_image_rejection(self.provider, &self.llm_config.model);

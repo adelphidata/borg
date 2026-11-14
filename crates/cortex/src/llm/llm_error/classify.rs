@@ -419,7 +419,9 @@ pub(super) fn body_indicates_image_unsupported(body: &str) -> bool {
         || lower.contains("not support")
         || lower.contains("unsupported")
         || lower.contains("does not accept")
-        || lower.contains("not enabled");
+        || lower.contains("not enabled")
+        // vLLM: "<model> is not a multimodal model".
+        || lower.contains("not a multimodal");
     let blames_the_image = MALFORMED_IMAGE_NEEDLES.iter().any(|n| lower.contains(n));
     mentions_image && rejects && !blames_the_image
 }

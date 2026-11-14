@@ -1043,6 +1043,58 @@ async fn image_rejection_strips_the_image_and_completes_the_turn() {
     );
 }
 
+/// A body that quotes an image-rejection phrase on a text-only request is
+/// not a verdict on the model: nothing is stripped, the error surfaces, and a
+/// later turn's image still goes out.
+#[tokio::test]
+async fn an_image_phrase_on_a_text_only_request_does_not_blind_the_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"test/vision-quoted is not a multimodal model"}}"#,
+        ))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_body(&[
+            r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+            "[DONE]",
+        ])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.llm.model = "test/vision-quoted".into();
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    let _ = client.stream_chat(&user_message("hello"), None, tx).await;
+    drop(collect_events(rx).await);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "a text-only request has nothing to strip, so no image retry"
+    );
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&message_with_image("what is this?"), None, tx)
+        .await
+        .expect("the vision request succeeds");
+    drop(collect_events(rx).await);
+    let received = server.received_requests().await.expect("recorded");
+    let last = String::from_utf8_lossy(&received.last().expect("request").body).into_owned();
+    assert!(
+        last.contains("image_url"),
+        "the model was never shown to reject images, so its image must go out: {last}"
+    );
+}
+
 /// The image lives in the conversation history, so the *next* turn re-sends it.
 /// Once the provider's verdict is known the client strips pre-emptively —
 /// otherwise every following turn 404s, which is what users hit in practice.
