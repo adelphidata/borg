@@ -507,9 +507,49 @@ pub fn render_call_result(result: &ToolCallResult) -> String {
     if serde_json::from_str::<serde_json::Value>(&out).is_ok_and(|text| text == *structured) {
         return out;
     }
+    if let Some(deduped) = unwrap_result_mirror(&result.content, &out, structured) {
+        return deduped;
+    }
     out.push_str(STRUCTURED_CONTENT_HEADER);
     out.push_str(&structured.to_string());
     out
+}
+
+/// Python SDK servers wrap a non-object return as `{"result": v}` in
+/// `structuredContent` and put the bare value in `content` — a string as its
+/// text, a list as one block per item. Both carry the same data, so the
+/// rendering keeps one copy. A list comes back as its JSON serialization so
+/// item boundaries and types survive (`[1, "1"]` stays distinct).
+fn unwrap_result_mirror(
+    blocks: &[ContentBlock],
+    rendered: &str,
+    structured: &Value,
+) -> Option<String> {
+    let wrapped = structured
+        .as_object()
+        .filter(|o| o.len() == 1)?
+        .get("result")?;
+    let matches = |text: &str, value: &Value| {
+        value.as_str() == Some(text)
+            || serde_json::from_str::<Value>(text).is_ok_and(|parsed| parsed == *value)
+    };
+    if matches(rendered, wrapped) {
+        return Some(rendered.to_string());
+    }
+    let items = wrapped.as_array()?;
+    let texts: Vec<&str> = blocks
+        .iter()
+        .map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let mirrored = texts.len() == items.len()
+        && texts
+            .iter()
+            .zip(items)
+            .all(|(text, item)| matches(text, item));
+    mirrored.then(|| wrapped.to_string())
 }
 
 /// Separator between the rendered content blocks and the structured payload.
@@ -802,6 +842,40 @@ mod tests {
         match &result.content[1] {
             ContentBlock::Text { text } => assert_eq!(text, "caption"),
             other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_wrapped_structured_content_is_not_sent_twice() {
+        for (wire, expected) in [
+            // `-> str`: the bare string mirrors {"result": "hello"}.
+            (
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"hello"}}"#,
+                "hello",
+            ),
+            // `-> int`: the text parses to the wrapped value.
+            (
+                r#"{"content":[{"type":"text","text":"42"}],"structuredContent":{"result":42}}"#,
+                "42",
+            ),
+            // `-> list`: one block per item; types survive in the output.
+            (
+                r#"{"content":[{"type":"text","text":"1"},{"type":"text","text":"1"}],"structuredContent":{"result":[1,"1"]}}"#,
+                r#"[1,"1"]"#,
+            ),
+            // Not a mirror: the structured copy carries different data.
+            (
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"bye"}}"#,
+                "hello\n\n[structured content]\n{\"result\":\"bye\"}",
+            ),
+            // Not the wrapper shape: a second key keeps the structured copy.
+            (
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"hello","n":1}}"#,
+                "hello\n\n[structured content]\n{\"n\":1,\"result\":\"hello\"}",
+            ),
+        ] {
+            let r: ToolCallResult = serde_json::from_str(wire).expect("decode");
+            assert_eq!(render_call_result(&r), expected, "wire: {wire}");
         }
     }
 
