@@ -37,6 +37,7 @@ pub use history::{
     is_agent_authored, latest_user_text, normalize_history, rewind_to_nth_user, undo_last_turn,
 };
 pub use summarize::SummarizeFailure;
+pub(crate) use summarize::{push_transcript_entry, TRANSCRIPT_QUOTING_RULE};
 pub use tokens::history_tokens;
 pub use truncation::{
     age_based_tool_result_degradation, compact_tool_results, degrade_old_tool_results,
