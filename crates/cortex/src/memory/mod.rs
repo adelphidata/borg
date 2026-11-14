@@ -1022,20 +1022,20 @@ fn query_terms(query: &str) -> Vec<String> {
         .split_whitespace()
         .map(|term| {
             term.trim_matches(|c: char| !c.is_alphanumeric())
-                .to_ascii_lowercase()
+                .to_lowercase()
         })
-        .filter(|term| term.len() >= 3)
+        .filter(|term| term.chars().count() >= 3)
         .collect()
 }
 
 fn score_knowledge_file(query: &str, file_name: &str, content: &str) -> f32 {
-    let trimmed = query.trim().to_ascii_lowercase();
+    let trimmed = query.trim().to_lowercase();
     if trimmed.is_empty() {
         return 0.0_f32;
     }
 
-    let content_lower = content.to_ascii_lowercase();
-    let name_lower = file_name.to_ascii_lowercase();
+    let content_lower = content.to_lowercase();
+    let name_lower = file_name.to_lowercase();
     let mut score: f32 = 0.0;
 
     if content_lower.contains(&trimmed) {
@@ -1057,19 +1057,29 @@ fn score_knowledge_file(query: &str, file_name: &str, content: &str) -> f32 {
     score.min(1.0_f32)
 }
 
+/// Byte offset in `haystack` where a case-insensitive match of `needle`
+/// begins. Lowercasing can change a character's byte length (`İ` is 2 bytes,
+/// its lowercase 3), so the match is found in the lowered text and mapped
+/// back to the original char boundary rather than reused as an offset.
+fn find_caseless(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut lower = String::with_capacity(haystack.len());
+    let mut boundaries = Vec::with_capacity(haystack.len());
+    for (orig, ch) in haystack.char_indices() {
+        boundaries.push((lower.len(), orig));
+        lower.extend(ch.to_lowercase());
+    }
+    let at = lower.find(&needle)?;
+    // The match starts inside the lowered form of the last char at or before it.
+    let i = boundaries.partition_point(|&(l, _)| l <= at);
+    Some(boundaries[i - 1].1)
+}
+
 fn make_snippet(content: &str, query: &str, max_chars: usize) -> String {
-    let trimmed = query.trim().to_ascii_lowercase();
-    let lower = content.to_ascii_lowercase();
-    let start = if trimmed.is_empty() {
-        0
-    } else {
-        lower.find(&trimmed).unwrap_or(0)
-    };
-    let start = content[..start]
-        .char_indices()
-        .last()
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
+    let start = find_caseless(content, query.trim()).unwrap_or(0);
     let snippet: String = content[start..].chars().take(max_chars).collect();
     if snippet.chars().count() == content[start..].chars().count() {
         snippet
@@ -1893,6 +1903,26 @@ mod tests {
         let names = files.into_iter().map(|f| f.name).collect::<Vec<_>>();
         assert!(names.contains(&"global/MEMORY.md".to_string()));
         assert!(names.contains(&"scope:project:abc/notes.md".to_string()));
+    }
+
+    /// Matching folds case for every script, not just ASCII: a German or
+    /// Turkish query in a different case must still find the file, and the
+    /// snippet must open at the match rather than silently at the top.
+    #[test]
+    fn knowledge_search_folds_non_ascii_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!("{}Termine: Ärzte am İstanbul-Standort", "x".repeat(40));
+        std::fs::write(tmp.path().join("notizen.md"), &body).unwrap();
+
+        for query in ["ÄRZTE", "ärzte", "i̇stanbul"] {
+            let hits =
+                search_knowledge_files_in(tmp.path(), &["global".to_string()], query, 5, 0.15)
+                    .unwrap();
+            assert_eq!(hits.len(), 1, "{query} must find the file");
+        }
+        assert!(make_snippet(&body, "ärzte", 500).starts_with("Ärzte am"));
+        assert!(make_snippet(&body, "i̇stanbul", 500).starts_with("İstanbul"));
+        assert!(make_snippet(&body, "absent", 500).starts_with("xxxx"));
     }
 
     #[test]
