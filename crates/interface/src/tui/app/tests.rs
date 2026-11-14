@@ -1437,6 +1437,25 @@ async fn a_slow_command_returns_at_once_and_reports_when_done() {
 }
 
 #[test]
+fn switching_conversations_drops_input_written_for_the_old_one() {
+    // Every path into another conversation leaves the old one's input behind:
+    // a queued follow-up would submit into the wrong conversation, and an
+    // unacknowledged steer would linger in the new one's pending preview.
+    for cmd in ["/new", "/resume abc123"] {
+        let mut app = make_app();
+        app.queued_messages.push_back(qm("for the old chat"));
+        app.pending_steers.push_back("steer the old turn".into());
+        app.session_prompt_tokens = 900;
+
+        drop(app.try_handle_command(cmd));
+
+        assert!(app.queued_messages.is_empty(), "{cmd}");
+        assert!(app.pending_steers.is_empty(), "{cmd}");
+        assert_eq!(app.session_prompt_tokens, 0, "{cmd}");
+    }
+}
+
+#[test]
 fn a_tool_call_after_new_or_resume_does_not_index_past_the_transcript() {
     // `/new` cleared the cells but kept the scrollback watermark, so the
     // next tool result sliced `cells[watermark..]` past the end and the TUI

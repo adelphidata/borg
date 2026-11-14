@@ -199,8 +199,7 @@ impl App<'_> {
                 );
                 return Some(Ok(AppAction::Continue));
             }
-            self.reset_transcript();
-            self.queued_messages.clear();
+            self.switch_conversation();
             return Some(Ok(AppAction::LoadSession { id: id.to_string() }));
         }
 
@@ -642,11 +641,7 @@ impl App<'_> {
     }
 
     fn cmd_new(&mut self) -> Result<AppAction> {
-        self.reset_transcript();
-        self.queued_messages.clear();
-        self.session_prompt_tokens = 0;
-        self.session_completion_tokens = 0;
-        self.last_prompt_tokens = 0;
+        self.switch_conversation();
         Ok(AppAction::NewSession)
     }
 
