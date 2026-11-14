@@ -545,6 +545,13 @@ pub async fn dispatch_webhook(
                                 session_id: None,
                                 payload_json: &payload_str,
                                 max_retries: 3,
+                                // The send below is the first attempt; the
+                                // drain loop only takes the row if it is
+                                // still unfinished after this window.
+                                not_before: Some(
+                                    chrono::Utc::now().timestamp()
+                                        + NATIVE_FIRST_SEND_GRACE_SECS,
+                                ),
                             };
                             if let Err(e) = db.enqueue_delivery(&new_delivery).await {
                                 tracing::warn!("Failed to enqueue {channel_name} delivery: {e}");
@@ -592,6 +599,11 @@ pub async fn dispatch_webhook(
         }
     }
 }
+
+/// How long the drain loop leaves a native reply alone while the webhook
+/// path makes its first send (flood waits and chunked sends included). A
+/// crash mid-send is retried once this passes.
+const NATIVE_FIRST_SEND_GRACE_SECS: i64 = 120;
 
 /// Run the out-of-queue cancel path for one inbound `/stop` and deliver its
 /// reply. Spawned so the webhook returns at once; every failure is logged.

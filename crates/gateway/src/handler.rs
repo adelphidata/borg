@@ -1587,6 +1587,7 @@ async fn process_message(
                 session_id: Some(&_session_id),
                 payload_json: &persist_str,
                 max_retries: retry_policy.max_retries as i32,
+                not_before: None,
             })
             .await
         {

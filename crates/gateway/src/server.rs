@@ -3257,6 +3257,7 @@ description = "Script fallback"
                 session_id: None,
                 payload_json: "{}",
                 max_retries: 5,
+                not_before: None,
             })
             .await
             .unwrap();
@@ -3299,6 +3300,70 @@ description = "Script fallback"
         assert!(
             (before + 60..=after + 60).contains(&retry_at),
             "reschedule must be one minute out (got {retry_at}, now ~{before})"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_redelivers_native_channel_replies() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let state = test_state(Config::default(), registry, &["stubnat"], 0, None, None);
+        let health = state.health.clone();
+
+        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .await
+            .unwrap();
+        for (id, payload) in [
+            (
+                "d-ok",
+                r#"{"text":"hello","response_context":{"chat_id":1}}"#,
+            ),
+            ("d-bad", "{}"),
+        ] {
+            db.enqueue_delivery(&cortex::db::NewDelivery {
+                id,
+                channel_name: "stubnat",
+                sender_id: "s1",
+                channel_id: None,
+                session_id: None,
+                payload_json: payload,
+                max_retries: 3,
+                not_before: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        drain_pending_deliveries(&state, &health).await;
+
+        let stmt = db
+            .conn()
+            .prepare("SELECT id, status, error FROM delivery_queue ORDER BY id ASC")
+            .await
+            .unwrap();
+        let mut rows_iter = stmt.query(()).await.unwrap();
+        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+        while let Some(row) = rows_iter.next().await.unwrap() {
+            rows.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            ));
+        }
+        let (_, bad_status, bad_err) = &rows[0];
+        assert_ne!(bad_status, "delivered");
+        assert!(
+            bad_err
+                .as_deref()
+                .is_some_and(|e| e.contains("unreadable queued reply")),
+            "{bad_err:?}"
+        );
+        let (_, ok_status, ok_err) = &rows[1];
+        assert_eq!(
+            ok_status, "delivered",
+            "a native reply must be re-sent, not failed as an unknown channel ({ok_err:?})"
         );
     }
 
@@ -3486,6 +3551,58 @@ description = "Script fallback"
     }
 }
 
+/// Re-send a native channel's queued reply. The row holds exactly what the
+/// first attempt sent (`{text, response_context}`), so a reply whose first
+/// send failed, or that a crash left unfinished, is retried here instead of
+/// running out its retries as "channel not found".
+async fn redeliver_native(
+    db: &Database,
+    channel: &Arc<dyn channel_trait::NativeChannel>,
+    delivery: &cortex::db::DeliveryRow,
+    health: &Arc<RwLock<ChannelHealthRegistry>>,
+) {
+    #[derive(serde::Deserialize)]
+    struct QueuedReply {
+        text: String,
+        #[serde(default)]
+        response_context: serde_json::Value,
+    }
+    let reply: QueuedReply = match serde_json::from_str(&delivery.payload_json) {
+        Ok(reply) => reply,
+        Err(e) => {
+            let error = format!("unreadable queued reply: {e}");
+            warn!(delivery_id = %delivery.id, "{error}");
+            if let Err(db_err) = db.mark_failed(&delivery.id, &error, None).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
+            }
+            return;
+        }
+    };
+    match channel
+        .send_response(&reply.text, &reply.response_context, health)
+        .await
+    {
+        Ok(()) => {
+            if let Err(e) = db.mark_delivered(&delivery.id).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery success status: {e}");
+            }
+            health.write().await.record_outbound(&delivery.channel_name);
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            warn!(delivery_id = %delivery.id, channel = %delivery.channel_name, "redelivery failed: {error}");
+            let next_retry = chrono::Utc::now().timestamp() + 60;
+            if let Err(db_err) = db.mark_failed(&delivery.id, &error, Some(next_retry)).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
+            }
+            health
+                .write()
+                .await
+                .record_error(&delivery.channel_name, &error);
+        }
+    }
+}
+
 /// Background task: claim pending deliveries and attempt to send them.
 #[instrument(skip_all)]
 async fn drain_pending_deliveries(
@@ -3518,6 +3635,10 @@ async fn drain_pending_deliveries(
     );
 
     for delivery in deliveries {
+        if let Some(native) = state.native_channels.get(&delivery.channel_name) {
+            redeliver_native(&db, native, &delivery, health).await;
+            continue;
+        }
         let channel = match state.registry.get(&delivery.channel_name) {
             Some(c) => c,
             None => {
