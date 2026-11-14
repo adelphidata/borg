@@ -1838,7 +1838,10 @@ impl CredentialPool {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        let _guard = entry_lock.lock().await;
+        // Owned guard: it moves into the detached refresh task below so the
+        // lock is held until the rotated tokens land, not until this caller
+        // happens to be dropped.
+        let guard = entry_lock.lock_owned().await;
 
         // Re-snapshot under the entry lock — a sibling caller may have just
         // refreshed (rotating both access_token AND refresh_token). Using the
@@ -1854,11 +1857,29 @@ impl CredentialPool {
             return Some(lease);
         };
 
-        match self.refresh_oauth(&refresh_token).await {
-            Ok(tokens) => {
-                self.apply_refreshed(&snapshot.id, tokens);
-                Some(lease)
-            }
+        // Cancellation safety: the refresh endpoint rotates the single-use
+        // refresh_token the moment it answers. If the HTTP call ran inside
+        // this future and the LLM request was dropped mid-flight, the new
+        // tokens would never be stored and the old refresh_token would already
+        // be spent — the next call dies with `invalid_grant`. A detached task
+        // always finishes and applies the result; a dropped caller just stops
+        // waiting for it.
+        let sink = self.refresh_sink();
+        let provider = self.provider;
+        let endpoint = self.refresh_endpoint();
+        let id = snapshot.id.clone();
+        let job = tokio::spawn(async move {
+            let _guard = guard;
+            let tokens = refresh_oauth(provider, endpoint.as_deref(), &refresh_token).await?;
+            sink.apply(&id, &refresh_token, &tokens);
+            anyhow::Ok(())
+        });
+        let outcome = job
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("oauth refresh task failed: {e}")));
+
+        match outcome {
+            Ok(()) => Some(lease),
             Err(e) => {
                 warn!(
                     target: "cortex::llm::credential_pool",
@@ -1884,35 +1905,64 @@ impl CredentialPool {
         }
     }
 
-    async fn refresh_oauth(
-        &self,
-        refresh_token: &str,
-    ) -> anyhow::Result<crate::llm::oauth_refresh::RefreshedTokens> {
-        use crate::llm::oauth_refresh::{
-            refresh_anthropic, refresh_anthropic_against, refresh_codex, refresh_codex_against,
-        };
-        let override_url = {
-            let g = self
-                .refresh_endpoint_override
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.clone()
-        };
-        match (self.provider, override_url) {
-            (Provider::ClaudeCodeOAuth, Some(url)) => {
-                refresh_anthropic_against(refresh_token, &url).await
-            }
-            (Provider::ClaudeCodeOAuth, None) => refresh_anthropic(refresh_token).await,
-            (Provider::CodexOAuth, Some(url)) => refresh_codex_against(refresh_token, &url).await,
-            (Provider::CodexOAuth, None) => refresh_codex(refresh_token).await,
-            (other, _) => Err(anyhow::anyhow!(
-                "oauth refresh not implemented for provider {}",
-                other.as_str()
-            )),
-        }
+    fn refresh_endpoint(&self) -> Option<String> {
+        self.refresh_endpoint_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    fn apply_refreshed(&self, id: &str, tokens: crate::llm::oauth_refresh::RefreshedTokens) {
+    fn refresh_sink(&self) -> RefreshSink {
+        RefreshSink {
+            provider: self.provider,
+            db_path: self.db_path.clone(),
+            inner: self.inner.clone(),
+            oauth_home: self
+                .oauth_home_for_writeback
+                .clone()
+                .or_else(dirs::home_dir),
+        }
+    }
+}
+
+async fn refresh_oauth(
+    provider: Provider,
+    endpoint: Option<&str>,
+    refresh_token: &str,
+) -> anyhow::Result<crate::llm::oauth_refresh::RefreshedTokens> {
+    use crate::llm::oauth_refresh::{
+        refresh_anthropic, refresh_anthropic_against, refresh_codex, refresh_codex_against,
+    };
+    match (provider, endpoint) {
+        (Provider::ClaudeCodeOAuth, Some(url)) => {
+            refresh_anthropic_against(refresh_token, url).await
+        }
+        (Provider::ClaudeCodeOAuth, None) => refresh_anthropic(refresh_token).await,
+        (Provider::CodexOAuth, Some(url)) => refresh_codex_against(refresh_token, url).await,
+        (Provider::CodexOAuth, None) => refresh_codex(refresh_token).await,
+        (other, _) => Err(anyhow::anyhow!(
+            "oauth refresh not implemented for provider {}",
+            other.as_str()
+        )),
+    }
+}
+
+/// The owned slice of a pool that a detached OAuth refresh needs to land its
+/// result: the in-memory entries, the DB row, and the source file.
+struct RefreshSink {
+    provider: Provider,
+    db_path: Option<std::path::PathBuf>,
+    inner: Arc<Mutex<PoolInner>>,
+    oauth_home: Option<std::path::PathBuf>,
+}
+
+impl RefreshSink {
+    fn apply(
+        &self,
+        id: &str,
+        spent_refresh_token: &str,
+        tokens: &crate::llm::oauth_refresh::RefreshedTokens,
+    ) {
         let snapshot = {
             let mut g = self
                 .inner
@@ -1926,35 +1976,48 @@ impl CredentialPool {
             c.expires_at_ms = Some(tokens.expires_at_ms);
             c.clone()
         };
-        self.persist_credential(&snapshot);
+        if let Some(path) = &self.db_path {
+            spawn_persist_task(
+                path.clone(),
+                self.provider.as_str().to_string(),
+                PersistOp::Upsert(snapshot.clone()),
+            );
+        }
         // Write the rotated refresh_token back to the source file so the next
         // daemon reload doesn't replay a burnt refresh_token. Best-effort: a
         // write failure logs `warn!` but doesn't fail the in-memory refresh
         // (the new tokens are already live in the pool).
-        if let CredentialSource::OAuth { name } = &snapshot.source {
-            if let Some(discoverer) = crate::llm::credential_sources::discoverer_by_name(name) {
-                let home = self
-                    .oauth_home_for_writeback
-                    .clone()
-                    .or_else(dirs::home_dir);
-                if let Some(home) = home {
-                    if let Err(e) = discoverer.write_back(
-                        &home,
-                        &tokens.access_token,
-                        &tokens.refresh_token,
-                        tokens.expires_at_ms,
-                    ) {
-                        warn!(
-                            target: "cortex::llm::credential_pool",
-                            source = name.as_str(),
-                            credential = id,
-                            error = %e,
-                            "oauth refresh: write-back to source file failed — \
-                             next daemon reload may use a stale refresh_token"
-                        );
-                    }
-                }
-            }
+        let CredentialSource::OAuth { name } = &snapshot.source else {
+            return;
+        };
+        let Some(discoverer) = crate::llm::credential_sources::discoverer_by_name(name) else {
+            return;
+        };
+        let Some(home) = &self.oauth_home else {
+            return;
+        };
+        let rotated = crate::llm::credential_sources::RotatedTokens {
+            access_token: &tokens.access_token,
+            refresh_token: &tokens.refresh_token,
+            expires_at_ms: tokens.expires_at_ms,
+        };
+        match discoverer.write_back(home, spent_refresh_token, &rotated) {
+            Ok(crate::llm::credential_sources::WriteBack::Written) => {}
+            Ok(crate::llm::credential_sources::WriteBack::SourceChanged) => warn!(
+                target: "cortex::llm::credential_pool",
+                source = name.as_str(),
+                credential = id,
+                "oauth refresh: source file changed since it was read (new login \
+                 or logout) — left it untouched"
+            ),
+            Err(e) => warn!(
+                target: "cortex::llm::credential_pool",
+                source = name.as_str(),
+                credential = id,
+                error = %e,
+                "oauth refresh: write-back to source file failed — \
+                 next daemon reload may use a stale refresh_token"
+            ),
         }
     }
 }

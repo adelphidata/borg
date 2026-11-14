@@ -883,6 +883,88 @@ async fn oauth_refresh_locks_do_not_accumulate() {
 }
 
 #[tokio::test]
+async fn dropped_caller_still_lands_the_rotated_tokens() {
+    // The refresh endpoint spends the single-use refresh_token the moment it
+    // answers. A caller dropped mid-refresh (a cancelled LLM request, a turn
+    // timeout) must not lose the rotated tokens — the old refresh_token is
+    // already burnt, so losing the new one strands the credential until the
+    // user logs in again.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_string(
+                    r#"{"access_token":"rotated-access","refresh_token":"rotated-r","expires_in":3600}"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (pool, home, _db) = oauth_pool("old-access", "old-refresh", 1_000).await;
+    pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        pool.acquire_lease_refreshing(None),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "caller gave up while the refresh was in flight"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pool.entries()[0].key != "rotated-access" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rotated tokens never reached the pool after the caller was dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        pool.entries()[0].refresh_token.as_deref(),
+        Some("rotated-r")
+    );
+    let on_disk = std::fs::read_to_string(home.path().join(".claude/.credentials.json")).unwrap();
+    assert!(
+        on_disk.contains("rotated-r"),
+        "rotated refresh token must reach the source file: {on_disk}"
+    );
+
+    // The next caller reuses the landed token instead of spending the burnt
+    // one again (`expect(1)` is verified when the server drops).
+    let lease = pool.acquire_lease_refreshing(None).await.unwrap();
+    assert_eq!(lease.credential().unwrap().key, "rotated-access");
+}
+
+#[tokio::test]
+async fn refresh_leaves_a_relogged_source_file_alone() {
+    // Between our read and our refresh the owning CLI logged in again and
+    // wrote a different refresh token. Our rotation still applies in memory,
+    // but the newer login on disk must not be overwritten.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"access_token":"rotated-access","refresh_token":"rotated-r","expires_in":3600}"#,
+        ))
+        .mount(&server)
+        .await;
+    let (pool, home, _db) = oauth_pool("old-access", "old-refresh", 1_000).await;
+    pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+    let creds = home.path().join(".claude/.credentials.json");
+    let relogged = r#"{"claudeAiOauth":{"accessToken":"cli-access","refreshToken":"cli-refresh","expiresAt":9999999999000}}"#;
+    std::fs::write(&creds, relogged).unwrap();
+
+    let lease = pool.acquire_lease_refreshing(None).await.unwrap();
+    assert_eq!(lease.credential().unwrap().key, "rotated-access");
+    assert_eq!(std::fs::read_to_string(&creds).unwrap(), relogged);
+}
+
+#[tokio::test]
 async fn second_auth_failure_after_grace_tombstones() {
     // The grace is one-shot per incident: if the refreshed token still 401s,
     // the credential is dead — removed exactly as before.
