@@ -316,6 +316,43 @@ pub async fn dispatch_webhook(
                     .enqueue(
                         btw_session_key,
                         Box::pin(async move {
+                            let channel_name = channel_for_btw.names()[0].to_string();
+                            let bot_mention = channel_for_btw.bot_mention();
+                            let admission = match Database::open_with_timeout(
+                                Database::GATEWAY_BUSY_TIMEOUT_MS,
+                            )
+                            .await
+                            {
+                                Ok(db) => {
+                                    crate::btw_dispatch::admit_btw(
+                                        &db,
+                                        &config_for_btw,
+                                        &channel_name,
+                                        &inbound,
+                                        bot_mention.as_deref(),
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e.context("open database for /btw")),
+                            };
+                            let refusal = match admission {
+                                Ok(refusal) => refusal,
+                                Err(e) => {
+                                    tracing::warn!(channel = %channel_name, error = %format!("{e:#}"), "/btw admission failed");
+                                    Some(crate::handler::format_gateway_error(&e))
+                                }
+                            };
+                            if let Some(reply) = refusal {
+                                if !reply.trim().is_empty() {
+                                    if let Err(e) = channel_for_btw
+                                        .send_response(&reply, &response_context, &health_for_btw)
+                                        .await
+                                    {
+                                        tracing::warn!(channel = %channel_name, error = %e, "failed to deliver /btw refusal");
+                                    }
+                                }
+                                return;
+                            }
                             let runner = |q: String, snap: Vec<cortex::types::Message>| {
                                 crate::btw_dispatch::run_btw_default(config_for_btw, q, snap)
                             };

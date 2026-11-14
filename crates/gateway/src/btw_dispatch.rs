@@ -180,11 +180,37 @@ where
             crate::handler::format_gateway_error(&e)
         }
     };
+    let response_text = crate::handler::redact_channel_output(
+        &channel_name,
+        &inbound.sender_id,
+        inbound.channel_id.as_deref(),
+        &response_text,
+    );
 
     channel
         .send_response(&response_text, &response_context, health)
         .await?;
     Ok(BtwOutcome::Delivered)
+}
+
+/// Activation + access-control gate for a `/btw` side question. The answer
+/// draws on the owner's memory, so it must clear the same verdict a normal
+/// turn does: `None` admits the sender, `Some(reply)` ends the request with
+/// that reply (empty = stay silent, e.g. an unaddressed group message).
+pub async fn admit_btw(
+    db: &Database,
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> Result<Option<String>> {
+    let route = crate::channel::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
+    crate::handler::fast_path_refusal(db, &route, channel_name, inbound, bot_identifier).await
 }
 
 /// Production runner — calls `cortex::agent::run_btw` with a fresh
@@ -272,6 +298,67 @@ mod tests {
             metadata: serde_json::Value::Null,
             peer_kind: Some("direct".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn btw_reply_is_redacted_before_delivery() {
+        let recording = RecordingChannel::new();
+        let channel = as_dyn(&recording);
+        let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+        let runner = |_q: String, _snap: Vec<Message>| async move {
+            Ok::<_, anyhow::Error>("the key is AKIAIOSFODNN7EXAMPLE".to_string())
+        };
+        dispatch_btw_message(
+            &channel,
+            &inbound("/btw key?"),
+            "key?",
+            serde_json::json!({}),
+            &health,
+            runner,
+        )
+        .await
+        .expect("dispatch ok");
+        let text = recording.last_text.lock().await.clone().unwrap();
+        assert!(
+            !text.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret leaked: {text}"
+        );
+        assert!(text.contains("[REDACTED"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn admit_btw_applies_the_pairing_and_activation_gates() {
+        let db = Database::test_db().await;
+        // Default DM policy is pairing: an unknown sender gets the challenge,
+        // never an answer.
+        let config = Config::default();
+        let challenge = admit_btw(&db, &config, "telegram", &inbound("/btw hi"), None)
+            .await
+            .unwrap();
+        assert!(
+            challenge.as_deref().is_some_and(|r| r.contains("u1")),
+            "unpaired sender must get the pairing challenge, got {challenge:?}"
+        );
+
+        let mut open = Config::default();
+        open.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        assert_eq!(
+            admit_btw(&db, &open, "telegram", &inbound("/btw hi"), None)
+                .await
+                .unwrap(),
+            None,
+            "an open-policy DM is admitted"
+        );
+
+        // A group message that does not address the bot stays silent.
+        let mut group = inbound("/btw hi");
+        group.peer_kind = Some(crate::constants::PEER_KIND_GROUP.to_string());
+        assert_eq!(
+            admit_btw(&db, &open, "telegram", &group, Some("@borg"))
+                .await
+                .unwrap(),
+            Some(String::new())
+        );
     }
 
     #[test]

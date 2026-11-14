@@ -488,6 +488,38 @@ pub(crate) async fn sender_may_enrich_with_db(
 /// then resolves the same session id the turn runs under and cancels it on
 /// `executor`. Returns the reply to deliver; an empty reply means "say
 /// nothing" (not activated, or a throttled challenge).
+/// The activation and access-control verdict `invoke_agent_inner` applies,
+/// for fast paths that answer outside it (`/stop`, `/btw`). `None` admits the
+/// sender; `Some(reply)` ends the request with that reply — empty means stay
+/// silent (an unaddressed group message), otherwise it is the access
+/// challenge or refusal.
+pub(crate) async fn fast_path_refusal(
+    db: &Database,
+    route: &crate::channel::routing::ResolvedRoute,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> Result<Option<String>> {
+    let config = &route.config;
+    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
+    let (should_respond, _) = check_activation(
+        &inbound.text,
+        inbound.peer_kind.as_deref(),
+        route,
+        config,
+        bot_identifier,
+        pre_addressed,
+    );
+    if !should_respond {
+        return Ok(Some(String::new()));
+    }
+    Ok(
+        enforce_access_control_with_db(db, config, channel_name, &inbound.sender_id)
+            .await?
+            .map(|(early, _)| early),
+    )
+}
+
 pub(crate) async fn cancel_in_flight_turn(
     db: &Database,
     executor: Option<&crate::session_executor::SessionExecutorHandle>,
@@ -502,23 +534,10 @@ pub(crate) async fn cancel_in_flight_turn(
         &inbound.sender_id,
         inbound.peer_kind.as_deref(),
     );
-    let config = &route.config;
-    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
-    let (should_respond, _) = check_activation(
-        &inbound.text,
-        inbound.peer_kind.as_deref(),
-        &route,
-        config,
-        bot_identifier,
-        pre_addressed,
-    );
-    if !should_respond {
-        return Ok(String::new());
-    }
-    if let Some((early, _)) =
-        enforce_access_control_with_db(db, config, channel_name, &inbound.sender_id).await?
+    if let Some(refusal) =
+        fast_path_refusal(db, &route, channel_name, inbound, bot_identifier).await?
     {
-        return Ok(early);
+        return Ok(refusal);
     }
 
     let session_key = build_session_key(inbound, &route.binding_id);
