@@ -92,6 +92,34 @@ pub(crate) const COMPACTION_OUTAGE_MAX_RETRY_TURNS: u32 = 90;
 static COMPACTION_OUTAGE_LATCH: std::sync::Mutex<Option<CompactionOutage>> =
     std::sync::Mutex::new(None);
 
+/// Why a persistent summarizer rejection happened and what the user does
+/// about it, as `(why, next)`. A key or billing problem is the operator's to
+/// fix; a content refusal clears by starting a new conversation or pointing
+/// compaction at another provider.
+pub(super) fn summarizer_rejection(
+    category: crate::error_format::ErrorCategory,
+) -> (&'static str, &'static str) {
+    match category {
+        crate::error_format::ErrorCategory::ContentPolicy => (
+            "the provider refused to summarize this conversation",
+            "Start a new conversation, or choose a different compaction model in settings",
+        ),
+        _ => (
+            "the summarizer could not reach the model provider",
+            "Check your API key or billing",
+        ),
+    }
+}
+
+/// The one-time notice shown when proactive compaction pauses.
+fn compaction_paused_notice(category: crate::error_format::ErrorCategory) -> String {
+    let (why, next) = summarizer_rejection(category);
+    format!(
+        "Context compaction is paused — {why}. Older messages will stay in context, so \
+         this conversation may hit the model's limit. {next}; compaction retries on its own."
+    )
+}
+
 /// Cooldown for the `streak`-th consecutive failed probe: 1x, 3x, 9x the base,
 /// clamped at [`COMPACTION_OUTAGE_MAX_RETRY_TURNS`]. `streak` is 1-based; 0 is
 /// treated as the first failure.
@@ -1187,12 +1215,7 @@ goals, or habits the conversation does not state. When unsure, leave it out.
         let _ = event_tx
             .send(AgentEvent::SystemNotice {
                 category: "compaction".to_string(),
-                text: format!(
-                    "Context compaction is paused — the summarizer could not reach the model \
-                     provider ({category}). Older messages will stay in context, so this \
-                     conversation may hit the model's limit. Check your API key or billing; \
-                     compaction retries on its own."
-                ),
+                text: compaction_paused_notice(category),
             })
             .await;
     }
@@ -1720,10 +1743,28 @@ fn flush_reply_has_signal(text: &str) -> bool {
 mod tests {
     use super::{
         breakdown_components, build_flush_transcript, compaction_llm_config,
-        contains_untrusted_marker, flush_reply_has_signal, CompactionGate, CompactionStrikes,
-        ContextBreakdown, MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
+        compaction_paused_notice, contains_untrusted_marker, flush_reply_has_signal,
+        CompactionGate, CompactionStrikes, ContextBreakdown, MAX_INEFFECTIVE_COMPACTIONS,
+        SUMMARY_OUTPUT_TOKENS_FLOOR,
     };
+    use crate::error_format::ErrorCategory;
     use crate::types::Message;
+
+    /// The pause notice names the next action for the cause. A content
+    /// refusal is not fixed by checking a key — sending the user there is a
+    /// dead end.
+    #[test]
+    fn compaction_pause_notice_names_the_fix_for_its_cause() {
+        for (category, says, never) in [
+            (ErrorCategory::Auth, "API key", "new conversation"),
+            (ErrorCategory::Billing, "billing", "new conversation"),
+            (ErrorCategory::ContentPolicy, "new conversation", "API key"),
+        ] {
+            let text = compaction_paused_notice(category);
+            assert!(text.contains(says), "{category}: {text}");
+            assert!(!text.contains(never), "{category}: {text}");
+        }
+    }
 
     #[test]
     fn only_a_flush_reply_with_content_is_saved() {

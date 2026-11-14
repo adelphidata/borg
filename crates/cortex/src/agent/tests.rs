@@ -555,30 +555,41 @@ async fn manual_compact_reports_a_refused_summary() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
     let _mirror = super::prompt_assembly::lock_compaction_outage_mirror().await;
-    let server = wiremock::MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
-        .mount(&server)
-        .await;
-    let mut agent = over_budget_agent_with_dead_override(&server.uri());
-    agent.config.compaction.model = None;
-    let before_len = agent.history.len();
+    // (status, body, the fix the error must name, advice it must not give)
+    let cases = [
+        (401, "invalid api key", "API key", "new conversation"),
+        (
+            400,
+            r#"{"error":{"message":"Your request was rejected as a result of our safety system.","code":"content_policy_violation"}}"#,
+            "new conversation",
+            "API key",
+        ),
+    ];
+    for (status, body, names, never) in cases {
+        super::prompt_assembly::store_compaction_outage(None);
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        let mut agent = over_budget_agent_with_dead_override(&server.uri());
+        agent.config.compaction.model = None;
+        let before_len = agent.history.len();
 
-    let err = agent
-        .compact()
-        .await
-        .expect_err("a refused summary must not read as a no-op");
+        let err = agent
+            .compact()
+            .await
+            .expect_err("a refused summary must not read as a no-op");
 
-    assert!(
-        err.to_string().contains("API key"),
-        "the error must point at the key: {err}"
-    );
-    assert_eq!(
-        agent.history.len(),
-        before_len,
-        "history must be kept whole"
-    );
+        assert!(err.to_string().contains(names), "{status}: {err}");
+        assert!(!err.to_string().contains(never), "{status}: {err}");
+        assert_eq!(
+            agent.history.len(),
+            before_len,
+            "history must be kept whole"
+        );
+    }
 }
 
 /// A history smaller than the summary marker would grow if folded, so a
