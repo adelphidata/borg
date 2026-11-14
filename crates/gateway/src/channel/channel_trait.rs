@@ -385,9 +385,20 @@ pub async fn dispatch_webhook(
                     session_key,
                     Box::pin(async move {
                         let mut response_context = response_context;
-                        let typing = channel.start_typing(&response_context);
                         let bot_mention = channel.bot_mention();
                         let channel_name = channel.names()[0].to_string();
+                        let typing = if handler::typing_wanted(
+                            &config,
+                            &channel_name,
+                            &inbound,
+                            bot_mention.as_deref(),
+                        )
+                        .await
+                        {
+                            channel.start_typing(&response_context)
+                        } else {
+                            None
+                        };
 
                         // Timeout only wraps the LLM agent call — delivery
                         // operations must always complete to avoid lost responses.

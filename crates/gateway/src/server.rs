@@ -597,7 +597,12 @@ impl GatewayServer {
                 crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
                 let inbound = parsed.inbound;
 
-                let typing = crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id);
+                let typing =
+                    handler::typing_wanted(&config, "telegram", &inbound, bot_mention.as_deref())
+                        .await
+                        .then(|| {
+                            crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id)
+                        });
 
                 let agent_result = tokio::time::timeout(
                     request_timeout,
@@ -613,7 +618,9 @@ impl GatewayServer {
 
                 match agent_result {
                     Ok(Ok((response_text, _))) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         let voice_reply_mode = match Database::open_with_timeout(
                             Database::GATEWAY_BUSY_TIMEOUT_MS,
                         )
@@ -656,7 +663,9 @@ impl GatewayServer {
                         .unwrap_or_else(|e| warn!("Failed to send Telegram poll response: {e}"));
                     }
                     Ok(Err(e)) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         warn!("Agent error in Telegram poll mode: {e:#}");
                         let error_msg = handler::format_gateway_error(&e);
                         crate::telegram::delivery::send_response(
@@ -669,7 +678,9 @@ impl GatewayServer {
                         });
                     }
                     Err(_) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         warn!("Agent timed out in Telegram poll mode");
                         let error_msg = cortex::error_format::format_error_with_context(
                             "request timed out",
@@ -730,12 +741,6 @@ impl GatewayServer {
                 let health = sse_health.clone();
                 let client = sse_client.clone();
                 Box::pin(async move {
-                    // Best-effort typing indicator; failure is a UX hint only,
-                    // never blocks the agent response below.
-                    let _ = client
-                        .send_typing(Some(&recipient), group_id.as_deref())
-                        .await;
-
                     // Bot mention identifier for group activation. Signal's
                     // resolve_mentions renders the bot's mention as
                     // `@<account>` (phone number) or `@<uuid>` — pass the
@@ -743,6 +748,14 @@ impl GatewayServer {
                     // explicit @bot in group chats when
                     // `gateway.group_activation = Mention` (the default).
                     let bot_id = format!("@{}", client.account());
+
+                    // Best-effort typing indicator; failure is a UX hint only,
+                    // never blocks the agent response below.
+                    if handler::typing_wanted(&config, "signal", &inbound, Some(&bot_id)).await {
+                        let _ = client
+                            .send_typing(Some(&recipient), group_id.as_deref())
+                            .await;
+                    }
                     match handler::invoke_agent(
                         "signal",
                         &inbound,
