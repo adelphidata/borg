@@ -2,10 +2,9 @@
 //!
 //! A denial reaches the agent today as an exit code plus whatever the backend
 //! chose to print, and the two backends print nothing alike: Seatbelt emits
-//! `deny(1) file-read-data /path`, bwrap emits English prose, and a seccomp
-//! kill emits nothing at all — the process just dies on `SIGSYS`. Every
+//! `deny(1) file-read-data /path` and bwrap emits English prose. Every
 //! consumer that wants to answer "what did the sandbox block" therefore has to
-//! re-parse all three shapes.
+//! re-parse both shapes.
 //!
 //! This module is that parse, done once. It is **classification only**: it
 //! never changes whether a command is denied, and a denial that fails to
@@ -23,7 +22,7 @@ pub const MAX_SNIPPET_BYTES: usize = 512;
 pub enum SandboxBackend {
     /// macOS `sandbox-exec` (Seatbelt).
     Seatbelt,
-    /// Linux `bwrap` (Bubblewrap) namespaces plus seccomp.
+    /// Linux `bwrap` (Bubblewrap) namespaces.
     Bubblewrap,
     /// The Windows restricted-token backend.
     Windows,
@@ -61,7 +60,7 @@ impl SandboxBackend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViolationKind {
     /// A file or directory access. `path` is present when the backend named
-    /// the target; bwrap and seccomp often do not.
+    /// the target; bwrap often does not.
     Filesystem {
         /// The denied path, as the backend reported it.
         path: Option<String>,
@@ -96,11 +95,6 @@ pub struct SandboxViolation {
     pub snippet: String,
 }
 
-/// The wait status a `SIGSYS` kill surfaces as through a shell (`128 + 31`).
-/// bwrap's seccomp filter is the only thing in Borg's stack that raises it,
-/// so it is an unambiguous denial signal even with empty stderr.
-const SIGSYS_SHELL_STATUS: i32 = 159;
-
 /// Classify a finished sandboxed command into a violation, or `None` if
 /// nothing indicates the sandbox denied it.
 ///
@@ -108,11 +102,7 @@ const SIGSYS_SHELL_STATUS: i32 = 159;
 /// ordinary `chmod 000` file produces exactly that text, and a false denial
 /// event is worse than a missing one — it would teach an operator to distrust
 /// the record. Only a backend-specific marker classifies.
-pub fn classify(
-    backend: SandboxBackend,
-    exit_code: Option<i32>,
-    stderr: &str,
-) -> Option<SandboxViolation> {
+pub fn classify(backend: SandboxBackend, stderr: &str) -> Option<SandboxViolation> {
     let build = |kind, reason: &str| {
         Some(SandboxViolation {
             backend,
@@ -121,14 +111,6 @@ pub fn classify(
             snippet: bound_snippet(stderr),
         })
     };
-
-    // Backend-gated: signal 31 is `SIGSYS` only on Linux. On Darwin it is
-    // `SIGUSR2`, so an unqualified check would file a command the user killed
-    // with `kill -USR2` as a seccomp denial.
-    if backend == SandboxBackend::Bubblewrap && exit_code == Some(SIGSYS_SHELL_STATUS) {
-        // Killed by the seccomp filter. There is no path and often no output.
-        return build(ViolationKind::Filesystem { path: None }, "seccomp");
-    }
 
     for line in stderr.lines() {
         if let Some((reason, path)) = seatbelt_denial(line) {
@@ -228,7 +210,6 @@ mod tests {
     fn a_seatbelt_file_denial_yields_the_operation_and_the_path() {
         let violation = classify(
             SandboxBackend::Seatbelt,
-            Some(1),
             "deny(1) file-read-data /Users/someone/.ssh/id_ed25519\n",
         )
         .expect("a seatbelt deny line must classify");
@@ -245,12 +226,8 @@ mod tests {
     #[test]
     fn a_seatbelt_denial_without_the_filter_index_still_classifies() {
         // The `(N)` group is not guaranteed; the parse must not depend on it.
-        let violation = classify(
-            SandboxBackend::Seatbelt,
-            Some(1),
-            "deny file-write-create /tmp/out",
-        )
-        .expect("classifies");
+        let violation = classify(SandboxBackend::Seatbelt, "deny file-write-create /tmp/out")
+            .expect("classifies");
         assert_eq!(violation.reason, "file-write-create");
     }
 
@@ -258,7 +235,6 @@ mod tests {
     fn a_seatbelt_network_denial_classifies_as_network() {
         let violation = classify(
             SandboxBackend::Seatbelt,
-            Some(1),
             "deny(1) network-outbound /private/var/run/mDNSResponder",
         )
         .expect("classifies");
@@ -269,7 +245,6 @@ mod tests {
     fn a_bwrap_mount_denial_extracts_the_path() {
         let violation = classify(
             SandboxBackend::Bubblewrap,
-            Some(1),
             "bwrap: Can't create file at /etc/passwd: Permission denied",
         )
         .expect("classifies");
@@ -288,7 +263,6 @@ mod tests {
     fn a_bwrap_network_denial_classifies_as_network() {
         let violation = classify(
             SandboxBackend::Bubblewrap,
-            Some(1),
             "bwrap: setting up the network: Permission denied",
         )
         .expect("classifies");
@@ -305,30 +279,28 @@ mod tests {
             "bwrap: Creating new namespace failed: Invalid argument",
         ] {
             assert!(
-                classify(SandboxBackend::Bubblewrap, Some(1), line).is_none(),
+                classify(SandboxBackend::Bubblewrap, line).is_none(),
                 "must not classify: {line}"
             );
         }
     }
 
-    /// Signal 31 is `SIGSYS` on Linux but `SIGUSR2` on Darwin. The status
-    /// check must therefore never fire for the Seatbelt backend.
+    /// Borg installs no seccomp filter, so a `SIGSYS` death (status
+    /// `128 + 31`) came from the program's own filter, a container runtime's,
+    /// or a `kill -SYS` — never from Borg's sandbox. On Darwin signal 31 is
+    /// `SIGUSR2`. Neither is evidence of a Borg denial on any backend.
     #[test]
-    fn the_seccomp_status_is_not_read_as_a_denial_on_seatbelt() {
-        assert!(
-            classify(SandboxBackend::Seatbelt, Some(SIGSYS_SHELL_STATUS), "").is_none(),
-            "status 159 means SIGUSR2 on macOS, not a sandbox denial"
-        );
-    }
-
-    #[test]
-    fn a_seccomp_kill_classifies_from_the_status_alone() {
-        // The defining case: the child is killed by SIGSYS and prints nothing,
-        // so status is the only evidence there is.
-        let violation = classify(SandboxBackend::Bubblewrap, Some(SIGSYS_SHELL_STATUS), "")
-            .expect("a seccomp kill must be recorded");
-        assert_eq!(violation.reason, "seccomp");
-        assert_eq!(violation.kind, ViolationKind::Filesystem { path: None });
+    fn a_bare_sigsys_status_is_not_a_sandbox_denial() {
+        for backend in [
+            SandboxBackend::Seatbelt,
+            SandboxBackend::Bubblewrap,
+            SandboxBackend::Windows,
+        ] {
+            assert!(
+                classify(backend, "").is_none(),
+                "{backend:?}: status 159 alone must not be filed as a denial"
+            );
+        }
     }
 
     #[test]
@@ -337,7 +309,6 @@ mod tests {
         // ledger with denials the sandbox never made.
         assert!(classify(
             SandboxBackend::Seatbelt,
-            Some(1),
             "cat: /tmp/locked: Permission denied",
         )
         .is_none());
@@ -345,14 +316,13 @@ mod tests {
 
     #[test]
     fn a_successful_command_reports_nothing() {
-        assert!(classify(SandboxBackend::Seatbelt, Some(0), "").is_none());
+        assert!(classify(SandboxBackend::Seatbelt, "").is_none());
     }
 
     #[test]
     fn prose_beginning_with_deny_does_not_masquerade_as_a_denial() {
         assert!(classify(
             SandboxBackend::Seatbelt,
-            Some(1),
             "denying the request was the right call",
         )
         .is_none());
@@ -363,7 +333,7 @@ mod tests {
         let noise = "é".repeat(MAX_SNIPPET_BYTES);
         let stderr = format!("deny(1) file-read-data /secret\n{noise}");
 
-        let violation = classify(SandboxBackend::Seatbelt, Some(1), &stderr).expect("classifies");
+        let violation = classify(SandboxBackend::Seatbelt, &stderr).expect("classifies");
 
         assert!(
             violation.snippet.len() <= MAX_SNIPPET_BYTES + "…".len(),

@@ -724,7 +724,7 @@ pub async fn handle_run_shell_with_context(
             } else {
                 (stdout, stderr)
             };
-            note_sandbox_denial(ctx, &stderr, code).await;
+            note_sandbox_denial(ctx, &stderr).await;
             let mut result =
                 format!("Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
             // A clean exit is scanned too when the command's shape means the
@@ -919,7 +919,7 @@ pub async fn run_gate_command(
             if let Some(g) = _guard {
                 g.complete(code);
             }
-            note_sandbox_denial(ctx, &stderr, code).await;
+            note_sandbox_denial(ctx, &stderr).await;
             let output = if stderr.trim().is_empty() {
                 stdout
             } else if stdout.trim().is_empty() {
@@ -1116,11 +1116,11 @@ async fn session_action_with_registry(
 /// condition as [`wrap_run_shell_for_sandbox`] — an unsandboxed command cannot
 /// produce a denial, so classifying its stderr could only produce noise. That
 /// gate is ACP-only, so today the TUI and REPL lanes record nothing.
-async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str, code: Option<i32>) {
+async fn note_sandbox_denial(ctx: &ExecutionContext, stderr: &str) {
     if !ctx.enforce_workspace_root() {
         return;
     }
-    crate::vitals::note_sandbox_denial(code, stderr, "run_shell").await;
+    crate::vitals::note_sandbox_denial(stderr, "run_shell").await;
 }
 
 /// Decide whether to wrap `run_shell` invocations in a workspace-scoped

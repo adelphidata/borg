@@ -451,8 +451,8 @@ pub async fn run_sandboxed_script(
 ///
 /// [`ScriptOutput::into_result_string`] folds both into one human-readable
 /// string, which is all a tool response needs but not enough to classify a
-/// sandbox denial — [`crate::violation::classify`] wants the raw stderr and the
-/// exit status separately.
+/// sandbox denial — [`crate::violation::classify`] wants the raw stderr on its
+/// own.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all)]
 pub async fn run_sandboxed_script_detailed(
