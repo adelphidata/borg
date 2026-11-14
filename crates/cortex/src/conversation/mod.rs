@@ -34,7 +34,8 @@ pub use event::{
     SESSION_HMAC_DOMAIN,
 };
 pub use history::{
-    is_agent_authored, latest_user_text, normalize_history, rewind_to_nth_user, undo_last_turn,
+    drop_current_turn, is_agent_authored, latest_user_text, normalize_history, rewind_to_nth_user,
+    undo_last_turn,
 };
 pub use summarize::SummarizeFailure;
 pub(crate) use summarize::{push_transcript_entry, TRANSCRIPT_QUOTING_RULE};

@@ -66,6 +66,31 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
     }
 }
 
+/// Remove the turn in progress: the user message that started it and
+/// everything after it. For a turn the provider refused on content grounds —
+/// safety filters judge the whole thread, so leaving the refused request in
+/// history gets every later message refused too.
+///
+/// The boundary is the last user-authored row, skipping sub-agent notices
+/// (they land mid-turn). A compaction marker is never removed: when it is the
+/// boundary only the rows after it go.
+pub fn drop_current_turn(history: &mut Vec<Message>) -> usize {
+    let Some(idx) = history
+        .iter()
+        .rposition(|m| m.role == Role::User && !crate::multi_agent::is_completion_notice(m))
+    else {
+        return 0;
+    };
+    let keep = if is_compaction_marker(&history[idx]) {
+        idx + 1
+    } else {
+        idx
+    };
+    let removed = history.len() - keep;
+    history.truncate(keep);
+    removed
+}
+
 /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
 /// Truncates everything from that user message onward (inclusive).
 /// Returns the number of messages removed, or 0 if the index is out of range.
@@ -257,6 +282,23 @@ mod tests {
 
     fn make_tool_result(call_id: &str, result: &str) -> Message {
         Message::tool_result(call_id, result)
+    }
+
+    #[test]
+    fn drop_current_turn_removes_the_request_and_the_work_after_it() {
+        let mut history = vec![
+            make_user("earlier question"),
+            make_assistant("earlier answer"),
+            make_user("the refused request"),
+            make_tool_call_msg("", "c1", "web_fetch"),
+            make_tool_result("c1", "page text"),
+        ];
+        assert_eq!(drop_current_turn(&mut history), 3);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].text_content(), Some("earlier answer"));
+
+        // Nothing to drop in an empty history.
+        assert_eq!(drop_current_turn(&mut Vec::new()), 0);
     }
 
     // -- normalize_history --

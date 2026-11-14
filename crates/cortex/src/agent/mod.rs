@@ -1945,6 +1945,23 @@ impl Agent {
         // arguments may be truncated and executing them risks running with
         // half-parsed input. Persist the interrupted marker and emit
         // TurnComplete so the TUI returns to the composer.
+        if stream_error
+            .as_deref()
+            .is_some_and(|e| classify_error_text(e) == Some(FailoverReason::ContentPolicy))
+        {
+            // Safety filters judge the whole thread: a refused request left in
+            // history gets every later message refused too. Take the turn out
+            // (no interrupted marker — there is nothing to resume) so the
+            // conversation can continue.
+            let dropped = crate::conversation::drop_current_turn(&mut self.history);
+            warn!(
+                dropped,
+                "provider refused the turn on content grounds; removed it from history"
+            );
+            self.auto_save();
+            let _ = event_tx.send(AgentEvent::TurnComplete).await;
+            return IterationOutcome::EndTurn;
+        }
         if stream_error.is_some() {
             self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
                 .await;
