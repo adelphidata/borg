@@ -758,8 +758,9 @@ mod chunked_send_tests {
         for r in &requests {
             let body = String::from_utf8_lossy(&r.body);
             let is_first_chunk = body.contains("HEADMARK filler line 000");
+            let json: serde_json::Value = serde_json::from_slice(&r.body).expect("json body");
             assert_eq!(
-                body.contains("\"reply_to_message_id\":4242"),
+                json["reply_parameters"]["message_id"] == 4242,
                 is_first_chunk,
                 "reply id must ride on the first chunk and only the first chunk: {body}"
             );

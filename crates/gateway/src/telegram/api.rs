@@ -9,9 +9,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use super::types::{
-    ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo, InlineKeyboardMarkup,
-    MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
-    Update, User,
+    reply_parameters, ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo,
+    InlineKeyboardMarkup, MediaSource, ReactionType, SendMessageRequest, SendPollRequest,
+    SetMessageReactionRequest, Update, User,
 };
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::{
@@ -386,7 +386,7 @@ impl TelegramClient {
                 form = form.text("message_thread_id", tid.to_string());
             }
             if let Some(rid) = reply_to_message_id {
-                form = form.text("reply_to_message_id", rid.to_string());
+                form = form.text("reply_parameters", reply_parameters(rid).to_string());
             }
             Ok(form)
         })
@@ -518,7 +518,7 @@ impl TelegramClient {
             form = form.text("message_thread_id", tid.to_string());
         }
         if let Some(rid) = reply_to_message_id {
-            form = form.text("reply_to_message_id", rid.to_string());
+            form = form.text("reply_parameters", reply_parameters(rid).to_string());
         }
 
         Ok(form)
@@ -1789,11 +1789,12 @@ mod tests {
         let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(
-            first["reply_to_message_id"], 10,
-            "first chunk must reply to the original"
+            first["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true}),
+            "first chunk must reply to the original, and still land if it was deleted"
         );
         assert!(
-            second.get("reply_to_message_id").is_none(),
+            second.get("reply_parameters").is_none(),
             "later chunks must not reply: {second}"
         );
     }
@@ -1968,7 +1969,7 @@ mod tests {
         assert_eq!(json["chat_id"], 42);
         assert_eq!(json["text"], "hello");
         assert_eq!(json["parse_mode"], "Markdown");
-        assert!(json.get("reply_to_message_id").is_none());
+        assert!(json.get("reply_parameters").is_none());
         assert!(json.get("message_thread_id").is_none());
     }
 
@@ -1984,7 +1985,11 @@ mod tests {
             disable_notification: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["reply_to_message_id"], 10);
+        assert_eq!(
+            json["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true})
+        );
+        assert!(json.get("reply_to_message_id").is_none());
         assert_eq!(json["message_thread_id"], 99);
     }
 
