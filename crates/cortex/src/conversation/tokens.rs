@@ -63,7 +63,20 @@ pub(super) fn message_tokens(msg: &Message) -> usize {
         .as_deref()
         .map(estimate_tokens)
         .unwrap_or(0);
-    role_overhead + content_tokens + tool_call_tokens + reasoning_tokens
+    // Signed thinking blocks are replayed on every tool-call turn for the
+    // model that produced them, so they are billed every request. Counting
+    // them as zero let thinking-heavy sessions overflow the window before
+    // compaction fired.
+    let reasoning_block_tokens: usize = msg
+        .reasoning_blocks
+        .iter()
+        .flatten()
+        .flat_map(|block| ["thinking", "signature", "data"].map(|k| block.get(k)))
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(estimate_tokens)
+        .sum();
+    role_overhead + content_tokens + tool_call_tokens + reasoning_tokens + reasoning_block_tokens
 }
 
 /// Total estimated tokens for a conversation history.
@@ -141,6 +154,26 @@ mod tests {
         assert_eq!(
             message_tokens(&with),
             message_tokens(&without) + estimate_tokens(&reasoning)
+        );
+    }
+
+    #[test]
+    fn message_tokens_count_replayed_reasoning_blocks() {
+        let without = make_tool_call_msg("", "id1", "read_memory");
+        let thinking = "Check the config loader first, then the caller. ".repeat(20);
+        let signature = "EqoBCkgIARABGAIiQL".repeat(10);
+        let redacted = "ErUBCkYIBRgCIkD".repeat(8);
+        let mut with = without.clone();
+        with.reasoning_blocks = Some(vec![
+            serde_json::json!({"type": "thinking", "thinking": thinking, "signature": signature}),
+            serde_json::json!({"type": "redacted_thinking", "data": redacted}),
+        ]);
+        assert_eq!(
+            message_tokens(&with),
+            message_tokens(&without)
+                + estimate_tokens(&thinking)
+                + estimate_tokens(&signature)
+                + estimate_tokens(&redacted)
         );
     }
 
