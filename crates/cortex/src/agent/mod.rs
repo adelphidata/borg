@@ -1057,10 +1057,10 @@ impl Agent {
             .await
             .context("could not start the summarizer")?;
         let failed = (dropped == 0).then(|| match &failure {
-            Some(crate::conversation::SummarizeFailure::Persistent(category)) => format!(
-                "the summarizer could not reach the model provider ({category}); \
-                 check your API key or billing"
-            ),
+            Some(crate::conversation::SummarizeFailure::Persistent(category)) => {
+                let (why, next) = prompt_assembly::summarizer_rejection(*category);
+                format!("{why} ({category}). {next}")
+            }
             Some(crate::conversation::SummarizeFailure::Transient) => {
                 "the summarizer returned no summary; try again in a moment".to_string()
             }

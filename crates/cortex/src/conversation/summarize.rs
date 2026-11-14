@@ -116,7 +116,9 @@ pub(super) fn is_trivial_tool_result(msg: &Message) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummarizeFailure {
     /// The provider rejected the call in a way retrying cannot fix — a bad or
-    /// expired key (401/403), or exhausted billing quota (402).
+    /// expired key (401/403), exhausted billing quota (402), or a content
+    /// refusal (the transcript being summarized only grows, so the same
+    /// verdict comes back every turn).
     Persistent(ErrorCategory),
     /// Anything else — overload, timeout, an empty response. Retry next turn.
     Transient,
@@ -129,7 +131,9 @@ pub enum SummarizeFailure {
 fn classify_summarize_failure(err: &anyhow::Error) -> SummarizeFailure {
     let category = classify_error(&err.to_string());
     match category {
-        ErrorCategory::Auth | ErrorCategory::Billing => SummarizeFailure::Persistent(category),
+        ErrorCategory::Auth | ErrorCategory::Billing | ErrorCategory::ContentPolicy => {
+            SummarizeFailure::Persistent(category)
+        }
         _ => SummarizeFailure::Transient,
     }
 }
@@ -1153,7 +1157,7 @@ mod failure_classification_tests {
     /// getting this wrong either burns tokens re-failing every turn, or
     /// silently stops compacting during a blip the next turn would survive.
     #[test]
-    fn auth_and_billing_rejections_are_persistent() {
+    fn auth_billing_and_content_rejections_are_persistent() {
         let cases = [
             ("HTTP 401 unauthorized", ErrorCategory::Auth),
             ("invalid api key provided", ErrorCategory::Auth),
@@ -1162,6 +1166,11 @@ mod failure_classification_tests {
             (
                 "insufficient_quota: exceeded your current quota",
                 ErrorCategory::Billing,
+            ),
+            (
+                "Your request was rejected as a result of our safety system. \
+                 content_policy_violation",
+                ErrorCategory::ContentPolicy,
             ),
         ];
         for (msg, expected) in cases {
