@@ -42,6 +42,15 @@ const SUBAGENT_PREAMBLE_LEAD: &str = "You are a sub-agent named \"";
 /// Opening tag of the preamble's goal block.
 const SUBAGENT_GOAL_OPEN: &str = "<goal>\n";
 
+/// Whether `msg` is a sub-agent's brief: the first user message its parent
+/// wrote, carrying identity, goal and output contract.
+pub(crate) fn is_subagent_brief(msg: &crate::types::Message) -> bool {
+    msg.role == crate::types::Role::User
+        && msg
+            .text_content()
+            .is_some_and(|t| t.starts_with(SUBAGENT_PREAMBLE_LEAD))
+}
+
 /// Drop the parent's own identity preamble from a message that is being
 /// forked into a grandchild, keeping the parent's goal block.
 ///

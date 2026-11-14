@@ -1319,6 +1319,17 @@ goals, or habits the conversation does not state. When unsure, leave it out.
         // Seed the iterative summary from the marker already in the working set
         // (itself a projection of the log) — no separate cached field to drift.
         let mut summary = extract_last_compaction_summary(&self.history);
+        // A sub-agent's whole task lives in its first user message. Head
+        // protection decays after the first pass, so from the second one on
+        // the brief would survive only as the summarizer's paraphrase.
+        let brief = (self.spawn_depth > 0)
+            .then(|| {
+                self.history
+                    .iter()
+                    .find(|m| crate::multi_agent::is_subagent_brief(m))
+                    .cloned()
+            })
+            .flatten();
         // Decay head protection once a prior compaction summary exists. The first
         // `protect_first_n` messages are protected only to keep the original user
         // request and early framing intact through the *first* compaction; that
@@ -1390,6 +1401,12 @@ goals, or habits the conversation does not state. When unsure, leave it out.
                 warn!(
                     "v2 compaction yielded no progress; fell back to v1 compaction and dropped {dropped} messages"
                 );
+            }
+        }
+
+        if dropped > 0 {
+            if let Some(brief) = brief {
+                restore_subagent_brief(&mut self.history, brief);
             }
         }
 
@@ -1691,6 +1708,23 @@ pub(super) struct PreparedLlmRequest {
     pub(super) system_stable_prefix: String,
 }
 
+/// Put a sub-agent's brief back verbatim when a compaction folded it away:
+/// right after the summary marker, so the child reads its task before the
+/// recent turns. A brief that survived the fold is left where it is.
+fn restore_subagent_brief(history: &mut Vec<crate::types::Message>, brief: crate::types::Message) {
+    if history
+        .iter()
+        .any(|m| crate::multi_agent::is_subagent_brief(m))
+    {
+        return;
+    }
+    let at = history
+        .iter()
+        .rposition(crate::conversation::is_compaction_marker)
+        .map_or(0, |i| i + 1);
+    history.insert(at, brief);
+}
+
 /// Build the role-tagged transcript fed to the pre-compaction memory writer.
 /// When `exclude_external` is set, messages carrying an untrusted trust boundary
 /// are dropped so externally-sourced text cannot seed durable memory. Each
@@ -1748,8 +1782,8 @@ mod tests {
     use super::{
         breakdown_components, build_flush_transcript, compaction_llm_config,
         compaction_paused_notice, contains_untrusted_marker, flush_reply_has_signal,
-        CompactionGate, CompactionStrikes, ContextBreakdown, MAX_INEFFECTIVE_COMPACTIONS,
-        SUMMARY_OUTPUT_TOKENS_FLOOR,
+        restore_subagent_brief, CompactionGate, CompactionStrikes, ContextBreakdown,
+        MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
     };
     use crate::error_format::ErrorCategory;
     use crate::types::Message;
@@ -1929,6 +1963,26 @@ mod tests {
     }
 
     const AGENT_RS_SRC: &str = include_str!("prompt_assembly.rs");
+
+    #[test]
+    fn a_folded_subagent_brief_is_restored_after_the_summary_marker() {
+        let brief = Message::user(
+            "You are a sub-agent named \"scout\" (id: a1).\n<goal>\nmap the auth flow\n</goal>",
+        );
+        let marker = crate::conversation::render_compaction_marker("earlier work");
+        let mut history = vec![
+            marker.clone(),
+            Message::assistant("reading auth.rs"),
+            Message::user("parent: also check the token refresh"),
+        ];
+        restore_subagent_brief(&mut history, brief.clone());
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[1].text_content(), brief.text_content());
+
+        // A brief that survived the fold is not duplicated.
+        restore_subagent_brief(&mut history, brief);
+        assert_eq!(history.len(), 4);
+    }
 
     #[test]
     fn flush_transcript_quotes_tool_output_so_it_cannot_pose_as_the_user() {
