@@ -29,7 +29,8 @@ pub fn is_invisible_or_bidi(c: char) -> bool {
     )
 }
 
-fn is_tag_char(c: char) -> bool {
+/// True for a Unicode tag character (U+E0000..U+E007F).
+pub fn is_tag_char(c: char) -> bool {
     matches!(c, '\u{E0000}'..='\u{E007F}')
 }
 
