@@ -3332,6 +3332,9 @@ impl LlmClient {
                     String::new()
                 }
             };
+            // The key in use is known by value: mask it before the body reaches
+            // the error chain, since a shapeless key slips `redact_secrets`.
+            let body = crate::security::secrets::mask_literals(&body, &[&self.api_key]);
             let err =
                 self.explain_missing_vendor_prefix(classify_status(status, &body, self.provider));
             return Err(crate::llm::llm_error::override_retry_after(

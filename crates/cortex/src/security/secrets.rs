@@ -786,6 +786,25 @@ impl RedactionOutcome {
 }
 
 /// Redact detected secrets in text, replacing matches with `[REDACTED <label>]`.
+/// Shortest literal `mask_literals` will replace — anything shorter is too
+/// likely to collide with ordinary text.
+const MIN_LITERAL_SECRET_LEN: usize = 8;
+
+/// Mask every occurrence of each known secret value in `text`. For
+/// credentials known by value rather than by shape: a custom provider's
+/// random-hex key matches no pattern, yet the provider can still echo it
+/// back (`Invalid API key: <key>`). Run it before `redact_secrets`, which
+/// still covers everything shaped like a secret.
+pub fn mask_literals(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= MIN_LITERAL_SECRET_LEN && out.contains(secret) {
+            out = out.replace(secret, "[REDACTED credential]");
+        }
+    }
+    out
+}
+
 pub fn redact_secrets(text: &str) -> String {
     redact_with_audit(text).text
 }
@@ -993,6 +1012,21 @@ mod tests {
             );
             assert!(!out.contains(token), "{token} survived redaction: {out}");
         }
+    }
+
+    #[test]
+    fn mask_literals_masks_known_values_and_ignores_short_ones() {
+        let key = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let out = mask_literals(
+            &format!("Invalid API key: {key} ({key})"),
+            &[key, "", "abc"],
+        );
+        assert_eq!(
+            out,
+            "Invalid API key: [REDACTED credential] ([REDACTED credential])"
+        );
+        // A short value would mask ordinary words; it is left alone.
+        assert_eq!(mask_literals("abc def", &["abc"]), "abc def");
     }
 
     #[test]

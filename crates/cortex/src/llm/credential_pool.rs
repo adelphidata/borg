@@ -1157,7 +1157,15 @@ impl CredentialPool {
         if c.is_removed() {
             return;
         }
-        let truncated = error_message.map(truncate_error_msg);
+        // The credential's own values first: a key with no recognizable shape
+        // (a custom provider's random hex) slips every pattern in
+        // `truncate_error_msg`, and the provider may echo it back.
+        let known = [
+            c.key.as_str(),
+            c.refresh_token.as_deref().unwrap_or_default(),
+        ];
+        let truncated = error_message
+            .map(|m| truncate_error_msg(&crate::security::secrets::mask_literals(m, &known)));
 
         match reason {
             // First 401 on an OAuth credential that can refresh: the access
