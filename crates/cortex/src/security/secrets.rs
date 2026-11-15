@@ -785,7 +785,6 @@ impl RedactionOutcome {
     }
 }
 
-/// Redact detected secrets in text, replacing matches with `[REDACTED <label>]`.
 /// Shortest literal `mask_literals` will replace — anything shorter is too
 /// likely to collide with ordinary text.
 const MIN_LITERAL_SECRET_LEN: usize = 8;
@@ -805,6 +804,7 @@ pub fn mask_literals(text: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// Redact detected secrets in text, replacing matches with `[REDACTED <label>]`.
 pub fn redact_secrets(text: &str) -> String {
     redact_with_audit(text).text
 }

@@ -507,15 +507,6 @@ pub(crate) async fn sender_may_enrich_with_db(
     }
 }
 
-/// Cancel the turn in flight for `inbound`'s session without queueing behind
-/// it. The queued path only sees a `/stop` once the running turn ends (or the
-/// request timeout fires), which is exactly when it is useless.
-///
-/// Mirrors the queued path's gates in order — activation, then the full
-/// access check (a challenge or denial is returned as the reply instead) —
-/// then resolves the same session id the turn runs under and cancels it on
-/// `executor`. Returns the reply to deliver; an empty reply means "say
-/// nothing" (not activated, or a throttled challenge).
 /// The activation and access-control verdict `invoke_agent_inner` applies,
 /// for fast paths that answer outside it (`/stop`, `/btw`). `None` admits the
 /// sender; `Some(reply)` ends the request with that reply — empty means stay
@@ -548,6 +539,15 @@ pub(crate) async fn fast_path_refusal(
     )
 }
 
+/// Cancel the turn in flight for `inbound`'s session without queueing behind
+/// it. The queued path only sees a `/stop` once the running turn ends (or the
+/// request timeout fires), which is exactly when it is useless.
+///
+/// Mirrors the queued path's gates in order — activation, then the full
+/// access check (a challenge or denial is returned as the reply instead) —
+/// then resolves the same session id the turn runs under and cancels it on
+/// `executor`. Returns the reply to deliver; an empty reply means "say
+/// nothing" (not activated, or a throttled challenge).
 pub(crate) async fn cancel_in_flight_turn(
     db: &Database,
     executor: Option<&crate::session_executor::SessionExecutorHandle>,
@@ -2829,10 +2829,8 @@ secret_env = "GW_TEST_WEBHOOK_SECRET"
         std::env::remove_var("BORG_HOME");
     }
 
-    /// The pre-enrichment gate is read-only and policy-driven: `Open` admits
-    /// anyone, `Disabled` nobody, and `Pairing` only a sender already in
-    /// `approved_senders`. It must mint no challenge and count no attempt,
-    /// otherwise the real check later would see a stale pending request.
+    /// Typing shows only for a message the turn will answer: it must be
+    /// addressed (activation) and from a sender the access check admits.
     #[tokio::test]
     async fn typing_waits_on_activation_and_the_sender_gate() {
         let mut open = Config::default();
@@ -2857,6 +2855,10 @@ secret_env = "GW_TEST_WEBHOOK_SECRET"
         assert!(typing_wanted(&open, "slack", &group, Some("@borg")).await);
     }
 
+    /// The pre-enrichment gate is read-only and policy-driven: `Open` admits
+    /// anyone, `Disabled` nobody, and `Pairing` only a sender already in
+    /// `approved_senders`. It must mint no challenge and count no attempt,
+    /// otherwise the real check later would see a stale pending request.
     #[tokio::test]
     async fn sender_may_enrich_follows_policy_and_approval_without_writing() {
         let db = cortex::db::Database::test_db().await;

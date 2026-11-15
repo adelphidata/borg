@@ -1129,7 +1129,6 @@ impl NativeCommandRegistration for TelegramClient {
     }
 }
 
-/// Determine if a network error is safe to retry (no data was sent/received).
 /// Retries after the first attempt of a getFile + download.
 const FILE_FETCH_RETRIES: u32 = 2;
 
@@ -1145,6 +1144,7 @@ impl std::fmt::Display for TransientFetch {
 
 impl std::error::Error for TransientFetch {}
 
+/// Determine if a network error is safe to retry (no data was sent/received).
 fn is_safe_to_retry(err: &reqwest::Error) -> bool {
     err.is_connect() || (err.is_timeout() && err.status().is_none())
 }
@@ -2420,9 +2420,8 @@ mod tests {
         }
     }
 
-    /// `get_file` must trust the `ok` flag, not the mere presence of a
-    /// `result` payload: ok=true yields the file info, ok=false errors even
-    /// with a result attached.
+    /// A read that fails mid-fetch is retried; a refusal Telegram answered
+    /// with `ok: false` is final.
     #[tokio::test]
     async fn fetch_file_retries_a_failed_read_but_not_a_refusal() {
         use wiremock::matchers::{method, path};
@@ -2469,6 +2468,9 @@ mod tests {
         assert!(err.to_string().contains("file is too big"), "{err}");
     }
 
+    /// `get_file` must trust the `ok` flag, not the mere presence of a
+    /// `result` payload: ok=true yields the file info, ok=false errors even
+    /// with a result attached.
     #[tokio::test]
     async fn get_file_honors_the_ok_flag() {
         use wiremock::matchers::{method, path};
