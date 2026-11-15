@@ -1712,10 +1712,7 @@ pub(super) struct PreparedLlmRequest {
 /// right after the summary marker, so the child reads its task before the
 /// recent turns. A brief that survived the fold is left where it is.
 fn restore_subagent_brief(history: &mut Vec<crate::types::Message>, brief: crate::types::Message) {
-    if history
-        .iter()
-        .any(|m| crate::multi_agent::is_subagent_brief(m))
-    {
+    if history.iter().any(crate::multi_agent::is_subagent_brief) {
         return;
     }
     let at = history
