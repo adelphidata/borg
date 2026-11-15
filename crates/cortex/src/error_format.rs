@@ -266,8 +266,8 @@ pub fn format_friendly_error(raw: &str) -> String {
 
         ErrorCategory::ContentPolicy => {
             "The provider refused this content under its usage policy, and a retry \
-             gets the same answer. The refused request was taken out of the conversation, \
-             so rephrase it or switch to another provider to continue."
+             gets the same answer. The refused request was taken out of the conversation. \
+             Rephrase it or switch to another provider to continue."
                 .to_string()
         }
 
