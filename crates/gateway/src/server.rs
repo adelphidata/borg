@@ -3303,6 +3303,24 @@ description = "Script fallback"
         );
     }
 
+    #[test]
+    fn a_flood_refusal_holds_the_redelivery_for_its_own_window() {
+        use crate::telegram::api::TelegramSendError;
+        let flood = |secs| {
+            anyhow::Error::new(TelegramSendError::Flood {
+                retry_after_secs: secs,
+                message: "Too Many Requests".into(),
+            })
+            .context("send to chat")
+        };
+        assert_eq!(redelivery_delay_secs(&flood(300)), 300);
+        assert_eq!(redelivery_delay_secs(&flood(5)), 60);
+        assert_eq!(
+            redelivery_delay_secs(&anyhow::anyhow!("connection reset")),
+            60
+        );
+    }
+
     #[tokio::test]
     async fn drain_redelivers_native_channel_replies() {
         let _guard = crate::test_env::borg_home_guard();
@@ -3555,6 +3573,21 @@ description = "Script fallback"
 /// first attempt sent (`{text, response_context}`), so a reply whose first
 /// send failed, or that a crash left unfinished, is retried here instead of
 /// running out its retries as "channel not found".
+/// Seconds before a failed native redelivery is tried again. Flood control
+/// names its own window, and a send inside it extends the penalty, so that
+/// window is honored when it is longer than the default.
+fn redelivery_delay_secs(error: &anyhow::Error) -> i64 {
+    const DEFAULT_SECS: i64 = 60;
+    match error.downcast_ref::<crate::telegram::api::TelegramSendError>() {
+        Some(crate::telegram::api::TelegramSendError::Flood {
+            retry_after_secs, ..
+        }) => i64::try_from(*retry_after_secs)
+            .unwrap_or(i64::MAX)
+            .max(DEFAULT_SECS),
+        _ => DEFAULT_SECS,
+    }
+}
+
 async fn redeliver_native(
     db: &Database,
     channel: &Arc<dyn channel_trait::NativeChannel>,
@@ -3583,22 +3616,18 @@ async fn redeliver_native(
         .await
     {
         Ok(()) => {
+            // `send_response` records channel health itself.
             if let Err(e) = db.mark_delivered(&delivery.id).await {
                 warn!(delivery_id = %delivery.id, "Failed to persist delivery success status: {e}");
             }
-            health.write().await.record_outbound(&delivery.channel_name);
         }
         Err(e) => {
             let error = format!("{e:#}");
             warn!(delivery_id = %delivery.id, channel = %delivery.channel_name, "redelivery failed: {error}");
-            let next_retry = chrono::Utc::now().timestamp() + 60;
+            let next_retry = chrono::Utc::now().timestamp() + redelivery_delay_secs(&e);
             if let Err(db_err) = db.mark_failed(&delivery.id, &error, Some(next_retry)).await {
                 warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
             }
-            health
-                .write()
-                .await
-                .record_error(&delivery.channel_name, &error);
         }
     }
 }
