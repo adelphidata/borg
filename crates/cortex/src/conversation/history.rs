@@ -71,20 +71,32 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
 /// safety filters judge the whole thread, so leaving the refused request in
 /// history gets every later message refused too.
 ///
-/// The boundary is the last user-authored row, skipping sub-agent notices
-/// (they land mid-turn). A compaction marker is never removed: when it is the
-/// boundary only the rows after it go.
-pub fn drop_current_turn(history: &mut Vec<Message>) -> usize {
-    let Some(idx) = history
-        .iter()
-        .rposition(|m| m.role == Role::User && !crate::multi_agent::is_completion_notice(m))
-    else {
-        return 0;
+/// `opening` is the message the turn started from. Steers and goal
+/// continuations add user rows mid-turn, so the last user row is not the
+/// boundary; the opening is found by identity instead. When it is gone
+/// (a compaction during the turn folded it into the summary), everything
+/// after the last compaction marker goes, and with no marker either, the
+/// last user-authored row is the best boundary left. A compaction marker is
+/// never removed.
+pub fn drop_current_turn(history: &mut Vec<Message>, opening: Option<&Message>) -> usize {
+    let same = |m: &Message, o: &Message| {
+        m.role == o.role && m.timestamp == o.timestamp && m.content == o.content
     };
-    let keep = if is_compaction_marker(&history[idx]) {
-        idx + 1
-    } else {
-        idx
+    let keep = opening
+        .and_then(|o| history.iter().rposition(|m| same(m, o)))
+        .or_else(|| {
+            history
+                .iter()
+                .rposition(is_compaction_marker)
+                .map(|i| i + 1)
+        })
+        .or_else(|| {
+            history
+                .iter()
+                .rposition(|m| m.role == Role::User && !is_agent_authored(m))
+        });
+    let Some(keep) = keep else {
+        return 0;
     };
     let removed = history.len() - keep;
     history.truncate(keep);
@@ -285,20 +297,30 @@ mod tests {
     }
 
     #[test]
-    fn drop_current_turn_removes_the_request_and_the_work_after_it() {
+    fn drop_current_turn_cuts_at_the_turn_opening_not_a_mid_turn_steer() {
+        let opening = make_user("summarize this page");
         let mut history = vec![
             make_user("earlier question"),
             make_assistant("earlier answer"),
-            make_user("the refused request"),
+            opening.clone(),
             make_tool_call_msg("", "c1", "web_fetch"),
-            make_tool_result("c1", "page text"),
+            make_tool_result("c1", "flagged page text"),
+            // A steer lands mid-turn as a user row.
+            make_user("keep it short"),
         ];
-        assert_eq!(drop_current_turn(&mut history), 3);
+        assert_eq!(drop_current_turn(&mut history, Some(&opening)), 4);
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].text_content(), Some("earlier answer"));
 
-        // Nothing to drop in an empty history.
-        assert_eq!(drop_current_turn(&mut Vec::new()), 0);
+        // Opening folded away by a mid-turn compaction: cut after the marker.
+        let mut compacted = vec![
+            crate::conversation::render_compaction_marker("summary of the turn so far"),
+            make_tool_result("c2", "more flagged text"),
+        ];
+        assert_eq!(drop_current_turn(&mut compacted, Some(&opening)), 1);
+        assert_eq!(compacted.len(), 1);
+
+        assert_eq!(drop_current_turn(&mut Vec::new(), None), 0);
     }
 
     // -- normalize_history --
