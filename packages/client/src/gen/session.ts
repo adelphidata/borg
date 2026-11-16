@@ -316,7 +316,12 @@ export interface ErrorEvent {
  * — not part of the LLM stream; clients render as a system cell / toast.
  */
 export interface SystemNotice {
-  /** e.g. "posture", "budget" */
+  /**
+   * e.g. "posture", "budget". "reconnecting" and "rate-limited" describe a
+   * wait (the provider dropped, or asked the client to back off) rather than
+   * an event; a surface replaces one with the next and clears it when the
+   * turn moves again.
+   */
   category: string;
   text: string;
 }
