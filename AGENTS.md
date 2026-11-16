@@ -68,6 +68,8 @@ just web-build       # build apps/web (REQUIRED before cargo build — borgd emb
 just web-dev         # SPA dev server on :5174, proxies /grpc to a local borgd
 just desktop-dev     # Vite + Electron with hot reload
 just web-ci          # everything CI runs for the web side
+just pbt-web         # Bombadil explores the SPA at random against a scratch borgd (packages/pbt)
+just pbt-desktop     # the same for the Electron app, through its remote debugger
 ```
 
 **Generated code is committed.** `packages/client/src/gen` comes from the same protos `crates/protocols/build.rs` compiles for Rust. Change a proto → run `just gen` → commit both sides. The codegen drift step in CI's Web surfaces job fails otherwise.

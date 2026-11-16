@@ -181,3 +181,32 @@ jobs:
         run: bun run --cwd apps/web build
       - name: Build desktop app
         run: bun run --cwd apps/desktop build
+
+  # Bombadil explores the browser SPA at random against a scratch daemon and
+  # checks the properties in packages/pbt/spec. Three minutes finds the
+  # shallow bugs (render loops, stuck overlays, lost drafts); longer soaks run
+  # locally with PBT_TIME_LIMIT. The trace is uploaded on failure so the run
+  # can be inspected and reproduced: see packages/pbt/README.md.
+  pbt:
+    name: Property-based browser tests
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config protobuf-compiler sqlite3
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Build borg and borgd
+        run: cargo build --bin borgd --bin borg
+      - name: Explore the browser SPA
+        run: PBT_TIME_LIMIT=3m packages/pbt/scripts/run-web.sh test
+      - name: Upload the trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bombadil-web
+          path: packages/pbt/output/web
