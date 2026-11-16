@@ -8,6 +8,7 @@
 
 use super::prompts::{PendingPrompt, PromptRegistry};
 use cortex::agent::AgentEvent as CoreEvent;
+use cortex::llm::ReconnectReason;
 use protocols::session as pb;
 use std::sync::Arc;
 
@@ -43,9 +44,20 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::A
         // client is about to sit still for seconds to a minute, and silence
         // reads as a hang. Carried as a notice rather than a new wire kind —
         // it needs no structure a remote surface would act on.
-        CoreEvent::LlmReconnecting { delay_secs, .. } => Kind::SystemNotice(pb::SystemNotice {
+        CoreEvent::LlmReconnecting {
+            delay_secs, reason, ..
+        } => Kind::SystemNotice(pb::SystemNotice {
             category: NOTICE_RECONNECTING.to_string(),
-            text: format!("Reconnecting — waiting for network. Retrying in {delay_secs}s."),
+            text: match reason {
+                ReconnectReason::ConnectionLost => {
+                    format!("Reconnecting — waiting for network. Retrying in {delay_secs}s.")
+                }
+                // The network is fine; naming it would send the user to the
+                // wrong fix. The next action is to wait.
+                ReconnectReason::RateLimited => {
+                    format!("Server is busy — rate limited. Retrying in {delay_secs}s.")
+                }
+            },
         }),
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
         // Every surface behind the wire accumulates the deltas, so each one
@@ -275,6 +287,31 @@ mod tests {
     use cortex::tool_handlers::user_input::{Answer, Question, QuestionOption};
     use std::collections::HashMap;
     use tokio::sync::oneshot;
+
+    /// A rate-limit pause must not be worded as a network fault: the user
+    /// would check their connection when the right move is to wait.
+    #[test]
+    fn reconnect_notice_names_a_rate_limit_as_server_busy_not_network() {
+        let prompts = Arc::new(PromptRegistry::default());
+        let text_for = |reason: ReconnectReason| {
+            let event = CoreEvent::LlmReconnecting {
+                attempt: 0,
+                delay_secs: 20,
+                reason,
+            };
+            let proto = to_proto(event, &prompts).expect("reconnect has a wire form");
+            let pb::agent_event::Kind::SystemNotice(n) = proto.kind.expect("kind") else {
+                panic!("expected SystemNotice");
+            };
+            assert_eq!(n.category, NOTICE_RECONNECTING);
+            n.text
+        };
+        let busy = text_for(ReconnectReason::RateLimited);
+        assert!(busy.contains("busy") && busy.contains("20s"), "{busy}");
+        assert!(!busy.contains("network"), "{busy}");
+        let lost = text_for(ReconnectReason::ConnectionLost);
+        assert!(lost.contains("network") && lost.contains("20s"), "{lost}");
+    }
 
     #[test]
     fn shell_confirmation_extracts_sender_and_assigns_prompt_id() {

@@ -255,6 +255,18 @@ pub struct UsageData {
     pub upstream: Option<String>,
 }
 
+/// Why a stream is paused before a retry. Only the two causes whose wait is
+/// long enough to read as a hang are named; shorter retries stay silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectReason {
+    /// The connection dropped or could not be established.
+    ConnectionLost,
+    /// The provider answered 429 and the client honours its pause. The
+    /// network is fine, so "waiting for network" would send the user to the
+    /// wrong fix.
+    RateLimited,
+}
+
 /// Events emitted during SSE streaming from the LLM.
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -323,15 +335,18 @@ pub enum StreamEvent {
     /// discrete (one per attempt) and originates in the transport, so a hung
     /// tool cannot forge it. Non-terminal.
     AttemptStarted { attempt: u32 },
-    /// The connection to the provider dropped and the client is waiting
-    /// before it tries again. Emitted once per reconnect wait, carrying how
-    /// long that wait is, so a surface can say "reconnecting" instead of
-    /// showing a minute of unexplained silence. Non-terminal.
+    /// The provider is unreachable or has asked the client to back off, and
+    /// the client is waiting before it tries again. Emitted once per such
+    /// wait, carrying how long that wait is and why, so a surface can name
+    /// the pause instead of showing a minute of unexplained silence.
+    /// Non-terminal.
     Reconnecting {
         /// Retry index within the current provider leg (0 for the first).
         attempt: u32,
         /// How long the client will wait before the next attempt.
         delay_secs: u64,
+        /// Why the client is waiting; decides the words a surface shows.
+        reason: ReconnectReason,
     },
     /// Stream completed.
     Done,
@@ -2998,14 +3013,22 @@ impl LlmClient {
                             )
                         };
 
-                        if e.reason() == FailoverReason::ConnectionLost {
-                            // The provider is unreachable, so the pause is
-                            // about to be long. Say so: an unexplained
-                            // minute of silence reads as a hang.
+                        // An unreachable provider, or one that asked for a
+                        // pause, means the wait is about to be long. Say so,
+                        // and say which: an unexplained minute of silence
+                        // reads as a hang, and "waiting for network" during a
+                        // rate limit sends the user to check the wrong thing.
+                        let reconnect_reason = match e.reason() {
+                            FailoverReason::ConnectionLost => Some(ReconnectReason::ConnectionLost),
+                            FailoverReason::RateLimit => Some(ReconnectReason::RateLimited),
+                            _ => None,
+                        };
+                        if let Some(reason) = reconnect_reason {
                             if tx
                                 .send(StreamEvent::Reconnecting {
                                     attempt,
                                     delay_secs: delay.as_secs(),
+                                    reason,
                                 })
                                 .await
                                 .is_err()

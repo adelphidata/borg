@@ -21,7 +21,7 @@ use tracing::{trace, warn};
 
 use crate::hooks::{HookData, HookPoint};
 use crate::internal_tag_filter::InternalTagFilter;
-use crate::llm::StreamEvent;
+use crate::llm::{ReconnectReason, StreamEvent};
 use crate::types::Message;
 
 use super::tool_validation::{apply_tool_call_delta, PartialToolCall};
@@ -283,6 +283,7 @@ impl Agent {
             StreamEvent::Reconnecting {
                 attempt,
                 delay_secs,
+                reason,
             } => {
                 // The wait is about to be seconds-to-a-minute long. Forward it
                 // so the surface can name the pause; without this the turn
@@ -291,11 +292,19 @@ impl Agent {
                 // backoff, and the attempt it announces is counted when
                 // `AttemptStarted` arrives. Counting here too would report one
                 // re-attempt as two.
-                warn!("LLM connection lost; reconnecting in {delay_secs}s (attempt {attempt})");
+                match reason {
+                    ReconnectReason::ConnectionLost => warn!(
+                        "LLM connection lost; reconnecting in {delay_secs}s (attempt {attempt})"
+                    ),
+                    ReconnectReason::RateLimited => {
+                        warn!("LLM rate limited; retrying in {delay_secs}s (attempt {attempt})")
+                    }
+                }
                 if event_tx
                     .send(AgentEvent::LlmReconnecting {
                         attempt,
                         delay_secs,
+                        reason,
                     })
                     .await
                     .is_err()
@@ -602,6 +611,7 @@ mod tests {
             StreamEvent::Reconnecting {
                 attempt: 0,
                 delay_secs: 3,
+                reason: crate::llm::ReconnectReason::ConnectionLost,
             },
             StreamEvent::AttemptStarted { attempt: 1 },
         ] {
@@ -836,6 +846,7 @@ mod tests {
             StreamEvent::Reconnecting {
                 attempt: 0,
                 delay_secs: 5,
+                reason: crate::llm::ReconnectReason::ConnectionLost,
             },
             StreamEvent::AttemptStarted { attempt: 1 },
             delta("The answer is "),

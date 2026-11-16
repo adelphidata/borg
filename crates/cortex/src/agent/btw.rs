@@ -254,6 +254,7 @@ mod tests {
             StreamEvent::Reconnecting {
                 attempt: 0,
                 delay_secs: 1,
+                reason: crate::llm::ReconnectReason::ConnectionLost,
             },
             StreamEvent::AttemptStarted { attempt: 1 },
             delta("The answer is "),

@@ -131,8 +131,10 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
             // event — recording it would perturb every event-sequence assertion
             // in this file.
             StreamEvent::AttemptStarted { .. } => {}
-            StreamEvent::Reconnecting { delay_secs, .. } => {
-                events.push(format!("reconnecting:{delay_secs}"));
+            StreamEvent::Reconnecting {
+                delay_secs, reason, ..
+            } => {
+                events.push(format!("reconnecting:{reason:?}:{delay_secs}"));
             }
         }
     }
@@ -311,6 +313,58 @@ async fn rate_limit_429() {
     if !events.is_empty() {
         assert!(events.iter().any(|e| e.starts_with("error:")));
     }
+}
+
+/// A 429 the client retries used to pass in silence: the reconnect notice
+/// was reserved for a dropped connection, so a `Retry-After` pause looked
+/// like a hang. The pause is now announced, and named as a rate limit so the
+/// surface does not send the user to check their network.
+#[tokio::test]
+async fn rate_limit_retry_announces_a_server_busy_pause() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "1")
+                .set_body_string(r#"{"error":{"message":"rate limited"}}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"content":"after the pause"},"finish_reason":"stop"}]}"#,
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(&server.uri());
+    config.llm.max_retries = 1;
+    let mut client = LlmClient::new(&config).await.expect("client");
+    let (tx, rx) = mpsc::channel(64);
+
+    client
+        .stream_chat(&user_message("hi"), None, tx)
+        .await
+        .expect("the retry after the 429 succeeds");
+
+    let events = collect_events(rx).await;
+    assert!(
+        events.contains(&"reconnecting:RateLimited:1".to_string()),
+        "a retried 429 must announce its pause as a rate limit, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e == "text:after the pause"),
+        "the retry's reply must still arrive, got {events:?}"
+    );
 }
 
 /// Drive one `stream_chat` against a single canned response and return the

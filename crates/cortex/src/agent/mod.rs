@@ -19,7 +19,7 @@ use crate::db::Database;
 use crate::hooks::{HookData, HookPoint, HookRegistry};
 use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::llm_error::{classify_error_text, FailoverReason};
-use crate::llm::{LlmClient, StreamEvent, UsageData};
+use crate::llm::{LlmClient, ReconnectReason, StreamEvent, UsageData};
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::SessionRateGuard;
 use crate::session::Session;
@@ -184,14 +184,16 @@ pub enum AgentEvent {
     /// buffer — see [`retract_text_tail`]. Never sent for a first attempt, a
     /// new tool iteration, or a retry that discards no visible text.
     TextRetracted { bytes: usize },
-    /// The connection to the provider dropped and the client is waiting before
-    /// it tries again. Unlike [`Self::LlmAttemptStarted`] this one *is* for
-    /// display: the wait is long enough that silence would read as a hang.
+    /// The provider is unreachable or rate-limiting, and the client is waiting
+    /// before it tries again. Unlike [`Self::LlmAttemptStarted`] this one *is*
+    /// for display: the wait is long enough that silence would read as a hang.
     LlmReconnecting {
         /// Retry index within the current provider leg.
         attempt: u32,
         /// How long the client will wait before the next attempt.
         delay_secs: u64,
+        /// Why the client is waiting; decides the words a surface shows.
+        reason: ReconnectReason,
     },
     /// Progress update from a spawned sub-agent.
     SubAgentUpdate {

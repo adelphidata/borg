@@ -1485,6 +1485,44 @@ fn a_tool_call_after_new_or_resume_does_not_index_past_the_transcript() {
     }
 }
 
+/// The pause after a 429 is not a network fault. Saying "waiting for
+/// network" sends the user to check a connection that is fine; the status
+/// must name the rate limit, and the next streamed text must replace it.
+#[test]
+fn rate_limit_reconnect_reads_as_server_busy_until_text_resumes() {
+    use cortex::llm::ReconnectReason;
+    let mut app = make_app();
+    app.process_external_event(AgentEvent::Preparing);
+    app.process_external_event(AgentEvent::LlmReconnecting {
+        attempt: 0,
+        delay_secs: 30,
+        reason: ReconnectReason::RateLimited,
+    });
+    assert_eq!(app.stream_status.header, "Server is busy");
+    let details = app.stream_status.details.clone().unwrap_or_default();
+    assert!(details.contains("30s"), "{details}");
+    assert!(!details.contains("network"), "{details}");
+
+    app.process_external_event(AgentEvent::LlmReconnecting {
+        attempt: 0,
+        delay_secs: 5,
+        reason: ReconnectReason::ConnectionLost,
+    });
+    assert_eq!(app.stream_status.header, "Reconnecting");
+    assert!(
+        app.stream_status
+            .details
+            .as_deref()
+            .is_some_and(|d| d.contains("network")),
+        "{:?}",
+        app.stream_status.details
+    );
+
+    app.process_external_event(AgentEvent::TextDelta("back".into()));
+    assert_eq!(app.stream_status.header, "Responding");
+    assert_eq!(app.stream_status.details, None);
+}
+
 #[test]
 fn a_daemon_started_turn_opens_and_closes_like_an_own_one() {
     // A `/heartbeat` fire used to run unseen: the reply only reached the
