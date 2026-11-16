@@ -39,7 +39,7 @@ export function CommandPalette() {
   // Doing this in an effect would queue a second render after every keystroke,
   // which React counts as a nested update and, typed fast enough, cuts off
   // with "Maximum update depth exceeded".
-  const cursor = Math.min(pickedRow, Math.max(0, results.length - 1));
+  const cursor = Math.max(0, Math.min(pickedRow, results.length - 1));
 
   useEffect(() => {
     if (!open) clearSaveError();

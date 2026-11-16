@@ -174,6 +174,11 @@ describe("CommandPalette", () => {
     await waitFor(() => expect(screen.getByText("New conversation")).toBeTruthy());
     fireEvent.keyDown(box(), { key: "ArrowDown" });
     fireEvent.keyDown(box(), { key: "ArrowDown" });
+    // Arrowing on an empty list must not push the cursor below the first row.
+    type("zzzz-nothing");
+    await waitFor(() => expect(screen.getByText("Nothing matches.")).toBeTruthy());
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    fireEvent.keyDown(box(), { key: "ArrowUp" });
     type("usage");
     await waitFor(() => expect(rows().some((r) => r?.includes("Usage"))).toBe(true));
     fireEvent.keyDown(box(), { key: "Enter" });
