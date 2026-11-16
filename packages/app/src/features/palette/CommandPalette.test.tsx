@@ -6,7 +6,7 @@ import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { dispatchKeybind } from "../../lib/keybinds";
 import { SettingsProvider } from "../../lib/settings";
-import { CommandPalette } from "./CommandPalette";
+import { clampCursor, CommandPalette } from "./CommandPalette";
 
 const SETTINGS = {
   GetSettings: {
@@ -313,5 +313,18 @@ describe("CommandPalette row labels", () => {
     open();
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
     expect(screen.getByText("Ship the daemon").getAttribute("title")).toBeNull();
+  });
+});
+
+describe("clampCursor", () => {
+  it("stays on the first row for an empty list and a stale negative pick", () => {
+    expect(clampCursor(0, 0)).toBe(0);
+    expect(clampCursor(-1, 0)).toBe(0);
+    expect(clampCursor(-1, 5)).toBe(0);
+  });
+
+  it("stops at the last row when the list shrinks under the pick", () => {
+    expect(clampCursor(7, 3)).toBe(2);
+    expect(clampCursor(1, 3)).toBe(1);
   });
 });

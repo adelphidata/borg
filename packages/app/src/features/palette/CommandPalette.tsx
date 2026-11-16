@@ -15,6 +15,16 @@ import { useCommands } from "./useCommands";
  * once by `SettingsProvider` — so there is no spinner between the chord and a
  * usable list.
  */
+
+/**
+ * The highlighted row for a picked index against the list now showing: never
+ * past the end, and never below the first row — arrowing on an empty list
+ * leaves a -1 behind that the next list must not inherit.
+ */
+export function clampCursor(picked: number, rows: number): number {
+  return Math.max(0, Math.min(picked, rows - 1));
+}
+
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -39,7 +49,7 @@ export function CommandPalette() {
   // Doing this in an effect would queue a second render after every keystroke,
   // which React counts as a nested update and, typed fast enough, cuts off
   // with "Maximum update depth exceeded".
-  const cursor = Math.max(0, Math.min(pickedRow, results.length - 1));
+  const cursor = clampCursor(pickedRow, results.length);
 
   useEffect(() => {
     if (!open) clearSaveError();
