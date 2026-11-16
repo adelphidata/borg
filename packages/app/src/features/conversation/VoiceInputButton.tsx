@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { useNavigate } from "react-router-dom";
 import { CheckIcon, CloseIcon, MicIcon, Pill } from "@borg/ui";
 import { acceleratorForChord } from "../../lib/chords";
-import { isMacPlatform } from "../../lib/keybinds";
+import { isMacPlatform, useKeybind } from "../../lib/keybinds";
 import { useNative } from "../../lib/platform";
 import { useSettings } from "../../lib/settings";
 import {
@@ -46,6 +46,7 @@ export function VoiceInputButton({
   if (catalog.state === "ready") lastReady.current = catalog.data.transcriptionReady;
   const ready = lastReady.current;
   const [setupOpen, setSetupOpen] = useState(false);
+  const mic = useRef<HTMLButtonElement>(null);
   const [deviceId, setDeviceId] = useState(() => readLocalVoiceChoice("microphone"));
   // Settings writes the choice from another page; pick it up on the next recording.
   useEffect(() => {
@@ -114,9 +115,14 @@ export function VoiceInputButton({
         />
       )}
       {setupOpen && !ready && catalog.state === "ready" && (
-        <SetupCard providers={catalog.data.transcription} onClose={() => setSetupOpen(false)} />
+        <SetupCard
+          providers={catalog.data.transcription}
+          anchor={mic}
+          onClose={() => setSetupOpen(false)}
+        />
       )}
       <button
+        ref={mic}
         type="button"
         // One stable name; the state rides on pressed/busy, as screen readers expect.
         aria-label="Voice input"
@@ -211,11 +217,44 @@ function RecordingBar({
  * What the microphone shows before voice input is set up. One press when a
  * saved chat key can do the job; otherwise the way to Settings.
  */
-function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose: () => void }) {
+function SetupCard({
+  providers,
+  anchor,
+  onClose,
+}: {
+  providers: VoiceProvider[];
+  /** The button that opened the card; its own click toggles, so it is not "outside". */
+  anchor: RefObject<HTMLElement | null>;
+  onClose: () => void;
+}) {
   const navigate = useNavigate();
   const { settings, save, saving } = useSettings();
   const provider = readyProvider(providers);
   const [failed, setFailed] = useState(false);
+  const card = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // It is a dialog, so it behaves like one: focus moves in while it is open
+  // and back to the microphone after, and Escape or a press anywhere else
+  // closes it. While it is up, Escape is its own rather than a running turn's.
+  useKeybind("cancel-turn", () => onCloseRef.current(), { inInputs: true });
+  // A layout effect, so the cleanup still sees the card in the document and
+  // can tell whether focus was inside it before React takes the node out.
+  useLayoutEffect(() => {
+    const opener = anchor.current;
+    card.current?.querySelector<HTMLElement>("button")?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (card.current?.contains(target) || opener?.contains(target)) return;
+      onCloseRef.current();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      if (card.current?.contains(document.activeElement)) opener?.focus();
+    };
+  }, [anchor]);
   const enable = async () => {
     if (!provider || settings.state !== "ready") return;
     setFailed(false);
@@ -227,6 +266,7 @@ function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose
   };
   return (
     <div
+      ref={card}
       role="dialog"
       aria-label="Set up voice input"
       className="absolute right-0 bottom-[calc(100%+8px)] z-20 w-[300px] rounded-[12px] border border-line2 bg-surface2 p-4 shadow-(--plateGlow)"

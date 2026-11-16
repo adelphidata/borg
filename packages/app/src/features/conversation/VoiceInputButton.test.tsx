@@ -177,6 +177,34 @@ describe("VoiceInputButton", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("behaves like a dialog: takes focus, and Escape or a press elsewhere closes it", async () => {
+    mount(
+      fakeDaemon({
+        GetSettings: { entries: [] },
+        GetVoiceCatalog: catalog(false, [provider("openai", "OpenAI", false)]),
+      }),
+    );
+    const mic = await findMic();
+    fireEvent.click(mic);
+    const card = await screen.findByRole("dialog", { name: "Set up voice input" });
+    expect(card.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(mic);
+
+    fireEvent.click(mic);
+    await screen.findByRole("dialog", { name: "Set up voice input" });
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // The microphone's own press is the toggle; it must not close the card
+    // on the way down only to reopen it on the click.
+    fireEvent.click(mic);
+    await screen.findByRole("dialog", { name: "Set up voice input" });
+    fireEvent.pointerDown(mic);
+    expect(screen.getByRole("dialog", { name: "Set up voice input" })).toBeTruthy();
+  });
+
   it("stays hidden in a browser that cannot record, even when set up", async () => {
     vi.stubGlobal("MediaRecorder", undefined);
     const { daemon } = mount(daemonWith(true));
