@@ -75,6 +75,7 @@ export const page = extract((state) => {
     onboarding: d.querySelector('input[aria-label="Agent name"]') !== null,
     dialogs: dialogs.length,
     menus: menus.length,
+    findBars: Array.from(d.querySelectorAll("[role=search]")).filter(visible).length,
     toasts: Array.from(d.querySelectorAll("[role=status][aria-live=polite]")).filter(visible)
       .length,
     h1s: Array.from(d.querySelectorAll("h1")).filter(visible).length,
@@ -119,9 +120,10 @@ export function shellRendered(): boolean {
   return p.sidebar || p.tabs > 0;
 }
 
+/** Everything Escape may close, one layer at a time: dialogs, menus, the find bar. */
 export function overlays(): number {
   const p = page.current;
-  return p.dialogs + p.menus;
+  return p.dialogs + p.menus + p.findBars;
 }
 
 /** The theme the app should be painting, by the same rules as `packages/ui`. */
