@@ -21,13 +21,14 @@ out="$OUTPUT_DIR/desktop"
 app="$REPO_ROOT/apps/desktop"
 mkdir -p "$OUTPUT_DIR"
 
-ensure_binaries
-prepare_home
-start_daemon
-
+# The viewer needs neither the daemon nor the app.
 if [[ "$command" == inspect ]]; then
   exec "$BOMBADIL" browser inspect "${1:-$out}"
 fi
+
+ensure_binaries
+prepare_home
+start_daemon
 
 if [[ "${PBT_BUILD:-0}" == 1 || ! -f "$app/dist/index.html" || ! -f "$app/dist-electron/main.js" ]]; then
   log "building the desktop app"

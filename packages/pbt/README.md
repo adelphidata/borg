@@ -38,10 +38,10 @@ just pbt-web inspect packages/pbt/output/web-shrunk   # the shortest failing tra
 ```
 
 A reproduction needs the same browser, viewport and origin as the original
-run. The runner pins all three (the webui token lives in
-`/tmp/borg-pbt/webui.token` so the origin URL stays stable between runs);
-`PBT_FRESH=1` starts from an empty scratch home when the data itself is the
-problem.
+run. The runner pins all three (the webui token lives beside the scratch
+database so the origin URL stays stable between runs); any extra Bombadil
+flags you passed to `test` must be passed to `reproduce` again. `PBT_FRESH=1`
+starts from an empty scratch home when the data itself is the problem.
 
 ## Layout
 

@@ -19,15 +19,16 @@ spec="$PBT_DIR/spec/web.ts"
 out="$OUTPUT_DIR/web"
 mkdir -p "$OUTPUT_DIR"
 
+# The viewer needs neither the daemon nor the app.
+if [[ "$command" == inspect ]]; then
+  exec "$BOMBADIL" browser inspect "${1:-$out}"
+fi
+
 ensure_binaries
 pin_chrome
 prepare_home
 start_daemon
 issue_token
-
-if [[ "$command" == inspect ]]; then
-  exec "$BOMBADIL" browser inspect "${1:-$out}"
-fi
 
 if [[ "${PBT_WEB_SERVER:-vite}" == gateway ]]; then
   origin="http://127.0.0.1:$PBT_GATEWAY_PORT/ui/#/?token=$TOKEN"

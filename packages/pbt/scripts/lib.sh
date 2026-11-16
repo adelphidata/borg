@@ -52,7 +52,7 @@ credential_unsets() {
 prepare_home() {
   if [[ "${PBT_FRESH:-0}" == 1 ]]; then
     log "wiping $PBT_HOME"
-    rm -rf "$PBT_HOME" "$PBT_ROOT/webui.token" "$PBT_ROOT/electron-data"
+    rm -rf "$PBT_HOME" "$PBT_ROOT/electron-data"
   fi
   [[ -f "$PBT_HOME/borg.db" ]] && return
   mkdir -p "$PBT_HOME"
@@ -99,10 +99,11 @@ start_daemon() {
   die "borgd never opened the gateway; see $PBT_ROOT/borgd.log"
 }
 
-# One webui token per scratch home, kept on disk: the token is part of the
-# origin URL, and a reproduction needs the same origin as the original run.
+# One webui token per scratch home, kept beside its database: the token is
+# part of the origin URL, and a reproduction needs the same origin as the
+# original run. Living inside the home, it goes when the home goes.
 issue_token() {
-  local token_file="$PBT_ROOT/webui.token" out
+  local token_file="$PBT_HOME/webui.token" out
   if [[ -s "$token_file" ]]; then
     TOKEN=$(cat "$token_file")
     return
