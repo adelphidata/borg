@@ -168,6 +168,18 @@ describe("CommandPalette", () => {
     expect(screen.getByTestId("path").textContent).toBe("/usage");
   });
 
+  it("starts a new query from the first row, however far down the old list was", async () => {
+    mount();
+    open();
+    await waitFor(() => expect(screen.getByText("New conversation")).toBeTruthy());
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    type("usage");
+    await waitFor(() => expect(rows().some((r) => r?.includes("Usage"))).toBe(true));
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(screen.getByTestId("path").textContent).toBe("/usage");
+  });
+
   it("forgets the query when it closes", async () => {
     mount();
     open();

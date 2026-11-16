@@ -18,7 +18,7 @@ import { useCommands } from "./useCommands";
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [cursor, setCursor] = useState(0);
+  const [pickedRow, setCursor] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
   useKeybind("command-palette", () => setOpen((v) => !v), { inInputs: true });
@@ -32,16 +32,14 @@ export function CommandPalette() {
 
   const results = useMemo(() => rank(commands, query).slice(0, 40), [commands, query]);
 
-  // A stale cursor from a longer list would point past the end of a shorter one.
-  useEffect(() => setCursor(0), [query]);
-
-  // The list also changes under a stable query: the conversation listing lands
-  // after the palette opens, and a toggle row keeps the palette open across the
-  // snapshot that follows it. A cursor past the new end highlights nothing and
-  // makes Enter a silent no-op.
-  useEffect(() => {
-    setCursor((c) => Math.min(c, Math.max(0, results.length - 1)));
-  }, [results.length]);
+  // The list changes under a stable query too: the conversation listing lands
+  // after the palette opens, and a toggle row keeps the palette open across
+  // the snapshot that follows it. A cursor past the new end would highlight
+  // nothing and make Enter a silent no-op, so it is clamped while rendering.
+  // Doing this in an effect would queue a second render after every keystroke,
+  // which React counts as a nested update and, typed fast enough, cuts off
+  // with "Maximum update depth exceeded".
+  const cursor = Math.min(pickedRow, Math.max(0, results.length - 1));
 
   useEffect(() => {
     if (!open) clearSaveError();
@@ -84,14 +82,19 @@ export function CommandPalette() {
             className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-ink outline-none select-text placeholder:text-ink3"
             placeholder="Search commands, conversations and settings"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              // A new query is a new list; a cursor from the old one would
+              // land on an unrelated row.
+              setCursor(0);
+            }}
             onKeyDown={(e) => {
               if (e.key === "ArrowDown") {
                 e.preventDefault();
-                setCursor((c) => Math.min(results.length - 1, c + 1));
+                setCursor(Math.min(results.length - 1, cursor + 1));
               } else if (e.key === "ArrowUp") {
                 e.preventDefault();
-                setCursor((c) => Math.max(0, c - 1));
+                setCursor(Math.max(0, cursor - 1));
               } else if (isSubmitEnter(e)) {
                 e.preventDefault();
                 choose(results[cursor]);
