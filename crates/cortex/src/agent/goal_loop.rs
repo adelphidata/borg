@@ -381,6 +381,9 @@ impl Agent {
         // One fingerprint for the whole pass: the workspace cannot change
         // between gates, and probing per gate would double the git calls.
         // It feeds the retry cap only, never the decision to run a gate.
+        // Known limit: the scan skips submodule worktrees (see
+        // `git_status_porcelain`), so a fix made only inside a submodule
+        // counts as no progress.
         let fingerprint =
             crate::git::workspace_fingerprint(self.execution_context.workspace_cwd()).await;
         // Both are operator-settable and unvalidated at the settings layer. A

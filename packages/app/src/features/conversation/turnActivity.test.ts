@@ -84,6 +84,18 @@ describe("turnActivity", () => {
     });
   });
 
+  it("names a rate limit as the provider being busy, not unreachable", () => {
+    const retrying: Cell = {
+      kind: "notice",
+      text: "Server is busy — rate limited. Retrying in 20s.",
+      reconnecting: true,
+      rateLimited: true,
+    };
+    expect(turnActivity([user(), assistant(), retrying])).toEqual({
+      label: "Provider is busy, retrying…",
+    });
+  });
+
   it("reads an ordinary notice as an ordinary gap", () => {
     const notice: Cell = { kind: "notice", text: "Posture: reduced" };
     expect(turnActivity([user(), notice])).toEqual({

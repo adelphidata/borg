@@ -241,6 +241,27 @@ describe("reduceEvent — provider retries", () => {
     expect(cells[0]).toMatchObject({ kind: "assistant" });
   });
 
+  it("marks a rate-limit wait as live and as a rate limit", () => {
+    const cells = fold([
+      { systemNotice: { category: "rate-limited", text: "Server is busy. Retrying in 9s." } },
+    ]);
+    expect(cells).toEqual([
+      {
+        kind: "notice",
+        text: "Server is busy. Retrying in 9s.",
+        reconnecting: true,
+        rateLimited: true,
+        at: expect.any(Number),
+      },
+    ]);
+    // The next sign of life takes it down like a network retry notice.
+    const after = fold([
+      { systemNotice: { category: "rate-limited", text: "Server is busy. Retrying in 9s." } },
+      { textDelta: { text: "back" } },
+    ]);
+    expect(after.some((c) => c.kind === "notice")).toBe(false);
+  });
+
   it("leaves an ordinary notice where it is", () => {
     const cells = fold([
       { systemNotice: { category: "posture", text: "Posture: reduced" } },

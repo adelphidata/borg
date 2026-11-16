@@ -319,7 +319,11 @@ message ErrorEvent { string message = 1; }
 // Out-of-band notice from the daemon (posture transitions, budget alerts, …)
 // — not part of the LLM stream; clients render as a system cell / toast.
 message SystemNotice {
-  string category = 1; // e.g. "posture", "budget"
+  // e.g. "posture", "budget". "reconnecting" and "rate-limited" describe a
+  // wait (the provider dropped, or asked the client to back off) rather than
+  // an event; a surface replaces one with the next and clears it when the
+  // turn moves again.
+  string category = 1;
   string text = 2;
 }
 

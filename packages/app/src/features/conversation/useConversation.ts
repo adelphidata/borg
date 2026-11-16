@@ -65,6 +65,8 @@ export interface SentAttachment {
 
 /** `SystemNotice.category` for a provider connection the daemon is redialling. */
 const NOTICE_RECONNECTING = "reconnecting";
+/** `SystemNotice.category` for a provider that asked the daemon to wait (429). */
+const NOTICE_RATE_LIMITED = "rate-limited";
 
 /** What a turn the user cut short says in the transcript. */
 const STOPPED = "Stopped";
@@ -119,6 +121,11 @@ type CellBody =
        * one and removed when the turn moves again.
        */
       reconnecting?: boolean;
+      /**
+       * With `reconnecting`: the provider is up but rate limiting, so the wait
+       * is not a network fault and must not be worded as one.
+       */
+      rateLimited?: boolean;
     }
   | { kind: "error"; text: string }
   | {
@@ -384,6 +391,9 @@ export function reduceEvent(
     const { category, text } = event.systemNotice;
     if (category === NOTICE_RECONNECTING) {
       return [...base, { kind: "notice", text, reconnecting: true, at: now }];
+    }
+    if (category === NOTICE_RATE_LIMITED) {
+      return [...base, { kind: "notice", text, reconnecting: true, rateLimited: true, at: now }];
     }
     return [...base, { kind: "notice", text, at: now }];
   }

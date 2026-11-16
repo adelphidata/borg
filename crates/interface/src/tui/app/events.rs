@@ -200,8 +200,18 @@ impl<'a> App<'a> {
             }
             AgentEvent::Usage(usage) => self.handle_event_usage(usage),
             // Liveness marker for the sub-agent stall watchdog — nothing to
-            // render. The spinner already covers "a request is in flight".
-            AgentEvent::LlmAttemptStarted { .. } => {}
+            // render, except to take down a "Reconnecting" / "Server is busy"
+            // header: the attempt it announced is now in flight, and a short
+            // back-off followed by a long think would otherwise read as the
+            // provider still being down.
+            AgentEvent::LlmAttemptStarted { .. } => {
+                if matches!(
+                    self.stream_status.header.as_str(),
+                    "Reconnecting" | "Server is busy"
+                ) {
+                    self.stream_status.reset();
+                }
+            }
             AgentEvent::TextRetracted { bytes } => self.handle_event_text_retracted(bytes),
             AgentEvent::LlmReconnecting {
                 delay_secs, reason, ..

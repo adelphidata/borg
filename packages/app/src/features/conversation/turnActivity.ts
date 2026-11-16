@@ -130,10 +130,14 @@ export function turnActivity(cells: readonly Cell[]): TurnActivity {
   const last = cells[cells.length - 1];
   if (!last) return WAITING;
 
-  // The provider dropped and the daemon is redialling. Not "Working": nothing
-  // is, and the wait is the provider's.
+  // The provider dropped, or asked the daemon to wait, and the daemon is
+  // retrying. Not "Working": nothing is, and the wait is the provider's. A
+  // rate limit is not an outage, so it must not send the user to check the
+  // network.
   if (last.kind === "notice" && last.reconnecting) {
-    return { label: "Provider unreachable, retrying…" };
+    return {
+      label: last.rateLimited ? "Provider is busy, retrying…" : "Provider unreachable, retrying…",
+    };
   }
 
   switch (last.kind) {

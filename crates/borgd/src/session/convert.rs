@@ -31,6 +31,10 @@ pub const PROMPT_REQUEST_SHELL: &str = "prompt_request:shell";
 /// waiting to retry. Remote surfaces can style it as a transient status
 /// instead of an error — the turn has not failed.
 pub const NOTICE_RECONNECTING: &str = "reconnecting";
+/// `SystemNotice.category` for a provider that asked the client to wait
+/// (429). Separate from [`NOTICE_RECONNECTING`] so a surface can word the wait
+/// as the provider being busy rather than unreachable.
+pub const NOTICE_RATE_LIMITED: &str = "rate-limited";
 
 /// Translate one core event. Returns `None` when the event has no useful wire
 /// representation — currently only `LlmAttemptStarted`, which is an in-process
@@ -46,17 +50,16 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> Option<pb::A
         // it needs no structure a remote surface would act on.
         CoreEvent::LlmReconnecting {
             delay_secs, reason, ..
-        } => Kind::SystemNotice(pb::SystemNotice {
-            category: NOTICE_RECONNECTING.to_string(),
-            text: match reason {
-                ReconnectReason::ConnectionLost => {
-                    format!("Reconnecting — waiting for network. Retrying in {delay_secs}s.")
-                }
-                // The network is fine; naming it would send the user to the
-                // wrong fix. The next action is to wait.
-                ReconnectReason::RateLimited => {
-                    format!("Server is busy — rate limited. Retrying in {delay_secs}s.")
-                }
+        } => Kind::SystemNotice(match reason {
+            ReconnectReason::ConnectionLost => pb::SystemNotice {
+                category: NOTICE_RECONNECTING.to_string(),
+                text: format!("Reconnecting — waiting for network. Retrying in {delay_secs}s."),
+            },
+            // The network is fine; naming it would send the user to the
+            // wrong fix. The next action is to wait.
+            ReconnectReason::RateLimited => pb::SystemNotice {
+                category: NOTICE_RATE_LIMITED.to_string(),
+                text: format!("Server is busy — rate limited. Retrying in {delay_secs}s."),
             },
         }),
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn reconnect_notice_names_a_rate_limit_as_server_busy_not_network() {
         let prompts = Arc::new(PromptRegistry::default());
-        let text_for = |reason: ReconnectReason| {
+        let notice_for = |reason: ReconnectReason| {
             let event = CoreEvent::LlmReconnecting {
                 attempt: 0,
                 delay_secs: 20,
@@ -303,14 +306,23 @@ mod tests {
             let pb::agent_event::Kind::SystemNotice(n) = proto.kind.expect("kind") else {
                 panic!("expected SystemNotice");
             };
-            assert_eq!(n.category, NOTICE_RECONNECTING);
-            n.text
+            n
         };
-        let busy = text_for(ReconnectReason::RateLimited);
-        assert!(busy.contains("busy") && busy.contains("20s"), "{busy}");
-        assert!(!busy.contains("network"), "{busy}");
-        let lost = text_for(ReconnectReason::ConnectionLost);
-        assert!(lost.contains("network") && lost.contains("20s"), "{lost}");
+        let busy = notice_for(ReconnectReason::RateLimited);
+        assert_eq!(busy.category, NOTICE_RATE_LIMITED);
+        assert!(
+            busy.text.contains("busy") && busy.text.contains("20s"),
+            "{}",
+            busy.text
+        );
+        assert!(!busy.text.contains("network"), "{}", busy.text);
+        let lost = notice_for(ReconnectReason::ConnectionLost);
+        assert_eq!(lost.category, NOTICE_RECONNECTING);
+        assert!(
+            lost.text.contains("network") && lost.text.contains("20s"),
+            "{}",
+            lost.text
+        );
     }
 
     #[test]

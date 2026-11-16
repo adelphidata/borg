@@ -115,7 +115,7 @@ Default view shows the smallest control set that finishes the job; the rest sits
 
 **Native click+drag text selection MUST work in the transcript with no modifier keys.** Has regressed multiple times.
 
-**Strategy:** inline viewport via `custom_terminal::Terminal::with_options` + `tui_lifecycle::Tui::insert_history_lines`. Trackpad/wheel scrolls the terminal pane natively. xterm Alternate Scroll Mode (`?1007h`) enabled on alt-screen surfaces. Ctrl+T opens transcript pager for full-text search.
+**Strategy:** inline viewport via `custom_terminal::Terminal::with_options` + `tui_lifecycle::Tui::insert_history_lines`. Trackpad/wheel scrolls the terminal pane natively. xterm Alternate Scroll Mode (`?1007h`) enabled on alt-screen surfaces. Teardown resets it and then re-emits `?1007h` after `?1049l` only when the startup probe saw the terminal had it on (`query_initial_alternate_scroll`). Ctrl+T opens transcript pager for full-text search.
 
 **FORBIDDEN (will regress text selection):** `?1000h`, `?1002h`, `?1003h`, `?1006h`, crossterm `EnableMouseCapture`/`DisableMouseCapture`/`Event::Mouse`/`App::handle_mouse`/`MouseEventKind`, scrollbar click/drag. Guard tests in `crates/interface/src/tui/mod.rs` and `app.rs` use `include_str!` to detect reintroduced patterns — do not weaken.
 

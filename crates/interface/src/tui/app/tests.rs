@@ -1572,6 +1572,18 @@ fn rate_limit_reconnect_reads_as_server_busy_until_text_resumes() {
     app.process_external_event(AgentEvent::TextDelta("back".into()));
     assert_eq!(app.stream_status.header, "Responding");
     assert_eq!(app.stream_status.details, None);
+
+    // The announced attempt starting is sign enough that the pause is over:
+    // a one-second back-off before a long think must not read as "busy".
+    app.process_external_event(AgentEvent::LlmReconnecting {
+        attempt: 1,
+        delay_secs: 1,
+        reason: ReconnectReason::RateLimited,
+    });
+    assert_eq!(app.stream_status.header, "Server is busy");
+    app.process_external_event(AgentEvent::LlmAttemptStarted { attempt: 2 });
+    assert_eq!(app.stream_status.header, "Working");
+    assert_eq!(app.stream_status.details, None);
 }
 
 #[test]
