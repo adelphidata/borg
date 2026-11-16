@@ -104,6 +104,10 @@ start_daemon() {
 # original run. Living inside the home, it goes when the home goes.
 issue_token() {
   local token_file="$PBT_HOME/webui.token" out
+  # The token used to live beside the home; carry it in so old traces still replay.
+  if [[ -s "$PBT_ROOT/webui.token" && ! -s "$token_file" ]]; then
+    mv "$PBT_ROOT/webui.token" "$token_file"
+  fi
   if [[ -s "$token_file" ]]; then
     TOKEN=$(cat "$token_file")
     return

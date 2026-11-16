@@ -21,6 +21,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # The viewer needs neither the daemon nor the app.
 if [[ "$command" == inspect ]]; then
+  [[ -x "$BOMBADIL" ]] || die "bombadil is not installed; run bun install at the repo root"
   exec "$BOMBADIL" browser inspect "${1:-$out}"
 fi
 
