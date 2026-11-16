@@ -28,7 +28,7 @@ import {
 import { ConversationPage } from "./features/conversation/ConversationPage";
 import { usePopCount } from "./features/conversation/conversationUrl";
 import {
-  draftsVersion,
+  draftNamesKey,
   isBlankSession,
   rowTitle,
   subscribeDrafts,
@@ -167,12 +167,16 @@ function Shell({ platform }: { platform: Platform }) {
     },
     [location.key, listVersion],
   );
-  // Same naming rule as the full list: an unsent session is called after what
-  // has been typed into it. The version counter re-renders as that changes.
-  useSyncExternalStore(subscribeDrafts, draftsVersion, draftsVersion);
   if (sessions.state === "ready" && sessions.data.from === client) {
     lastListed.current = sessions.data.list.sessions;
   }
+  // Same naming rule as the full list: an unsent session is called after what
+  // has been typed into it. The snapshot is the names themselves, not the
+  // store's version counter: this is the root of the whole shell, and a
+  // keystroke that leaves every row's name as it was must not re-render the
+  // sidebar, the page and the transcript under it.
+  const draftNames = () => draftNamesKey(lastListed.current);
+  useSyncExternalStore(subscribeDrafts, draftNames, draftNames);
   // One subscription for the whole app; every list reads the store it fills.
   // It also renews this list when a turn ends or a conversation it has never
   // listed starts one, so a reply that lands in the background gets its dot

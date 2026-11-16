@@ -104,6 +104,27 @@ export function draftsVersion(): number {
 }
 
 /**
+ * Snapshot for `useSyncExternalStore` in a list that names its rows: the
+ * draft-derived names of the sessions it shows, as one string.
+ *
+ * The version counter above moves on every keystroke in every composer. A
+ * list that subscribed to it would re-render — and everything under it, the
+ * transcript included — for a keystroke that cannot change what it shows: a
+ * conversation with history keeps its name whatever sits in its composer, and
+ * a draft past its first sixty characters has stopped renaming its row. This
+ * key is the same string across all of those, so such a keystroke costs the
+ * list nothing.
+ */
+export function draftNamesKey(sessions: readonly { id: string; messageCount: number }[]): string {
+  let key = "";
+  for (const s of sessions) {
+    if (s.messageCount > 0) continue;
+    key += `${s.id}=${draftTitle(readDraft(draftKeyFor(s.id)))}\0`;
+  }
+  return key;
+}
+
+/**
  * What to call a session row.
  *
  * The daemon calls a fresh session "New conversation" and the list falls back
