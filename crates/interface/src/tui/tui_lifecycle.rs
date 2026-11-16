@@ -16,6 +16,7 @@ use std::io::Stdout;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
@@ -51,6 +52,10 @@ pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 // alt-screen surface. The terminal itself translates wheel events into
 // CUR_UP / CUR_DOWN key sequences. We never enable mouse tracking modes, so
 // click+drag selection stays handled entirely by the terminal.
+//
+// On exit the mode goes back to whatever the terminal had before borg ran
+// (see `query_initial_alternate_scroll`): some terminals ship with it on, and
+// forcing it off would break wheel scrolling in the user's pager afterwards.
 //
 // FORBIDDEN — DO NOT ADD any of these (each one will regress text selection):
 //   - ?1000h  Normal button tracking
@@ -90,6 +95,69 @@ impl Command for DisableAlternateScroll {
     #[cfg(windows)]
     fn execute_winapi(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Whether the terminal had Alternate Scroll Mode on before borg touched it.
+/// `None` until probed, or when the terminal did not say.
+static INITIAL_ALTERNATE_SCROLL: OnceLock<Option<bool>> = OnceLock::new();
+
+/// Ask the terminal whether Alternate Scroll Mode (`?1007`) is already on, so
+/// teardown can put it back rather than force it off. Alacritty and Ghostty
+/// enable it by default; an unconditional `?1007l` on exit left the wheel dead
+/// in `less`, `man` and `vim` until the user restarted their terminal.
+///
+/// Must run before the event loop starts reading stdin: the reply is consumed
+/// here. Cheap on terminals that do not answer — the query is followed by a
+/// DA1 request, which every terminal answers, so an ignored DECRQM costs no
+/// timeout. An unknown answer is treated as "off", which is the old behaviour.
+pub(crate) fn query_initial_alternate_scroll() {
+    INITIAL_ALTERNATE_SCROLL.get_or_init(probe_alternate_scroll);
+}
+
+/// The probed startup state, defaulting to "off" when unknown or unprobed.
+fn initial_alternate_scroll() -> bool {
+    INITIAL_ALTERNATE_SCROLL
+        .get()
+        .copied()
+        .flatten()
+        .unwrap_or(false)
+}
+
+fn probe_alternate_scroll() -> Option<bool> {
+    // DECRQM for mode 1007, then DA1 (`CSI c`) as a barrier.
+    let reply = super::colors::query_terminal(b"\x1b[?1007$p\x1b[c", da1_reply_complete)?;
+    parse_decrpm_1007(&reply)
+}
+
+/// True once the bytes hold a DA1 reply (`CSI ? ... c`). The DECRPM reply the
+/// probe wants arrives before it, so the probe can stop reading here.
+fn da1_reply_complete(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let Some(start) = rest.windows(3).position(|w| w == b"\x1b[?") {
+        let body = &rest[start + 3..];
+        // The final byte of a CSI sequence is in 0x40..=0x7E; `$` (0x24) in
+        // the DECRPM reply is an intermediate, not a final.
+        match body.iter().position(|b| (0x40..=0x7E).contains(b)) {
+            Some(end) if body[end] == b'c' => return true,
+            Some(end) => rest = &body[end + 1..],
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Parse a DECRPM reply for mode 1007: `CSI ? 1007 ; Ps $ y`, where `Ps` 1 or
+/// 3 means set and 2 or 4 means reset. Anything else, including a terminal
+/// that reports the mode as unrecognised (`0`), is "unknown".
+fn parse_decrpm_1007(bytes: &[u8]) -> Option<bool> {
+    let start = bytes.windows(8).position(|w| w == b"\x1b[?1007;")? + 8;
+    let body = &bytes[start..];
+    let end = body.windows(2).position(|w| w == b"$y")?;
+    match &body[..end] {
+        b"1" | b"3" => Some(true),
+        b"2" | b"4" => Some(false),
+        _ => None,
     }
 }
 
@@ -441,6 +509,15 @@ pub(crate) fn write_enter_alt_screen_sequence(out: &mut impl std::io::Write) -> 
 /// byte-level guard in tests can assert what the terminal actually receives
 /// without needing a tty.
 pub(crate) fn write_restore_sequence(out: &mut impl std::io::Write) -> Result<()> {
+    write_restore_sequence_with(out, initial_alternate_scroll())
+}
+
+/// [`write_restore_sequence`] with the probed startup state passed in, so the
+/// byte-level guard tests can cover both answers without a terminal.
+pub(crate) fn write_restore_sequence_with(
+    out: &mut impl std::io::Write,
+    initial_alternate_scroll: bool,
+) -> Result<()> {
     // Undo the alt-screen surface unconditionally. `Tui::leave_alt_screen` only
     // runs on the normal reconciliation path, so a panic (or `/uninstall`,
     // which enters the alt screen and returns without leaving it) exited with
@@ -450,6 +527,13 @@ pub(crate) fn write_restore_sequence(out: &mut impl std::io::Write) -> Result<()
     // unconditional here.
     let _ = execute!(out, DisableAlternateScroll);
     let _ = execute!(out, LeaveAlternateScreen);
+    // Then hand the mode back as the terminal had it. This comes after
+    // leaving the alt screen: on the main screen `?1007` has no effect, so the
+    // wheel cannot type arrow keys at the shell prompt, while the user's next
+    // pager gets the wheel scrolling it had before borg ran.
+    if initial_alternate_scroll {
+        let _ = execute!(out, EnableAlternateScroll);
+    }
     // Pop may fail on platforms that did not accept the push; ignore errors.
     let _ = execute!(out, PopKeyboardEnhancementFlags);
     execute!(out, DisableBracketedPaste)?;
@@ -1125,16 +1209,80 @@ mod tests {
 
     #[test]
     fn restore_sequence_enables_no_mouse_tracking_mode() {
-        // Teardown must never turn a tracking mode *on*.
-        let mut buf: Vec<u8> = Vec::new();
-        write_restore_sequence(&mut buf).expect("restore sequence writes to buffer");
-        let s = String::from_utf8_lossy(&buf);
-        for forbidden in ["?1000h", "?1002h", "?1003h", "?1006h", "?1007h"] {
-            assert!(
-                !s.contains(forbidden),
-                "teardown emitted mouse-tracking SET `{forbidden}`; captured: {s:?}"
-            );
+        // Teardown must never turn a tracking mode *on*, whatever the
+        // terminal's own alternate-scroll setting was.
+        for initial in [false, true] {
+            let mut buf: Vec<u8> = Vec::new();
+            write_restore_sequence_with(&mut buf, initial)
+                .expect("restore sequence writes to buffer");
+            let s = String::from_utf8_lossy(&buf);
+            for forbidden in ["?1000h", "?1002h", "?1003h", "?1006h"] {
+                assert!(
+                    !s.contains(forbidden),
+                    "teardown emitted mouse-tracking SET `{forbidden}`; captured: {s:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn restore_sequence_hands_alternate_scroll_back_as_the_terminal_had_it() {
+        // A terminal that ships with Alternate Scroll on (Alacritty, Ghostty)
+        // used to lose wheel scrolling in its pagers after borg exited,
+        // because teardown forced `?1007l`. One that had it off must not be
+        // left with it on, or the wheel types arrow keys in a later alt-screen
+        // program that never asked for it.
+        let mut off: Vec<u8> = Vec::new();
+        write_restore_sequence_with(&mut off, false).unwrap();
+        let off = String::from_utf8_lossy(&off);
+        assert!(off.contains("?1007l") && !off.contains("?1007h"), "{off:?}");
+
+        let mut on: Vec<u8> = Vec::new();
+        write_restore_sequence_with(&mut on, true).unwrap();
+        let on = String::from_utf8_lossy(&on);
+        let leave = on.find("?1049l").expect("teardown leaves the alt screen");
+        let re_enable = on.find("?1007h").expect("teardown restores the mode");
+        assert!(
+            on.find("?1007l").is_some_and(|reset| reset < leave) && leave < re_enable,
+            "the mode must be reset before leaving the alt screen and restored after: {on:?}"
+        );
+    }
+
+    #[test]
+    fn decrpm_reply_parses_set_reset_and_unknown() {
+        // DECRPM `Ps`: 1 set, 2 reset, 3 permanently set, 4 permanently
+        // reset, 0 unrecognised.
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1007;1$y"), Some(true));
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1007;3$y"), Some(true));
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1007;2$y"), Some(false));
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1007;4$y"), Some(false));
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1007;0$y"), None);
+        // The DA1 barrier reply alone says nothing about the mode.
+        assert_eq!(parse_decrpm_1007(b"\x1b[?62;22c"), None);
+        // A reply about a different mode must not be read as this one.
+        assert_eq!(parse_decrpm_1007(b"\x1b[?1049;1$y"), None);
+        // Both replies in one read, which is the normal case.
+        assert_eq!(
+            parse_decrpm_1007(b"\x1b[?1007;2$y\x1b[?62;22c"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn probe_stops_reading_at_the_da1_barrier_and_not_before() {
+        // Stopping early would leave the DA1 reply in stdin for the event
+        // loop to misread as keys; never stopping would cost the full timeout.
+        assert!(!da1_reply_complete(b""));
+        assert!(!da1_reply_complete(b"\x1b[?1007;1$y"));
+        assert!(!da1_reply_complete(b"\x1b[?1007;1$y\x1b[?62;2"));
+        assert!(da1_reply_complete(b"\x1b[?1007;1$y\x1b[?62;22c"));
+        // A terminal that ignores DECRQM answers DA1 alone.
+        assert!(da1_reply_complete(b"\x1b[?1;2c"));
+        // `c` inside a DECRPM parameter list is impossible, but a `c` final
+        // byte must be found even when the DECRPM reply precedes it.
+        assert!(da1_reply_complete(
+            b"\x1b[?1007;2$y\x1b[?64;1;2;6;9;15;18;21;22c"
+        ));
     }
 
     #[test]

@@ -63,11 +63,25 @@ pub(super) fn is_light_terminal() -> bool {
 }
 
 /// Send an OSC 10/11 query and parse the terminal's color response.
-/// Briefly enters raw mode, sends the query, reads raw bytes from stdin
-/// using `poll(2)` with a [`TERMINAL_COLOR_PROBE_TIMEOUT`] deadline, then
-/// restores terminal state.
 #[cfg(unix)]
 fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
+    // An OSC reply ends in BEL (\x07) or ST (\x1b\\).
+    let reply = query_terminal(query, |bytes| {
+        bytes.contains(&0x07) || bytes.windows(2).any(|w| w == b"\x1b\\")
+    })?;
+    parse_osc_color_response(&reply)
+}
+
+/// Write `query` to the terminal and read its reply from stdin.
+///
+/// Briefly enters raw mode, sends the query, reads raw bytes using `poll(2)`
+/// with a [`TERMINAL_COLOR_PROBE_TIMEOUT`] deadline — stopping as soon as
+/// `is_complete` says the reply is whole — then restores terminal state.
+/// Returns `None` when nothing arrived before the deadline. Every byte read
+/// is consumed here and never reaches the input loop, so a probe must run
+/// before the TUI starts reading events.
+#[cfg(unix)]
+pub(super) fn query_terminal(query: &[u8], is_complete: impl Fn(&[u8]) -> bool) -> Option<Vec<u8>> {
     use super::constants::TERMINAL_COLOR_PROBE_TIMEOUT;
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
@@ -118,8 +132,7 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
             break;
         }
         total += n;
-        // Check for terminator: BEL (\x07) or ST (\x1b\\)
-        if buf[..total].contains(&0x07) || buf[..total].windows(2).any(|w| w == b"\x1b\\") {
+        if is_complete(&buf[..total]) {
             break;
         }
     }
@@ -131,11 +144,19 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
         return None;
     }
 
-    parse_osc_color_response(&buf[..total])
+    Some(buf[..total].to_vec())
 }
 
 #[cfg(not(unix))]
 fn query_osc_color(_query: &[u8]) -> Option<(u8, u8, u8)> {
+    None
+}
+
+#[cfg(not(unix))]
+pub(super) fn query_terminal(
+    _query: &[u8],
+    _is_complete: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
     None
 }
 

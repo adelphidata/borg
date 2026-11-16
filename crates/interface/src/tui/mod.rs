@@ -564,6 +564,10 @@ pub async fn run(
     // Query terminal background before entering alt screen (some terminals
     // don't respond to the query inside alternate screen).
     colors::query_terminal_bg();
+    // And the terminal's own Alternate Scroll setting, so teardown can hand
+    // it back instead of forcing it off. Before `set_modes`, like the color
+    // probe: the reply is read straight from stdin here.
+    tui_lifecycle::query_initial_alternate_scroll();
 
     tui_lifecycle::set_modes()?;
 
