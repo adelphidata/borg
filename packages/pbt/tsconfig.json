@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@antithesishq/bombadil/browser/extras/resources": [
+        "../../node_modules/@antithesishq/bombadil/dist/browser/extras/resources.d.ts"
+      ]
+    }
+  },
+  "include": ["spec"]
+}

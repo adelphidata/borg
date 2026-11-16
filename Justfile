@@ -191,5 +191,17 @@ desktop-bundle-borgd: web-build
     mkdir -p apps/desktop/resources/bin
     cp target/release/borgd apps/desktop/resources/bin/borgd
 
+# Property-based browser tests (Bombadil) against a scratch daemon. Examples:
+#   just pbt-web                       explore the browser SPA for 3 minutes
+#   PBT_TIME_LIMIT=10m just pbt-web    longer
+#   just pbt-web shrink packages/pbt/output/web --property noUncaughtExceptions
+#   just pbt-web inspect               open the last trace
+pbt-web *args:
+    packages/pbt/scripts/run-web.sh {{args}}
+
+# Same for the desktop app, driven through Electron's remote debugger
+pbt-desktop *args:
+    packages/pbt/scripts/run-desktop.sh {{args}}
+
 # Everything CI runs for the web surfaces
 web-ci: web-install gen-check web-lint web-test web-build desktop-build

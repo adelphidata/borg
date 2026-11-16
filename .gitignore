@@ -79,3 +79,6 @@ apps/desktop/resources/bin/borgd.exe
 # Local UI screenshots for review (not tracked)
 /screenshots/
 /output/*
+
+# Bombadil traces and screenshots
+packages/pbt/output/
