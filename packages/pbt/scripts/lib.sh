@@ -14,7 +14,9 @@ PBT_HOME="$PBT_ROOT/home"
 PBT_GATEWAY_PORT="${PBT_GATEWAY_PORT:-7999}"
 PBT_KEK_PASSPHRASE="${PBT_KEK_PASSPHRASE:-bombadil}"
 PBT_TIME_LIMIT="${PBT_TIME_LIMIT:-3m}"
-BOMBADIL="$REPO_ROOT/node_modules/.bin/bombadil"
+# The package manager may keep the binary in this workspace or hoist it to the root.
+BOMBADIL="$PBT_DIR/node_modules/.bin/bombadil"
+[[ -x "$BOMBADIL" ]] || BOMBADIL="$REPO_ROOT/node_modules/.bin/bombadil"
 OUTPUT_DIR="${PBT_OUTPUT_DIR:-$PBT_DIR/output}"
 
 DAEMON_PID=""
