@@ -35,26 +35,22 @@ function NewSkill({ from }: { from: string | undefined }) {
   const skills = useSkills();
   const source = useSkill(from);
   const [name, setName] = useState("");
-  const [content, setContent] = useState(() => skillTemplate(""));
-  const [touched, setTouched] = useState(false);
+  /** The body once it has been edited by hand; until then it follows the name field. */
+  const [edited, setEdited] = useState<string>();
   const [localError, setLocalError] = useState<string>();
   const [saving, setSaving] = useState(false);
 
-  // The copy arrives after mount; take it unless something has been typed.
-  useEffect(() => {
-    if (!from || touched || source.state !== "ready" || !source.data) return;
-    setContent(source.data.content);
-  }, [from, touched, source]);
-  // Keep the frontmatter name in step with the name field until the body
-  // has been edited by hand — then it is the author's text.
-  useEffect(() => {
-    if (touched) return;
-    setContent((c) =>
-      from && source.state === "ready" && source.data
-        ? withFrontmatterName(c, name.trim() || source.data.entry?.name || "")
-        : skillTemplate(name),
-    );
-  }, [name, touched, from, source]);
+  // Derived while rendering, not written back from an effect: an effect that
+  // sets state on every keystroke is a nested update React cuts off with
+  // "Maximum update depth exceeded" once the typing is fast enough. The copy
+  // arrives after mount and is taken unless something has been typed; the
+  // frontmatter name follows the name field until the body is the author's.
+  const copied = from && source.state === "ready" ? source.data : undefined;
+  const content =
+    edited ??
+    (copied
+      ? withFrontmatterName(copied.content, name.trim() || copied.entry?.name || "")
+      : skillTemplate(name));
 
   const save = () => {
     const id = name.trim();
@@ -107,10 +103,7 @@ function NewSkill({ from }: { from: string | undefined }) {
           className={EDITOR}
           spellCheck={false}
           value={content}
-          onChange={(e) => {
-            setTouched(true);
-            setContent(e.target.value);
-          }}
+          onChange={(e) => setEdited(e.target.value)}
         />
       </div>
       {(localError || skills.error) && (
