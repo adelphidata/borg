@@ -83,8 +83,12 @@ export const themeFollowsPreference = always(() => {
   return p.theme !== null && p.theme === expectedTheme();
 });
 
-/** An open dialog holds keyboard focus. */
-export const dialogHoldsFocus = always(() => page.current.focusInDialog !== false);
+/** An open dialog holds keyboard focus; a click that closes it may take a moment to land. */
+export const dialogHoldsFocus = always(
+  now(() => page.current.focusInDialog === false).implies(
+    eventually(() => page.current.focusInDialog !== false).within(2, "seconds"),
+  ),
+);
 
 /** Escape closes the topmost overlay. */
 export const escapeClosesOverlay = always(() => {
@@ -99,11 +103,16 @@ export const escapeClosesOverlay = always(() => {
     .implies(next(() => overlays() < before));
 });
 
+/** The chat routes: the root resumes the latest conversation, `/c/…` names one. */
+function onConversation(hash: string): boolean {
+  return hash === "" || hash === "#/" || hash.startsWith("#/c/");
+}
+
 /** A draft typed into the composer is still there after a reload. */
 export const draftSurvivesReload = always(() => {
-  const draft = page.current.composer;
-  return now(() => draft !== null && draft.trim() !== "")
-    .and(next(() => lastAction.current === "Reload"))
+  const { composer: draft, hash } = page.current;
+  return now(() => onConversation(hash) && draft !== null && draft.trim() !== "")
+    .and(next(() => lastAction.current === "Reload" && onConversation(page.current.hash)))
     .implies(next(eventually(() => page.current.composer === draft).within(5, "seconds")));
 });
 

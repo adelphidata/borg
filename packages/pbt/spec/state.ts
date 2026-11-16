@@ -20,6 +20,17 @@ function enabled(el: Element): boolean {
   return !(el as HTMLButtonElement).disabled && el.getAttribute("aria-disabled") !== "true";
 }
 
+/**
+ * Drops lone surrogates. Extracted values travel as JSON over the debugger
+ * protocol, and a string cut in the middle of an emoji is not valid there.
+ */
+function clean(text: string): string {
+  return text.replace(
+    /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
+    "",
+  );
+}
+
 /** Text that only ever reaches the screen when a value escaped unformatted. */
 const RAW_VALUE = /\[object Object\]|\bNaN\b|\bundefined\b/;
 
@@ -44,7 +55,10 @@ export const page = extract((state) => {
     // storage blocked: the app falls back to dark, and so does the property
   }
 
-  const composer = d.querySelector<HTMLTextAreaElement>("main textarea[placeholder]");
+  // The chat box only; other pages have textareas of their own.
+  const composer = d.querySelector<HTMLTextAreaElement>(
+    'main textarea[placeholder^="Ask Borg"], main textarea[placeholder^="Steer Borg"], main textarea[placeholder^="Send after this"]',
+  );
 
   return {
     hash: w.location.hash,
@@ -83,11 +97,19 @@ export const page = extract((state) => {
       dialogs.length === 0
         ? null
         : dialogs.some((dialog) => active !== null && dialog.contains(active)),
-    dialogLabels: dialogs.map((dialog) => dialog.getAttribute("aria-label") ?? ""),
+    dialogLabels: dialogs.map((dialog) => clean(dialog.getAttribute("aria-label") ?? "")),
     activeElement: active
-      ? `${active.tagName.toLowerCase()}[${active.getAttribute("aria-label") ?? active.getAttribute("placeholder") ?? active.textContent?.trim().slice(0, 40) ?? ""}]`
+      ? clean(
+          `${active.tagName.toLowerCase()}[${
+            active.getAttribute("aria-label") ??
+            active.getAttribute("placeholder") ??
+            Array.from(active.textContent?.trim() ?? "")
+              .slice(0, 40)
+              .join("")
+          }]`,
+        )
       : null,
-    composer: composer ? composer.value : null,
+    composer: composer ? clean(composer.value) : null,
   };
 });
 
