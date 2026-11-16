@@ -51,8 +51,18 @@ const safeClicks = clicks.filter(
   (action) => !(isAction(action, "Click") && blocked(action.Click.fingerprint)),
 );
 
+/** Enter on a focused control activates it, so it obeys the same block list as a click. */
+function enterIsBlocked(): boolean {
+  const { activeTag, activeLabel, activeHref } = page.current;
+  if (activeHref !== null && /^https?:/i.test(activeHref)) return true;
+  if (activeTag === "button" || activeTag === "a") return BLOCKED_LABELS.test(activeLabel ?? "");
+  return false;
+}
+
 const keys = actions(() =>
-  [ESCAPE, ENTER, TAB, ARROW_UP, ARROW_DOWN].map((code) => ({ PressKey: { code } })),
+  [ESCAPE, ENTER, TAB, ARROW_UP, ARROW_DOWN]
+    .filter((code) => code !== ENTER || !enterIsBlocked())
+    .map((code) => ({ PressKey: { code } })),
 );
 
 /** `mod+<key>` chords the app binds: palette, new chat, sidebar, activity, find, settings. */

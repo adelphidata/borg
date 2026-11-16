@@ -111,6 +111,12 @@ export const page = extract((state) => {
         )
       : null,
     composer: composer ? clean(composer.value) : null,
+    // What Enter would activate: the generator skips it on blocked controls.
+    activeTag: active ? active.tagName.toLowerCase() : null,
+    activeLabel: active
+      ? clean((active.getAttribute("aria-label") ?? active.textContent ?? "").trim())
+      : null,
+    activeHref: active?.getAttribute("href") ?? null,
   };
 });
 
