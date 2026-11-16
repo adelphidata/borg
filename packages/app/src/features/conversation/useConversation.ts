@@ -68,6 +68,12 @@ const NOTICE_RECONNECTING = "reconnecting";
 /** `SystemNotice.category` for a provider that asked the daemon to wait (429). */
 const NOTICE_RATE_LIMITED = "rate-limited";
 
+/**
+ * How long a cleanly closed stream may stay closed before it is an outage.
+ * Long enough for the first redial (about a second) and the reopen it leads to.
+ */
+export const CLEAN_CLOSE_GRACE_MS = 2_500;
+
 /** What a turn the user cut short says in the transcript. */
 const STOPPED = "Stopped";
 
@@ -741,6 +747,18 @@ export function useConversation(target: string | undefined): Conversation {
   const [sendError, setSendError] = useState<BorgError>();
   const [streamError, setStreamError] = useState<BorgError>();
   /**
+   * Counts down from the first clean close to the outage banner. Only an event
+   * or a reopen stops it — not a redial being accepted: a daemon that keeps
+   * accepting a redial only to end it again must still come out as an outage.
+   */
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const streamIsBack = () => {
+    clearTimeout(closeTimer.current);
+    closeTimer.current = undefined;
+    setStreamError(undefined);
+  };
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
+  /**
    * Highest event seq applied. Resuming from this — not from the seq captured
    * at open — is what stops a reconnect from replaying the whole turn.
    */
@@ -885,7 +903,7 @@ export function useConversation(target: string | undefined): Conversation {
       setPlan([]);
       setBusy(false);
       setSendError(undefined);
-      setStreamError(undefined);
+      streamIsBack();
       setContext(undefined);
       setTitle(undefined);
       setGone(false);
@@ -963,7 +981,7 @@ export function useConversation(target: string | undefined): Conversation {
       }
       // An event is proof the session exists, so a later loss earns a new try.
       reopenSpent.current = false;
-      setStreamError(undefined);
+      streamIsBack();
       if (event.turnComplete || event.error) setBusy(false);
       // A turn the daemon started on its own — a resumed one, or a scheduled
       // wake — has no submit to arm the clock, so the first event does it. So
@@ -1018,6 +1036,13 @@ export function useConversation(target: string | undefined): Conversation {
   // A clean `closed` counts as dropped: a turn stream ends when the daemon goes
   // away as readily as when it errors, and the silent case is the worse one —
   // the reply simply stops mid-sentence with nothing on screen to say why.
+  //
+  // But a clean close is also how a session ends on purpose. Archiving the
+  // conversation on screen closes its session, and the resubscribe that
+  // follows reopens it within a moment; the banner would flash "lost the
+  // connection" over a conversation nothing is wrong with. So a close waits
+  // out a grace period before it counts, and a stream that is open again by
+  // then was never an outage. An error frame still shows at once.
   useEffect(() => {
     if (state.status === "open" || !sessionId) return;
     // A missing session is not a lost connection, and is handled below.
@@ -1026,7 +1051,14 @@ export function useConversation(target: string | undefined): Conversation {
     // next restart its own try. A reopen that is missing at once never passes
     // through here, which is what stops that case from looping.
     if (state.error && !reopening.current) reopenSpent.current = false;
-    setStreamError(state.error ?? asBorgError("The connection to Borg ended."));
+    if (state.error) {
+      setStreamError(state.error);
+      return;
+    }
+    closeTimer.current ??= setTimeout(() => {
+      closeTimer.current = undefined;
+      setStreamError(asBorgError("The connection to Borg ended."));
+    }, CLEAN_CLOSE_GRACE_MS);
   }, [state.status, state.error, sessionId]);
 
   // The daemon answers, but no longer has this session: it restarted, or the
@@ -1048,7 +1080,7 @@ export function useConversation(target: string | undefined): Conversation {
     const giveUp = (error: BorgError) => {
       if (!current()) return;
       setGone(true);
-      setStreamError(undefined);
+      streamIsBack();
       setSendError(
         error.code === GrpcStatus.NotFound
           ? new BorgError(
@@ -1087,7 +1119,7 @@ export function useConversation(target: string | undefined): Conversation {
         lastSeq.current = Number(open.lastEventSeq);
         agentSessionId.current = live.agentSessionId;
         stopRequested.current = false;
-        setStreamError(undefined);
+        streamIsBack();
         setSessionId(open.sessionId);
         // The live id usually comes back unchanged, so the id alone would not
         // resubscribe: the stream would wait out its backoff timer instead.

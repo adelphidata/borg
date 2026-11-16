@@ -5,7 +5,7 @@ import { BorgError, GrpcStatus, type session as sessionPb } from "@borg/client";
 import { PlatformProvider } from "../../lib/platform";
 import { SettingsProvider } from "../../lib/settings";
 import { FAILED_PRECONDITION, fakeDaemon } from "../../test/harness";
-import { useConversation, type Conversation } from "./useConversation";
+import { CLEAN_CLOSE_GRACE_MS, useConversation, type Conversation } from "./useConversation";
 
 const OPEN = {
   ListSessions: { sessions: [{ id: "agent-1" }] },
@@ -600,9 +600,35 @@ describe("useConversation stream health", () => {
     const stream = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
 
     act(() => stream.handlers.onComplete?.());
-    await waitFor(() =>
-      expect(conv.current.streamError?.message).toBe("The connection to Borg ended."),
+    // Not at once: a close is also how a session ends on purpose.
+    await waitFor(() => expect(daemon.streams.filter((s) => s.method === "Stream").length).toBe(2));
+    expect(conv.current.streamError).toBeUndefined();
+    // The redial is accepted and ended again: the daemon is going away.
+    act(() =>
+      daemon.streams
+        .filter((s) => s.method === "Stream")
+        .at(-1)!
+        .handlers.onComplete?.(),
     );
+    await waitFor(
+      () => expect(conv.current.streamError?.message).toBe("The connection to Borg ended."),
+      { timeout: CLEAN_CLOSE_GRACE_MS + 2_000 },
+    );
+  });
+
+  it("shows no outage for a close the resubscribe recovers from in time", async () => {
+    // Archiving the conversation on screen closes its session; the redial
+    // finds it gone and reopens it. Nothing was wrong with the connection.
+    const daemon = fakeDaemon(OPEN);
+    const conv = mount(daemon);
+    await ready(conv);
+    const first = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
+    act(() => first.handlers.onComplete?.());
+    await waitFor(() => expect(daemon.streams.filter((s) => s.method === "Stream").length).toBe(2));
+    const second = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
+    act(() => second.handlers.onMessage?.({ seq: 8n } as never));
+    await new Promise((r) => setTimeout(r, CLEAN_CLOSE_GRACE_MS + 300));
+    expect(conv.current.streamError).toBeUndefined();
   });
 
   it("clears the outage once events flow again", async () => {
