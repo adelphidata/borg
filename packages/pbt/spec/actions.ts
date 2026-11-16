@@ -53,8 +53,15 @@ const safeClicks = clicks.filter(
 
 /** Enter on a focused control activates it, so it obeys the same block list as a click. */
 function enterIsBlocked(): boolean {
-  const { activeTag, activeLabel, activeHref } = page.current;
+  const { hash, activeTag, activeLabel, activeHref } = page.current;
   if (activeHref !== null && /^https?:/i.test(activeHref)) return true;
+  // The raw setting editor saves on Enter in its input as well as on its button.
+  if (
+    hash.startsWith("#/settings/key/") &&
+    (activeTag === "input" || /^Sav(e|ing…)$/.test(activeLabel ?? ""))
+  ) {
+    return true;
+  }
   if (activeTag === "button" || activeTag === "a") return BLOCKED_LABELS.test(activeLabel ?? "");
   return false;
 }
