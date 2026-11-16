@@ -119,7 +119,14 @@ export function VoiceInputButton({
           in between, the palette on its chord, say. */}
       {setupOpen && !ready && (
         <SetupCard
-          providers={catalog.state === "ready" ? catalog.data.transcription : undefined}
+          providers={
+            catalog.state === "ready"
+              ? catalog.data.transcription
+              : // A failed read is not still checking: Settings is the way on.
+                catalog.state === "error"
+                ? []
+                : undefined
+          }
           anchor={mic}
           onClose={() => setSetupOpen(false)}
         />
