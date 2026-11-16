@@ -1436,6 +1436,57 @@ async fn a_slow_command_returns_at_once_and_reports_when_done() {
     assert_eq!(done.as_deref(), Some("Done."));
 }
 
+/// Text and thinking that precede a tool call can never receive another
+/// delta: the next response opens its own cells after the tool result. They
+/// used to stay marked as streaming all turn, so the stability walk stopped
+/// at them and every tool cell behind them sat in the height-capped viewport
+/// until the turn ended. A long tool-heavy turn then clipped its own history.
+#[test]
+fn cells_before_a_tool_call_flush_to_scrollback_mid_turn() {
+    for thinking_first in [false, true] {
+        let mut app = make_app();
+        app.process_external_event(AgentEvent::Preparing);
+        if thinking_first {
+            app.process_external_event(AgentEvent::ThinkingDelta("weighing it".into()));
+        }
+        app.process_external_event(AgentEvent::TextDelta("Let me look.".into()));
+        app.process_external_event(AgentEvent::ToolExecuting {
+            tool_call_id: "t1".into(),
+            name: "read_file".into(),
+            args: "{}".into(),
+        });
+        app.process_external_event(AgentEvent::ToolResult {
+            tool_call_id: "t1".into(),
+            name: "read_file".into(),
+            result: "ok".into(),
+            images: Vec::new(),
+        });
+        // Second call in the same turn: the first call's cells are history.
+        app.process_external_event(AgentEvent::Preparing);
+        app.process_external_event(AgentEvent::ToolExecuting {
+            tool_call_id: "t2".into(),
+            name: "read_file".into(),
+            args: "{}".into(),
+        });
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+
+        app.flush_stable_cells(80);
+
+        let last_tool_start = app
+            .cells
+            .iter()
+            .rposition(|c| matches!(c, HistoryCell::ToolStart { .. }))
+            .unwrap();
+        assert_eq!(
+            app.cells_emitted,
+            last_tool_start,
+            "everything before the open tool call must be in scrollback \
+             (thinking_first={thinking_first}, {} cells)",
+            app.cells.len()
+        );
+    }
+}
+
 #[test]
 fn switching_conversations_drops_input_written_for_the_old_one() {
     // Every path into another conversation leaves the old one's input behind:

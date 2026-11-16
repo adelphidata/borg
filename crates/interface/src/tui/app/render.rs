@@ -798,8 +798,13 @@ impl<'a> App<'a> {
             // by the approval key handler; flushing it early would freeze
             // "[y/N]" in scrollback with the resolution never shown.
             HistoryCell::ShellApproval { status, .. } => !matches!(status, ApprovalStatus::Pending),
-            // Thinking placeholders accept further deltas.
-            HistoryCell::Thinking { .. } => false,
+            // Thinking cells accept further deltas until the response they
+            // belong to asks for a tool: after that, deltas go to the next
+            // response's own cells (`handle_event_thinking_delta` only looks
+            // at the last two cells), so the cell is history.
+            HistoryCell::Thinking { .. } => self.cells[idx + 1..]
+                .iter()
+                .any(|c| matches!(c, HistoryCell::ToolStart { .. })),
             // An open ToolStart can still be mutated by a later ToolResult.
             HistoryCell::ToolStart { completed, .. } => *completed,
             // ToolStreaming is bound to its preceding open ToolStart and is

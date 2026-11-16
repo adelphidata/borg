@@ -361,10 +361,25 @@ impl<'a> App<'a> {
     fn handle_event_tool_executing(&mut self, name: String, args: String) {
         // Drop a trailing empty streaming Assistant cell: models sometimes open
         // with a tool call after emitting no text, which would otherwise leave
-        // a dangling cell rendering only the streaming cursor `▊`.
+        // a dangling cell rendering only the streaming cursor `▊`. The same
+        // goes for the empty Thinking placeholder `Preparing` opened when the
+        // response went straight to a tool call.
         if matches!(self.cells.last(), Some(HistoryCell::Assistant { text, .. }) if text.trim().is_empty())
+            || matches!(self.cells.last(), Some(HistoryCell::Thinking { text }) if text.is_empty())
         {
             self.cells.pop();
+        }
+        // The response that asked for this tool is over: text deltas only
+        // ever append to the *last* cell, and the next response opens its
+        // own after the tool result. Finalize what it streamed so the
+        // stability walk can move it into scrollback now, instead of
+        // holding every cell of a tool-heavy turn in the height-capped
+        // viewport until the turn ends.
+        let split = self.cells_emitted.min(self.cells.len());
+        for cell in &mut self.cells[split..] {
+            if let HistoryCell::Assistant { streaming, .. } = cell {
+                *streaming = false;
+            }
         }
         // Status row: "Running <tool>" + a compact args snippet so the user
         // can see *which* call is in flight (e.g. a long-running shell).
@@ -487,11 +502,12 @@ impl<'a> App<'a> {
             })
             .collect();
         self.cells.extend(kept_tail);
-        // Finalize any still-streaming Assistant cell in the un-flushed tail.
-        for cell in self.cells[split..].iter_mut().rev() {
+        // Finalize every still-streaming Assistant cell in the un-flushed
+        // tail, not just the last: the forced flush below renders them, and a
+        // cell still marked streaming skips `collapse_long_lines`.
+        for cell in self.cells[split..].iter_mut() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
-                break;
             }
         }
         // Turn divider, emitted only after turns that did concrete
@@ -578,12 +594,13 @@ impl<'a> App<'a> {
                 cortex::error_format::ErrorContext::Tui,
             ),
         });
-        // Finalize any still-streaming Assistant cell in the un-flushed tail.
+        // Finalize every still-streaming Assistant cell in the un-flushed
+        // tail, not just the last: the forced flush below renders them, and a
+        // cell still marked streaming skips `collapse_long_lines`.
         let split = self.cells_emitted.min(self.cells.len());
-        for cell in self.cells[split..].iter_mut().rev() {
+        for cell in self.cells[split..].iter_mut() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
-                break;
             }
         }
         // Error finalizes the turn; hand the full tail to scrollback now.
@@ -765,10 +782,9 @@ impl<'a> App<'a> {
         };
         self.event_rx = None;
         let split = self.cells_emitted.min(self.cells.len());
-        for cell in self.cells[split..].iter_mut().rev() {
+        for cell in self.cells[split..].iter_mut() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
-                break;
             }
         }
         self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
