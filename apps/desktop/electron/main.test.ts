@@ -233,6 +233,18 @@ describe("main process launch", () => {
     });
   });
 
+  it("leaves the global hotkey alone when BORG_DESKTOP_NO_GLOBAL_HOTKEY is set", async () => {
+    process.env.BORG_DESKTOP_NO_GLOBAL_HOTKEY = "1";
+    try {
+      restores.push(await launch({ dev: true }));
+      expect(spies.registerQuickEntry).toHaveBeenCalledWith(
+        expect.objectContaining({ accelerator: undefined }),
+      );
+    } finally {
+      delete process.env.BORG_DESKTOP_NO_GLOBAL_HOTKEY;
+    }
+  });
+
   it("hands the native bridge a live view of the main window, not a snapshot", async () => {
     // The window can be closed and recreated; a captured reference would send
     // reveals to a destroyed window.

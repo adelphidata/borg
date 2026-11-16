@@ -24,8 +24,14 @@ const appRoot = app.getAppPath();
 const indexHtml = path.join(appRoot, "dist", "index.html");
 const preloadJs = path.join(appRoot, "dist-electron", "preload.js");
 
-/** Summons the quick-entry panel from anywhere in the OS. */
-const QUICK_ENTRY_HOTKEY = acceleratorForChord(QUICK_ENTRY_CHORD);
+/**
+ * Summons the quick-entry panel from anywhere in the OS. A second instance run
+ * by a test harness sets BORG_DESKTOP_NO_GLOBAL_HOTKEY so it cannot take the
+ * hotkey away from the instance the user is working in.
+ */
+const QUICK_ENTRY_HOTKEY = process.env.BORG_DESKTOP_NO_GLOBAL_HOTKEY
+  ? undefined
+  : acceleratorForChord(QUICK_ENTRY_CHORD);
 
 let mainWindow: BrowserWindow | null = null;
 /** Set once a quit is under way, when a renderer that goes away is expected. */
