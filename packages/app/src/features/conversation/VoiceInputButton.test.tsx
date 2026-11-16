@@ -162,6 +162,28 @@ describe("VoiceInputButton", () => {
     );
   });
 
+  it("opens on the click even while the catalog is still loading", async () => {
+    // A card that waited for the catalog would mount late and take focus from
+    // whatever opened in between, so two dialogs would be up at once.
+    let land!: (value: unknown) => void;
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [] },
+      GetVoiceCatalog: () => new Promise((resolve) => (land = resolve)),
+    });
+    mount(daemon);
+    const mic = await findMic();
+    fireEvent.click(mic);
+    const card = await screen.findByRole("dialog", { name: "Set up voice input" });
+    expect(card.textContent).toMatch(/Checking which of your providers/);
+    expect(screen.queryByRole("button", { name: "Open Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Not now" })).toBe(document.activeElement);
+    await act(async () => land(catalog(false, [provider("groq", "Groq", true)])));
+    await waitFor(() =>
+      expect(card.textContent).toMatch(/Your Groq key can turn speech into text/),
+    );
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
   it("points to Settings when no saved key can transcribe", async () => {
     mount(
       fakeDaemon({

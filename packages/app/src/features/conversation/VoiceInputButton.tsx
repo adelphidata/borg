@@ -114,9 +114,12 @@ export function VoiceInputButton({
           onCancel={dictation.cancel}
         />
       )}
-      {setupOpen && !ready && catalog.state === "ready" && (
+      {/* The card opens on the click itself, not when the catalog lands: a
+          dialog that appears a moment late takes focus from whatever opened
+          in between, the palette on its chord, say. */}
+      {setupOpen && !ready && (
         <SetupCard
-          providers={catalog.data.transcription}
+          providers={catalog.state === "ready" ? catalog.data.transcription : undefined}
           anchor={mic}
           onClose={() => setSetupOpen(false)}
         />
@@ -222,14 +225,15 @@ function SetupCard({
   anchor,
   onClose,
 }: {
-  providers: VoiceProvider[];
+  /** Undefined while the catalog is still loading. */
+  providers: VoiceProvider[] | undefined;
   /** The button that opened the card; its own click toggles, so it is not "outside". */
   anchor: RefObject<HTMLElement | null>;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
   const { settings, save, saving } = useSettings();
-  const provider = readyProvider(providers);
+  const provider = providers ? readyProvider(providers) : undefined;
   const [failed, setFailed] = useState(false);
   const card = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -282,9 +286,11 @@ function SetupCard({
     >
       <div className="text-[13.5px] leading-[1.3] font-medium text-ink">Talk instead of typing</div>
       <div className="mt-1.5 text-[12px] leading-[1.45] text-ink3">
-        {provider
-          ? `Your ${provider.label} key can turn speech into text. Turn it on?`
-          : "Borg needs a transcription provider to understand your voice. Pick one in Settings."}
+        {providers === undefined
+          ? "Checking which of your providers can turn speech into text…"
+          : provider
+            ? `Your ${provider.label} key can turn speech into text. Turn it on?`
+            : "Borg needs a transcription provider to understand your voice. Pick one in Settings."}
       </div>
       {failed && (
         <div className="mt-2 text-[12px] leading-[1.45] text-alert">
@@ -299,11 +305,11 @@ function SetupCard({
           <Pill variant="primary" square onClick={() => void enable()}>
             {saving ? "Turning on…" : `Use ${provider.label}`}
           </Pill>
-        ) : (
+        ) : providers ? (
           <Pill variant="primary" square onClick={() => navigate("/settings/voice")}>
             Open Settings
           </Pill>
-        )}
+        ) : null}
       </div>
     </div>
   );
