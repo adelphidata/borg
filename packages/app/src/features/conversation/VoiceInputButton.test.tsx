@@ -203,6 +203,14 @@ describe("VoiceInputButton", () => {
     await screen.findByRole("dialog", { name: "Set up voice input" });
     fireEvent.pointerDown(mic);
     expect(screen.getByRole("dialog", { name: "Set up voice input" })).toBeTruthy();
+
+    // Focus moving to another control (a chord opening the palette) ends it
+    // too; a window blur, where focus goes nowhere, does not.
+    const notNow = screen.getByRole("button", { name: "Not now" });
+    fireEvent.focusOut(notNow, { relatedTarget: null });
+    expect(screen.getByRole("dialog", { name: "Set up voice input" })).toBeTruthy();
+    fireEvent.focusOut(notNow, { relatedTarget: document.body });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("stays hidden in a browser that cannot record, even when set up", async () => {

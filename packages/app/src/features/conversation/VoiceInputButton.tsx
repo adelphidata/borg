@@ -244,14 +244,23 @@ function SetupCard({
   useLayoutEffect(() => {
     const opener = anchor.current;
     card.current?.querySelector<HTMLElement>("button")?.focus();
+    const outside = (target: EventTarget | null) =>
+      target instanceof Node && !card.current?.contains(target) && !opener?.contains(target);
     const onPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (card.current?.contains(target) || opener?.contains(target)) return;
-      onCloseRef.current();
+      if (outside(event.target)) onCloseRef.current();
     };
+    // Focus leaving for another control — the palette opening on its chord,
+    // say — ends the dialog too; two dialogs at once is a focus and Escape
+    // conflict. Focus going nowhere (a window blur) is not leaving.
+    const onFocusOut = (event: FocusEvent) => {
+      if (outside(event.relatedTarget)) onCloseRef.current();
+    };
+    const node = card.current;
     document.addEventListener("pointerdown", onPointerDown);
+    node?.addEventListener("focusout", onFocusOut);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
+      node?.removeEventListener("focusout", onFocusOut);
       if (card.current?.contains(document.activeElement)) opener?.focus();
     };
   }, [anchor]);
