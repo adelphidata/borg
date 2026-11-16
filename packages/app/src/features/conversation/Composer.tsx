@@ -106,7 +106,12 @@ export function Composer({
   onCompact,
 }: ComposerProps) {
   const isMobile = useIsMobile();
-  const [draft, setDraft] = useState("");
+  // Starts from storage rather than restoring in an effect: the effect that
+  // mirrors `draft` back to storage runs in the same pass and would write the
+  // empty initial value first. Under StrictMode's doubled mount that erased
+  // the draft before the second restore could read it, so a reload in dev
+  // emptied the box.
+  const [draft, setDraft] = useState(() => sessionStorage.getItem(draftKey) ?? "");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   /** True once a transcript lands that Settings says to send right away. */
   const sendAfterDictation = useRef(false);

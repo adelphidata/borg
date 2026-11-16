@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { dispatchKeybind, resetKeybinds } from "../../lib/keybinds";
@@ -128,6 +129,27 @@ afterEach(() => {
 });
 
 describe("Composer", () => {
+  it("shows a stored draft on first render, even under StrictMode's doubled mount", () => {
+    // The storage mirror runs in the same effect pass as a restore would. With
+    // StrictMode mounting twice, a restore-by-effect saw the mirror's empty
+    // write and a reload in dev lost the draft.
+    sessionStorage.setItem(draftKeyFor("sess-1"), "half a thought");
+    render(
+      <StrictMode>
+        <Composer
+          busy={false}
+          onSend={noop}
+          onSteer={noop}
+          onCancel={noop}
+          draftKey={draftKeyFor("sess-1")}
+          conversationKey="sess-1"
+        />
+      </StrictMode>,
+    );
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("half a thought");
+    expect(sessionStorage.getItem(draftKeyFor("sess-1"))).toBe("half a thought");
+  });
+
   it("keeps an attachment when a new conversation is issued its id", async () => {
     // `/c/new` types under a provisional key until the daemon answers. An image
     // attached in that window used to vanish silently when the key changed.

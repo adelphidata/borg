@@ -22,7 +22,8 @@ const HEIGHT = 148;
 const VERTICAL_BIAS = 0.28;
 
 export function registerQuickEntry(options: {
-  accelerator: string;
+  /** Global hotkey; `undefined` leaves the panel reachable from the menu only. */
+  accelerator: string | undefined;
   isDev: boolean;
   devServerUrl?: string;
   indexHtml: string;
@@ -89,18 +90,19 @@ export function registerQuickEntry(options: {
     win.focus();
   };
 
-  // A shortcut another app already owns simply does not register; that is a
-  // conflict to report, not a crash.
-  const registered = globalShortcut.register(options.accelerator, toggle);
-  if (!registered) {
-    console.warn(`[borg] quick entry hotkey ${options.accelerator} is already taken`);
+  const { accelerator } = options;
+  if (accelerator) {
+    // A shortcut another app already owns simply does not register; that is a
+    // conflict to report, not a crash.
+    if (!globalShortcut.register(accelerator, toggle)) {
+      console.warn(`[borg] quick entry hotkey ${accelerator} is already taken`);
+    }
+    app.on("will-quit", () => globalShortcut.unregister(accelerator));
   }
-
-  app.on("will-quit", () => globalShortcut.unregister(options.accelerator));
 
   return {
     dispose() {
-      globalShortcut.unregister(options.accelerator);
+      if (accelerator) globalShortcut.unregister(accelerator);
       if (win && !win.isDestroyed()) win.destroy();
       win = null;
     },

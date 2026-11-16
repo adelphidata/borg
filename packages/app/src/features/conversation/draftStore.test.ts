@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  draftNamesKey,
   draftKeyFor,
   draftTitle,
   draftsVersion,
@@ -74,6 +75,34 @@ describe("publishDraft", () => {
     subscribeDrafts(listener)();
     publishDraft(draftKeyFor("a"), "hello");
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("draftNamesKey", () => {
+  const rows = [
+    { id: "fresh", messageCount: 0 },
+    { id: "history", messageCount: 3 },
+  ];
+
+  it("changes when a draft renames an unsent session", () => {
+    const before = draftNamesKey(rows);
+    publishDraft(draftKeyFor("fresh"), "Plan the trip");
+    expect(draftNamesKey(rows)).not.toBe(before);
+    expect(draftNamesKey(rows)).toContain("Plan the trip");
+  });
+
+  it("holds still for a conversation with history, whatever is typed into it", () => {
+    const before = draftNamesKey(rows);
+    publishDraft(draftKeyFor("history"), "a note nobody has sent");
+    expect(draftNamesKey(rows)).toBe(before);
+  });
+
+  it("holds still once a draft is past the characters that name its row", () => {
+    const sixty = "x".repeat(60);
+    publishDraft(draftKeyFor("fresh"), sixty + " and more");
+    const before = draftNamesKey(rows);
+    publishDraft(draftKeyFor("fresh"), sixty + " and more typed after");
+    expect(draftNamesKey(rows)).toBe(before);
   });
 });
 

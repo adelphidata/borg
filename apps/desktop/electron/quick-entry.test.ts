@@ -36,6 +36,13 @@ describe("registerQuickEntry", () => {
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(OPTIONS.accelerator));
   });
 
+  it("registers no hotkey when none is given, and disposes cleanly", () => {
+    const panel = registerQuickEntry({ ...OPTIONS, accelerator: undefined });
+    expect(shortcutState.registered.size).toBe(0);
+    for (const listener of appState.listeners.get("will-quit") ?? []) listener();
+    expect(() => panel.dispose()).not.toThrow();
+  });
+
   it("releases the hotkey when the app quits", () => {
     const panel = registerQuickEntry(OPTIONS);
     for (const listener of appState.listeners.get("will-quit") ?? []) listener();

@@ -6,7 +6,7 @@ import { BorgError, GrpcStatus } from "@borg/client";
 import { fakeDaemon, renderApp } from "../../test/harness";
 import { dispatchKeybind } from "../../lib/keybinds";
 import { SettingsProvider } from "../../lib/settings";
-import { CommandPalette } from "./CommandPalette";
+import { clampCursor, CommandPalette } from "./CommandPalette";
 
 const SETTINGS = {
   GetSettings: {
@@ -168,6 +168,23 @@ describe("CommandPalette", () => {
     expect(screen.getByTestId("path").textContent).toBe("/usage");
   });
 
+  it("starts a new query from the first row, however far down the old list was", async () => {
+    mount();
+    open();
+    await waitFor(() => expect(screen.getByText("New conversation")).toBeTruthy());
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    // Arrowing on an empty list must not push the cursor below the first row.
+    type("zzzz-nothing");
+    await waitFor(() => expect(screen.getByText("Nothing matches.")).toBeTruthy());
+    fireEvent.keyDown(box(), { key: "ArrowDown" });
+    fireEvent.keyDown(box(), { key: "ArrowUp" });
+    type("usage");
+    await waitFor(() => expect(rows().some((r) => r?.includes("Usage"))).toBe(true));
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(screen.getByTestId("path").textContent).toBe("/usage");
+  });
+
   it("forgets the query when it closes", async () => {
     mount();
     open();
@@ -296,5 +313,18 @@ describe("CommandPalette row labels", () => {
     open();
     await waitFor(() => expect(screen.getByText("Ship the daemon")).toBeTruthy());
     expect(screen.getByText("Ship the daemon").getAttribute("title")).toBeNull();
+  });
+});
+
+describe("clampCursor", () => {
+  it("stays on the first row for an empty list and a stale negative pick", () => {
+    expect(clampCursor(0, 0)).toBe(0);
+    expect(clampCursor(-1, 0)).toBe(0);
+    expect(clampCursor(-1, 5)).toBe(0);
+  });
+
+  it("stops at the last row when the list shrinks under the pick", () => {
+    expect(clampCursor(7, 3)).toBe(2);
+    expect(clampCursor(1, 3)).toBe(1);
   });
 });

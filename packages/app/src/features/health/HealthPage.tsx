@@ -304,9 +304,9 @@ export function HealthPage() {
               )}
             </span>
             <div className="flex-1 pt-0.5">
-              <h1 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">
+              <h2 className="m-0 text-[27px] leading-[1.25] font-light tracking-[-0.025em] text-ink">
                 {headline}
-              </h1>
+              </h2>
               <p className="mt-[9px] mb-0 text-[14.5px] leading-[1.6] text-pretty text-ink2">
                 {failing.length > 0 && <>Needs you: {failing.map((c) => c.name).join(", ")}. </>}
                 {unchecked.length > 0 && (

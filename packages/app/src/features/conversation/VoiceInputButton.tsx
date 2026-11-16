@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { useNavigate } from "react-router-dom";
 import { CheckIcon, CloseIcon, MicIcon, Pill } from "@borg/ui";
 import { acceleratorForChord } from "../../lib/chords";
-import { isMacPlatform } from "../../lib/keybinds";
+import { isMacPlatform, useKeybind } from "../../lib/keybinds";
 import { useNative } from "../../lib/platform";
 import { useSettings } from "../../lib/settings";
 import {
@@ -46,6 +46,7 @@ export function VoiceInputButton({
   if (catalog.state === "ready") lastReady.current = catalog.data.transcriptionReady;
   const ready = lastReady.current;
   const [setupOpen, setSetupOpen] = useState(false);
+  const mic = useRef<HTMLButtonElement>(null);
   const [deviceId, setDeviceId] = useState(() => readLocalVoiceChoice("microphone"));
   // Settings writes the choice from another page; pick it up on the next recording.
   useEffect(() => {
@@ -113,10 +114,25 @@ export function VoiceInputButton({
           onCancel={dictation.cancel}
         />
       )}
-      {setupOpen && !ready && catalog.state === "ready" && (
-        <SetupCard providers={catalog.data.transcription} onClose={() => setSetupOpen(false)} />
+      {/* The card opens on the click itself, not when the catalog lands: a
+          dialog that appears a moment late takes focus from whatever opened
+          in between, the palette on its chord, say. */}
+      {setupOpen && !ready && (
+        <SetupCard
+          providers={
+            catalog.state === "ready"
+              ? catalog.data.transcription
+              : // A failed read is not still checking: Settings is the way on.
+                catalog.state === "error"
+                ? []
+                : undefined
+          }
+          anchor={mic}
+          onClose={() => setSetupOpen(false)}
+        />
       )}
       <button
+        ref={mic}
         type="button"
         // One stable name; the state rides on pressed/busy, as screen readers expect.
         aria-label="Voice input"
@@ -211,11 +227,54 @@ function RecordingBar({
  * What the microphone shows before voice input is set up. One press when a
  * saved chat key can do the job; otherwise the way to Settings.
  */
-function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose: () => void }) {
+function SetupCard({
+  providers,
+  anchor,
+  onClose,
+}: {
+  /** Undefined while the catalog is still loading. */
+  providers: VoiceProvider[] | undefined;
+  /** The button that opened the card; its own click toggles, so it is not "outside". */
+  anchor: RefObject<HTMLElement | null>;
+  onClose: () => void;
+}) {
   const navigate = useNavigate();
   const { settings, save, saving } = useSettings();
-  const provider = readyProvider(providers);
+  const provider = providers ? readyProvider(providers) : undefined;
   const [failed, setFailed] = useState(false);
+  const card = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // It is a dialog, so it behaves like one: focus moves in while it is open
+  // and back to the microphone after, and Escape or a press anywhere else
+  // closes it. While it is up, Escape is its own rather than a running turn's.
+  useKeybind("cancel-turn", () => onCloseRef.current(), { inInputs: true });
+  // A layout effect, so the cleanup still sees the card in the document and
+  // can tell whether focus was inside it before React takes the node out.
+  useLayoutEffect(() => {
+    const opener = anchor.current;
+    card.current?.querySelector<HTMLElement>("button")?.focus();
+    const outside = (target: EventTarget | null) =>
+      target instanceof Node && !card.current?.contains(target) && !opener?.contains(target);
+    const onPointerDown = (event: PointerEvent) => {
+      if (outside(event.target)) onCloseRef.current();
+    };
+    // Focus leaving for another control — the palette opening on its chord,
+    // say — ends the dialog too; two dialogs at once is a focus and Escape
+    // conflict. Focus going nowhere (a window blur) is not leaving.
+    const onFocusOut = (event: FocusEvent) => {
+      if (outside(event.relatedTarget)) onCloseRef.current();
+    };
+    const node = card.current;
+    document.addEventListener("pointerdown", onPointerDown);
+    node?.addEventListener("focusout", onFocusOut);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      node?.removeEventListener("focusout", onFocusOut);
+      if (card.current?.contains(document.activeElement)) opener?.focus();
+    };
+  }, [anchor]);
   const enable = async () => {
     if (!provider || settings.state !== "ready") return;
     setFailed(false);
@@ -227,15 +286,18 @@ function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose
   };
   return (
     <div
+      ref={card}
       role="dialog"
       aria-label="Set up voice input"
       className="absolute right-0 bottom-[calc(100%+8px)] z-20 w-[300px] rounded-[12px] border border-line2 bg-surface2 p-4 shadow-(--plateGlow)"
     >
       <div className="text-[13.5px] leading-[1.3] font-medium text-ink">Talk instead of typing</div>
       <div className="mt-1.5 text-[12px] leading-[1.45] text-ink3">
-        {provider
-          ? `Your ${provider.label} key can turn speech into text. Turn it on?`
-          : "Borg needs a transcription provider to understand your voice. Pick one in Settings."}
+        {providers === undefined
+          ? "Checking which of your providers can turn speech into text…"
+          : provider
+            ? `Your ${provider.label} key can turn speech into text. Turn it on?`
+            : "Borg needs a transcription provider to understand your voice. Pick one in Settings."}
       </div>
       {failed && (
         <div className="mt-2 text-[12px] leading-[1.45] text-alert">
@@ -250,11 +312,11 @@ function SetupCard({ providers, onClose }: { providers: VoiceProvider[]; onClose
           <Pill variant="primary" square onClick={() => void enable()}>
             {saving ? "Turning on…" : `Use ${provider.label}`}
           </Pill>
-        ) : (
+        ) : providers ? (
           <Pill variant="primary" square onClick={() => navigate("/settings/voice")}>
             Open Settings
           </Pill>
-        )}
+        ) : null}
       </div>
     </div>
   );

@@ -41,37 +41,51 @@ export function useFindInTranscript(
   const [focusRequest, setFocusRequest] = useState(0);
   const matches = useRef<Range[]>([]);
 
-  // One effect owns the painted state: it derives the ranges, paints them, and
-  // scrubs them when the bar closes. Splitting the paint from the derive is how
-  // a stale highlight outlives the thing that made it.
+  // Derives the ranges for a query and records how many there are. A query
+  // that narrowed to nothing takes its predecessor's paint with it, or the bar
+  // says "None" over highlights still lit from the last one.
+  const derive = (next: string) => {
+    const root = scope.current;
+    const found = next === "" || !root ? [] : findRanges(root, next);
+    matches.current = found;
+    setCount(found.length);
+    if (found.length === 0) clearRanges();
+    return found;
+  };
+  // The effect below re-derives when the transcript changes, so it needs the
+  // query without being keyed on it: a keystroke derives in its own handler.
+  // Deriving keystrokes in an effect would set state after every commit, which
+  // React counts as a nested update and, typed fast enough, cuts off with
+  // "Maximum update depth exceeded".
+  const queryRef = useRef(query);
+  queryRef.current = query;
+
+  // Re-derives when the bar opens or the transcript underneath it changes, and
+  // scrubs the paint when the bar closes. Splitting the paint from the derive
+  // is how a stale highlight outlives the thing that made it.
   useEffect(() => {
-    if (!open || query === "") {
+    if (!open || queryRef.current === "") {
       matches.current = [];
       setCount(0);
       clearRanges();
       return;
     }
-    const root = scope.current;
-    const found = root ? findRanges(root, query) : [];
-    matches.current = found;
-    setCount(found.length);
+    const found = derive(queryRef.current);
     setAt((current) => wrapIndex(current, found.length));
-    // A query that narrowed to nothing must take its predecessor's paint with
-    // it, or the bar says "None" over highlights still lit from the last one.
-    if (found.length === 0) clearRanges();
-  }, [open, query, revision, scope]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, revision, scope]);
 
-  // Painting reads `at`, so it is a second pass over the ranges the effect above
-  // derived — stepping between matches must not re-walk the whole transcript.
-  // `revision` is a dependency here too: a re-render that happens to leave the
-  // count unchanged still hands the effect above a fresh set of ranges, and the
-  // registry would otherwise keep painting the dead ones.
+  // Painting reads `at`, so it is a second pass over the ranges derived above —
+  // stepping between matches must not re-walk the whole transcript. `revision`
+  // and `query` are dependencies too: a re-render that happens to leave the
+  // count and position unchanged still hands this a fresh set of ranges, and
+  // the registry would otherwise keep painting the dead ones.
   useEffect(() => {
     if (!open || matches.current.length === 0) return;
     const current = matches.current[wrapIndex(at, matches.current.length)];
     paintRanges(matches.current, current);
     if (current) revealRange(current, scope.current?.parentElement ?? null);
-  }, [open, at, count, revision, scope]);
+  }, [open, at, count, query, revision, scope]);
 
   useEffect(() => clearRanges, []);
 
@@ -94,6 +108,9 @@ export function useFindInTranscript(
       // A new query starts from the first match, not from wherever the last one
       // left off — the old position means nothing in the new results.
       setAt(0);
+      // The transcript has not changed under a keystroke, so its ranges can be
+      // derived here, in the same batch as the query itself.
+      if (open) derive(next);
     },
     count,
     position: count === 0 ? 0 : wrapIndex(at, count) + 1,

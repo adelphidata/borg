@@ -162,6 +162,28 @@ describe("VoiceInputButton", () => {
     );
   });
 
+  it("opens on the click even while the catalog is still loading", async () => {
+    // A card that waited for the catalog would mount late and take focus from
+    // whatever opened in between, so two dialogs would be up at once.
+    let land!: (value: unknown) => void;
+    const daemon = fakeDaemon({
+      GetSettings: { entries: [] },
+      GetVoiceCatalog: () => new Promise((resolve) => (land = resolve)),
+    });
+    mount(daemon);
+    const mic = await findMic();
+    fireEvent.click(mic);
+    const card = await screen.findByRole("dialog", { name: "Set up voice input" });
+    expect(card.textContent).toMatch(/Checking which of your providers/);
+    expect(screen.queryByRole("button", { name: "Open Settings" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Not now" })).toBe(document.activeElement);
+    await act(async () => land(catalog(false, [provider("groq", "Groq", true)])));
+    await waitFor(() =>
+      expect(card.textContent).toMatch(/Your Groq key can turn speech into text/),
+    );
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
   it("points to Settings when no saved key can transcribe", async () => {
     mount(
       fakeDaemon({
@@ -174,6 +196,42 @@ describe("VoiceInputButton", () => {
     expect(card.textContent).toMatch(/Pick one in Settings/);
     expect(screen.getByRole("button", { name: "Open Settings" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Not now" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("behaves like a dialog: takes focus, and Escape or a press elsewhere closes it", async () => {
+    mount(
+      fakeDaemon({
+        GetSettings: { entries: [] },
+        GetVoiceCatalog: catalog(false, [provider("openai", "OpenAI", false)]),
+      }),
+    );
+    const mic = await findMic();
+    fireEvent.click(mic);
+    const card = await screen.findByRole("dialog", { name: "Set up voice input" });
+    expect(card.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(mic);
+
+    fireEvent.click(mic);
+    await screen.findByRole("dialog", { name: "Set up voice input" });
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // The microphone's own press is the toggle; it must not close the card
+    // on the way down only to reopen it on the click.
+    fireEvent.click(mic);
+    await screen.findByRole("dialog", { name: "Set up voice input" });
+    fireEvent.pointerDown(mic);
+    expect(screen.getByRole("dialog", { name: "Set up voice input" })).toBeTruthy();
+
+    // Focus moving to another control (a chord opening the palette) ends it
+    // too; a window blur, where focus goes nowhere, does not.
+    const notNow = screen.getByRole("button", { name: "Not now" });
+    fireEvent.focusOut(notNow, { relatedTarget: null });
+    expect(screen.getByRole("dialog", { name: "Set up voice input" })).toBeTruthy();
+    fireEvent.focusOut(notNow, { relatedTarget: document.body });
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 

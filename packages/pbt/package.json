@@ -1,0 +1,17 @@
+{
+  "name": "@borg/pbt",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Property-based browser tests for the web and desktop surfaces (Bombadil)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "pbt:web": "./scripts/run-web.sh test",
+    "pbt:desktop": "./scripts/run-desktop.sh test"
+  },
+  "devDependencies": {
+    "@antithesishq/bombadil": "^0.7.10",
+    "typescript": "^7.0.2"
+  }
+}
