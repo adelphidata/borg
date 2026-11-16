@@ -103,17 +103,25 @@ export const escapeClosesOverlay = always(() => {
     .implies(next(() => overlays() < before));
 });
 
-/** The chat routes: the root resumes the latest conversation, `/c/…` names one. */
-function onConversation(hash: string): boolean {
-  return hash === "" || hash === "#/" || hash.startsWith("#/c/");
-}
-
-/** A draft typed into the composer is still there after a reload. */
+/**
+ * A draft typed into a conversation is still there after a reload of that
+ * conversation, for as long as the conversation stays on screen. Only `/c/<id>`
+ * names one: the root resumes whichever conversation is newest, and `/c/new`
+ * is rewritten to the id the daemon issues.
+ */
 export const draftSurvivesReload = always(() => {
   const { composer: draft, hash } = page.current;
-  return now(() => onConversation(hash) && draft !== null && draft.trim() !== "")
-    .and(next(() => lastAction.current === "Reload" && onConversation(page.current.hash)))
-    .implies(next(eventually(() => page.current.composer === draft).within(5, "seconds")));
+  const named = /^#\/c\/(?!new$)/.test(hash);
+  return now(() => named && draft !== null && draft.trim() !== "")
+    .and(next(() => lastAction.current === "Reload" && page.current.hash === hash))
+    .implies(
+      next(
+        eventually(() => page.current.hash !== hash || page.current.composer === draft).within(
+          5,
+          "seconds",
+        ),
+      ),
+    );
 });
 
 /**
