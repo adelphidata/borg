@@ -1355,6 +1355,42 @@ fn missing_required_args(schema: &Value, args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Argument keys a closed schema (`additionalProperties: false`) does not
+/// declare. Servers built on schema validators that strip unknown keys answer
+/// such a call with a normal default result, so the model never learns its
+/// misspelled argument was dropped. Open schemas, and schemas whose shape is
+/// decided by a combinator, are left to the server.
+fn undeclared_args(schema: &Value, args: &Value) -> Vec<String> {
+    let closed = schema.get("additionalProperties") == Some(&Value::Bool(false));
+    let combined = ["anyOf", "oneOf", "allOf", "patternProperties", "$ref"]
+        .iter()
+        .any(|key| schema.get(key).is_some());
+    let (true, false, Some(args)) = (closed, combined, args.as_object()) else {
+        return Vec::new();
+    };
+    let declared = schema.get("properties").and_then(Value::as_object);
+    args.keys()
+        .filter(|key| declared.is_none_or(|props| !props.contains_key(*key)))
+        .cloned()
+        .collect()
+}
+
+/// Build the not-dispatched refusal for a call carrying [`undeclared_args`].
+fn undeclared_args_refusal(full_name: &str, input_schema: &Value, unknown: &[String]) -> String {
+    let declared: Vec<&String> = input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|props| props.keys().collect())
+        .unwrap_or_default();
+    serde_json::json!({
+        "error": format!("unknown argument(s): {}", unknown.join(", ")),
+        "tool": full_name,
+        "valid_arguments": declared,
+        "note": "The call was not dispatched. This tool accepts only the listed arguments; fix the argument names and call it again.",
+    })
+    .to_string()
+}
+
 /// Ceiling on the compact-serialized `input_schema` echoed in a blind-call
 /// refusal. The refusal exists to make the model's *immediate* retry
 /// informed, not to re-transmit an arbitrarily large schema into the
@@ -1466,6 +1502,14 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
             &tool.full_name,
             &tool.input_schema,
             &missing,
+        ))));
+    }
+    let unknown = undeclared_args(&tool.input_schema, args);
+    if !unknown.is_empty() {
+        return Ok(Some(ToolOutput::Text(undeclared_args_refusal(
+            &tool.full_name,
+            &tool.input_schema,
+            &unknown,
         ))));
     }
 
@@ -4823,6 +4867,76 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["tools"].as_array().unwrap().is_empty());
         assert!(v["note"].as_str().unwrap().contains("no MCP tools matched"));
+    }
+
+    #[test]
+    fn undeclared_args_only_fire_on_a_closed_plain_schema() {
+        let props = serde_json::json!({"level": {"type": "string"}, "limit": {"type": "integer"}});
+        let closed = serde_json::json!({
+            "type": "object", "properties": props, "additionalProperties": false
+        });
+        let typo = serde_json::json!({"levle": "error", "limit": 5});
+        // (name, schema, args, expected undeclared keys)
+        let cases: Vec<(&str, Value, Value, Vec<&str>)> = vec![
+            (
+                "misspelled key",
+                closed.clone(),
+                typo.clone(),
+                vec!["levle"],
+            ),
+            (
+                "declared keys only",
+                closed.clone(),
+                serde_json::json!({"level": "error"}),
+                vec![],
+            ),
+            ("no args", closed.clone(), Value::Null, vec![]),
+            (
+                "open schema",
+                serde_json::json!({"type": "object", "properties": props}),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "additionalProperties as a schema",
+                serde_json::json!({
+                    "type": "object", "properties": props,
+                    "additionalProperties": {"type": "string"}
+                }),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "union-shaped schema",
+                serde_json::json!({
+                    "type": "object", "properties": props, "additionalProperties": false,
+                    "oneOf": [{"required": ["level"]}, {"required": ["levle"]}]
+                }),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "closed schema with no properties",
+                serde_json::json!({"type": "object", "additionalProperties": false}),
+                serde_json::json!({"anything": 1}),
+                vec!["anything"],
+            ),
+        ];
+        for (name, schema, args, expected) in cases {
+            assert_eq!(undeclared_args(&schema, &args), expected, "case: {name}");
+        }
+
+        let refusal: Value = serde_json::from_str(&undeclared_args_refusal(
+            "mcp_browser_console",
+            &closed,
+            &["levle".to_string()],
+        ))
+        .unwrap();
+        assert_eq!(refusal["error"], "unknown argument(s): levle");
+        assert_eq!(
+            refusal["valid_arguments"],
+            serde_json::json!(["level", "limit"])
+        );
     }
 
     #[test]

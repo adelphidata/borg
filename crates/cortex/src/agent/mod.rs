@@ -84,6 +84,25 @@ enum BudgetCheck {
 ///
 /// A warning is a notice, not an error: the turn goes on and succeeds, and a
 /// headless caller maps an error event to a failed exit code.
+/// How the loop recovers from a request the provider rejected as too big.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OversizeRecovery {
+    /// Over the context window: compact, then retry.
+    RetryAfterCompaction,
+    /// Over a byte cap: compact, and retry only if the history got smaller —
+    /// compaction counts tokens, so it may not shrink a byte-heavy request.
+    RetryIfCompactionShrinks,
+}
+
+/// Whether a failed request should be answered by compacting the history.
+fn oversize_recovery(err_msg: &str) -> Option<OversizeRecovery> {
+    match classify_error_text(err_msg)? {
+        FailoverReason::ContextOverflow => Some(OversizeRecovery::RetryAfterCompaction),
+        FailoverReason::PayloadTooLarge => Some(OversizeRecovery::RetryIfCompactionShrinks),
+        _ => None,
+    }
+}
+
 fn budget_check_events(check: BudgetCheck) -> (Vec<AgentEvent>, bool) {
     match check {
         BudgetCheck::Ok => (Vec::new(), false),
@@ -1703,16 +1722,22 @@ impl Agent {
             // iteration rather than surfacing the error. Tool_calls may be
             // mid-stream garbage from the failed call — discard them.
             if let Some(err_msg) = &stream_error {
-                if !reactive_compacted_this_turn
-                    && classify_error_text(err_msg) == Some(FailoverReason::ContextOverflow)
-                {
+                let recovery = oversize_recovery(err_msg);
+                if !reactive_compacted_this_turn && recovery.is_some() {
                     reactive_compacted_this_turn = true;
-                    warn!("Reactive compaction triggered by provider context overflow: {err_msg}");
+                    warn!("Reactive compaction triggered by an oversized request: {err_msg}");
+                    let before_tokens = history_tokens(&self.history);
                     self.reactive_compact_history(&event_tx).await?;
-                    // Discard partial stream state (stream_error, tool_calls,
-                    // tag_filter are re-bound at the top of the outer loop).
-                    self.retract_emitted_text(&event_tx).await;
-                    continue;
+                    if recovery == Some(OversizeRecovery::RetryAfterCompaction)
+                        || history_tokens(&self.history) < before_tokens
+                    {
+                        // Discard partial stream state (stream_error, tool_calls,
+                        // tag_filter are re-bound at the top of the outer loop).
+                        self.retract_emitted_text(&event_tx).await;
+                        continue;
+                    }
+                    // A byte cap that compaction did not shrink would only be
+                    // rejected again — fall through and surface the error.
                 }
             }
 

@@ -3,7 +3,7 @@
 /// re-entering context on replay. Matching is ASCII case-insensitive
 /// (`<Thinking>`, `<THINK>`, … are stripped too) — names here must be
 /// lowercase.
-const STRIPPED_TAGS: &[&str] = &["internal", "thinking", "think", "reasoning"];
+const STRIPPED_TAGS: &[&str] = &["internal", "thinking", "think", "reasoning", "mm:think"];
 
 /// Strip `<internal>`, `<thinking>`, `<think>` and `<reasoning>` blocks
 /// (tag names matched ASCII case-insensitively) from text to prevent
@@ -169,6 +169,20 @@ mod tests {
     fn strip_internal_tags_unclosed() {
         let input = "Hello <internal>never closed";
         assert_eq!(strip_internal_tags(input), "Hello ");
+    }
+
+    #[test]
+    fn namespaced_reasoning_tag_is_stripped_whole_and_streamed() {
+        assert_eq!(
+            strip_internal_tags("<mm:think>plan the answer</mm:think>Done."),
+            "Done."
+        );
+        let mut filter = InternalTagFilter::new();
+        let mut shown = String::new();
+        for piece in ["Hi <mm:", "think>hidden</mm:th", "ink> there"] {
+            shown.push_str(&filter.push(piece).unwrap_or_default());
+        }
+        assert_eq!(shown, "Hi  there");
     }
 
     #[test]

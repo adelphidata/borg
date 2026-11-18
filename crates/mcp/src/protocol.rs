@@ -504,12 +504,34 @@ pub fn render_call_result(result: &ToolCallResult) -> String {
     // A server may mirror the structured payload as JSON text for older
     // clients. Value equality ignores key order and whitespace, so the
     // same data is not sent to the LLM twice.
-    if serde_json::from_str::<serde_json::Value>(&out).is_ok_and(|text| text == *structured) {
+    if mirrors_text(structured, &out)
+        || unwrap_result(structured).is_some_and(|v| mirrors_text(v, &out))
+    {
         return out;
     }
     out.push_str(STRUCTURED_CONTENT_HEADER);
     out.push_str(&structured.to_string());
     out
+}
+
+/// Whether `text` already carries `value`: either it parses to the same JSON,
+/// or `value` is a string and `text` is that string verbatim.
+fn mirrors_text(value: &serde_json::Value, text: &str) -> bool {
+    value.as_str() == Some(text)
+        || serde_json::from_str::<serde_json::Value>(text).is_ok_and(|parsed| parsed == *value)
+}
+
+/// The value inside a `{"result": value}` wrapper. Server frameworks that
+/// cannot put a bare string, number or list in `structuredContent` wrap it
+/// this way and send the bare value as the text block. An object with any
+/// other key is real structure, not a wrapper.
+fn unwrap_result(structured: &serde_json::Value) -> Option<&serde_json::Value> {
+    let object = structured.as_object()?;
+    if object.len() == 1 {
+        object.get("result")
+    } else {
+        None
+    }
 }
 
 /// Separator between the rendered content blocks and the structured payload.
@@ -1007,6 +1029,36 @@ mod tests {
                 "JSON text with different data keeps both",
                 r#"{"content":[{"type":"text","text":"{\"a\":1}"}],"structuredContent":{"a":2}}"#,
                 "{\"a\":1}\n\n[structured content]\n{\"a\":2}",
+                false,
+            ),
+            (
+                "bare string wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"hello world"}],"structuredContent":{"result":"hello world"}}"#,
+                "hello world",
+                false,
+            ),
+            (
+                "bare number wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"42"}],"structuredContent":{"result":42}}"#,
+                "42",
+                false,
+            ),
+            (
+                "list wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"[1, 2]"}],"structuredContent":{"result":[1,2]}}"#,
+                "[1, 2]",
+                false,
+            ),
+            (
+                "result wrapper with a different value keeps both",
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"goodbye"}}"#,
+                "hello\n\n[structured content]\n{\"result\":\"goodbye\"}",
+                false,
+            ),
+            (
+                "result beside another key is real structure",
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"hello","id":7}}"#,
+                "hello\n\n[structured content]\n{\"id\":7,\"result\":\"hello\"}",
                 false,
             ),
             (

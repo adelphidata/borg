@@ -844,13 +844,20 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         Some(ch) if !ch.trim().is_empty() => format!("\n    Failure notices: {ch}"),
         _ => String::new(),
     };
+    // A cron hour means nothing without its zone: `0 9 * * *` pinned to
+    // Tokyo reads as the reader's own 09:00 unless the zone is shown.
+    let zone = match task.timezone.as_str() {
+        "" | "UTC" | "utc" => String::new(),
+        tz => format!(" ({tz})"),
+    };
     format!(
-        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}{}{}",
+        "  {} [{}] ({})\n    Schedule: {} {}{}\n    Next run: {}\n    {}: {}{}{}",
         task.name,
         task.status,
         task.id.chars().take(8).collect::<String>(),
         task.schedule_type,
         task.schedule_expr,
+        zone,
         next,
         payload_label,
         crate::util::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
@@ -1248,6 +1255,22 @@ mod tests {
         let out = format_task(&task);
         assert!(out.contains("Last error"), "got: {out}");
         assert!(out.contains("slack"), "got: {out}");
+
+        // The schedule line names a pinned zone and stays bare for UTC.
+        for (timezone, suffix) in [
+            ("Asia/Tokyo", " (Asia/Tokyo)\n"),
+            ("local", " (local)\n"),
+            ("UTC", "\n"),
+            ("", "\n"),
+        ] {
+            task.timezone = timezone.to_string();
+            let expected = format!(
+                "Schedule: {} {}{suffix}",
+                task.schedule_type, task.schedule_expr
+            );
+            let out = format_task(&task);
+            assert!(out.contains(&expected), "timezone {timezone:?}, got: {out}");
+        }
     }
 
     #[test]

@@ -3,6 +3,32 @@ use super::tool_execution::dispatch_parallel_safe_tool;
 use super::*;
 use crate::types::ToolOutput;
 
+/// A request the provider rejected as too big is answered by compaction: a
+/// context overflow always retries, a byte cap only when compaction shrank
+/// the history, and no other failure compacts at all.
+#[test]
+fn oversize_recovery_compacts_for_window_and_byte_caps_only() {
+    let cases = [
+        (
+            "anthropic returned 400 (context overflow): prompt is too long",
+            Some(OversizeRecovery::RetryAfterCompaction),
+        ),
+        (
+            "openai returned 413 (payload too large): ",
+            Some(OversizeRecovery::RetryIfCompactionShrinks),
+        ),
+        (
+            "gateway returned 400: request body too large, must be less than 20MB",
+            Some(OversizeRecovery::RetryIfCompactionShrinks),
+        ),
+        ("openai returned 429: rate limit exceeded", None),
+        ("connection reset by peer", None),
+    ];
+    for (message, expected) in cases {
+        assert_eq!(oversize_recovery(message), expected, "{message}");
+    }
+}
+
 // ── Prompt cache: stable prefix ordering ──
 //
 // `build_system_prompt` must emit its stable (cache-friendly) sections

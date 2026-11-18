@@ -881,15 +881,20 @@ fn parse_gemini_response(
     provider: &str,
     model: &str,
 ) -> Result<TransportResponse> {
-    // Prompt-level safety block: the request never reached the model. Map
-    // to `LlmError::Fatal { reason: Unknown }` via `anyhow::bail!` — surfacing
-    // this as success would mislead the agent into thinking it got a reply.
+    // Prompt-level safety block: the request never reached the model.
+    // Surfacing this as success would mislead the agent into thinking it got
+    // a reply, and an untyped error would be classified as a malformed
+    // request — it is a content refusal, the same as a blocked candidate.
     if let Some(block_reason) = response
         .get("promptFeedback")
         .and_then(|f| f.get("blockReason"))
         .and_then(Value::as_str)
     {
-        anyhow::bail!("gemini blocked prompt: {block_reason}");
+        return Err(anyhow::Error::new(LlmError::Fatal {
+            source: anyhow::anyhow!("gemini blocked prompt: {block_reason}"),
+            reason: FailoverReason::ContentPolicy,
+            status: None,
+        }));
     }
 
     let candidates = response
@@ -1098,15 +1103,16 @@ pub(crate) fn parse_gemini_sse_line(
         }
     };
 
-    // Prompt-level safety block: the model didn't run. Surface as Error
-    // and stop the stream so the agent doesn't treat empty as success.
+    // Prompt-level safety block: the model didn't run. Report it as the
+    // content refusal it is and stop the stream, so the agent neither treats
+    // empty as success nor retries a prompt that will be blocked again.
     if let Some(reason) = value
         .pointer("/promptFeedback/blockReason")
         .and_then(Value::as_str)
     {
-        return SseAction::Done(vec![StreamEvent::Error(format!(
-            "gemini blocked prompt: {reason}"
-        ))]);
+        return SseAction::Done(vec![StreamEvent::ContentFiltered {
+            reason: format!("prompt blocked: {reason}"),
+        }]);
     }
 
     let mut events: Vec<StreamEvent> = Vec::new();
@@ -2340,6 +2346,18 @@ mod tests {
             Ok(_) => panic!("expected safety-block error, got Ok"),
         };
         assert!(err.to_string().contains("SAFETY"));
+        // A refusal, not a malformed request: the caller must offer
+        // "rephrase or switch provider" and must not bench the credential.
+        assert!(
+            matches!(
+                err.downcast_ref::<LlmError>(),
+                Some(LlmError::Fatal {
+                    reason: FailoverReason::ContentPolicy,
+                    ..
+                })
+            ),
+            "prompt block must be typed as content policy, got {err:?}"
+        );
     }
 
     #[test]
@@ -2566,14 +2584,14 @@ mod tests {
         let line = r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#;
         let (_, emitted, done) = feed(&[line]);
         assert!(done, "stream should terminate on safety block");
-        let err = emitted
+        let reason = emitted
             .iter()
             .find_map(|e| match e {
-                StreamEvent::Error(msg) => Some(msg.as_str()),
+                StreamEvent::ContentFiltered { reason } => Some(reason.as_str()),
                 _ => None,
             })
-            .expect("expected Error event");
-        assert!(err.contains("SAFETY"));
+            .expect("a prompt block must surface as ContentFiltered");
+        assert!(reason.contains("SAFETY"));
     }
 
     #[test]
