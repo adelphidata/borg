@@ -481,6 +481,7 @@ impl GatewayServer {
                 auth_token: inits.twilio_auth_token.clone(),
                 phone_number: inits.twilio_phone_number.clone(),
                 whatsapp_number: inits.twilio_whatsapp_number.clone(),
+                dedup: Arc::new(Mutex::new(crate::twilio::dedup::MessageDeduplicator::new())),
                 config: self.config.clone(),
             }));
         }

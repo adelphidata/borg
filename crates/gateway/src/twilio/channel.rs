@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::http::HeaderMap;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use cortex::config::Config;
 
@@ -14,6 +14,7 @@ use crate::health::ChannelHealthRegistry;
 use crate::message_processing::voice;
 
 use super::api::TwilioClient;
+use super::dedup::MessageDeduplicator;
 use super::types::TwilioChannelType;
 
 /// Twilio-specific response context stored in the delivery queue.
@@ -34,6 +35,8 @@ pub struct TwilioChannel {
     pub phone_number: Option<String>,
     /// Outbound WhatsApp phone number (E.164 format).
     pub whatsapp_number: Option<String>,
+    /// Message SIDs already accepted, so a redelivered webhook is skipped.
+    pub dedup: Arc<Mutex<MessageDeduplicator>>,
     /// Application configuration.
     pub config: Config,
 }
@@ -74,6 +77,23 @@ impl NativeChannel for TwilioChannel {
         crate::twilio::verify::verify_twilio_signature(headers, &webhook_url, body, auth_token)?;
 
         let mut parsed = super::parse::parse_webhook(body)?;
+
+        // Deduplicate on the message SID, after the signature check so an
+        // unsigned request cannot burn a SID. The signature has no nonce, so
+        // a retried or replayed POST is otherwise a second paid turn and a
+        // second reply. Checked before the media download and transcription
+        // below, which a duplicate must not pay for either.
+        if let Some(sid) = parsed
+            .message
+            .message_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            if self.dedup.lock().await.is_duplicate(sid) {
+                tracing::debug!(message_sid = %sid, "Skipping duplicate Twilio message");
+                return Ok(WebhookOutcome::Skip);
+            }
+        }
 
         // Inbound voice/audio transcription — parity with the Telegram
         // path (gateway/src/telegram/mod.rs:72-115). When the message
@@ -213,6 +233,7 @@ mod tests {
             auth_token: None,
             phone_number: Some("+15550000000".to_string()),
             whatsapp_number: Some("+15551111111".to_string()),
+            dedup: Arc::new(Mutex::new(MessageDeduplicator::new())),
             config: Config::default(),
         }
     }
@@ -439,8 +460,95 @@ mod tests {
             auth_token: auth_token.map(str::to_string),
             phone_number: Some("+15550000000".to_string()),
             whatsapp_number: None,
+            dedup: Arc::new(Mutex::new(MessageDeduplicator::new())),
             config,
         }
+    }
+
+    /// Twilio's signature has no nonce, so a retried or replayed POST passes
+    /// verification exactly like the original. The second copy must not
+    /// become a second turn (and a second SMS); a different message from the
+    /// same sender must still get through.
+    #[tokio::test]
+    async fn redelivered_message_sid_is_skipped_once_accepted() {
+        const URL: &str = "https://borg.example";
+        let health = Arc::new(RwLock::new(crate::health::ChannelHealthRegistry::default()));
+        let config = Config::default();
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        let channel = channel(Some("tok"), Some(URL));
+        let deliver = |sid: &str| {
+            let body = format!(
+                "MessageSid={sid}&AccountSid=AC1&From=%2B15551234567&To=%2B15550000000&Body=hi"
+            );
+            let signature = crate::twilio::verify::compute_signature(
+                &format!("{URL}/webhook/twilio"),
+                &body,
+                "tok",
+            )
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("x-twilio-signature", signature.parse().unwrap());
+            (headers, body)
+        };
+
+        // (SID, expected message id when delivered; None = skipped).
+        let cases = [
+            ("SM1", Some("SM1")),
+            ("SM1", None),
+            ("SM2", Some("SM2")),
+            ("SM1", None),
+        ];
+        for (step, (sid, expected)) in cases.into_iter().enumerate() {
+            let (headers, body) = deliver(sid);
+            let outcome = channel
+                .handle_webhook(&headers, &body, &ctx)
+                .await
+                .expect("a correctly signed webhook must be accepted");
+            let delivered = match outcome {
+                WebhookOutcome::Message { inbound, .. } => inbound.message_id,
+                WebhookOutcome::Skip => None,
+                _ => panic!("step {step}: unexpected outcome for {sid}"),
+            };
+            assert_eq!(delivered.as_deref(), expected, "step {step} ({sid})");
+        }
+    }
+
+    /// A request that fails the signature check must not mark its SID as
+    /// seen: otherwise anyone could pre-empt a real message by posting its
+    /// SID unsigned.
+    #[tokio::test]
+    async fn unsigned_request_does_not_consume_the_message_sid() {
+        let health = Arc::new(RwLock::new(crate::health::ChannelHealthRegistry::default()));
+        let config = Config::default();
+        let ctx = WebhookContext {
+            config: &config,
+            health: &health,
+        };
+        let channel = channel(Some("tok"), Some("https://borg.example"));
+        let body = "MessageSid=SM9&AccountSid=AC1&From=%2B15551234567&To=%2B15550000000&Body=hi";
+
+        let mut forged = HeaderMap::new();
+        forged.insert("x-twilio-signature", "AAAA".parse().unwrap());
+        assert!(channel.handle_webhook(&forged, body, &ctx).await.is_err());
+
+        let signature = crate::twilio::verify::compute_signature(
+            "https://borg.example/webhook/twilio",
+            body,
+            "tok",
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-twilio-signature", signature.parse().unwrap());
+        assert!(
+            matches!(
+                channel.handle_webhook(&headers, body, &ctx).await.unwrap(),
+                WebhookOutcome::Message { .. }
+            ),
+            "the genuine delivery must still be processed"
+        );
     }
 
     /// The `From` number in a Twilio POST is the entire sender identity, and

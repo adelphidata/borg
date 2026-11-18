@@ -294,8 +294,9 @@ pub struct SendMessageRequest {
     /// Parse mode for formatting (e.g. "HTML", "MarkdownV2").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
-    /// ID of the message to reply to.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// ID of the message to reply to. When set, the request also carries
+    /// `allow_sending_without_reply: true` (see [`serialize_reply_anchor`]).
+    #[serde(flatten, serialize_with = "serialize_reply_anchor")]
     pub reply_to_message_id: Option<i64>,
     /// Forum topic thread ID to send into.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -306,6 +307,31 @@ pub struct SendMessageRequest {
     /// Whether to send the message silently.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_notification: Option<bool>,
+}
+
+/// Request field that lets a reply go out even when its anchor is gone.
+pub const ALLOW_SENDING_WITHOUT_REPLY: &str = "allow_sending_without_reply";
+
+/// Serialize a reply anchor as `reply_to_message_id` plus
+/// `allow_sending_without_reply: true`, or as nothing when there is no anchor.
+///
+/// Without the flag Telegram rejects the whole send with a 400 when the
+/// anchored message no longer exists — a user deleting their message while
+/// the turn runs would lose the reply. With it the message is delivered
+/// unanchored instead. Emitting the pair from one field keeps every request
+/// that names an anchor covered.
+fn serialize_reply_anchor<S: serde::Serializer>(
+    reply_to_message_id: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(None)?;
+    if let Some(id) = reply_to_message_id {
+        map.serialize_entry("reply_to_message_id", id)?;
+        map.serialize_entry(ALLOW_SENDING_WITHOUT_REPLY, &true)?;
+    }
+    map.end()
 }
 
 /// Telegram inline keyboard markup.
@@ -745,6 +771,41 @@ mod tests {
         assert_eq!(json["reply_to_message_id"], 10);
         assert!(json.get("reply_markup").is_none());
         assert!(json.get("disable_notification").is_none());
+    }
+
+    /// A reply whose anchor was deleted mid-turn is rejected outright unless
+    /// the request opts into sending unanchored, so the flag must ride every
+    /// request that names an anchor — and only those: with no anchor there is
+    /// nothing to fall back from.
+    #[test]
+    fn reply_anchor_carries_allow_sending_without_reply() {
+        for (reply_to_message_id, expected) in [
+            (
+                Some(10),
+                serde_json::json!({
+                    "chat_id": 42,
+                    "text": "hello",
+                    "reply_to_message_id": 10,
+                    "allow_sending_without_reply": true,
+                }),
+            ),
+            (None, serde_json::json!({ "chat_id": 42, "text": "hello" })),
+        ] {
+            let req = SendMessageRequest {
+                chat_id: 42,
+                text: "hello".into(),
+                parse_mode: None,
+                reply_to_message_id,
+                message_thread_id: None,
+                reply_markup: None,
+                disable_notification: None,
+            };
+            assert_eq!(
+                serde_json::to_value(&req).unwrap(),
+                expected,
+                "anchor {reply_to_message_id:?}"
+            );
+        }
     }
 
     #[test]

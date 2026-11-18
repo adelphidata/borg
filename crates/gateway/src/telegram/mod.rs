@@ -52,18 +52,8 @@ pub async fn enrich_parsed_message(
     }
 
     if let Some(ref photo) = parsed.photo {
-        match async {
-            let file_info = client.get_file(&photo.file_id).await?;
-            let file_path = file_info
-                .file_path
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-            let bytes = client.download_file(file_path).await?;
-            Ok::<_, anyhow::Error>(bytes)
-        }
-        .await
-        {
-            Ok(bytes) => {
+        match client.fetch_file(&photo.file_id).await {
+            Ok((_, bytes)) => {
                 use base64::Engine;
                 parsed
                     .inbound
@@ -93,22 +83,15 @@ pub async fn enrich_parsed_message(
             // Download and transcription fail differently for the agent:
             // a missing file is "[audio could not be downloaded]", a file
             // that arrived but produced no text says why.
-            let downloaded = async {
-                let file_info = client.get_file(&audio.file_id).await?;
-                let file_path = file_info
-                    .file_path
-                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-                let bytes = client.download_file(&file_path).await?;
-                let filename = file_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("audio.ogg")
-                    .to_string();
-                Ok::<_, anyhow::Error>((bytes, filename))
-            }
-            .await;
-            let (bytes, filename) = match downloaded {
-                Ok(pair) => pair,
+            let (bytes, filename) = match client.fetch_file(&audio.file_id).await {
+                Ok((file_path, bytes)) => {
+                    let filename = file_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("audio.ogg")
+                        .to_string();
+                    (bytes, filename)
+                }
                 Err(e) => {
                     tracing::warn!("Telegram audio download failed: {e}");
                     crate::message_processing::media_failure::append_download_failure(

@@ -164,6 +164,9 @@ pub const DISCORD_MESSAGE_CHUNK_SIZE: usize = 2000;
 /// Twilio REST API base URL (2010-04-01 API version).
 pub const TWILIO_API_BASE: &str = "https://api.twilio.com/2010-04-01";
 
+/// Inbound message SIDs remembered for webhook deduplication.
+pub const TWILIO_DEDUP_CAPACITY: usize = 2000;
+
 // ── Google Chat ───────────────────────────────────────────────────
 
 /// Google Chat API base URL.

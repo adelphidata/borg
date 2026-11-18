@@ -48,6 +48,10 @@ pub struct SlackEvent {
     pub bot_id: Option<String>,
     /// Files attached to the message.
     pub files: Option<Vec<SlackFile>>,
+    /// Message attachments. A forwarded message arrives as an entry with
+    /// `is_share` set; link unfurls arrive here too.
+    #[serde(default)]
+    pub attachments: Option<Vec<SlackMessageAttachment>>,
     /// Nested message payload for `message_changed` (the new content) and
     /// `message_deleted` (typically inside `previous_message`). Slack puts the
     /// post-edit message in `message`.
@@ -70,6 +74,22 @@ pub struct NestedSlackMessage {
     pub ts: Option<String>,
     /// Parent thread timestamp for threaded replies and threaded edit/delete events.
     pub thread_ts: Option<String>,
+}
+
+/// One entry of a message event's `attachments` array. Mirrors the subset of
+/// fields needed to read a forwarded message; Slack sends more.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SlackMessageAttachment {
+    /// True when the attachment is another message shared into this one
+    /// ("Forward message"). Absent on link unfurls.
+    #[serde(default)]
+    pub is_share: bool,
+    /// Text of the shared message.
+    pub text: Option<String>,
+    /// Plain-text rendering, used when `text` is absent.
+    pub fallback: Option<String>,
+    /// Display name of the shared message's author.
+    pub author_name: Option<String>,
 }
 
 /// File metadata attached to a Slack message event.
