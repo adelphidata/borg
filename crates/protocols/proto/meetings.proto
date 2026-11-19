@@ -26,6 +26,10 @@ service Meetings {
   // End recording. The meeting moves to "finalizing"; the summary arrives as
   // SummaryReady (or SummaryFailed) on SubscribeMeetingEvents.
   rpc StopMeeting(MeetingId) returns (Meeting);
+  // Record more of a stopped meeting: back to "recording", new audio joins
+  // the same transcript and the next stop rewrites the summary. Emits
+  // MeetingStarted. Refused while the summary is still being written.
+  rpc ResumeMeeting(MeetingId) returns (Meeting);
   // Remove the meeting and its folder.
   rpc DeleteMeeting(MeetingId) returns (Empty);
   // Clear the unread mark a finished summary sets.

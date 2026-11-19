@@ -111,11 +111,6 @@ describe("MeetingsSettingsPage", () => {
     );
   });
 
-  it("explains that only a Mac notices meetings by itself", async () => {
-    mount(ON, { GetMeetingsStatus: status({ detectionSupported: false }) });
-    expect(await screen.findByText(/notices meetings automatically on a Mac/)).toBeTruthy();
-  });
-
   it("keeps the folder and the recording rules under More options", async () => {
     const { daemon } = mount(ON);
     fireEvent.click(await screen.findByRole("button", { name: /More options/ }));

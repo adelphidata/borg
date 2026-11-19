@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { meetings, type BorgClient } from "@borg/client";
+import { BorgError, GrpcStatus, meetings, type BorgClient } from "@borg/client";
 import { readLocalVoiceChoice } from "../../../lib/voice";
 import { useBorg } from "../../../lib/useDaemon";
 import { WAV_RATE, encodeWav } from "../../../lib/wav";
 import { meetingsChanged } from "../meetingsStore";
-import { PcmChunker, PushQueue, firstSeqFor, rms, type PcmChunk } from "./chunker";
+import {
+  PcmChunker,
+  PushQueue,
+  firstSeqFor,
+  rms,
+  type PcmChunk,
+  type QueueReport,
+} from "./chunker";
 import { PCM_WORKLET_NAME, pcmWorkletUrl } from "./pcmWorklet";
 
 /** Whether the other side of the call is being recorded. */
@@ -34,6 +41,19 @@ interface TrackPipe {
   context: AudioContext;
   chunker: PcmChunker;
   queue: PushQueue<PcmChunk>;
+}
+
+/**
+ * What to say when a chunk could not be delivered. A refusal the daemon
+ * wrote for the person (a rejected key, no credit, meetings turned off)
+ * is shown as it is, since it names the fix; anything else means the
+ * audio is not getting through.
+ */
+export function failureWarning(error: unknown): string {
+  if (error instanceof BorgError && error.code === GrpcStatus.FailedPrecondition) {
+    return error.message;
+  }
+  return "Borg isn't receiving the audio. Recording continues.";
 }
 
 /** The other side of the call, or undefined when this platform cannot record it. */
@@ -130,9 +150,9 @@ export function useMeetingCapture(
     if (!active) return;
     let live = true;
     const opened: TrackPipe[] = [];
-    const report = (r: { failed?: boolean; dropped?: boolean; delivered?: boolean }) => {
+    const report = (r: QueueReport) => {
       if (!live) return;
-      if (r.failed) setWarning("Borg isn't receiving the audio. Recording continues.");
+      if (r.failed) setWarning(failureWarning(r.error));
       else if (r.dropped) setWarning("Borg is falling behind; some audio was skipped.");
       else if (r.delivered) setWarning(undefined);
     };

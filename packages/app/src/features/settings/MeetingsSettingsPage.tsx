@@ -61,11 +61,6 @@ function MeetingsCard({
               {status?.calendar?.connected ? "Change" : "Connect"}
             </Link>
           </div>
-          {status && !status.detectionSupported && (
-            <div className="text-[12px] leading-[1.45] text-ink3">
-              Borg notices meetings automatically on a Mac; elsewhere it follows your calendar.
-            </div>
-          )}
           <MoreOptions>
             <TextSetting
               label="Folder"

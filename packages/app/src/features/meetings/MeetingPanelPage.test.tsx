@@ -106,6 +106,31 @@ describe("MeetingPanelPage", () => {
     expect(screen.getByRole("button", { name: "Open in Borg" })).toBeTruthy();
   });
 
+  it("resumes a finished meeting: listening again, the microphone back on", async () => {
+    const { daemon } = mount({
+      GetMeeting: fullMeeting({ id: "m1", state: "done", hasSummary: true }),
+      ResumeMeeting: fullMeeting({ id: "m1", state: "recording" }),
+    });
+    const resume = await screen.findByRole("button", { name: "Resume" });
+    expect(audio.getUserMedia).not.toHaveBeenCalled();
+    daemon.answer("GetMeeting", recording);
+    fireEvent.click(resume);
+    expect(await screen.findByText("Listening")).toBeTruthy();
+    expect(daemon.calls.filter((c) => c.method === "ResumeMeeting").map((c) => c.request)).toEqual([
+      { id: "m1" },
+    ]);
+    await waitFor(() => expect(audio.getUserMedia).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("offers Resume after a failed summary, but not while the notes are being written", async () => {
+    const { emit } = mount({ GetMeeting: fullMeeting({ id: "m1", state: "finalizing" }) });
+    await screen.findByText("Writing notes…");
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    emit({ summaryFailed: { id: "m1", message: "The model is out of credit." } });
+    expect(await screen.findByRole("button", { name: "Resume" })).toBeTruthy();
+  });
+
   it("stops by itself 30 s after the call ends, unless the call comes back", async () => {
     const { daemon, emit } = mount({ StopMeeting: fullMeeting({ state: "finalizing" }) });
     await screen.findByText("Listening");

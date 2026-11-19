@@ -94,20 +94,25 @@ export class PcmChunker {
  * The first chunk number for a capture that starts `baseOffsetMs` into the
  * meeting.
  *
- * A panel that reopens mid-meeting must not reuse a number an earlier capture
- * already sent — the daemon would drop the chunk as a repeat. An earlier
- * capture that ended without Stop sent only whole chunks, each finished
- * before this one began, so every number it used is below
- * `floor(baseOffsetMs / chunkMs)`. A capture from the start numbers from 0.
+ * A capture must not reuse a number an earlier one already sent — the daemon
+ * would drop the chunk as a repeat. That earlier capture may be a panel that
+ * reopened mid-meeting, or a stretch before Stop and Resume whose last,
+ * partial chunk began moments before this one. So a capture numbers from its
+ * start in milliseconds: an earlier capture that started at `b` and sent `k`
+ * more chunks used at most `b + k`, and its last chunk began at
+ * `b + k × 25 s`, before this capture's start. A capture from the very start
+ * numbers from 0; numbers skip, which the daemon allows.
  */
-export function firstSeqFor(baseOffsetMs: number, chunkMs = CHUNK_MS): number {
-  return Math.max(0, Math.floor(baseOffsetMs / chunkMs));
+export function firstSeqFor(baseOffsetMs: number): number {
+  return Math.max(0, Math.floor(baseOffsetMs));
 }
 
 /** What a `PushQueue` reports as it goes. */
 export interface QueueReport {
   /** A chunk failed twice and was given up on. */
   failed?: boolean;
+  /** Why the last attempt failed, when `failed`. */
+  error?: unknown;
   /** A chunk was dropped because too many were waiting. */
   dropped?: boolean;
   /** A chunk went through, so whatever was wrong has cleared. */
@@ -156,8 +161,8 @@ export class PushQueue<T> {
         try {
           await this.send(item);
           this.report({ delivered: true });
-        } catch {
-          this.report({ failed: true });
+        } catch (error) {
+          this.report({ failed: true, error });
         }
       }
     }

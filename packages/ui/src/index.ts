@@ -39,6 +39,7 @@ export {
   BorgHead,
   BranchIcon,
   ChatIcon,
+  ClockIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronIcon,
@@ -52,6 +53,7 @@ export {
   MoreIcon,
   NewChatIcon,
   PencilIcon,
+  PeopleIcon,
   PinIcon,
   PlugIcon,
   PlusIcon,
@@ -68,6 +70,7 @@ export {
   TrashIcon,
   UnpinIcon,
   UsageIcon,
+  VideoIcon,
 } from "./components/icons";
 export type { IconProps } from "./components/icons";
 export {
