@@ -885,6 +885,14 @@ fn part_dimensions(part: &crate::types::ContentPart) -> Option<(u32, u32)> {
     }
 }
 
+/// Whether any message carries an image part.
+pub(super) fn carries_images(messages: &[Message]) -> bool {
+    messages.iter().any(|m| match &m.content {
+        Some(crate::types::MessageContent::Parts(parts)) => parts.iter().any(is_image_part),
+        _ => false,
+    })
+}
+
 fn is_image_part(part: &crate::types::ContentPart) -> bool {
     matches!(
         part,

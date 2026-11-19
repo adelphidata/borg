@@ -2,7 +2,7 @@
 /// emitted to the UI or persisted. All prevent chain-of-thought from
 /// re-entering context on replay. Matching is ASCII case-insensitive
 /// (`<Thinking>`, `<THINK>`, … are stripped too) — names here must be
-/// lowercase.
+/// lowercase. `mm:think` is MiniMax's namespaced reasoning block.
 const STRIPPED_TAGS: &[&str] = &["internal", "thinking", "think", "reasoning", "mm:think"];
 
 /// Strip `<internal>`, `<thinking>`, `<think>` and `<reasoning>` blocks
@@ -304,6 +304,15 @@ mod tests {
         // `<reasoned>` must pass through untouched.
         let input = "<thinkingaloud>y</thinkingaloud> <thinky>z</thinky> <reason>w</reason> <reasoned>v</reasoned>";
         assert_eq!(strip_internal_tags(input), input);
+    }
+
+    #[test]
+    fn namespaced_minimax_reasoning_is_stripped_even_when_split_across_chunks() {
+        assert_eq!(strip_internal_tags("A <mm:think>plan</mm:think>B"), "A B");
+        let mut filter = InternalTagFilter::new();
+        assert_eq!(filter.push("answer <mm:th").as_deref(), Some("answer "));
+        assert_eq!(filter.push("ink>private</mm:th").as_deref(), None);
+        assert_eq!(filter.push("ink> done").as_deref(), Some(" done"));
     }
 
     #[test]

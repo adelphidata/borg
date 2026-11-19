@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   attendeeLine,
-  avatarTone,
   dayLabel,
   dayRows,
+  duration,
+  eventWhen,
+  fullNames,
   groupPast,
   initialOf,
-  meetingMeta,
   segmentClock,
+  shortDay,
   timeRange,
 } from "./meetingsFormat";
 import { event, meeting } from "../../test/meetings";
@@ -150,10 +152,6 @@ describe("groupPast", () => {
 });
 
 describe("tiles", () => {
-  it("rotates through four tones so neighbours never match", () => {
-    expect([0, 1, 2, 3, 4, 5].map(avatarTone)).toEqual([0, 1, 2, 3, 0, 1]);
-  });
-
   it("puts the first attendee's initial on the tile, else the title's", () => {
     expect(initialOf({ attendees: people("juan"), title: "Standup" })).toBe("J");
     expect(initialOf({ attendees: [], title: "standup" })).toBe("S");
@@ -172,27 +170,65 @@ describe("segmentClock", () => {
   });
 });
 
-describe("meetingMeta", () => {
-  it("names the day, the start and how long it ran", () => {
+describe("duration", () => {
+  const start = at(2026, 11, 12, 9);
+  it.each([
+    [32 * 60, "32 min"],
+    [20, "1 min"],
+    [3600, "1 h"],
+    [5400, "1 h 30 min"],
+  ])("%d s is %s", (seconds, text) => {
+    expect(duration(start, start + seconds)).toBe(text);
+  });
+
+  it("is empty while the meeting is still recording", () => {
+    expect(duration(start, 0)).toBe("");
+  });
+});
+
+describe("shortDay", () => {
+  const now = new Date(2026, 10, 13, 9, 0);
+  it.each([
+    [new Date(2026, 10, 13, 23, 59), "Today"],
+    [new Date(2026, 10, 12, 0, 1), "Yesterday"],
+    [new Date(2026, 10, 14, 8, 0), "Tomorrow"],
+    [new Date(2026, 10, 10, 12, 0), "Tue, Nov 10"],
+  ])("%s is %s", (day, label) => {
+    expect(shortDay(day, now, "en-US")).toBe(label);
+  });
+});
+
+describe("eventWhen", () => {
+  const now = new Date(2026, 10, 13, 9, 0);
+  it("names the day and the time range with its period", () => {
     expect(
-      meetingMeta(
-        { startedAt: at(2026, 11, 12, 9, 45), endedAt: at(2026, 11, 12, 10, 17) },
+      eventWhen(
+        { startUnix: at(2026, 11, 13, 9, 45), endUnix: at(2026, 11, 13, 10, 15), allDay: false },
+        now,
         "en-US",
       ),
-    ).toBe("Thu, Nov 12 · 9:45 AM · 32 min");
+    ).toBe("Today · 9:45 – 10:15 AM");
   });
 
-  it("leaves the length off while it is still recording", () => {
-    expect(meetingMeta({ startedAt: at(2026, 11, 12, 9, 45), endedAt: 0 }, "en-US")).toBe(
-      "Thu, Nov 12 · 9:45 AM",
-    );
+  it("says All day instead of a time for an all-day event", () => {
+    expect(
+      eventWhen(
+        { startUnix: at(2026, 11, 14), endUnix: at(2026, 11, 15), allDay: true },
+        now,
+        "en-US",
+      ),
+    ).toBe("Tomorrow · All day");
   });
+});
 
-  it("counts long meetings in hours", () => {
-    const start = at(2026, 11, 12, 9);
-    expect(meetingMeta({ startedAt: start, endedAt: start + 3600 }, "en-US")).toMatch(/· 1 h$/);
-    expect(meetingMeta({ startedAt: start, endedAt: start + 5400 }, "en-US")).toMatch(
-      /· 1 h 30 min$/,
-    );
+describe("fullNames", () => {
+  it("gives full names, an address when there is no name, and skips blanks", () => {
+    expect(
+      fullNames([
+        { name: " Juan Pérez ", email: "juan@example.com" },
+        { name: "", email: "jae@example.com" },
+        { name: " ", email: "" },
+      ]),
+    ).toEqual(["Juan Pérez", "jae@example.com"]);
   });
 });

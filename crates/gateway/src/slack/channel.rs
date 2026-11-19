@@ -176,16 +176,19 @@ impl NativeChannel for SlackChannel {
                             const MAX_CONTEXT_CHARS: usize = 8000;
                             let mut context = String::new();
                             for m in history.iter().rev() {
-                                let line = format!("<@{}>: {}\n", m.user, m.text);
+                                let line = crate::format_common::channel_context_line(
+                                    &format!("<@{}>", m.user),
+                                    &m.text,
+                                );
                                 if context.len() + line.len() > MAX_CONTEXT_CHARS {
                                     break;
                                 }
                                 context.push_str(&line);
                             }
                             if !context.is_empty() {
-                                inbound.text = format!(
-                                    "[Channel context]\n{context}[Current message]\n{}",
-                                    inbound.text
+                                inbound.text = crate::format_common::with_channel_context(
+                                    &context,
+                                    &inbound.text,
                                 );
                             }
                         }

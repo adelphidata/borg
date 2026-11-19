@@ -284,6 +284,22 @@ pub struct ResponseParameters {
     pub retry_after: Option<u64>,
 }
 
+/// Bot API `ReplyParameters` for `message_id`, quoting it when it still
+/// exists and sending plainly when it does not.
+pub fn reply_parameters(message_id: i64) -> serde_json::Value {
+    serde_json::json!({ "message_id": message_id, "allow_sending_without_reply": true })
+}
+
+fn serialize_reply_parameters<S: serde::Serializer>(
+    message_id: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match message_id {
+        Some(id) => reply_parameters(*id).serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Request body for sendMessage.
 #[derive(Debug, Serialize)]
 pub struct SendMessageRequest {
@@ -294,9 +310,14 @@ pub struct SendMessageRequest {
     /// Parse mode for formatting (e.g. "HTML", "MarkdownV2").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
-    /// ID of the message to reply to. When set, the request also carries
-    /// `allow_sending_without_reply: true` (see [`serialize_reply_anchor`]).
-    #[serde(flatten, serialize_with = "serialize_reply_anchor")]
+    /// ID of the message to reply to. Sent as `reply_parameters` with
+    /// `allow_sending_without_reply`, so a reply still lands when the user
+    /// deleted the message it answers (otherwise a 400 loses the reply).
+    #[serde(
+        rename = "reply_parameters",
+        serialize_with = "serialize_reply_parameters",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reply_to_message_id: Option<i64>,
     /// Forum topic thread ID to send into.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -307,31 +328,6 @@ pub struct SendMessageRequest {
     /// Whether to send the message silently.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_notification: Option<bool>,
-}
-
-/// Request field that lets a reply go out even when its anchor is gone.
-pub const ALLOW_SENDING_WITHOUT_REPLY: &str = "allow_sending_without_reply";
-
-/// Serialize a reply anchor as `reply_to_message_id` plus
-/// `allow_sending_without_reply: true`, or as nothing when there is no anchor.
-///
-/// Without the flag Telegram rejects the whole send with a 400 when the
-/// anchored message no longer exists — a user deleting their message while
-/// the turn runs would lose the reply. With it the message is delivered
-/// unanchored instead. Emitting the pair from one field keeps every request
-/// that names an anchor covered.
-fn serialize_reply_anchor<S: serde::Serializer>(
-    reply_to_message_id: &Option<i64>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeMap;
-
-    let mut map = serializer.serialize_map(None)?;
-    if let Some(id) = reply_to_message_id {
-        map.serialize_entry("reply_to_message_id", id)?;
-        map.serialize_entry(ALLOW_SENDING_WITHOUT_REPLY, &true)?;
-    }
-    map.end()
 }
 
 /// Telegram inline keyboard markup.
@@ -768,7 +764,11 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["message_thread_id"], 99);
-        assert_eq!(json["reply_to_message_id"], 10);
+        assert_eq!(
+            json["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true})
+        );
+        assert!(json.get("reply_to_message_id").is_none());
         assert!(json.get("reply_markup").is_none());
         assert!(json.get("disable_notification").is_none());
     }
@@ -785,8 +785,10 @@ mod tests {
                 serde_json::json!({
                     "chat_id": 42,
                     "text": "hello",
-                    "reply_to_message_id": 10,
-                    "allow_sending_without_reply": true,
+                    "reply_parameters": {
+                        "message_id": 10,
+                        "allow_sending_without_reply": true,
+                    },
                 }),
             ),
             (None, serde_json::json!({ "chat_id": 42, "text": "hello" })),

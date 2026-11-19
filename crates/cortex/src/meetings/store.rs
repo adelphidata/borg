@@ -17,6 +17,41 @@ use crate::meetings::{audio, files, new_meeting_id, transcript, Attendee, Meetin
 /// Chunks shorter than this hold no words worth a request.
 const MIN_CHUNK_MS: i64 = 300;
 
+/// Why the transcriber turned a chunk down, in words the person can act on.
+///
+/// A rejected key and a spent quota do not heal on retry, and the person is
+/// in a call: they need to know which it is and where to fix it, not that
+/// "all providers failed". Those come back as `TranscriptionRefused`; an
+/// outage or an unreachable service, which may pass, as `TranscriptionFailed`.
+fn why_transcription_failed(e: &anyhow::Error) -> StoreError {
+    let Some(http) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::media::HttpStatusError>())
+    else {
+        return StoreError::TranscriptionFailed(format!(
+            "Borg couldn't reach the transcription service: {}.",
+            e.root_cause()
+        ));
+    };
+    let who = crate::media::understanding::providers()
+        .find(|p| p.id == http.label)
+        .map_or(http.label.as_str(), |p| p.label);
+    match http.status.as_u16() {
+        401 | 403 => StoreError::TranscriptionRefused(format!(
+            "{who} rejected the API key. Paste a working key in Settings → Meetings."
+        )),
+        429 => StoreError::TranscriptionRefused(format!(
+            "{who} is refusing requests: too many, or no credit left. Check your {who} account."
+        )),
+        code if code >= 500 => StoreError::TranscriptionFailed(format!(
+            "{who} is having trouble ({code}). Borg tries again with the next chunk."
+        )),
+        code => StoreError::TranscriptionRefused(format!(
+            "{who} couldn't transcribe the audio ({code})."
+        )),
+    }
+}
+
 /// Why a meeting operation was refused. Each maps to one gRPC status, so
 /// callers never match on message text.
 #[derive(Debug, thiserror::Error)]
@@ -30,15 +65,23 @@ pub enum StoreError {
     /// A second recording while one is running.
     #[error("another meeting is already recording")]
     AlreadyRecording,
+    /// The meeting's notes are still being written; it can't record yet.
+    #[error("Borg is still writing this meeting's notes; resume once they're done")]
+    StillWriting,
     /// `meetings.enabled` is off.
     #[error("meeting notes are turned off; turn them on in Settings → Meetings")]
     Disabled,
     /// No `audio.models` provider can run.
     #[error("no transcription provider is set up; choose one in Settings → Meetings")]
     TranscriptionUnavailable,
-    /// Every provider in the chain failed for this chunk; retrying may work.
-    #[error("transcription failed: {0}")]
+    /// The provider is down or out of reach for this chunk; the next may
+    /// work. The message is written for the person.
+    #[error("{0}")]
     TranscriptionFailed(String),
+    /// The provider refused the chunk for a reason only the person can fix
+    /// (a rejected key, no credit). The message says what and where.
+    #[error("{0}")]
+    TranscriptionRefused(String),
     /// The request itself is wrong.
     #[error("{0}")]
     Invalid(String),
@@ -232,7 +275,10 @@ pub async fn append_chunk(
         let (text, _attempts) = transcriber
             .transcribe(input.wav, "audio/wav", "chunk.wav", None)
             .await
-            .map_err(|e| StoreError::TranscriptionFailed(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!("meetings: transcription failed: {e:#}");
+                why_transcription_failed(&e)
+            })?;
         if crate::media::voice_capture::is_whisper_hallucination(&text) {
             String::new()
         } else {
@@ -317,6 +363,36 @@ pub async fn stop_meeting(db: &Database, id: &str, now: i64) -> StoreResult<Meet
     if meeting.state == MeetingState::Recording {
         db.set_meeting_state(id, MeetingState::Finalizing, Some(now), None, now)
             .await?;
+    }
+    load(db, id).await
+}
+
+/// Record more of a stopped meeting: it goes back to recording, and new
+/// audio joins the same transcript. The earlier summary stays until the next
+/// stop writes a fresh one from everything. Refused while the notes are still
+/// being written, when the feature is off, or while another meeting records.
+pub async fn resume_meeting(
+    db: &Database,
+    config: &Config,
+    id: &str,
+    now: i64,
+) -> StoreResult<MeetingRow> {
+    if !config.meetings.enabled {
+        return Err(StoreError::Disabled);
+    }
+    let _starting = START_LOCK.lock().await;
+    let meeting = load(db, id).await?;
+    match meeting.state {
+        MeetingState::Recording => return Ok(meeting),
+        MeetingState::Finalizing => return Err(StoreError::StillWriting),
+        MeetingState::Done | MeetingState::Failed => {}
+    }
+    if db.recording_meeting().await?.is_some() {
+        return Err(StoreError::AlreadyRecording);
+    }
+    if !db.reopen_meeting(id, now).await? {
+        // The finalizer moved it between the read and the update.
+        return Err(StoreError::StillWriting);
     }
     load(db, id).await
 }
@@ -588,6 +664,93 @@ mod tests {
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(f.db.segments_for(&m.id).await.unwrap().len(), 1);
+    }
+
+    /// What the person is told when the provider turns a chunk down. A
+    /// rejected key must say so and name where to fix it, not "all providers
+    /// failed", and is a refusal (retrying cannot help) where an outage is
+    /// not. Nothing is stored, so the chunk can be sent again.
+    #[tokio::test]
+    async fn a_refused_chunk_says_why_in_words_the_person_can_act_on() {
+        for (status, refused, says) in [
+            (
+                401,
+                true,
+                "OpenAI rejected the API key. Paste a working key in Settings → Meetings.",
+            ),
+            (403, true, "OpenAI rejected the API key."),
+            (
+                429,
+                true,
+                "OpenAI is refusing requests: too many, or no credit left.",
+            ),
+            (503, false, "OpenAI is having trouble (503)."),
+            (400, true, "OpenAI couldn't transcribe the audio (400)."),
+        ] {
+            let mut f = fixture().await;
+            let server = whisper(&mut f.config, "").await;
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({ "error": { "code": "invalid_api_key" } }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+            let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+                .await
+                .unwrap();
+            let wav = wav_ms(2_000);
+            let err = append_chunk(
+                &f.db,
+                &f.config,
+                Some(&transcriber),
+                chunk(&m.id, Track::Mic, 0, 0, &wav),
+                1_001,
+            )
+            .await
+            .unwrap_err();
+            let message = match (&err, refused) {
+                (StoreError::TranscriptionRefused(m), true)
+                | (StoreError::TranscriptionFailed(m), false) => m.clone(),
+                _ => panic!("{status}: expected refused={refused}, got {err:?}"),
+            };
+            assert!(message.starts_with(says), "{status}: {message}");
+            assert!(f.db.segments_for(&m.id).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_transcriber_is_named_as_unreachable() {
+        let mut f = fixture().await;
+        let _server = whisper(&mut f.config, "").await;
+        // A port that was free a moment ago: nothing listens there.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        f.config.audio.models[0].base_url = Some(format!("http://127.0.0.1:{port}"));
+        let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        let wav = wav_ms(2_000);
+        let err = append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 0, 0, &wav),
+            1_001,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Borg couldn't reach the transcription service:"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -899,6 +1062,103 @@ mod tests {
             finalize_meeting(&f.db, &fake(Ok("x")), &m.id, 1_001).await,
             Err(StoreError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_meeting_records_into_the_same_transcript_and_is_summarised_again() {
+        let mut f = fixture().await;
+        let _server = whisper(&mut f.config, "second half").await;
+        let transcriber = AudioTranscriber::from_models(&f.config).expect("chain builds");
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        let wav = wav_ms(2_000);
+        append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 0, 0, &wav),
+            1_001,
+        )
+        .await
+        .unwrap();
+        stop_meeting(&f.db, &m.id, 1_010).await.unwrap();
+        finalize_meeting(&f.db, &fake(Err("model is down")), &m.id, 1_011)
+            .await
+            .unwrap();
+
+        let back = resume_meeting(&f.db, &f.config, &m.id, 1_100)
+            .await
+            .unwrap();
+        assert_eq!(back.state, MeetingState::Recording);
+        assert_eq!(back.ended_at, None, "a recording meeting has no end yet");
+        assert_eq!(back.error, None, "the old failure no longer applies");
+        assert_eq!(back.dir, m.dir, "same folder, same transcript");
+
+        let more = append_chunk(
+            &f.db,
+            &f.config,
+            Some(&transcriber),
+            chunk(&m.id, Track::Mic, 100_000, 100_000, &wav),
+            1_101,
+        )
+        .await
+        .unwrap();
+        assert!(!more.replayed);
+        assert_eq!(f.db.segments_for(&m.id).await.unwrap().len(), 2);
+
+        stop_meeting(&f.db, &m.id, 1_200).await.unwrap();
+        let done = finalize_meeting(&f.db, &fake(Ok("All of it")), &m.id, 1_201)
+            .await
+            .unwrap();
+        assert_eq!(done.state, MeetingState::Done);
+        assert_eq!(done.ended_at, Some(1_200));
+        assert_eq!(done.summary_md.as_deref(), Some("All of it"));
+    }
+
+    #[tokio::test]
+    async fn resume_waits_for_the_notes_and_for_the_other_meeting() {
+        let mut f = fixture().await;
+        let m = start_meeting(&f.db, &f.config, StartParams::default(), 1_000)
+            .await
+            .unwrap();
+        // Recording already: nothing to do.
+        let same = resume_meeting(&f.db, &f.config, &m.id, 1_001)
+            .await
+            .unwrap();
+        assert_eq!(same.state, MeetingState::Recording);
+
+        stop_meeting(&f.db, &m.id, 1_002).await.unwrap();
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_003).await,
+            Err(StoreError::StillWriting)
+        ));
+        finalize_meeting(&f.db, &fake(Ok("x")), &m.id, 1_004)
+            .await
+            .unwrap();
+
+        let other = start_meeting(&f.db, &f.config, StartParams::default(), 1_005)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_006).await,
+            Err(StoreError::AlreadyRecording)
+        ));
+        stop_meeting(&f.db, &other.id, 1_007).await.unwrap();
+
+        f.config.meetings.enabled = false;
+        assert!(matches!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_008).await,
+            Err(StoreError::Disabled)
+        ));
+        f.config.meetings.enabled = true;
+        assert_eq!(
+            resume_meeting(&f.db, &f.config, &m.id, 1_009)
+                .await
+                .unwrap()
+                .state,
+            MeetingState::Recording
+        );
     }
 
     #[tokio::test]

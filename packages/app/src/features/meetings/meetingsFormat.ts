@@ -152,17 +152,6 @@ export function groupPast(list: MeetingSummary[], now: Date, locale?: string): P
   return groups;
 }
 
-/**
- * The pastel tiles, as whole class names so Tailwind finds them. A row's tile
- * is `AVATAR_TILES[avatarTone(index)]`.
- */
-export const AVATAR_TILES = ["bg-avatar-1", "bg-avatar-2", "bg-avatar-3", "bg-avatar-4"] as const;
-
-/** Which tile a row gets: rotating, so neighbours never match. */
-export function avatarTone(index: number): number {
-  return index % AVATAR_TILES.length;
-}
-
 /** The letter on a row's tile: the first attendee's, else the title's. */
 export function initialOf(m: Pick<MeetingSummary, "attendees" | "title">): string {
   const who = m.attendees.map(firstName).find((n) => n !== "");
@@ -179,19 +168,37 @@ export function segmentClock(ms: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
 
-/** "Thu, Nov 12 · 9:45 AM · 32 min": the detail page's header line. */
-export function meetingMeta(
-  m: Pick<MeetingSummary, "startedAt" | "endedAt">,
+/** "32 min", "1 h", "1 h 5 min"; empty while the meeting has no end yet. */
+export function duration(startUnix: number, endUnix: number): string {
+  if (endUnix <= startUnix) return "";
+  const mins = Math.max(1, Math.round((endUnix - startUnix) / 60));
+  const hours = Math.floor(mins / 60);
+  const rest = mins % 60;
+  return hours === 0 ? `${mins} min` : rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+/** "Today", "Yesterday", "Tomorrow", else "Thu, Nov 12": a chip's day. */
+export function shortDay(at: Date, now: Date, locale?: string): string {
+  const days = Math.round((startOfDay(at).getTime() - startOfDay(now).getTime()) / 86_400_000);
+  if (days === 0) return "Today";
+  if (days === -1) return "Yesterday";
+  if (days === 1) return "Tomorrow";
+  return at.toLocaleDateString(locale, { weekday: "short", month: "short", day: "numeric" });
+}
+
+/** "Today · 9:45 – 10:15 AM", "Fri, Nov 14 · All day": when an event is. */
+export function eventWhen(
+  e: Pick<CalendarEvent, "startUnix" | "endUnix" | "allDay">,
+  now: Date,
   locale?: string,
 ): string {
-  const at = new Date(m.startedAt * 1000);
-  const date = at.toLocaleDateString(locale, { weekday: "short", month: "short", day: "numeric" });
-  const parts = [date, timeOfDay(m.startedAt, locale)];
-  if (m.endedAt > m.startedAt) {
-    const mins = Math.max(1, Math.round((m.endedAt - m.startedAt) / 60));
-    const hours = Math.floor(mins / 60);
-    const rest = mins % 60;
-    parts.push(hours === 0 ? `${mins} min` : rest === 0 ? `${hours} h` : `${hours} h ${rest} min`);
-  }
-  return parts.join(" · ");
+  const day = shortDay(new Date(e.startUnix * 1000), now, locale);
+  if (e.allDay) return `${day} · All day`;
+  const range = timeRange(e.startUnix, e.endUnix, locale);
+  return `${day} · ${range.text}${range.suffix ? ` ${range.suffix}` : ""}`;
+}
+
+/** Everyone by full name, or address when there is no name. */
+export function fullNames(attendees: Attendee[]): string[] {
+  return attendees.map((a) => a.name.trim() || a.email.trim()).filter((n) => n !== "");
 }

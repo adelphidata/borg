@@ -9,9 +9,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use super::types::{
-    ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo, InlineKeyboardMarkup,
-    MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
-    Update, User, ALLOW_SENDING_WITHOUT_REPLY,
+    reply_parameters, ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo,
+    InlineKeyboardMarkup, MediaSource, ReactionType, SendMessageRequest, SendPollRequest,
+    SetMessageReactionRequest, Update, User,
 };
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::{
@@ -397,7 +397,10 @@ impl TelegramClient {
             if let Some(tid) = message_thread_id {
                 form = form.text("message_thread_id", tid.to_string());
             }
-            Ok(with_reply_anchor(form, reply_to_message_id))
+            if let Some(rid) = reply_to_message_id {
+                form = form.text("reply_parameters", reply_parameters(rid).to_string());
+            }
+            Ok(form)
         })
         .await
     }
@@ -526,8 +529,11 @@ impl TelegramClient {
         if let Some(tid) = message_thread_id {
             form = form.text("message_thread_id", tid.to_string());
         }
+        if let Some(rid) = reply_to_message_id {
+            form = form.text("reply_parameters", reply_parameters(rid).to_string());
+        }
 
-        Ok(with_reply_anchor(form, reply_to_message_id))
+        Ok(form)
     }
 
     /// Internal: POST a multipart form to a Telegram media endpoint.
@@ -781,7 +787,7 @@ impl TelegramClient {
         Ok(())
     }
 
-    /// Get file info by file_id (for future media download support).
+    /// Get file info by file_id.
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
         let body = serde_json::json!({ "file_id": file_id });
         let resp = self
@@ -798,7 +804,7 @@ impl TelegramClient {
         let resp: ApiResponse<FileInfo> = resp
             .json()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to parse getFile response"))?;
+            .map_err(|e| self.transient_err(e, "Failed to parse getFile response"))?;
 
         match resp.result {
             Some(info) if resp.ok => Ok(info),
@@ -1128,21 +1134,6 @@ impl NativeCommandRegistration for TelegramClient {
     async fn register_commands(&self, commands: &[CommandDef]) -> Result<()> {
         let pairs: Vec<(&str, &str)> = commands.iter().map(|c| (c.name, c.description)).collect();
         self.set_my_commands(&pairs).await
-    }
-}
-
-/// Add the reply anchor to a media form, with the flag that lets the upload
-/// go out unanchored if that message has been deleted in the meantime — the
-/// multipart counterpart of `SendMessageRequest`'s reply fields.
-fn with_reply_anchor(
-    form: reqwest::multipart::Form,
-    reply_to_message_id: Option<i64>,
-) -> reqwest::multipart::Form {
-    match reply_to_message_id {
-        Some(id) => form
-            .text("reply_to_message_id", id.to_string())
-            .text(ALLOW_SENDING_WITHOUT_REPLY, "true"),
-        None => form,
     }
 }
 
@@ -1878,15 +1869,12 @@ mod tests {
         let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(
-            first["reply_to_message_id"], 10,
-            "first chunk must reply to the original"
-        );
-        assert_eq!(
-            first[ALLOW_SENDING_WITHOUT_REPLY], true,
-            "an anchored send must survive the anchor being deleted: {first}"
+            first["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true}),
+            "first chunk must reply to the original, and still land if it was deleted"
         );
         assert!(
-            second.get("reply_to_message_id").is_none(),
+            second.get("reply_parameters").is_none(),
             "later chunks must not reply: {second}"
         );
     }
@@ -2061,7 +2049,7 @@ mod tests {
         assert_eq!(json["chat_id"], 42);
         assert_eq!(json["text"], "hello");
         assert_eq!(json["parse_mode"], "Markdown");
-        assert!(json.get("reply_to_message_id").is_none());
+        assert!(json.get("reply_parameters").is_none());
         assert!(json.get("message_thread_id").is_none());
     }
 
@@ -2077,7 +2065,11 @@ mod tests {
             disable_notification: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["reply_to_message_id"], 10);
+        assert_eq!(
+            json["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true})
+        );
+        assert!(json.get("reply_to_message_id").is_none());
         assert_eq!(json["message_thread_id"], 99);
     }
 
@@ -2456,6 +2448,54 @@ mod tests {
         }
     }
 
+    /// A read that fails mid-fetch is retried; a refusal Telegram answered
+    /// with `ok: false` is final.
+    #[tokio::test]
+    async fn fetch_file_retries_a_failed_read_but_not_a_refusal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A truncated getFile body first, then the real one.
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":tr"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_id": "F1", "file_unique_id": "U1", "file_path": "voice/f.oga"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bot123:ABC/voice/f.oga"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OggS".to_vec()))
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let (file_path, bytes) = client.fetch_file("F1").await.expect("retry recovers");
+        assert_eq!(bytes, b"OggS");
+        assert_eq!(file_path, "voice/f.oga");
+
+        // A refusal is final: exactly one getFile.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false, "description": "Bad Request: file is too big"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client.fetch_file("F1").await.expect_err("refusal fails");
+        assert!(err.to_string().contains("file is too big"), "{err}");
+    }
+
     /// `get_file` must trust the `ok` flag, not the mere presence of a
     /// `result` payload: ok=true yields the file info, ok=false errors even
     /// with a result attached.
@@ -2726,13 +2766,13 @@ mod tests {
             for request in &requests {
                 let body = String::from_utf8_lossy(&request.body);
                 let lane = request.url.path();
-                for field in ["reply_to_message_id", ALLOW_SENDING_WITHOUT_REPLY] {
-                    assert_eq!(
-                        body.contains(&format!("name=\"{field}\"")),
-                        reply_to_message_id.is_some(),
-                        "{lane}, anchor {reply_to_message_id:?}: field {field}"
-                    );
-                }
+                assert_eq!(
+                    body.contains("name=\"reply_parameters\"")
+                        && body.contains("\"allow_sending_without_reply\":true"),
+                    reply_to_message_id.is_some(),
+                    "{lane}, anchor {reply_to_message_id:?}"
+                );
+                assert!(!body.contains("name=\"reply_to_message_id\""), "{lane}");
             }
         }
     }

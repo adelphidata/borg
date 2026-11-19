@@ -1375,22 +1375,6 @@ fn undeclared_args(schema: &Value, args: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Build the not-dispatched refusal for a call carrying [`undeclared_args`].
-fn undeclared_args_refusal(full_name: &str, input_schema: &Value, unknown: &[String]) -> String {
-    let declared: Vec<&String> = input_schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .map(|props| props.keys().collect())
-        .unwrap_or_default();
-    serde_json::json!({
-        "error": format!("unknown argument(s): {}", unknown.join(", ")),
-        "tool": full_name,
-        "valid_arguments": declared,
-        "note": "The call was not dispatched. This tool accepts only the listed arguments; fix the argument names and call it again.",
-    })
-    .to_string()
-}
-
 /// Ceiling on the compact-serialized `input_schema` echoed in a blind-call
 /// refusal. The refusal exists to make the model's *immediate* retry
 /// informed, not to re-transmit an arbitrarily large schema into the
@@ -1404,12 +1388,27 @@ const BLIND_CALL_SCHEMA_ECHO_MAX_BYTES: usize = 4096;
 /// the missing keys; echoes the full `input_schema` only when its compact
 /// serialization fits [`BLIND_CALL_SCHEMA_ECHO_MAX_BYTES`], otherwise the
 /// schema's `required` list stands in so the payload stays bounded.
-fn blind_call_refusal(full_name: &str, input_schema: &Value, missing: &[String]) -> String {
-    let mut payload = serde_json::json!({
-        "error": format!(
+fn blind_call_refusal(
+    full_name: &str,
+    input_schema: &Value,
+    missing: &[String],
+    undeclared: &[String],
+) -> String {
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!(
             "missing required argument(s): {}",
             missing.join(", ")
-        ),
+        ));
+    }
+    if !undeclared.is_empty() {
+        problems.push(format!(
+            "unknown argument(s) this tool does not accept: {}",
+            undeclared.join(", ")
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "error": problems.join("; "),
         "tool": full_name,
         "note": "The call was not dispatched. Re-call this tool with the required arguments per input_schema.",
     });
@@ -1496,20 +1495,16 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
     // nothing — echo the tool's parameter schema instead so the retry is
     // informed. Checked before the rate-limit gate: a call that cannot
     // succeed must not consume a rate token.
+    // Same refusal for an argument a closed schema does not declare: the
+    // server would drop it silently and answer as if it were never sent.
     let missing = missing_required_args(&tool.input_schema, args);
-    if !missing.is_empty() {
+    let undeclared = undeclared_args(&tool.input_schema, args);
+    if !missing.is_empty() || !undeclared.is_empty() {
         return Ok(Some(ToolOutput::Text(blind_call_refusal(
             &tool.full_name,
             &tool.input_schema,
             &missing,
-        ))));
-    }
-    let unknown = undeclared_args(&tool.input_schema, args);
-    if !unknown.is_empty() {
-        return Ok(Some(ToolOutput::Text(undeclared_args_refusal(
-            &tool.full_name,
-            &tool.input_schema,
-            &unknown,
+            &undeclared,
         ))));
     }
 
@@ -4925,18 +4920,6 @@ mod tests {
         for (name, schema, args, expected) in cases {
             assert_eq!(undeclared_args(&schema, &args), expected, "case: {name}");
         }
-
-        let refusal: Value = serde_json::from_str(&undeclared_args_refusal(
-            "mcp_browser_console",
-            &closed,
-            &["levle".to_string()],
-        ))
-        .unwrap();
-        assert_eq!(refusal["error"], "unknown argument(s): levle");
-        assert_eq!(
-            refusal["valid_arguments"],
-            serde_json::json!(["level", "limit"])
-        );
     }
 
     #[test]
@@ -4979,6 +4962,22 @@ mod tests {
     }
 
     #[test]
+    fn blind_call_refusal_names_unknown_keys_alongside_missing_ones() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let out = blind_call_refusal(
+            "mcp_logs_query",
+            &schema,
+            &["q".to_string()],
+            &["levle".to_string()],
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("structured JSON");
+        assert_eq!(
+            v["error"],
+            "missing required argument(s): q; unknown argument(s) this tool does not accept: levle"
+        );
+    }
+
+    #[test]
     fn blind_call_refusal_names_missing_keys_and_echoes_schema() {
         // Spec: the refusal must be structured JSON that (a) names every
         // missing key so the model knows what to add, and (b) carries the
@@ -4993,6 +4992,7 @@ mod tests {
             "mcp_gh_create_issue",
             &schema,
             &["owner".to_string(), "repo".to_string()],
+            &[],
         );
         let v: serde_json::Value = serde_json::from_str(&out).expect("structured JSON");
         let err = v["error"].as_str().expect("error field");
@@ -5035,7 +5035,7 @@ mod tests {
             schema.to_string().len() > BLIND_CALL_SCHEMA_ECHO_MAX_BYTES,
             "fixture must exceed the echo cap"
         );
-        let out = blind_call_refusal("mcp_big_tool", &schema, &["field_0".to_string()]);
+        let out = blind_call_refusal("mcp_big_tool", &schema, &["field_0".to_string()], &[]);
         assert!(
             out.len() < BLIND_CALL_SCHEMA_ECHO_MAX_BYTES,
             "bounded payload must stay under the cap; got {} bytes",

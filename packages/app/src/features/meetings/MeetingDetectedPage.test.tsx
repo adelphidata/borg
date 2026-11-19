@@ -57,11 +57,10 @@ describe("MeetingDetectedPage", () => {
     expect(native.openedPanels).toEqual([]);
   });
 
-  it("puts itself away from Not this meeting, and from Escape", () => {
+  it("puts itself away from its close button, and from Escape", () => {
     const { native } = mount();
     act(() => native.emitDetection({ sourceApp: "Zoom" }));
-    fireEvent.click(screen.getByRole("button", { name: "More choices" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Not this meeting" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(native.hidden).toBe(1);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(native.hidden).toBe(2);

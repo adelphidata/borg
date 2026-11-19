@@ -91,6 +91,17 @@ fn credential_assignment_key_is_real(full_match: &str) -> bool {
         .any(|kw| lower.ends_with(kw) && is_word_start(key, key.len() - kw.len()))
 }
 
+/// Post-match validator for the Discord Token pattern: a real token's first
+/// segment is the bot's user id (a 17–20 digit snowflake) in base64url.
+fn discord_token_has_user_id(full_match: &str) -> bool {
+    use base64::Engine as _;
+    let head = full_match.split('.').next().unwrap_or_default();
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(head.trim_end_matches('=')) {
+        Ok(decoded) => (17..=20).contains(&decoded.len()) && decoded.iter().all(u8::is_ascii_digit),
+        Err(_) => false,
+    }
+}
+
 /// Post-match validator for the CLI Credential Flag pattern. An `=` form
 /// (`--token=value`) is always a credential. A space-separated value is one
 /// only when it looks like a secret: it carries a digit, `_` or `-`, or mixes
@@ -122,18 +133,6 @@ fn cli_flag_value_is_credential(full_match: &str) -> bool {
     // `AbCdEf…` and `abcDef…` are mixed; `Authenticate` and `followed`
     // are words; `ABCDEFGH` could be either, so it is masked (fail-secure).
     (tail_has_upper && tail_has_lower) || (first.is_ascii_uppercase() && !tail_has_lower)
-}
-
-/// Whether the first dotted segment of a Discord-token-shaped match is the
-/// base64 of a 17–20 digit snowflake id, as every real bot token's is.
-fn discord_token_has_snowflake_id(full_match: &str) -> bool {
-    use base64::Engine as _;
-    let Some((id, _)) = full_match.split_once('.') else {
-        return false;
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(id)
-        .is_ok_and(|bytes| (17..=20).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_digit))
 }
 
 static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
@@ -241,63 +240,12 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // distinctive enough that a 30+ char lower bound won't false-positive.
         (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
         (r"\bAQ\.[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
-        // Google OAuth: the client secret, a short-lived access token, and
-        // the long-lived refresh token a calendar sign-in stores.
-        (
-            r"\bGOCSPX-[0-9A-Za-z_-]{24,}",
-            "Google OAuth Client Secret",
-            false,
-            None,
-        ),
-        (
-            r"\bya29\.[0-9A-Za-z._-]{30,}",
-            "Google OAuth Token",
-            false,
-            None,
-        ),
+        // The long-lived Google OAuth refresh token a calendar sign-in stores.
         (
             r"\b1//0[0-9A-Za-z_-]{40,}",
             "Google OAuth Token",
             false,
             None,
-        ),
-        // Grafana service-account (`glsa_`) and cloud (`glc_`) tokens.
-        (
-            r"\bgl(?:sa|c)_[0-9A-Za-z=_-]{32,}",
-            "Grafana Token",
-            false,
-            None,
-        ),
-        // Incoming-webhook URLs: the URL is the credential — anyone holding
-        // it can post. Only the secret segment is masked, so the host and the
-        // workspace/webhook ids stay readable.
-        (
-            r"hooks\.slack\.com/services/T[0-9A-Z]+/B[0-9A-Z]+/([0-9A-Za-z]{16,})",
-            "Slack Webhook URL",
-            true,
-            None,
-        ),
-        (
-            r"discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d{17,20}/([0-9A-Za-z_-]{40,})",
-            "Discord Webhook URL",
-            true,
-            None,
-        ),
-        (
-            r"[0-9a-z-]+\.webhook\.office\.com/webhookb2/([0-9A-Za-z@/_-]{40,})",
-            "Teams Webhook URL",
-            true,
-            None,
-        ),
-        // A bare Discord bot token: `<base64 user id>.<timestamp>.<hmac>`.
-        // Three dotted base64 runs also describe plenty of harmless
-        // identifiers, so the validator requires the first run to decode to
-        // a snowflake id.
-        (
-            r"\b[0-9A-Za-z_-]{23,27}\.[0-9A-Za-z_-]{6,7}\.[0-9A-Za-z_-]{27,40}",
-            "Discord Bot Token",
-            false,
-            Some(discord_token_has_snowflake_id as fn(&str) -> bool),
         ),
         (
             r"\bmfa\.[0-9A-Za-z_-]{60,}",
@@ -382,6 +330,69 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // Langfuse keys are `pk-lf-`/`sk-lf-` + a hyphenated uuid; the
         // hyphens keep `sk-lf-` out of the generic `sk-` pattern.
         (r"\b[ps]k-lf-[A-Za-z0-9-]{30,}", "Langfuse Key", false, None),
+        // Grafana service-account tokens (optional hex checksum suffix) and
+        // Grafana Cloud access-policy tokens (base64 body, may be padded).
+        (
+            r"\bglsa_[A-Za-z0-9]{10,}(?:_[A-Fa-f0-9]{8})?",
+            "Grafana Token",
+            false,
+            None,
+        ),
+        (
+            r"\bglc_[A-Za-z0-9+/_-]{32,}={0,3}",
+            "Grafana Token",
+            false,
+            None,
+        ),
+        // Google OAuth: a pasted `client_secret.json` carries `GOCSPX-…`;
+        // access tokens are `ya29.` plus a dotted url-safe body (an optional
+        // one-letter issuer tag first: `c.` service account, `d.` STS).
+        (
+            r"\bGOCSPX-[A-Za-z0-9_-]{8,}",
+            "Google OAuth Secret",
+            false,
+            None,
+        ),
+        (
+            r"\bya29\.[A-Za-z0-9._-]{20,}",
+            "Google OAuth Token",
+            false,
+            None,
+        ),
+        // Discord bot tokens: `<base64 user id>.<base64 timestamp>.<hmac>`.
+        // The shape alone fits a long dotted CamelCase identifier, so the
+        // validator requires the first segment to decode to a real user id.
+        // No leading `\b`: a token glued to an escape spelling (`\n`, `%0A`)
+        // has a letter on its left and would slip a word boundary.
+        (
+            r"[MNO][A-Za-z0-9_-]{22,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}",
+            "Discord Token",
+            false,
+            Some(discord_token_has_user_id as fn(&str) -> bool),
+        ),
+        // Incoming-webhook URLs: the URL itself is the credential, so the
+        // secret path segment is masked while host and ids stay readable.
+        // `http://` or no scheme at all is matched too — the path carries the
+        // same secret. Teams Workflows URLs keep their secret in `sig=`, which the
+        // URL Query Credential pattern below already masks.
+        (
+            r"(?i)(?:https?://)?hooks\.slack(?:-gov)?\.com\.?(?::\d+)?/(?:services|workflows|triggers)/[A-Z0-9]+/[A-Z0-9]+/(?:\d+/)?([A-Za-z0-9]{8,})",
+            "Webhook Secret",
+            true,
+            None,
+        ),
+        (
+            r"(?i)(?:https?://)?(?:canary\.|ptb\.|www\.)?discord(?:app)?\.com\.?(?::\d+)?/api/(?:v\d+/)?webhooks/\d+/([\w-]{8,})",
+            "Webhook Secret",
+            true,
+            None,
+        ),
+        (
+            r"(?i)(?:https?://)?[A-Za-z0-9.-]*(?:webhook\.office\.com\.?(?::\d+)?/webhookb2|outlook\.office\.com\.?(?::\d+)?/webhook)/([\w@/%+=-]{8,})",
+            "Webhook Secret",
+            true,
+            None,
+        ),
         (
             r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
             "JWT",
@@ -788,6 +799,25 @@ impl RedactionOutcome {
     }
 }
 
+/// Shortest literal `mask_literals` will replace — anything shorter is too
+/// likely to collide with ordinary text.
+const MIN_LITERAL_SECRET_LEN: usize = 8;
+
+/// Mask every occurrence of each known secret value in `text`. For
+/// credentials known by value rather than by shape: a custom provider's
+/// random-hex key matches no pattern, yet the provider can still echo it
+/// back (`Invalid API key: <key>`). Run it before `redact_secrets`, which
+/// still covers everything shaped like a secret.
+pub fn mask_literals(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= MIN_LITERAL_SECRET_LEN && out.contains(secret) {
+            out = out.replace(secret, "[REDACTED credential]");
+        }
+    }
+    out
+}
+
 /// Redact detected secrets in text, replacing matches with `[REDACTED <label>]`.
 pub fn redact_secrets(text: &str) -> String {
     redact_with_audit(text).text
@@ -995,6 +1025,127 @@ mod tests {
                 "{token} should be labeled {label}, got: {out}"
             );
             assert!(!out.contains(token), "{token} survived redaction: {out}");
+        }
+    }
+
+    #[test]
+    fn mask_literals_masks_known_values_and_ignores_short_ones() {
+        let key = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let out = mask_literals(
+            &format!("Invalid API key: {key} ({key})"),
+            &[key, "", "abc"],
+        );
+        assert_eq!(
+            out,
+            "Invalid API key: [REDACTED credential] ([REDACTED credential])"
+        );
+        // A short value would mask ordinary words; it is left alone.
+        assert_eq!(mask_literals("abc def", &["abc"]), "abc def");
+    }
+
+    #[test]
+    fn grafana_and_google_oauth_tokens_are_masked() {
+        let sa_body = "abcdefghijklmnopqrstuvwxyzABCDEF0123";
+        let cloud_body = "eyJrIjoiYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoiLCJuIjoidGVzdCJ9";
+        let cases = [
+            (format!("glsa_{sa_body}_0123abcd"), "Grafana Token"),
+            (format!("glsa_{sa_body}"), "Grafana Token"),
+            (format!("glc_{cloud_body}=="), "Grafana Token"),
+            (
+                format!("GOCSPX-{}", "aB3_dE6-gH9jK2mN5pQ8"),
+                "Google OAuth Secret",
+            ),
+            (
+                format!("ya29.{}", "a0AfB_byC9xYz0123456789abcdef"),
+                "Google OAuth Token",
+            ),
+            (
+                format!("ya29.c.{}", "c0AZ4bNpq7zP2mX9vLk4nRt8wYb1"),
+                "Google OAuth Token",
+            ),
+        ];
+        for (token, label) in cases {
+            let out = redact_secrets(&format!("token: {token}\n"));
+            assert_eq!(out, format!("token: [REDACTED {label}]\n"), "{token}");
+        }
+        for benign in [
+            "glsa_short",
+            "glc_config_loader",
+            "myglsa_abcdefghijklmnop",
+            "ya29.short",
+        ] {
+            assert_eq!(
+                redact_secrets(benign),
+                benign,
+                "{benign} must not be masked"
+            );
+        }
+    }
+
+    #[test]
+    fn discord_tokens_are_masked_only_when_they_carry_a_user_id() {
+        use base64::Engine as _;
+        let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("123456789012345678");
+        let token = format!("{id}.GhIjKl.{}", "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123");
+        for text in [
+            format!("connecting with {token}"),
+            format!(r#"{{"DISCORD_BOT_TOKEN": "{token}"}}"#),
+            format!(r"line one\n{token}"),
+        ] {
+            let out = redact_secrets(&text);
+            assert!(!out.contains(&token), "token survived: {out}");
+            assert!(out.contains("[REDACTED Discord Token]"), "{out}");
+        }
+        // Same shape, but the first segment is not a base64 snowflake.
+        let lookalike = "MyVeryLongModuleNameHere.Config.SomeExtremelyLongAttributeName_value";
+        assert_eq!(redact_secrets(lookalike), lookalike);
+    }
+
+    #[test]
+    fn webhook_url_secrets_are_masked_and_hosts_stay_readable() {
+        let slack_secret = "AbCdEfGhIjKlMnOpQrStUvWx";
+        let discord_secret = "aBcD-eFgH_iJkLmNoPqRsTuVwXyZ0123456789";
+        let teams_tail = "0a1b2c3d@4e5f6a7b/IncomingWebhook/9c8d7e6f5a4b/0a1b2c3d";
+        let cases = [
+            (
+                format!("https://hooks.slack.com/services/T0123ABCD/B0123ABCD/{slack_secret}"),
+                slack_secret,
+                "https://hooks.slack.com/services/T0123ABCD/B0123ABCD/",
+            ),
+            (
+                format!("http://hooks.slack.com/workflows/T01/A02/123456789/{slack_secret}"),
+                slack_secret,
+                "http://hooks.slack.com/workflows/T01/A02/123456789/",
+            ),
+            (
+                format!("https://discord.com/api/webhooks/123456789012345678/{discord_secret}"),
+                discord_secret,
+                "https://discord.com/api/webhooks/123456789012345678/",
+            ),
+            (
+                format!("https://contoso.webhook.office.com/webhookb2/{teams_tail}"),
+                teams_tail,
+                "https://contoso.webhook.office.com/webhookb2/",
+            ),
+        ];
+        for (url, secret, kept) in cases {
+            let out = redact_secrets(&format!("posting to {url} now"));
+            assert!(!out.contains(secret), "secret survived: {out}");
+            assert!(
+                out.contains(&format!("{kept}[REDACTED")),
+                "host lost: {out}"
+            );
+        }
+        for benign in [
+            "https://hooks.slack.com/docs",
+            "https://discord.com/api/webhooks",
+            "https://example.com/services/T0/B0/notasecret",
+        ] {
+            assert_eq!(
+                redact_secrets(benign),
+                benign,
+                "{benign} must not be masked"
+            );
         }
     }
 
@@ -1720,7 +1871,7 @@ mod tests {
             (
                 "client_secret {S}",
                 ["GOCSPX-aBcDeFgHiJ", "kLmNoPqRsTuVwXyZ12"],
-                "Google OAuth Client Secret",
+                "Google OAuth Secret",
                 "client_secret",
             ),
             (
@@ -1744,7 +1895,7 @@ mod tests {
             (
                 "post to https://hooks.slack.com/services/T01ABCDEF/B02GHIJKL/{S} please",
                 ["aBcDeFgHiJkL", "mNoPqRsTuVwX"],
-                "Slack Webhook URL",
+                "Webhook Secret",
                 "https://hooks.slack.com/services/T01ABCDEF/B02GHIJKL/",
             ),
             (
@@ -1753,13 +1904,13 @@ mod tests {
                     "abcdefghijklmnopqrstuvwxyzABCDEFGH",
                     "IJKLMNOPQRSTUVWXYZ0123456789_-abcd",
                 ],
-                "Discord Webhook URL",
+                "Webhook Secret",
                 "https://discord.com/api/webhooks/123456789012345678/",
             ),
             (
                 "https://contoso.webhook.office.com/webhookb2/0a1b2c3d-1111-2222-3333-444455556666@7e8f9a0b-aaaa-bbbb-cccc-ddddeeeeffff/IncomingWebhook/{S}/1a2b3c4d",
                 ["abcdef0123456789", "abcdef0123456789"],
-                "Teams Webhook URL",
+                "Webhook Secret",
                 "https://contoso.webhook.office.com/webhookb2/",
             ),
             // The first dotted segment is base64("123456789012345678").
@@ -1769,7 +1920,7 @@ mod tests {
                     "MTIzNDU2Nzg5MDEyMzQ1Njc4",
                     ".GaBcDe.abcdefghijklmnopqrstuvwxyz0123456789AB",
                 ],
-                "Discord Bot Token",
+                "Discord Token",
                 "here",
             ),
         ];

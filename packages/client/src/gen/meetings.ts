@@ -3371,6 +3371,19 @@ export const MeetingsDefinition = {
       responseStream: false,
       options: {},
     },
+    /**
+     * Record more of a stopped meeting: back to "recording", new audio joins
+     * the same transcript and the next stop rewrites the summary. Emits
+     * MeetingStarted. Refused while the summary is still being written.
+     */
+    resumeMeeting: {
+      name: "ResumeMeeting",
+      requestType: MeetingId as typeof MeetingId,
+      requestStream: false,
+      responseType: Meeting as typeof Meeting,
+      responseStream: false,
+      options: {},
+    },
     /** Remove the meeting and its folder. */
     deleteMeeting: {
       name: "DeleteMeeting",

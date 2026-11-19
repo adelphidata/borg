@@ -734,6 +734,10 @@ pub struct NewDelivery<'a> {
     pub payload_json: &'a str,
     /// Maximum number of delivery retry attempts.
     pub max_retries: i32,
+    /// Earliest unix time the drain loop may claim the row. Set when the
+    /// caller is sending the first attempt itself, so a slow first send is
+    /// not picked up and sent a second time while still in flight.
+    pub not_before: Option<i64>,
 }
 
 /// Parameters for updating an existing scheduled task. `None` fields are left unchanged.

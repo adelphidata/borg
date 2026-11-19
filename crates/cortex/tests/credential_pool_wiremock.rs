@@ -259,6 +259,59 @@ async fn a_benched_credential_records_the_http_status_that_benched_it() {
 }
 
 #[tokio::test]
+async fn an_error_body_echoing_the_key_is_masked_in_the_recorded_message() {
+    // `borg auth list` prints `last_error_message`. These test keys match no
+    // redaction pattern, like a custom provider's random hex key, so only
+    // masking the known value keeps a provider's echo of it out.
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (config, key_a, key_b) = two_key_config(&server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(429).set_body_string(format!("rate limited for key {key_a}")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_b}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(chat_completion("ok"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).await.expect("client");
+    client
+        .chat(&user_message("hi"), None)
+        .await
+        .expect("second key serves the request");
+
+    let pool = client.primary_pool().cloned().expect("primary pool");
+    let messages: Vec<String> = pool
+        .entries()
+        .into_iter()
+        .filter_map(|e| e.last_error_message)
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "one credential was benched: {messages:?}"
+    );
+    assert!(
+        !messages[0].contains(&key_a) && messages[0].contains("[REDACTED credential]"),
+        "the echoed key must be masked: {}",
+        messages[0]
+    );
+}
+
+#[tokio::test]
 async fn chat_falls_back_to_the_next_provider_when_the_pool_is_exhausted() {
     let _guard = SERIAL
         .lock()

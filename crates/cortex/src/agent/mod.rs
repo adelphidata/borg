@@ -448,6 +448,10 @@ pub struct Agent {
     /// wire order. Attached to the assistant tool-call message so the next
     /// request of the same tool loop can replay them. Scoped to one stream.
     pub(super) turn_reasoning_blocks: Vec<serde_json::Value>,
+    /// The message the running turn started from (its last user-authored row
+    /// when the loop began). A content-policy refusal rolls history back to
+    /// it; the last user row is not the boundary once a steer has landed.
+    pub(super) turn_opening: Option<Message>,
     /// Full `reasoning_content` of the current stream, uncapped (unlike
     /// [`Self::turn_reasoning`], which keeps a display tail). Attached to
     /// the assistant tool-call message for providers that require it
@@ -667,6 +671,7 @@ impl Agent {
             unknown_tool_tracker,
             turn_reasoning: String::new(),
             turn_reasoning_blocks: Vec::new(),
+            turn_opening: None,
             turn_reasoning_content: String::new(),
             turn_reasoning_model: None,
             tool_intent_signalled: false,
@@ -1383,6 +1388,11 @@ impl Agent {
                 .clone()
                 .with_session_id(Some(self.session.meta.id.clone()));
         }
+        self.turn_opening = self
+            .history
+            .iter()
+            .rfind(|m| m.role == Role::User && !crate::conversation::is_agent_authored(m))
+            .cloned();
         let turn_baseline = self
             .execution_context
             .process_registry()
@@ -1972,6 +1982,25 @@ impl Agent {
         // arguments may be truncated and executing them risks running with
         // half-parsed input. Persist the interrupted marker and emit
         // TurnComplete so the TUI returns to the composer.
+        if stream_error
+            .as_deref()
+            .is_some_and(|e| classify_error_text(e) == Some(FailoverReason::ContentPolicy))
+        {
+            // Safety filters judge the whole thread: a refused request left in
+            // history gets every later message refused too. Take the turn out
+            // (no interrupted marker — there is nothing to resume) so the
+            // conversation can continue.
+            let opening = self.turn_opening.take();
+            let dropped =
+                crate::conversation::drop_current_turn(&mut self.history, opening.as_ref());
+            warn!(
+                dropped,
+                "provider refused the turn on content grounds; removed it from history"
+            );
+            self.auto_save();
+            let _ = event_tx.send(AgentEvent::TurnComplete).await;
+            return IterationOutcome::EndTurn;
+        }
         if stream_error.is_some() {
             self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
                 .await;

@@ -1651,6 +1651,16 @@ mod tests {
     }
 
     #[test]
+    fn not_a_multimodal_model_is_an_image_rejection() {
+        // vLLM's wording names no "support" verb, so it used to read as a
+        // malformed request and wedge the turn on the same image.
+        let body =
+            r#"{"object":"error","message":"Qwen/Qwen3-32B is not a multimodal model","code":400}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::Custom);
+        assert_eq!(err.reason(), FailoverReason::ImageUnsupported);
+    }
+
+    #[test]
     fn image_rejection_beats_model_not_found_when_the_body_says_both() {
         // The model id is fine here — only the pixels are undeliverable.
         // Reading this as ModelNotFound would cool a healthy slot and fail over.

@@ -8,9 +8,9 @@ impl Database {
     pub async fn enqueue_delivery(&self, d: &NewDelivery<'_>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO delivery_queue (id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?8, ?8)",
-            params!(d.id, d.channel_name, d.sender_id, d.channel_id.map(std::string::ToString::to_string), d.session_id.map(std::string::ToString::to_string), d.payload_json, d.max_retries, now),
+            "INSERT INTO delivery_queue (id, channel_name, sender_id, channel_id, session_id, payload_json, status, retry_count, max_retries, next_retry_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?8, ?9, ?9)",
+            params!(d.id, d.channel_name, d.sender_id, d.channel_id.map(std::string::ToString::to_string), d.session_id.map(std::string::ToString::to_string), d.payload_json, d.max_retries, d.not_before, now),
         ).await?;
         Ok(())
     }
@@ -114,7 +114,22 @@ mod tests {
             session_id: Some("sess1"),
             payload_json: r#"{"text":"hello"}"#,
             max_retries: 3,
+            not_before: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_row_held_by_not_before_is_not_claimed_early() {
+        let db = test_db().await;
+        let mut held = sample_delivery("held", "telegram");
+        held.not_before = Some(chrono::Utc::now().timestamp() + 120);
+        db.enqueue_delivery(&held).await.unwrap();
+        db.enqueue_delivery(&sample_delivery("free", "telegram"))
+            .await
+            .unwrap();
+        let claimed = db.claim_pending_deliveries(10).await.unwrap();
+        let ids: Vec<&str> = claimed.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["free"], "the in-flight first send must be left alone");
     }
 
     #[tokio::test]
