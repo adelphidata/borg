@@ -10,6 +10,12 @@ ignore = [
     # Pulled transitively (reqwest/rustls-native-certs); revisit when upstream
     # deps drop it.
     "RUSTSEC-2025-0134",
+    # chrono and chrono-tz are flagged unmaintained with no fixed release.
+    # Both are direct dependencies across the workspace; these are maintenance
+    # notices, not vulnerabilities. Drop them when maintenance resumes or the
+    # workspace moves to another date-time crate.
+    "RUSTSEC-2026-0543", # chrono: unmaintained
+    "RUSTSEC-2026-0555", # chrono-tz: unmaintained
     # --- songbird lockfile artifacts NOT compiled into borg's voice build ---
     # These reach Cargo.lock only via songbird 0.6, behind the opt-in
     # `discord-voice-channels` feature: songbird's MANDATORY DAVE (E2EE) dep
