@@ -239,6 +239,20 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // Google API keys are `AIza` + 35 url-safe base64 chars. The prefix is
         // distinctive enough that a 30+ char lower bound won't false-positive.
         (r"AIza[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
+        (r"\bAQ\.[0-9A-Za-z_-]{30,}", "Google API Key", false, None),
+        // The long-lived Google OAuth refresh token a calendar sign-in stores.
+        (
+            r"\b1//0[0-9A-Za-z_-]{40,}",
+            "Google OAuth Token",
+            false,
+            None,
+        ),
+        (
+            r"\bmfa\.[0-9A-Za-z_-]{60,}",
+            "Discord MFA Token",
+            false,
+            None,
+        ),
         // Stripe live secret/restricted keys (`sk_live_`/`rk_live_`). Test-mode
         // keys are deliberately left alone.
         (r"[sr]k_live_[0-9A-Za-z]{16,}", "Stripe Key", false, None),
@@ -325,14 +339,14 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             None,
         ),
         (
-            r"\bglc_[A-Za-z0-9+/]{32,}={0,3}",
+            r"\bglc_[A-Za-z0-9+/_-]{32,}={0,3}",
             "Grafana Token",
             false,
             None,
         ),
         // Google OAuth: a pasted `client_secret.json` carries `GOCSPX-…`;
-        // access tokens are `ya29.` plus an optional one-letter issuer tag
-        // (`c.` service account, `d.` STS).
+        // access tokens are `ya29.` plus a dotted url-safe body (an optional
+        // one-letter issuer tag first: `c.` service account, `d.` STS).
         (
             r"\bGOCSPX-[A-Za-z0-9_-]{8,}",
             "Google OAuth Secret",
@@ -340,7 +354,7 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
             None,
         ),
         (
-            r"\bya29\.(?:[a-z]\.)?[A-Za-z0-9_-]{20,}",
+            r"\bya29\.[A-Za-z0-9._-]{20,}",
             "Google OAuth Token",
             false,
             None,
@@ -358,23 +372,23 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         ),
         // Incoming-webhook URLs: the URL itself is the credential, so the
         // secret path segment is masked while host and ids stay readable.
-        // `http://` is matched too — a mistyped scheme carries the same
-        // secret. Teams Workflows URLs keep their secret in `sig=`, which the
+        // `http://` or no scheme at all is matched too — the path carries the
+        // same secret. Teams Workflows URLs keep their secret in `sig=`, which the
         // URL Query Credential pattern below already masks.
         (
-            r"(?i)https?://hooks\.slack(?:-gov)?\.com\.?(?::\d+)?/(?:services|workflows|triggers)/[A-Z0-9]+/[A-Z0-9]+/(?:\d+/)?([A-Za-z0-9]{8,})",
+            r"(?i)(?:https?://)?hooks\.slack(?:-gov)?\.com\.?(?::\d+)?/(?:services|workflows|triggers)/[A-Z0-9]+/[A-Z0-9]+/(?:\d+/)?([A-Za-z0-9]{8,})",
             "Webhook Secret",
             true,
             None,
         ),
         (
-            r"(?i)https?://(?:canary\.|ptb\.|www\.)?discord(?:app)?\.com\.?(?::\d+)?/api/(?:v\d+/)?webhooks/\d+/([\w-]{8,})",
+            r"(?i)(?:https?://)?(?:canary\.|ptb\.|www\.)?discord(?:app)?\.com\.?(?::\d+)?/api/(?:v\d+/)?webhooks/\d+/([\w-]{8,})",
             "Webhook Secret",
             true,
             None,
         ),
         (
-            r"(?i)https?://[A-Za-z0-9.-]*(?:webhook\.office\.com\.?(?::\d+)?/webhookb2|outlook\.office\.com\.?(?::\d+)?/webhook)/([\w@/%+=-]{8,})",
+            r"(?i)(?:https?://)?[A-Za-z0-9.-]*(?:webhook\.office\.com\.?(?::\d+)?/webhookb2|outlook\.office\.com\.?(?::\d+)?/webhook)/([\w@/%+=-]{8,})",
             "Webhook Secret",
             true,
             None,
@@ -1842,6 +1856,104 @@ mod tests {
             "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw", // 34-char body
             "127.0.0.1:8080/health",
             "2026-10-06T12:34:56Z",
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
+        }
+    }
+
+    #[test]
+    fn redacts_oauth_webhook_and_chat_bot_credentials_table() {
+        // (input with `{S}` where the secret sits, the secret in two halves,
+        // label, text that must survive). Each secret is joined at runtime so
+        // no credential-shaped literal sits in this file.
+        let positives: &[(&str, [&str; 2], &str, &str)] = &[
+            (
+                "client_secret {S}",
+                ["GOCSPX-aBcDeFgHiJ", "kLmNoPqRsTuVwXyZ12"],
+                "Google OAuth Secret",
+                "client_secret",
+            ),
+            (
+                "got {S} back",
+                ["ya29.a0AfH6SMBx1234567890", "abcdefghijklmnopqrstuvwxyz-_AB"],
+                "Google OAuth Token",
+                "back",
+            ),
+            (
+                "refresh {S}",
+                ["1//0gAbCdEfGhIjKlMnOpQrSt", "UvWxYz0123456789-_abcdefghij"],
+                "Google OAuth Token",
+                "refresh",
+            ),
+            (
+                "grafana {S}",
+                ["glsa_0123456789abcdefghij", "ABCDEFGHIJ01_9f8e7d6c"],
+                "Grafana Token",
+                "grafana",
+            ),
+            (
+                "post to https://hooks.slack.com/services/T01ABCDEF/B02GHIJKL/{S} please",
+                ["aBcDeFgHiJkL", "mNoPqRsTuVwX"],
+                "Webhook Secret",
+                "https://hooks.slack.com/services/T01ABCDEF/B02GHIJKL/",
+            ),
+            (
+                "https://discord.com/api/webhooks/123456789012345678/{S}",
+                [
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGH",
+                    "IJKLMNOPQRSTUVWXYZ0123456789_-abcd",
+                ],
+                "Webhook Secret",
+                "https://discord.com/api/webhooks/123456789012345678/",
+            ),
+            (
+                "https://contoso.webhook.office.com/webhookb2/0a1b2c3d-1111-2222-3333-444455556666@7e8f9a0b-aaaa-bbbb-cccc-ddddeeeeffff/IncomingWebhook/{S}/1a2b3c4d",
+                ["abcdef0123456789", "abcdef0123456789"],
+                "Webhook Secret",
+                "https://contoso.webhook.office.com/webhookb2/",
+            ),
+            // The first dotted segment is base64("123456789012345678").
+            (
+                "token {S} here",
+                [
+                    "MTIzNDU2Nzg5MDEyMzQ1Njc4",
+                    ".GaBcDe.abcdefghijklmnopqrstuvwxyz0123456789AB",
+                ],
+                "Discord Token",
+                "here",
+            ),
+        ];
+        for (template, halves, label, kept) in positives {
+            let secret = halves.concat();
+            let input = template.replace("{S}", &secret);
+            let out = redact_with_audit(&input);
+            assert!(!out.text.contains(&secret), "{label} leaked: {}", out.text);
+            assert!(out.text.contains(kept), "{label} over-masked: {}", out.text);
+            assert!(
+                out.hits.iter().any(|h| h.label == *label),
+                "{input} expected {label}, got {:?}",
+                out.hits
+            );
+        }
+        // A dotted triple shaped like a bot token whose first segment does
+        // not decode to a snowflake id.
+        let not_a_snowflake = [
+            "abcdefghijklmnopqrstuvwx",
+            ".GaBcDe.abcdefghijklmnopqrstuvwxyz0123456789AB",
+        ]
+        .concat();
+        let negatives = [
+            "GOCSPX-short",
+            "ya29.short",
+            "version 1//0 of the spec",
+            "glsa_short",
+            "https://hooks.slack.com/services/T01ABCDEF/B02GHIJKL/short",
+            "https://discord.com/api/webhooks/123456789012345678",
+            "https://discord.com/api/channels/123456789012345678/messages",
+            // Three dotted runs whose first segment is not a snowflake id.
+            "com.example.application_identifier.SomeLongModuleName.AnotherVeryLongTypeNameHere",
+            not_a_snowflake.as_str(),
         ];
         for input in negatives {
             assert_eq!(redact_secrets(input), input, "false positive on {input}");

@@ -1848,6 +1848,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn byte_cap_bodies_are_payload_too_large_whatever_the_status() {
+        let too_large = [
+            "gateway returned 400: request body too large, must be less than 20MB",
+            "proxy returned 400: Request size exceeds the limit",
+            "returned 400: Payload exceeded the maximum allowed size",
+            "Request Entity Too Large",
+        ];
+        for body in too_large {
+            assert_eq!(
+                classify_error_text(body),
+                Some(FailoverReason::PayloadTooLarge),
+                "{body}"
+            );
+        }
+        let not_a_size_cap = [
+            // One field is too long, not the request.
+            "returned 400: 'name' is too long, string exceeds maxLength 64",
+            // A throttle that happens to mention size.
+            "429 rate limit: request size exceeds your tokens per min quota",
+            "invalid payload: missing field `model`",
+        ];
+        for body in not_a_size_cap {
+            assert_ne!(
+                classify_error_text(body),
+                Some(FailoverReason::PayloadTooLarge),
+                "{body}"
+            );
+        }
+    }
+
     // ── classify_error_text: extended taxonomy (auth / billing / rate_limit /
     //    overloaded / timeout). One table per direction so a missing needle
     //    or a misordered branch fails a concrete row instead of a generic

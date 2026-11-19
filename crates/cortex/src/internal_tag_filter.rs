@@ -172,6 +172,20 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_reasoning_tag_is_stripped_whole_and_streamed() {
+        assert_eq!(
+            strip_internal_tags("<mm:think>plan the answer</mm:think>Done."),
+            "Done."
+        );
+        let mut filter = InternalTagFilter::new();
+        let mut shown = String::new();
+        for piece in ["Hi <mm:", "think>hidden</mm:th", "ink> there"] {
+            shown.push_str(&filter.push(piece).unwrap_or_default());
+        }
+        assert_eq!(shown, "Hi  there");
+    }
+
+    #[test]
     fn strip_internal_tags_empty() {
         assert_eq!(strip_internal_tags(""), "");
     }

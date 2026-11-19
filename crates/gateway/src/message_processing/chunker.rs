@@ -11,8 +11,17 @@
 /// Callers upstream of the adapters generally drop empty replies before they
 /// are enqueued; this is the adapter's own contract, so it holds no matter who
 /// calls it.
+///
+/// Text carrying a ``` code fence is split with [`chunk_markdown_fenced`], so
+/// a boundary inside a block closes the fence in one message and reopens it
+/// in the next instead of leaving an unterminated block followed by orphaned
+/// code. Text without a fence keeps [`chunk_text`]'s paragraph-first split.
 pub fn chunks_for_delivery(text: &str, max_chars: usize) -> anyhow::Result<Vec<String>> {
-    let chunks = chunk_text_nonempty(text, max_chars);
+    let chunks = if text.contains("```") {
+        chunk_markdown_fenced(text, max_chars)
+    } else {
+        chunk_text_nonempty(text, max_chars)
+    };
     if chunks.is_empty() {
         anyhow::bail!("refusing to send an empty message");
     }
@@ -76,7 +85,9 @@ pub fn chunk_text_nonempty(text: &str, max_chars: usize) -> Vec<String> {
 /// Split text into chunks that fit within `max_chars` (character count, not bytes).
 ///
 /// Splitting priority: paragraph boundary (`\n\n`), line boundary (`\n`),
-/// sentence boundary (`. `), then hard character split.
+/// sentence boundary (`. `), whitespace, then hard character split. Sentence
+/// and whitespace splits keep the separator at the end of the earlier chunk,
+/// so the chunks of a single line concatenate back to it.
 pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![];
@@ -124,6 +135,20 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
         // Try sentence boundary
         if let Some(pos) = window.rfind(". ") {
             let split_at = pos + 2;
+            chunks.push(remaining[..split_at].to_string());
+            remaining = &remaining[split_at..];
+            continue;
+        }
+
+        // Try a word boundary, so a line with no sentence end is not cut
+        // mid-word. Leading whitespace is skipped: splitting there would
+        // emit a whitespace-only chunk.
+        if let Some((pos, ws)) = window
+            .char_indices()
+            .rev()
+            .find(|(i, c)| *i > 0 && c.is_whitespace())
+        {
+            let split_at = pos + ws.len_utf8();
             chunks.push(remaining[..split_at].to_string());
             remaining = &remaining[split_at..];
             continue;
@@ -425,11 +450,34 @@ mod tests {
     #[test]
     fn multibyte_unicode_no_panic() {
         let text = "Hello \u{1F600}\u{1F600}\u{1F600} world";
-        let chunks = chunk_text(text, 8);
-        // "Hello 😀😀" = 8 chars, "😀 world" = 7 chars
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "Hello \u{1F600}\u{1F600}");
-        assert_eq!(chunks[1], "\u{1F600} world");
+        // With whitespace available the emoji run stays whole.
+        assert_eq!(
+            chunk_text(text, 8),
+            vec!["Hello ", "\u{1F600}\u{1F600}\u{1F600} ", "world"]
+        );
+        // With none in reach the cut lands inside the run, and the byte
+        // offsets must stay char-aligned.
+        assert_eq!(
+            chunk_text("Hello\u{1F600}\u{1F600}\u{1F600}\u{1F600} world", 7),
+            vec!["Hello\u{1F600}\u{1F600}", "\u{1F600}\u{1F600} ", "world"]
+        );
+    }
+
+    /// A long line with no sentence end must break between words: a hard cut
+    /// at the limit delivers "…fox" / "trot…" across two messages.
+    #[test]
+    fn line_without_sentence_boundary_splits_at_whitespace() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel";
+        let chunks = chunk_text(text, 20);
+        assert_eq!(
+            chunks,
+            vec!["alpha bravo charlie ", "delta echo foxtrot ", "golf hotel"]
+        );
+        assert_eq!(chunks.concat(), text, "no character may be lost");
+
+        // Leading whitespace is not a usable boundary: it must not become a
+        // whitespace-only chunk, and the unbreakable word is still cut.
+        assert_eq!(chunk_text(" abcdefgh", 4), vec![" abc", "defg", "h"]);
     }
 
     #[test]
@@ -733,6 +781,48 @@ mod tests {
         assert_eq!(truncate_utf16(s, 5), "\u{1F600}\u{1F601}");
         assert_eq!(truncate_utf16(s, 6), s);
         assert_eq!(truncate_utf16("abc", 2), "ab");
+    }
+
+    /// The adapters that send through `chunks_for_delivery` post each chunk
+    /// as its own message, so every chunk must render standalone: a code
+    /// block longer than the limit is closed at the end of one message and
+    /// reopened (with its language) in the next, and the bracketing fences
+    /// count against the limit.
+    #[test]
+    fn chunks_for_delivery_keeps_fences_balanced_within_the_limit() {
+        let max = 200;
+        let code: Vec<String> = (0..40).map(|i| format!("let value_{i} = {i};")).collect();
+        let text = format!("Here you go:\n```rust\n{}\n```\nDone.", code.join("\n"));
+        assert!(text.chars().count() > max * 3);
+
+        let chunks = chunks_for_delivery(&text, max).unwrap();
+        assert!(chunks.len() > 1, "expected a split: {chunks:?}");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.chars().count() <= max,
+                "chunk {i} is {} chars, over the {max} limit: {chunk:?}",
+                chunk.chars().count()
+            );
+            assert_eq!(
+                fence_count(chunk) % 2,
+                0,
+                "chunk {i} leaves a fence open: {chunk:?}"
+            );
+        }
+        // Every code line arrives exactly once, in order, inside a block
+        // that keeps the language tag.
+        let delivered: Vec<&str> = chunks
+            .iter()
+            .flat_map(|c| c.lines())
+            .filter(|l| l.starts_with("let value_"))
+            .collect();
+        assert_eq!(delivered, code);
+        for chunk in chunks.iter().filter(|c| c.contains("let value_")) {
+            assert!(
+                chunk.contains("```rust\n"),
+                "code must sit in a rust block: {chunk:?}"
+            );
+        }
     }
 
     #[test]

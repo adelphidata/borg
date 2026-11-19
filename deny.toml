@@ -10,6 +10,12 @@ ignore = [
     # Pulled transitively (reqwest/rustls-native-certs); revisit when upstream
     # deps drop it.
     "RUSTSEC-2025-0134",
+    # chrono and chrono-tz are flagged unmaintained with no fixed release.
+    # Both are direct dependencies across the workspace; these are maintenance
+    # notices, not vulnerabilities. Drop them when maintenance resumes or the
+    # workspace moves to another date-time crate.
+    "RUSTSEC-2026-0543", # chrono: unmaintained
+    "RUSTSEC-2026-0555", # chrono-tz: unmaintained
     # --- songbird lockfile artifacts NOT compiled into borg's voice build ---
     # These reach Cargo.lock only via songbird 0.6, behind the opt-in
     # `discord-voice-channels` feature: songbird's MANDATORY DAVE (E2EE) dep
@@ -32,15 +38,6 @@ ignore = [
     # elliptic-curve 0.14; no davey/openmls release takes it yet. Drop this
     # when songbird's chain moves, or voice is dropped.
     "RUSTSEC-2026-0387", # crypto-bigint: timing variability in constant-time ops
-    # zip 8 reaches the graph only through anydoc (document text extraction),
-    # and every anydoc release still requires `zip ^8`. All four bugs live in
-    # `ZipArchive::extract` / `ZipStreamReader::extract` writing to disk;
-    # anydoc never calls them — it reads entries into memory. Drop these once
-    # anydoc moves to zip >= 9.
-    "RUSTSEC-2026-0367", # zip: SUID/SGID bits kept on extract
-    "RUSTSEC-2026-0368", # zip: extract creates symlinks escaping the destination
-    "RUSTSEC-2026-0369", # zip: extract applies permissions through symlinks
-    "RUSTSEC-2026-0429", # zip: extract aborts on a symlink entry with a huge size
 ]
 
 [licenses]

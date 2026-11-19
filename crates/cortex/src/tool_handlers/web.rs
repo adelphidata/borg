@@ -174,12 +174,20 @@ pub async fn handle_web_fetch(args: &serde_json::Value, config: &Config) -> Resu
     }
 }
 
+const EMPTY_QUERY_ERROR: &str =
+    "Error searching: 'query' is empty. Call web_search again with the words to search for.";
+
 #[instrument(skip_all, fields(tool.name = "web_search"))]
 pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Result<String> {
     if let Some(msg) = check_enabled(config.web.enabled, "web") {
         return Ok(msg);
     }
     let query = require_str_param(args, "query")?;
+    // A blank query only earns a provider validation error the model cannot
+    // act on, after a network round trip and a cache row.
+    if query.trim().is_empty() {
+        return Ok(EMPTY_QUERY_ERROR.to_string());
+    }
     let mode = SearchMode::parse(args["mode"].as_str());
     let provider = web::resolve_provider_id(&config.web).to_string();
 
@@ -284,6 +292,18 @@ mod tests {
             result.contains("disabled"),
             "expected 'disabled' in: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn blank_web_search_query_is_refused_before_any_lookup() {
+        let mut config = Config::default();
+        config.web.enabled = true;
+        for query in ["", "   ", "\n\t"] {
+            let result = handle_web_search(&json!({"query": query}), &config)
+                .await
+                .unwrap();
+            assert_eq!(result, EMPTY_QUERY_ERROR, "query {query:?}");
+        }
     }
 
     #[test]

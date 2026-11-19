@@ -28,6 +28,11 @@ const MEDIA_SEND_TIMEOUT: Duration = crate::constants::TELEGRAM_MEDIA_SEND_TIMEO
 const MAX_SEND_RETRIES: u32 = crate::constants::TELEGRAM_MAX_SEND_RETRIES;
 const FLOOD_FAIL_FAST_SECS: u64 = crate::constants::TELEGRAM_FLOOD_FAIL_FAST_SECS;
 
+/// Extra attempts for an inbound file fetch that failed transiently.
+const FILE_FETCH_RETRIES: u32 = 2;
+/// Wait before the first file fetch retry; each later retry adds one more.
+const FILE_FETCH_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Longest per-chat flood cooldown that the client keeps, whatever wait
 /// Telegram names.
 const FLOOD_COOLDOWN_CAP: Duration = Duration::from_secs(300);
@@ -156,6 +161,13 @@ impl TelegramClient {
     fn scrub_err(&self, e: reqwest::Error, action: &str) -> anyhow::Error {
         let chain = format!("{:#}", anyhow::Error::from(e));
         anyhow::anyhow!("{action}: {}", self.scrub(&chain))
+    }
+
+    /// Like [`Self::scrub_err`], for a read-only file fetch whose transport
+    /// failure is safe to retry: the scrubbed text is carried by a
+    /// [`TransientFetchError`].
+    fn transient_err(&self, e: reqwest::Error, action: &str) -> anyhow::Error {
+        TransientFetchError(self.scrub_err(e, action).to_string()).into()
     }
 
     /// Validate the bot token by calling getMe.
@@ -775,56 +787,24 @@ impl TelegramClient {
         Ok(())
     }
 
-    /// A transport failure on getFile or the file download. Both are pure
-    /// reads, so any of them may be retried.
-    fn fetch_err(&self, e: reqwest::Error, action: &str) -> anyhow::Error {
-        anyhow::Error::new(TransientFetch(format!("{:#}", self.scrub_err(e, action))))
-    }
-
-    /// getFile plus the download as one unit, retried on transport failures
-    /// so one stalled read does not turn a photo or voice note into a
-    /// "could not be downloaded" placeholder. A size-cap refusal or an
-    /// `ok:false` answer is final. Returns the bytes and the file's path.
-    pub async fn fetch_file(&self, file_id: &str) -> Result<(Vec<u8>, String)> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let result = async {
-                let path = self
-                    .get_file(file_id)
-                    .await?
-                    .file_path
-                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-                let bytes = self.download_file(&path).await?;
-                Ok::<_, anyhow::Error>((bytes, path))
-            }
-            .await;
-            match result {
-                Err(e)
-                    if attempt <= FILE_FETCH_RETRIES
-                        && e.downcast_ref::<TransientFetch>().is_some() =>
-                {
-                    warn!(attempt, error = %e, "telegram: file fetch failed; retrying");
-                    tokio::time::sleep(connect_backoff(attempt)).await;
-                }
-                other => return other,
-            }
-        }
-    }
-
     /// Get file info by file_id.
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
         let body = serde_json::json!({ "file_id": file_id });
-        let resp: ApiResponse<FileInfo> = self
+        let resp = self
             .client
             .post(self.api_url("getFile"))
             .json(&body)
             .send()
             .await
-            .map_err(|e| self.fetch_err(e, "Failed to call getFile"))?
+            .map_err(|e| self.transient_err(e, "Failed to call getFile"))?;
+        let status = resp.status();
+        if is_transient_status(status) {
+            return Err(TransientFetchError(format!("getFile failed: HTTP {status}")).into());
+        }
+        let resp: ApiResponse<FileInfo> = resp
             .json()
             .await
-            .map_err(|e| self.fetch_err(e, "Failed to parse getFile response"))?;
+            .map_err(|e| self.transient_err(e, "Failed to parse getFile response"))?;
 
         match resp.result {
             Some(info) if resp.ok => Ok(info),
@@ -837,13 +817,25 @@ impl TelegramClient {
 
     /// Download a file by its file_path (obtained from get_file).
     /// Limits download size to `TELEGRAM_MAX_FILE_SIZE_BYTES` to prevent memory exhaustion.
+    ///
+    /// A non-success status is an error: the body of a 404 or 5xx is an error
+    /// page, not the file, and must never be handed on as image or audio
+    /// bytes.
     pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
         let resp = self
             .client
             .get(self.file_url(file_path))
             .send()
             .await
-            .map_err(|e| self.fetch_err(e, "Failed to download file"))?;
+            .map_err(|e| self.transient_err(e, "Failed to download file"))?;
+
+        let status = resp.status();
+        if is_transient_status(status) {
+            return Err(TransientFetchError(format!("File download failed: HTTP {status}")).into());
+        }
+        if !status.is_success() {
+            bail!("File download failed: HTTP {status}");
+        }
 
         if let Some(len) = resp.content_length() {
             if len > TELEGRAM_MAX_FILE_SIZE_BYTES {
@@ -861,7 +853,7 @@ impl TelegramClient {
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| self.fetch_err(e, "Failed to read file bytes"))?
+            .map_err(|e| self.transient_err(e, "Failed to read file bytes"))?
         {
             if bytes.len() as u64 + chunk.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
                 bail!(
@@ -873,6 +865,22 @@ impl TelegramClient {
         }
 
         Ok(bytes)
+    }
+
+    /// Resolve `file_id` and download it, returning `(file_path, bytes)`.
+    ///
+    /// Each step is retried a bounded number of times on a transport failure
+    /// or a 5xx/429 answer, so one dropped connection does not cost the user
+    /// their photo or voice note. Any other refusal (a 4xx, a file over the
+    /// size cap) is final and fails at once.
+    pub async fn fetch_file(&self, file_id: &str) -> Result<(String, Vec<u8>)> {
+        let info = retry_transient("Telegram getFile", || self.get_file(file_id)).await?;
+        let file_path = info
+            .file_path
+            .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+        let bytes =
+            retry_transient("Telegram file download", || self.download_file(&file_path)).await?;
+        Ok((file_path, bytes))
     }
 
     /// Send a message with an inline keyboard.
@@ -1129,20 +1137,40 @@ impl NativeCommandRegistration for TelegramClient {
     }
 }
 
-/// Retries after the first attempt of a getFile + download.
-const FILE_FETCH_RETRIES: u32 = 2;
+/// A file fetch failure worth another attempt: the request never completed,
+/// or Telegram answered 5xx/429. Attached to the `anyhow` error so
+/// [`retry_transient`] can tell it from a final refusal (any other 4xx, an
+/// oversized file).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TransientFetchError(String);
 
-/// Marker for a getFile/download failure a retry may cure.
-#[derive(Debug)]
-struct TransientFetch(String);
-
-impl std::fmt::Display for TransientFetch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+/// True for the statuses a file fetch may retry: server errors and 429.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
-impl std::error::Error for TransientFetch {}
+/// Run a read-only fetch, retrying up to [`FILE_FETCH_RETRIES`] times while
+/// it fails with a [`TransientFetchError`]. Any other error is returned at
+/// once.
+async fn retry_transient<T, F, Fut>(what: &str, op: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut retries = 0u32;
+    loop {
+        match op().await {
+            Err(e) if retries < FILE_FETCH_RETRIES && e.is::<TransientFetchError>() => {
+                retries += 1;
+                let backoff = FILE_FETCH_BACKOFF * retries;
+                warn!("{what} failed, retrying in {backoff:?} (retry {retries}/{FILE_FETCH_RETRIES}): {e}");
+                tokio::time::sleep(backoff).await;
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Determine if a network error is safe to retry (no data was sent/received).
 fn is_safe_to_retry(err: &reqwest::Error) -> bool {
@@ -2449,7 +2477,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
-        let (bytes, file_path) = client.fetch_file("F1").await.expect("retry recovers");
+        let (file_path, bytes) = client.fetch_file("F1").await.expect("retry recovers");
         assert_eq!(bytes, b"OggS");
         assert_eq!(file_path, "voice/f.oga");
 
@@ -2515,6 +2543,238 @@ mod tests {
             err.to_string().contains("file is too big"),
             "description must surface, got: {err}"
         );
+    }
+
+    /// Telegram answers a missing or expired file path with an error body.
+    /// Returning that body as the file would attach an error page as an
+    /// image, or send it to speech-to-text.
+    #[tokio::test]
+    async fn download_file_rejects_an_error_status_instead_of_returning_its_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file/bot123:ABC/photos/gone.jpg"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client
+            .download_file("photos/gone.jpg")
+            .await
+            .expect_err("a 404 body is not the file");
+        let msg = err.to_string();
+        assert!(msg.contains("404"), "the status must surface: {msg}");
+        assert!(!msg.contains("123:ABC"), "token leak: {msg}");
+    }
+
+    /// One transient failure of either fetch step must not cost the user
+    /// their attachment, a refusal that cannot change must not be asked
+    /// again, and a persistent outage must stop after the retry budget.
+    #[tokio::test]
+    async fn fetch_file_retries_transient_failures_only() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct Case {
+            name: &'static str,
+            /// Status answered by getFile before it starts succeeding, and
+            /// how many times (`u64::MAX` = always).
+            get_file_failure: Option<(u16, u64)>,
+            /// The same for the download.
+            download_failure: Option<(u16, u64)>,
+            succeeds: bool,
+            get_file_calls: usize,
+            download_calls: usize,
+        }
+        let cases = [
+            Case {
+                name: "clean fetch",
+                get_file_failure: None,
+                download_failure: None,
+                succeeds: true,
+                get_file_calls: 1,
+                download_calls: 1,
+            },
+            Case {
+                name: "download 503 then ok",
+                get_file_failure: None,
+                download_failure: Some((503, 1)),
+                succeeds: true,
+                get_file_calls: 1,
+                download_calls: 2,
+            },
+            Case {
+                name: "download 429 twice then ok",
+                get_file_failure: None,
+                download_failure: Some((429, 2)),
+                succeeds: true,
+                get_file_calls: 1,
+                download_calls: 3,
+            },
+            Case {
+                name: "getFile 502 then ok",
+                get_file_failure: Some((502, 1)),
+                download_failure: None,
+                succeeds: true,
+                get_file_calls: 2,
+                download_calls: 1,
+            },
+            Case {
+                name: "download 404 is final",
+                get_file_failure: None,
+                download_failure: Some((404, u64::MAX)),
+                succeeds: false,
+                get_file_calls: 1,
+                download_calls: 1,
+            },
+            Case {
+                name: "getFile 400 is final",
+                get_file_failure: Some((400, u64::MAX)),
+                download_failure: None,
+                succeeds: false,
+                get_file_calls: 1,
+                download_calls: 0,
+            },
+            Case {
+                name: "download 500 forever stops after the budget",
+                get_file_failure: None,
+                download_failure: Some((500, u64::MAX)),
+                succeeds: false,
+                get_file_calls: 1,
+                download_calls: 1 + FILE_FETCH_RETRIES as usize,
+            },
+        ];
+
+        for case in cases {
+            let server = MockServer::start().await;
+            // Mounted first, so they answer until their budget is spent.
+            if let Some((status, times)) = case.get_file_failure {
+                Mock::given(method("POST"))
+                    .and(path("/bot123:ABC/getFile"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({ "ok": false, "description": "refused" }),
+                    ))
+                    .up_to_n_times(times)
+                    .mount(&server)
+                    .await;
+            }
+            if let Some((status, times)) = case.download_failure {
+                Mock::given(method("GET"))
+                    .and(path("/file/bot123:ABC/photos/file_1.jpg"))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("error page"))
+                    .up_to_n_times(times)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(path("/bot123:ABC/getFile"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "file_id": "F1",
+                        "file_unique_id": "U1",
+                        "file_path": "photos/file_1.jpg"
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/file/bot123:ABC/photos/file_1.jpg"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"jpeg-bytes".to_vec()))
+                .mount(&server)
+                .await;
+
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            let result = client.fetch_file("F1").await;
+            match (&result, case.succeeds) {
+                (Ok((file_path, bytes)), true) => {
+                    assert_eq!(file_path, "photos/file_1.jpg", "{}", case.name);
+                    assert_eq!(bytes, b"jpeg-bytes", "{}", case.name);
+                }
+                (Err(_), false) => {}
+                _ => panic!("{}: unexpected result {result:?}", case.name),
+            }
+
+            let requests = server.received_requests().await.unwrap();
+            let calls = |suffix: &str| {
+                requests
+                    .iter()
+                    .filter(|r| r.url.path().ends_with(suffix))
+                    .count()
+            };
+            assert_eq!(calls("/getFile"), case.get_file_calls, "{}", case.name);
+            assert_eq!(calls("/file_1.jpg"), case.download_calls, "{}", case.name);
+        }
+    }
+
+    /// A connection that never completes is the transient failure users
+    /// actually hit; it must be retried, and what is finally reported must
+    /// not carry the bot token that the request URL embeds.
+    #[tokio::test]
+    async fn fetch_file_transport_failure_is_retried_and_scrubbed() {
+        let client = TelegramClient::with_base("123:ABC", "http://127.0.0.1:1").unwrap();
+        let started = Instant::now();
+        let err = client
+            .fetch_file("F1")
+            .await
+            .expect_err("nothing listens on the port");
+        assert!(
+            started.elapsed() >= FILE_FETCH_BACKOFF * 3,
+            "both retries must have been taken, with their backoff"
+        );
+        assert!(!err.to_string().contains("123:ABC"), "token leak: {err}");
+    }
+
+    /// The media endpoints take the reply anchor as a form field. Like the
+    /// JSON sends, an anchored upload must be allowed to go out unanchored
+    /// when the user has deleted that message, and an unanchored upload
+    /// carries neither field.
+    #[tokio::test]
+    async fn media_forms_carry_allow_sending_without_reply_with_an_anchor() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for reply_to_message_id in [Some(10), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": {}
+                })))
+                .mount(&server)
+                .await;
+            let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+            client
+                .send_photo(
+                    7,
+                    MediaSource::FileId("P1"),
+                    None,
+                    None,
+                    reply_to_message_id,
+                )
+                .await
+                .unwrap();
+            client
+                .send_voice(7, b"ogg", None, None, reply_to_message_id)
+                .await
+                .unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            for request in &requests {
+                let body = String::from_utf8_lossy(&request.body);
+                let lane = request.url.path();
+                assert_eq!(
+                    body.contains("name=\"reply_parameters\"")
+                        && body.contains("\"allow_sending_without_reply\":true"),
+                    reply_to_message_id.is_some(),
+                    "{lane}, anchor {reply_to_message_id:?}"
+                );
+                assert!(!body.contains("name=\"reply_to_message_id\""), "{lane}");
+            }
+        }
     }
 
     /// `get_updates` must return the updates on ok=true and error with the

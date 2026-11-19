@@ -837,9 +837,18 @@ async fn git_status_porcelain(repo_root: &Path) -> StatusResult {
                 // own config, which filter discovery here never sees, so a
                 // scan there would run any filter a submodule names. `dirty`
                 // still reports a submodule that moved to another commit.
-                run_git_neutralized(
+                //
+                // This scan is a background read of the user's own index.
+                // Without `GIT_OPTIONAL_LOCKS=0`, `status` writes its stat
+                // refresh back to `.git/index` — computed here with the clean
+                // filters neutralized, so a file that differs from HEAD only
+                // through its filter would then look unmodified to the user's
+                // own `git status`. It also keeps this scan from holding
+                // `index.lock` while the user or the agent runs git.
+                run_git_neutralized_with_env(
                     &["status", "--porcelain", "--ignore-submodules=dirty"],
                     &scan_key,
+                    &[("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string())],
                 )
                 .await
                 .map_err(|e| e.to_string())
@@ -1461,6 +1470,39 @@ mod tests {
 
         assert!(!ra.unwrap().contains("only-in-b.txt"));
         assert!(rb.unwrap().contains("only-in-b.txt"));
+    }
+
+    /// Spec: the background scan is read-only. A plain `git status` rewrites
+    /// `.git/index` when a tracked file's stat data went stale; this scan must
+    /// leave the user's index byte-for-byte alone and still report the change.
+    #[tokio::test]
+    async fn status_scan_does_not_rewrite_the_users_index() {
+        use test_support::git;
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        let file = repo.path().join("tracked.txt");
+        std::fs::write(&file, "hello").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        // Same size, different content and an mtime far from the indexed one:
+        // the cached stat entry is stale, which is what `status` refreshes.
+        std::fs::write(&file, "HELLO").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let index = repo.path().join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let status = git_status_porcelain(repo.path()).await.unwrap();
+        assert!(status.contains("tracked.txt"), "got: {status:?}");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "the status scan wrote to .git/index"
+        );
     }
 
     /// Spec: this deduplicates, it does not cache. A caller arriving after the

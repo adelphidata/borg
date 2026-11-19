@@ -300,6 +300,13 @@ impl Command {
     }
 }
 
+/// Returns `true` if `text` parses as any gateway slash command. For
+/// adapters that add context to a message and must not change what the
+/// command dispatcher sees as the command's arguments.
+pub fn is_command(text: &str) -> bool {
+    Command::parse(text).is_some()
+}
+
 /// Returns `true` if `text` parses as the `/cancel` slash command. Handled
 /// separately from [`try_handle_command`] because cancellation requires an
 /// async registry call, and the main dispatcher is intentionally synchronous

@@ -332,6 +332,32 @@ pub(super) fn body_indicates_model_not_found(body: &str) -> bool {
     body_has_code(body, &[MODEL_NOT_FOUND_CODE], &[])
 }
 
+/// True when a body says the request exceeded a byte cap. Gateways with a
+/// body-size limit often answer with a 400 rather than a 413 ("request body
+/// too large, must be less than 20MB"). The body must name the whole request
+/// as the subject *and* say it is over a limit, so a 400 about one field's
+/// length does not match; a rate-limit body is never a size cap.
+fn body_indicates_payload_too_large(lower: &str) -> bool {
+    const SUBJECTS: &[&str] = &[
+        "request body",
+        "request size",
+        "request entity",
+        "payload",
+        "body size",
+    ];
+    const OVER_LIMIT: &[&str] = &[
+        "too large",
+        "too big",
+        "exceeds",
+        "exceeded",
+        "must be less than",
+        "larger than",
+    ];
+    matches_any(lower, SUBJECTS)
+        && matches_any(lower, OVER_LIMIT)
+        && !matches_any(lower, RATE_LIMIT_NEEDLES)
+}
+
 pub(super) fn body_indicates_context_overflow(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     matches_any(&lower, OVERFLOW_NEEDLES)
@@ -467,7 +493,7 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
     if lower.contains("(model not found)") {
         return Some(FailoverReason::ModelNotFound);
     }
-    if lower.contains("(payload too large)") {
+    if lower.contains("(payload too large)") || body_indicates_payload_too_large(lower) {
         return Some(FailoverReason::PayloadTooLarge);
     }
     if lower.contains("(image input unsupported)") || body_indicates_image_unsupported(lower) {

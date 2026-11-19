@@ -773,6 +773,43 @@ mod tests {
         assert!(json.get("disable_notification").is_none());
     }
 
+    /// A reply whose anchor was deleted mid-turn is rejected outright unless
+    /// the request opts into sending unanchored, so the flag must ride every
+    /// request that names an anchor — and only those: with no anchor there is
+    /// nothing to fall back from.
+    #[test]
+    fn reply_anchor_carries_allow_sending_without_reply() {
+        for (reply_to_message_id, expected) in [
+            (
+                Some(10),
+                serde_json::json!({
+                    "chat_id": 42,
+                    "text": "hello",
+                    "reply_parameters": {
+                        "message_id": 10,
+                        "allow_sending_without_reply": true,
+                    },
+                }),
+            ),
+            (None, serde_json::json!({ "chat_id": 42, "text": "hello" })),
+        ] {
+            let req = SendMessageRequest {
+                chat_id: 42,
+                text: "hello".into(),
+                parse_mode: None,
+                reply_to_message_id,
+                message_thread_id: None,
+                reply_markup: None,
+                disable_notification: None,
+            };
+            assert_eq!(
+                serde_json::to_value(&req).unwrap(),
+                expected,
+                "anchor {reply_to_message_id:?}"
+            );
+        }
+    }
+
     #[test]
     fn deserialize_file_info() {
         let json = r#"{

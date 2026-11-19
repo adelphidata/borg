@@ -1084,6 +1084,36 @@ mod tests {
                 false,
             ),
             (
+                "bare string wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"hello world"}],"structuredContent":{"result":"hello world"}}"#,
+                "hello world",
+                false,
+            ),
+            (
+                "bare number wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"42"}],"structuredContent":{"result":42}}"#,
+                "42",
+                false,
+            ),
+            (
+                "list wrapped as result is not repeated",
+                r#"{"content":[{"type":"text","text":"[1, 2]"}],"structuredContent":{"result":[1,2]}}"#,
+                "[1, 2]",
+                false,
+            ),
+            (
+                "result wrapper with a different value keeps both",
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"goodbye"}}"#,
+                "hello\n\n[structured content]\n{\"result\":\"goodbye\"}",
+                false,
+            ),
+            (
+                "result beside another key is real structure",
+                r#"{"content":[{"type":"text","text":"hello"}],"structuredContent":{"result":"hello","id":7}}"#,
+                "hello\n\n[structured content]\n{\"id\":7,\"result\":\"hello\"}",
+                false,
+            ),
+            (
                 "null structured content changes nothing",
                 r#"{"content":[{"type":"text","text":"ok"}],"structuredContent":null}"#,
                 "ok",

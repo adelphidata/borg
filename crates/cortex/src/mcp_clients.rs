@@ -1356,23 +1356,23 @@ fn missing_required_args(schema: &Value, args: &Value) -> Vec<String> {
 }
 
 /// Argument keys a closed schema (`additionalProperties: false`) does not
-/// declare. Such a server strips the key and answers as if it were never
-/// sent, so a misspelled `levle=` returns a default result the model reads
-/// as success. Open schemas accept extras by contract and are not checked.
+/// declare. Servers built on schema validators that strip unknown keys answer
+/// such a call with a normal default result, so the model never learns its
+/// misspelled argument was dropped. Open schemas, and schemas whose shape is
+/// decided by a combinator, are left to the server.
 fn undeclared_args(schema: &Value, args: &Value) -> Vec<String> {
-    if schema.get("additionalProperties") != Some(&Value::Bool(false)) {
+    let closed = schema.get("additionalProperties") == Some(&Value::Bool(false));
+    let combined = ["anyOf", "oneOf", "allOf", "patternProperties", "$ref"]
+        .iter()
+        .any(|key| schema.get(key).is_some());
+    let (true, false, Some(args)) = (closed, combined, args.as_object()) else {
         return Vec::new();
-    }
+    };
     let declared = schema.get("properties").and_then(Value::as_object);
-    args.as_object()
-        .map(|given| {
-            given
-                .keys()
-                .filter(|key| !declared.is_some_and(|d| d.contains_key(*key)))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    args.keys()
+        .filter(|key| declared.is_none_or(|props| !props.contains_key(*key)))
+        .cloned()
+        .collect()
 }
 
 /// Ceiling on the compact-serialized `input_schema` echoed in a blind-call
@@ -4865,6 +4865,64 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_args_only_fire_on_a_closed_plain_schema() {
+        let props = serde_json::json!({"level": {"type": "string"}, "limit": {"type": "integer"}});
+        let closed = serde_json::json!({
+            "type": "object", "properties": props, "additionalProperties": false
+        });
+        let typo = serde_json::json!({"levle": "error", "limit": 5});
+        // (name, schema, args, expected undeclared keys)
+        let cases: Vec<(&str, Value, Value, Vec<&str>)> = vec![
+            (
+                "misspelled key",
+                closed.clone(),
+                typo.clone(),
+                vec!["levle"],
+            ),
+            (
+                "declared keys only",
+                closed.clone(),
+                serde_json::json!({"level": "error"}),
+                vec![],
+            ),
+            ("no args", closed.clone(), Value::Null, vec![]),
+            (
+                "open schema",
+                serde_json::json!({"type": "object", "properties": props}),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "additionalProperties as a schema",
+                serde_json::json!({
+                    "type": "object", "properties": props,
+                    "additionalProperties": {"type": "string"}
+                }),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "union-shaped schema",
+                serde_json::json!({
+                    "type": "object", "properties": props, "additionalProperties": false,
+                    "oneOf": [{"required": ["level"]}, {"required": ["levle"]}]
+                }),
+                typo.clone(),
+                vec![],
+            ),
+            (
+                "closed schema with no properties",
+                serde_json::json!({"type": "object", "additionalProperties": false}),
+                serde_json::json!({"anything": 1}),
+                vec!["anything"],
+            ),
+        ];
+        for (name, schema, args, expected) in cases {
+            assert_eq!(undeclared_args(&schema, &args), expected, "case: {name}");
+        }
+    }
+
+    #[test]
     fn missing_required_args_reports_only_absent_keys() {
         let schema = serde_json::json!({
             "type": "object",
@@ -4901,29 +4959,6 @@ mod tests {
             &serde_json::Value::Null
         )
         .is_empty());
-    }
-
-    #[test]
-    fn undeclared_args_are_reported_only_for_closed_schemas() {
-        let closed = serde_json::json!({
-            "type": "object",
-            "properties": {"level": {"type": "string"}},
-            "additionalProperties": false
-        });
-        let args = serde_json::json!({"level": "info", "levle": "debug"});
-        assert_eq!(undeclared_args(&closed, &args), vec!["levle".to_string()]);
-        assert!(undeclared_args(&closed, &serde_json::json!({"level": "x"})).is_empty());
-
-        // A closed schema with no properties accepts no arguments at all.
-        let empty_closed = serde_json::json!({"type": "object", "additionalProperties": false});
-        assert_eq!(
-            undeclared_args(&empty_closed, &serde_json::json!({"x": 1})),
-            vec!["x".to_string()]
-        );
-
-        // Open (or unspecified) schemas take extras by contract.
-        let open = serde_json::json!({"type": "object", "properties": {"level": {}}});
-        assert!(undeclared_args(&open, &args).is_empty());
     }
 
     #[test]
