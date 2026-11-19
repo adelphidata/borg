@@ -9,9 +9,9 @@ use serde::Serialize;
 use tracing::warn;
 
 use super::types::{
-    ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo, InlineKeyboardMarkup,
-    MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
-    Update, User,
+    reply_parameters, ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo,
+    InlineKeyboardMarkup, MediaSource, ReactionType, SendMessageRequest, SendPollRequest,
+    SetMessageReactionRequest, Update, User,
 };
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::{
@@ -386,7 +386,7 @@ impl TelegramClient {
                 form = form.text("message_thread_id", tid.to_string());
             }
             if let Some(rid) = reply_to_message_id {
-                form = form.text("reply_to_message_id", rid.to_string());
+                form = form.text("reply_parameters", reply_parameters(rid).to_string());
             }
             Ok(form)
         })
@@ -518,7 +518,7 @@ impl TelegramClient {
             form = form.text("message_thread_id", tid.to_string());
         }
         if let Some(rid) = reply_to_message_id {
-            form = form.text("reply_to_message_id", rid.to_string());
+            form = form.text("reply_parameters", reply_parameters(rid).to_string());
         }
 
         Ok(form)
@@ -775,7 +775,44 @@ impl TelegramClient {
         Ok(())
     }
 
-    /// Get file info by file_id (for future media download support).
+    /// A transport failure on getFile or the file download. Both are pure
+    /// reads, so any of them may be retried.
+    fn fetch_err(&self, e: reqwest::Error, action: &str) -> anyhow::Error {
+        anyhow::Error::new(TransientFetch(format!("{:#}", self.scrub_err(e, action))))
+    }
+
+    /// getFile plus the download as one unit, retried on transport failures
+    /// so one stalled read does not turn a photo or voice note into a
+    /// "could not be downloaded" placeholder. A size-cap refusal or an
+    /// `ok:false` answer is final. Returns the bytes and the file's path.
+    pub async fn fetch_file(&self, file_id: &str) -> Result<(Vec<u8>, String)> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = async {
+                let path = self
+                    .get_file(file_id)
+                    .await?
+                    .file_path
+                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+                let bytes = self.download_file(&path).await?;
+                Ok::<_, anyhow::Error>((bytes, path))
+            }
+            .await;
+            match result {
+                Err(e)
+                    if attempt <= FILE_FETCH_RETRIES
+                        && e.downcast_ref::<TransientFetch>().is_some() =>
+                {
+                    warn!(attempt, error = %e, "telegram: file fetch failed; retrying");
+                    tokio::time::sleep(connect_backoff(attempt)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Get file info by file_id.
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
         let body = serde_json::json!({ "file_id": file_id });
         let resp: ApiResponse<FileInfo> = self
@@ -784,10 +821,10 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to call getFile"))?
+            .map_err(|e| self.fetch_err(e, "Failed to call getFile"))?
             .json()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to parse getFile response"))?;
+            .map_err(|e| self.fetch_err(e, "Failed to parse getFile response"))?;
 
         match resp.result {
             Some(info) if resp.ok => Ok(info),
@@ -806,7 +843,7 @@ impl TelegramClient {
             .get(self.file_url(file_path))
             .send()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to download file"))?;
+            .map_err(|e| self.fetch_err(e, "Failed to download file"))?;
 
         if let Some(len) = resp.content_length() {
             if len > TELEGRAM_MAX_FILE_SIZE_BYTES {
@@ -824,7 +861,7 @@ impl TelegramClient {
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| self.scrub_err(e, "Failed to read file bytes"))?
+            .map_err(|e| self.fetch_err(e, "Failed to read file bytes"))?
         {
             if bytes.len() as u64 + chunk.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
                 bail!(
@@ -1091,6 +1128,21 @@ impl NativeCommandRegistration for TelegramClient {
         self.set_my_commands(&pairs).await
     }
 }
+
+/// Retries after the first attempt of a getFile + download.
+const FILE_FETCH_RETRIES: u32 = 2;
+
+/// Marker for a getFile/download failure a retry may cure.
+#[derive(Debug)]
+struct TransientFetch(String);
+
+impl std::fmt::Display for TransientFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TransientFetch {}
 
 /// Determine if a network error is safe to retry (no data was sent/received).
 fn is_safe_to_retry(err: &reqwest::Error) -> bool {
@@ -1789,11 +1841,12 @@ mod tests {
         let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(
-            first["reply_to_message_id"], 10,
-            "first chunk must reply to the original"
+            first["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true}),
+            "first chunk must reply to the original, and still land if it was deleted"
         );
         assert!(
-            second.get("reply_to_message_id").is_none(),
+            second.get("reply_parameters").is_none(),
             "later chunks must not reply: {second}"
         );
     }
@@ -1968,7 +2021,7 @@ mod tests {
         assert_eq!(json["chat_id"], 42);
         assert_eq!(json["text"], "hello");
         assert_eq!(json["parse_mode"], "Markdown");
-        assert!(json.get("reply_to_message_id").is_none());
+        assert!(json.get("reply_parameters").is_none());
         assert!(json.get("message_thread_id").is_none());
     }
 
@@ -1984,7 +2037,11 @@ mod tests {
             disable_notification: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["reply_to_message_id"], 10);
+        assert_eq!(
+            json["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true})
+        );
+        assert!(json.get("reply_to_message_id").is_none());
         assert_eq!(json["message_thread_id"], 99);
     }
 
@@ -2361,6 +2418,54 @@ mod tests {
                 "{api_method}: description must surface, got: {err}"
             );
         }
+    }
+
+    /// A read that fails mid-fetch is retried; a refusal Telegram answered
+    /// with `ok: false` is final.
+    #[tokio::test]
+    async fn fetch_file_retries_a_failed_read_but_not_a_refusal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A truncated getFile body first, then the real one.
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":tr"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_id": "F1", "file_unique_id": "U1", "file_path": "voice/f.oga"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bot123:ABC/voice/f.oga"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"OggS".to_vec()))
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let (bytes, file_path) = client.fetch_file("F1").await.expect("retry recovers");
+        assert_eq!(bytes, b"OggS");
+        assert_eq!(file_path, "voice/f.oga");
+
+        // A refusal is final: exactly one getFile.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:ABC/getFile"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false, "description": "Bad Request: file is too big"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::with_base("123:ABC", &server.uri()).unwrap();
+        let err = client.fetch_file("F1").await.expect_err("refusal fails");
+        assert!(err.to_string().contains("file is too big"), "{err}");
     }
 
     /// `get_file` must trust the `ok` flag, not the mere presence of a

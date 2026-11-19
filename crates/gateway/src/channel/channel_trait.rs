@@ -316,6 +316,43 @@ pub async fn dispatch_webhook(
                     .enqueue(
                         btw_session_key,
                         Box::pin(async move {
+                            let channel_name = channel_for_btw.names()[0].to_string();
+                            let bot_mention = channel_for_btw.bot_mention();
+                            let admission = match Database::open_with_timeout(
+                                Database::GATEWAY_BUSY_TIMEOUT_MS,
+                            )
+                            .await
+                            {
+                                Ok(db) => {
+                                    crate::btw_dispatch::admit_btw(
+                                        &db,
+                                        &config_for_btw,
+                                        &channel_name,
+                                        &inbound,
+                                        bot_mention.as_deref(),
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e.context("open database for /btw")),
+                            };
+                            let refusal = match admission {
+                                Ok(refusal) => refusal,
+                                Err(e) => {
+                                    tracing::warn!(channel = %channel_name, error = %format!("{e:#}"), "/btw admission failed");
+                                    Some(crate::handler::format_gateway_error(&e))
+                                }
+                            };
+                            if let Some(reply) = refusal {
+                                if !reply.trim().is_empty() {
+                                    if let Err(e) = channel_for_btw
+                                        .send_response(&reply, &response_context, &health_for_btw)
+                                        .await
+                                    {
+                                        tracing::warn!(channel = %channel_name, error = %e, "failed to deliver /btw refusal");
+                                    }
+                                }
+                                return;
+                            }
                             let runner = |q: String, snap: Vec<cortex::types::Message>| {
                                 crate::btw_dispatch::run_btw_default(config_for_btw, q, snap)
                             };
@@ -348,9 +385,20 @@ pub async fn dispatch_webhook(
                     session_key,
                     Box::pin(async move {
                         let mut response_context = response_context;
-                        let typing = channel.start_typing(&response_context);
                         let bot_mention = channel.bot_mention();
                         let channel_name = channel.names()[0].to_string();
+                        let typing = if handler::typing_wanted(
+                            &config,
+                            &channel_name,
+                            &inbound,
+                            bot_mention.as_deref(),
+                        )
+                        .await
+                        {
+                            channel.start_typing(&response_context)
+                        } else {
+                            None
+                        };
 
                         // Timeout only wraps the LLM agent call — delivery
                         // operations must always complete to avoid lost responses.
@@ -497,6 +545,13 @@ pub async fn dispatch_webhook(
                                 session_id: None,
                                 payload_json: &payload_str,
                                 max_retries: 3,
+                                // The send below is the first attempt; the
+                                // drain loop only takes the row if it is
+                                // still unfinished after this window.
+                                not_before: Some(
+                                    chrono::Utc::now().timestamp()
+                                        + NATIVE_FIRST_SEND_GRACE_SECS,
+                                ),
                             };
                             if let Err(e) = db.enqueue_delivery(&new_delivery).await {
                                 tracing::warn!("Failed to enqueue {channel_name} delivery: {e}");
@@ -544,6 +599,11 @@ pub async fn dispatch_webhook(
         }
     }
 }
+
+/// How long the drain loop leaves a native reply alone while the webhook
+/// path makes its first send (flood waits and chunked sends included). A
+/// crash mid-send is retried once this passes.
+const NATIVE_FIRST_SEND_GRACE_SECS: i64 = 120;
 
 /// Run the out-of-queue cancel path for one inbound `/stop` and deliver its
 /// reply. Spawned so the webhook returns at once; every failure is logged.

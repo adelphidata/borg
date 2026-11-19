@@ -66,6 +66,43 @@ pub fn undo_last_turn(history: &mut Vec<Message>) -> usize {
     }
 }
 
+/// Remove the turn in progress: the user message that started it and
+/// everything after it. For a turn the provider refused on content grounds —
+/// safety filters judge the whole thread, so leaving the refused request in
+/// history gets every later message refused too.
+///
+/// `opening` is the message the turn started from. Steers and goal
+/// continuations add user rows mid-turn, so the last user row is not the
+/// boundary; the opening is found by identity instead. When it is gone
+/// (a compaction during the turn folded it into the summary), everything
+/// after the last compaction marker goes, and with no marker either, the
+/// last user-authored row is the best boundary left. A compaction marker is
+/// never removed.
+pub fn drop_current_turn(history: &mut Vec<Message>, opening: Option<&Message>) -> usize {
+    let same = |m: &Message, o: &Message| {
+        m.role == o.role && m.timestamp == o.timestamp && m.content == o.content
+    };
+    let keep = opening
+        .and_then(|o| history.iter().rposition(|m| same(m, o)))
+        .or_else(|| {
+            history
+                .iter()
+                .rposition(is_compaction_marker)
+                .map(|i| i + 1)
+        })
+        .or_else(|| {
+            history
+                .iter()
+                .rposition(|m| m.role == Role::User && !is_agent_authored(m))
+        });
+    let Some(keep) = keep else {
+        return 0;
+    };
+    let removed = history.len() - keep;
+    history.truncate(keep);
+    removed
+}
+
 /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
 /// Truncates everything from that user message onward (inclusive).
 /// Returns the number of messages removed, or 0 if the index is out of range.
@@ -257,6 +294,33 @@ mod tests {
 
     fn make_tool_result(call_id: &str, result: &str) -> Message {
         Message::tool_result(call_id, result)
+    }
+
+    #[test]
+    fn drop_current_turn_cuts_at_the_turn_opening_not_a_mid_turn_steer() {
+        let opening = make_user("summarize this page");
+        let mut history = vec![
+            make_user("earlier question"),
+            make_assistant("earlier answer"),
+            opening.clone(),
+            make_tool_call_msg("", "c1", "web_fetch"),
+            make_tool_result("c1", "flagged page text"),
+            // A steer lands mid-turn as a user row.
+            make_user("keep it short"),
+        ];
+        assert_eq!(drop_current_turn(&mut history, Some(&opening)), 4);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].text_content(), Some("earlier answer"));
+
+        // Opening folded away by a mid-turn compaction: cut after the marker.
+        let mut compacted = vec![
+            crate::conversation::render_compaction_marker("summary of the turn so far"),
+            make_tool_result("c2", "more flagged text"),
+        ];
+        assert_eq!(drop_current_turn(&mut compacted, Some(&opening)), 1);
+        assert_eq!(compacted.len(), 1);
+
+        assert_eq!(drop_current_turn(&mut Vec::new(), None), 0);
     }
 
     // -- normalize_history --

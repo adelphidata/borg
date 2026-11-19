@@ -409,6 +409,34 @@ async fn check_sender_access_control(
     .await
 }
 
+/// Whether a channel may show a typing indicator before the queued turn runs
+/// its own gates. Typing tells the chat the bot is working, and on Signal
+/// linked to the owner's own number it types *as the owner*, so it waits on
+/// the activation verdict (an unaddressed group message stays silent) and the
+/// read-only sender check the enrichment work uses.
+pub(crate) async fn typing_wanted(
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> bool {
+    let route = crate::channel::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
+    let (activates, _) = check_activation(
+        &inbound.text,
+        inbound.peer_kind.as_deref(),
+        &route,
+        &route.config,
+        bot_identifier,
+        inbound_addressed_to_bot(inbound, bot_identifier),
+    );
+    activates && sender_may_enrich(config, channel_name, inbound).await
+}
+
 /// Read-only gate for the work a channel does *before* the queued turn
 /// runs its access check: attachment downloads, paid speech-to-text,
 /// reactions, history reads. Those must not run for a sender the turn is
@@ -479,6 +507,38 @@ pub(crate) async fn sender_may_enrich_with_db(
     }
 }
 
+/// The activation and access-control verdict `invoke_agent_inner` applies,
+/// for fast paths that answer outside it (`/stop`, `/btw`). `None` admits the
+/// sender; `Some(reply)` ends the request with that reply — empty means stay
+/// silent (an unaddressed group message), otherwise it is the access
+/// challenge or refusal.
+pub(crate) async fn fast_path_refusal(
+    db: &Database,
+    route: &crate::channel::routing::ResolvedRoute,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> Result<Option<String>> {
+    let config = &route.config;
+    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
+    let (should_respond, _) = check_activation(
+        &inbound.text,
+        inbound.peer_kind.as_deref(),
+        route,
+        config,
+        bot_identifier,
+        pre_addressed,
+    );
+    if !should_respond {
+        return Ok(Some(String::new()));
+    }
+    Ok(
+        enforce_access_control_with_db(db, config, channel_name, &inbound.sender_id)
+            .await?
+            .map(|(early, _)| early),
+    )
+}
+
 /// Cancel the turn in flight for `inbound`'s session without queueing behind
 /// it. The queued path only sees a `/stop` once the running turn ends (or the
 /// request timeout fires), which is exactly when it is useless.
@@ -502,23 +562,10 @@ pub(crate) async fn cancel_in_flight_turn(
         &inbound.sender_id,
         inbound.peer_kind.as_deref(),
     );
-    let config = &route.config;
-    let pre_addressed = inbound_addressed_to_bot(inbound, bot_identifier);
-    let (should_respond, _) = check_activation(
-        &inbound.text,
-        inbound.peer_kind.as_deref(),
-        &route,
-        config,
-        bot_identifier,
-        pre_addressed,
-    );
-    if !should_respond {
-        return Ok(String::new());
-    }
-    if let Some((early, _)) =
-        enforce_access_control_with_db(db, config, channel_name, &inbound.sender_id).await?
+    if let Some(refusal) =
+        fast_path_refusal(db, &route, channel_name, inbound, bot_identifier).await?
     {
-        return Ok(early);
+        return Ok(refusal);
     }
 
     let session_key = build_session_key(inbound, &route.binding_id);
@@ -1540,6 +1587,7 @@ async fn process_message(
                 session_id: Some(&_session_id),
                 payload_json: &persist_str,
                 max_retries: retry_policy.max_retries as i32,
+                not_before: None,
             })
             .await
         {
@@ -2779,6 +2827,32 @@ secret_env = "GW_TEST_WEBHOOK_SECRET"
             );
         }
         std::env::remove_var("BORG_HOME");
+    }
+
+    /// Typing shows only for a message the turn will answer: it must be
+    /// addressed (activation) and from a sender the access check admits.
+    #[tokio::test]
+    async fn typing_waits_on_activation_and_the_sender_gate() {
+        let mut open = Config::default();
+        open.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        let dm = inbound_with_text("u1", "hello");
+        assert!(typing_wanted(&open, "signal", &dm, Some("@borg")).await);
+
+        let mut disabled = Config::default();
+        disabled.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+        assert!(
+            !typing_wanted(&disabled, "signal", &dm, Some("@borg")).await,
+            "a sender the turn will refuse must not see typing"
+        );
+
+        let mut group = inbound_with_text("u1", "chatting among ourselves");
+        group.peer_kind = Some(PEER_KIND_GROUP.to_string());
+        assert!(
+            !typing_wanted(&open, "slack", &group, Some("@borg")).await,
+            "an unaddressed group message must not show typing"
+        );
+        group.text = "@borg what's the weather".to_string();
+        assert!(typing_wanted(&open, "slack", &group, Some("@borg")).await);
     }
 
     /// The pre-enrichment gate is read-only and policy-driven: `Open` admits

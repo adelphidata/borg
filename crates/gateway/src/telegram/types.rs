@@ -284,6 +284,22 @@ pub struct ResponseParameters {
     pub retry_after: Option<u64>,
 }
 
+/// Bot API `ReplyParameters` for `message_id`, quoting it when it still
+/// exists and sending plainly when it does not.
+pub fn reply_parameters(message_id: i64) -> serde_json::Value {
+    serde_json::json!({ "message_id": message_id, "allow_sending_without_reply": true })
+}
+
+fn serialize_reply_parameters<S: serde::Serializer>(
+    message_id: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match message_id {
+        Some(id) => reply_parameters(*id).serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Request body for sendMessage.
 #[derive(Debug, Serialize)]
 pub struct SendMessageRequest {
@@ -294,8 +310,14 @@ pub struct SendMessageRequest {
     /// Parse mode for formatting (e.g. "HTML", "MarkdownV2").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_mode: Option<String>,
-    /// ID of the message to reply to.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// ID of the message to reply to. Sent as `reply_parameters` with
+    /// `allow_sending_without_reply`, so a reply still lands when the user
+    /// deleted the message it answers (otherwise a 400 loses the reply).
+    #[serde(
+        rename = "reply_parameters",
+        serialize_with = "serialize_reply_parameters",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reply_to_message_id: Option<i64>,
     /// Forum topic thread ID to send into.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,7 +764,11 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["message_thread_id"], 99);
-        assert_eq!(json["reply_to_message_id"], 10);
+        assert_eq!(
+            json["reply_parameters"],
+            serde_json::json!({"message_id": 10, "allow_sending_without_reply": true})
+        );
+        assert!(json.get("reply_to_message_id").is_none());
         assert!(json.get("reply_markup").is_none());
         assert!(json.get("disable_notification").is_none());
     }

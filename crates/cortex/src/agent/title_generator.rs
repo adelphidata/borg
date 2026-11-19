@@ -42,6 +42,34 @@ fn char_truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Longest reply, in words, still read as a title.
+const TITLE_MAX_WORDS: usize = 12;
+
+/// Longest CJK reply, in characters, still read as a title when it ends a
+/// sentence. CJK has no spaces, so the word count cannot catch it.
+const TITLE_MAX_CJK_CHARS: usize = 30;
+
+/// True when the title model answered the conversation instead of naming it
+/// ("I don't have access to that link. Could you paste…"). Cutting that to
+/// the title cap would store half an answer as the title, and titling runs
+/// once per session, so it would stick.
+fn looks_like_an_answer(text: &str) -> bool {
+    let words = text.split_whitespace().count();
+    let chars: Vec<char> = text.chars().collect();
+    let sentence_ends = chars
+        .iter()
+        .enumerate()
+        .filter(|&(i, c)| match c {
+            '。' | '！' | '？' => true,
+            '.' | '!' | '?' => chars.get(i + 1).is_none_or(|n| n.is_whitespace()),
+            _ => false,
+        })
+        .count();
+    let cjk_sentence =
+        chars.len() > TITLE_MAX_CJK_CHARS && chars.iter().any(|c| matches!(c, '。' | '！' | '？'));
+    words > TITLE_MAX_WORDS || sentence_ends >= 2 || cjk_sentence
+}
+
 /// Cleanup pipeline for raw LLM output. Pure function so tests can pin the
 /// spec without standing up an LLM. Returns `None` on whitespace-only input.
 pub(super) fn clean_title(raw: &str) -> Option<String> {
@@ -69,7 +97,7 @@ pub(super) fn clean_title(raw: &str) -> Option<String> {
     // but models sometimes add a period). Other punctuation (?, !) survives
     // because it can be meaningful in a title.
     let no_trailing_dot = no_prefix.trim_end_matches('.').trim();
-    if no_trailing_dot.is_empty() {
+    if no_trailing_dot.is_empty() || looks_like_an_answer(no_prefix) {
         return None;
     }
     if no_trailing_dot.chars().count() > TITLE_CHAR_CAP {
@@ -282,6 +310,25 @@ mod tests {
         assert_eq!(clean_title("Title:   "), None);
         // After stripping the trailing period the remainder is empty.
         assert_eq!(clean_title("."), None);
+    }
+
+    #[test]
+    fn clean_title_rejects_a_reply_that_answers_instead_of_titling() {
+        for raw in [
+            "I don't have access to that link. Could you paste the page text instead?",
+            "Sure! Here is a short summary of what we discussed about the deploy pipeline today",
+            "我无法访问该链接，请您直接粘贴页面的内容，这样我就可以帮助您总结其中的要点和结论。",
+        ] {
+            assert_eq!(clean_title(raw), None, "input={raw:?}");
+        }
+        // Real titles keep working, dotted versions included.
+        for (raw, expected) in [
+            ("Release notes for v1.2.3", "Release notes for v1.2.3"),
+            ("Why does the build fail?", "Why does the build fail?"),
+            ("部署流水线排错", "部署流水线排错"),
+        ] {
+            assert_eq!(clean_title(raw).as_deref(), Some(expected), "input={raw:?}");
+        }
     }
 
     #[test]

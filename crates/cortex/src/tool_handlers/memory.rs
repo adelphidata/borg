@@ -781,7 +781,12 @@ fn format_message_fts_hits(hits: &[crate::db::MessageFtsHit]) -> String {
     for (i, h) in hits.iter().enumerate() {
         // Strip persisted ANSI escapes BEFORE truncating so escape bytes
         // don't consume the snippet budget or re-enter model context.
-        let clean = crate::util::ansi::strip_ansi(&h.content);
+        // Redact before truncating too: user turns are stored unredacted, so
+        // a key pasted in one session would otherwise come back verbatim into
+        // another, and a cut through the middle of a key hides it from the
+        // redactor's patterns.
+        let clean =
+            crate::security::secrets::redact_secrets(&crate::util::ansi::strip_ansi(&h.content));
         let snippet = truncate_for_display(&clean, 240);
         out.push_str(&format!(
             "\n{}. session={} role={} score={:.3}\n   {}\n",
@@ -956,6 +961,26 @@ mod tests {
             out.contains(&visible) && !out.contains('…'),
             "content fitting the budget after stripping must not be truncated"
         );
+    }
+
+    #[test]
+    fn format_message_fts_hits_redacts_secrets_from_past_sessions() {
+        // The key sits right at the snippet cut so truncating first would
+        // leave a fragment the patterns no longer recognize.
+        let key = "AKIAIOSFODNN7EXAMPLE";
+        let content = format!("{} my key is {key} keep it safe", "x".repeat(225));
+        let hits = vec![crate::db::MessageFtsHit {
+            id: 1,
+            session_id: "abc".into(),
+            role: "user".into(),
+            content,
+            created_at: 0,
+            score: 1.0,
+        }];
+        let out = format_message_fts_hits(&hits);
+        assert!(!out.contains("AKIA"), "key fragment leaked: {out}");
+        // The marker itself sits at the cut, so only its head survives.
+        assert!(out.contains("key is [RED"), "{out}");
     }
 
     #[test]

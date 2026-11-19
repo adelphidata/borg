@@ -323,6 +323,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         unknown_tool_tracker: UnknownToolTracker::default(),
         turn_reasoning: String::new(),
         turn_reasoning_blocks: Vec::new(),
+        turn_opening: None,
         turn_reasoning_content: String::new(),
         turn_reasoning_model: None,
         tool_intent_signalled: false,

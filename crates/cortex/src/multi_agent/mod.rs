@@ -6,6 +6,7 @@ pub mod names;
 pub mod roles;
 /// Sub-agent spawn + execution machinery (driven by `AgentControl::spawn_agent`).
 mod spawn;
+pub(crate) use spawn::is_subagent_brief;
 mod stall;
 /// Tool definitions for multi-agent orchestration.
 pub mod tools;

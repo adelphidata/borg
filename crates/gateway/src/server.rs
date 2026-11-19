@@ -597,7 +597,12 @@ impl GatewayServer {
                 crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
                 let inbound = parsed.inbound;
 
-                let typing = crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id);
+                let typing =
+                    handler::typing_wanted(&config, "telegram", &inbound, bot_mention.as_deref())
+                        .await
+                        .then(|| {
+                            crate::telegram::typing::start_typing_keepalive(tg.clone(), chat_id)
+                        });
 
                 let agent_result = tokio::time::timeout(
                     request_timeout,
@@ -613,7 +618,9 @@ impl GatewayServer {
 
                 match agent_result {
                     Ok(Ok((response_text, _))) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         let voice_reply_mode = match Database::open_with_timeout(
                             Database::GATEWAY_BUSY_TIMEOUT_MS,
                         )
@@ -656,7 +663,9 @@ impl GatewayServer {
                         .unwrap_or_else(|e| warn!("Failed to send Telegram poll response: {e}"));
                     }
                     Ok(Err(e)) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         warn!("Agent error in Telegram poll mode: {e:#}");
                         let error_msg = handler::format_gateway_error(&e);
                         crate::telegram::delivery::send_response(
@@ -669,7 +678,9 @@ impl GatewayServer {
                         });
                     }
                     Err(_) => {
-                        typing.stop().await;
+                        if let Some(typing) = typing {
+                            typing.stop().await;
+                        }
                         warn!("Agent timed out in Telegram poll mode");
                         let error_msg = cortex::error_format::format_error_with_context(
                             "request timed out",
@@ -730,12 +741,6 @@ impl GatewayServer {
                 let health = sse_health.clone();
                 let client = sse_client.clone();
                 Box::pin(async move {
-                    // Best-effort typing indicator; failure is a UX hint only,
-                    // never blocks the agent response below.
-                    let _ = client
-                        .send_typing(Some(&recipient), group_id.as_deref())
-                        .await;
-
                     // Bot mention identifier for group activation. Signal's
                     // resolve_mentions renders the bot's mention as
                     // `@<account>` (phone number) or `@<uuid>` — pass the
@@ -743,6 +748,14 @@ impl GatewayServer {
                     // explicit @bot in group chats when
                     // `gateway.group_activation = Mention` (the default).
                     let bot_id = format!("@{}", client.account());
+
+                    // Best-effort typing indicator; failure is a UX hint only,
+                    // never blocks the agent response below.
+                    if handler::typing_wanted(&config, "signal", &inbound, Some(&bot_id)).await {
+                        let _ = client
+                            .send_typing(Some(&recipient), group_id.as_deref())
+                            .await;
+                    }
                     match handler::invoke_agent(
                         "signal",
                         &inbound,
@@ -3244,6 +3257,7 @@ description = "Script fallback"
                 session_id: None,
                 payload_json: "{}",
                 max_retries: 5,
+                not_before: None,
             })
             .await
             .unwrap();
@@ -3286,6 +3300,88 @@ description = "Script fallback"
         assert!(
             (before + 60..=after + 60).contains(&retry_at),
             "reschedule must be one minute out (got {retry_at}, now ~{before})"
+        );
+    }
+
+    #[test]
+    fn a_flood_refusal_holds_the_redelivery_for_its_own_window() {
+        use crate::telegram::api::TelegramSendError;
+        let flood = |secs| {
+            anyhow::Error::new(TelegramSendError::Flood {
+                retry_after_secs: secs,
+                message: "Too Many Requests".into(),
+            })
+            .context("send to chat")
+        };
+        assert_eq!(redelivery_delay_secs(&flood(300)), 300);
+        assert_eq!(redelivery_delay_secs(&flood(5)), 60);
+        assert_eq!(
+            redelivery_delay_secs(&anyhow::anyhow!("connection reset")),
+            60
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_redelivers_native_channel_replies() {
+        let _guard = crate::test_env::borg_home_guard();
+        let _home = BorgHomeTemp::new();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        let state = test_state(Config::default(), registry, &["stubnat"], 0, None, None);
+        let health = state.health.clone();
+
+        let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .await
+            .unwrap();
+        for (id, payload) in [
+            (
+                "d-ok",
+                r#"{"text":"hello","response_context":{"chat_id":1}}"#,
+            ),
+            ("d-bad", "{}"),
+        ] {
+            db.enqueue_delivery(&cortex::db::NewDelivery {
+                id,
+                channel_name: "stubnat",
+                sender_id: "s1",
+                channel_id: None,
+                session_id: None,
+                payload_json: payload,
+                max_retries: 3,
+                not_before: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        drain_pending_deliveries(&state, &health).await;
+
+        let stmt = db
+            .conn()
+            .prepare("SELECT id, status, error FROM delivery_queue ORDER BY id ASC")
+            .await
+            .unwrap();
+        let mut rows_iter = stmt.query(()).await.unwrap();
+        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+        while let Some(row) = rows_iter.next().await.unwrap() {
+            rows.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            ));
+        }
+        let (_, bad_status, bad_err) = &rows[0];
+        assert_ne!(bad_status, "delivered");
+        assert!(
+            bad_err
+                .as_deref()
+                .is_some_and(|e| e.contains("unreadable queued reply")),
+            "{bad_err:?}"
+        );
+        let (_, ok_status, ok_err) = &rows[1];
+        assert_eq!(
+            ok_status, "delivered",
+            "a native reply must be re-sent, not failed as an unknown channel ({ok_err:?})"
         );
     }
 
@@ -3473,6 +3569,69 @@ description = "Script fallback"
     }
 }
 
+/// Re-send a native channel's queued reply. The row holds exactly what the
+/// first attempt sent (`{text, response_context}`), so a reply whose first
+/// send failed, or that a crash left unfinished, is retried here instead of
+/// running out its retries as "channel not found".
+/// Seconds before a failed native redelivery is tried again. Flood control
+/// names its own window, and a send inside it extends the penalty, so that
+/// window is honored when it is longer than the default.
+fn redelivery_delay_secs(error: &anyhow::Error) -> i64 {
+    const DEFAULT_SECS: i64 = 60;
+    match error.downcast_ref::<crate::telegram::api::TelegramSendError>() {
+        Some(crate::telegram::api::TelegramSendError::Flood {
+            retry_after_secs, ..
+        }) => i64::try_from(*retry_after_secs)
+            .unwrap_or(i64::MAX)
+            .max(DEFAULT_SECS),
+        _ => DEFAULT_SECS,
+    }
+}
+
+async fn redeliver_native(
+    db: &Database,
+    channel: &Arc<dyn channel_trait::NativeChannel>,
+    delivery: &cortex::db::DeliveryRow,
+    health: &Arc<RwLock<ChannelHealthRegistry>>,
+) {
+    #[derive(serde::Deserialize)]
+    struct QueuedReply {
+        text: String,
+        #[serde(default)]
+        response_context: serde_json::Value,
+    }
+    let reply: QueuedReply = match serde_json::from_str(&delivery.payload_json) {
+        Ok(reply) => reply,
+        Err(e) => {
+            let error = format!("unreadable queued reply: {e}");
+            warn!(delivery_id = %delivery.id, "{error}");
+            if let Err(db_err) = db.mark_failed(&delivery.id, &error, None).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
+            }
+            return;
+        }
+    };
+    match channel
+        .send_response(&reply.text, &reply.response_context, health)
+        .await
+    {
+        Ok(()) => {
+            // `send_response` records channel health itself.
+            if let Err(e) = db.mark_delivered(&delivery.id).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery success status: {e}");
+            }
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            warn!(delivery_id = %delivery.id, channel = %delivery.channel_name, "redelivery failed: {error}");
+            let next_retry = chrono::Utc::now().timestamp() + redelivery_delay_secs(&e);
+            if let Err(db_err) = db.mark_failed(&delivery.id, &error, Some(next_retry)).await {
+                warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
+            }
+        }
+    }
+}
+
 /// Background task: claim pending deliveries and attempt to send them.
 #[instrument(skip_all)]
 async fn drain_pending_deliveries(
@@ -3505,6 +3664,10 @@ async fn drain_pending_deliveries(
     );
 
     for delivery in deliveries {
+        if let Some(native) = state.native_channels.get(&delivery.channel_name) {
+            redeliver_native(&db, native, &delivery, health).await;
+            continue;
+        }
         let channel = match state.registry.get(&delivery.channel_name) {
             Some(c) => c,
             None => {

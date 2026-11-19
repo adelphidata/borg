@@ -295,6 +295,9 @@ pub const DEFAULT_READ_MAX_CHARS: usize = 50_000;
 
 /// Max image file size for inline rendering (50 MB).
 pub const MAX_IMAGE_FILE_SIZE: usize = 50 * 1024 * 1024;
+/// Largest text file `read_file` loads. The read is bounded, not just probed,
+/// so a multi-GB log cannot exhaust the daemon's memory before windowing.
+pub const MAX_TEXT_READ_BYTES: usize = 64 * 1024 * 1024;
 
 /// Image compression target size (1 MB).
 pub const IMAGE_COMPRESSION_TARGET: usize = 1_048_576;

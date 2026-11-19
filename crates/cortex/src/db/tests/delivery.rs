@@ -34,6 +34,7 @@ fn new_delivery<'a>(
         session_id: None,
         payload_json: payload,
         max_retries,
+        not_before: None,
     }
 }
 

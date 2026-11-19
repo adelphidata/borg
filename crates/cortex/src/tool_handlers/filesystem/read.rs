@@ -156,6 +156,16 @@ fn special_file_note(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Read at most `cap` bytes of `path`; `Ok(None)` when it holds more.
+fn read_bounded(path: &std::path::Path, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut buf)?;
+    Ok((buf.len() <= cap).then_some(buf))
+}
+
 /// Apply the 1-based `offset`/`limit` line window and the `max_chars` ceiling,
 /// annotating the result whenever the caller is not seeing all of it.
 fn window_text(content: &str, offset: usize, limit: usize, max_chars: usize) -> String {
@@ -296,8 +306,13 @@ pub fn handle_read_file_with_context(
             }
         }
 
-        let raw_bytes = match std::fs::read(&canonical) {
-            Ok(b) => b,
+        // The metadata probe above names the size; this bound is what holds
+        // when the file grows between the probe and the read.
+        let raw_bytes = match read_bounded(&canonical, constants::MAX_IMAGE_FILE_SIZE) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return Ok(ToolOutput::Text("Image too large. Max 50 MB.".to_string()));
+            }
             Err(e) => {
                 return Ok(ToolOutput::Text(format!("Error reading file: {e}")));
             }
@@ -361,8 +376,23 @@ pub fn handle_read_file_with_context(
             }
         }
     } else {
-        match std::fs::read_to_string(&canonical) {
-            Ok(c) => c,
+        let text = read_bounded(&canonical, constants::MAX_TEXT_READ_BYTES).and_then(|bytes| {
+            bytes
+                .map(|b| {
+                    String::from_utf8(b)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })
+                .transpose()
+        });
+        match text {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(ToolOutput::Text(format!(
+                    "File is larger than {} MB, too large to read whole. Read a slice with \
+                     run_shell instead, e.g. `sed -n '1,200p' {raw_path}` or `tail -n 200 {raw_path}`.",
+                    constants::MAX_TEXT_READ_BYTES / (1024 * 1024)
+                )));
+            }
             Err(e) => {
                 // The extension promised text but the bytes are not UTF-8.
                 // Before giving up, check whether this is a document wearing
@@ -481,6 +511,38 @@ mod tests {
     fn handle_read_pdf_missing_param() {
         let result = handle_read_pdf(&json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_bounded_refuses_more_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ten.txt");
+        std::fs::write(&path, "0123456789").unwrap();
+        assert_eq!(
+            read_bounded(&path, 10).unwrap().as_deref(),
+            Some(&b"0123456789"[..])
+        );
+        assert_eq!(read_bounded(&path, 9).unwrap(), None);
+    }
+
+    #[test]
+    fn handle_read_file_refuses_a_text_file_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        // Sparse: the length is real but no disk is spent on it.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(constants::MAX_TEXT_READ_BYTES as u64 + 1)
+            .unwrap();
+        let config = Config::default();
+        let out = handle_read_file(&json!({"path": path.to_str().unwrap()}), &config).unwrap();
+        match out {
+            ToolOutput::Text(s) => assert!(
+                s.contains("too large to read whole") && s.contains("sed -n"),
+                "{s}"
+            ),
+            _ => panic!("expected Text"),
+        }
     }
 
     #[test]
