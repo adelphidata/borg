@@ -360,37 +360,65 @@ pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
     let Ok(home) = crate::paths::resolve_borg_home_readonly(None) else {
         return false;
     };
-    let home = home.canonicalize().unwrap_or(home);
-    let target = canonicalize_write_target(path);
-
-    // SQLite DB plus its WAL/SHM siblings — `borg.db`, `borg.db-wal`, `borg.db-shm`.
-    for sibling in ["borg.db", "borg.db-wal", "borg.db-shm"] {
-        if same_path_ignoring_case(&target, &home.join(sibling)) {
-            return true;
-        }
-    }
-
-    // Whole-tree denies for secret material.
-    if starts_with_ignoring_case(&target, &home.join("secrets")) {
-        return true;
-    }
-
     // Lifecycle-hooks config plus sockets / pidfile / lockfile at the home
     // root. `hooks.json` runs arbitrary shell at every hook point, so it is the
     // security-policy file an agent must not be able to rewrite.
-    for name in [
-        "hooks.json",
+    const WRITE_ONLY_FILES: &[&str] = &[
         "borgd.sock",
         "borgd-pair.sock",
         "borgd.pid",
         "scheduler.tick.lock",
-    ] {
-        if same_path_ignoring_case(&target, &home.join(name)) {
-            return true;
-        }
-    }
+    ];
+    control_plane_match(path, &home, WRITE_ONLY_FILES, &[])
+}
 
-    false
+/// `$BORG_HOME` root files that hold the control-plane state: the SQLite DB
+/// with its WAL/SHM siblings (cleartext at rest, credential rows included)
+/// and the lifecycle-hooks config. Denied for writes and for egress reads.
+const CONTROL_PLANE_FILES: &[&str] = &["borg.db", "borg.db-wal", "borg.db-shm", "hooks.json"];
+
+/// `$BORG_HOME` subtrees denied as a whole for writes and egress reads:
+/// `secrets/` holds the KEK material (`kek.enc`, the dev KEK cache).
+const CONTROL_PLANE_TREES: &[&str] = &["secrets"];
+
+/// Hard-coded **read** deny for Borg control-plane files under the data dir
+/// `home`, for paths whose content would leave the machine (`[MEDIA:]` reply
+/// attachments).
+///
+/// Covers everything [`is_control_plane_write_denied`] protects that holds
+/// data — the DB and its WAL/SHM siblings (the DB is cleartext at rest and
+/// carries credential rows), the `secrets/` KEK tree, `hooks.json` — plus the
+/// data dir's own `.env` (provider keys) and the `backups/` tarballs, which
+/// are full copies of the DB and secrets. Sockets, the pidfile, and the lock
+/// carry nothing worth reading. Ordinary data-dir output such as
+/// `screenshots/` stays readable. Same resolution and case folding as the
+/// write check, and equally non-configurable.
+pub fn is_control_plane_read_denied(path: &std::path::Path, home: &std::path::Path) -> bool {
+    const READ_ONLY_FILES: &[&str] = &[".env"];
+    const READ_ONLY_TREES: &[&str] = &["backups"];
+    control_plane_match(path, home, READ_ONLY_FILES, READ_ONLY_TREES)
+}
+
+/// `path` resolves to one of the shared [`CONTROL_PLANE_FILES`] /
+/// [`CONTROL_PLANE_TREES`] under `home`, or to one of the caller's `files` /
+/// `trees`. Both sides are canonicalized so `..` traversal and symlinked
+/// ancestors cannot bypass the match.
+fn control_plane_match(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    files: &[&str],
+    trees: &[&str],
+) -> bool {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let target = canonicalize_write_target(path);
+    CONTROL_PLANE_FILES
+        .iter()
+        .chain(files)
+        .any(|name| same_path_ignoring_case(&target, &home.join(name)))
+        || CONTROL_PLANE_TREES
+            .iter()
+            .chain(trees)
+            .any(|tree| starts_with_ignoring_case(&target, &home.join(tree)))
 }
 
 /// Conventional control-plane file leaves under `$BORG_HOME`. `borg.db`'s
@@ -1035,6 +1063,58 @@ mod tests {
         assert!(!is_control_plane_write_denied(&home.join("notes.md")));
 
         std::env::remove_var("BORG_HOME");
+    }
+
+    /// Egress reads of control-plane data are refused under any spelling
+    /// (traversal, case, symlinked ancestor); ordinary data-dir output and
+    /// files outside the data dir stay readable.
+    #[test]
+    #[cfg(unix)]
+    fn control_plane_read_denies_db_secrets_and_backups_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp
+            .path()
+            .canonicalize()
+            .expect("canonicalize")
+            .join("home");
+        std::fs::create_dir_all(home.join("secrets")).expect("mkdir secrets");
+        std::fs::create_dir_all(home.join("screenshots")).expect("mkdir screenshots");
+        std::fs::write(home.join("borg.db"), b"db").expect("seed db");
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&home, &alias).expect("symlink");
+
+        let denied = [
+            home.join("borg.db"),
+            home.join("borg.db-wal"),
+            home.join("borg.db-shm"),
+            home.join("BORG.DB"),
+            home.join("secrets/kek.enc"),
+            home.join("secrets/dev-kek-cache.enc"),
+            home.join("hooks.json"),
+            home.join(".env"),
+            home.join("backups/borg-2026.tar.gz"),
+            home.join("screenshots/../borg.db"),
+            alias.join("borg.db"),
+        ];
+        for p in &denied {
+            assert!(
+                is_control_plane_read_denied(p, &home),
+                "{p:?} must be denied"
+            );
+        }
+        let allowed = [
+            home.join("screenshots/screenshot_1.png"),
+            home.join("borg.db.notes.md"),
+            home.join("memory/notes.md"),
+            tmp.path().join("borg.db"),
+            tmp.path().join("project/chart.png"),
+        ];
+        for p in &allowed {
+            assert!(
+                !is_control_plane_read_denied(p, &home),
+                "{p:?} must stay readable"
+            );
+        }
     }
 
     #[test]

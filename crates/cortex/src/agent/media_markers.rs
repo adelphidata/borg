@@ -99,9 +99,12 @@ fn parse_marker_line(line: &str) -> Option<&str> {
 ///
 /// Refuses, in order:
 /// 1. paths denied by the configured security blocklist
-///    ([`crate::tool_handlers::filesystem::is_blocked_path`]) — checked before
-///    any filesystem access so an injected `[MEDIA:~/.ssh/id_rsa]` is refused
-///    even if the file does not exist;
+///    ([`crate::tool_handlers::filesystem::is_blocked_path`]) or by the
+///    non-configurable control-plane read deny
+///    ([`crate::tool_handlers::filesystem::is_control_plane_read_denied`]:
+///    Borg's own DB, KEK secrets, hooks, data-dir `.env`, backups) — checked
+///    before any filesystem access so an injected `[MEDIA:~/.ssh/id_rsa]` or
+///    `[MEDIA:~/.borg/borg.db]` is refused even if the file does not exist;
 /// 2. paths that do not exist or are not regular files.
 ///    `symlink_metadata` is used deliberately: `is_blocked_path` resolves
 ///    symlinked *ancestors* but not a symlinked leaf, so accepting only
@@ -115,12 +118,33 @@ pub fn validate_media_path(
     path: &Path,
     security: &crate::config::SecurityConfig,
 ) -> Result<(), String> {
+    match crate::paths::resolve_borg_home_readonly(None) {
+        Ok(home) => validate_media_path_under(path, security, Some(&home)),
+        Err(e) => {
+            tracing::warn!("media egress: could not resolve the data dir ({e:#}); skipping the control-plane check");
+            validate_media_path_under(path, security, None)
+        }
+    }
+}
+
+/// [`validate_media_path`] against an explicit data dir (`None` when it
+/// cannot be resolved, in which case there is no control plane to protect).
+fn validate_media_path_under(
+    path: &Path,
+    security: &crate::config::SecurityConfig,
+    borg_home: Option<&Path>,
+) -> Result<(), String> {
     if crate::tool_handlers::filesystem::is_blocked_path(
         path,
         &security.blocked_paths,
         &security.allowed_paths,
     ) {
         return Err("blocked by security policy".to_string());
+    }
+    if borg_home.is_some_and(|home| {
+        crate::tool_handlers::filesystem::is_control_plane_read_denied(path, home)
+    }) {
+        return Err("blocked by security policy (Borg's own data files)".to_string());
     }
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("file not readable: {e}"))?;
     if !meta.is_file() {
@@ -255,6 +279,51 @@ mod tests {
             assert!(
                 validate_media_path(&paths[0], &security).is_err(),
                 "{p} must be refused by the blocklist"
+            );
+        }
+    }
+
+    /// A prompt-injected `[MEDIA:~/.borg/borg.db]` must never upload Borg's
+    /// cleartext DB (credential rows included), its WAL/SHM siblings, or the
+    /// KEK tree — refused before any filesystem access. Media Borg itself
+    /// writes into the data dir (browser screenshots) and a workspace image
+    /// still attach.
+    #[test]
+    fn control_plane_files_are_refused_and_normal_media_is_not() {
+        let security = crate::config::SecurityConfig::default();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("borg-home");
+        std::fs::create_dir_all(home.join("secrets")).expect("mkdir secrets");
+        std::fs::create_dir_all(home.join("screenshots")).expect("mkdir screenshots");
+        for name in ["borg.db", "borg.db-wal", "secrets/x"] {
+            std::fs::write(home.join(name), b"secret").expect("seed");
+        }
+
+        for name in [
+            "borg.db",
+            "borg.db-wal",
+            "borg.db-shm",
+            "secrets/x",
+            "backups/b.tar.gz",
+        ] {
+            let err = validate_media_path_under(&home.join(name), &security, Some(&home))
+                .expect_err("control-plane file must be refused");
+            assert!(
+                err.contains("blocked"),
+                "{name}: refusal must cite policy, got {err}"
+            );
+        }
+
+        let screenshot = home.join("screenshots/screenshot_1.png");
+        std::fs::write(&screenshot, b"png").expect("write screenshot");
+        let workspace_image = tmp.path().join("project/chart.png");
+        std::fs::create_dir_all(workspace_image.parent().unwrap()).expect("mkdir project");
+        std::fs::write(&workspace_image, b"png").expect("write image");
+        for ok in [&screenshot, &workspace_image] {
+            assert_eq!(
+                validate_media_path_under(ok, &security, Some(&home)),
+                Ok(()),
+                "{ok:?} must stay attachable"
             );
         }
     }
