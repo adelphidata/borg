@@ -253,19 +253,22 @@ fn conversation_key(recipient: &str, group_id: Option<&str>) -> String {
 /// configured, transcribe and append `[Voice transcript]: …` to the message
 /// text — parity with Telegram inbound voice.
 ///
-/// Runs nothing for a sender the queued turn will challenge or deny: their
-/// audio never reaches a third party and no paid transcript is bought
-/// before the pairing challenge. The plain text still goes through.
+/// Runs nothing for a message the queued turn will drop (a group message
+/// that does not address the bot) or a sender it will challenge or deny:
+/// their audio never reaches a third party and no paid transcript is bought
+/// for a message nobody answers. The plain text still goes through.
 async fn enrich_inbound(
     inbound: &mut InboundMessage,
     raw_attachments: &[Attachment],
     client: &SignalClient,
     config: &Config,
 ) {
-    if !crate::handler::sender_may_enrich(config, "signal", inbound).await {
+    // The same `@<account>` identifier the turn and typing use for activation.
+    let bot_id = format!("@{}", client.account());
+    if !crate::handler::pre_turn_work_wanted(config, "signal", inbound, Some(&bot_id)).await {
         info!(
             sender = %inbound.sender_id,
-            "signal: sender not approved; skipping attachment download and transcription"
+            "signal: message not addressed to the bot or sender not approved; skipping attachment download and transcription"
         );
         return;
     }
@@ -875,6 +878,72 @@ mod tests {
             first,
             vec!["/stop".to_string()],
             "the cancel must be handled while the sender's turn is still running"
+        );
+    }
+
+    /// Under the default mention gate, a group voice note that does not
+    /// mention the bot is not downloaded; one that mentions it is.
+    #[tokio::test]
+    async fn sse_unaddressed_group_voice_note_is_not_downloaded() {
+        let group = |ts: i64, message: &str, mention_bot: bool| {
+            let mut env = envelope("+15557778888", ts, message, true);
+            env["envelope"]["dataMessage"]["groupInfo"] = serde_json::json!({ "groupId": "grp-1" });
+            if mention_bot {
+                env["envelope"]["dataMessage"]["mentions"] = serde_json::json!([{
+                    "start": 0, "length": 1, "number": "+15550001111"
+                }]);
+            }
+            env
+        };
+        let (base, fetches) = serve_sse(vec![
+            group(1_723_000_000_001, "chatting among ourselves", false),
+            group(1_723_000_000_002, "\u{fffc} listen to this", true),
+        ])
+        .await;
+
+        let mut config = Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let callback: SseCallback = Arc::new(move |msg, _recipient, _group| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(msg);
+            })
+        });
+        let client = Arc::new(SignalClient::new(&base, "+15550001111").unwrap());
+        let shutdown = CancellationToken::new();
+        let loop_task = tokio::spawn(run_sse_loop(client, callback, shutdown.clone(), config));
+
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(
+                tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                    .await
+                    .expect("both messages must reach the callback")
+                    .unwrap(),
+            );
+        }
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), loop_task).await;
+
+        let unaddressed = got
+            .iter()
+            .find(|m| m.text.contains("among ourselves"))
+            .expect("unaddressed message delivered");
+        let addressed = got
+            .iter()
+            .find(|m| m.text.contains("listen"))
+            .expect("addressed message delivered");
+        assert!(
+            unaddressed.attachments.is_empty(),
+            "an unaddressed group note must not be downloaded"
+        );
+        assert_eq!(addressed.attachments.len(), 1, "a mention keeps enrichment");
+        assert_eq!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the addressed note may be fetched"
         );
     }
 

@@ -49,10 +49,16 @@ impl NativeChannel for GoogleChatChannel {
         // Inbound voice transcription. The parse step embeds the
         // attachment's `resourceName` in `data`; download via the
         // `media.download` endpoint (Bearer auth) and run STT.
-        // A sender the queued turn will challenge or deny gets no download
-        // and no paid STT; the plain text still carries the challenge.
-        let may_enrich =
-            crate::handler::sender_may_enrich(&self.config, self.names()[0], &inbound).await;
+        // A message the queued turn will drop or a sender it will challenge
+        // or deny gets no download and no paid STT; the plain text still
+        // carries the challenge.
+        let may_enrich = crate::handler::pre_turn_work_wanted(
+            &self.config,
+            self.names()[0],
+            &inbound,
+            self.bot_mention().as_deref(),
+        )
+        .await;
         if let Some(transcriber) =
             cortex::media::understanding::AudioTranscriber::from_config(&self.config)
                 .filter(|_| may_enrich)
@@ -329,6 +335,68 @@ mod tests {
         let reqs = server.received_requests().await.expect("recorded");
         assert_eq!(reqs.len(), 1, "exactly the audio attachment is fetched");
         assert_eq!(reqs[0].url.path(), "/media/attachments/AUDIO1");
+    }
+
+    /// A space (group) voice note shares the turn's verdict. Google Chat
+    /// delivers a space message by default only on an @mention or slash
+    /// command, and the turn has no bot identifier for it, so under the
+    /// default mention gate an admitted sender's note is downloaded; a
+    /// refused sender's is not, yet the message still reaches the turn.
+    #[tokio::test]
+    async fn space_voice_note_download_follows_the_turn_verdict() {
+        let cases = [
+            ("admitted sender", cortex::pairing::DmPolicy::Open, 1),
+            ("refused sender", cortex::pairing::DmPolicy::Disabled, 0),
+        ];
+        for (label, policy, want_downloads) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let mut config = stt_config();
+            assert_eq!(
+                config.gateway.group_activation,
+                cortex::config::ActivationMode::Mention,
+                "the default must be mention-gated for this spec to hold"
+            );
+            config.gateway.dm_policy = policy;
+            let channel = stub_channel(&server, config);
+
+            let body = serde_json::json!({
+                "type": "MESSAGE",
+                "token": "hook-token",
+                "message": {
+                    "name": "spaces/S1/messages/M2",
+                    "sender": {"name": "users/U1", "displayName": "Alice", "type": "HUMAN"},
+                    "text": "@Borg listen",
+                    "argumentText": "listen",
+                    "attachment": [{
+                        "contentName": "note.ogg",
+                        "contentType": "audio/ogg",
+                        "attachmentDataRef": {"resourceName": "attachments/AUDIO2"}
+                    }]
+                },
+                "space": {"name": "spaces/S1", "displayName": "General", "type": "ROOM"}
+            })
+            .to_string();
+            let gw_config = cortex::config::Config::default();
+            let hreg = health();
+            let ctx = WebhookContext {
+                config: &gw_config,
+                health: &hreg,
+            };
+            let outcome = channel
+                .handle_webhook(&HeaderMap::new(), &body, &ctx)
+                .await
+                .expect("webhook");
+            let WebhookOutcome::Message { inbound, .. } = outcome else {
+                panic!("{label}: the message must still reach the turn");
+            };
+            assert_eq!(inbound.peer_kind.as_deref(), Some("group"), "{label}");
+            let downloads = server.received_requests().await.expect("recorded").len();
+            assert_eq!(downloads, want_downloads, "{label}");
+        }
     }
 
     #[test]

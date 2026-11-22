@@ -46,7 +46,11 @@ pub fn parse_interaction(interaction: &Interaction) -> Option<InboundMessage> {
         thread_ts: None,
         attachments: Vec::new(),
         reaction: None,
-        metadata: serde_json::Value::Null,
+        // Every interaction (slash command, button, modal) is aimed at this
+        // application, so it addresses the bot by definition. Group
+        // activation then lets it through on the flag, never on a mention
+        // search over text that may carry folded-in channel history.
+        metadata: serde_json::json!({ "addressed_to_bot": true }),
         peer_kind: if interaction.guild_id.is_some() {
             Some(PEER_KIND_GROUP.to_string())
         } else {
@@ -533,6 +537,44 @@ mod tests {
         let dm_msg = parse_interaction(&dm).unwrap();
         assert_eq!(dm_msg.peer_kind.as_deref(), Some(PEER_KIND_DIRECT));
         assert_eq!(dm_msg.sender_id, "u_dm");
+    }
+
+    /// An interaction is aimed at this application, so a guild interaction
+    /// activates under the default mention gate even when a bot identifier
+    /// is known and the text never names it. The verdict rests on the
+    /// parser's flag, not on a mention search, so history folded into the
+    /// text later can neither grant nor withhold activation.
+    #[test]
+    fn guild_interaction_addresses_the_bot_under_mention_activation() {
+        let config = cortex::config::Config::default();
+        assert_eq!(
+            config.gateway.group_activation,
+            cortex::config::ActivationMode::Mention,
+            "the default must be mention-gated for this spec to hold"
+        );
+        let mut interaction = make_interaction(InteractionType::ApplicationCommand);
+        interaction.data = Some(InteractionData {
+            id: Some("cmd1".into()),
+            name: Some("ask".into()),
+            options: None,
+            custom_id: None,
+            values: None,
+            components: None,
+        });
+        let mut msg = parse_interaction(&interaction).unwrap();
+        assert_eq!(msg.peer_kind.as_deref(), Some(PEER_KIND_GROUP));
+        let bot = Some("<@app1>");
+        assert!(!msg.text.contains("<@app1>"));
+        assert!(crate::handler::message_activates(
+            &config, "discord", &msg, bot
+        ));
+
+        // Control: without the flag the same message is an unaddressed
+        // group message and stays silent.
+        msg.metadata = serde_json::Value::Null;
+        assert!(!crate::handler::message_activates(
+            &config, "discord", &msg, bot
+        ));
     }
 
     #[test]

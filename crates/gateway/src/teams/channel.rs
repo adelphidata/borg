@@ -85,10 +85,16 @@ impl NativeChannel for TeamsChannel {
 
         // Inbound voice transcription. Teams voice attachments come as
         // `audio/*` content types on Bot Framework URLs that require the
-        // OAuth token to fetch. A sender the queued turn will challenge or
-        // deny gets no download and no paid STT; the plain text still
-        // carries the challenge.
-        let may_enrich = crate::handler::sender_may_enrich(&self.config, "teams", &inbound).await;
+        // OAuth token to fetch. A message the queued turn will drop or a
+        // sender it will challenge or deny gets no download and no paid STT;
+        // the plain text still carries the challenge.
+        let may_enrich = crate::handler::pre_turn_work_wanted(
+            &self.config,
+            "teams",
+            &inbound,
+            self.bot_mention().as_deref(),
+        )
+        .await;
         if let Some(atts) = activity.attachments.as_ref().filter(|_| may_enrich) {
             if let Some(transcriber) =
                 cortex::media::understanding::AudioTranscriber::from_config(&self.config)
@@ -470,6 +476,73 @@ mod tests {
             !reqs.iter().any(|r| r.url.path().starts_with("/files/")),
             "no attachment may be fetched for a denied sender"
         );
+    }
+
+    /// A group voice note shares the turn's activation verdict. Teams
+    /// delivers a group message by default only on an @mention, and the turn
+    /// has no bot identifier for Teams, so under the default mention gate an
+    /// admitted sender's note is still fetched; a refused sender's is not.
+    #[tokio::test]
+    async fn group_voice_note_fetch_follows_the_turn_verdict() {
+        let cases = [
+            ("admitted sender", cortex::pairing::DmPolicy::Open, 1),
+            ("refused sender", cortex::pairing::DmPolicy::Disabled, 0),
+        ];
+        for (label, policy, want_fetches) in cases {
+            let server = MockServer::start().await;
+            mount_token(&server).await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let mut config = stt_config();
+            assert_eq!(
+                config.gateway.group_activation,
+                cortex::config::ActivationMode::Mention,
+                "the default must be mention-gated for this spec to hold"
+            );
+            config.gateway.dm_policy = policy;
+            let channel = stub_channel(&server, config);
+
+            let body = serde_json::json!({
+                "id": "act-group",
+                "type": "message",
+                "from": {"id": "user-1", "name": "Alice"},
+                "conversation": {"id": "conv-g", "isGroup": true},
+                "recipient": {"id": "bot-1", "name": "MyBot"},
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                "text": "<at>MyBot</at> listen",
+                "attachments": [{
+                    "contentType": "audio/ogg",
+                    "contentUrl": format!("{}/files/voice.ogg", server.uri()),
+                    "name": "voice.ogg"
+                }]
+            })
+            .to_string();
+            let headers = make_signed_headers(&make_secret(), &body);
+            let gw_config = cortex::config::Config::default();
+            let hreg = health();
+            let ctx = WebhookContext {
+                config: &gw_config,
+                health: &hreg,
+            };
+            let outcome = channel
+                .handle_webhook(&headers, &body, &ctx)
+                .await
+                .expect("webhook");
+            let WebhookOutcome::Message { inbound, .. } = outcome else {
+                panic!("{label}: expected a message outcome");
+            };
+            assert_eq!(inbound.peer_kind.as_deref(), Some("group"), "{label}");
+            let fetches = server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .iter()
+                .filter(|r| r.url.path().starts_with("/files/"))
+                .count();
+            assert_eq!(fetches, want_fetches, "{label}");
+        }
     }
 
     #[test]

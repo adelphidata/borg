@@ -595,7 +595,13 @@ impl GatewayServer {
             let request_timeout = poll_request_timeout;
             Box::pin(async move {
                 let (mut parsed, chat_id, thread_id, reply_to) = queued.into_parsed();
-                crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
+                crate::telegram::enrich_parsed_message(
+                    &tg,
+                    &config,
+                    &mut parsed,
+                    bot_mention.as_deref(),
+                )
+                .await;
                 let inbound = parsed.inbound;
 
                 let typing =

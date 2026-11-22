@@ -34,19 +34,25 @@ pub use parse::{TelegramAudioRef, TelegramInputKind, TelegramParsed, TelegramPho
 ///
 /// Photos become base64 image attachments. Audio/voice becomes transcribed text
 /// when audio transcription is enabled.
+///
+/// `bot_mention` is the `@username` group activation matches on — the same
+/// identifier the turn and the typing indicator use.
 pub async fn enrich_parsed_message(
     client: &api::TelegramClient,
     config: &cortex::config::Config,
     parsed: &mut TelegramParsed,
+    bot_mention: Option<&str>,
 ) {
-    // A sender the queued turn will challenge or deny gets no download and
-    // no paid STT; the plain text still carries the challenge.
+    // A message the queued turn will drop (a group message that does not
+    // address the bot) or a sender it will challenge or deny gets no
+    // download and no paid STT; the plain text still carries the challenge.
     if (parsed.photo.is_some() || parsed.audio.is_some())
-        && !crate::handler::sender_may_enrich(config, "telegram", &parsed.inbound).await
+        && !crate::handler::pre_turn_work_wanted(config, "telegram", &parsed.inbound, bot_mention)
+            .await
     {
         tracing::info!(
             sender = %parsed.inbound.sender_id,
-            "telegram: sender not approved; skipping media enrichment"
+            "telegram: message not addressed to the bot or sender not approved; skipping media enrichment"
         );
         return;
     }
@@ -343,7 +349,7 @@ mod tests {
         )
         .await;
 
-        enrich_parsed_message(&client, &config, &mut parsed).await;
+        enrich_parsed_message(&client, &config, &mut parsed, None).await;
 
         assert_eq!(
             parsed.inbound.text,
@@ -426,7 +432,7 @@ mod tests {
         .await;
         assert_eq!(parsed.inbound.channel_id.as_deref(), Some("4242"));
 
-        enrich_parsed_message(&client, &config, &mut parsed).await;
+        enrich_parsed_message(&client, &config, &mut parsed, None).await;
 
         assert!(
             parsed.inbound.text.starts_with(VOICE_TRANSCRIPT_PREFIX),
@@ -501,7 +507,7 @@ mod tests {
         )
         .await;
 
-        enrich_parsed_message(&client, &config, &mut parsed).await;
+        enrich_parsed_message(&client, &config, &mut parsed, None).await;
 
         assert_eq!(
             parsed.inbound.text,
@@ -542,11 +548,90 @@ mod tests {
         )
         .await;
 
-        enrich_parsed_message(&client, &config, &mut parsed).await;
+        enrich_parsed_message(&client, &config, &mut parsed, None).await;
 
         assert_eq!(
             parsed.inbound.text,
             "[Voice message]\n[audio could not be downloaded]"
+        );
+    }
+
+    /// Under the default mention gate, a group voice note that does not
+    /// address the bot is neither fetched nor transcribed; the same note sent
+    /// as a reply to the bot is.
+    #[tokio::test]
+    async fn enrich_skips_unaddressed_group_voice_and_runs_for_a_reply_to_the_bot() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottesttok/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_id": "vf9", "file_unique_id": "u9", "file_size": 1500, "file_path": "voice/g.oga" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottesttok/voice/g.oga"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1500]))
+            .mount(&server)
+            .await;
+
+        let client = api::TelegramClient::with_base("testtok", &server.uri()).unwrap();
+        let mut config = cortex::config::Config::default();
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        config.audio.enabled = true;
+        config.audio.models = vec![cortex::config::AudioModelConfig {
+            provider: "custom".to_string(),
+            model: None,
+            api_key_env: None,
+            language: None,
+            timeout_ms: None,
+            base_url: None,
+            xai_stt_format: None,
+            xai_stt_diarize: None,
+            command: Some("cat '{audio_file}'".to_string()),
+        }];
+        let group_voice = |update_id: i64, reply_to_bot: bool| {
+            let mut message = serde_json::json!({
+                "message_id": 1,
+                "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                "chat": { "id": -100, "type": "supergroup", "title": "team" },
+                "date": 1700000000,
+                "voice": { "file_id": "vf9", "file_unique_id": "u9", "duration": 3 }
+            });
+            if reply_to_bot {
+                message["reply_to_message"] = serde_json::json!({
+                    "message_id": 0,
+                    "from": { "id": 7, "first_name": "Borg", "is_bot": true, "username": "borg_bot" },
+                    "chat": { "id": -100, "type": "supergroup", "title": "team" },
+                    "date": 1699999999,
+                    "text": "earlier answer"
+                });
+            }
+            serde_json::json!({ "update_id": update_id, "message": message }).to_string()
+        };
+
+        let mut unaddressed = parse_body(&group_voice(50, false)).await;
+        let before = unaddressed.inbound.text.clone();
+        enrich_parsed_message(&client, &config, &mut unaddressed, Some("@borg_bot")).await;
+        assert_eq!(
+            unaddressed.inbound.text, before,
+            "no transcript for an unaddressed note"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the Bot API must see no file request for an unaddressed group note"
+        );
+
+        let mut addressed = parse_body(&group_voice(51, true)).await;
+        enrich_parsed_message(&client, &config, &mut addressed, Some("@borg_bot")).await;
+        assert!(
+            addressed.inbound.text.starts_with(VOICE_TRANSCRIPT_PREFIX),
+            "an addressed note must be transcribed, got: {}",
+            addressed.inbound.text
         );
     }
 
@@ -619,7 +704,7 @@ mod tests {
         .await;
         let before = parsed.inbound.text.clone();
 
-        enrich_parsed_message(&client, &config, &mut parsed).await;
+        enrich_parsed_message(&client, &config, &mut parsed, None).await;
         std::env::remove_var("BORG_HOME");
 
         assert_eq!(

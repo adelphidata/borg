@@ -209,15 +209,24 @@ impl NativeChannel for DiscordChannel {
 
                 // Channel history context injection for guild (group) interactions.
                 // Skip for DMs (no useful channel context) to save rate-limit budget,
-                // and for a sender the queued turn will challenge or deny: the
-                // history read and the paid STT on its voice notes are pre-turn
-                // work that must not run for a stranger.
+                // and for a message the queued turn will drop or a sender it
+                // will challenge or deny: the history read and the paid STT on
+                // its voice notes are pre-turn work that must not run then.
+                // The verdict reads the user's own text, before history is
+                // folded in. An interaction always addresses the bot (the
+                // parser marks it), so in practice this is the sender gate.
                 let is_guild = inbound
                     .peer_kind
                     .as_deref()
                     .is_some_and(|pk| pk == crate::constants::PEER_KIND_GROUP);
                 if is_guild
-                    && crate::handler::sender_may_enrich(&self.config, "discord", &inbound).await
+                    && crate::handler::pre_turn_work_wanted(
+                        &self.config,
+                        "discord",
+                        &inbound,
+                        self.bot_mention().as_deref(),
+                    )
+                    .await
                 {
                     if let Some(ref channel_id) = inbound.channel_id {
                         if let Some(context) = self.channel_context(channel_id).await {
