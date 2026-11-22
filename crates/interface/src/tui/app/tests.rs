@@ -2179,6 +2179,61 @@ fn pasted_image_path_attaches_only_regular_files_within_the_cap() {
     }
 }
 
+/// Ctrl+V pastes what the clipboard holds. An image wins; text naming an
+/// image file attaches the file; other text must paste as text, because a
+/// terminal that passes Ctrl+V through raw sends no paste event of its own.
+#[test]
+fn clipboard_read_attaches_images_and_pastes_other_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let photo = tmp.path().join("shot.png");
+    std::fs::write(&photo, b"file png").unwrap();
+    let photo_text = photo.display().to_string();
+
+    type Case<'a> = (Option<Vec<u8>>, Option<&'a str>, Option<ClipboardPaste>);
+    let cases: Vec<Case> = vec![
+        (
+            Some(b"raw png".to_vec()),
+            Some("ignored text"),
+            Some(ClipboardPaste::Image(
+                b"raw png".to_vec(),
+                "image/png".into(),
+            )),
+        ),
+        (
+            None,
+            Some(&photo_text),
+            Some(ClipboardPaste::Image(
+                b"file png".to_vec(),
+                "image/png".into(),
+            )),
+        ),
+        (
+            None,
+            Some("fn main() {}\n"),
+            Some(ClipboardPaste::Text("fn main() {}\n".into())),
+        ),
+        (None, Some(""), None),
+        (None, None, None),
+    ];
+    for (png, text, expected) in cases {
+        let label = format!("png={:?} text={text:?}", png.is_some());
+        assert_eq!(
+            classify_clipboard(png, text.map(str::to_string)),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+/// Clipboard text lands in the composer exactly as a terminal paste does.
+#[test]
+fn clipboard_text_pastes_into_the_composer() {
+    let mut app = make_app();
+    app.apply_clipboard_paste(ClipboardPaste::Text("hello from the clipboard".into()));
+    assert_eq!(app.composer.text(), "hello from the clipboard");
+    assert!(app.composer.take_image_attachments().is_empty());
+}
+
 /// Ctrl+L clears the screen, not the conversation: earlier exchanges stay in
 /// the transcript Ctrl+T pages through, and output still streaming into the
 /// live viewport keeps its place.
@@ -2932,6 +2987,44 @@ fn at_query_terminates_on_any_whitespace_not_punctuation() {
 }
 
 // --- `!cmd` shell mode ---
+
+/// A `!` line runs as typed, so an `@` in it is never a file mention: the
+/// popup must stay shut, or Enter would complete a path instead of running
+/// the command. With shell mode off the same line is a message and mentions
+/// work as usual.
+#[test]
+fn at_in_a_shell_line_opens_no_file_popup() {
+    for (line, shell_mode, popup) in [
+        ("!echo @sr", true, false),
+        ("!echo @sr", false, true),
+        ("echo @sr", true, true),
+    ] {
+        let mut config = Config::default();
+        config.ui.shell_mode_enabled = shell_mode;
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, None, client, None);
+        app.composer.set_text(line);
+        app.sync_file_popup();
+        assert_eq!(
+            app.file_popup.is_visible(),
+            popup,
+            "{line:?} with shell mode {shell_mode}"
+        );
+    }
+}
+
+/// Pasting a `!` in front of an open mention turns the line into a shell
+/// command, so the popup must shut then too, or Enter completes a path.
+#[test]
+fn pasting_a_bang_before_a_mention_shuts_the_file_popup() {
+    let mut app = make_app();
+    app.composer.set_text("@sr");
+    app.sync_file_popup();
+    assert!(app.file_popup.is_visible(), "control: `@sr` is a mention");
+    app.composer.set_text("");
+    app.handle_paste("!echo @sr".to_string());
+    assert!(!app.file_popup.is_visible());
+}
 
 #[test]
 fn bang_prefix_dispatches_exec_shell_with_the_command_stripped() {
