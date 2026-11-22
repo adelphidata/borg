@@ -31,6 +31,13 @@ const OVERFLOW_NEEDLES: &[&str] = &[
     // reactive-compaction recovery fires; the underscored form does not match
     // the spaced "request too large" needle above.
     "request_too_large",
+    // The structured `error.code` for an over-long prompt. A compatible
+    // server may send the code with a message that names no limit, and the
+    // spaced "context length" needle does not match the underscored form.
+    // It is matched as text like the needles above, so a body that only
+    // quotes the code elsewhere also reads as overflow; the rate-limit guard
+    // still wins, and a spurious compaction costs less than a missed one.
+    "context_length_exceeded",
 ];
 
 const AUTH_PERMANENT_NEEDLES: &[&str] = &[
