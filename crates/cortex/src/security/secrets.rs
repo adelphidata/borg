@@ -73,10 +73,17 @@ fn is_word_start(s: &str, i: usize) -> bool {
 /// ALL-CAPS keys keep the legacy embedded matching (`MYTOKEN=…`, `MONKEY=…`
 /// included) — an all-caps name is env-var-shaped and almost never prose, so
 /// over-masking there is the safer failure.
-fn credential_assignment_key_is_real(full_match: &str) -> bool {
+///
+/// A value that is a dotted call or index expression (`getpass.getpass()`,
+/// `os.environ["X"]`) is source code, not a secret. Shell output reaches the
+/// model redacted, so masking it would corrupt the code the model edits.
+fn credential_assignment_is_real(full_match: &str) -> bool {
     let Some(eq) = full_match.find('=') else {
         return true; // defensive: pattern guarantees a '='
     };
+    if value_is_code_expression(full_match[eq + 1..].trim_start()) {
+        return false;
+    }
     let key = full_match[..eq]
         .trim_start_matches([' ', '\t', '\n', ';'])
         .trim_start_matches("export ")
@@ -89,6 +96,321 @@ fn credential_assignment_key_is_real(full_match: &str) -> bool {
     CREDENTIAL_KEY_SUFFIXES
         .iter()
         .any(|kw| lower.ends_with(kw) && is_word_start(key, key.len() - kw.len()))
+}
+
+/// True when `value` is a dotted identifier chain that is called or indexed
+/// and carries no literal that could be a secret: `getpass.getpass()`,
+/// `os.environ['NPM_TOKEN']`, `os.getenv("API_KEY")`,
+/// `client.auth.fetch_token(scope)`. Each call or index argument must be an
+/// identifier (dotted allowed), and the whole value may hold at most one
+/// quoted literal, shaped like an env-var name (`[A-Z_][A-Z0-9_]*`). So
+/// `os.getenv("K","Hunter2Secret!")` and `base64.b64decode("c2st…")` are
+/// still masked. A bare identifier before `(` (`Hunter2(!)`) does not count:
+/// passwords carry parentheses, but seldom a `name.name(` shape. A trailing
+/// `;` is allowed; anything else after the expression means not code.
+fn value_is_code_expression(value: &str) -> bool {
+    let value = value.strip_suffix(';').unwrap_or(value);
+    let Some(open) = value.find(['(', '[']) else {
+        return false;
+    };
+    let chain = &value[..open];
+    if chain.split('.').count() < 2 || !is_dotted_identifier(chain) {
+        return false;
+    }
+    let mut rest = &value[open..];
+    let mut literals = 0usize;
+    while !rest.is_empty() {
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            // A method or field after a call: `.strip()`, `.value`.
+            let end = after_dot.find(['(', '[', '.']).unwrap_or(after_dot.len());
+            if !is_identifier(&after_dot[..end]) {
+                return false;
+            }
+            rest = &after_dot[end..];
+            continue;
+        }
+        let close = match rest.as_bytes()[0] {
+            b'(' => ')',
+            b'[' => ']',
+            _ => return false,
+        };
+        let Some(end) = rest.find(close) else {
+            return false; // unclosed (the match stops at whitespace): mask
+        };
+        let args = &rest[1..end];
+        for arg in args.split(',').map(str::trim) {
+            if arg.is_empty() || is_dotted_identifier(arg) {
+                continue;
+            }
+            literals += 1;
+            if literals > 1 || !is_env_name_literal(arg) {
+                return false;
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    true
+}
+
+/// `name`: an ASCII identifier (`_` or a letter, then word characters).
+fn is_identifier(seg: &str) -> bool {
+    seg.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `a.b.c`: one or more identifiers joined by dots.
+fn is_dotted_identifier(s: &str) -> bool {
+    s.split('.').all(is_identifier)
+}
+
+/// `'NAME'` or `"NAME"` where `NAME` is shaped like an env-var name.
+fn is_env_name_literal(arg: &str) -> bool {
+    let inner = ['\'', '"']
+        .iter()
+        .find_map(|q| arg.strip_prefix(*q).and_then(|a| a.strip_suffix(*q)));
+    let Some(inner) = inner else {
+        return false;
+    };
+    inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Lowercase words of an identifier, split at non-letters and at camelCase /
+/// acronym junctures (`SecretAccessKey` → `secret access key`,
+/// `DB_PASSWORD` → `db password`, `APIKey` → `api key`). Digits and
+/// punctuation separate words and are dropped.
+fn identifier_words(key: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for (i, c) in key.char_indices() {
+        if !c.is_ascii_alphabetic() {
+            continue;
+        }
+        let lower = c.to_ascii_lowercase();
+        match words.last_mut() {
+            Some(word) if !is_word_start(key, i) => word.push(lower),
+            _ => words.push(lower.to_string()),
+        }
+    }
+    words
+}
+
+/// Whole words that name a credential on their own. Concatenated compounds
+/// (`authtoken`, `secretkey`) are spelled out because they read as one word.
+/// `auth` is the Docker `config.json` field; `tokens` is deliberately absent
+/// so a `max_tokens` usage field is never treated as a credential.
+const CREDENTIAL_KEY_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "secrets",
+    "token",
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "apikey",
+    "apitoken",
+    "authtoken",
+    "authkey",
+    "accesstoken",
+    "refreshtoken",
+    "sessiontoken",
+    "secretkey",
+    "accesskey",
+    "privatekey",
+    "clientsecret",
+];
+
+/// Words that, right before `token`, make it a pagination or sync cursor
+/// (`nextPageToken`, `page_token`, `continuationToken`, `syncToken`), not a
+/// credential. Masking those breaks every paged API listing the agent reads.
+const CURSOR_TOKEN_QUALIFIERS: &[&str] = &[
+    "page",
+    "next",
+    "continuation",
+    "cursor",
+    "sync",
+    "resume",
+    "resumption",
+    "pagination",
+];
+
+/// Adjacent word pairs that name a credential (`api_key`, `AccessKey`,
+/// `private-key`) where neither word does alone.
+const CREDENTIAL_KEY_PAIRS: &[(&str, &str)] =
+    &[("api", "key"), ("access", "key"), ("private", "key")];
+
+/// Final words that make a key describe a credential rather than hold one:
+/// `token_type`, `auth_uri`, `secret_name`, `password_file`,
+/// `token_expires_at`. Their values are metadata, and masking them corrupts
+/// ordinary OAuth and cloud-SDK JSON.
+const CREDENTIAL_METADATA_WORDS: &[&str] = &[
+    "type",
+    "types",
+    "kind",
+    "uri",
+    "url",
+    "urls",
+    "endpoint",
+    "host",
+    "domain",
+    "issuer",
+    "audience",
+    "scope",
+    "scopes",
+    "id",
+    "ids",
+    "name",
+    "names",
+    "count",
+    "length",
+    "len",
+    "size",
+    "limit",
+    "path",
+    "file",
+    "dir",
+    "location",
+    "ttl",
+    "expiry",
+    "expires",
+    "expiration",
+    "exp",
+    "at",
+    "in",
+    "lifetime",
+    "hint",
+    "policy",
+    "mode",
+    "method",
+    "methods",
+    "scheme",
+    "provider",
+    "header",
+    "format",
+    "version",
+    "enabled",
+    "required",
+    "label",
+    "description",
+    "prefix",
+    "field",
+    "source",
+    "strategy",
+    "status",
+    "style",
+    "flow",
+    "algorithm",
+    "alg",
+    "encoding",
+];
+
+/// True when a JSON key names a credential at word boundaries: some word
+/// (or adjacent pair) is a credential word, and the last word is not a
+/// metadata word. `tokenizer`, `author` and `authority` embed a keyword
+/// mid-word and are rejected; `SessionToken`, `DB_PASSWORD`, `bot_token`
+/// and `SecretAccessKey` are accepted. A `token` right after a cursor
+/// qualifier (`nextPageToken`, `syncToken`) does not count.
+fn json_key_names_credential(key: &str) -> bool {
+    let words = identifier_words(key);
+    let Some(last) = words.last() else {
+        return false;
+    };
+    if CREDENTIAL_METADATA_WORDS.contains(&last.as_str()) {
+        return false;
+    }
+    let is_cursor_token = |i: usize| {
+        words[i] == "token" && i > 0 && CURSOR_TOKEN_QUALIFIERS.contains(&words[i - 1].as_str())
+    };
+    words
+        .iter()
+        .enumerate()
+        .any(|(i, w)| CREDENTIAL_KEY_WORDS.contains(&w.as_str()) && !is_cursor_token(i))
+        || words.windows(2).any(|pair| {
+            CREDENTIAL_KEY_PAIRS
+                .iter()
+                .any(|(a, b)| pair[0] == *a && pair[1] == *b)
+        })
+}
+
+/// Post-match validator for the JSON Credential patterns (plain and
+/// backslash-escaped quotes). The pattern only guarantees that a keyword
+/// sits somewhere in the key; this checks it sits at a word boundary.
+fn json_credential_key_is_real(full_match: &str) -> bool {
+    let body = full_match.trim_start_matches('\\');
+    let Some(body) = body.strip_prefix('"') else {
+        return false;
+    };
+    let key_end = body.find(['"', '\\']).unwrap_or(body.len());
+    json_key_names_credential(&body[..key_end])
+}
+
+/// The JSON Credential pattern for JSON escaped inside a string value
+/// (`"SecretString":"{\"password\":\"…\"}"`). The inner value's own escapes
+/// arrive doubled: `\\\"` is an inner `\"`, `\\n` / `\\/` / `\\u00e9` are
+/// inner `\n` / `\/` / `é`. A lone `\"` ends the value.
+const ESCAPED_JSON_CREDENTIAL_PATTERN: &str = r#"(?i)\\"[\w.-]*(?:passw(?:or)?d|passphrase|secret|token|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key)[\w.-]*\\"\s*:\s*\\"((?:[^"\\]|\\\\\\.|\\\\[^"\\]|\\[^"\\]){8,})\\""#;
+
+/// `ESCAPED_JSON_CREDENTIAL_PATTERN` compiled on its own, so the plain-quote
+/// validator can ask whether the escaped pattern will mask an inner field.
+static ESCAPED_JSON_CREDENTIAL: LazyLock<Option<Regex>> =
+    LazyLock::new(|| match Regex::new(ESCAPED_JSON_CREDENTIAL_PATTERN) {
+        Ok(regex) => Some(regex),
+        Err(e) => {
+            tracing::error!("Failed to compile escaped JSON Credential pattern: {e}");
+            None
+        }
+    });
+
+/// Post-match validator for the plain-quote JSON Credential pattern. The key
+/// must name a credential. When the value is an escaped JSON object whose own
+/// credential field the escaped-quote pattern masks
+/// (`"SecretString":"{\"password\":\"…\"}"`), the outer match is left to it,
+/// so the rest of the object stays readable. Any other value, an escaped
+/// object without a maskable credential field included, is masked whole.
+fn json_plain_credential_is_real(full_match: &str) -> bool {
+    if !json_credential_key_is_real(full_match) {
+        return false;
+    }
+    let Some(inner) = ESCAPED_JSON_CREDENTIAL.as_ref() else {
+        return true; // the escaped pattern is unavailable: mask the outer value
+    };
+    let inner_masks_a_field = inner
+        .find_iter(full_match)
+        .any(|m| json_credential_key_is_real(m.as_str()));
+    !inner_masks_a_field
+}
+
+/// Post-match validator for the line-start npmrc pattern. The pattern keeps
+/// the value to token/base64 characters; this also rejects a `.` before a
+/// letter, so code such as `_password = config.secret` stays readable.
+fn npmrc_bare_value_is_token(full_match: &str) -> bool {
+    let Some(eq) = full_match.find('=') else {
+        return false; // defensive: pattern guarantees a '='
+    };
+    let value = full_match[eq + 1..].trim().as_bytes();
+    !value
+        .windows(2)
+        .any(|w| w[0] == b'.' && w[1].is_ascii_alphabetic())
+}
+
+/// Post-match validator for the registry-scoped npmrc pattern: an
+/// environment reference (`${NPM_TOKEN}`) is the recommended way to keep the
+/// secret out of the file, so it is not a credential itself.
+fn npmrc_value_is_literal(full_match: &str) -> bool {
+    let Some(eq) = full_match.find('=') else {
+        return true; // defensive: pattern guarantees a '='
+    };
+    let value = full_match[eq + 1..].trim().trim_matches(['"', '\'']);
+    !(value.starts_with("${") && value.ends_with('}'))
 }
 
 /// Post-match validator for the Discord Token pattern: a real token's first
@@ -410,8 +732,15 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // The exact body length plus the trailing `\b` keeps a
         // `<timestamp>:<40-hex sha>` pair out. capture_only so the lead-in
         // character stays in the clear.
+        //
+        // A colored log line or an escaped transcript also puts a letter on
+        // the token's left: an ANSI CSI sequence (`ESC[32m`), its escaped
+        // spellings (`\x1b[`, `\u001b[`, `\033[`), a backslash escape (`\n`)
+        // or a percent escape (`%0A`). Those lead-ins are allowed too, and
+        // stay visible because only the token is captured. Each lead-in may
+        // also carry the URL's `bot` prefix (`ESC[32mbot<token>`).
         (
-            r"(?:^|[^\w]|\bbot)(\d{8,10}:[A-Za-z0-9_-]{35})\b",
+            r"(?:^|[^\w]|\bbot|(?:\x1b\[[0-?]*[ -/]*[@-~]|(?:\\x1[bB]|\\u001[bB]|\\033)\[[0-?]*[ -/]*[@-~]|\\[nrtbfv]|%[0-9A-Fa-f]{2})(?:bot)?)(\d{8,10}:[A-Za-z0-9_-]{35})\b",
             "Telegram Bot Token",
             true,
             None,
@@ -493,13 +822,63 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // JSON credential fields (`"api_key": "…"`, `"access_token":"…"`,
         // `"secret":"…"`). The header patterns above need the key to run
         // straight into the colon, so a quoted JSON key never reached them.
-        // The key must match whole, so `"token_type": "bearer"` is kept; only
-        // the quoted value is masked and both quotes survive.
+        // Any key that carries a credential word counts — `DB_PASSWORD`,
+        // `bot_token`, `SessionToken`, `SecretAccessKey`, Docker's `auth` —
+        // but the validator demands a word boundary (`tokenizer`, `author`
+        // stay readable) and rejects metadata keys (`token_type`,
+        // `auth_uri`). See `json_key_names_credential`. Only the quoted value
+        // is masked and both quotes survive; a value under 8 chars or a
+        // non-string value (`"max_tokens": 1024`) is never touched. A
+        // backslash escape (`\"`) inside the value is part of the value.
         (
-            r#"(?i)"(?:api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|auth[-_]?token|token|secret|client[-_]?secret|password|passwd|private[-_]?key)"\s*:\s*"([^"]{8,})""#,
+            r#"(?i)"[\w.-]*(?:passw(?:or)?d|passphrase|secret|token|api[-_]?key|auth|credential|private[-_]?key|access[-_]?key)[\w.-]*"\s*:\s*"((?:[^"\\]|\\.){8,})""#,
             "JSON Credential",
             true,
+            Some(json_plain_credential_is_real as fn(&str) -> bool),
+        ),
+        // The same fields inside JSON that is itself a string value, with
+        // escaped quotes: `"SecretString":"{\"password\":\"…\"}"` from a
+        // secrets-manager read, or a tool result embedded in a log line. See
+        // `ESCAPED_JSON_CREDENTIAL_PATTERN` for the doubled-escape rules.
+        (
+            ESCAPED_JSON_CREDENTIAL_PATTERN,
+            "JSON Credential",
+            true,
+            Some(json_credential_key_is_real as fn(&str) -> bool),
+        ),
+        // netrc entries (`~/.netrc`, `_netrc`): whitespace-separated tokens,
+        // on one line or spread over several. `login` must come before
+        // `password` in the same entry, which keeps prose that only mentions
+        // a machine and a password out. Prose such as "machine learning:
+        // login once, password reset" is kept out by the entry's shape: the
+        // machine value must look like a host (dotted name, IP, IPv6 or
+        // `localhost`, optional `:port`) and `default` must open a line.
+        // Only the password value is masked.
+        (
+            r"(?m)(?:^[ \t]*default|\bmachine\s+(?:localhost|[\w-]+(?:\.[\w-]+)+|\[?[0-9A-Fa-f]*:[0-9A-Fa-f:.]*\]?)(?::\d+)?)(?:\s+(?:account|port)\s+\S+)*\s+login\s+\S+(?:\s+(?:account|port)\s+\S+)*\s+password\s+(\S+)",
+            "netrc Password",
+            true,
             None,
+        ),
+        // npmrc registry auth (`//registry.example.com/:_authToken=…`,
+        // `:_auth=` base64 user:pass, `:_password=`), registry-scoped. An env
+        // reference (`${NPM_TOKEN}`) is exempt.
+        (
+            r"//\S*?:_(?:authToken|auth|password)[ \t]*=[ \t]*(\S+)",
+            "npmrc Credential",
+            true,
+            Some(npmrc_value_is_literal as fn(&str) -> bool),
+        ),
+        // The unscoped npmrc form, bare at line start. Shell output reaches
+        // the model redacted, so code such as `_password = getpass.getpass()`
+        // or `_auth == other` must stay readable: the line must be a whole
+        // npmrc entry with one `=` and a token/base64 value to end of line,
+        // and the validator rejects a `.` before a letter.
+        (
+            r"(?m)^[ \t]*_(?:authToken|auth|password)[ \t]*=[ \t]*([A-Za-z0-9+/._-][A-Za-z0-9+/=._-]*)[ \t]*\r?$",
+            "npmrc Credential",
+            true,
+            Some(npmrc_bare_value_is_token as fn(&str) -> bool),
         ),
         // CLI flags carrying a credential (`--api-key=…`, `--token …`). The
         // flag must end at the name, so `--token-file path` and
@@ -572,12 +951,12 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         // underscore is required: the shell's own `PWD`/`OLDPWD` are paths.
         // The post-match validator rejects keys that merely EMBED a keyword
         // (`turkey=`, `mypassword=` prose shapes) — the keyword must sit at a
-        // word boundary in the key. See `credential_assignment_key_is_real`.
+        // word boundary in the key. See `credential_assignment_is_real`.
         (
             r"(?i)(?:^|[\s;])(?:export\s+)?(?:[\w.]*(?:PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY|APIKEY|API_KEY|_PWD|_PASSWD|SSHPASS))\s*=\s*(\S{8,})",
             "Credential Assignment",
             true,
-            Some(credential_assignment_key_is_real as fn(&str) -> bool),
+            Some(credential_assignment_is_real as fn(&str) -> bool),
         ),
     ];
 
@@ -967,6 +1346,10 @@ pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
     "x-auth-token: AbCdEf0123456789TokenValue",
     "Cookie: session=AbCdEf0123456789; theme=dark",
     r#"{"api_key": "AbCdEf0123456789TokenValue"}"#,
+    r#"{"SecretString":"{\"password\":\"AbCdEf0123456789\"}"}"#,
+    "machine api.example.com login bob password AbCdEf0123456789",
+    "//registry.example.com/:_authToken=AbCdEf0123456789TokenValue",
+    "_authToken=AbCdEf0123456789TokenValue",
     "--api-key=AbCdEf0123456789TokenValue",
     "https://app.example/login?next=https%3A%2F%2Fx.example%2Fcb%3Ftoken%3DAbCdEf0123456789Value",
     "API_KEY=AbCdEf0123456789TokenValue",
@@ -2324,5 +2707,335 @@ mod gitlab_pattern_tests {
         // alternation would otherwise match `glrt` and leave a stray `r-`.
         let out = redact_secrets("glrtr-ABCDEFGHIJKLMNOPQRSTUV");
         assert_eq!(out, "[REDACTED GitLab Token]", "got: {out}");
+    }
+}
+
+#[cfg(test)]
+mod credential_carrier_tests {
+    use super::redact_secrets;
+
+    /// JSON fields whose key carries a credential word at a word boundary
+    /// are masked, value only, in plain and escaped-quote JSON.
+    #[test]
+    fn json_credential_keys_are_masked_at_word_boundaries() {
+        let cases: &[(&str, &str)] = &[
+            // `aws sts get-session-token`: every credential field, not just
+            // the key id the AWS shape pattern already knew.
+            (
+                r#"{"AccessKeyId":"ASIAIOSFODNN7EXAMPLE","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","SessionToken":"IQoJb3JpZ2luX2VjEJr//////////wEaCXVzLWVhc3QtMSJHMEUCIQ"}"#,
+                r#"{"AccessKeyId":"[REDACTED AWS Access Key]","SecretAccessKey":"[REDACTED JSON Credential]","SessionToken":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"DB_PASSWORD":"Zx9vQ2mLp4abc"}"#,
+                r#"{"DB_PASSWORD":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"API_TOKEN": "Zx9vQ2mLp4abcdef"}"#,
+                r#"{"API_TOKEN": "[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"bot_token":"Zx9vQ2mLp4abcdef","chat":"general"}"#,
+                r#"{"bot_token":"[REDACTED JSON Credential]","chat":"general"}"#,
+            ),
+            (
+                r#"{"session_token":"Zx9vQ2mLp4abcdef"}"#,
+                r#"{"session_token":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"clientSecret":"Zx9vQ2mLp4abcdef","x-api-key":"Qw8eR7tY6uI5oP4a"}"#,
+                r#"{"clientSecret":"[REDACTED JSON Credential]","x-api-key":"[REDACTED JSON Credential]"}"#,
+            ),
+            // Concatenated compound and a credential word mid-key.
+            (
+                r#"{"sessiontoken":"Zx9vQ2mLp4abcdef","password_hash":"Zx9vQ2mLp4abcdef"}"#,
+                r#"{"sessiontoken":"[REDACTED JSON Credential]","password_hash":"[REDACTED JSON Credential]"}"#,
+            ),
+            // Docker `config.json`: the base64 `user:pass` under `auth`.
+            (
+                r#"{"auths":{"registry.example.com":{"auth":"Ym9iOnNlY3JldHBhc3N3b3Jk"}}}"#,
+                r#"{"auths":{"registry.example.com":{"auth":"[REDACTED JSON Credential]"}}}"#,
+            ),
+            // A secrets-manager read: JSON escaped inside a string value.
+            (
+                r#"{"SecretString":"{\"password\":\"Zx9vQ2mLp4abc\"}"}"#,
+                r#"{"SecretString":"{\"password\":\"[REDACTED JSON Credential]\"}"}"#,
+            ),
+            (
+                r#"log: {\"user\":\"bob\",\"api_key\": \"Zx9vQ2mLp4abcdef\"}"#,
+                r#"log: {\"user\":\"bob\",\"api_key\": \"[REDACTED JSON Credential]\"}"#,
+            ),
+            // OAuth token responses: an id_token is a signed JWT credential,
+            // so it is masked with the access/refresh/session tokens.
+            (
+                r#"{"accessToken":"Zx9vQ2mLp4abcdef","refreshToken":"Qw8eR7tY6uI5oP4a"}"#,
+                r#"{"accessToken":"[REDACTED JSON Credential]","refreshToken":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"idToken":"Zx9vQ2mLp4abcdef","sessionToken":"Qw8eR7tY6uI5oP4a"}"#,
+                r#"{"idToken":"[REDACTED JSON Credential]","sessionToken":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"authorization":"Basic dXNlcjpwYXNzd29yZA=="}"#,
+                r#"{"authorization":"[REDACTED JSON Credential]"}"#,
+            ),
+            // An escaped quote inside the value is part of the value, in
+            // plain JSON and in JSON escaped inside a string.
+            (
+                r#"{"password": "abc\"defghijklmn"}"#,
+                r#"{"password": "[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{\"password\":\"abc\\\"defghijklmn\",\"user\":\"bob\"}"#,
+                r#"{\"password\":\"[REDACTED JSON Credential]\",\"user\":\"bob\"}"#,
+            ),
+            // Other doubled escapes inside the inner value (`\\n`, `\\/`,
+            // `\\u00e9`, an inner backslash `\\\\`) stay part of it.
+            (
+                r#"{"SecretString":"{\"password\":\"line1\\nline2secretvalue\"}"}"#,
+                r#"{"SecretString":"{\"password\":\"[REDACTED JSON Credential]\"}"}"#,
+            ),
+            (
+                r#"{"SecretString":"{\"password\":\"https:\\/\\/secretvalue\",\"user\":\"bob\"}"}"#,
+                r#"{"SecretString":"{\"password\":\"[REDACTED JSON Credential]\",\"user\":\"bob\"}"}"#,
+            ),
+            (
+                r#"{"SecretString":"{\"password\":\"caf\\u00e9secretvalue\"}"}"#,
+                r#"{"SecretString":"{\"password\":\"[REDACTED JSON Credential]\"}"}"#,
+            ),
+            (
+                r#"{"SecretString":"{\"password\":\"abcdefgh\\\\\",\"user\":\"bob\"}"}"#,
+                r#"{"SecretString":"{\"password\":\"[REDACTED JSON Credential]\",\"user\":\"bob\"}"}"#,
+            ),
+            // An escaped object under a credential key: when an inner field
+            // names a credential, only that field is masked; when none does
+            // (or its value is too short to mask), the outer value is masked
+            // whole, so nothing in it reaches the model in the clear.
+            (
+                r#"{"client_secret":"{\"password\":\"Hunter2Hunter2Hunter2\",\"user\":\"bob\"}"}"#,
+                r#"{"client_secret":"{\"password\":\"[REDACTED JSON Credential]\",\"user\":\"bob\"}"}"#,
+            ),
+            (
+                r#"{"client_secret":"{\"k\":\"Hunter2Hunter2Hunter2\"}"}"#,
+                r#"{"client_secret":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"client_secret":"{\"password\":\"short\",\"k\":\"Hunter2Hunter2\"}"}"#,
+                r#"{"client_secret":"[REDACTED JSON Credential]"}"#,
+            ),
+            (
+                r#"{"SecretString":"{\"username\":\"bob\",\"host\":\"db.example.com\"}"}"#,
+                r#"{"SecretString":"[REDACTED JSON Credential]"}"#,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), *expected, "input: {input}");
+        }
+
+        // A keyword embedded mid-word, a metadata key, a short value and a
+        // non-string value all stay readable.
+        let negatives = [
+            r#"{"tokenizer":"gpt2-tokenizer-fast"}"#,
+            r#"{"author":"Robert Smithson"}"#,
+            r#"{"authority":"https://login.microsoftonline.com/common"}"#,
+            r#"{"passwordless":"enabled-for-everyone"}"#,
+            r#"{"oauth":"disabled-entirely"}"#,
+            r#"{"max_tokens":1024,"prompt_tokens":"123"}"#,
+            r#"{"token_count":"12"}"#,
+            r#"{"token_type":"refresh_grant_v2","expires_in":3600}"#,
+            r#"{"auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}"#,
+            r#"{"secretName":"prod-db-credentials","password_file":"/run/secrets/db"}"#,
+            r#"{\"tokenizer\":\"gpt2-tokenizer-fast\"}"#,
+            r#"{\"password\":\"short\"}"#,
+            // Pagination and sync cursors are not credentials.
+            r#"{"items":[],"nextPageToken":"CiAKGjBpNDd2Nmp2Zml2cXRwYjBpOXA0dmowMhIB"}"#,
+            r#"{"page_token":"eyJvZmZzZXQiOjEwMH0"}"#,
+            r#"{"continuationToken":"1-AbCdEf0123456789"}"#,
+            r#"{"cursorToken":"Y3Vyc29yOjEyMzQ1Njc4"}"#,
+            r#"{"syncToken":"CPDAlvWDx70CEPDAlvWDx70CGAU="}"#,
+            r#"{"resumeToken":"8263A1B2C3D4E5F60000"}"#,
+            r#"{"NextToken":"AbCdEf0123456789TokenValue"}"#,
+            // OAuth discovery metadata names endpoints, not credentials.
+            r#"{"authorization_url":"https://idp.example/authorize"}"#,
+            r#"{"authorizationEndpoint":"https://idp.example/oauth2/authorize"}"#,
+            // An escaped JSON object under a key that names no credential.
+            r#"{"Payload":"{\"username\":\"bob\",\"host\":\"db.example.com\"}"}"#,
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
+        }
+    }
+
+    /// netrc and npmrc credential lines: only the value is masked.
+    #[test]
+    fn credential_store_formats_mask_the_value_only() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "machine api.example.com login bob password hunter2secretpass",
+                "machine api.example.com login bob password [REDACTED netrc Password]",
+            ),
+            (
+                "machine api.example.com\n  login bob\n  password hunter2secretpass\nmachine b.example login x",
+                "machine api.example.com\n  login bob\n  password [REDACTED netrc Password]\nmachine b.example login x",
+            ),
+            (
+                "machine 10.0.0.5 login root password hunter2secretpass",
+                "machine 10.0.0.5 login root password [REDACTED netrc Password]",
+            ),
+            (
+                "machine localhost:8080 login dev password hunter2secretpass",
+                "machine localhost:8080 login dev password [REDACTED netrc Password]",
+            ),
+            (
+                "default login anonymous password guest2024pw",
+                "default login anonymous password [REDACTED netrc Password]",
+            ),
+            (
+                "machine h.example account acct login bob password pw",
+                "machine h.example account acct login bob password [REDACTED netrc Password]",
+            ),
+            (
+                // Split so the fake token never sits whole in the source,
+                // where forge push protection reads it as a real one.
+                concat!(
+                    "//registry.example.com/:_authToken=5f3c2a1b-",
+                    "9d8e-4f00-a1b2-c3d4e5f6a7b8"
+                ),
+                "//registry.example.com/:_authToken=[REDACTED npmrc Credential]",
+            ),
+            (
+                "//reg.example:8443/npm/:_auth=Ym9iOnNlY3JldHBhc3M=\nalways-auth=true",
+                "//reg.example:8443/npm/:_auth=[REDACTED npmrc Credential]\nalways-auth=true",
+            ),
+            (
+                "//reg/:username=bob\n//reg/:_password=c2VjcmV0",
+                "//reg/:username=bob\n//reg/:_password=[REDACTED npmrc Credential]",
+            ),
+            (
+                "registry=https://r.example/\n_auth=Ym9iOnNlY3JldHBhc3M=",
+                "registry=https://r.example/\n_auth=[REDACTED npmrc Credential]",
+            ),
+            (
+                "  _authToken = npm_AbCdEf0123456789TokenValue\r\nemail=a@b.example",
+                "  _authToken = [REDACTED npmrc Credential]\r\nemail=a@b.example",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), *expected, "input: {input:?}");
+        }
+
+        let negatives = [
+            // An env reference keeps the secret out of the file.
+            "//registry.npmjs.org/:_authToken=${NPM_TOKEN}",
+            "registry=https://registry.npmjs.org/",
+            "the build machine asked for a password twice",
+            "machine learning models never see a password reset link",
+            "please login with your password manager",
+            // netrc-like prose: the machine value is not a host, and
+            // `default` does not open the line.
+            "Change the default login page password field",
+            "machine learning: login once, password reset after",
+            // Code and comparisons with a bare npmrc key name.
+            "    _password = getpass.getpass()",
+            "_auth == other_value",
+            "_auth = settings.registryAuth",
+            "_authToken = os.environ['NPM_TOKEN']",
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
+        }
+    }
+
+    /// A credential assignment whose value is a dotted call or index
+    /// expression is source code and stays readable; a literal value that
+    /// merely contains parentheses is still masked.
+    #[test]
+    fn credential_assignment_skips_code_expression_values() {
+        let negatives = [
+            "    _password = getpass.getpass()",
+            "api_key = os.environ['OPENAI_API_KEY']",
+            "API_KEY=os.getenv(\"API_KEY\")",
+            "NPM_TOKEN=os.environ[\"NPM_TOKEN\"];",
+            "self.token = client.auth.fetch_token(scope)",
+            "SECRET_KEY=os.environ.get(\"SECRET_KEY\").strip()",
+            "auth_token = self.vault.read(cfg.path)[key]",
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(input), input, "false positive on {input}");
+        }
+
+        let cases: &[(&str, &str)] = &[
+            (
+                "DB_PASSWORD=Hunter2(!)xyz",
+                "DB_PASSWORD=[REDACTED Credential Assignment]",
+            ),
+            (
+                "API_SECRET=abc.def.Zx9vQ2mLp4",
+                "API_SECRET=[REDACTED Credential Assignment]",
+            ),
+            // A call whose argument is a literal secret, or a default value
+            // beside the env-var name, is not plain code.
+            (
+                "DB_PASSWORD=os.getenv(\"DB_PASSWORD\",\"Hunter2Secret!\")",
+                "DB_PASSWORD=[REDACTED Credential Assignment]",
+            ),
+            (
+                "TOKEN=base64.b64decode(\"c2stbGl2ZS1hYmNkZWY=\")",
+                "TOKEN=[REDACTED Credential Assignment]",
+            ),
+            (
+                "API_KEY=os.getenv(\"API_KEY\",\"OTHER_KEY\")",
+                "API_KEY=[REDACTED Credential Assignment]",
+            ),
+            (
+                "api_token = client.login('Zx9vQ2mLp4abc')",
+                "api_token = [REDACTED Credential Assignment]",
+            ),
+            (
+                "SECRET=cfg.get(\"SECRET\")Hunter2tail",
+                "SECRET=[REDACTED Credential Assignment]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), *expected, "input: {input}");
+        }
+    }
+
+    /// A Telegram bot token after an ANSI color code or an escape spelling
+    /// is masked, and the lead-in stays visible.
+    #[test]
+    fn telegram_token_after_escape_lead_ins_is_masked() {
+        let token = ["123456789:", "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawX"].concat();
+        let lead_ins = [
+            "\x1b[32m",
+            "\x1b[1;32m",
+            "\x1b[32mbot",
+            r"\x1b[32m",
+            r"\x1b[32mbot",
+            r"\nbot",
+            r"\u001b[0m",
+            r"\033[1m",
+            r"\n",
+            r"\t",
+            "%0A",
+            "ok ",
+        ];
+        for lead in lead_ins {
+            let input = format!("{lead}{token}\x1b[0m done");
+            let expected = format!("{lead}[REDACTED Telegram Bot Token]\x1b[0m done");
+            assert_eq!(redact_secrets(&input), expected, "lead-in {lead:?}");
+        }
+
+        // A letter glued to the digits is still not a lead-in, and a
+        // `<timestamp>:<40-hex sha>` pair after a color code stays readable.
+        let negatives = [
+            format!("abc{token}"),
+            format!(
+                "\x1b[32m1700000000:{}",
+                "0123456789abcdef0123456789abcdef01234567"
+            ),
+        ];
+        for input in negatives {
+            assert_eq!(redact_secrets(&input), input, "false positive on {input:?}");
+        }
     }
 }
