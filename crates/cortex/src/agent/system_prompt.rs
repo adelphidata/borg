@@ -624,7 +624,9 @@ pub(super) async fn render_scheduled_tasks_snapshot(db: &crate::db::Database, no
                 .as_deref()
                 .unwrap_or("(unknown)")
                 .replace('\n', " ");
-            let err = if err.len() > 120 { &err[..120] } else { &err };
+            // Byte cap on a char boundary: slicing at a raw byte offset
+            // panics when it splits a multi-byte character.
+            let err = &err[..crate::util::truncate::floor_char_boundary(&err, 120)];
             s.push_str(&format!(
                 "  - {} (id={}, last_error: \"{}\")\n",
                 task.name, task.id, err
@@ -1046,6 +1048,30 @@ mod scheduled_tasks_snapshot_tests {
         assert!(
             snap.is_empty(),
             "expected empty snapshot on clean DB, got: {snap}"
+        );
+    }
+
+    /// Spec: a `last_error` whose 120th byte falls inside a multi-byte
+    /// character must be cut on a char boundary. A raw byte slice panics,
+    /// and this snapshot is built on every main-session turn.
+    #[tokio::test]
+    async fn snapshot_truncates_multibyte_error_on_a_char_boundary() {
+        let db = Database::test_db().await;
+        make_task(&db, "task-mb", "multibyte").await;
+        // 119 ASCII bytes, then a 3-byte em dash straddling byte 120.
+        let long_err = format!("{}\u{2014}tail that must be cut", "a".repeat(119));
+        db.set_task_retry("task-mb", 1, &long_err, 9999)
+            .await
+            .expect("set");
+
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000).await;
+        assert!(
+            snap.contains(&format!("last_error: \"{}\")", "a".repeat(119))),
+            "expected the 119-byte prefix, cut before the split char: {snap}"
+        );
+        assert!(
+            !snap.contains("tail that must be cut"),
+            "the error must still be capped: {snap}"
         );
     }
 
