@@ -275,6 +275,7 @@ pub async fn spawn_task_execution(
         let monitor_mode = task.monitor_mode;
         let last_pre_run_hash = task.last_pre_run_hash.clone();
         let continuity = task.continuity;
+        let timezone = task.timezone.clone();
         // Emergency stop (`borg pause`): the dispatcher gate normally stops
         // runs from being claimed at all, but a run can reach here through
         // the claim-vs-pause race window or the orchestrator path. This run
@@ -388,6 +389,7 @@ pub async fn spawn_task_execution(
             monitor_mode,
             last_pre_run_hash,
             continuity,
+            timezone,
             executor,
             model_pin,
         };
@@ -792,6 +794,9 @@ struct TaskExecContext {
     /// Carry what previous runs of this task produced into this run's turn.
     /// See `ScheduledTaskRow::continuity`.
     continuity: bool,
+    /// The task's stored schedule zone. A pinned IANA zone is the clock the
+    /// run reads; see `cortex::tasks::run_time_zone`.
+    timezone: String,
     /// Session executor for agentic turns: prompt tasks and heartbeat
     /// remediation. `None` on paths that only run tool-less completions.
     executor: Option<Arc<DaemonSessionExecutor>>,
@@ -914,6 +919,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         monitor_mode: _,
         last_pre_run_hash: _,
         continuity: _,
+        timezone: _,
         executor: _,
         model_pin: _,
     } = ctx;
@@ -1317,6 +1323,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         monitor_mode,
         last_pre_run_hash,
         continuity,
+        timezone,
         executor,
         model_pin,
         ..
@@ -1446,6 +1453,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
             task_id,
             task_name,
             &user_msg,
+            pinned_run_time_line(timezone).as_deref(),
             delivery_channel.is_some() && delivery_target.is_some(),
             model_pin,
             *timeout,
@@ -1460,7 +1468,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
         .await
         .unwrap_or_default();
-    let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
+    let time = run_time_line(timezone, config);
     let system = format!(
         "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
          # Scheduled Task\nYou are executing a scheduled task: \"{task_name}\"\n\
@@ -1688,8 +1696,33 @@ pub(crate) fn ensure_task_session(task_id: &str, task_name: &str) -> anyhow::Res
     Ok(key)
 }
 
-/// What a scheduled run says in the task's conversation.
-fn task_turn_message(task_name: &str, user_msg: &str, delivered: bool) -> String {
+/// The clock line a scheduled run reads: the task's pinned zone, else the
+/// user's. This lane builds its system prompt fresh per run, so the line
+/// lives there as it always has.
+fn run_time_line(task_timezone: &str, config: &Config) -> String {
+    cortex::util::time::current_time_line(cortex::tasks::run_time_zone(
+        task_timezone,
+        config.user.timezone.as_deref(),
+    ))
+}
+
+/// The run-time line for an executor-lane turn, only for a task pinned to a
+/// zone. That turn's system prompt already carries the user's clock, and it
+/// stays as is so the cached prefix stays stable; a pinned task's own clock
+/// rides in the run's user message instead.
+fn pinned_run_time_line(task_timezone: &str) -> Option<String> {
+    cortex::tasks::pinned_zone(task_timezone)
+        .map(|_| cortex::util::time::current_time_line(Some(task_timezone)))
+}
+
+/// What a scheduled run says in the task's conversation. `run_time` is the
+/// task's own clock when it is pinned to a zone (see [`pinned_run_time_line`]).
+fn task_turn_message(
+    task_name: &str,
+    user_msg: &str,
+    run_time: Option<&str>,
+    delivered: bool,
+) -> String {
     let silence = if delivered {
         format!(
             "\n\nYour reply is sent on to the owner. If this run found nothing worth \
@@ -1698,16 +1731,22 @@ fn task_turn_message(task_name: &str, user_msg: &str, delivered: bool) -> String
     } else {
         String::new()
     };
-    format!("Scheduled task \"{task_name}\" is running.\n\n{user_msg}{silence}")
+    let clock = match run_time {
+        Some(line) => format!("\nRun time in this task's schedule zone: {line}"),
+        None => String::new(),
+    };
+    format!("Scheduled task \"{task_name}\" is running.{clock}\n\n{user_msg}{silence}")
 }
 
 /// Runs one prompt-task fire as an agent turn in the task's conversation and
 /// returns its reply.
+#[allow(clippy::too_many_arguments)]
 async fn run_prompt_task_turn(
     executor: &DaemonSessionExecutor,
     task_id: &str,
     task_name: &str,
     user_msg: &str,
+    run_time: Option<&str>,
     delivered: bool,
     model_pin: &cortex::agent::ConfigPin,
     timeout: std::time::Duration,
@@ -1716,7 +1755,7 @@ async fn run_prompt_task_turn(
         .map_err(|e| format!("could not create the task's conversation: {e:#}"))?;
     let turn = gateway::InboundTurn {
         session_key: session_key.clone(),
-        text: task_turn_message(task_name, user_msg, delivered),
+        text: task_turn_message(task_name, user_msg, run_time, delivered),
         images: Vec::new(),
         kind: gateway::TurnKind::Internal,
     };
@@ -1979,7 +2018,7 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             let memory = cortex::memory::load_memory_context_db(SCHEDULED_TURN_MEMORY_TOKENS)
                 .await
                 .unwrap_or_default();
-            let time = cortex::util::time::current_time_line(config.user.timezone.as_deref());
+            let time = run_time_line(&task.timezone, config);
             let system = format!(
                 "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
                  # Heartbeat\nYou are running a proactive heartbeat check-in. \
@@ -4233,14 +4272,52 @@ mod task_session_tests {
 
     #[test]
     fn the_silence_marker_is_offered_only_when_the_reply_is_delivered() {
-        let delivered = task_turn_message("Digest", "summarise", true);
+        let delivered = task_turn_message("Digest", "summarise", None, true);
         assert!(delivered.contains(SILENT_SENTINEL), "{delivered}");
-        let kept = task_turn_message("Digest", "summarise", false);
+        let kept = task_turn_message("Digest", "summarise", None, false);
         assert!(!kept.contains(SILENT_SENTINEL), "{kept}");
         assert!(
             kept.contains("\"Digest\"") && kept.ends_with("summarise"),
             "{kept}"
         );
+    }
+
+    /// Spec: a task pinned to New York reads New York's clock even when the
+    /// owner lives in Los Angeles — at 09:00 NY the run must not believe it
+    /// is 06:00. An unpinned task keeps the owner's clock.
+    #[test]
+    fn a_run_reads_the_task_zone_clock_when_the_task_is_pinned() {
+        let mut config = Config::default();
+        config.user.timezone = Some("America/Los_Angeles".into());
+        let pinned = run_time_line("America/New_York", &config);
+        assert!(pinned.contains("(America/New_York, UTC-0"), "{pinned}");
+        for unpinned in ["", "local", "UTC"] {
+            let line = run_time_line(unpinned, &config);
+            assert!(
+                line.contains("(America/Los_Angeles, UTC-0"),
+                "task zone {unpinned:?}: {line}"
+            );
+        }
+    }
+
+    /// Spec: the executor lane's turn message carries the task's own clock
+    /// only when the task is pinned; unpinned runs add nothing, since the
+    /// session's system prompt already shows the owner's clock.
+    #[test]
+    fn the_turn_message_names_the_pinned_zone_clock() {
+        let line = pinned_run_time_line("America/New_York").expect("a pinned zone yields a line");
+        assert!(line.contains("(America/New_York, UTC-0"), "{line}");
+        let msg = task_turn_message("Standup", "summarise", Some(&line), false);
+        assert!(
+            msg.contains(&format!("Run time in this task's schedule zone: {line}")),
+            "{msg}"
+        );
+        assert!(msg.ends_with("summarise"), "{msg}");
+        for unpinned in ["", "local", "UTC", "Not/AZone"] {
+            assert_eq!(pinned_run_time_line(unpinned), None, "{unpinned:?}");
+        }
+        let plain = task_turn_message("Standup", "summarise", None, false);
+        assert!(!plain.contains("Run time"), "{plain}");
     }
 
     async fn collect(

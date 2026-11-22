@@ -317,6 +317,31 @@ fn is_default_zone(timezone: &str) -> bool {
     matches!(timezone, "" | "UTC" | "utc") || timezone.eq_ignore_ascii_case("local")
 }
 
+/// The IANA zone a task is pinned to, if any. The default spellings (`""`,
+/// `local`, `UTC`) are not a pin; neither is a name that does not parse —
+/// [`calculate_next_run`] already reads that one in the host zone and warns.
+pub fn pinned_zone(timezone: &str) -> Option<Tz> {
+    if is_default_zone(timezone) {
+        return None;
+    }
+    Tz::from_str(timezone).ok()
+}
+
+/// The zone a scheduled run's clock line is rendered in: the task's pinned
+/// zone, else the user's `user.timezone` (and, when that is unset,
+/// `current_time_line`'s own host-zone fallback). A `0 9 * * 1-5` task
+/// pinned to New York fires at 09:00 there; reading the owner's Pacific
+/// clock, the run would think it is 06:00.
+pub fn run_time_zone<'a>(
+    task_timezone: &'a str,
+    user_timezone: Option<&'a str>,
+) -> Option<&'a str> {
+    match pinned_zone(task_timezone) {
+        Some(_) => Some(task_timezone),
+        None => user_timezone,
+    }
+}
+
 /// Resolve a stored timezone string. An unparseable IANA name falls back to
 /// the host's zone after logging: a scheduled task must never fail to
 /// compute a next run because its timezone field got corrupted.
@@ -814,11 +839,20 @@ pub fn live_run_ids() -> std::collections::HashSet<i64> {
 
 /// Format a task row for display.
 pub fn format_task(task: &ScheduledTaskRow) -> String {
+    // A pinned task's next run reads in its own zone, so `0 9 * * *` pinned
+    // to Tokyo shows 09:00, not 00:00 UTC. Unpinned tasks keep the UTC form.
+    let pinned = pinned_zone(&task.timezone);
     let next = task
         .next_run
         .map(|ts| {
             chrono::DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .map(|dt| match pinned {
+                    Some(tz) => dt
+                        .with_timezone(&tz)
+                        .format("%Y-%m-%d %H:%M %Z")
+                        .to_string(),
+                    None => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+                })
                 .unwrap_or_else(|| ts.to_string())
         })
         .unwrap_or_else(|| "—".to_string());
@@ -1270,6 +1304,83 @@ mod tests {
             );
             let out = format_task(&task);
             assert!(out.contains(&expected), "timezone {timezone:?}, got: {out}");
+        }
+    }
+
+    /// Spec: a pinned task's next run is shown in its own zone; a task with
+    /// no pin keeps the UTC rendering. 2026-01-05 14:00 UTC is 09:00 EST and
+    /// 23:00 JST.
+    #[test]
+    fn format_task_shows_next_run_in_the_pinned_zone() {
+        let mut task = ScheduledTaskRow {
+            id: "abcdef123456".to_string(),
+            name: "brief".to_string(),
+            prompt: "summarize".to_string(),
+            schedule_type: "cron".to_string(),
+            schedule_expr: "0 9 * * 1-5".to_string(),
+            timezone: String::new(),
+            status: TASK_STATUS_ACTIVE.to_string(),
+            next_run: Some(1_767_621_600), // 2026-01-05T14:00:00Z
+            created_at: 0,
+            max_retries: 3,
+            retry_count: 0,
+            retry_after: None,
+            last_error: None,
+            timeout_ms: 0,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt".to_string(),
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: 0,
+            bypass_quiet_hours_once: false,
+            min_interval_secs: None,
+            continuity: false,
+            last_response_hash: None,
+            model: None,
+            model_provider: None,
+            monitor_mode: false,
+            last_pre_run_hash: None,
+            run_now_requested: false,
+            failure_delivery_channel: None,
+            failure_delivery_target: None,
+        };
+        for (timezone, expected) in [
+            ("America/New_York", "Next run: 2026-01-05 09:00 EST\n"),
+            ("Asia/Tokyo", "Next run: 2026-01-05 23:00 JST\n"),
+            ("UTC", "Next run: 2026-01-05 14:00 UTC\n"),
+            ("", "Next run: 2026-01-05 14:00 UTC\n"),
+            ("local", "Next run: 2026-01-05 14:00 UTC\n"),
+            // A corrupt stored zone is not a pin: keep the unambiguous form.
+            ("Not/AZone", "Next run: 2026-01-05 14:00 UTC\n"),
+        ] {
+            task.timezone = timezone.to_string();
+            let out = format_task(&task);
+            assert!(out.contains(expected), "timezone {timezone:?}, got: {out}");
+        }
+    }
+
+    /// Spec: a run reads the task's pinned zone; without a pin it reads the
+    /// user's zone, and with neither it defers to `current_time_line`'s
+    /// fallback (`None`).
+    #[test]
+    fn run_time_zone_prefers_the_task_pin_over_the_user_zone() {
+        let la = Some("America/Los_Angeles");
+        for (task_tz, user_tz, expected) in [
+            ("America/New_York", la, Some("America/New_York")),
+            ("America/New_York", None, Some("America/New_York")),
+            ("", la, la),
+            ("local", la, la),
+            ("UTC", la, la),
+            ("Not/AZone", la, la),
+            ("", None, None),
+        ] {
+            assert_eq!(
+                run_time_zone(task_tz, user_tz),
+                expected,
+                "task {task_tz:?}, user {user_tz:?}"
+            );
         }
     }
 
