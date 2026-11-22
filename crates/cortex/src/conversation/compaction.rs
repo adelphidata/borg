@@ -1168,8 +1168,9 @@ mod tests {
     #[test]
     fn strip_reasoning_traces_drops_unclosed_trace_remainder() {
         // A stream cut off mid-trace leaves an unclosed tag; the half-emitted
-        // trace must not leak into the summarizer.
-        let out = strip_reasoning_traces("visible <think>never closed and secret");
+        // trace must not leak into the summarizer. (A mid-line unclosed tag
+        // is a mention and is kept; the cut-off trace opens a line.)
+        let out = strip_reasoning_traces("visible\n<think>never closed and secret");
         assert_eq!(out.trim(), "visible");
     }
 
