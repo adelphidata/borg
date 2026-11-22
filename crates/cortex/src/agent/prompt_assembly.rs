@@ -1686,6 +1686,15 @@ goals, or habits the conversation does not state. When unsure, leave it out.
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::system(&system_prompt));
         messages.extend(self.history.iter().cloned());
+        // A retry hint rides on this request's copy only; history, the
+        // session log and the system prompt never see it.
+        if let Some(hint) = self.pending_request_hint {
+            if !apply_request_hint(&mut messages, hint) {
+                tracing::warn!(
+                    "retry hint not sent: the request does not end on a user or tool message"
+                );
+            }
+        }
 
         Ok(Some(PreparedLlmRequest {
             messages,
@@ -1706,6 +1715,38 @@ pub(super) struct PreparedLlmRequest {
     /// providers with explicit cache breakpoints mark the end of the cacheable
     /// prefix rather than the end of a prompt whose tail carries a clock.
     pub(super) system_stable_prefix: String,
+}
+
+/// Append a one-request `hint` to the last message of an outgoing request,
+/// when that message is user- or tool-authored: a text body gets
+/// `"\n\n<hint>"`, a multi-part body gets a trailing text part. Returns
+/// whether the hint was placed.
+///
+/// The hint goes in the last turn rather than a system row because a system
+/// row is dropped by the Anthropic wire when it is not first (the retry would
+/// go out unchanged) and folded into the system instruction by Gemini and
+/// Bedrock (changing the cached prefix). It joins a trailing tool result
+/// rather than following it as its own user turn: Bedrock Converse rejects
+/// two user turns in a row, and tool results already ride in a user turn.
+/// Any other last message is left alone: there is no turn the hint can join
+/// without reordering roles.
+pub(super) fn apply_request_hint(messages: &mut [crate::types::Message], hint: &str) -> bool {
+    use crate::types::{ContentPart, MessageContent, Role};
+    let Some(last) = messages.last_mut() else {
+        return false;
+    };
+    if !matches!(last.role, Role::User | Role::Tool) {
+        return false;
+    }
+    match &mut last.content {
+        Some(MessageContent::Text(text)) => {
+            text.push_str("\n\n");
+            text.push_str(hint);
+        }
+        Some(MessageContent::Parts(parts)) => parts.push(ContentPart::Text(hint.to_string())),
+        None => last.content = Some(MessageContent::Text(hint.to_string())),
+    }
+    true
 }
 
 /// Put a sub-agent's brief back verbatim when a compaction folded it away:
@@ -1777,13 +1818,89 @@ fn flush_reply_has_signal(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        breakdown_components, build_flush_transcript, compaction_llm_config,
+        apply_request_hint, breakdown_components, build_flush_transcript, compaction_llm_config,
         compaction_paused_notice, contains_untrusted_marker, flush_reply_has_signal,
         restore_subagent_brief, CompactionGate, CompactionStrikes, ContextBreakdown,
         MAX_INEFFECTIVE_COMPACTIONS, SUMMARY_OUTPUT_TOKENS_FLOOR,
     };
     use crate::error_format::ErrorCategory;
     use crate::types::Message;
+
+    /// Spec: a retry hint joins the last message only when that message is
+    /// the user's or a tool's — a text body gets it after a blank line, a
+    /// multi-part body gets it as a trailing text part — and nothing else in
+    /// the request changes.
+    #[test]
+    fn request_hint_joins_only_a_trailing_user_or_tool_message() {
+        use crate::types::{ContentPart, MessageContent};
+        const HINT: &str = "Please answer.";
+        let system = Message::system("You are Borg.");
+        // (name, request, hint placed, expected last content)
+        let cases: Vec<(&str, Vec<Message>, bool, Option<MessageContent>)> = vec![
+            (
+                "user text",
+                vec![system.clone(), Message::user("hi")],
+                true,
+                Some(MessageContent::Text(format!("hi\n\n{HINT}"))),
+            ),
+            (
+                "tool result",
+                vec![system.clone(), Message::tool_result("call_1", "ok")],
+                true,
+                Some(MessageContent::Text(format!("ok\n\n{HINT}"))),
+            ),
+            (
+                "multi-part user",
+                vec![
+                    system.clone(),
+                    Message::user_multimodal(vec![ContentPart::Text("see this".into())]),
+                ],
+                true,
+                Some(MessageContent::Parts(vec![
+                    ContentPart::Text("see this".into()),
+                    ContentPart::Text(HINT.into()),
+                ])),
+            ),
+            // Negative controls: no user/tool turn to join.
+            (
+                "assistant last",
+                vec![
+                    system.clone(),
+                    Message::user("hi"),
+                    Message::assistant("hello"),
+                ],
+                false,
+                Some(MessageContent::Text("hello".into())),
+            ),
+            (
+                "system only",
+                vec![system.clone()],
+                false,
+                Some(MessageContent::Text("You are Borg.".into())),
+            ),
+        ];
+        for (name, mut request, placed, want_last) in cases {
+            let before = request.clone();
+            assert_eq!(apply_request_hint(&mut request, HINT), placed, "{name}");
+            let (last, earlier) = request.split_last().expect("non-empty");
+            assert_eq!(
+                serde_json::to_value(&last.content).unwrap(),
+                serde_json::to_value(&want_last).unwrap(),
+                "{name}"
+            );
+            for (got, was) in earlier.iter().zip(&before) {
+                assert_eq!(
+                    serde_json::to_value(got).unwrap(),
+                    serde_json::to_value(was).unwrap(),
+                    "{name}: only the last message may change"
+                );
+            }
+        }
+        assert!(
+            !apply_request_hint(&mut [], HINT),
+            "an empty request takes nothing"
+        );
+    }
 
     /// The pause notice names the next action for the cause. A content
     /// refusal is not fixed by checking a key — sending the user there is a

@@ -1438,6 +1438,17 @@ fn render_thinking(text: &str, width: u16) -> Vec<Line<'static>> {
     if text.is_empty() {
         return vec![];
     }
+    // Same output-redaction chokepoint as the assistant cell. The agent
+    // redacts each thinking delta, but a secret split across two deltas
+    // only shows up whole here, in the accumulated cell.
+    let redacted;
+    let text: &str = match current_policy().apply(OutputSink::Tui, None, text) {
+        std::borrow::Cow::Borrowed(b) => b,
+        std::borrow::Cow::Owned(o) => {
+            redacted = o;
+            &redacted
+        }
+    };
     let content_style = theme::reasoning_style();
     let bullet = Span::styled(format!("{} ", theme::BULLET), theme::dim());
     let header = Line::from(vec![

@@ -137,6 +137,25 @@ pub(super) fn wedged_session_error(consecutive: u32) -> String {
     )
 }
 
+// Retry hints. Each rides on the next request only, appended to its last
+// user or tool message (see `prompt_assembly::apply_request_hint`), and is
+// never persisted: a stored system row is dropped by the Anthropic wire (so
+// the retry went out byte-identical) and folded permanently into the system
+// instruction by Gemini and Bedrock (breaking the prompt cache every turn).
+
+/// The provider signalled a tool call, but none arrived.
+pub(super) const DROPPED_TOOL_CALL_HINT: &str =
+    "Your response signalled a tool call, but no tool call was received. \
+     Issue the tool call now, or state plainly that you are finished.";
+
+/// An empty reply after this turn ran tools.
+pub(super) const EMPTY_AFTER_TOOLS_HINT: &str =
+    "Respond to the user with a brief confirmation of what you just did.";
+
+/// An empty reply with no tools run this turn.
+pub(super) const EMPTY_REPLY_HINT: &str =
+    "Your last response was empty. Please answer the user's message.";
+
 /// The visible notice for an answer that a provider-side filter stopped.
 /// `reason` is the provider's stop label (`content_filter`, `refusal`, ...).
 pub(super) fn content_filtered_notice(reason: &str) -> String {
@@ -312,7 +331,12 @@ impl Agent {
                     trace!("Event channel closed, could not deliver reconnect notice");
                 }
             }
-            StreamEvent::Done => return StreamEventOutcome::Terminal,
+            StreamEvent::Done => {
+                // The response to the request that carried a pending hint
+                // has arrived; the hint was for that one request only.
+                self.pending_request_hint = None;
+                return StreamEventOutcome::Terminal;
+            }
             StreamEvent::Error(e) => {
                 warn!("LLM stream emitted error mid-response: {e}");
                 *stream_error = Some(e.clone());
@@ -350,7 +374,16 @@ impl Agent {
                     self.turn_reasoning.drain(..cut);
                 }
                 if self.config.conversation.show_thinking {
-                    let _ = event_tx.send(AgentEvent::ThinkingDelta(delta)).await;
+                    // Redacted for display on the same terms as a text
+                    // delta: a model that reasons over a key it read must
+                    // not put that key on screen. Only this display copy is
+                    // redacted — the echoed `reasoning_content` above and the
+                    // signed `reasoning_blocks` go back to the provider
+                    // byte-exact, or replay verification fails. A secret
+                    // split across two deltas escapes this per-delta pass,
+                    // as it does for text; the TUI redacts the whole cell.
+                    let redacted = self.maybe_redact(delta);
+                    let _ = event_tx.send(AgentEvent::ThinkingDelta(redacted)).await;
                 }
             }
         }
@@ -527,19 +560,17 @@ impl Agent {
         if self.tool_intent_signalled && !self.nudged_for_dropped_tools {
             self.nudged_for_dropped_tools = true;
             warn!("provider signalled tool use but no tool calls arrived; nudging once");
-            self.log_and_persist(Message::system(
-                "Your response signalled a tool call, but no tool call was received. \
-                 Issue the tool call now, or state plainly that you are finished.",
-            ))
-            .await;
+            self.pending_request_hint = Some(DROPPED_TOOL_CALL_HINT);
             return TextOnlyOutcome::NudgeAndContinue;
         }
 
         if should_nudge_for_response(text_content, needs_response, nudged_for_response) {
-            self.log_and_persist(Message::system(
-                "Respond to the user with a brief confirmation of what you just did.",
-            ))
-            .await;
+            // Only a turn that ran tools has something to confirm.
+            self.pending_request_hint = Some(if needs_response {
+                EMPTY_AFTER_TOOLS_HINT
+            } else {
+                EMPTY_REPLY_HINT
+            });
             return TextOnlyOutcome::NudgeAndContinue;
         }
 
@@ -1282,5 +1313,241 @@ mod tests {
             "StreamEvent::Usage arm must delegate to self.record_usage; do not \
              inline the DB + pricing call back into handle_stream_event"
         );
+    }
+
+    /// Spec: a thinking delta is redacted for display on the same terms as a
+    /// text delta, while a signed reasoning block is kept byte-exact for
+    /// replay (the provider verifies its signature).
+    #[tokio::test]
+    async fn thinking_display_is_redacted_but_signed_blocks_stay_verbatim() {
+        use crate::agent::AgentEvent;
+        use crate::llm::StreamEvent;
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let secret_thought = format!("the key in the file is {KEY}, so");
+        // (secret_detection, delta, the key must reach the display)
+        let cases = [
+            (true, secret_thought.clone(), false),
+            // Operator turned detection off: the trace passes as written.
+            (false, secret_thought.clone(), true),
+        ];
+        for (detection, delta, key_visible) in cases {
+            let mut config = crate::config::Config::default();
+            config.conversation.show_thinking = true;
+            config.security.secret_detection = detection;
+            let mut agent = crate::agent::tests::minimal_test_agent(config);
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+            let mut tag_filter = crate::internal_tag_filter::InternalTagFilter::new();
+            let mut tool_calls = Vec::new();
+            let mut stream_error = None;
+            let mut truncated = false;
+            let block = serde_json::json!({
+                "type": "thinking",
+                "thinking": format!("signed reasoning naming {KEY}"),
+                "signature": "c2lnbmVk",
+            });
+            for event in [
+                StreamEvent::ThinkingDelta(delta.clone()),
+                StreamEvent::ReasoningBlock(block.clone()),
+            ] {
+                agent
+                    .handle_stream_event(
+                        event,
+                        &mut tag_filter,
+                        &mut tool_calls,
+                        &mut stream_error,
+                        &mut truncated,
+                        &event_tx,
+                    )
+                    .await;
+            }
+            let mut shown = String::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let AgentEvent::ThinkingDelta(text) = event {
+                    shown.push_str(&text);
+                }
+            }
+            assert_eq!(
+                shown.contains(KEY),
+                key_visible,
+                "detection={detection}: {shown:?}"
+            );
+            assert!(
+                shown.starts_with("the key in the file is "),
+                "the rest of the thought still shows: {shown:?}"
+            );
+            assert_eq!(
+                agent.turn_reasoning_blocks,
+                vec![block],
+                "signed blocks replay byte-exact, secret detection or not"
+            );
+        }
+
+        // Negative control: a benign thought is delivered unchanged.
+        let mut config = crate::config::Config::default();
+        config.conversation.show_thinking = true;
+        config.security.secret_detection = true;
+        let mut agent = crate::agent::tests::minimal_test_agent(config);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let benign = "compare the two branches, then run the tests".to_string();
+        agent
+            .handle_stream_event(
+                StreamEvent::ThinkingDelta(benign.clone()),
+                &mut crate::internal_tag_filter::InternalTagFilter::new(),
+                &mut Vec::new(),
+                &mut None,
+                &mut false,
+                &event_tx,
+            )
+            .await;
+        match event_rx.try_recv() {
+            Ok(AgentEvent::ThinkingDelta(text)) => assert_eq!(text, benign),
+            Ok(_) => panic!("expected a thinking delta, got another event"),
+            Err(e) => panic!("expected a thinking delta, got none: {e}"),
+        }
+    }
+
+    /// Spec: the retry hint after an empty reply rides on the retry request
+    /// only — appended to its last user message — and never reaches the
+    /// system prompt, a system row, history, the session log, or a later
+    /// request.
+    #[tokio::test]
+    async fn an_empty_reply_hint_rides_on_the_retry_request_only() {
+        use super::EMPTY_REPLY_HINT;
+        use crate::llm::test_server::{reply_with_usage, serve_sse};
+
+        let (url, requests) = serve_sse(vec![
+            reply_with_usage("", "stop"),
+            reply_with_usage("Four.", "stop"),
+            reply_with_usage("Five.", "stop"),
+        ]);
+        let mut config = crate::config::Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "test-model".to_string();
+        config.llm.base_url = Some(url);
+        config.llm.max_retries = 0;
+        // The test is about the request bodies, not the budget gate.
+        config.budget.monthly_token_limit = 0;
+        let mut agent = crate::agent::tests::minimal_test_agent(config);
+        *agent.db.lock().await = Some(crate::db::Database::test_db().await);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent
+            .send_message("What is 2+2?", tx.clone())
+            .await
+            .expect("first turn");
+        agent
+            .send_message("And 2+3?", tx)
+            .await
+            .expect("second turn");
+        let mut errors = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::agent::AgentEvent::Error(e) = event {
+                errors.push(e);
+            }
+        }
+        assert!(errors.is_empty(), "both turns must run: {errors:?}");
+
+        let bodies: Vec<serde_json::Value> = requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|raw| {
+                let (_, body) = raw.split_once("\r\n\r\n").expect("http body");
+                serde_json::from_str(body).expect("json body")
+            })
+            .collect();
+        assert_eq!(bodies.len(), 3, "empty reply, retry, second turn");
+        let messages = |i: usize| bodies[i]["messages"].as_array().expect("messages").clone();
+        let text = |m: &serde_json::Value| m["content"].to_string();
+
+        let retry = messages(1);
+        let (last, earlier) = retry.split_last().expect("non-empty request");
+        assert_eq!(last["role"], "user");
+        let last_text = last["content"].as_str().expect("text content");
+        assert!(
+            last_text.contains("What is 2+2?")
+                && last_text.ends_with(&format!("\n\n{EMPTY_REPLY_HINT}")),
+            "the retry's last user message carries the hint: {last_text:?}"
+        );
+        assert!(
+            earlier.iter().all(|m| !text(m).contains(EMPTY_REPLY_HINT)),
+            "no other message of the retry — system prompt included — carries it"
+        );
+        let system_rows =
+            |msgs: &[serde_json::Value]| msgs.iter().filter(|m| m["role"] == "system").count();
+        assert_eq!(
+            system_rows(&retry),
+            system_rows(&messages(0)),
+            "the hint adds no system row"
+        );
+        for i in [0, 2] {
+            assert!(
+                !bodies[i].to_string().contains(EMPTY_REPLY_HINT),
+                "request {i} must not carry the hint"
+            );
+        }
+
+        assert!(
+            agent.history.iter().all(|m| !m
+                .text_content()
+                .unwrap_or_default()
+                .contains(EMPTY_REPLY_HINT)),
+            "history never holds the hint"
+        );
+        let guard = agent.db_guard().await;
+        let rows = guard
+            .as_ref()
+            .expect("db")
+            .load_session_messages(&agent.session.meta.id)
+            .await
+            .expect("session rows");
+        assert!(
+            rows.iter()
+                .any(|r| r.content.as_deref() == Some("What is 2+2?")),
+            "the session log was written: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| !r
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains(EMPTY_REPLY_HINT)),
+            "the session log never holds the hint"
+        );
+    }
+
+    /// Spec: the confirmation wording is for a turn that ran tools; an empty
+    /// reply with no tools run gets the neutral wording. A dropped tool call
+    /// gets its own. None of them is persisted.
+    #[tokio::test]
+    async fn retry_hint_wording_follows_what_the_turn_did() {
+        use super::{
+            TextOnlyOutcome, DROPPED_TOOL_CALL_HINT, EMPTY_AFTER_TOOLS_HINT, EMPTY_REPLY_HINT,
+        };
+        // (tool intent signalled, tools ran this turn, expected hint)
+        let cases = [
+            (false, true, EMPTY_AFTER_TOOLS_HINT),
+            (false, false, EMPTY_REPLY_HINT),
+            (true, false, DROPPED_TOOL_CALL_HINT),
+        ];
+        for (intent, tools_ran, want) in cases {
+            let mut agent =
+                crate::agent::tests::minimal_test_agent(crate::config::Config::default());
+            agent
+                .history
+                .push(crate::types::Message::user("tidy the repo"));
+            agent.tool_intent_signalled = intent;
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let outcome = agent
+                .handle_text_only_response("", None, tools_ran, false, &tx)
+                .await;
+            assert!(matches!(outcome, TextOnlyOutcome::NudgeAndContinue));
+            assert_eq!(
+                agent.pending_request_hint,
+                Some(want),
+                "intent={intent} tools={tools_ran}"
+            );
+            assert_eq!(agent.history.len(), 1, "the hint is not persisted");
+        }
     }
 }
