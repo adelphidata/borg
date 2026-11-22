@@ -424,8 +424,12 @@ static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = La
     let sonnet_4 = || AnthropicModelRate::new("3.00", "0.30", "3.75", "6.00", "15.00");
     let haiku_4_5 = || AnthropicModelRate::new("1.00", "0.10", "1.25", "2.00", "5.00");
     HashMap::from([
-        // Cache reads are 0.025x input on Fable 5.1, and 0.05x on Opus 5.5
-        // and Sonnet 5.5.
+        // Cache reads are 0.025x input on Fable 5.1 and 5.2, and 0.05x on
+        // Opus 5.5 and Sonnet 5.5.
+        (
+            "claude-fable-5-2",
+            AnthropicModelRate::new("8.00", "0.20", "10.00", "16.00", "40.00"),
+        ),
         (
             "claude-fable-5-1",
             AnthropicModelRate::new("10.00", "0.25", "12.50", "20.00", "50.00"),
@@ -688,6 +692,7 @@ pub fn shipped_openai_models() -> &'static [&'static str] {
 #[cfg(test)]
 pub fn shipped_anthropic_models() -> &'static [&'static str] {
     &[
+        "claude-fable-5-2",
         "claude-fable-5-1",
         "claude-fable-5",
         "claude-opus-5-5",
@@ -885,6 +890,41 @@ mod tests {
         )
         .expect("the OpenRouter spelling of Fable 5.1 must price");
         assert_eq!(fable_5_1_read, "0.25");
+    }
+
+    #[test]
+    fn fable_5_2_prices_at_its_published_card() {
+        // (input, output, cache read, cache write, ttl, want). Fable 5.2
+        // undercuts 5.1 on every column: $8 / $40, reads $0.20, writes
+        // $10 (5-minute) and $16 (1-hour) per million.
+        let cases: &[(u64, u64, u64, u64, CacheTtl, &str)] = &[
+            (1_000_000, 0, 0, 0, CacheTtl::Auto, "8.00"),
+            (0, 1_000_000, 0, 0, CacheTtl::Auto, "40.00"),
+            (0, 0, 1_000_000, 0, CacheTtl::Auto, "0.20"),
+            (0, 0, 0, 1_000_000, CacheTtl::FiveMin, "10.00"),
+            (0, 0, 0, 1_000_000, CacheTtl::OneHour, "16.00"),
+        ];
+        // The direct id, the dotted spelling OpenRouter serves, and the
+        // Bedrock id (region prefix, `anthropic.` namespace) all price alike.
+        for model in [
+            "claude-fable-5-2",
+            "anthropic/claude-fable-5.2",
+            "us.anthropic.claude-fable-5-2",
+        ] {
+            for &(input, output, read, write, ttl, want) in cases {
+                let got = estimate_anthropic_cost_usd(model, input, output, read, write, ttl)
+                    .unwrap_or_else(|| panic!("{model} must price"));
+                assert_eq!(
+                    got, want,
+                    "{model} in={input} out={output} read={read} write={write} {ttl:?}"
+                );
+            }
+        }
+        // Negative control: 5.1 keeps its own, higher rate.
+        let fable_5_1 =
+            estimate_anthropic_cost_usd("claude-fable-5-1", 1_000_000, 0, 0, 0, CacheTtl::Auto)
+                .unwrap();
+        assert_eq!(fable_5_1, "10.00");
     }
 
     /// GPT-5.5 bills a request over 272K input tokens at its long-context rate.
