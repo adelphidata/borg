@@ -487,16 +487,129 @@ fn assemble_prompt(messages: &[Message]) -> AssembledPrompt {
     }
 }
 
+/// The least idle time the CLI is given before it counts as wedged.
+///
+/// The CLI prints nothing while the model reads a long prompt and thinks:
+/// no keep-alive, no partial line. An HTTP stream sends bytes during that
+/// time; the CLI does not, so the HTTP per-chunk timeout (90s by default)
+/// would kill healthy runs. Fifteen minutes covers a long prefill plus a
+/// long think and still frees a schedule or subscription lane from a child
+/// that will never answer.
+pub(crate) const CLI_IDLE_TIMEOUT_FLOOR_SECS: u64 = 900;
+
+/// The idle timeout for one CLI run: the configured per-chunk timeout,
+/// raised to the model's reasoning floor and then to
+/// [`CLI_IDLE_TIMEOUT_FLOOR_SECS`]. A configured 0 disables it, the same as
+/// for HTTP streams.
+pub(crate) fn cli_idle_timeout(configured_secs: u64, model: &str) -> Option<std::time::Duration> {
+    if configured_secs == 0 {
+        return None;
+    }
+    let secs = configured_secs
+        .max(crate::llm::reasoning_timeouts::stale_timeout_floor_secs(
+            model,
+        ))
+        .max(CLI_IDLE_TIMEOUT_FLOOR_SECS);
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// The error for a CLI run that went quiet. Fatal with a timeout reason: a
+/// same-slot retry would wait out the whole idle window again and re-run any
+/// tools the CLI already started, so the fallback chain takes over at once.
+fn cli_stall_error(what: &str, idle: std::time::Duration) -> LlmError {
+    LlmError::Fatal {
+        source: anyhow::anyhow!(
+            "Claude CLI {what} for {}s; the process was stopped \
+             (raise llm.stream_chunk_timeout_secs, or set it to 0 to disable)",
+            idle.as_secs()
+        ),
+        reason: FailoverReason::Timeout,
+        status: None,
+    }
+}
+
+/// Stop a wedged or abandoned child and reap it. Failure is logged, not
+/// returned: the caller is already on an error or cancel path.
+///
+/// The CLI runs its own tools as subprocesses, so on unix the whole process
+/// group (the child leads it, see the spawn) is killed, not just the CLI.
+async fn kill_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) {
+        // SAFETY: `killpg` only sends a signal; `pid` is our own child, which
+        // leads its own process group, so no unrelated group is signalled.
+        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                warn!("failed to stop claude CLI process group: {err}");
+            }
+        }
+    }
+    if let Err(e) = child.kill().await {
+        warn!("failed to stop claude CLI subprocess: {e}");
+    }
+}
+
+/// The CLI child, owned so that a caller dropping the stream future mid-run
+/// also takes down the tools the CLI started. `kill_on_drop` reaches only the
+/// leader; this reaches its process group.
+struct CliChild(tokio::process::Child);
+
+impl std::ops::Deref for CliChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CliChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for CliChild {
+    fn drop(&mut self) {
+        // `id()` is `None` once the child is reaped, so a pid the OS may have
+        // reused is never signalled; until then the group id is ours.
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id().and_then(|id| libc::pid_t::try_from(id).ok()) {
+            // SAFETY: `killpg` only sends a signal to our own child's group.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Await `fut`, giving up after `idle` when set. `None` means it elapsed.
+async fn within<F: std::future::Future>(
+    idle: Option<std::time::Duration>,
+    fut: F,
+) -> Option<F::Output> {
+    match idle {
+        Some(limit) => tokio::time::timeout(limit, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
 /// Stream a response from the Claude CLI subprocess.
 ///
 /// Spawns `claude -p --output-format stream-json --model <model>` and reads
 /// JSONL from stdout, mapping events to `StreamEvent`s.
+///
+/// `idle_timeout` bounds both the prompt write to stdin and each wait for
+/// the next stdout line (see [`cli_idle_timeout`]); `None` disables it. A run
+/// that exceeds it is killed and returns a fatal timeout error, so the
+/// fallback chain takes over.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_claude_cli(
     cli_path: &Path,
     messages: &[Message],
     _tools: Option<&[ToolDefinition]>,
     model: &str,
     _temperature: f32,
+    idle_timeout: Option<std::time::Duration>,
     tx: &mpsc::Sender<StreamEvent>,
     cancel: &CancellationToken,
 ) -> Result<(), LlmError> {
@@ -548,12 +661,17 @@ pub async fn stream_claude_cli(
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Its own process group, so `kill_child` also reaches the tools the CLI
+    // starts; and never outlive a caller that drops this future.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| LlmError::Fatal {
+    let mut child = CliChild(cmd.spawn().map_err(|e| LlmError::Fatal {
         source: anyhow::anyhow!("failed to spawn claude CLI: {e}"),
         reason: FailoverReason::Unknown,
         status: None,
-    })?;
+    })?);
 
     // Drained on its own task so a chatty CLI can never fill the pipe and
     // stall; only the tail is kept, which is where the CLI puts its reason
@@ -568,8 +686,31 @@ pub async fn stream_claude_cli(
         } else {
             &assembled.user
         };
-        if let Err(e) = stdin.write_all(stdin_content.as_bytes()).await {
-            warn!("failed to write to claude CLI stdin: {e}");
+        // A child that never reads its stdin blocks this write once the
+        // pipe buffer fills, so it races cancel and the idle timeout.
+        let written = tokio::select! {
+            _ = cancel.cancelled() => {
+                kill_child(&mut child).await;
+                // The receiver may already be gone during shutdown.
+                let _ = tx.send(StreamEvent::Done).await;
+                return Ok(());
+            }
+            written = within(idle_timeout, stdin.write_all(stdin_content.as_bytes())) => written,
+        };
+        match written {
+            Some(Ok(())) => {}
+            // A child that exits early closes the pipe; its exit status
+            // below says why.
+            Some(Err(e)) => warn!("failed to write to claude CLI stdin: {e}"),
+            None => {
+                kill_child(&mut child).await;
+                let idle = idle_timeout.unwrap_or_default();
+                warn!(
+                    idle_secs = idle.as_secs(),
+                    "claude CLI did not read its prompt; stopped it"
+                );
+                return Err(cli_stall_error("did not read its prompt", idle));
+            }
         }
         drop(stdin); // Close stdin to signal EOF
     }
@@ -593,13 +734,22 @@ pub async fn stream_claude_cli(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                // Best-effort kill on cancel — child may have already exited; the Done
-                // event signals receiver, which may itself be dropped during shutdown.
-                let _ = child.kill().await;
+                kill_child(&mut child).await;
+                // The Done event signals the receiver, which may itself be
+                // dropped during shutdown.
                 let _ = tx.send(StreamEvent::Done).await;
                 return Ok(());
             }
-            line_result = reader.next_line() => {
+            line_result = within(idle_timeout, reader.next_line()) => {
+                let Some(line_result) = line_result else {
+                    kill_child(&mut child).await;
+                    let idle = idle_timeout.unwrap_or_default();
+                    warn!(
+                        idle_secs = idle.as_secs(),
+                        "claude CLI sent no output within the idle timeout; stopped it"
+                    );
+                    return Err(cli_stall_error("sent no output", idle));
+                };
                 match line_result {
                     Ok(Some(line)) => {
                         let line = line.trim();
@@ -631,7 +781,7 @@ pub async fn stream_claude_cli(
                             terminal |= matches!(event, StreamEvent::Done | StreamEvent::Error(_));
                             if tx.send(event).await.is_err() {
                                 debug!("claude CLI: stream receiver dropped");
-                                let _ = child.kill().await;
+                                kill_child(&mut child).await;
                                 return Ok(());
                             }
                             if terminal {
@@ -1096,6 +1246,217 @@ mod tests {
         assert_eq!(
             find_cli_in_known_locations(home, under_home),
             Some(nvm.join("v20.11.0/bin/claude"))
+        );
+    }
+
+    #[test]
+    fn cli_idle_timeout_floors_and_disables() {
+        // (configured, model, expected seconds; None = disabled)
+        let cases: &[(u64, &str, Option<u64>)] = &[
+            // 0 disables, as it does for HTTP streams.
+            (0, "opus", None),
+            // The 90s HTTP default is far below a silent prefill: floored.
+            (90, "opus", Some(CLI_IDLE_TIMEOUT_FLOOR_SECS)),
+            // A higher configured value is never lowered.
+            (1_800, "sonnet", Some(1_800)),
+        ];
+        for &(configured, model, want) in cases {
+            assert_eq!(
+                cli_idle_timeout(configured, model).map(|d| d.as_secs()),
+                want,
+                "configured={configured} model={model}"
+            );
+        }
+    }
+
+    /// A fake `claude` binary: a shell script that first writes its pid to
+    /// `pid_file`, then runs `body`. `exec` in `body` keeps that pid.
+    #[cfg(unix)]
+    fn fake_cli(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let pid_file = dir.join("pid");
+        let script = dir.join("claude");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho $$ > '{}'\n{body}\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, pid_file)
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid_file: &Path) -> bool {
+        let pid = std::fs::read_to_string(pid_file).expect("fake CLI wrote its pid");
+        std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[cfg(unix)]
+    async fn run_fake(
+        script: &Path,
+        prompt: String,
+        idle: Option<std::time::Duration>,
+    ) -> (Result<(), LlmError>, Vec<StreamEvent>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let messages = [Message::user(prompt)];
+        // A generous outer bound: if the idle timeout fails, the test fails
+        // instead of hanging the suite.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            stream_claude_cli(script, &messages, None, "sonnet", 0.0, idle, &tx, &cancel),
+        )
+        .await
+        .expect("stream_claude_cli must return once the idle timeout passes");
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_cli_is_killed_and_falls_back_after_the_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reads its prompt, then never prints a line.
+        let (script, pid_file) = fake_cli(dir.path(), "cat > /dev/null\nexec sleep 30");
+        let (result, events) = run_fake(
+            &script,
+            "hello".into(),
+            Some(std::time::Duration::from_millis(1_500)),
+        )
+        .await;
+        let err = result.expect_err("a silent CLI must fail, not hang");
+        assert!(
+            !err.is_retryable() && err.should_fallback(),
+            "a stall skips same-slot retries and goes to the fallback chain: {err:?}"
+        );
+        assert_eq!(err.reason(), FailoverReason::Timeout);
+        assert!(err.to_string().contains("sent no output"), "{err}");
+        assert!(!process_alive(&pid_file), "the wedged child must be killed");
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Done)),
+            "a stalled run must not look complete: {events:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_that_never_reads_its_prompt_is_killed_after_the_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Never reads stdin, so a prompt larger than the pipe buffer blocks
+        // the write.
+        let (script, pid_file) = fake_cli(dir.path(), "exec sleep 30");
+        let (result, _) = run_fake(
+            &script,
+            "x".repeat(4 * 1024 * 1024),
+            Some(std::time::Duration::from_millis(1_500)),
+        )
+        .await;
+        let err = result.expect_err("a blocked prompt write must fail, not hang");
+        assert_eq!(err.reason(), FailoverReason::Timeout);
+        assert!(!err.is_retryable() && err.should_fallback(), "{err:?}");
+        assert!(err.to_string().contains("did not read its prompt"), "{err}");
+        assert!(!process_alive(&pid_file), "the wedged child must be killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_cli_takes_the_tools_it_started_down_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let grandchild = dir.path().join("grandchild");
+        // Starts a long-running tool of its own, then goes quiet.
+        let (script, pid_file) = fake_cli(
+            dir.path(),
+            &format!(
+                "cat > /dev/null\nsleep 30 &\necho $! > '{}'\nwait",
+                grandchild.display()
+            ),
+        );
+        let (result, _) = run_fake(
+            &script,
+            "hello".into(),
+            Some(std::time::Duration::from_millis(1_500)),
+        )
+        .await;
+        assert_eq!(result.expect_err("stall").reason(), FailoverReason::Timeout);
+        assert!(!process_alive(&pid_file), "the CLI must be killed");
+        // SIGKILL is delivered at once, but the orphan is reaped by init;
+        // allow it a moment to disappear from the process table.
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = process_alive(&grandchild);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "a tool the CLI started must not outlive it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_stream_future_takes_the_cli_tools_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let grandchild = dir.path().join("grandchild");
+        let (script, pid_file) = fake_cli(
+            dir.path(),
+            &format!(
+                "cat > /dev/null\nsleep 30 &\necho $! > '{}'\nwait",
+                grandchild.display()
+            ),
+        );
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let messages = [Message::user("hello".to_string())];
+        // No idle timeout: only the caller giving up ends this run.
+        let run = stream_claude_cli(&script, &messages, None, "sonnet", 0.0, None, &tx, &cancel);
+        let gave_up = tokio::time::timeout(std::time::Duration::from_millis(1_500), run).await;
+        assert!(gave_up.is_err(), "the fake CLI never answers");
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = process_alive(&pid_file) || process_alive(&grandchild);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !alive,
+            "neither the CLI nor its tools may outlive a dropped run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_cli_finishes_normally_under_the_idle_timeout() {
+        // Negative control: a CLI that answers within the timeout completes.
+        let dir = tempfile::tempdir().unwrap();
+        let (script, _) = fake_cli(
+            dir.path(),
+            r#"cat > /dev/null
+echo '{"type":"result","subtype":"success","result":"done"}'"#,
+        );
+        let (result, events) = run_fake(
+            &script,
+            "hello".into(),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        result.expect("a CLI that answers in time must succeed");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::Done)),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "{events:?}"
         );
     }
 }
