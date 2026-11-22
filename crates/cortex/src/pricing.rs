@@ -93,6 +93,7 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
     let entries: Vec<(&str, f64, f64)> = vec![
         // Claude 5. The 5.5 Opus is cheaper than Opus 5 ($4/$20 against
         // $5/$25); Sonnet 5 and 5.5 both list at $2/$10.
+        ("claude-fable-5-2", 8.0, 40.0),
         ("claude-fable-5-1", 10.0, 50.0),
         ("claude-fable-5", 10.0, 50.0),
         ("claude-opus-5-5", 4.0, 20.0),
@@ -287,6 +288,12 @@ pub struct BundledRateCardEntry {
 pub fn bundled_rate_card_entries() -> &'static [BundledRateCardEntry] {
     &[
         // Anthropic. Haiku 5.5 carries its rate for prompts up to 100K tokens.
+        BundledRateCardEntry {
+            provider_id: "anthropic",
+            model: "claude-fable-5-2",
+            prompt_per_mtok_usd: "8.00",
+            completion_per_mtok_usd: "40.00",
+        },
         BundledRateCardEntry {
             provider_id: "anthropic",
             model: "claude-fable-5-1",

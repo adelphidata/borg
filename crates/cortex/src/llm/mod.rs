@@ -3998,6 +3998,10 @@ impl LlmClient {
             })?;
 
         let model = self.provider.normalize_model(&self.llm_config.model);
+        // The CLI is silent while the model reads and thinks, so its idle
+        // timeout has a much higher floor than an HTTP stream's.
+        let idle_timeout =
+            claude_cli::cli_idle_timeout(self.llm_config.stream_chunk_timeout_secs, &model);
 
         claude_cli::stream_claude_cli(
             &cli_path,
@@ -4005,6 +4009,7 @@ impl LlmClient {
             tools,
             &model,
             self.llm_config.temperature,
+            idle_timeout,
             tx,
             cancel,
         )

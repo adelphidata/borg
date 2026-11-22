@@ -264,9 +264,13 @@ pub fn check_activation(
                 return (true, text.to_string());
             }
             if let Some(bot_id) = bot_identifier {
-                // Case-insensitive search for the bot mention
-                let lower_text = text.to_lowercase();
-                let lower_bot = bot_id.to_lowercase();
+                // Case-insensitive search for the bot mention. ASCII
+                // folding keeps every byte offset of `text` (Unicode
+                // lowercasing does not: `İ` grows from 2 bytes to 3), so a
+                // position found in the folded copy slices `text` safely.
+                // Mention handles are ASCII on every platform.
+                let lower_text = text.to_ascii_lowercase();
+                let lower_bot = bot_id.to_ascii_lowercase();
                 if let Some(pos) = lower_text.find(&lower_bot) {
                     let cleaned = format!("{}{}", &text[..pos], &text[pos + bot_id.len()..])
                         .trim()
@@ -411,10 +415,48 @@ async fn check_sender_access_control(
 
 /// Whether a channel may show a typing indicator before the queued turn runs
 /// its own gates. Typing tells the chat the bot is working, and on Signal
-/// linked to the owner's own number it types *as the owner*, so it waits on
-/// the activation verdict (an unaddressed group message stays silent) and the
-/// read-only sender check the enrichment work uses.
+/// linked to the owner's own number it types *as the owner*, so it uses the
+/// same verdict as the rest of the pre-turn work ([`pre_turn_work_wanted`]).
 pub(crate) async fn typing_wanted(
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> bool {
+    pre_turn_work_wanted(config, channel_name, inbound, bot_identifier).await
+}
+
+/// The one verdict for every piece of work a channel does *before* the queued
+/// turn runs: typing, ack reactions, attachment downloads, paid
+/// speech-to-text, history reads. The turn drops a group message that does
+/// not address the bot (activation) and challenges or denies a sender the
+/// access check refuses, so the pre-turn work waits on both — an unaddressed
+/// voice note in a group is never downloaded or transcribed.
+///
+/// `bot_identifier` must be the one the turn gets (the channel's
+/// `bot_mention()`), and `inbound.text` must still be the user's own text:
+/// call this before folding channel history or transcripts into it, or that
+/// text could trip the mention match. A channel with no bot identifier
+/// (Discord, Teams, Google Chat) activates every group message, as the turn
+/// does, so the verdict there reduces to the sender gate. A Discord
+/// interaction always addresses the bot (its parser marks it so), and Teams
+/// and Google Chat by default deliver a group message only on an @mention or
+/// slash command.
+pub(crate) async fn pre_turn_work_wanted(
+    config: &Config,
+    channel_name: &str,
+    inbound: &InboundMessage,
+    bot_identifier: Option<&str>,
+) -> bool {
+    message_activates(config, channel_name, inbound, bot_identifier)
+        && sender_may_enrich(config, channel_name, inbound).await
+}
+
+/// The activation half of [`pre_turn_work_wanted`]: the verdict
+/// [`check_activation`] gives `inbound` under its resolved route. DMs always
+/// activate; a group message in `Mention` mode only when it mentions the bot
+/// or is a reply/command addressed to it.
+pub(crate) fn message_activates(
     config: &Config,
     channel_name: &str,
     inbound: &InboundMessage,
@@ -426,15 +468,15 @@ pub(crate) async fn typing_wanted(
         &inbound.sender_id,
         inbound.peer_kind.as_deref(),
     );
-    let (activates, _) = check_activation(
+    check_activation(
         &inbound.text,
         inbound.peer_kind.as_deref(),
         &route,
         &route.config,
         bot_identifier,
         inbound_addressed_to_bot(inbound, bot_identifier),
-    );
-    activates && sender_may_enrich(config, channel_name, inbound).await
+    )
+    .0
 }
 
 /// Read-only gate for the work a channel does *before* the queued turn
@@ -2053,6 +2095,40 @@ mod tests {
         assert!(activate);
     }
 
+    /// Text whose Unicode lowercase form has a different byte length (`İ`
+    /// is 2 bytes, its lowercase `i̇` is 3) must not shift the mention
+    /// position: the mention is found, the message activates, and exactly
+    /// the mention is cut out. Before the fix the first case sliced inside
+    /// `日` and the second sliced past the end of the text — both panicked.
+    #[test]
+    fn mention_match_survives_text_whose_lowercase_changes_length() {
+        let route = default_route();
+        let config = Config::default();
+        let cases = [
+            ("İİİİİİ @borg日本", "İİİİİİ 日本"),
+            ("İİİİİİİİİİ @borg", "İİİİİİİİİİ"),
+            ("İİİ @Borg hello", "İİİ  hello"),
+            // Negative control: plain ASCII still matches case-insensitively.
+            ("hey @BORG hi", "hey  hi"),
+        ];
+        for (input, cleaned) in cases {
+            let (activate, text) =
+                check_activation(input, Some("group"), &route, &config, Some("@borg"), false);
+            assert!(activate, "{input:?} mentions the bot");
+            assert_eq!(text, cleaned, "{input:?}");
+        }
+        // A group message with no mention still stays silent.
+        let (activate, _) = check_activation(
+            "İİİ hello",
+            Some("group"),
+            &route,
+            &config,
+            Some("@borg"),
+            false,
+        );
+        assert!(!activate);
+    }
+
     #[test]
     fn signal_phone_bot_id_required_in_groups_with_mention_mode() {
         // Regression: the Signal SSE callback used to pass `bot_identifier=None`,
@@ -2853,6 +2929,74 @@ secret_env = "GW_TEST_WEBHOOK_SECRET"
         );
         group.text = "@borg what's the weather".to_string();
         assert!(typing_wanted(&open, "slack", &group, Some("@borg")).await);
+    }
+
+    /// Downloads, paid STT, and ack reactions share one verdict with typing:
+    /// under the default `Mention` activation an unaddressed group message
+    /// gets none of them, while a mention, a reply to the bot, a DM, and an
+    /// `Always` group do. A refused sender gets none even when addressed.
+    #[tokio::test]
+    async fn pre_turn_work_follows_activation_and_the_sender_gate() {
+        let mut open = Config::default();
+        open.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
+        assert_eq!(
+            open.gateway.group_activation,
+            cortex::config::ActivationMode::Mention,
+            "the default must be mention-gated for this spec to hold"
+        );
+        let mut always = open.clone();
+        always.gateway.group_activation = cortex::config::ActivationMode::Always;
+        let mut disabled = open.clone();
+        disabled.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
+
+        let group = |text: &str| {
+            let mut m = inbound_with_text("u1", text);
+            m.peer_kind = Some(PEER_KIND_GROUP.to_string());
+            m
+        };
+        let mut reply_to_bot = group("[Voice message]");
+        reply_to_bot.metadata = serde_json::json!({ "reply_to_bot_username": "borg" });
+
+        let cases: [(&str, &Config, InboundMessage, bool); 6] = [
+            (
+                "unaddressed group voice note",
+                &open,
+                group("[Voice message]"),
+                false,
+            ),
+            ("group mention", &open, group("@borg listen to this"), true),
+            ("group reply to the bot", &open, reply_to_bot, true),
+            (
+                "direct message",
+                &open,
+                inbound_with_text("u1", "[Voice message]"),
+                true,
+            ),
+            (
+                "group under Always",
+                &always,
+                group("[Voice message]"),
+                true,
+            ),
+            (
+                "refused sender, addressed",
+                &disabled,
+                group("@borg hi"),
+                false,
+            ),
+        ];
+        for (label, config, inbound, want) in cases {
+            assert_eq!(
+                pre_turn_work_wanted(config, "telegram", &inbound, Some("@borg")).await,
+                want,
+                "{label}"
+            );
+            assert_eq!(
+                typing_wanted(config, "telegram", &inbound, Some("@borg")).await,
+                want,
+                "typing must share the verdict: {label}"
+            );
+        }
     }
 
     /// The pre-enrichment gate is read-only and policy-driven: `Open` admits

@@ -85,12 +85,19 @@ impl NativeChannel for SlackChannel {
             return Ok(WebhookOutcome::Skip);
         }
 
-        // A sender the queued turn will challenge or deny gets none of the
-        // pre-turn work: no reaction, no file download, no paid STT, no
-        // history read. The plain text still goes through so the challenge
-        // itself is delivered. Placeholder URLs are dropped with the
-        // enrichment — nothing downstream can use them.
-        let may_enrich = crate::handler::sender_may_enrich(&self.config, "slack", &inbound).await;
+        // A message the queued turn will drop (an unaddressed group message)
+        // or a sender it will challenge or deny gets none of the pre-turn
+        // work: no reaction, no file download, no paid STT, no history read.
+        // The plain text still goes through so the challenge itself is
+        // delivered. Placeholder URLs are dropped with the enrichment —
+        // nothing downstream can use them.
+        let may_enrich = crate::handler::pre_turn_work_wanted(
+            &self.config,
+            "slack",
+            &inbound,
+            self.bot_mention().as_deref(),
+        )
+        .await;
         if !may_enrich {
             inbound.attachments.clear();
         }
@@ -794,6 +801,75 @@ mod tests {
                 let got_message = matches!(outcome, WebhookOutcome::Message { .. });
                 assert_eq!(got_message, expect_message, "channel {channel_id}");
             }
+        }
+
+        /// Under the default mention gate, a group message that does not
+        /// address the bot gets no pre-turn work — no ack reaction, no file
+        /// download, no history read — and its placeholder attachments are
+        /// dropped. The same message addressed to the bot gets the reaction.
+        #[tokio::test]
+        async fn unaddressed_group_message_gets_no_pre_turn_work() {
+            let file_event = |text: &str| {
+                let mut body: serde_json::Value =
+                    serde_json::from_str(&envelope(text, None)).unwrap();
+                body["event"]["files"] = serde_json::json!([{
+                    "id": "F1",
+                    "name": "note.m4a",
+                    "mimetype": "audio/mp4",
+                    "url_private": "https://files.slack.com/files-pri/T1-F1/note.m4a",
+                }]);
+                body.to_string()
+            };
+            let config = cortex::config::Config::default();
+            let health = Arc::new(RwLock::new(ChannelHealthRegistry::new()));
+            let ctx = WebhookContext {
+                config: &config,
+                health: &health,
+            };
+
+            let server = MockServer::start().await;
+            mount_history(&server, &[]).await;
+            let channel = make_channel(&server.uri(), Some("UBOT"));
+            let body = file_event("voice note for the team");
+            let outcome = channel
+                .handle_webhook(&signed_headers(&body), &body, &ctx)
+                .await
+                .expect("webhook must be accepted");
+            let WebhookOutcome::Message { inbound, .. } = outcome else {
+                panic!("expected a Message outcome");
+            };
+            assert!(
+                inbound.attachments.is_empty(),
+                "an unaddressed group file must not be kept for download"
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty(),
+                "no reaction, download, or history read for an unaddressed group message"
+            );
+
+            let server = MockServer::start().await;
+            mount_history(&server, &[]).await;
+            let channel = make_channel(&server.uri(), Some("UBOT"));
+            let mut body: serde_json::Value =
+                serde_json::from_str(&envelope("<@UBOT> what do you think", None)).unwrap();
+            body["event_id"] = serde_json::json!("Ev2");
+            let body = body.to_string();
+            channel
+                .handle_webhook(&signed_headers(&body), &body, &ctx)
+                .await
+                .expect("webhook must be accepted");
+            let reactions = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.url.path() == "/reactions.add")
+                .count();
+            assert_eq!(reactions, 1, "an addressed message gets the ack reaction");
         }
 
         /// A threaded @mention already carries its own conversation context;

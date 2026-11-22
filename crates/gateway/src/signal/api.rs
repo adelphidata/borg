@@ -135,8 +135,8 @@ impl SignalClient {
                 SendTarget::Group(g) => params["groupId"] = serde_json::json!(g),
             }
             if !chunk.styles.is_empty() {
-                // TextStyle derives Serialize with the exact wire shape
-                // ({start, length, style: "SCREAMING_SNAKE_CASE"}).
+                // signal-cli reads each entry as a `start:length:STYLE`
+                // string with UTF-16 offsets (see `TextStyle::to_wire`).
                 params["textStyle"] = serde_json::to_value(&chunk.styles)?;
             }
             let resp = self.rpc_call("send", params).await?;
@@ -412,9 +412,25 @@ mod tests {
         assert_eq!(params["recipient"], serde_json::json!(["+15551234567"]));
         assert_eq!(
             params["textStyle"],
-            serde_json::json!([{ "start": 0, "length": 4, "style": "BOLD" }]),
-            "bold span must be sent as a Signal textStyle range"
+            serde_json::json!(["0:4:BOLD"]),
+            "bold span must be sent as signal-cli's `start:length:STYLE` string"
         );
+    }
+
+    /// Wire offsets are UTF-16 code units: the emoji before the bold word is
+    /// two units, so the range starts at 3.
+    #[tokio::test]
+    async fn send_message_text_style_offsets_are_utf16_units() {
+        let (base, server) = spawn_rpc_mock(OK_RESULT).await;
+        let client = SignalClient::new(&base, "+15559876543").unwrap();
+        client
+            .send_message("+15551234567", "🎉 **Done**")
+            .await
+            .unwrap();
+
+        let json = recv_rpc(server, "send_message").await;
+        assert_eq!(json["params"]["message"], "🎉 Done");
+        assert_eq!(json["params"]["textStyle"], serde_json::json!(["3:4:BOLD"]));
     }
 
     /// `send_group_message` must address the RPC by `groupId` (not
@@ -433,10 +449,7 @@ mod tests {
         let params = &json["params"];
         assert_eq!(params["groupId"], "grp-123");
         assert_eq!(params["message"], "hello team");
-        assert_eq!(
-            params["textStyle"],
-            serde_json::json!([{ "start": 6, "length": 4, "style": "BOLD" }])
-        );
+        assert_eq!(params["textStyle"], serde_json::json!(["6:4:BOLD"]));
         assert!(
             params.get("recipient").is_none(),
             "group sends must not carry a recipient field"

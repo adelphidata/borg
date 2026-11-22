@@ -27,7 +27,29 @@ pub fn discover_project_docs(
     cwd: &Path,
     security: &crate::config::security::SecurityConfig,
 ) -> Result<Option<String>> {
+    discover_project_docs_with_home(cwd, security, dirs::home_dir().as_deref())
+}
+
+/// [`discover_project_docs`] with the home directory passed in, so tests can
+/// stand a temp dir in for `$HOME` instead of touching the real one.
+fn discover_project_docs_with_home(
+    cwd: &Path,
+    security: &crate::config::security::SecurityConfig,
+    home: Option<&Path>,
+) -> Result<Option<String>> {
     let root = find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    // Canonical so it compares against the canonical root (`/var` vs
+    // `/private/var` on macOS). A home that will not resolve is compared as
+    // given: that still matches a root spelled the same way.
+    let home = home.map(|h| {
+        h.canonicalize().unwrap_or_else(|e| {
+            tracing::warn!(
+                "home dir {} did not resolve, comparing it as given: {e}",
+                h.display()
+            );
+            h.to_path_buf()
+        })
+    });
     let doc_groups = collect_doc_candidates(&root, cwd);
 
     if doc_groups.is_empty() {
@@ -45,7 +67,7 @@ pub fn discover_project_docs(
         // One directory contributes at most one doc, but a refused `AGENTS.md`
         // must not take a legitimate `CLAUDE.md` beside it down with it —
         // otherwise a hostile symlink is a way to *suppress* project rules.
-        let Some((path, content)) = first_readable(group, &root, security) else {
+        let Some((path, content)) = first_readable(group, &root, home.as_deref(), security) else {
             continue;
         };
         if remaining_bytes == 0 {
@@ -175,6 +197,18 @@ fn omitted_headings(content: &str, from: usize) -> Vec<String> {
 /// Non-regular files (fifos, devices) are refused outright — reading one can block
 /// forever, and nothing legitimate ships an `AGENTS.md` fifo.
 ///
+/// When the root is `$HOME` or one of its ancestors (a dotfiles repo at `~`, a
+/// cwd of `~` with no `.git`, a `.git` at `/`), "inside the root" means "anywhere
+/// in the operator's home", which is no containment at all:
+/// `~/Downloads/x/AGENTS.md -> ~/Documents/private.txt` would pass. In that
+/// case the doc must *also* resolve inside its own directory — the directory
+/// it was discovered in, canonicalized — so a symlink that escapes its own
+/// directory is refused while a real `~/AGENTS.md` (or a link into a
+/// subdirectory beside it) still loads. The root check still applies on top:
+/// the canonical directory of `~/Downloads/x/AGENTS.md` where
+/// `~/Downloads/x -> /opt/foo` is `/opt/foo`, which holds the doc, but
+/// `/opt/foo` is outside the root.
+///
 /// Known residual: a *hardlink* to an outside file canonicalizes to a path inside
 /// the root and passes the containment check. Git cannot ship a hardlink, so the
 /// delivery path is narrow, and the `blocked_paths` check below is what actually
@@ -182,6 +216,7 @@ fn omitted_headings(content: &str, from: usize) -> Vec<String> {
 fn read_doc_within_root(
     path: &Path,
     root: &Path,
+    home: Option<&Path>,
     security: &crate::config::security::SecurityConfig,
 ) -> Result<String> {
     let resolved = path.canonicalize()?;
@@ -204,6 +239,24 @@ fn read_doc_within_root(
             path.display(),
             resolved.display()
         );
+    }
+    if home.is_some_and(|home| home.starts_with(&resolved_root)) {
+        let doc_dir = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("project doc {} has no parent directory", path.display())
+        })?;
+        let resolved_doc_dir = doc_dir.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "directory of project doc {} could not be resolved, refusing to read it: {e}",
+                path.display()
+            )
+        })?;
+        if !resolved.starts_with(&resolved_doc_dir) {
+            anyhow::bail!(
+                "project doc {} resolves outside its own directory ({})",
+                path.display(),
+                resolved.display()
+            );
+        }
     }
     // Containment is not the same guarantee as "not a secret". A checked-in
     // `.env`, or a `~/AGENTS.md -> ~/.ssh/id_rsa` in a directory with no `.git`
@@ -230,10 +283,11 @@ fn read_doc_within_root(
 fn first_readable(
     group: &[PathBuf],
     root: &Path,
+    home: Option<&Path>,
     security: &crate::config::security::SecurityConfig,
 ) -> Option<(PathBuf, String)> {
     for candidate in group {
-        match read_doc_within_root(candidate, root, security) {
+        match read_doc_within_root(candidate, root, home, security) {
             Ok(content) => return Some((candidate.clone(), content)),
             Err(e) => {
                 tracing::warn!("Skipping project doc {}: {e}", candidate.display());
@@ -397,8 +451,10 @@ mod tests {
     }
 
     /// Spec: with no `.git` anywhere the root falls back to the cwd, so running
-    /// from `$HOME` makes `~/.ssh/id_rsa` "inside the root". Containment cannot
-    /// catch this one at all — only the blocked-path check can.
+    /// from `$HOME` makes `~/.ssh/id_rsa` "inside the root". A root at `$HOME`
+    /// narrows containment to the doc's own directory, but for `~/AGENTS.md`
+    /// that directory is `~` itself and `.ssh` sits beneath it — so the
+    /// blocked-path check is the guard that refuses this one.
     #[cfg(unix)]
     #[test]
     fn a_project_doc_symlinked_to_a_key_is_refused_even_when_the_root_is_the_cwd() {
@@ -410,7 +466,8 @@ mod tests {
         std::fs::write(&key, "BEGIN OPENSSH PRIVATE KEY").unwrap();
         std::os::unix::fs::symlink(&key, home.path().join("AGENTS.md")).unwrap();
 
-        let result = discover_project_docs(home.path(), &sec()).unwrap();
+        let result =
+            discover_project_docs_with_home(home.path(), &sec(), Some(home.path())).unwrap();
         assert!(
             !result
                 .as_deref()
@@ -418,6 +475,123 @@ mod tests {
                 .contains("BEGIN OPENSSH PRIVATE KEY"),
             "key leaked through the cwd-as-root fallback: {result:?}"
         );
+    }
+
+    /// Spec: when the project root is `$HOME` or an ancestor of it, "inside
+    /// the root" is no containment at all, so each doc is held to its own
+    /// directory instead. A link that leaves its own directory is refused; a
+    /// real doc, or a link into a subdirectory beside it, still loads. When
+    /// the root is an ordinary repo (home elsewhere), the repo-wide rule stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_at_or_above_home_holds_each_doc_to_its_own_directory() {
+        enum Root {
+            /// `.git` at the stand-in home (dotfiles repo at `~`).
+            Home,
+            /// `.git` one level above the stand-in home (root is an ancestor).
+            AboveHome,
+            /// `.git` at the stand-in home, but the real home is elsewhere.
+            UnrelatedHome,
+        }
+        enum Doc {
+            /// `x/AGENTS.md -> <home>/Documents/private.txt`.
+            LinkOutOfOwnDir,
+            /// `x/AGENTS.md -> x/docs/rules.md`.
+            LinkIntoOwnSubdir,
+            /// A regular `x/AGENTS.md`.
+            Regular,
+            /// A regular `AGENTS.md` in `x -> <tmp>/opt/foo`, a directory
+            /// outside home: the doc sits in its own (canonical) directory,
+            /// but that directory is outside the root.
+            DirLinkOutOfHome,
+        }
+        // (case, root, doc placement, cwd is home itself, expect loaded)
+        let cases = [
+            (
+                "escape at home root",
+                Root::Home,
+                Doc::LinkOutOfOwnDir,
+                false,
+                false,
+            ),
+            (
+                "escape above home root",
+                Root::AboveHome,
+                Doc::LinkOutOfOwnDir,
+                false,
+                false,
+            ),
+            (
+                "link in own subdir",
+                Root::Home,
+                Doc::LinkIntoOwnSubdir,
+                false,
+                true,
+            ),
+            ("regular nested doc", Root::Home, Doc::Regular, false, true),
+            ("regular ~/AGENTS.md", Root::Home, Doc::Regular, true, true),
+            (
+                "directory symlink out of home",
+                Root::Home,
+                Doc::DirLinkOutOfHome,
+                false,
+                false,
+            ),
+            (
+                "ordinary repo keeps repo-wide rule",
+                Root::UnrelatedHome,
+                Doc::LinkOutOfOwnDir,
+                false,
+                true,
+            ),
+        ];
+        for (name, root, doc, cwd_is_home, expect_loaded) in cases {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            let other_home = tmp.path().join("someone-else");
+            std::fs::create_dir_all(&other_home).unwrap();
+            let doc_dir = if cwd_is_home {
+                home.clone()
+            } else {
+                home.join("Downloads").join("x")
+            };
+            if let Doc::DirLinkOutOfHome = doc {
+                let outside = tmp.path().join("opt").join("foo");
+                std::fs::create_dir_all(&outside).unwrap();
+                std::fs::create_dir_all(doc_dir.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&outside, &doc_dir).unwrap();
+            }
+            std::fs::create_dir_all(doc_dir.join("docs")).unwrap();
+            std::fs::create_dir_all(home.join("Documents")).unwrap();
+            match root {
+                Root::Home | Root::UnrelatedHome => std::fs::create_dir(home.join(".git")).unwrap(),
+                Root::AboveHome => std::fs::create_dir(tmp.path().join(".git")).unwrap(),
+            }
+            let marker = "MARKER-CONTENT-7f3a";
+            let agents = doc_dir.join("AGENTS.md");
+            match doc {
+                Doc::LinkOutOfOwnDir => {
+                    let target = home.join("Documents").join("private.txt");
+                    std::fs::write(&target, marker).unwrap();
+                    std::os::unix::fs::symlink(&target, &agents).unwrap();
+                }
+                Doc::LinkIntoOwnSubdir => {
+                    let target = doc_dir.join("docs").join("rules.md");
+                    std::fs::write(&target, marker).unwrap();
+                    std::os::unix::fs::symlink(&target, &agents).unwrap();
+                }
+                Doc::Regular | Doc::DirLinkOutOfHome => std::fs::write(&agents, marker).unwrap(),
+            }
+            let effective_home = match root {
+                Root::UnrelatedHome => other_home,
+                Root::Home | Root::AboveHome => home.clone(),
+            };
+
+            let result =
+                discover_project_docs_with_home(&doc_dir, &sec(), Some(&effective_home)).unwrap();
+            let loaded = result.as_deref().unwrap_or_default().contains(marker);
+            assert_eq!(loaded, expect_loaded, "{name}: {result:?}");
+        }
     }
 
     /// Spec: refusing `AGENTS.md` must not suppress a legitimate `CLAUDE.md`

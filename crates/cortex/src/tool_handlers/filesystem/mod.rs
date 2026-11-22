@@ -19,7 +19,9 @@ mod listing;
 mod patch;
 mod read;
 
-pub use blocked::{is_blocked_path, shell_command_targets_control_plane};
+pub use blocked::{
+    is_blocked_path, is_control_plane_read_denied, shell_command_targets_control_plane,
+};
 pub use completion::{complete_paths, PathSuggestion, MAX_PATH_SUGGESTIONS};
 pub use listing::{handle_list_dir, handle_list_dir_with_context};
 pub use patch::{

@@ -61,6 +61,7 @@ use crate::maintenance::cooldowns::CooldownTable;
 use crate::maintenance::MonthlyBudgetTracker;
 use cortex::config::Config;
 use cortex::db::Database;
+use cortex::util::truncate::floor_char_boundary;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -306,6 +307,9 @@ boxed_check!(check_task_health => check_task_health_inner);
 /// stale failures the user has already seen.
 const TASK_HEALTH_WINDOW_SECS: i64 = 24 * 60 * 60;
 const TASK_HEALTH_MAX_LISTED: usize = 5;
+/// Per-line cap on a quoted `last_error`, in bytes. Cut on a char boundary:
+/// a raw `&err[..N]` panics when byte N splits a multi-byte character.
+const LAST_ERROR_MAX_BYTES: usize = 120;
 
 async fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
     let failing_tasks = match db.tasks_with_last_error().await {
@@ -371,7 +375,7 @@ async fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
                 .replace('\n', " ");
             // Cap the per-line error so a single noisy task can't blow the
             // proactive_nudges block past sane sizes.
-            let err = if err.len() > 120 { &err[..120] } else { &err };
+            let err = &err[..floor_char_boundary(&err, LAST_ERROR_MAX_BYTES)];
             nudge.push_str(&format!(
                 "    - {} (id={}, last_error: \"{}\")\n",
                 task.name, task.id, err
@@ -401,7 +405,7 @@ async fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
                 .as_deref()
                 .unwrap_or("(no error captured)")
                 .replace('\n', " ");
-            let err = if err.len() > 120 { &err[..120] } else { &err };
+            let err = &err[..floor_char_boundary(&err, LAST_ERROR_MAX_BYTES)];
             nudge.push_str(&format!(
                 "    - {} (id={}, {} failure(s), last_error: \"{}\")\n",
                 group.task_name, group.task_id, group.failures, err
@@ -1092,6 +1096,39 @@ mod tests {
         assert!(
             nudge.contains("do not fabricate"),
             "directive must instruct LLM not to fabricate: {nudge}"
+        );
+    }
+
+    /// Spec: a `last_error` whose 120th byte falls inside a multi-byte
+    /// character must render truncated on a char boundary, not panic the
+    /// heartbeat. Both quoting sites (the `last_error` block and the windowed
+    /// failed-run block) take the error from user-visible provider text, so
+    /// an em dash or emoji at the wrong offset is an ordinary input.
+    #[tokio::test]
+    async fn task_health_truncates_multibyte_errors_on_a_char_boundary() {
+        let db = in_memory_db().await;
+        make_task(&db, "t_cur", "carries_error").await;
+        make_task(&db, "t_win", "windowed_only").await;
+        // 119 ASCII bytes, then a 3-byte em dash straddling byte 120.
+        let long_err = format!("{}\u{2014}tail that must be cut", "a".repeat(119));
+        db.set_task_retry("t_cur", 1, &long_err, 9999)
+            .await
+            .expect("set error");
+        let now = 1_000_000_i64;
+        db.record_task_run("t_win", now - 60, 100, None, Some(&long_err))
+            .await
+            .expect("record");
+
+        let nudge = build_task_health_nudge(&db, now).await.expect("must fire");
+        let quoted = format!("last_error: \"{}\"", "a".repeat(119));
+        assert_eq!(
+            nudge.matches(&quoted).count(),
+            2,
+            "both sites must quote the 119-byte prefix and stop before the split char: {nudge}"
+        );
+        assert!(
+            !nudge.contains("tail that must be cut"),
+            "the error must still be capped: {nudge}"
         );
     }
 

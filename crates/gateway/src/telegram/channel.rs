@@ -76,7 +76,13 @@ impl NativeChannel for TelegramChannel {
         };
 
         let mut parsed = parsed;
-        super::enrich_parsed_message(&self.client, &self.config, &mut parsed).await;
+        super::enrich_parsed_message(
+            &self.client,
+            &self.config,
+            &mut parsed,
+            self.bot_mention().as_deref(),
+        )
+        .await;
         let inbound = parsed.inbound;
 
         let chat_id: i64 = match inbound.channel_id.as_deref().and_then(|id| id.parse().ok()) {

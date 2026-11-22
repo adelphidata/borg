@@ -475,6 +475,12 @@ pub struct Agent {
     /// that persistently signals tool use without shipping a call can't
     /// loop the nudge. Reset at turn start with the other loop guards.
     pub(super) nudged_for_dropped_tools: bool,
+    /// A retry hint for the next LLM request only (an empty reply or a
+    /// dropped tool call). `prepare_llm_request` appends it to the outgoing
+    /// copy of the last user/tool message; it is never written to history
+    /// or the session log. Cleared when the next response completes and at
+    /// turn start.
+    pub(super) pending_request_hint: Option<&'static str>,
     /// Which LLM chain this agent's `make_llm_client_from_config` builds.
     /// `Primary` is the default — interactive turns and tool-spawned
     /// sub-agents always run on the user's primary chain. `Auxiliary` is
@@ -677,6 +683,7 @@ impl Agent {
             tool_intent_signalled: false,
             emitted_text_bytes: 0,
             nudged_for_dropped_tools: false,
+            pending_request_hint: None,
             llm_role,
             goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
             goal_event_sink: None,
@@ -1480,6 +1487,7 @@ impl Agent {
         self.unknown_tool_tracker.reset();
         self.expensive_tool_budget.reset();
         self.nudged_for_dropped_tools = false;
+        self.pending_request_hint = None;
 
         // Cross-turn stale-stream circuit breaker: a session whose streams
         // keep dying as stale would otherwise burn the full stall timeout

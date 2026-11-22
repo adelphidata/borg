@@ -1480,6 +1480,54 @@ fn assistant_cell_passes_through_when_policy_disabled() {
 }
 
 #[test]
+fn thinking_cell_redacts_secrets_including_one_split_across_deltas() {
+    // The agent redacts each thinking delta on its own, so a key split
+    // across two deltas reaches the TUI whole only in the accumulated cell.
+    // The cell must catch it, as the assistant cell does.
+    let _guard =
+        PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());
+    let mut text = String::new();
+    for delta in ["the key is AKIAIOSF", "ODNN7EXAMPLE, so use it"] {
+        text.push_str(delta);
+    }
+    let cell = HistoryCell::Thinking { text };
+    let rendered = flatten_plain(&cell.render(80, None));
+    assert!(
+        !rendered.contains("AKIAIOSFODNN7EXAMPLE"),
+        "raw secret leaked into the thinking cell: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("[REDACTED AWS Access Key]"),
+        "expected redaction marker, got: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("so use it"),
+        "the rest of the thought stays"
+    );
+}
+
+#[test]
+fn thinking_cell_passes_benign_text_and_honours_a_disabled_policy() {
+    // Negative controls: clean reasoning renders verbatim, and an operator
+    // who turned output redaction off sees the trace as written.
+    let _guard =
+        PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());
+    let benign = HistoryCell::Thinking {
+        text: "compare both branches, then run the tests".to_string(),
+    };
+    assert!(flatten_plain(&benign.render(80, None))
+        .contains("compare both branches, then run the tests"));
+    drop(_guard);
+
+    let _guard = PolicyGuard::install(cortex::output_redaction::RedactionPolicy::disabled());
+    let secret = HistoryCell::Thinking {
+        text: "the key is AKIAIOSFODNN7EXAMPLE".to_string(),
+    };
+    let rendered = flatten_plain(&secret.render(80, None));
+    assert!(rendered.contains("AKIAIOSFODNN7EXAMPLE"), "{rendered:?}");
+}
+
+#[test]
 fn tool_result_cell_redacts_secrets() {
     let _guard =
         PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());

@@ -64,9 +64,9 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
             }
         }
 
-        // Italic: *...*
+        // Italic: *...* (flanking rules, see `find_italic_close`)
         if chars[i] == '*' {
-            if let Some(end) = find_char(&chars, '*', i + 1) {
+            if let Some(end) = find_italic_close(&chars, i) {
                 let content: String = chars[i + 1..end].iter().collect();
                 result.push_str("<i>");
                 result.push_str(&content);
@@ -150,6 +150,45 @@ pub fn split_caption(text: &str) -> (String, Option<String>) {
 
 fn find_char(chars: &[char], target: char, start: usize) -> Option<usize> {
     (start..chars.len()).find(|&i| chars[i] == target)
+}
+
+/// Index of the `*` closing an italic opened by the single `*` at `open`,
+/// using CommonMark-style flanking: the opener must not be followed by
+/// whitespace, the closer must not be preceded by whitespace, and the pair
+/// must not span a newline. So `* item` bullets and `2 * 3` arithmetic stay
+/// literal. A doubled `**` inside the content belongs to bold and is skipped,
+/// and so is a closed inline code span: a `*` inside backticks is code.
+fn find_italic_close(chars: &[char], open: usize) -> Option<usize> {
+    let next = *chars.get(open + 1)?;
+    if next == '*' || next.is_whitespace() {
+        return None;
+    }
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '\n' => return None,
+            // Same span rule as the inline-code renderer: the next backtick
+            // closes it. An unclosed backtick is a literal character.
+            '`' => {
+                if let Some(close) = find_char(chars, '`', i + 1) {
+                    // The pair still may not span a newline.
+                    if chars[i + 1..close].contains(&'\n') {
+                        return None;
+                    }
+                    i = close + 1;
+                    continue;
+                }
+            }
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                continue;
+            }
+            '*' if !chars[i - 1].is_whitespace() => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn find_double_star(chars: &[char], start: usize) -> Option<usize> {
@@ -285,6 +324,66 @@ mod tests {
             markdown_to_telegram_html("a single * star"),
             "a single * star"
         );
+    }
+
+    /// A single `*` only opens italic when it flanks text: bullets, spaced
+    /// arithmetic, and a pair split across lines stay literal; real
+    /// emphasis and bold still render.
+    #[test]
+    fn single_star_italic_requires_flanking() {
+        let cases = [
+            ("* apple\n* banana", "* apple\n* banana"),
+            ("2 * 3 and 4 * 5", "2 * 3 and 4 * 5"),
+            ("a *b\nc* d", "a *b\nc* d"),
+            ("*open but spaced *", "*open but spaced *"),
+            ("*real italic*", "<i>real italic</i>"),
+            ("**bold**", "<b>bold</b>"),
+            (
+                "* item with *emph* inside",
+                "* item with <i>emph</i> inside",
+            ),
+            ("*a * b* and **c**", "<i>a * b</i> and <b>c</b>"),
+            ("- 2 * 3 = *six*", "- 2 * 3 = <i>six</i>"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                markdown_to_telegram_html(input),
+                expected,
+                "input={input:?}"
+            );
+        }
+    }
+
+    /// A `*` inside an inline code span is code, not an italic closer: the
+    /// italic closes at the first `*` outside backticks. An unclosed
+    /// backtick is literal and does not hide the closer.
+    #[test]
+    fn italic_close_skips_inline_code_spans() {
+        let cases = [
+            ("*see `x*y`*", "<i>see `x*y`</i>"),
+            ("*a `b*c` d* tail", "<i>a `b*c` d</i> tail"),
+            (
+                "*two `p*` and `q*` spans*",
+                "<i>two `p*` and `q*` spans</i>",
+            ),
+            // Unclosed backtick: literal, the next flanking `*` closes.
+            ("*a `b* c", "<i>a `b</i> c"),
+            // The code span holds the only `*`: no closer, nothing renders
+            // as italic; the span itself is still inline code.
+            ("*see `x*y`", "*see <code>x*y</code>"),
+            // A code span across a newline cannot carry the italic over it.
+            ("*a `b\nc` d*", "*a <code>b\nc</code> d*"),
+            // Negative controls: plain code and plain italic are unchanged.
+            ("`x*y` and *z*", "<code>x*y</code> and <i>z</i>"),
+            ("*plain*", "<i>plain</i>"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                markdown_to_telegram_html(input),
+                expected,
+                "input={input:?}"
+            );
+        }
     }
 
     #[test]

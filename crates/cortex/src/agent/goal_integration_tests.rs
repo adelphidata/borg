@@ -68,6 +68,7 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         tool_intent_signalled: false,
         emitted_text_bytes: 0,
         nudged_for_dropped_tools: false,
+        pending_request_hint: None,
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,

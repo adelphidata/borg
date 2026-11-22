@@ -8,11 +8,34 @@ const STRIPPED_TAGS: &[&str] = &["internal", "thinking", "think", "reasoning", "
 /// Strip `<internal>`, `<thinking>`, `<think>` and `<reasoning>` blocks
 /// (tag names matched ASCII case-insensitively) from text to prevent
 /// chain-of-thought leakage into the UI or persisted history.
+///
+/// A closed block is stripped wherever it sits. An unclosed block is
+/// stripped to the end of the text only when its opening tag starts the
+/// text or a line (leading spaces/tabs allowed) — the shape of a reasoning
+/// preamble the stream cut off. An unclosed tag in the middle of a line is
+/// a mention ("use the `<internal>` tag to …") and is kept as written,
+/// with the text after it.
 pub fn strip_internal_tags(text: &str) -> String {
+    scan(text).cleaned
+}
+
+/// Result of one pass over the text: the cleaned output, and how many of
+/// its leading bytes no later input can change.
+struct Scan {
+    cleaned: String,
+    /// `None`: every block is closed, so all of `cleaned` is final (bar a
+    /// trailing partial opening tag). `Some(n)`: an unclosed block is open
+    /// and only the first `n` bytes of `cleaned` — the text before it — are
+    /// final; a later close would strip what follows.
+    unresolved_at: Option<usize>,
+}
+
+fn scan(text: &str) -> Scan {
     // ASCII lowercasing is length- and boundary-preserving, so positions
     // found in `lower` index directly into `text`.
     let lower = text.to_ascii_lowercase();
     let mut result = String::with_capacity(text.len());
+    let mut unresolved_at = None;
     let mut cursor = 0usize;
     loop {
         // Find the earliest opening tag among the set.
@@ -26,24 +49,55 @@ pub fn strip_internal_tags(text: &str) -> String {
                 }
             }
         }
-        let Some((start, tag)) = earliest else {
+        let Some((rel, tag)) = earliest else {
             result.push_str(&text[cursor..]);
-            return result;
+            return Scan {
+                cleaned: result,
+                unresolved_at,
+            };
         };
-        result.push_str(&text[cursor..cursor + start]);
+        let start = cursor + rel;
+        result.push_str(&text[cursor..start]);
+        let open_len = tag.len() + 2;
         let close = format!("</{tag}>");
-        if let Some(end) = lower[cursor + start..].find(&close) {
-            cursor = cursor + start + end + close.len();
-        } else {
-            // Unclosed tag — strip everything from the opening tag onward.
-            return result;
+        if let Some(end) = lower[start..].find(&close) {
+            cursor = start + end + close.len();
+            continue;
         }
+        // Unclosed. Until the stream ends, a close may still arrive, so
+        // nothing from here on is final.
+        unresolved_at.get_or_insert(result.len());
+        if starts_line(&result, result.len()) {
+            // A reasoning block the stream cut off: strip to the end.
+            return Scan {
+                cleaned: result,
+                unresolved_at,
+            };
+        }
+        // A mid-line mention of the tag: keep it and scan on after it.
+        result.push_str(&text[start..start + open_len]);
+        cursor = start + open_len;
     }
+}
+
+/// Whether byte offset `pos` of `text` begins the text or a line, with
+/// only spaces or tabs before it on that line.
+fn starts_line(text: &str, pos: usize) -> bool {
+    text.as_bytes()[..pos]
+        .iter()
+        .rev()
+        .find(|&&b| b != b' ' && b != b'\t')
+        .is_none_or(|&b| b == b'\n')
 }
 
 /// Streaming filter that buffers text to strip `STRIPPED_TAGS` blocks
 /// (`<internal>`, `<thinking>`, `<think>`, `<reasoning>`, any ASCII case)
 /// in real-time.
+///
+/// Text after an unclosed opening tag is held back wherever the tag sits:
+/// a later close would strip it, so emitting it early could leak a block.
+/// When the stream ends, [`Self::flush`] releases what
+/// [`strip_internal_tags`] keeps — a mid-line mention and the text after it.
 #[derive(Default)]
 pub struct InternalTagFilter {
     raw: String,
@@ -58,32 +112,18 @@ impl InternalTagFilter {
     /// Append new text and return the portion safe to emit.
     pub fn push(&mut self, delta: &str) -> Option<String> {
         self.raw.push_str(delta);
-        let cleaned = strip_internal_tags(&self.raw);
-        // Case-insensitive search mirror; positions index directly into `raw`.
-        let lower = self.raw.to_ascii_lowercase();
+        let Scan {
+            cleaned,
+            unresolved_at,
+        } = scan(&self.raw);
 
-        // If there's an unclosed opening tag somewhere in `raw`, only emit up
-        // to that opening position (in cleaned coordinates).
-        let mut unclosed_open: Option<usize> = None;
-        for tag in STRIPPED_TAGS {
-            let open = format!("<{tag}>");
-            let close = format!("</{tag}>");
-            if let Some(pos) = lower.rfind(&open) {
-                if !lower[pos..].contains(&close) {
-                    unclosed_open = Some(match unclosed_open {
-                        Some(prev) => prev.min(pos),
-                        None => pos,
-                    });
-                }
+        let safe_end = match unresolved_at {
+            Some(pos) => pos,
+            None => {
+                // Hold back any trailing partial-open-tag bytes.
+                let hold_back = partial_tag_overlap(&self.raw);
+                cleaned.len().saturating_sub(hold_back)
             }
-        }
-
-        let safe_end = if let Some(pos) = unclosed_open {
-            strip_internal_tags(&self.raw[..pos]).len()
-        } else {
-            // Hold back any trailing partial-open-tag bytes.
-            let hold_back = partial_tag_overlap(&self.raw);
-            cleaned.len().saturating_sub(hold_back)
         };
 
         if safe_end > self.emitted_len {
@@ -167,8 +207,114 @@ mod tests {
 
     #[test]
     fn strip_internal_tags_unclosed() {
-        let input = "Hello <internal>never closed";
-        assert_eq!(strip_internal_tags(input), "Hello ");
+        // An unclosed block strips to the end only when its opening tag
+        // starts the text or a line. Mid-line it is a mention of the tag,
+        // and the text after it is part of the answer.
+        let cases: &[(&str, &str)] = &[
+            // Leading unclosed tag: a cut-off reasoning preamble.
+            ("<internal>never closed", ""),
+            ("<think>plan\nmore plan", ""),
+            // Start of a later line, with leading spaces or tabs.
+            ("Answer.\n<internal>never closed", "Answer.\n"),
+            ("Answer.\n  \t<thinking>never closed", "Answer.\n  \t"),
+            // Mid-line mention: kept as written, tail included.
+            (
+                "Use the <internal> tag to hide notes. Next step: run tests.",
+                "Use the <internal> tag to hide notes. Next step: run tests.",
+            ),
+            (
+                "Hello <internal>never closed",
+                "Hello <internal>never closed",
+            ),
+            (
+                "Hello <thinking>never closed",
+                "Hello <thinking>never closed",
+            ),
+            // A closed block is still stripped after a mid-line mention.
+            (
+                "Wrap notes in <think> tags. <internal>x</internal>Done.",
+                "Wrap notes in <think> tags. Done.",
+            ),
+            // A mid-line mention followed by a line-start unclosed block:
+            // the mention stays, the cut-off block goes.
+            (
+                "Use <internal> here.\n<thinking>cut off",
+                "Use <internal> here.\n",
+            ),
+            // A cut-off block right after a stripped one still opens the
+            // kept text (or line), so it is reasoning, not a mention.
+            ("<think>a</think><think>b", ""),
+            ("x\n<i>y</i><internal>z", "x\n<i>y</i><internal>z"),
+            ("x\n<think>y</think><internal>z", "x\n"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_internal_tags(input), *expected, "input={input:?}");
+        }
+    }
+
+    /// Push `pieces` through a filter, then flush, and return the text the
+    /// consumer saw. It must always equal `full_clean()`: the consumer and
+    /// the persisted message may never disagree.
+    fn stream(pieces: &[&str]) -> (Vec<Option<String>>, String) {
+        let mut filter = InternalTagFilter::new();
+        let pushed: Vec<Option<String>> = pieces.iter().map(|p| filter.push(p)).collect();
+        let mut shown: String = pushed.iter().flatten().cloned().collect();
+        shown.push_str(&filter.flush().unwrap_or_default());
+        assert_eq!(shown, filter.full_clean(), "pieces={pieces:?}");
+        (pushed, shown)
+    }
+
+    #[test]
+    fn streaming_mid_line_mention_is_held_then_released_at_flush() {
+        // The text after a mid-line open tag is held back (a close could
+        // still arrive and strip it), then released at the end — not lost.
+        let (pushed, shown) = stream(&[
+            "Use the <internal> tag ",
+            "to hide notes. ",
+            "Next step: run tests.",
+        ]);
+        assert_eq!(pushed[0].as_deref(), Some("Use the "));
+        assert_eq!(pushed[1], None, "held back while the tag is unclosed");
+        assert_eq!(pushed[2], None);
+        assert_eq!(
+            shown,
+            "Use the <internal> tag to hide notes. Next step: run tests."
+        );
+    }
+
+    #[test]
+    fn streaming_mid_line_open_that_later_closes_never_leaks() {
+        // Same opening shape as a mention, but the close arrives: nothing
+        // inside the block may reach the consumer.
+        let (pushed, shown) = stream(&["Hello <internal>sec", "ret</internal> world"]);
+        assert_eq!(pushed[0].as_deref(), Some("Hello "));
+        assert_eq!(pushed[1].as_deref(), Some(" world"));
+        assert_eq!(shown, "Hello  world");
+    }
+
+    #[test]
+    fn streaming_cut_off_block_after_a_stripped_block_never_leaks() {
+        let (pushed, shown) = stream(&["<think>a</think>", "<think>b", " more"]);
+        assert!(pushed.iter().flatten().all(|p| p.is_empty()), "{pushed:?}");
+        assert_eq!(shown, "");
+    }
+
+    #[test]
+    fn streaming_line_start_unclosed_block_is_dropped_at_flush() {
+        let (pushed, shown) = stream(&["Answer.\n", "<think>plan the ", "next step"]);
+        assert_eq!(pushed[0].as_deref(), Some("Answer.\n"));
+        assert_eq!(pushed[1], None);
+        assert_eq!(pushed[2], None);
+        assert_eq!(shown, "Answer.\n");
+    }
+
+    #[test]
+    fn streaming_mention_before_a_closed_block_of_another_tag() {
+        // A mid-line `<think>` whose close never comes, with a closed
+        // `<internal>` block after it: the closed block is stripped, the
+        // mention survives, and the stream agrees with the final text.
+        let (_, shown) = stream(&["a <think> b ", "<internal>c</internal>", " d"]);
+        assert_eq!(shown, "a <think> b  d");
     }
 
     #[test]
@@ -234,8 +380,8 @@ mod tests {
 
     #[test]
     fn strip_thinking_tags_unclosed() {
-        let input = "Hello <thinking>never closed";
-        assert_eq!(strip_internal_tags(input), "Hello ");
+        let input = "<thinking>never closed";
+        assert_eq!(strip_internal_tags(input), "");
     }
 
     #[test]
@@ -330,8 +476,8 @@ mod tests {
             ("Hello <THINK>secret</think> World", "Hello  World"),
             ("Hello <INTERNAL>secret</Internal> World", "Hello  World"),
             ("Hello <Reasoning>secret</REASONING> World", "Hello  World"),
-            // Unclosed mixed-case open tag strips to the end.
-            ("Hello <ThInKiNg>never closed", "Hello "),
+            // Leading unclosed mixed-case open tag strips to the end.
+            ("<ThInKiNg>never closed", ""),
         ];
         for (input, expected) in cases {
             assert_eq!(strip_internal_tags(input), *expected, "input={input:?}");

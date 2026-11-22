@@ -263,6 +263,24 @@ mod tests {
         assert_eq!(p["mentioned"], true);
     }
 
+    #[test]
+    fn a_discord_interaction_reaches_subscriptions_as_a_mention() {
+        // A slash command, button or modal is aimed at this application, so
+        // the parser marks it addressed even though Discord has no mention
+        // token and the channel has no bot handle to search for.
+        let interaction: crate::discord::types::Interaction = serde_json::from_value(json!({
+            "id": "1", "application_id": "2", "type": 2, "token": "t",
+            "channel_id": "10", "guild_id": "20",
+            "member": {"user": {"id": "30", "username": "u"}},
+            "data": {"name": "ask", "options": [{"name": "q", "type": 3, "value": "hello"}]}
+        }))
+        .unwrap();
+        let msg = crate::discord::parse::parse_interaction(&interaction).unwrap();
+        let addressed = crate::handler::inbound_addressed_to_bot(&msg, None);
+        let p = channel_payload(None, addressed, &msg);
+        assert_eq!(p["kind"], "mention");
+    }
+
     #[tokio::test]
     async fn an_unapproved_sender_wakes_nothing_under_pairing() {
         let db = Database::test_db().await;

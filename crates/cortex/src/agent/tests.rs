@@ -355,6 +355,7 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         tool_intent_signalled: false,
         emitted_text_bytes: 0,
         nudged_for_dropped_tools: false,
+        pending_request_hint: None,
         llm_role: LlmRole::Primary,
         goal_runtime: crate::goals::runtime::GoalRuntimeState::new(),
         goal_event_sink: None,
@@ -2033,16 +2034,18 @@ async fn dropped_tool_call_nudges_once_then_terminates() {
         .handle_text_only_response("Let me check the file...", None, false, false, &tx)
         .await;
     assert!(matches!(outcome, TextOnlyOutcome::NudgeAndContinue));
+    // The nudge rides on the next request only; it is never persisted.
     let nudge = agent
-        .history
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, crate::types::Role::System))
-        .and_then(|m| m.text_content())
-        .expect("nudge must be persisted as a system message");
+        .pending_request_hint
+        .expect("nudge must be queued for the next request");
     assert!(
         nudge.contains("no tool call was received"),
         "unexpected nudge text: {nudge}"
+    );
+    assert!(
+        agent.history.is_empty(),
+        "the nudge must not be written to history: {:?}",
+        agent.history
     );
 
     // Second occurrence in the same turn (intent still signalled, guard set):
