@@ -1337,6 +1337,27 @@ mod tests {
         );
     }
 
+    /// Spec: the `context_length_exceeded` code alone means the prompt is
+    /// over the window, whatever the message says and whether it arrives on
+    /// a 400 response, a status-less stream frame, or as opaque text. Each
+    /// path must route to reactive compaction rather than a generic failure.
+    #[test]
+    fn context_length_exceeded_code_is_overflow_on_every_path() {
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"Request rejected"}}"#;
+        assert_eq!(
+            classify_error_text(body),
+            Some(FailoverReason::ContextOverflow)
+        );
+        assert_eq!(
+            classify_stream_error_frame(body, "openai").reason(),
+            FailoverReason::ContextOverflow
+        );
+        assert_eq!(
+            classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::Custom).reason(),
+            FailoverReason::ContextOverflow
+        );
+    }
+
     /// Spec: the stream-frame classifier reaches the embedded header, so a
     /// mid-stream 429 frame produces a `Retryable` error that carries the
     /// provider's delay instead of `None`.

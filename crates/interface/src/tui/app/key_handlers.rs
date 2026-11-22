@@ -17,10 +17,7 @@ use cortex::config::CollaborationMode;
 use super::super::history::{ApprovalStatus, HistoryCell};
 use super::super::plan_overlay::PlanOption;
 use super::super::transcript_pager::PagerAction;
-use super::{
-    extract_at_query, try_paste_clipboard_image, App, AppAction, AppState, BacktrackPhase,
-    QueuedMessage,
-};
+use super::{read_clipboard, App, AppAction, AppState, BacktrackPhase, QueuedMessage};
 
 /// The command name of a composer line that is a slash command (`/x …`),
 /// or `None` for ordinary text. A lone `/` and a `/` followed by
@@ -553,12 +550,13 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+V — paste clipboard image (fall through to normal paste if no image)
-        if key.code == KeyCode::Char('v')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && try_paste_clipboard_image(&mut self.composer)
-        {
-            return Ok(AppAction::Continue);
+        // Ctrl+V — paste the clipboard: an image attaches, text goes through
+        // the same path as a terminal paste. An empty or unreadable clipboard
+        // falls through to the composer.
+        if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(paste) = read_clipboard() {
+                return Ok(self.apply_clipboard_paste(paste));
+            }
         }
 
         // Shift+Tab — cycle collaboration mode (default → execute → plan → default)
@@ -603,12 +601,7 @@ impl<'a> App<'a> {
             let text = self.composer.text();
             self.command_popup.update_filter(&text);
             if !self.command_popup.is_visible() {
-                if let Some(q) = extract_at_query(&text) {
-                    self.file_popup.set_pending_query(&q);
-                    self.file_search.on_query(&q);
-                } else {
-                    self.file_popup.dismiss();
-                }
+                self.sync_file_popup();
             }
         }
         Ok(AppAction::Continue)
@@ -750,13 +743,7 @@ impl<'a> App<'a> {
                     let is_dir = file.is_dir;
                     if is_dir {
                         self.composer.set_partial_mention(display);
-                        let text = self.composer.text();
-                        if let Some(q) = extract_at_query(&text) {
-                            self.file_popup.set_pending_query(&q);
-                            self.file_search.on_query(&q);
-                        } else {
-                            self.file_popup.dismiss();
-                        }
+                        self.sync_file_popup();
                     } else {
                         let _ = path; // mentions expander re-resolves from display at submit
                         self.composer.complete_file_mention(&display);
@@ -769,13 +756,7 @@ impl<'a> App<'a> {
             }
             _ => {
                 self.composer.handle_key(key);
-                let text = self.composer.text();
-                if let Some(q) = extract_at_query(&text) {
-                    self.file_popup.set_pending_query(&q);
-                    self.file_search.on_query(&q);
-                } else {
-                    self.file_popup.dismiss();
-                }
+                self.sync_file_popup();
             }
         }
         Ok(Some(AppAction::Continue))

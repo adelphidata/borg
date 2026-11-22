@@ -1013,6 +1013,9 @@ impl<'a> App<'a> {
                 if composer_text.starts_with('/') {
                     self.command_popup.update_filter(&composer_text);
                 }
+                if !self.command_popup.is_visible() {
+                    self.sync_file_popup();
+                }
                 AppAction::Continue
             }
             _ => {
@@ -1246,6 +1249,37 @@ impl<'a> App<'a> {
     }
 }
 
+impl App<'_> {
+    /// Open the file popup on the `@file` query the composer is in the middle
+    /// of, or shut it when there is none. A `!` line is a shell command that
+    /// runs as typed, so an `@` in it (`git log --author=@me`) is never a
+    /// mention: an open popup would let Enter complete a path instead of
+    /// running the command.
+    pub(super) fn sync_file_popup(&mut self) {
+        let text = self.composer.text();
+        let shell_line = self.config.ui.shell_mode_enabled && text.starts_with('!');
+        match extract_at_query(&text).filter(|_| !shell_line) {
+            Some(q) => {
+                self.file_popup.set_pending_query(&q);
+                self.file_search.on_query(&q);
+            }
+            None => self.file_popup.dismiss(),
+        }
+    }
+
+    /// Apply a Ctrl+V clipboard read: attach an image, or paste text as the
+    /// terminal would have.
+    pub(super) fn apply_clipboard_paste(&mut self, paste: ClipboardPaste) -> AppAction {
+        match paste {
+            ClipboardPaste::Image(bytes, mime) => {
+                self.composer.add_image(bytes, mime);
+                AppAction::Continue
+            }
+            ClipboardPaste::Text(text) => self.handle_paste(text),
+        }
+    }
+}
+
 /// Extract the query portion after the last `@` in text, if it looks like a file
 /// mention in progress (preceded by whitespace or at position 0, and unterminated).
 fn extract_at_query(text: &str) -> Option<String> {
@@ -1268,31 +1302,58 @@ fn extract_at_query(text: &str) -> Option<String> {
     Some(after.to_string())
 }
 
-/// Try to paste a clipboard image into the composer. Returns true if an image was pasted.
-fn try_paste_clipboard_image(composer: &mut Composer) -> bool {
-    let Ok(mut clipboard) = arboard::Clipboard::new() else {
-        return false;
+/// What Ctrl+V takes from the system clipboard.
+#[derive(Debug, PartialEq)]
+pub(super) enum ClipboardPaste {
+    /// Image bytes and their MIME type, attached to the next message.
+    Image(Vec<u8>, String),
+    /// Text, inserted into the composer as a terminal paste would be.
+    Text(String),
+}
+
+/// Read the system clipboard for Ctrl+V. `None` when it is unavailable or
+/// holds nothing usable, and the key falls through to the composer.
+pub(super) fn read_clipboard() -> Option<ClipboardPaste> {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(e) => {
+            tracing::debug!(error = %e, "clipboard unavailable for Ctrl+V");
+            return None;
+        }
     };
+    let png = clipboard
+        .get_image()
+        .ok()
+        .and_then(|img| rgba_to_png(&img.bytes, img.width as u32, img.height as u32));
+    // Each read is a round trip on X11/Wayland, so text is read only when
+    // there is no image to win over it.
+    let text = if png.is_some() {
+        None
+    } else {
+        clipboard
+            .get_text()
+            .map_err(|e| tracing::debug!(error = %e, "clipboard holds no text for Ctrl+V"))
+            .ok()
+    };
+    classify_clipboard(png, text)
+}
 
-    if let Ok(img_data) = clipboard.get_image() {
-        if let Some(png_bytes) = rgba_to_png(
-            &img_data.bytes,
-            img_data.width as u32,
-            img_data.height as u32,
-        ) {
-            composer.add_image(png_bytes, "image/png".to_string());
-            return true;
-        }
+/// Decide what a clipboard read pastes. An image wins; text that names an
+/// image file attaches that file; any other non-empty text pastes as text.
+/// Terminals that pass Ctrl+V through raw send no paste event of their own,
+/// so dropping the text here would make Ctrl+V paste nothing at all.
+pub(super) fn classify_clipboard(
+    png: Option<Vec<u8>>,
+    text: Option<String>,
+) -> Option<ClipboardPaste> {
+    if let Some(bytes) = png {
+        return Some(ClipboardPaste::Image(bytes, "image/png".to_string()));
     }
-
-    if let Ok(text) = clipboard.get_text() {
-        if let Some((bytes, mime)) = read_pasted_image_path(&text) {
-            composer.add_image(bytes, mime.to_string());
-            return true;
-        }
+    let text = text.filter(|t| !t.is_empty())?;
+    if let Some((bytes, mime)) = read_pasted_image_path(&text) {
+        return Some(ClipboardPaste::Image(bytes, mime.to_string()));
     }
-
-    false
+    Some(ClipboardPaste::Text(text))
 }
 
 /// The image `text` names, with its MIME type, when `text` is the path of a

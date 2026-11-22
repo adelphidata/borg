@@ -23,6 +23,24 @@ mod sse_framing;
 pub mod stdio;
 pub mod url_guard;
 
+/// The reason a request or body read failed, without the endpoint URL.
+///
+/// `reqwest::Error`'s `Display` names the full URL, and an MCP endpoint can
+/// carry its credential in the query string. The error text reaches logs, the
+/// audit trail, server health and the model, and the server name already
+/// identifies the endpoint, so the URL is dropped. The source chain stays,
+/// because it holds the cause (refused, DNS, TLS, timeout).
+pub(crate) fn transport_error_reason(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut reason = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        reason.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    reason
+}
+
 /// Open the transport described by `manifest` under `policy`.
 ///
 /// This is the one place that knows how to translate a `ServerManifest` into

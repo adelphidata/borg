@@ -100,7 +100,11 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| {
-        McpError::Connect(format!("{}: sse connect failed: {e}", config.server_name))
+        McpError::Connect(format!(
+            "{}: sse connect failed: {}",
+            config.server_name,
+            super::transport_error_reason(e)
+        ))
     })?;
 
     let status = resp.status();
@@ -370,7 +374,11 @@ impl Transport for SseTransport {
             req = req.header(k, v);
         }
         let resp = req.json(&msg).send().await.map_err(|e| {
-            McpError::TransportClosed(format!("{}: sse post failed: {e}", self.server_name))
+            McpError::TransportClosed(format!(
+                "{}: sse post failed: {}",
+                self.server_name,
+                super::transport_error_reason(e)
+            ))
         })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -434,6 +442,37 @@ mod tests {
             .map(|r| r.map(|ev| ev.data).map_err(|e| e.to_string()))
             .collect()
             .await
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_names_the_server_but_not_the_endpoint_url() {
+        // The SSE URL can carry its credential in the query string, and the
+        // connect error reaches logs, server health and the model.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = SseConfig {
+            server_name: "events".to_string(),
+            url: format!("http://127.0.0.1:{port}/sse?api_key=sk-query-secret"),
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            policy: HttpPolicy {
+                allow_plaintext_http: true,
+                allow_local_network: true,
+            },
+            client_identity: None,
+            ca_cert_path: None,
+            max_response_bytes: 1024,
+        };
+        let Err(err) = open(config, Duration::from_secs(5)).await else {
+            panic!("nothing listens on the port");
+        };
+        let McpError::Connect(msg) = err else {
+            panic!("a refused connection is a connect error, got {err:?}");
+        };
+        assert!(msg.starts_with("events: sse connect failed"), "{msg}");
+        assert!(!msg.contains("sk-query-secret"), "credential leaked: {msg}");
+        assert!(!msg.contains("/sse"), "endpoint URL leaked: {msg}");
     }
 
     #[tokio::test]

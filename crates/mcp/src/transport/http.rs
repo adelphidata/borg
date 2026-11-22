@@ -279,8 +279,13 @@ impl HttpTransport {
             // A connect/timeout failure (server not yet listening, momentary
             // network blip) is transient and retryable on the idempotent startup
             // path; any other send failure tears the transport down.
-            let detail = format!("{}: http send failed: {e}", self.server_name);
-            if e.is_connect() || e.is_timeout() {
+            let retryable = e.is_connect() || e.is_timeout();
+            let detail = format!(
+                "{}: http send failed: {}",
+                self.server_name,
+                super::transport_error_reason(e)
+            );
+            if retryable {
                 McpError::Connect(detail)
             } else {
                 McpError::TransportClosed(detail)
@@ -360,7 +365,11 @@ impl HttpTransport {
         let (body, truncated) = read_body_capped(&mut resp, self.max_response_bytes)
             .await
             .map_err(|e| {
-                McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
+                McpError::TransportClosed(format!(
+                    "{}: body read failed: {}",
+                    self.server_name,
+                    super::transport_error_reason(e)
+                ))
             })?;
         if truncated {
             return Err(self.response_too_large());
@@ -403,7 +412,11 @@ impl HttpTransport {
         let mut answered = false;
         while !answered {
             let chunk = resp.chunk().await.map_err(|e| {
-                McpError::TransportClosed(format!("{}: body read failed: {e}", self.server_name))
+                McpError::TransportClosed(format!(
+                    "{}: body read failed: {}",
+                    self.server_name,
+                    super::transport_error_reason(e)
+                ))
             })?;
             // End of stream with no response: `recv` reports the missing
             // response after it drains what did arrive.
@@ -849,6 +862,29 @@ mod tests {
             ca_cert_path: None,
             max_response_bytes,
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_names_the_server_but_not_the_endpoint_url() {
+        // An endpoint can carry its credential in the query string. The send
+        // error goes to logs, server health and the model, so it must name
+        // the server and the cause but never echo the URL.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = local_http_config(port, 1024);
+        config.url = format!("http://127.0.0.1:{port}/mcp?api_key=sk-query-secret");
+        let mut transport = open(config).await.unwrap();
+        let err = transport
+            .send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))
+            .await
+            .expect_err("nothing listens on the port");
+        let McpError::Connect(msg) = err else {
+            panic!("a refused connection must stay retryable, got {err:?}");
+        };
+        assert!(msg.starts_with("capped: http send failed"), "{msg}");
+        assert!(!msg.contains("sk-query-secret"), "credential leaked: {msg}");
+        assert!(!msg.contains("/mcp"), "endpoint URL leaked: {msg}");
     }
 
     #[tokio::test]
