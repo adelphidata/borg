@@ -163,9 +163,9 @@ async fn generate_session_title(
     ];
     // Streamed aggregate: the timeout is inactivity-based (same contract as
     // compaction), so a slow aux model finishes while a wedged one dies.
-    let reply = llm.chat_streamed(&messages).await;
+    let reply = llm.chat_streamed_checked(&messages).await;
     let usage = llm.take_usage();
-    let response = match reply {
+    let (response, truncated) = match reply {
         Ok(m) => m,
         Err(e) => {
             warn!("auto-title: aux chat failed: {e}");
@@ -173,7 +173,15 @@ async fn generate_session_title(
         }
     };
     let raw = response.text_content().unwrap_or("");
-    (clean_title(raw), usage)
+    let title = clean_title(raw);
+    if title.is_none() && truncated {
+        // E.g. reasoning spent the output budget, or the cut left only text
+        // the cleanup drops. Judged after cleanup so both cases are logged.
+        warn!(
+            "auto-title: the reply for {session_id} stopped at the output limit and left no usable title"
+        );
+    }
+    (title, usage)
 }
 
 /// Background entry point. Wraps the full lifecycle: skip if the user has
@@ -404,5 +412,25 @@ mod tests {
 
         assert_eq!(requests.lock().expect("requests").len(), 1);
         assert_eq!(db.monthly_token_total().await.expect("token total"), 18);
+    }
+
+    /// A reply cut at the output limit whose only text the cleanup drops
+    /// gives no title; the call still reports its usage.
+    #[tokio::test]
+    async fn a_reply_cut_at_the_limit_with_no_usable_text_gives_no_title() {
+        use crate::llm::test_server::{reply_with_usage, serve_sse};
+        let (url, requests) = serve_sse(vec![reply_with_usage("...", "length")]);
+        let mut config = Config::default();
+        config.llm.provider = Some("custom".to_string());
+        config.llm.model = "test-model".to_string();
+        config.llm.base_url = Some(url);
+        config.llm.max_retries = 0;
+
+        let (title, usage) =
+            generate_session_title("title-cut-test-5b1e", "hello", "hi there", &config).await;
+
+        assert_eq!(title, None);
+        assert_eq!(requests.lock().expect("requests").len(), 1);
+        assert_eq!(usage.len(), 1);
     }
 }
