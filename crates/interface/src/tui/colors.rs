@@ -213,11 +213,17 @@ fn best_color(r: u8, g: u8, b: u8) -> Option<Color> {
 }
 
 pub(super) fn supports_truecolor() -> bool {
-    if let Ok(ct) = std::env::var("COLORTERM") {
-        matches!(ct.as_str(), "truecolor" | "24bit")
-    } else {
-        false
-    }
+    truecolor_from_env(
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+/// `COLORTERM` is the usual truecolor signal, but SSH does not forward it by
+/// default. Ghostty always renders 24-bit colour and announces itself through
+/// `TERM`, which SSH does forward, so accept that as well.
+fn truecolor_from_env(colorterm: Option<&str>, term: Option<&str>) -> bool {
+    matches!(colorterm, Some("truecolor" | "24bit")) || term == Some("xterm-ghostty")
 }
 
 fn supports_256color() -> bool {
@@ -295,6 +301,20 @@ pub(super) fn user_message_bg() -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truecolor_accepts_colorterm_or_ghostty_term() {
+        assert!(truecolor_from_env(
+            Some("truecolor"),
+            Some("xterm-256color")
+        ));
+        assert!(truecolor_from_env(Some("24bit"), None));
+        // SSH forwards TERM but not COLORTERM.
+        assert!(truecolor_from_env(None, Some("xterm-ghostty")));
+        assert!(!truecolor_from_env(None, Some("xterm-256color")));
+        assert!(!truecolor_from_env(Some("1"), Some("xterm")));
+        assert!(!truecolor_from_env(None, None));
+    }
 
     #[test]
     fn parse_osc11_handles_all_digit_widths_and_both_terminators() {

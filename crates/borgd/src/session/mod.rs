@@ -51,6 +51,12 @@ struct HostInner {
     /// forwarder. Held under one mutex so `start_turn` can serialize a new
     /// turn against the prior one's drain (no event-leak between turns).
     turn_state: AsyncMutex<TurnState>,
+    /// Cancel token of the turn that is running now. Kept outside
+    /// `turn_state` on purpose: a queued turn holds that lock for as long as
+    /// the running turn takes to drain, and a cancel that waited for the lock
+    /// would arrive after the turn it was meant for and stop the queued one
+    /// instead.
+    active_cancel: std::sync::Mutex<CancellationToken>,
     /// `true` while a turn's events are streaming. Set when a turn installs
     /// its state in [`SessionHost::start_turn`]; cleared when that turn's
     /// forwarder drains. Read by [`SessionHost::is_busy`] so an internal/
@@ -118,8 +124,16 @@ impl HostInner {
     }
 }
 
+impl HostInner {
+    fn active_cancel(&self) -> CancellationToken {
+        self.active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 struct TurnState {
-    cancel: CancellationToken,
     /// Awaited at the start of the next turn so the prior forwarder finishes
     /// pushing its events into the buffer before this turn's baseline is
     /// captured. Without this, `Session.Send`'s "events for THIS turn" filter
@@ -154,10 +168,8 @@ impl SessionHost {
                 backend,
                 buffer: SequencedBuffer::new(),
                 prompts: Arc::new(PromptRegistry::default()),
-                turn_state: AsyncMutex::new(TurnState {
-                    cancel: CancellationToken::new(),
-                    forwarder: None,
-                }),
+                turn_state: AsyncMutex::new(TurnState { forwarder: None }),
+                active_cancel: std::sync::Mutex::new(CancellationToken::new()),
                 busy: AtomicBool::new(false),
                 activity: OnceLock::new(),
                 publishes_activity: AtomicBool::new(true),
@@ -261,8 +273,7 @@ impl SessionHost {
     /// Cancel the in-flight turn (if any). No-op when between turns.
     /// Background sub-agents keep running: a turn interrupt is not a stop.
     pub async fn cancel_turn(&self) {
-        let token = self.inner.turn_state.lock().await.cancel.clone();
-        token.cancel();
+        self.inner.active_cancel().cancel();
     }
 
     /// Explicit stop: cancel the in-flight turn and end the session's
@@ -282,12 +293,17 @@ impl SessionHost {
     /// the session is being closed or replaced so any waiting agent task
     /// unblocks promptly and the next turn (if any) starts clean.
     pub async fn close(&self) {
+        // Stop the running turn first. A queued turn holds the turn lock
+        // until this one drains, so waiting for the lock before the cancel
+        // would make close last as long as the turn.
+        self.inner.active_cancel().cancel();
         let token = {
-            let state = self.inner.turn_state.lock().await;
+            let _state = self.inner.turn_state.lock().await;
             // Under the turn lock, so a guarded internal start that is waiting on
             // the same lock sees the flag and declines rather than queueing.
             self.inner.closed.store(true, Ordering::SeqCst);
-            state.cancel.clone()
+            // A queued turn may have installed itself in the meantime.
+            self.inner.active_cancel()
         };
         token.cancel();
         self.inner.prompts.clear();
@@ -519,7 +535,11 @@ impl SessionHost {
                     tracing::warn!(error = %e, "prior turn's forwarder join failed");
                 }
             }
-            state.cancel = cancel.clone();
+            *self
+                .inner
+                .active_cancel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = cancel.clone();
             state.forwarder = Some(forwarder);
             // Mark busy under the same lock that installs the turn, so a
             // concurrent `is_busy()` can't observe a half-installed state.
@@ -1145,6 +1165,60 @@ mod tests {
             matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
             "expected terminal Error('cancelled'), got {:?}",
             last.kind
+        );
+    }
+
+    /// A cancel sent while a second turn is queued must stop the turn that is
+    /// running. The queued turn holds the turn lock until the running one
+    /// drains; a cancel that waited on that lock arrived only after the turn
+    /// ended by itself and then stopped the queued turn instead.
+    #[tokio::test]
+    async fn cancel_with_a_queued_turn_stops_the_running_turn() {
+        let host = Arc::new(SessionHost::new(stub(
+            "s-queue",
+            &["a", "b", "c", "d"],
+            300,
+        )));
+        let mut rx = host.subscribe();
+        host.start_turn("first".into(), Vec::new(), None, None)
+            .await;
+        let _ = tokio::time::timeout(Duration::from_millis(600), rx.recv()).await;
+
+        let queued_host = host.clone();
+        let queued = tokio::spawn(async move {
+            queued_host
+                .start_turn("second".into(), Vec::new(), None, None)
+                .await
+        });
+        // Let the queued start take the turn lock and park on the drain.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let cancel_at = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_millis(200), host.cancel_turn())
+            .await
+            .expect("cancel must not wait for the running turn to end");
+        let first = drain_until_terminal(&mut rx).await;
+        assert!(
+            cancel_at.elapsed() < Duration::from_millis(500),
+            "the running turn kept going for {:?} after the cancel",
+            cancel_at.elapsed()
+        );
+        assert!(
+            matches!(&first.last().expect("terminal event").kind, Some(Kind::Error(e)) if e.message == "cancelled"),
+            "the running turn must end as cancelled, got {:?}",
+            first.last()
+        );
+
+        // The queued turn was not the target: it runs to completion.
+        queued.await.expect("queued start joins");
+        let second = drain_until_terminal(&mut rx).await;
+        assert!(
+            matches!(
+                second.last().expect("terminal event").kind,
+                Some(Kind::TurnComplete(_))
+            ),
+            "the queued turn must complete, got {:?}",
+            second.last()
         );
     }
 

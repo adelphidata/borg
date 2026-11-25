@@ -414,6 +414,26 @@ impl<'a> Composer<'a> {
         self.paste_burst.append_control_char_if_active('\t', now)
     }
 
+    /// Capture an unmodified Enter that belongs to a paste arriving without
+    /// bracketed paste markers. Callers that bind Enter outside the composer
+    /// (the mid-turn steer) must ask here first, or a pasted newline sends
+    /// half of the paste. Returns `true` when the Enter was consumed as text.
+    pub fn capture_burst_enter(&mut self, key: &KeyEvent) -> bool {
+        self.capture_burst_enter_at(key, Instant::now())
+    }
+
+    fn capture_burst_enter_at(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if key.code != KeyCode::Enter || key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        if self.search.is_some() {
+            return false;
+        }
+        self.flush_due_burst(now);
+        self.paste_burst.capture_newline(now)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         self.handle_key_at(key, Instant::now())
     }
@@ -448,8 +468,8 @@ impl<'a> Composer<'a> {
 
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                // During a paste burst, treat Enter as newline instead of submit
-                if self.paste_burst.append_control_char_if_active('\n', now) {
+                // Inside a paste, Enter is a newline instead of a submit.
+                if self.paste_burst.capture_newline(now) {
                     return None;
                 }
 
@@ -862,6 +882,9 @@ impl<'a> Composer<'a> {
 
         // 1-row top/bottom padding floats the textarea inside the tinted card.
         let top = u16::from(area.height > 2);
+        if top == 1 && theme::user_message_style().bg.is_none() {
+            render_untinted_rules(frame.buffer_mut(), area);
+        }
         let textarea_rect = Rect {
             x: area.x.saturating_add(gutter),
             y: area.y.saturating_add(top),
@@ -893,9 +916,32 @@ impl<'a> Composer<'a> {
     }
 }
 
+/// Without a known terminal background there is no tint, so nothing separates
+/// the composer from the transcript above it. Draw a dim rule in each padding
+/// row instead.
+fn render_untinted_rules(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    let rule = "─".repeat(area.width as usize);
+    let style = Style::default().add_modifier(ratatui::style::Modifier::DIM);
+    for y in [area.y, area.bottom().saturating_sub(1)] {
+        buf.set_string(area.x, y, &rule, style);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untinted_rules_fill_only_the_two_padding_rows() {
+        let area = Rect::new(0, 0, 6, 4);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_untinted_rules(&mut buf, area);
+        let row = |y: u16| -> String { (0..6).map(|x| buf[(x, y)].symbol()).collect() };
+        assert_eq!(row(0), "──────");
+        assert_eq!(row(1), "      ");
+        assert_eq!(row(2), "      ");
+        assert_eq!(row(3), "──────");
+    }
 
     /// A crash mid-append leaves a line with no trailing newline. The next
     /// append must not fuse onto it — that would corrupt the new entry too,

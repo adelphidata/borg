@@ -88,6 +88,7 @@ const BILLING_NEEDLES: &[&str] = &[
     "spend_limit_exceeded",
     "spend limit exceeded",
     "organization_usage_limit_exceeded",
+    "budget_reached",
 ];
 
 /// Structured `error.code` / `error.type` values that mean the *account* is
@@ -106,7 +107,11 @@ const BILLING_ERROR_CODES: &[&str] = &[
     "credit_balance_exhausted",
     "organization_spend_limit_exceeded",
     "project_spend_limit_exceeded",
+    // The cap can also sit on the key itself. An exact-code list has to name
+    // it: the 429 path does not fall back to the substring needles.
+    "api_key_spend_limit_exceeded",
     "organization_usage_limit_exceeded",
+    "budget_reached",
 ];
 
 /// Free-text fallback for a 429 body whose structured code did not survive a
@@ -649,6 +654,10 @@ const CONTENT_POLICY_NEEDLES: &[&str] = &[
     "violates our usage policies",
     "responsibleaipolicyviolation",
     "content exists risk",
+    // Domain-specific refusal codes. They arrive as bare stream frames with
+    // no status as well, where anything unrecognized is retried.
+    "cyber_policy",
+    "bio_policy",
 ];
 
 /// True when the body is a content-policy refusal, whatever status wraps it

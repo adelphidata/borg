@@ -24,6 +24,16 @@ const BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
 /// Minimum consecutive fast chars to trigger burst detection.
 const BURST_MIN_CHARS: u16 = 3;
 
+/// Fast chars that make an immediately following Enter part of a paste even
+/// though the burst has not started yet (a short first line such as `hi`).
+/// No person presses two keys and Enter inside the burst interval.
+const NEWLINE_MIN_FAST_CHARS: u16 = 2;
+
+/// How long after an idle flush an Enter still counts as pasted text. A
+/// terminal can stall mid-paste for longer than the idle timeout; the newline
+/// that arrives next must not submit the half-pasted prompt.
+const ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
+
 /// What to do with a character event.
 pub(crate) enum CharAction {
     /// Insert the character normally (not part of a burst).
@@ -38,6 +48,8 @@ pub(crate) struct PasteBurst {
     last_char_time: Option<Instant>,
     consecutive_fast_chars: u16,
     active: bool,
+    /// When the burst that the idle timeout last flushed went idle.
+    last_idle_flush: Option<Instant>,
 }
 
 impl PasteBurst {
@@ -53,6 +65,8 @@ impl PasteBurst {
             }
             _ => {
                 self.consecutive_fast_chars = 1;
+                // A char at typing speed: the paste is over.
+                self.last_idle_flush = None;
             }
         }
         self.last_char_time = Some(now);
@@ -90,6 +104,34 @@ impl PasteBurst {
         }
     }
 
+    /// Decide whether an unmodified Enter is a pasted newline, and buffer it
+    /// when it is. Three cases qualify: a burst is active; the Enter follows a
+    /// run of fast chars too short to have started one; or a burst was flushed
+    /// by the idle timeout a moment ago, which is a paste that stalled rather
+    /// than one that ended. The last two start a burst so the rest of the
+    /// paste is buffered behind the newline.
+    pub fn capture_newline(&mut self, now: Instant) -> bool {
+        if self.append_control_char_if_active('\n', now) {
+            return true;
+        }
+        let in_fast_run = self.consecutive_fast_chars >= NEWLINE_MIN_FAST_CHARS
+            && self
+                .last_char_time
+                .is_some_and(|t| now.duration_since(t) <= BURST_CHAR_INTERVAL);
+        // One Enter per flush: taken here, so a second Enter is a submit.
+        let just_flushed = self
+            .last_idle_flush
+            .take()
+            .is_some_and(|t| now.saturating_duration_since(t) <= ENTER_SUPPRESS_WINDOW);
+        if !(in_fast_run || just_flushed) {
+            return false;
+        }
+        self.active = true;
+        self.buffer.push('\n');
+        self.last_char_time = Some(now);
+        true
+    }
+
     /// Called on each tick. Returns buffered text if idle timeout has elapsed.
     pub fn flush_if_due(&mut self, now: Instant) -> Option<String> {
         if !self.active || self.buffer.is_empty() {
@@ -103,6 +145,11 @@ impl PasteBurst {
         if timed_out {
             self.active = false;
             self.consecutive_fast_chars = 0;
+            // Stamp the moment the burst went idle, not the moment this call
+            // noticed. Ticks are skipped while a popup is open, so the flush
+            // can run long after the paste ended, and an Enter right after
+            // such a late flush is the user's own submit.
+            self.last_idle_flush = self.last_char_time.map(|t| t + BURST_IDLE_TIMEOUT);
             Some(std::mem::take(&mut self.buffer))
         } else {
             None
@@ -111,6 +158,7 @@ impl PasteBurst {
 
     /// Flush immediately when a non-char key arrives during buffering.
     pub fn flush_immediate(&mut self) -> Option<String> {
+        self.last_idle_flush = None;
         if !self.active || self.buffer.is_empty() {
             return None;
         }
@@ -130,6 +178,89 @@ impl PasteBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enter_after_a_short_fast_line_is_a_pasted_newline() {
+        // "hi\nthere" without bracketed paste: two chars is under the burst
+        // threshold, so the Enter used to submit "hi".
+        let mut pb = PasteBurst::new();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(1);
+        assert!(matches!(pb.on_char('h', t0), CharAction::Insert));
+        assert!(matches!(pb.on_char('i', t0 + step), CharAction::Insert));
+        assert!(pb.capture_newline(t0 + step * 2));
+        // The rest of the paste is buffered behind the newline.
+        assert!(matches!(pb.on_char('t', t0 + step * 3), CharAction::Buffer));
+        assert_eq!(
+            pb.flush_if_due(t0 + Duration::from_millis(200)).as_deref(),
+            Some("\nt")
+        );
+    }
+
+    #[test]
+    fn enter_after_typed_text_is_not_captured() {
+        let mut pb = PasteBurst::new();
+        let t0 = Instant::now();
+        // One fast char is not a run.
+        pb.on_char('y', t0);
+        assert!(!pb.capture_newline(t0 + Duration::from_millis(1)));
+        // Two chars at typing speed, then Enter.
+        pb.on_char('o', t0 + Duration::from_millis(150));
+        pb.on_char('k', t0 + Duration::from_millis(300));
+        assert!(!pb.capture_newline(t0 + Duration::from_millis(301)));
+        // Two fast chars, but the Enter comes at typing speed.
+        let t1 = t0 + Duration::from_secs(1);
+        pb.on_char('o', t1);
+        pb.on_char('k', t1 + Duration::from_millis(1));
+        assert!(!pb.capture_newline(t1 + Duration::from_millis(150)));
+        assert!(!pb.is_active());
+    }
+
+    #[test]
+    fn enter_just_after_an_idle_flush_continues_the_paste() {
+        let mut pb = PasteBurst::new();
+        let t0 = Instant::now();
+        for (i, ch) in "abcd".chars().enumerate() {
+            pb.on_char(ch, t0 + Duration::from_millis(i as u64));
+        }
+        // The terminal stalls past the idle timeout and the tick flushes.
+        let flushed_at = t0 + Duration::from_millis(80);
+        assert!(pb.flush_if_due(flushed_at).is_some());
+        assert!(!pb.is_active());
+        assert!(pb.capture_newline(flushed_at + Duration::from_millis(40)));
+        assert!(pb.is_active());
+        // The window is spent: after that newline flushes, the next Enter
+        // is a submit.
+        assert!(pb
+            .flush_if_due(flushed_at + Duration::from_millis(60))
+            .is_some());
+        assert!(pb.capture_newline(flushed_at + Duration::from_millis(70)));
+        assert!(pb
+            .flush_if_due(flushed_at + Duration::from_millis(90))
+            .is_some());
+        assert!(!pb.capture_newline(flushed_at + Duration::from_millis(300)));
+
+        // Outside the window an Enter is the user's own.
+        let mut pb = PasteBurst::new();
+        for (i, ch) in "abcd".chars().enumerate() {
+            pb.on_char(ch, t0 + Duration::from_millis(i as u64));
+        }
+        assert!(pb.flush_if_due(flushed_at).is_some());
+        assert!(!pb.capture_newline(flushed_at + ENTER_SUPPRESS_WINDOW * 2));
+    }
+
+    #[test]
+    fn an_immediate_flush_does_not_open_the_enter_window() {
+        // A non-char key ends the burst on purpose; the Enter that follows
+        // is a real submit.
+        let mut pb = PasteBurst::new();
+        let t0 = Instant::now();
+        for (i, ch) in "abcd".chars().enumerate() {
+            pb.on_char(ch, t0 + Duration::from_millis(i as u64));
+        }
+        assert!(pb.flush_immediate().is_some());
+        assert!(!pb.capture_newline(t0 + Duration::from_millis(20)));
+    }
 
     #[test]
     fn test_single_char_not_buffered() {

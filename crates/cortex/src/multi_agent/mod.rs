@@ -400,8 +400,9 @@ impl SubAgentCompletion {
             SubAgentStatus::Errored { error } => Some((
                 bound_sub_agent_error(error),
                 "This sub-agent's turn failed before returning a result. \
-                 Re-task it with send_to_agent, or spawn a fresh agent, if you \
-                 still need the work — do not treat the empty result as success.",
+                 It cannot take more input. Spawn a fresh agent with the same \
+                 goal if you still need the work — do not treat the empty \
+                 result as success.",
             )),
             _ => None,
         }
@@ -2921,7 +2922,7 @@ mod sub_agent_surface_tests {
         assert!(
             v["next_action"]
                 .as_str()
-                .is_some_and(|s| s.contains("send_to_agent")),
+                .is_some_and(|s| s.contains("Spawn a fresh agent") && !s.contains("send_to_agent")),
             "parent must get an actionable recovery hint, got: {v}"
         );
     }

@@ -111,6 +111,38 @@ pub(crate) fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+/// Kills the process group led by a child when dropped, unless disarmed.
+///
+/// A command future can be dropped in the middle of its output drain: the
+/// owning task is aborted, or a caller stops polling. `kill_on_drop` then
+/// reaps the shell only, and whatever the shell started keeps running with no
+/// registry entry left to find it by. Hold one of these across the wait and
+/// [`disarm`](Self::disarm) it once the command has been waited on.
+///
+/// The drop is not a clean exit, so it takes background jobs with it; a
+/// command that completes normally keeps the ones it started.
+///
+/// Requires the child to have been spawned via [`spawn_in_own_group`].
+pub(crate) struct KillGroupOnDrop(Option<u32>);
+
+impl KillGroupOnDrop {
+    pub(crate) fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    /// The command was waited on (or its group already signalled): the pid may
+    /// be reused from here on, so it must not be signalled again.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        kill_process_group(self.0.take());
+    }
+}
+
 /// Current working directory of a live process, if the platform can report it.
 ///
 /// Used by persistent shell sessions to notice when a `cd` moved the session
@@ -370,6 +402,70 @@ mod tests {
             child_pgid, pid,
             "the PGID == PID invariant every killpg here relies on must survive"
         );
+    }
+
+    /// Spawn `sh` that backgrounds a `sleep` and report (child, grandchild pid).
+    async fn spawn_with_grandchild() -> (tokio::process::Child, i32) {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        spawn_in_own_group(&mut cmd);
+        let mut child = cmd.kill_on_drop(true).spawn().expect("spawn sh");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut buf = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        while stdout.read_exact(&mut byte).await.is_ok() {
+            if byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let grandchild = String::from_utf8_lossy(&buf).trim().parse().expect("pid");
+        (child, grandchild)
+    }
+
+    async fn wait_until_dead(pid: i32) -> bool {
+        for _ in 0..100 {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A dropped command future must take the whole tree with it: the guard
+    /// is what signals the group when nobody reaches the explicit kill.
+    #[tokio::test]
+    async fn kill_group_on_drop_reaps_grandchildren_of_a_dropped_command() {
+        let (child, grandchild) = spawn_with_grandchild().await;
+        assert!(pid_is_alive(grandchild), "precondition: grandchild alive");
+        let guard = KillGroupOnDrop::new(child.id());
+        drop(guard);
+        drop(child);
+        assert!(
+            wait_until_dead(grandchild).await,
+            "grandchild {grandchild} outlived the dropped command"
+        );
+    }
+
+    /// A disarmed guard signals nothing: a finished command may leave a
+    /// background job on purpose, and its pid may already be reused.
+    #[tokio::test]
+    async fn disarmed_kill_group_guard_leaves_the_group_alone() {
+        let (child, grandchild) = spawn_with_grandchild().await;
+        let pid = child.id();
+        KillGroupOnDrop::new(pid).disarm();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            pid_is_alive(grandchild),
+            "a disarmed guard must not signal the group"
+        );
+        kill_process_group(pid);
+        drop(child);
+        assert!(wait_until_dead(grandchild).await);
     }
 
     /// The whole point of the module: a child that backgrounds a grandchild and

@@ -819,6 +819,8 @@ mod tests {
                 true,
             ),
             (r#"{"error":{"code":"project_spend_limit_exceeded"}}"#, true),
+            (r#"{"error":{"code":"api_key_spend_limit_exceeded"}}"#, true),
+            (r#"{"error":{"code":"budget_reached"}}"#, true),
             (
                 r#"{"error":{"code":"organization_usage_limit_exceeded"}}"#,
                 true,
@@ -925,6 +927,8 @@ mod tests {
             r#"{"error":{"message":"This request violates our usage policies."}}"#,
             r#"{"error":{"code":"ResponsibleAIPolicyViolation","message":"The response was filtered."}}"#,
             r#"{"error":{"message":"Content Exists Risk"}}"#,
+            r#"{"error":{"code":"cyber_policy","message":"This request was blocked."}}"#,
+            r#"{"error":{"code":"bio_policy","message":"This request was blocked."}}"#,
         ];
         for body in bodies {
             for status in [

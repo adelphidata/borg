@@ -230,6 +230,33 @@ impl ShellSessionRegistry {
         }
     }
 
+    /// Whether `owner` may open one more session. Cheap and side-effect free,
+    /// so a caller can refuse before it spawns anything.
+    pub fn check_capacity(&self, owner: &Option<String>) -> Result<()> {
+        Self::capacity_of(&self.lock(), owner)
+    }
+
+    fn capacity_of(inner: &Inner, owner: &Option<String>) -> Result<()> {
+        if inner.sessions.len() >= MAX_SESSIONS {
+            return Err(anyhow!(
+                "too many shell sessions are open ({MAX_SESSIONS}); kill one with \
+                 action=kill (or poll an exited one) before starting another"
+            ));
+        }
+        let owned = inner
+            .sessions
+            .values()
+            .filter(|s| &s.owner == owner)
+            .count();
+        if owned >= MAX_SESSIONS_PER_OWNER {
+            return Err(anyhow!(
+                "this conversation already has {MAX_SESSIONS_PER_OWNER} shell sessions open; \
+                 kill one with action=kill (or poll an exited one) before starting another"
+            ));
+        }
+        Ok(())
+    }
+
     /// Register a freshly-spawned child as a session and start draining its
     /// output. Takes ownership of the child's stdio pipes. Returns the
     /// generated session id (`sh-<n>`). The caller is responsible for having
@@ -249,8 +276,10 @@ impl ShellSessionRegistry {
     /// the returned id must present the same value (see [`Session::owner`]).
     ///
     /// Errors when [`MAX_SESSIONS`] are already live, or `owner` already has
-    /// [`MAX_SESSIONS_PER_OWNER`]; the child is then dropped (and killed by
-    /// `kill_on_drop`) rather than registered.
+    /// [`MAX_SESSIONS_PER_OWNER`]; the child's whole process group is then
+    /// killed rather than registered. Callers should ask
+    /// [`check_capacity`](Self::check_capacity) before they spawn, so this
+    /// refusal is only the answer to a race between the two.
     pub fn register(
         &self,
         mut child: Child,
@@ -259,18 +288,11 @@ impl ShellSessionRegistry {
         owner: Option<String>,
     ) -> Result<String> {
         let mut inner = self.lock();
-        if inner.sessions.len() >= MAX_SESSIONS {
-            return Err(anyhow!(
-                "too many shell sessions are open ({MAX_SESSIONS}); kill one with \
-                 action=kill (or poll an exited one) before starting another"
-            ));
-        }
-        let owned = inner.sessions.values().filter(|s| s.owner == owner).count();
-        if owned >= MAX_SESSIONS_PER_OWNER {
-            return Err(anyhow!(
-                "this conversation already has {MAX_SESSIONS_PER_OWNER} shell sessions open; \
-                 kill one with action=kill (or poll an exited one) before starting another"
-            ));
+        if let Err(e) = Self::capacity_of(&inner, &owner) {
+            // `kill_on_drop` reaps the shell only; the command it was given
+            // is already running in the group the shell leads.
+            crate::util::process_tree::kill_process_group(child.id());
+            return Err(e);
         }
         let pid = child.id();
         let stdout = child.stdout.take();

@@ -338,8 +338,15 @@ ensure_runtime_deps() {
 
 # ── PATH setup ──
 
+# Wrap a value in single quotes for a shell profile line. Inside single quotes
+# nothing is interpreted, so a directory name with a space, `$`, a backtick or
+# a quote stays a literal path every time the profile is sourced.
+shell_single_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 ensure_path() {
-    if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+    if echo "$PATH" | tr ':' '\n' | grep -qxF "$INSTALL_DIR"; then
         return 0
     fi
 
@@ -348,14 +355,20 @@ ensure_path() {
     local shell_name
     shell_name=$(basename "${SHELL:-/bin/sh}")
 
+    local quoted_dir
+    quoted_dir=$(shell_single_quote "$INSTALL_DIR")
     local line
     if [[ "$shell_name" == "fish" ]]; then
-        line="fish_add_path $INSTALL_DIR"
+        line="fish_add_path -- $quoted_dir"
     else
-        line="export PATH=\"$INSTALL_DIR:\$PATH\""
+        line="export PATH=$quoted_dir:\"\$PATH\""
     fi
 
-    if [[ -f "$profile" ]] && grep -qF "$INSTALL_DIR" "$profile"; then
+    # The quoted form is checked too: a directory with a single quote in it is
+    # written escaped, so the raw path alone would never match and each run
+    # would append the line again.
+    if [[ -f "$profile" ]] &&
+        { grep -qF -- "$INSTALL_DIR" "$profile" || grep -qF -- "$line" "$profile"; }; then
         return 0
     fi
 
