@@ -15,15 +15,18 @@
     "@bufbuild/buf": "^1.75.0",
     "@stryker-mutator/core": "^10.1.1",
     "@stryker-mutator/vitest-runner": "^10.1.1",
-    "@vitest/coverage-v8": "5.1.0",
+    "@vitest/coverage-v8": "5.1.1",
     "prettier": "^3.10.1",
-    "ts-proto": "^2.18.5",
+    "ts-proto": "^2.23.9",
     "typescript": "^7.0.2"
   },
   "trustedDependencies": [
     "electron"
   ],
   "overrides": {
-    "qs": "^6.16.1"
+    "qs": "^6.16.1",
+    "joi": "^18.3.1",
+    "follow-redirects": "^1.16.2",
+    "electron-builder-squirrel-windows": "26.18.0"
   }
 }

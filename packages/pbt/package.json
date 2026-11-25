@@ -11,7 +11,7 @@
     "pbt:desktop": "./scripts/run-desktop.sh test"
   },
   "devDependencies": {
-    "@antithesishq/bombadil": "^0.7.10",
+    "@antithesishq/bombadil": "^0.8.0",
     "typescript": "^7.0.2"
   }
 }

@@ -20,29 +20,29 @@
     "pack": "bun run build && electron-builder --config electron-builder.yml --dir"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.3",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/node": "^26.6.7",
+    "@types/react": "^19.3.1",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "concurrently": "^10.0.6",
+    "@vitejs/plugin-react": "^6.3.0",
+    "concurrently": "^10.0.7",
     "cross-env": "^10.1.0",
-    "electron": "^45.0.0",
-    "electron-builder": "^26.15.3",
-    "tailwindcss": "^4.3.3",
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0",
+    "tailwindcss": "^4.3.5",
     "typescript": "^7.0.2",
-    "vite": "^8.3.5",
-    "vitest": "^5.0.5",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.1",
     "wait-on": "^9.5.1"
   },
   "dependencies": {
     "@borg/app": "workspace:*",
     "@borg/client": "workspace:*",
     "@borg/ui": "workspace:*",
-    "electron-updater": "^6.8.9",
-    "lucide-react": "^1.61.0",
+    "electron-updater": "^6.8.11",
+    "lucide-react": "^1.79.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "react-router-dom": "^7.18.4"
+    "react-router-dom": "^7.18.7"
   }
 }
