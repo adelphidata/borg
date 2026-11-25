@@ -94,7 +94,7 @@ opentelemetry-http = "0.33"
 http = "1"
 tracing-opentelemetry = "0.34"
 chromiumoxide = { version = "0.9", default-features = false }
-notify = "8"
+notify = "9"
 image = "0.25"
 arboard = "3"
 strsim = "0.11"
@@ -107,7 +107,7 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 wasmparser = "0.263"
 # Every default feature except `cache`: plugins never configure wasmtime's
 # on-disk compile cache, and it is the only path that pulls in zstd 0.13.
-wasmtime = { version = "50", default-features = false, features = [
+wasmtime = { version = "51", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
