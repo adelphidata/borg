@@ -38,6 +38,26 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
+/// How long blocking-pool threads may hold the process after the daemon's
+/// main future has returned.
+pub const BLOCKING_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `main` on `runtime`, then give its blocking threads at most `grace`.
+///
+/// Dropping a runtime waits for every `spawn_blocking` thread with no limit,
+/// so one stuck blocking call (a hung subprocess wait, a stalled disk) kept a
+/// daemon that had already finished its shutdown alive until SIGKILL, and the
+/// service manager could not start the next one.
+pub fn block_on_then_exit<F: std::future::Future>(
+    runtime: Runtime,
+    main: F,
+    grace: std::time::Duration,
+) -> F::Output {
+    let out = runtime.block_on(main);
+    runtime.shutdown_timeout(grace);
+    out
+}
+
 /// Soft open-file limit the daemon raises itself to on Unix.
 ///
 /// A launchd- or shell-spawned process inherits a soft `RLIMIT_NOFILE` of
@@ -136,6 +156,36 @@ pub fn extend_path() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A blocking call that never returns must not hold the process past the
+    /// grace once the daemon's main future is done.
+    #[test]
+    fn a_stuck_blocking_thread_cannot_hold_the_exit() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered) = tokio::sync::oneshot::channel::<()>();
+        let runtime = build_runtime().expect("runtime");
+        let started = std::time::Instant::now();
+        let out = block_on_then_exit(
+            runtime,
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = entered_tx.send(());
+                    let _ = stuck.recv();
+                });
+                // The thread is inside its blocking call before the exit.
+                let _ = entered.await;
+                7
+            },
+            std::time::Duration::from_millis(200),
+        );
+        assert_eq!(out, 7);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "exit waited on the blocking thread: {:?}",
+            started.elapsed()
+        );
+        drop(release);
+    }
 
     #[test]
     fn path_with_appends_only_the_missing_dirs_after_the_launchers_own() {

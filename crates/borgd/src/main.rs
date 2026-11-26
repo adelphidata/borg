@@ -61,7 +61,11 @@ fn main() -> Result<()> {
     // tokio's 2 MiB default worker stack, and a stack overflow `abort()`s the
     // whole daemon uncatchably. `build_runtime` enlarges the worker stack to
     // give that poll chain the headroom it needs.
-    borgd::runtime::build_runtime()?.block_on(async_main(nofile_result))
+    borgd::runtime::block_on_then_exit(
+        borgd::runtime::build_runtime()?,
+        async_main(nofile_result),
+        borgd::runtime::BLOCKING_EXIT_GRACE,
+    )
 }
 
 /// Load `<home>/.env` into the process environment.

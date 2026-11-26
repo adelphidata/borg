@@ -327,7 +327,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // See `grpc_web::build_grpc_web_router` for why Capability and Pki are out.
     grpc_web_slot.install(crate::grpc_web::build_grpc_web_router(&services));
 
-    serve_until_drained(
+    let served = serve_until_drained(
         serve_transports(
             uds,
             cfg.listen_tcp,
@@ -343,7 +343,17 @@ pub async fn run(cfg: Config) -> Result<()> {
         shutdown_tx.subscribe(),
         LISTENER_DRAIN_GRACE,
     )
-    .await?;
+    .await;
+    // A listener that failed must not skip the session drain below: the
+    // sessions are as live as after a clean stop. The error is returned once
+    // they are finalized. No signal arrived on this path, so the stop is
+    // recorded and broadcast here: without the broadcast the gateway,
+    // heartbeat and scheduler keep starting turns under the drain.
+    if let Err(e) = &served {
+        tracing::error!(error = %e, "transports failed; finalizing sessions before exit");
+        emit_daemon_stop(&audit, "transport_error").await;
+        let _ = shutdown_tx.send(());
+    }
 
     // Drain-then-finalize. The transports above have stopped, but gateway- and
     // heartbeat-driven turns run on spawned tasks that no listener waits for —
@@ -363,6 +373,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     // `_lifecycle` drop records the shutdown counter as this scope unwinds.
+    served?;
     tracing::info!("borgd shutdown complete");
     Ok(())
 }
