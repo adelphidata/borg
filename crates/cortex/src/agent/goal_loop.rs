@@ -428,7 +428,9 @@ impl Agent {
                 cancel,
             )
             .await;
-            let (exit_code, output) = (i64::from(run.exit_code), run.output);
+            let exit_code = i64::from(run.exit_code);
+            // Masked before it is cut, stored or shown to the model.
+            let output = crate::goals::gates::redacted_tail(&run.output);
 
             // The retry cap counts failures the agent made *no progress*
             // against, not failing turns. A turn-boundary count gives a Ralph
@@ -448,7 +450,7 @@ impl Agent {
                             &session_id,
                             gate.ordinal,
                             exit_code,
-                            crate::goals::gates::output_tail(&output),
+                            &output,
                             fingerprint.as_deref(),
                             made_progress,
                         )

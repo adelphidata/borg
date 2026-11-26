@@ -57,6 +57,15 @@ pub(crate) fn output_tail(output: &str) -> &str {
     &output[start..]
 }
 
+/// The gate evidence that may leave the process: secrets masked, then the tail.
+///
+/// The mask runs on the whole output first. A cut that lands inside a key
+/// hides the key's prefix from the masker, and the rest of the key would go
+/// to the model and the database in the clear.
+pub(crate) fn redacted_tail(output: &str) -> String {
+    output_tail(&crate::security::secrets::redact_secrets(output)).to_string()
+}
+
 /// Continuation prompt for a failed gate.
 ///
 /// Deliberately concrete: the command, its exit code, and its real output. The
@@ -177,6 +186,23 @@ mod tests {
         assert!(tail.len() <= GATE_OUTPUT_TAIL_BYTES);
         // Short output is returned whole.
         assert_eq!(output_tail("short"), "short");
+    }
+
+    #[test]
+    fn a_key_cut_by_the_tail_window_is_still_masked() {
+        // The window starts inside the token: masking after the cut would see
+        // only a prefix-less remainder and let it through.
+        let token = format!("ghp_{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk");
+        let output = format!("{token}\n{}", "x".repeat(GATE_OUTPUT_TAIL_BYTES - 22));
+        assert!(
+            output_tail(&output).starts_with(&token[20..]),
+            "the cut must land inside the token for this test to mean anything"
+        );
+        let tail = redacted_tail(&output);
+        assert!(!tail.contains(&token[20..]), "key body leaked: {tail}");
+        assert!(tail.len() <= GATE_OUTPUT_TAIL_BYTES);
+        // Ordinary output is unchanged.
+        assert_eq!(redacted_tail("1 failed"), "1 failed");
     }
 
     #[test]
