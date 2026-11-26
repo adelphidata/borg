@@ -684,6 +684,9 @@ pub async fn handle_run_shell_with_context(
         .kill_on_drop(true)
         .spawn()
         .context("Failed to spawn shell command")?;
+    // If this future is dropped mid-drain (the owning task is aborted),
+    // neither arm below runs and `kill_on_drop` reaps only the shell.
+    let group_guard = crate::util::process_tree::KillGroupOnDrop::new(child.id());
 
     // Register with the process registry so `borg status` / `/doctor`
     // can see the child mid-flight. The guard's Drop marks the entry
@@ -712,6 +715,7 @@ pub async fn handle_run_shell_with_context(
     .await
     {
         Ok((stdout, stderr, code)) => {
+            group_guard.disarm();
             if let Some(g) = _guard {
                 g.complete(code);
             }
@@ -755,6 +759,7 @@ pub async fn handle_run_shell_with_context(
             // letting go. A pipe/wait failure abandons the tree just as a
             // timeout does, so both paths need it.
             crate::util::process_tree::kill_process_group(child.id());
+            group_guard.disarm();
             if e.to_string().contains("timed out") {
                 if let Some(g) = _guard {
                     g.timed_out();
@@ -971,6 +976,12 @@ async fn start_session(
     };
 
     let cwd_path = workdir.unwrap_or(ctx.workspace_cwd()).to_path_buf();
+    // Refuse before the spawn, not after it: a command that is started and
+    // then turned away has already run for a moment.
+    let owner = ctx.session_id().map(str::to_string);
+    if let Err(e) = sessions.check_capacity(&owner) {
+        return Ok(e.to_string());
+    }
     let (program, full_args) =
         wrap_run_shell_for_sandbox(ctx, config, shell, shell_flag, command, &cwd_path);
     let mut cmd = tokio::process::Command::new(&program);

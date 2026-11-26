@@ -135,6 +135,19 @@ pub(super) fn sanitize_user_text(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// What a terminal row shows after its carriage returns: the text written
+/// since the last bare `\r`. Progress bars and spinners redraw one row this
+/// way, and without this every redraw would be joined into one long line. A
+/// trailing `\r` (CRLF output, or a redraw whose text has not arrived yet)
+/// keeps the text before it.
+pub(super) fn resolve_carriage_returns(text: &str) -> &str {
+    let text = text.trim_end_matches('\r');
+    match text.rfind('\r') {
+        Some(idx) => &text[idx + 1..],
+        None => text,
+    }
+}
+
 /// Parse a single line of tool output, honoring embedded ANSI escape
 /// sequences (colors / bold / etc.) so output from `cargo`, `git`,
 /// `pytest`, etc. retains its meaning. `fallback_style` is applied to
@@ -145,6 +158,7 @@ pub(super) fn sanitize_user_text(text: &str) -> std::borrow::Cow<'_, str> {
 /// span and logs via `tracing::warn!` per the project error-handling
 /// invariant.
 fn parse_ansi_line(text: &str, fallback_style: Style) -> Line<'static> {
+    let text = resolve_carriage_returns(text);
     match text.into_text() {
         Ok(parsed) => {
             // Callers split on `.lines()` so `\n` shouldn't reach us, but

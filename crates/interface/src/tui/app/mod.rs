@@ -1018,11 +1018,13 @@ impl<'a> App<'a> {
                 }
                 AppAction::Continue
             }
-            _ => {
-                // While streaming, queue the pasted text
-                self.pending_steers.push_back(text);
+            AppState::Streaming { .. } => {
+                // Typed keys reach the composer mid-turn so the user can
+                // prepare a steer; a paste goes to the same place.
+                self.composer.handle_paste(&text);
                 AppAction::Continue
             }
+            _ => AppAction::Continue,
         }
     }
 

@@ -172,12 +172,14 @@ where
     B: Backend,
     B: Write,
 {
-    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
         // Attempt to restore the cursor state
         if self.hidden_cursor {
             if let Err(err) = self.show_cursor() {
-                eprintln!("Failed to show the cursor: {err}");
+                // `eprintln!` panics when stderr is gone, and after a terminal
+                // hangup it usually is. A panic inside `Drop` aborts the
+                // process mid-unwind, so the diagnostic is best-effort.
+                let _ = writeln!(io::stderr().lock(), "Failed to show the cursor: {err}");
             }
         }
     }

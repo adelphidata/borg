@@ -258,6 +258,20 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_preparing(&mut self) {
+        // A new response starts. What the previous one streamed is complete,
+        // also when it ended without a tool call (a steer continued the
+        // turn): close it so the next delta opens its own cell below.
+        let split = self.cells_emitted.min(self.cells.len());
+        for cell in &mut self.cells[split..] {
+            if let HistoryCell::Assistant {
+                text, streaming, ..
+            } = cell
+            {
+                if !text.is_empty() {
+                    *streaming = false;
+                }
+            }
+        }
         self.cells.push(HistoryCell::Thinking {
             text: String::new(),
         });
@@ -292,10 +306,13 @@ impl<'a> App<'a> {
         if matches!(self.cells.last(), Some(HistoryCell::Thinking { text }) if text.is_empty()) {
             self.cells.pop();
         }
-        if let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() {
-            text.push_str(&delta);
-        } else {
-            self.cells.push(HistoryCell::assistant(delta, true));
+        match self.open_assistant_idx() {
+            Some(idx) => {
+                if let HistoryCell::Assistant { text, .. } = &mut self.cells[idx] {
+                    text.push_str(&delta);
+                }
+            }
+            None => self.cells.push(HistoryCell::assistant(delta, true)),
         }
         // First visible assistant token → phase flips to "Responding"; further
         // deltas are cheap string compares so we don't re-allocate.
@@ -310,17 +327,39 @@ impl<'a> App<'a> {
     /// is in progress. A cell that is in the terminal scrollback already
     /// cannot change.
     fn handle_event_text_retracted(&mut self, bytes: usize) {
-        let last = self.cells.len().saturating_sub(1);
-        if last < self.cells_emitted {
+        let Some(idx) = self.open_assistant_idx() else {
             return;
-        }
-        let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() else {
+        };
+        let HistoryCell::Assistant { text, .. } = &mut self.cells[idx] else {
             return;
         };
         cortex::agent::retract_text_tail(text, bytes);
         if text.is_empty() {
-            self.cells.pop();
+            self.cells.remove(idx);
         }
+    }
+
+    /// The answer the current response is streaming into, if it has one.
+    ///
+    /// That is not always the last cell: a steer echo or a notice can land
+    /// below it mid-stream. Looking only at the tail would split the answer
+    /// around that cell, break an open code fence, and leave the first half
+    /// marked as streaming. Cells already in terminal scrollback are never
+    /// candidates.
+    fn open_assistant_idx(&self) -> Option<usize> {
+        let split = self.cells_emitted.min(self.cells.len());
+        let idx = split
+            + self.cells[split..].iter().rposition(|c| {
+                !matches!(c, HistoryCell::User { .. } | HistoryCell::System { .. })
+            })?;
+        matches!(
+            self.cells[idx],
+            HistoryCell::Assistant {
+                streaming: true,
+                ..
+            }
+        )
+        .then_some(idx)
     }
 
     fn handle_event_thinking_delta(&mut self, delta: String) {
@@ -703,7 +742,12 @@ impl<'a> App<'a> {
         // Surface the most recent output line as live status details so the
         // user can see streaming tools (e.g. `cargo build`) are actually
         // making progress — not just sitting on an open pipe.
-        if let Some(last_line) = delta.lines().rev().find(|l| !l.trim().is_empty()) {
+        if let Some(last_line) = delta
+            .lines()
+            .map(super::super::history::resolve_carriage_returns)
+            .rev()
+            .find(|l| !l.trim().is_empty())
+        {
             self.stream_status.set_details(Some(last_line.to_string()));
         }
         // Attach to a ToolStreaming cell at the tail of the history. We only
@@ -730,39 +774,16 @@ impl<'a> App<'a> {
         if let Some(idx) = target {
             debug_assert!(idx >= self.cells_emitted, "mutating flushed cell at {idx}");
             if let HistoryCell::ToolStreaming { lines, dropped } = &mut self.cells[idx] {
-                let parts: Vec<&str> = delta.split('\n').collect();
-                for (i, part) in parts.iter().enumerate() {
-                    if i == 0 {
-                        match lines.last_mut() {
-                            Some((buf, stream)) if *stream == is_stderr => {
-                                // Per-line byte clamp: rendering truncates to
-                                // viewport width anyway, and an unclamped
-                                // newline-free stream grows one String without
-                                // bound and re-parses it every frame.
-                                let budget = super::super::constants::TOOL_STREAM_MAX_LINE_BYTES
-                                    .saturating_sub(buf.len());
-                                if budget > 0 {
-                                    buf.push_str(clamp_at_char_boundary(part, budget));
-                                }
-                            }
-                            _ => lines.push((
-                                clamp_at_char_boundary(
-                                    part,
-                                    super::super::constants::TOOL_STREAM_MAX_LINE_BYTES,
-                                )
-                                .to_string(),
-                                is_stderr,
-                            )),
+                for (i, part) in delta.split('\n').enumerate() {
+                    match lines.last_mut() {
+                        Some((buf, stream)) if i == 0 && *stream == is_stderr => {
+                            push_stream_text(buf, part);
                         }
-                    } else {
-                        lines.push((
-                            clamp_at_char_boundary(
-                                part,
-                                super::super::constants::TOOL_STREAM_MAX_LINE_BYTES,
-                            )
-                            .to_string(),
-                            is_stderr,
-                        ));
+                        _ => {
+                            let mut buf = String::new();
+                            push_stream_text(&mut buf, part);
+                            lines.push((buf, is_stderr));
+                        }
                     }
                 }
                 // Line-count cap: only the tail is ever rendered live; evict
@@ -1044,6 +1065,34 @@ impl<'a> App<'a> {
             }
         }
         None
+    }
+}
+
+/// Append streamed tool output to one transcript row.
+///
+/// A carriage return followed by more text restarts the row, as a terminal
+/// does for progress bars, so only the newest redraw is kept. The `\r` stays
+/// at the end of the buffer until that text arrives: the next chunk may be the
+/// `\n` of a CRLF pair, and then the row must keep its content. Rendering
+/// resolves a leftover `\r` through `resolve_carriage_returns`.
+///
+/// Per-row byte clamp: rendering truncates to viewport width anyway, and an
+/// unclamped newline-free stream grows one String without bound and re-parses
+/// it every frame.
+pub(super) fn push_stream_text(buf: &mut String, part: &str) {
+    let max = super::super::constants::TOOL_STREAM_MAX_LINE_BYTES;
+    for (i, segment) in part.split('\r').enumerate() {
+        if i > 0 && !buf.ends_with('\r') {
+            buf.push('\r');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if buf.ends_with('\r') {
+            buf.clear();
+        }
+        let budget = max.saturating_sub(buf.len());
+        buf.push_str(clamp_at_char_boundary(segment, budget));
     }
 }
 

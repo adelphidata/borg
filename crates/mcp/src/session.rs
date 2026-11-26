@@ -584,7 +584,10 @@ impl SessionActor {
             };
 
             match msg.id {
-                Some(resp_id) if resp_id == id => {
+                // A frame with a method is a request from the server, never
+                // the response, even when it reuses the id of the request in
+                // flight: the two sides number their requests independently.
+                Some(resp_id) if resp_id == id && msg.method.is_none() => {
                     return match (msg.result, msg.error) {
                         (Some(value), _) => Ok(value),
                         (None, Some(rpc_err)) if rpc_err.looks_like_auth() => {
@@ -827,6 +830,52 @@ mod tests {
         let mut session = SessionActor::new(&manifest(), transport);
         let err = session.handshake().await.unwrap_err();
         assert!(matches!(err, McpError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn server_request_that_reuses_the_pending_id_is_not_the_response() {
+        // Client and server number their requests independently, so a server
+        // `ping` may carry the id of the client request in flight. It must be
+        // refused like any other server request, and the real response that
+        // follows must complete the call.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let inbound = Arc::new(Mutex::new(VecDeque::new()));
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: Some("ping".into()),
+            result: None,
+            error: None,
+            params: None,
+        });
+        inbound.lock().unwrap().push_back(Message {
+            jsonrpc: Some("2.0".into()),
+            id: Some(1),
+            method: None,
+            result: Some(json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "demo", "version": "0.1"}
+            })),
+            error: None,
+            params: None,
+        });
+
+        let transport = Box::new(ScriptedTransport::new(sent.clone(), inbound));
+        let mut session = SessionActor::new(&manifest(), transport);
+        session
+            .handshake()
+            .await
+            .expect("the response after the colliding request completes the call");
+
+        let refused = session.drain_refused_server_requests();
+        assert_eq!(refused, vec![("ping".to_string(), 1)]);
+        let sent_guard = sent.lock().unwrap();
+        assert!(
+            sent_guard.iter().any(|v| v.get("id").and_then(Value::as_u64) == Some(1)
+                && v.get("error").is_some()),
+            "the server request must get a reply, got {sent_guard:?}",
+        );
     }
 
     #[tokio::test]

@@ -634,7 +634,9 @@ pub struct GitContext {
     pub branch: Option<String>,
     pub commit_hash: Option<String>,
     pub recent_commits: Vec<String>,
-    pub has_uncommitted_changes: bool,
+    /// `None` when the status scan failed or timed out. That is not a clean
+    /// tree, and the prompt must not present it as one.
+    pub has_uncommitted_changes: Option<bool>,
 }
 
 /// Find the git repo root by walking up from `cwd`.
@@ -1060,7 +1062,7 @@ pub async fn collect_git_context(cwd: &Path) -> GitContext {
             .ok()
             .map(|s| s.lines().map(String::from).collect())
             .unwrap_or_default(),
-        has_uncommitted_changes: status.map(|s| !s.is_empty()).unwrap_or(false),
+        has_uncommitted_changes: status.map(|s| !s.is_empty()).ok(),
     }
 }
 
@@ -1254,8 +1256,14 @@ pub fn format_git_context(ctx: &GitContext) -> String {
     if let Some(ref hash) = ctx.commit_hash {
         out.push_str(&format!("Git commit: {hash}\n"));
     }
-    if ctx.has_uncommitted_changes {
-        out.push_str("Uncommitted changes: yes\n");
+    match ctx.has_uncommitted_changes {
+        Some(true) => out.push_str("Uncommitted changes: yes\n"),
+        Some(false) => {}
+        // Outside a repository there is no tree to be unsure about.
+        None if ctx.repo_root.is_some() => {
+            out.push_str("Uncommitted changes: unknown (the status scan did not finish)\n");
+        }
+        None => {}
     }
     if !ctx.recent_commits.is_empty() {
         out.push_str("Recent commits:\n");
@@ -1611,7 +1619,7 @@ mod tests {
             branch: Some("main".into()),
             commit_hash: Some("abc1234".into()),
             recent_commits: vec!["abc1234 Fix bug".into(), "def5678 Add feature".into()],
-            has_uncommitted_changes: true,
+            has_uncommitted_changes: Some(true),
         };
         let out = format_git_context(&ctx);
         assert!(out.contains("Git branch: main"));
@@ -1661,7 +1669,7 @@ mod tests {
     #[test]
     fn format_git_context_uncommitted_only() {
         let ctx = GitContext {
-            has_uncommitted_changes: true,
+            has_uncommitted_changes: Some(true),
             ..Default::default()
         };
         let out = format_git_context(&ctx);
@@ -1670,10 +1678,26 @@ mod tests {
     }
 
     #[test]
+    fn format_git_context_reports_an_unfinished_status_scan_as_unknown() {
+        let ctx = GitContext {
+            repo_root: Some(PathBuf::from("/repo")),
+            branch: Some("main".into()),
+            has_uncommitted_changes: None,
+            ..Default::default()
+        };
+        let out = format_git_context(&ctx);
+        assert!(out.contains("Uncommitted changes: unknown"), "{out}");
+
+        // Not a repository: nothing to report.
+        let out = format_git_context(&GitContext::default());
+        assert!(!out.contains("Uncommitted changes"), "{out}");
+    }
+
+    #[test]
     fn format_git_context_no_uncommitted_changes() {
         let ctx = GitContext {
             branch: Some("main".into()),
-            has_uncommitted_changes: false,
+            has_uncommitted_changes: Some(false),
             ..Default::default()
         };
         let out = format_git_context(&ctx);

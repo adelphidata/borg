@@ -177,7 +177,7 @@ Hash-chained audit events (via the same `AuditWriter` as the WASM plugin sandbox
 
 OTEL-style structured events under target `borg.mcp` (`tracing::info!` / `tracing::warn!`). The borgd tracing-opentelemetry layer projects these into:
 
-- `borg.mcp.executes_total{server,tool,outcome}` — `event="execute"`, `outcome` ∈ `success`/`error`
+- `borg.mcp.executes_total{server,tool,outcome}` — `event="execute"`, `outcome` ∈ `success`/`tool_error` (the server replied with `isError`)/`error`
 - `borg.mcp.execute_duration_ms{server,tool}` — `duration_ms` field on the same `event="execute"` record
 - `borg.mcp.tools_listed_total{server}` — `event="tools_listed"`, `count`
 - `borg.mcp.rate_limited_total{server}` — `event="rate_limited"`, `retry_after_secs`

@@ -34,6 +34,7 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthChar;
 
 /// Selects the terminal escape strategy for inserting history lines above the viewport.
 ///
@@ -110,7 +111,7 @@ where
             };
         wrapped_rows += line_wrapped
             .iter()
-            .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
+            .map(|wrapped_line| physical_row_count(wrapped_line, wrap_width))
             .sum::<usize>();
         wrapped.extend(line_wrapped);
     }
@@ -221,11 +222,34 @@ where
     Ok(clobbered_viewport)
 }
 
+/// Rows the terminal uses to show `line` when it soft-wraps at `wrap_width`.
+///
+/// A plain `width / wrap_width` is short when a double-width character does
+/// not fit in the last column: the terminal leaves that cell empty and moves
+/// the whole character to the next row.
+fn physical_row_count(line: &Line, wrap_width: usize) -> usize {
+    let wrap_width = wrap_width.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if col + w > wrap_width && col > 0 {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    rows
+}
+
 /// Render a single wrapped history line: clear continuation rows for wide lines,
 /// set foreground/background colors, and write styled spans. Caller is responsible
 /// for cursor positioning and any leading `\r\n`.
 fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) -> io::Result<()> {
-    let physical_rows = line.width().max(1).div_ceil(wrap_width) as u16;
+    let physical_rows = physical_row_count(line, wrap_width) as u16;
     if physical_rows > 1 {
         queue!(writer, SavePosition)?;
         for _ in 1..physical_rows {
@@ -410,6 +434,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_row_count_matches_plain_division_for_narrow_text() {
+        assert_eq!(physical_row_count(&Line::from(""), 10), 1);
+        assert_eq!(physical_row_count(&Line::from("a".repeat(10)), 10), 1);
+        assert_eq!(physical_row_count(&Line::from("a".repeat(11)), 10), 2);
+        assert_eq!(physical_row_count(&Line::from("a".repeat(30)), 10), 3);
+    }
+
+    #[test]
+    fn physical_row_count_adds_the_row_a_wide_char_wraps_early() {
+        // Five columns: "abcd" leaves one cell, the wide char cannot use it.
+        // Width is 4 + 2*3 = 10, so plain division says 2 rows; the terminal
+        // shows "abcd" / "文文" / "文".
+        let line = Line::from("abcd文文文");
+        assert_eq!(line.width().div_ceil(5), 2);
+        assert_eq!(physical_row_count(&line, 5), 3);
+    }
+
+    #[test]
+    fn physical_row_count_spans_share_one_column_cursor() {
+        let line = Line::from(vec!["abcd".into(), "文".into()]);
+        assert_eq!(physical_row_count(&line, 5), 2);
+    }
 
     #[test]
     fn writes_bold_then_regular_spans() {

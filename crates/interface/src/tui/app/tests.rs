@@ -3221,3 +3221,190 @@ fn mode_usage_lists_only_modes_that_mode_accepts() {
         );
     }
 }
+
+fn streaming_tool_lines(app: &App<'_>) -> Vec<String> {
+    let Some(HistoryCell::ToolStreaming { lines, .. }) = app.cells.last() else {
+        panic!("expected a ToolStreaming cell at the tail");
+    };
+    lines
+        .iter()
+        .map(|(l, _)| super::super::history::resolve_carriage_returns(l).to_string())
+        .collect()
+}
+
+fn tool_delta(app: &mut App<'_>, delta: &str) {
+    app.process_agent_event(AgentEvent::ToolOutputDelta {
+        tool_call_id: "call-1".into(),
+        name: "run_shell".into(),
+        delta: delta.into(),
+        is_stderr: false,
+    });
+}
+
+fn app_running_a_tool() -> App<'static> {
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::ToolExecuting {
+        tool_call_id: "call-1".into(),
+        name: "run_shell".into(),
+        args: "{}".into(),
+    });
+    app
+}
+
+/// A progress bar redraws one row with carriage returns. The row must show
+/// the newest redraw only, however the stream is cut into deltas, and CRLF
+/// line ends must not wipe the rows they end.
+#[test]
+fn tool_stream_carriage_returns_keep_only_the_newest_redraw() {
+    let mut app = app_running_a_tool();
+    tool_delta(&mut app, "10%\r50%\r100%\ndone\n");
+    assert_eq!(streaming_tool_lines(&app), ["100%", "done", ""]);
+
+    // Same stream, cut between every redraw and inside the CRLF pair.
+    let mut app = app_running_a_tool();
+    for part in ["10%", "\r", "50%\r", "100%\r", "\nline two\r\n"] {
+        tool_delta(&mut app, part);
+    }
+    assert_eq!(streaming_tool_lines(&app), ["100%", "line two", ""]);
+    assert_eq!(app.stream_status.details.as_deref(), Some("line two"));
+}
+
+/// Before the fix the row buffer stopped growing at the byte cap and every
+/// later redraw was dropped, so a long-running bar froze on screen.
+#[test]
+fn tool_stream_redraws_past_the_row_cap_still_show() {
+    use super::super::constants::TOOL_STREAM_MAX_LINE_BYTES;
+    let mut app = app_running_a_tool();
+    let frame = "x".repeat(100);
+    for _ in 0..(TOOL_STREAM_MAX_LINE_BYTES / 50) {
+        tool_delta(&mut app, &format!("{frame}\r"));
+    }
+    tool_delta(&mut app, "final frame");
+    assert_eq!(streaming_tool_lines(&app), ["final frame"]);
+    let Some(HistoryCell::ToolStreaming { lines, .. }) = app.cells.last() else {
+        unreachable!()
+    };
+    assert!(lines[0].0.len() <= TOOL_STREAM_MAX_LINE_BYTES);
+}
+
+fn assistant_texts(app: &App<'_>) -> Vec<(String, bool)> {
+    app.cells
+        .iter()
+        .filter_map(|c| match c {
+            HistoryCell::Assistant {
+                text, streaming, ..
+            } => Some((text.clone(), *streaming)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A notice that lands below the answer in progress must not split it: the
+/// rest of the answer belongs to the same cell, or an open code fence breaks
+/// and the first half stays marked as streaming.
+#[test]
+fn text_delta_after_a_mid_stream_notice_continues_the_same_answer() {
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::TextDelta("```rust\nfn a() {".into()));
+    app.cells.push(HistoryCell::User {
+        text: "also b".into(),
+    });
+    app.push_system_message("[steer queued]".into());
+    app.process_agent_event(AgentEvent::TextDelta("}\n```".into()));
+    assert_eq!(
+        assistant_texts(&app),
+        [("```rust\nfn a() {}\n```".to_string(), true)]
+    );
+}
+
+/// The next response is a new answer. It opens its own cell below whatever
+/// was pushed in between, and the previous answer is closed.
+#[test]
+fn text_delta_of_the_next_response_opens_a_new_cell() {
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::TextDelta("first answer".into()));
+    app.cells.push(HistoryCell::User {
+        text: "a steer".into(),
+    });
+    app.process_agent_event(AgentEvent::Preparing);
+    app.process_agent_event(AgentEvent::TextDelta("second answer".into()));
+    assert_eq!(
+        assistant_texts(&app),
+        [
+            ("first answer".to_string(), false),
+            ("second answer".to_string(), true)
+        ]
+    );
+    assert!(
+        matches!(app.cells.last(), Some(HistoryCell::Assistant { text, .. }) if text == "second answer"),
+        "the new answer must sit below the steer"
+    );
+}
+
+/// A retried response retracts what the failed attempt streamed. With a
+/// notice below the answer the retraction used to find no answer at the tail,
+/// and the retry then showed the partial text twice.
+#[test]
+fn text_retracted_reaches_the_open_answer_below_a_notice() {
+    let mut app = make_app();
+    app.enter_streaming();
+    app.process_agent_event(AgentEvent::TextDelta("kept. partial".into()));
+    app.push_system_message("[steer queued]".into());
+    app.process_agent_event(AgentEvent::TextRetracted { bytes: 8 });
+    app.process_agent_event(AgentEvent::TextDelta(" full".into()));
+    assert_eq!(assistant_texts(&app), [("kept. full".to_string(), true)]);
+}
+
+/// A paste while a turn runs used to go to a queue that nothing sent,
+/// showed, or kept: the text vanished at turn end. It belongs in the
+/// composer, where typed keys already go.
+#[test]
+fn paste_during_a_turn_lands_in_the_composer() {
+    let mut app = make_app();
+    app.enter_streaming();
+    app.handle_paste("pasted\ntext".into());
+    assert_eq!(app.composer.text(), "pasted\ntext");
+    assert!(app.pending_steers.is_empty());
+}
+
+/// Shift+Enter is a newline in the composer. Mid-turn it used to send the
+/// half-written steer.
+#[test]
+fn shift_enter_during_a_turn_inserts_a_newline() {
+    let mut app = make_app();
+    app.enter_streaming();
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.steer_tx = Some(steer_tx);
+    app.composer.set_text("line one");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(app.composer.text(), "line one\n");
+    assert!(steer_rx.try_recv().is_err(), "nothing may be sent");
+}
+
+/// Without bracketed paste a pasted newline is a bare Enter key. Mid-turn it
+/// used to send the first line as a steer and strand the rest of the paste.
+#[test]
+fn pasted_enter_during_a_turn_does_not_send_a_steer() {
+    let mut app = make_app();
+    app.enter_streaming();
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.steer_tx = Some(steer_tx);
+    // The burst is fed with an explicit clock, so only the Enter depends on
+    // real time, and the post-flush window covers a slow test host there.
+    app.composer.feed_paste_burst_for_test("line1");
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    for ch in "line2".chars() {
+        app.handle_key(key(KeyCode::Char(ch))).unwrap();
+    }
+    assert!(
+        steer_rx.try_recv().is_err(),
+        "a pasted newline is not a send"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    app.tick_paste_burst();
+    assert_eq!(app.composer.text(), "line1\nline2");
+}

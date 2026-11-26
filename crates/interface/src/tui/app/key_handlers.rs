@@ -177,9 +177,10 @@ impl<'a> App<'a> {
         // A Tab inside a non-bracketed paste burst is pasted whitespace. Route
         // it into the burst before popup completion (Idle) or the streaming
         // no-op binding can claim it — either would drop the tab and split
-        // the paste in two.
+        // the paste in two. A pasted Enter is the same: mid-turn it would
+        // send the first line as a steer and strand the rest.
         if matches!(self.state, AppState::Idle | AppState::Streaming { .. })
-            && self.composer.capture_burst_tab(&key)
+            && (self.composer.capture_burst_tab(&key) || self.composer.capture_burst_enter(&key))
         {
             return Ok(AppAction::Continue);
         }
@@ -378,8 +379,13 @@ impl<'a> App<'a> {
                     self.truncate_cells(len - 2);
                 }
             }
-        } else if key.code == KeyCode::Enter {
-            // Send as a steer (mid-turn injection at tool boundary)
+        } else if key.code == KeyCode::Enter
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        {
+            // Send as a steer (mid-turn injection at tool boundary).
+            // Shift/Alt+Enter falls through to the composer for a newline.
             let text = self.composer.text().trim().to_string();
             // Intercept /cancel mid-stream so it doesn't get sent to
             // the agent as a steer. Equivalent to pressing Esc.

@@ -1630,55 +1630,54 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
         }))) => (text, is_error, images),
         Ok(Ok(Err(e))) => {
             breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
-            let duration_ms = start.elapsed().as_millis() as u64;
             // Structured error kind from the typed `McpError` (preserved as the
             // anyhow root by the session actor). Defaults to "unknown" for
             // errors raised outside the MCP crate.
             let error_kind = e
                 .downcast_ref::<mcp::errors::McpError>()
                 .map_or("unknown", mcp::errors::McpError::kind);
-            crate::db::try_emit_global(
-                crate::db::audit_events::MCP_TOOL_EXECUTED,
+            record_execute_failure(
                 &tool.server,
-                &serde_json::json!({
-                    "server": &tool.server,
-                    "tool": &tool.full_name,
-                    "success": false,
-                    "duration_ms": duration_ms,
-                    "error_kind": error_kind,
-                    "error": e.to_string(),
-                }),
+                &tool.full_name,
+                start,
+                error_kind,
+                &e.to_string(),
             )
             .await;
-            // OTEL-style structured event — `borg.mcp.executes_total{outcome="error"}`
-            // plus the error kind and message for correlation with logs.
-            tracing::info!(
-                target: MCP_LOG_TARGET,
-                event = "execute",
-                server = %tool.server,
-                tool = %tool.full_name,
-                outcome = "error",
-                duration_ms,
-                error_kind,
-                error = %e,
-                "mcp tool execution failed",
-            );
             return Err(e.context(format!("MCP tool '{}' failed", tool.full_name)));
         }
         Ok(Err(_canceled)) => {
             breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
-            return Err(anyhow!(
+            let e = anyhow!(
                 "MCP server '{server}' reply channel dropped",
                 server = tool.server
-            ));
+            );
+            record_execute_failure(
+                &tool.server,
+                &tool.full_name,
+                start,
+                "reply_dropped",
+                &e.to_string(),
+            )
+            .await;
+            return Err(e);
         }
         Err(_elapsed) => {
             breaker_record(&tool.server, Some(StrikeKind::Transport), Instant::now());
-            return Err(anyhow!(
+            let e = anyhow!(
                 "MCP server '{server}' did not reply within {ms}ms",
                 server = tool.server,
                 ms = outer_deadline.as_millis()
-            ));
+            );
+            record_execute_failure(
+                &tool.server,
+                &tool.full_name,
+                start,
+                "watchdog_timeout",
+                &e.to_string(),
+            )
+            .await;
+            return Err(e);
         }
     };
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -1823,7 +1822,9 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
         event = "execute",
         server = %tool.server,
         tool = %tool.full_name,
-        outcome = "success",
+        // A reply the server marked `isError` is a failed call that happened
+        // to produce text. Counting it as a success hides a broken tool.
+        outcome = if is_error { "tool_error" } else { "success" },
         duration_ms,
         threat_level = threat_label,
         redaction_hits,
@@ -1833,6 +1834,45 @@ pub async fn try_execute_tool(name: &str, args: &Value) -> Result<Option<ToolOut
     let parts =
         decode_mcp_images_blocking(&tool.server, &tool.full_name, images, max_image_bytes()).await;
     Ok(Some(assemble_tool_output(wrapped, parts)))
+}
+
+/// Audit row and structured event for a call that produced no reply text.
+/// Every failure arm goes through here: an arm that returns without it leaves
+/// the call out of `borg.mcp.executes_total` and out of the audit trail.
+async fn record_execute_failure(
+    server: &str,
+    full_name: &str,
+    start: Instant,
+    error_kind: &str,
+    error: &str,
+) {
+    let duration_ms = start.elapsed().as_millis() as u64;
+    crate::db::try_emit_global(
+        crate::db::audit_events::MCP_TOOL_EXECUTED,
+        server,
+        &serde_json::json!({
+            "server": server,
+            "tool": full_name,
+            "success": false,
+            "duration_ms": duration_ms,
+            "error_kind": error_kind,
+            "error": error,
+        }),
+    )
+    .await;
+    // OTEL-style structured event — `borg.mcp.executes_total{outcome="error"}`
+    // plus the error kind and message for correlation with logs.
+    tracing::info!(
+        target: MCP_LOG_TARGET,
+        event = "execute",
+        server = %server,
+        tool = %full_name,
+        outcome = "error",
+        duration_ms,
+        error_kind,
+        error = %error,
+        "mcp tool execution failed",
+    );
 }
 
 /// Classify a server *startup* failure for audit attribution and health
