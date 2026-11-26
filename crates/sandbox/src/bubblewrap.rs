@@ -675,8 +675,21 @@ mod tests {
     fn detect_bwrap_version_reads_the_resolved_binary() {
         let dir = tempfile::tempdir().unwrap();
         let fake = write_fake_helper(dir.path(), 0o755);
+        // A test on another thread can fork while the write handle for the
+        // fake helper is still open. The forked child holds a copy of that
+        // handle until it execs, and until then executing the helper fails
+        // with ETXTBSY, which the probe reports as `None`. The window is
+        // short, so retry rather than fail on it.
+        let mut detected = detect_bwrap_version(&fake);
+        for _ in 0..100 {
+            if detected.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            detected = detect_bwrap_version(&fake);
+        }
         assert_eq!(
-            detect_bwrap_version(&fake),
+            detected,
             Some(BwrapVersion {
                 major: 0,
                 minor: 7,
