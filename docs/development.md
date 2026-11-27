@@ -57,7 +57,7 @@ Source paths to know:
 
 - `crates/cortex/src/agent/` — agent loop and turn execution
 - `crates/cortex/src/tool_handlers/` — built-in tool implementations
-- `crates/cortex/src/tool_definitions.rs`, `tool_catalog.rs` — tool schemas + groups
+- `crates/cortex/src/tool/definitions.rs`, `tool/catalog.rs` — tool schemas + groups
 - `crates/cortex/src/config/` — settings registry + DB-backed resolver
 - `crates/cortex/src/db/` — SQLite schema, migrations, per-table helpers
 - `crates/cortex/src/memory/` — short/long-term memory + hybrid search

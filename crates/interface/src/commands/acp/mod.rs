@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::daemon_client::{connect_or_spawn, AcpFsClient, DaemonClient};
 
@@ -84,8 +83,10 @@ fn init_acp_logging() -> Result<()> {
     }
     let file = opts.open(&log_path).context("open ACP log file")?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,hyper=error"));
+    let env_filter = cortex::telemetry::log_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        "warn,hyper=error",
+    );
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)

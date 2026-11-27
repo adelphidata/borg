@@ -137,6 +137,34 @@ fn otel_export_filter() -> tracing_subscriber::filter::FilterFn {
     })
 }
 
+/// Log targets held at a fixed level whatever `RUST_LOG` asks for.
+///
+/// `chromiumoxide::conn` logs every CDP command and reply at TRACE, verbatim:
+/// the text typed into a page (passwords included) and everything a page
+/// evaluation returns. One layer down, `tungstenite::protocol` logs the whole
+/// payload of each WebSocket frame it sends — the same CDP commands again,
+/// key press by key press, and a channel's gateway frames (the one that
+/// carries its bot token among them). A debugging `RUST_LOG=trace` must not
+/// write either to `daemon.log`.
+///
+/// Each entry names the exact target of the payload-bearing events, so a
+/// `RUST_LOG` directive for the same target is replaced, not out-ranked.
+const PINNED_LOG_DIRECTIVES: &[&str] = &["chromiumoxide::conn=error", "tungstenite::protocol=info"];
+
+/// The process log filter: `rust_log` (the `RUST_LOG` value) when it is set
+/// and parses, otherwise `default`, with [`PINNED_LOG_DIRECTIVES`] applied
+/// last so neither can loosen them.
+pub fn log_filter(rust_log: Option<&str>, default: &str) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let base = rust_log
+        .and_then(|spec| EnvFilter::try_new(spec).ok())
+        .unwrap_or_else(|| EnvFilter::new(default));
+    PINNED_LOG_DIRECTIVES
+        .iter()
+        .filter_map(|directive| directive.parse().ok())
+        .fold(base, EnvFilter::add_directive)
+}
+
 /// Type alias for a boxed tracing layer compatible with Registry.
 pub type BoxedLayer = Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync>;
 
@@ -702,6 +730,25 @@ pub(crate) mod tests {
     use opentelemetry_sdk::Resource;
     use plugins::wasm::WasmExecuteErrorKind;
     use wasm_metrics::{is_resource_exhaustion, Instruments, WasmCacheOutcome};
+
+    /// `RUST_LOG` wins when it parses; a missing or malformed value falls back
+    /// to the binary's default rather than to "log nothing" or "log all".
+    #[test]
+    fn log_filter_uses_rust_log_or_falls_back_to_the_default() {
+        use tracing_subscriber::filter::LevelFilter;
+        let cases: &[(Option<&str>, LevelFilter)] = &[
+            (None, LevelFilter::WARN),
+            (Some("debug"), LevelFilter::DEBUG),
+            (Some("cortex=not-a-level"), LevelFilter::WARN),
+        ];
+        for (rust_log, expected) in cases {
+            assert_eq!(
+                log_filter(*rust_log, "warn").max_level_hint(),
+                Some(*expected),
+                "RUST_LOG={rust_log:?}"
+            );
+        }
+    }
 
     /// Transport and runtime spans would be re-exported by the very exporter
     /// they describe; application spans and ordinary events must pass.

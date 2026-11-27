@@ -10,7 +10,7 @@ use crate::constants;
 use crate::execution_context::ExecutionContext;
 use crate::types::{ContentPart, MediaData, ToolOutput};
 
-use super::blocked::is_blocked_path;
+use super::blocked::is_read_denied;
 use super::default_execution_context;
 use super::document;
 use crate::tool_handlers::{optional_u64_param, require_str_param};
@@ -263,8 +263,8 @@ pub fn handle_read_file_with_context(
         )));
     }
 
-    // Security: check blocked paths
-    if is_blocked_path(
+    // Security: blocked paths, plus Borg's own keys, DB and backups
+    if is_read_denied(
         &canonical,
         &config.security.blocked_paths,
         &config.security.allowed_paths,

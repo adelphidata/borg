@@ -385,8 +385,8 @@ const CONTROL_PLANE_FILES: &[&str] = &["borg.db", "borg.db-wal", "borg.db-shm", 
 const CONTROL_PLANE_TREES: &[&str] = &["secrets", "checkpoints"];
 
 /// Hard-coded **read** deny for Borg control-plane files under the data dir
-/// `home`, for paths whose content would leave the machine (`[MEDIA:]` reply
-/// attachments).
+/// `home`, for paths whose content would reach the model or leave the machine
+/// (file reads via [`is_read_denied`], `[MEDIA:]` reply attachments).
 ///
 /// Covers everything [`is_control_plane_write_denied`] protects that holds
 /// data — the DB and its WAL/SHM siblings (the DB is cleartext at rest and
@@ -400,6 +400,21 @@ pub fn is_control_plane_read_denied(path: &std::path::Path, home: &std::path::Pa
     const READ_ONLY_FILES: &[&str] = &[".env"];
     const READ_ONLY_TREES: &[&str] = &["backups"];
     control_plane_match(path, home, READ_ONLY_FILES, READ_ONLY_TREES)
+}
+
+/// The read gate for every in-process reader whose bytes reach the model or
+/// leave the machine: `read_file`, `list_dir`, `@path` mentions, audio
+/// transcription, browser uploads.
+///
+/// Denies what the operator's `security.blocked_paths` denies, plus Borg's own
+/// control-plane data ([`is_control_plane_read_denied`]) under the resolved
+/// data dir. The second half is not configurable and `allowed_paths` cannot
+/// lift it: the KEK file, the provider-key `.env`, the cleartext DB and the
+/// backup tarballs are never model input, whatever the blocklist says.
+pub fn is_read_denied(path: &std::path::Path, blocked: &[String], allowed: &[String]) -> bool {
+    is_blocked_path(path, blocked, allowed)
+        || crate::paths::resolve_borg_home_readonly(None)
+            .is_ok_and(|home| is_control_plane_read_denied(path, &home))
 }
 
 /// `path` resolves to one of the shared [`CONTROL_PLANE_FILES`] /
@@ -1167,6 +1182,67 @@ mod tests {
         // Lexical traversal through a non-existent prefix still resolves.
         let traversal = home.join("ghost").join("..").join("borg.db");
         assert!(is_control_plane_write_denied(&traversal));
+
+        std::env::remove_var("BORG_HOME");
+    }
+
+    /// Borg's own keys, DB, hooks and backups are never model input: the
+    /// in-process readers refuse them even when the operator's blocklist is
+    /// empty and the data dir is on the allowlist. The rest of the data dir
+    /// (logs, the directory listing itself) stays readable.
+    #[test]
+    #[cfg(unix)]
+    fn in_process_readers_refuse_borgs_own_control_plane_data() {
+        use crate::tool_handlers::filesystem::{handle_list_dir, handle_read_file};
+        use crate::types::ToolOutput;
+        use serde_json::json;
+
+        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().canonicalize().expect("canonicalize tempdir");
+        std::env::set_var("BORG_HOME", &home);
+        for dir in ["secrets", "backups", "logs"] {
+            std::fs::create_dir_all(home.join(dir)).expect("mkdir");
+        }
+        let denied = [
+            "secrets/kek.enc",
+            ".env",
+            "hooks.json",
+            "borg.db",
+            "backups/borg-2026.tar.gz",
+        ];
+        for rel in denied {
+            std::fs::write(home.join(rel), "TOP-SECRET-CONTENT").expect("seed");
+        }
+        std::fs::write(home.join("logs/tui.log"), "an ordinary log line").expect("seed log");
+
+        let mut config = crate::config::Config::default();
+        config.security.blocked_paths.clear();
+        config.security.allowed_paths = vec![home.to_string_lossy().into_owned()];
+
+        let read = |rel: &str| {
+            let path = home.join(rel);
+            match handle_read_file(&json!({"path": path.to_string_lossy()}), &config) {
+                Ok(ToolOutput::Text(text)) => text,
+                other => panic!("expected text for {rel}, got {other:?}"),
+            }
+        };
+        for rel in denied {
+            let out = read(rel);
+            assert!(out.starts_with("Access denied"), "{rel} was read: {out}");
+            assert!(!out.contains("TOP-SECRET-CONTENT"), "{rel} leaked: {out}");
+        }
+        assert!(read("logs/tui.log").contains("an ordinary log line"));
+
+        let list = |rel: &str| {
+            handle_list_dir(&json!({"path": home.join(rel).to_string_lossy()}), &config)
+                .expect("list_dir")
+        };
+        for rel in ["secrets", "backups"] {
+            let out = list(rel);
+            assert!(out.starts_with("Access denied"), "{rel} was listed: {out}");
+        }
+        assert!(list("logs").contains("tui.log"));
 
         std::env::remove_var("BORG_HOME");
     }

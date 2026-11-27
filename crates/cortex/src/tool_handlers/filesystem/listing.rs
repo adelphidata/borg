@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
-use super::blocked::is_blocked_path;
+use super::blocked::{is_blocked_path, is_read_denied};
 use super::default_execution_context;
 use crate::tool_handlers::{optional_bool_param, optional_str_param, optional_u64_param};
 
@@ -44,8 +44,8 @@ pub fn handle_list_dir_with_context(
         Err(_) => return Ok(format!("Not a directory: {path_str}")),
     };
 
-    // Security: reuse the same blocked-path check as read_file
-    if is_blocked_path(
+    // Security: reuse the same read gate as read_file
+    if is_read_denied(
         &canonical,
         &config.security.blocked_paths,
         &config.security.allowed_paths,

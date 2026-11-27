@@ -32,7 +32,7 @@ pub(crate) async fn handle(
             args.path
         ));
     }
-    if crate::tool_handlers::filesystem::is_blocked_path(
+    if crate::tool_handlers::filesystem::is_read_denied(
         &path,
         &config.security.blocked_paths,
         &config.security.allowed_paths,

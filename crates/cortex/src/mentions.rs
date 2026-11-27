@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::tool_handlers::filesystem::{handle_list_dir, is_blocked_path};
+use crate::tool_handlers::filesystem::{handle_list_dir, is_read_denied};
 
 /// `MAX_BYTES = 50 * 1024`. Files larger than this are truncated at a
 /// UTF-8 boundary and a marker line is appended.
@@ -211,11 +211,11 @@ pub fn expand_mentions_with_cwd(text: &str, config: &Config, cwd: &Path) -> Ment
         let raw_token = format!("@{raw_path}");
         let resolved = resolve_path(raw_path, cwd);
 
-        // For blocked-path check we need a canonical-ish path. is_blocked_path
+        // For the read gate we need a canonical-ish path. is_read_denied
         // handles non-existent paths by falling back to the literal form.
         let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
 
-        if is_blocked_path(
+        if is_read_denied(
             &canonical,
             &config.security.blocked_paths,
             &config.security.allowed_paths,

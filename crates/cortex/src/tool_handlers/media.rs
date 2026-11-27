@@ -211,6 +211,19 @@ fn browser_open_error_hint(config: &Config, e: &anyhow::Error) -> String {
     }
 }
 
+/// True when `raw` (as the model wrote it: `~`-relative, absolute, or relative
+/// to the process cwd) names a file the read gate refuses. Symlinks are
+/// resolved; a path that does not resolve is judged by its literal form.
+fn upload_path_denied(raw: &str, config: &Config) -> bool {
+    let expanded = std::path::PathBuf::from(crate::util::unix_ext::expand_tilde(raw));
+    let resolved = expanded.canonicalize().unwrap_or(expanded);
+    crate::tool_handlers::filesystem::is_read_denied(
+        &resolved,
+        &config.security.blocked_paths,
+        &config.security.allowed_paths,
+    )
+}
+
 #[instrument(skip_all, fields(tool.name = "browser"))]
 pub async fn handle_browser(
     args: &serde_json::Value,
@@ -228,6 +241,22 @@ pub async fn handle_browser(
 
     if let Some(err_msg) = validate_browser_args(action, args) {
         return Ok(ToolOutput::Text(format!("Error: {err_msg}")));
+    }
+
+    // An upload hands the file's bytes to the page, so every path passes the
+    // same read gate as `read_file` — before a browser is launched.
+    if action == "upload" {
+        let denied = args["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .find(|f| upload_path_denied(f, config));
+        if let Some(denied) = denied {
+            return Ok(ToolOutput::Text(format!(
+                "Access denied: {denied} is in a blocked path."
+            )));
+        }
     }
 
     // Close runs before the session is required: closing an already-dead
@@ -713,6 +742,43 @@ mod tests {
             assert!(msg.contains("delta"), "missing delta hint: {msg}");
         } else {
             panic!("expected text output");
+        }
+    }
+
+    /// An upload sends a local file to whatever page is open, so it is an
+    /// exfiltration path for anything the read gate protects. A blocked file
+    /// anywhere in the list refuses the whole call, under any spelling, and
+    /// no browser is launched to find out.
+    #[tokio::test]
+    async fn handle_browser_upload_refuses_blocked_files() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let harmless = workdir.path().join("report.pdf");
+        std::fs::write(&harmless, b"%PDF").expect("seed");
+        let harmless = harmless.to_string_lossy().into_owned();
+
+        for blocked in ["~/.ssh/id_ed25519", "~/.aws/credentials"] {
+            let mut session: Option<BrowserSession> = None;
+            let out = handle_browser(
+                &json!({
+                    "action": "upload",
+                    "selector": "input[type=file]",
+                    "files": [harmless, blocked],
+                }),
+                &config,
+                &mut session,
+            )
+            .await
+            .expect("ok");
+            let ToolOutput::Text(msg) = out else {
+                panic!("expected text output");
+            };
+            assert_eq!(
+                msg,
+                format!("Access denied: {blocked} is in a blocked path."),
+            );
+            assert!(session.is_none(), "no browser may be launched");
         }
     }
 
