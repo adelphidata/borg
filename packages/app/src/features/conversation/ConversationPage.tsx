@@ -75,6 +75,9 @@ export function ConversationPage() {
     fork,
     context,
   } = useConversation(target);
+  const rollbackFiles = useCallback(() => {
+    runCommand("/rollback");
+  }, [runCommand]);
   const runCompact = useCallback(() => {
     setCompacting(true);
     void compact().finally(() => setCompacting(false));
@@ -499,6 +502,7 @@ export function ConversationPage() {
           onCancel={cancel}
           onCommand={runCommand}
           onCompact={cells.length > 0 && !busy && !compacting ? runCompact : undefined}
+          onRollback={cells.length > 0 && !busy ? rollbackFiles : undefined}
         />
       </div>
     </PageChrome>

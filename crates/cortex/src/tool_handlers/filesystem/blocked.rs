@@ -378,8 +378,11 @@ pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
 const CONTROL_PLANE_FILES: &[&str] = &["borg.db", "borg.db-wal", "borg.db-shm", "hooks.json"];
 
 /// `$BORG_HOME` subtrees denied as a whole for writes and egress reads:
-/// `secrets/` holds the KEK material (`kek.enc`, the dev KEK cache).
-const CONTROL_PLANE_TREES: &[&str] = &["secrets"];
+/// `secrets/` holds the KEK material (`kek.enc`, the dev KEK cache);
+/// `checkpoints/` holds the undo points — a copy of every file in each
+/// snapshotted workspace, blocked-path files included, and the only way back
+/// from a bad edit, so the agent may neither read nor rewrite it.
+const CONTROL_PLANE_TREES: &[&str] = &["secrets", "checkpoints"];
 
 /// Hard-coded **read** deny for Borg control-plane files under the data dir
 /// `home`, for paths whose content would leave the machine (`[MEDIA:]` reply
@@ -423,8 +426,8 @@ fn control_plane_match(
 
 /// Conventional control-plane file leaves under `$BORG_HOME`. `borg.db`'s
 /// WAL/SHM siblings are covered by the `borg.db` substring; `secrets` matches
-/// the whole KEK subtree.
-const CONTROL_PLANE_LEAVES: &[&str] = &["hooks.json", "borg.db", "secrets"];
+/// the whole KEK subtree and `checkpoints` the whole undo-point store.
+const CONTROL_PLANE_LEAVES: &[&str] = &["hooks.json", "borg.db", "secrets", "checkpoints"];
 
 /// Substrings whose presence in a shell token means the token points at one of
 /// Borg's own control-plane files. Built once (process-lifetime) from the
@@ -461,6 +464,7 @@ const CONTROL_PLANE_BARE_LEAVES: &[&str] = &[
     "borg.db-shm",
     "kek.enc",
     "secrets",
+    "checkpoints",
     "borgd.sock",
     "borgd-pair.sock",
     "borgd.pid",
@@ -552,10 +556,21 @@ fn command_cwd_is_control_plane(command: &str) -> bool {
                     let expanded = folded_token(target);
                     CONTROL_PLANE_DIR_NEEDLES
                         .iter()
-                        .any(|n| expanded.contains(n.as_str()))
+                        .any(|n| names_directory(&expanded, n))
                 })
             })
         })
+}
+
+/// True when `token` holds `dir` as a whole directory name: `~/.borg` and
+/// `~/.borg/secrets` do, `~/.borg-worktrees/project` and `~/.borgrc` do not.
+/// Only the end is checked. What follows a match must not continue the name;
+/// a quote, a slash or the end of the token does not.
+fn names_directory(token: &str, dir: &str) -> bool {
+    token.match_indices(dir).any(|(at, _)| {
+        !token[at + dir.len()..]
+            .starts_with(|next: char| next.is_alphanumeric() || matches!(next, '-' | '_' | '.'))
+    })
 }
 
 /// Basename of a command word, stripping any directory prefix (`/usr/bin/borg`
@@ -1042,6 +1057,11 @@ mod tests {
             &home.join("secrets/sub/nested.bin")
         ));
         assert!(is_control_plane_write_denied(&home.join("borgd.sock")));
+        // The undo points: an agent that could rewrite them could make its
+        // own changes impossible to roll back.
+        assert!(is_control_plane_write_denied(
+            &home.join("checkpoints/store/refs/borg/tip/abc")
+        ));
         // hooks.json executes arbitrary shell at every hook point, so it is as
         // security-sensitive as the DB and must be write-denied too.
         assert!(is_control_plane_write_denied(&home.join("hooks.json")));
@@ -1093,6 +1113,7 @@ mod tests {
             home.join("hooks.json"),
             home.join(".env"),
             home.join("backups/borg-2026.tar.gz"),
+            home.join("checkpoints/store/objects/ab/cdef"),
             home.join("screenshots/../borg.db"),
             alias.join("borg.db"),
         ];
@@ -1200,6 +1221,10 @@ mod tests {
             "sed -i.bak s/a/b/ ~/.borg/hooks.json",
             "dd if=/dev/zero of=~/.borg/borg.db",
             "truncate -s0 ~/.borg/secrets/kek.enc",
+            // The undo-point store: a rewritten ref or exclude file changes
+            // what a rollback puts back.
+            "cp /tmp/evil ~/.borg/checkpoints/store/HEAD",
+            "echo '*' > ~/.borg/checkpoints/store/info/exclude",
             "sqlite3 ~/.borg/borg.db 'UPDATE settings SET v=0'",
             "/usr/local/bin/borg settings set security.blocked_paths []",
             "borg settings unset mcp.allow_local_network",
@@ -1260,6 +1285,11 @@ mod tests {
             "python3 -c 'print(1)'",
             // A token that merely contains 'secrets' is not a bare leaf.
             "cd ~/.borg && echo x > my-secrets.txt",
+            // A worktree lives beside the data dir, not in it, and a project
+            // may well have a `checkpoints` or `secrets` folder of its own.
+            "cd ~/.borg-worktrees/project/fix && rm -rf checkpoints",
+            "cd ~/.borg-worktrees/project/fix && echo x > secrets",
+            "cd ~/.borgrc.d && rm -rf checkpoints",
         ] {
             assert!(
                 !shell_command_targets_control_plane(cmd),
@@ -1278,6 +1308,9 @@ mod tests {
             "rm ~/.borg/borg.db",
             "rm -f ~/.borg/hooks.json",
             "rm -rf ~/.borg/secrets",
+            "rm -rf ~/.borg/checkpoints",
+            "rm -rf ~/.borg/checkpoints/store/refs",
+            "cd ~/.borg && rm -rf checkpoints",
             "rm -rf ~/.borg",
             "rm -rf ~/.borg/",
             "unlink ~/.borg/hooks.json",
@@ -1346,6 +1379,9 @@ mod tests {
         // ".borg" as a substring — must keep auto-approving.
         for cmd in [
             "rm -rf /tmp/build",
+            // A project's own model checkpoints are not Borg's.
+            "rm -rf checkpoints",
+            "rm -rf ./training/checkpoints/epoch-3",
             "rm foo.borg",
             "rm -rf ~/.borgrc",
             "rm -rf ./my.borg/cache",

@@ -60,8 +60,9 @@ use protocols::session::{
     AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
     CompactRequest, CompactResponse, ContextBreakdown, ExecShellRequest, ExecShellResponse,
     ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
-    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse,
+    RollbackRequest, RollbackResponse, SendRequest, SessionState, SessionStateRequest,
+    SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::{
@@ -894,6 +895,14 @@ rpc_wrappers! {
     session fn undo(session_id: &str) -> UndoResponse =
         undo("Session.Undo", UndoRequest {
             session_id: session_id.to_string(),
+        });
+
+    /// Put the workspace's files back to an undo point, or list the points.
+    session fn rollback(session_id: &str, point: u32, list_only: bool) -> RollbackResponse =
+        rollback("Session.Rollback", RollbackRequest {
+            session_id: session_id.to_string(),
+            point,
+            list_only,
         });
 
     /// Rewind to the Nth user message.

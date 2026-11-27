@@ -1177,7 +1177,7 @@ export function useConversation(target: string | undefined): Conversation {
   );
 
   /**
-   * Runs `/goal …`, `/heartbeat …` or `/mode …` against this conversation and answers
+   * Runs `/goal …`, `/heartbeat …`, `/mode …` or `/rollback …` against this conversation and answers
    * with a notice. False when `text` is not one of them, so the caller sends
    * it as an ordinary message.
    */
@@ -1209,7 +1209,7 @@ export function useConversation(target: string | undefined): Conversation {
           answer("Borg could not find this conversation. Try again in a moment.");
           return;
         }
-        answer(await runArgCommand(borg, agentId, cmd, saveSetting));
+        answer(await runArgCommand(borg, agentId, cmd, saveSetting, sessionId));
       })();
       return true;
     },

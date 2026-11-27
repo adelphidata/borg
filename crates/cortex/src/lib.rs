@@ -81,7 +81,7 @@ pub mod execution_context;
 pub mod export;
 /// Task-local gateway origin context for tool handlers.
 pub mod gateway_context;
-/// Git utilities: ghost commits, context enrichment, turn diff tracking.
+/// Git utilities: hardened runners, context enrichment, file-change undo points.
 pub mod git;
 /// Per-session goals: types, validators, prompt builders, runtime accounting.
 pub mod goals;

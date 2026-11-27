@@ -46,7 +46,8 @@ async fn agent_with_db(db: Option<Database>) -> Agent {
         config_pin: None,
         db: Mutex::new(db),
         caches: SystemPromptCache::default(),
-        ghost_commit: None,
+        turn_checkpointed: false,
+        checkpoint_timed_out_in: None,
         execution_context: crate::execution_context::ExecutionContext::unrestricted(
             std::path::PathBuf::from("."),
         ),
@@ -604,6 +605,38 @@ async fn continuation_injects_for_active_goal_and_reserves_turn() {
         before + 1,
         "no additional message on the deduped call"
     );
+}
+
+/// A goal runs leg after leg inside one user turn. Each leg that changes
+/// files must get its own undo point: with only the first leg's, undoing the
+/// last leg of a long run would throw away every leg before it too.
+#[tokio::test]
+async fn a_goal_continuation_lets_the_next_leg_take_its_own_undo_point() {
+    let db = Database::test_db().await;
+    let mut agent = agent_with_db(Some(db)).await;
+    seed_active_goal(&agent, "ship the feature", Some(5000)).await;
+    let edit = [crate::types::ToolCall {
+        id: "call_1".to_string(),
+        call_type: "function".to_string(),
+        function: crate::types::FunctionCall {
+            name: "apply_patch".to_string(),
+            arguments: r#"{"patch":"x"}"#.to_string(),
+        },
+    }];
+    // The first leg already took its undo point.
+    agent.turn_checkpointed = true;
+    assert!(!agent.wants_checkpoint(&edit));
+
+    let continued = agent
+        .maybe_inject_goal_continuation(
+            "turn-1",
+            &discard_events(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    assert!(continued);
+    assert!(agent.wants_checkpoint(&edit));
 }
 
 /// Negative: only an *Active* goal continues. Every other status ends the turn.

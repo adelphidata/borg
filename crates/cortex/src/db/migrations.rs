@@ -316,6 +316,28 @@ impl Database {
         Ok(())
     }
 
+    /// v10: file checkpoints. The table is in `SCHEMA_SQL`, which only a
+    /// fresh database runs, so a database stamped before it gets it here.
+    pub(super) async fn migrate_v10(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_snapshots (
+                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id        TEXT NOT NULL,
+                     user_message_seq  INTEGER,
+                     snapshot_root     TEXT NOT NULL,
+                     commit_id         TEXT NOT NULL,
+                     uncovered_json    TEXT NOT NULL DEFAULT '[]',
+                     before_rollback   INTEGER NOT NULL DEFAULT 0,
+                     created_at        INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_session_snapshots_session
+                     ON session_snapshots(session_id, id DESC);",
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Remove `tools.include` from every server whose list is empty; returns
     /// the names of the servers that changed.
     fn drop_empty_include_lists(servers: &mut serde_json::Value) -> Vec<String> {
@@ -1552,6 +1574,21 @@ CREATE TABLE IF NOT EXISTS redaction_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_redaction_audit_ts ON redaction_audit(ts DESC);
 
+-- File checkpoints: the store commit taken before each turn that changed
+-- files. `session_id` is the root session of the agent tree.
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        TEXT NOT NULL,
+    user_message_seq  INTEGER,
+    snapshot_root     TEXT NOT NULL,
+    commit_id         TEXT NOT NULL,
+    uncovered_json    TEXT NOT NULL DEFAULT '[]',
+    before_rollback   INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_session
+    ON session_snapshots(session_id, id DESC);
+
 -- Skill audit / doctor / maintenance --------------------------------------
 CREATE TABLE IF NOT EXISTS skill_audit (
     name           TEXT PRIMARY KEY,
@@ -1809,6 +1846,41 @@ mod tests {
             db.schema_version().await.unwrap(),
             Database::CURRENT_VERSION
         );
+    }
+
+    /// A database stamped by the previous release has no `session_snapshots`
+    /// table: `SCHEMA_SQL` only runs on a fresh database, so the upgrade
+    /// step is what gives every existing install the table. Without it the
+    /// first undo point after an upgrade fails with "no such table".
+    #[tokio::test]
+    async fn a_v9_database_gains_the_checkpoint_table_on_upgrade() {
+        let db = Database::test_db().await;
+        db.conn
+            .execute_batch("DROP TABLE session_snapshots;")
+            .await
+            .expect("drop to simulate a v9 database");
+        db.set_meta("schema_version", "9").await.unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        assert_eq!(
+            db.schema_version().await.unwrap(),
+            Database::CURRENT_VERSION
+        );
+        let id = db
+            .record_session_snapshot(&crate::db::NewSessionSnapshot {
+                session_id: "s1",
+                user_message_seq: Some(4),
+                snapshot_root: std::path::Path::new("/work/project"),
+                commit_id: "abc",
+                uncovered: &[],
+                before_rollback: false,
+            })
+            .await
+            .expect("the upgraded table takes a row");
+        let rows = db.list_session_snapshots("s1", 5).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
     }
 
     /// A database made by an early v8 build has `subscriptions` without the

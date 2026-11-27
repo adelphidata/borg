@@ -489,7 +489,7 @@ pub async fn handle_run_shell_with_context(
     // (`bash -lc "apply_patch <<'EOF' ... EOF"`), reroute through the
     // verified patch path. The shell binary `apply_patch` doesn't exist on
     // `$PATH`, so running it raw fails; we also lose blocked-path
-    // enforcement, vitals classification, and ghost-commit undo.
+    // enforcement, vitals classification, and the patch's own rollback.
     if action == "run" {
         if let Some(patch_text) = coding::maybe_extract_apply_patch_from_shell(command) {
             let patch_args = serde_json::json!({ "patch": patch_text });

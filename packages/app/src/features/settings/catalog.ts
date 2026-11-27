@@ -226,7 +226,7 @@ export const ADVANCED_CATEGORIES: readonly AdvancedCategory[] = [
   {
     id: "security",
     name: "Security",
-    prefixes: ["security", "sandbox"],
+    prefixes: ["security", "sandbox", "checkpoints"],
   },
   {
     id: "system",

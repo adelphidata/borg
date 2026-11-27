@@ -292,6 +292,23 @@ describe("starting over", () => {
   });
 });
 
+describe("undoing file changes", () => {
+  it("is offered only where a conversation can be asked to put files back", () => {
+    expect(buildCommands(context(), ROUTES).map((c) => c.id)).not.toContain("action:rollback");
+  });
+
+  it.each(["rollback", "undo file", "revert"])("answers %j with the action", (query) => {
+    const rollbackFiles = vi.fn();
+    const commands = buildCommands(context({ searching: true, rollbackFiles }), ROUTES);
+
+    const top = rank(commands, query)[0];
+    top?.run();
+
+    expect(top?.id).toBe("action:rollback");
+    expect(rollbackFiles).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("compacting the conversation", () => {
   it("is offered only where there is a conversation to compact", () => {
     expect(buildCommands(context(), ROUTES).map((c) => c.id)).not.toContain("action:compact");

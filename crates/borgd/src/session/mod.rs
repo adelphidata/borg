@@ -320,6 +320,14 @@ impl SessionHost {
         self.inner.backend.undo()
     }
 
+    /// Put the workspace's files back to an undo point, or list the points.
+    pub async fn rollback(
+        &self,
+        request: backend::RollbackRequest,
+    ) -> Result<backend::RollbackReply> {
+        self.inner.backend.rollback(request).await
+    }
+
     /// Rewind to Nth user message.
     pub fn rewind_to_nth_user_message(&self, n: usize) -> Result<usize> {
         self.inner.backend.rewind_to_nth_user_message(n)

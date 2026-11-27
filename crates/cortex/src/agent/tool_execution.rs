@@ -224,6 +224,8 @@ impl Agent {
         }
         self.log_and_persist_batch(head_batch).await;
 
+        self.checkpoint_before_mutation(tc, cancel).await;
+
         // Plan concurrent tool groups. The planner guarantees every group
         // either (a) contains a single Unknown-effect tool or (b) contains
         // only parallel-safe tools with no conflicting file-path writes.

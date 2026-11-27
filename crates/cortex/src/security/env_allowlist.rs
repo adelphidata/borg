@@ -449,11 +449,11 @@ mod tests {
 
     #[test]
     fn forwards_git_identity_but_not_git_credentials() {
-        // A ghost commit or a `git commit` in a child shell needs the
+        // A `git commit` in a child shell needs the
         // operator's identity; the credential-bearing git vars stay out.
         // Drive `filter_iter` directly: setting `GIT_AUTHOR_EMAIL` on the
         // process would outrank repo config for every other test that runs
-        // `git commit` in parallel (the ghost-commit identity tests).
+        // `git commit` in parallel.
         let key = "GIT_AUTHOR_EMAIL";
         let forwarded = filter_iter(
             [

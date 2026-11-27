@@ -16,4 +16,9 @@ describe("advancedCategoryOf", () => {
     expect(category.name).toBe("Meetings");
     expect(category.page?.path).toBe("/settings/meetings");
   });
+
+  it("files the undo-point switch under Security, beside the sandbox", () => {
+    expect(advancedCategoryOf("checkpoints.enabled").name).toBe("Security");
+    expect(advancedCategoryOf("sandbox.enabled").name).toBe("Security");
+  });
 });

@@ -100,7 +100,7 @@ borg
 borg start
 ```
 
-Launches the full TUI with markdown rendering, slash commands, and an auto-started gateway for messaging channels. Use slash commands like `/compact`, `/undo`, `/settings`, `/plugins`, `/pairing`, and `/doctor`.
+Launches the full TUI with markdown rendering, slash commands, and an auto-started gateway for messaging channels. Use slash commands like `/compact`, `/undo`, `/rollback`, `/settings`, `/plugins`, `/pairing`, and `/doctor`. `/rollback` puts the files Borg changed back to how they were ([undo points](undo-points.md)).
 
 ### One-shot query
 

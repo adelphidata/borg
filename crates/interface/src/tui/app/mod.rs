@@ -408,6 +408,13 @@ pub enum AppAction {
     /// conversation state or the Ctrl+T transcript. Used by Ctrl+L.
     ClearTranscript,
     UndoLastTurn,
+    /// Put the workspace's files back to an undo point: number `point` of
+    /// the list, or the most recent one that differs when it is 0. With
+    /// `list_only`, show the list and change nothing.
+    RollbackFiles {
+        point: u32,
+        list_only: bool,
+    },
     /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
     RewindTo {
         nth_user_message: usize,

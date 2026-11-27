@@ -2,8 +2,8 @@ import { admin, type BorgClient } from "@borg/client";
 import { MODE_KEY } from "../settings/catalog";
 
 /**
- * Slash commands that take words after them: `/goal …`, `/heartbeat …` and
- * `/mode …`.
+ * Slash commands that take words after them: `/goal …`, `/heartbeat …`,
+ * `/mode …` and `/rollback …`.
  *
  * The `/` menu runs one-word commands; these carry an objective or a prompt,
  * so the menu never matches them and they used to go to the model as prose —
@@ -24,6 +24,8 @@ export type ArgCommand =
       intervalSecs: number;
     }
   | { kind: "mode"; mode: "plan" | "execute" }
+  /** `point` 0 is the most recent undo point that differs from the files. */
+  | { kind: "rollback"; point: number; listOnly: boolean }
   | { kind: "usage"; text: string };
 
 export const GOAL_USAGE =
@@ -31,6 +33,10 @@ export const GOAL_USAGE =
 
 export const MODE_USAGE =
   "Use /mode plan to have Borg propose changes and make none, or /mode execute to let it act.";
+
+export const ROLLBACK_USAGE =
+  "Use /rollback to put files back to before the last turn that changed them, " +
+  "/rollback list to see the undo points, or /rollback <number> to pick one.";
 
 export const HEARTBEAT_USAGE =
   "Use /heartbeat every <interval> <prompt>, for example: /heartbeat every 15m Check the deploy. " +
@@ -50,10 +56,11 @@ export function parseIntervalSecs(raw: string): number | undefined {
  * case it is ordinary text and is sent as usual.
  */
 export function parseArgCommand(text: string): ArgCommand | undefined {
-  const m = /^\/(goal|heartbeat|hb|mode)(?:\s+([\s\S]*))?$/.exec(text.trim());
+  const m = /^\/(goal|heartbeat|hb|mode|rollback)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!m) return undefined;
   const rest = (m[2] ?? "").trim();
   if (m[1] === "mode") return parseMode(rest);
+  if (m[1] === "rollback") return parseRollback(rest);
   return m[1] === "goal" ? parseGoal(rest) : parseHeartbeat(rest);
 }
 
@@ -66,6 +73,20 @@ function parseMode(rest: string): ArgCommand {
   return mode === "plan" || mode === "execute"
     ? { kind: "mode", mode }
     : { kind: "usage", text: MODE_USAGE };
+}
+
+/**
+ * `/rollback`, `/rollback list` and `/rollback 2`. Files only: the
+ * conversation stays as it is.
+ */
+function parseRollback(rest: string): ArgCommand {
+  if (rest === "") return { kind: "rollback", point: 0, listOnly: false };
+  if (rest === "list") return { kind: "rollback", point: 0, listOnly: true };
+  // 0 on the wire means "the most recent"; typed, it is not a point.
+  const point = /^\d{1,6}$/.test(rest) ? Number(rest) : 0;
+  return point > 0
+    ? { kind: "rollback", point, listOnly: false }
+    : { kind: "usage", text: ROLLBACK_USAGE };
 }
 
 function parseGoal(rest: string): ArgCommand {
@@ -152,6 +173,10 @@ function describeHeartbeat(
  *
  * `save` writes a setting; the app passes its settings store so the mode
  * switch beside the model follows at once.
+ *
+ * `liveSessionId` is the open session the conversation runs in — a different
+ * id from the agent session the Admin RPCs take. A rollback moves the files
+ * that live session works on, so it goes there.
  */
 export async function runArgCommand(
   borg: BorgClient,
@@ -161,6 +186,7 @@ export async function runArgCommand(
     await borg.admin.setSetting({ key, value });
     return true;
   },
+  liveSessionId = "",
 ): Promise<string> {
   const sessionId = agentSessionId;
   try {
@@ -172,6 +198,16 @@ export async function runArgCommand(
         return cmd.mode === "plan"
           ? "Plan mode is on. Borg proposes changes and makes none."
           : "Execute mode is on.";
+      case "rollback":
+        // The daemon writes the answer: the list, what was put back, or why
+        // nothing was. The terminal shows the same words.
+        return (
+          await borg.session.rollback({
+            sessionId: liveSessionId,
+            point: cmd.point,
+            listOnly: cmd.listOnly,
+          })
+        ).report;
       case "goal-terminal-only":
         return "Goal budgets and quality gates are set from the terminal: run `borg`, then /goal.";
       case "goal-show":

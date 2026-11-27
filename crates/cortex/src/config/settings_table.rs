@@ -413,6 +413,9 @@ define_settings! {
         "loop_guard.web_search_max_per_turn" => loop_guard.web_search_max_per_turn, parsed(u32);
         "loop_guard.subagent_max_per_turn" => loop_guard.subagent_max_per_turn, parsed(u32);
 
+        // ── Checkpoints (undo points for file changes) ──
+        "checkpoints.enabled" => checkpoints.enabled, parsed(bool);
+
         // ── Subscriptions (outside events that wake the agent) ──
         "subscriptions.enabled" => subscriptions.enabled, parsed(bool);
         "subscriptions.max_concurrent" => subscriptions.max_concurrent, nonzero(usize);
@@ -1092,6 +1095,7 @@ define_settings! {
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
         "ui.shell_mode_enabled" => "! shell mode", Bool, "Interface";
         "ui.notify_on_complete" => "Notify when a reply finishes", Bool, "Interface";
+        "checkpoints.enabled" => "Keep undo points for file changes", Bool, "Security";
         "security.secret_detection" => "Secret detection", Bool, "Security";
         "security.startup_audit" => "Startup posture audit", Bool, "Security";
         "security.output_redaction" => "Output redaction", Bool, "Security";

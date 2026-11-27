@@ -275,6 +275,20 @@ describe("TranscriptCell — other kinds", () => {
     expect(screen.getByText("Older messages were compacted to save space.")).toBeTruthy();
   });
 
+  it("keeps the lines of a notice that has several", () => {
+    // `/rollback list` answers with one undo point per line. Shown as one
+    // paragraph, the numbers run into each other.
+    renderCell({
+      kind: "notice",
+      text: 'Undo points, newest first:\n  1. before "tidy" · 2 files differ\n  2. before "sort" · same as now',
+    });
+    const second = screen.getByText('2. before "sort" · same as now');
+    const first = screen.getByText('1. before "tidy" · 2 files differ');
+    expect(second).not.toBe(first);
+    expect(first.textContent).not.toContain("Undo points");
+    expect(second.parentElement).toBe(first.parentElement);
+  });
+
   it("shows a sub-agent's nickname and status", () => {
     renderCell({ kind: "sub-agent", agentId: "a1", nickname: "scout", status: "running" });
     expect(screen.getByText("scout")).toBeTruthy();
