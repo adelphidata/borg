@@ -51,6 +51,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear conversation"),
     ("/cancel", "Stop the current in-progress turn"),
     ("/undo", "Undo last agent turn"),
+    (
+        "/rollback",
+        "Put files back to before the last turn that changed them",
+    ),
     ("/resume-turn", "Continue a reply that was cut short"),
     ("/btw", "Ask an ephemeral side question (not persisted)"),
     // Context

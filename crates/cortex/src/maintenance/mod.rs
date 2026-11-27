@@ -29,6 +29,7 @@ pub(crate) mod fts;
 mod gateway_recovery;
 mod issues;
 mod log_prune;
+mod undo_points;
 
 pub use fs_setup::{ensure_data_subdirs, ensure_global_index};
 pub use gateway_recovery::recover_gateway_if_abandoned;
@@ -76,6 +77,10 @@ pub struct MaintenanceReport {
     /// observable side of the daily retention behavior.
     #[serde(default)]
     pub audit_events_tombstoned: usize,
+    /// File undo points dropped from the checkpoint store: past a week
+    /// old, or beyond the number kept per workspace.
+    #[serde(default)]
+    pub undo_points_pruned: usize,
     /// Doctor checks persisted across runs (subset of `current_issues`
     /// whose issue-state rows are still open with `consecutive_count >= 2`.
     pub persistent_warnings: Vec<String>,
@@ -391,6 +396,9 @@ pub async fn run_daily_maintenance_with_registry(
 
     // 3–4c. Budgeted database retention/pruning steps.
     apply_db_retention(db, config, now, &mut report, &mut budget).await;
+
+    // 4d. Old file undo points, and the rows that name them.
+    undo_points::prune_undo_points(db, now, &mut report, &mut budget).await;
 
     // 5 + 5_gate. Task healing and the scheduled-command policy scan.
     heal_scheduled_tasks(db, config, now, &mut report, &mut budget).await;

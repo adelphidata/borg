@@ -23,6 +23,7 @@ mod plugins;
 mod redaction_audit;
 mod scripts;
 mod session_heartbeat;
+mod session_snapshots;
 mod sessions;
 mod settings;
 mod skill_audit;
@@ -48,6 +49,7 @@ pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use redaction_audit::RedactionAuditRow;
 pub use session_heartbeat::{SessionHeartbeat, MIN_HEARTBEAT_INTERVAL_SECS};
+pub use session_snapshots::{NewSessionSnapshot, SessionSnapshotRow};
 pub use sessions::{MessageFtsHit, SessionEventDraft};
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use subscriptions::{
@@ -1190,7 +1192,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 9;
+    const CURRENT_VERSION: u32 = 10;
 
     /// True when the stamp matches this binary exactly, so migrations can be
     /// skipped.
@@ -1289,8 +1291,9 @@ impl Database {
         self.migrate_v7().await?;
         self.migrate_v8().await?;
         self.migrate_v9().await?;
+        self.migrate_v10().await?;
         const _: () = assert!(
-            Database::CURRENT_VERSION == 9,
+            Database::CURRENT_VERSION == 10,
             "add the new migrate_vN call above and bump this constant",
         );
 

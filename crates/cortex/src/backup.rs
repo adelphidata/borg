@@ -68,6 +68,15 @@ const EXCLUDED_NAMES: &[&str] = &[
     "borg.db-shm",
 ];
 
+/// Directories excluded only at the top of the data dir, so a skill or a
+/// memory folder that happens to share the name is still archived.
+///
+/// `checkpoints` holds the undo points for file changes: a copy of every
+/// snapshotted workspace. It can be far larger than the rest of the data dir,
+/// it is other projects' files rather than Borg state, and an undo point is
+/// useless on the machine a backup is restored to.
+const EXCLUDED_TOP_LEVEL: &[&str] = &["checkpoints"];
+
 /// File-extension suffix excluded from the archive.
 const EXCLUDED_SUFFIXES: &[&str] = &[".lock", ".sock"];
 
@@ -557,6 +566,10 @@ fn walk_dir_into(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<
 }
 
 fn should_skip_entry(rel: &Path) -> bool {
+    let top_level = rel.components().next().map(std::path::Component::as_os_str);
+    if top_level.is_some_and(|top| EXCLUDED_TOP_LEVEL.iter().any(|name| top == *name)) {
+        return true;
+    }
     let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
@@ -1097,13 +1110,22 @@ mod tests {
             "borg.db",
             "borg.db-wal",
             "borg.db-shm",
+            // Undo points: copies of other projects' files, not Borg state.
+            "checkpoints",
+            "checkpoints/store/objects/ab/cdef",
         ] {
             assert!(
                 should_skip_entry(Path::new(skip)),
                 "expected to skip {skip}"
             );
         }
-        for keep in ["skills/x/SKILL.md", "blobs/a.bin", "hooks.json"] {
+        for keep in [
+            "skills/x/SKILL.md",
+            "blobs/a.bin",
+            "hooks.json",
+            // Only the top-level store is left out, not a namesake below it.
+            "skills/checkpoints/SKILL.md",
+        ] {
             assert!(
                 !should_skip_entry(Path::new(keep)),
                 "expected to keep {keep}"

@@ -333,7 +333,8 @@ pub(super) fn minimal_test_agent(config: Config) -> Agent {
         config_pin: None,
         db: Mutex::new(None),
         caches: SystemPromptCache::with_test_state(None, Some(HashMap::new()), None, None, None),
-        ghost_commit: None,
+        turn_checkpointed: false,
+        checkpoint_timed_out_in: None,
         execution_context: crate::execution_context::ExecutionContext::unrestricted(
             std::path::PathBuf::from("."),
         ),
@@ -473,12 +474,21 @@ async fn mount_dead_override_live_primary(server: &wiremock::MockServer) {
 /// An agent whose `[compaction]` override points at a dead model while the
 /// primary model still works, with history well over the budget.
 fn over_budget_agent_with_dead_override(server_uri: &str) -> Agent {
-    std::env::set_var("BORG_COMPACTION_FALLBACK_TEST_KEY", "test-key");
+    over_budget_agent_with_key(server_uri, "BORG_COMPACTION_FALLBACK_TEST_KEY", "test-key")
+}
+
+/// [`over_budget_agent_with_dead_override`] with a key of the caller's own.
+///
+/// For a test whose provider answers 401: the credential pool drops a refused
+/// key for good and records that in the database every test in this process
+/// shares, so a refusal of the common key fails whichever test loads it next.
+fn over_budget_agent_with_key(server_uri: &str, key_env: &str, key: &str) -> Agent {
+    std::env::set_var(key_env, key);
     let mut config = Config::default();
     config.llm.provider = Some("openai".into());
     config.llm.model = "live-primary-model".into();
     config.llm.base_url = Some(format!("{server_uri}/v1/chat/completions"));
-    config.llm.api_key_env = "BORG_COMPACTION_FALLBACK_TEST_KEY".into();
+    config.llm.api_key_env = key_env.into();
     config.llm.max_retries = 0;
     config.compaction.model = Some("dead-compaction-model".into());
     config.conversation.max_history_tokens = 200;
@@ -601,7 +611,12 @@ async fn manual_compact_reports_a_refused_summary() {
             .respond_with(ResponseTemplate::new(status).set_body_string(body))
             .mount(&server)
             .await;
-        let mut agent = over_budget_agent_with_dead_override(&server.uri());
+        // A key per case: the 401 gets this one dropped from the pool.
+        let mut agent = over_budget_agent_with_key(
+            &server.uri(),
+            &format!("BORG_REFUSED_SUMMARY_TEST_KEY_{status}"),
+            &format!("refused-summary-key-{status}"),
+        );
         agent.config.compaction.model = None;
         let before_len = agent.history.len();
 

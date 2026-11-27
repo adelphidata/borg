@@ -937,6 +937,25 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// What `/undo` adds when the undone turn's file changes are still on disk.
+/// `points` is the session's undo points, newest first. The one that counts
+/// is the one a bare `/rollback` would go back to: the newest that differs
+/// from the files. Empty unless that is the undone turn's own point — an
+/// earlier turn's work is not this undo's business, and after a rollback the
+/// user has been moving files themselves and knows where they are.
+fn undo_files_note(points: &[protocols::session::UndoPoint]) -> String {
+    match points.iter().find(|point| point.differing_files > 0) {
+        Some(point) if point.turn_undone && !point.before_rollback => {
+            let files = match point.differing_files {
+                1 => "1 file is".to_string(),
+                n => format!("{n} files are"),
+            };
+            format!(" {files} still changed: use /rollback to put the files back too.")
+        }
+        _ => String::new(),
+    }
+}
+
 /// User-facing message after a `/update --check` (dry-run) completes.
 fn format_check_outcome(current: &str, latest: &str) -> String {
     if cortex::update::is_newer(current, latest) {
@@ -1492,12 +1511,28 @@ async fn run_event_loop(
                     tui.terminal.reposition_viewport_to_cursor();
                 }
             }
+            AppAction::RollbackFiles { point, list_only } => {
+                match client.rollback(session_id, point, list_only).await {
+                    Ok(r) => app.push_system_message(r.report),
+                    Err(e) => app.push_system_message(format!("Rollback failed: {e}")),
+                }
+            }
             AppAction::UndoLastTurn => match client.undo(session_id).await {
                 Ok(r) => {
                     let removed = r.removed as usize;
                     if removed > 0 {
+                        // `/undo` rewinds the conversation only. Say so when
+                        // files are still changed, or the user believes the
+                        // turn is gone when half of it is on disk.
+                        let files_note = match client.rollback(session_id, 0, true).await {
+                            Ok(list) => undo_files_note(&list.points),
+                            Err(e) => {
+                                tracing::warn!("undo: could not check for file changes: {e:#}");
+                                String::new()
+                            }
+                        };
                         app.push_system_message(format!(
-                            "Undid last turn ({removed} messages removed)."
+                            "Undid last turn ({removed} messages removed).{files_note}"
                         ));
                     } else {
                         app.push_system_message("Nothing to undo.".to_string());
@@ -2498,6 +2533,67 @@ mod tests {
     /// Forbidden escape-sequence modes. Presence of ANY of these in the code
     /// paths that emit ANSI to the terminal will break native text selection.
     const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
+
+    /// `/undo` rewinds the conversation and leaves the files. It says so
+    /// only when the undone turn's own file changes are still on disk, and
+    /// `/rollback` is what would take them away.
+    #[test]
+    fn undo_mentions_files_only_when_the_undone_turn_left_them_changed() {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            /// Before a turn that is still in the conversation.
+            Kept,
+            /// Before the turn that was just undone.
+            Undone,
+            /// The files as a rollback found them.
+            Rollback,
+        }
+        use Kind::*;
+        let point = |differing_files, kind: Kind| protocols::session::UndoPoint {
+            number: 1,
+            created_at: 0,
+            prompt: "tidy".to_string(),
+            before_rollback: matches!(kind, Rollback),
+            differing_files,
+            turn_undone: matches!(kind, Undone),
+        };
+        let cases: &[(&str, Vec<protocols::session::UndoPoint>, &str)] = &[
+            (
+                "the undone turn changed one file",
+                vec![point(1, Undone), point(9, Kept)],
+                " 1 file is still changed: use /rollback to put the files back too.",
+            ),
+            (
+                "the undone turn changed three files",
+                vec![point(3, Undone)],
+                " 3 files are still changed: use /rollback to put the files back too.",
+            ),
+            (
+                "the undone turn only talked; an earlier one changed files",
+                vec![point(4, Kept)],
+                "",
+            ),
+            (
+                "the undone turn's point matches the files; an earlier one does not",
+                vec![point(0, Undone), point(4, Kept)],
+                "",
+            ),
+            (
+                "its files were already rolled back",
+                vec![point(2, Rollback), point(0, Undone)],
+                "",
+            ),
+            (
+                "a rollback was itself undone: /rollback would not go to the turn's point",
+                vec![point(2, Rollback), point(0, Rollback), point(2, Undone)],
+                "",
+            ),
+            ("no undo points", vec![], ""),
+        ];
+        for (case, points, expected) in cases {
+            assert_eq!(undo_files_note(points), *expected, "{case}");
+        }
+    }
 
     /// `/compact` on a short chat printed "33 messages dropped, ~33 tokens
     /// remain": the before-size was shown as a message count.

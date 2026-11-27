@@ -235,6 +235,17 @@ impl App<'_> {
             }
         }
 
+        if trimmed == "/rollback" || trimmed.starts_with("/rollback ") {
+            let rest = trimmed.strip_prefix("/rollback").unwrap_or_default();
+            return Some(Ok(match parse_rollback(rest) {
+                Some(action) => action,
+                None => {
+                    self.push_system_message(ROLLBACK_USAGE.to_string());
+                    AppAction::Continue
+                }
+            }));
+        }
+
         if trimmed == "/goal" {
             return Some(self.cmd_goal_show());
         }
@@ -426,6 +437,7 @@ pub(super) const HELP_TEXT: &str = "Commands:\n  \
              /clear     - Clear conversation\n  \
              /cancel    - Stop the current in-progress turn\n  \
              /undo      - Undo last agent turn\n  \
+             /rollback  - Put files back to before the last turn (list, <number>)\n  \
              /resume-turn - Continue a reply that was cut short\n\
              \n  \
              /memory    - Show memory\n  \
@@ -2568,6 +2580,21 @@ pub(super) fn format_reload_response(
 /// shown after `/heal`. Retained for tests covering the in-process formatter
 /// shape; the production `/heal` path now goes through [`format_heal_report`]
 /// against the daemon-side `HealReport`.
+/// Shown for a `/rollback` argument that is neither `list` nor a number.
+const ROLLBACK_USAGE: &str = "Use /rollback to put files back to before the last turn that \
+    changed them, /rollback list to see the undo points, or /rollback <number> to pick one.";
+
+/// What follows `/rollback`: nothing, `list`, or a point's number.
+fn parse_rollback(rest: &str) -> Option<AppAction> {
+    let (point, list_only) = match rest.trim() {
+        "" => (0, false),
+        "list" => (0, true),
+        // 0 on the wire means "the most recent"; typed, it is not a point.
+        number => (number.parse::<u32>().ok().filter(|n| *n > 0)?, false),
+    };
+    Some(AppAction::RollbackFiles { point, list_only })
+}
+
 #[cfg(test)]
 fn format_heal_summary(report: &cortex::maintenance::MaintenanceReport) -> String {
     let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
@@ -2610,6 +2637,25 @@ mod tests {
     use super::*;
     use crate::tui::app::{parse_export_destination, ExportDestination};
     use cortex::types::Role;
+
+    /// `/rollback` takes nothing, `list`, or a point's number. Anything
+    /// else — and 0, which the wire reserves for "the most recent" — is
+    /// answered with the usage line, not sent as a rollback.
+    #[test]
+    fn rollback_arguments_are_nothing_list_or_a_number() {
+        let ask = |rest: &str| match parse_rollback(rest) {
+            Some(AppAction::RollbackFiles { point, list_only }) => Some((point, list_only)),
+            Some(_) => panic!("not a rollback"),
+            None => None,
+        };
+        assert_eq!(ask(""), Some((0, false)));
+        assert_eq!(ask("  "), Some((0, false)));
+        assert_eq!(ask(" list"), Some((0, true)));
+        assert_eq!(ask(" 3 "), Some((3, false)));
+        for bad in [" 0", " -1", " two", " list 2", " 1.5", " 99999999999"] {
+            assert_eq!(ask(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn heartbeat_off_clears_like_clear() {

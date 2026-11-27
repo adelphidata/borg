@@ -310,6 +310,10 @@ impl Agent {
             }
         };
         self.log_and_persist(Message::user(prompt)).await;
+        // The continuation starts the next leg of the goal. Each leg gets its
+        // own undo point, so one bad leg can be undone without the ones
+        // before it.
+        self.turn_checkpointed = false;
         true
     }
 

@@ -58,6 +58,11 @@ export interface CommandContext {
    * flight).
    */
   compact?: () => void;
+  /**
+   * Puts the files Borg changed in the open conversation back to how they
+   * were, or undefined where that cannot be asked (no chat, a turn in flight).
+   */
+  rollbackFiles?: () => void;
   /** Empty on a surface with no prompt box — skill rows need one to write into. */
   skills: CommandSkill[];
   /** Skill names most-recently-used first, from `skillRecency`. */
@@ -134,6 +139,14 @@ export function buildCommands(ctx: CommandContext, routes: RouteRow[]): Command[
       label: "Compact conversation",
       keywords: "summarize summarise shrink context window free tokens",
       run: ctx.compact,
+    });
+  }
+  if (ctx.rollbackFiles) {
+    actions.push({
+      id: "action:rollback",
+      label: "Undo file changes",
+      keywords: "rollback restore revert put files back undo point",
+      run: ctx.rollbackFiles,
     });
   }
   if (ctx.markAllRead) {

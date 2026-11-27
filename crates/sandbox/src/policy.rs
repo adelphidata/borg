@@ -400,7 +400,8 @@ impl SandboxPolicy {
     /// the credential/key material inside it, consuming self.
     ///
     /// The whole `~/.borg` is write-protected. For reads we deny the specific
-    /// secret stores (`secrets/`, `identity/`, `borg.db`, `editor/`) rather
+    /// secret stores (`secrets/`, `identity/`, `borg.db`, `editor/`,
+    /// `checkpoints/`) rather
     /// than all of `~/.borg`, because the sandboxed tool's own directory lives
     /// under `~/.borg/tools/<tool>` and is bound in explicitly. These deny-read
     /// entries are emitted last by the backends, so they win even under a broad
@@ -410,6 +411,9 @@ impl SandboxPolicy {
     /// `editor/` holds `$EDITOR` scratch buffers — the user's unsent message.
     /// It is deny-read for the same reason: the text is the user's, not the
     /// model's, until they send it.
+    ///
+    /// `checkpoints/` holds the undo points: a copy of every file in each
+    /// snapshotted workspace, including the ones `blocked_paths` hides.
     pub fn with_borg_dir_protected(mut self) -> Self {
         let borg_dir = dirs::home_dir()
             .map(|h| format!("{}/.borg", h.display()))
@@ -422,7 +426,7 @@ impl SandboxPolicy {
             self.deny_write.push(borg_dir.clone());
         }
 
-        for sensitive in ["secrets", "identity", "borg.db", "editor"] {
+        for sensitive in ["secrets", "identity", "borg.db", "editor", "checkpoints"] {
             let path = format!("{borg_dir}/{sensitive}");
             if !self.deny_read.iter().any(|p| p == &path) {
                 self.deny_read.push(path);
@@ -1145,6 +1149,8 @@ mod tests {
             "/.borg/identity",
             "/.borg/borg.db",
             "/.borg/editor",
+            // The undo points copy every workspace file, `.env` included.
+            "/.borg/checkpoints",
         ] {
             assert!(
                 protected.deny_read.iter().any(|p| p.ends_with(suffix)),

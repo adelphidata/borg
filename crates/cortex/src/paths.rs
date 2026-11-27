@@ -136,8 +136,70 @@ pub fn resolve_borg_home_readonly(override_path: Option<&Path>) -> Result<PathBu
 }
 
 /// `~/.borg` — the data dir used when no override or `$BORG_HOME` is set.
+#[cfg(not(test))]
 pub fn default_borg_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".borg"))
+}
+
+/// In this crate's unit tests the default data dir is a scratch directory of
+/// the test process, never the real `~/.borg`.
+///
+/// A test that does not set `$BORG_HOME` would otherwise open the
+/// developer's live database. Opening migrates it, so a branch that adds a
+/// schema version stamps the live file with a version the installed daemon
+/// then refuses to start on; a test that writes changes real data.
+#[cfg(test)]
+pub fn default_borg_home() -> Option<PathBuf> {
+    Some(unit_test_home::dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod unit_test_home {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime};
+
+    /// Homes of test processes that ended this long ago are removed.
+    const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+    /// `<tmp>/borg-unit-test-homes/<pid>/.borg`, made on first use.
+    pub(super) fn dir() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let parent = std::env::temp_dir().join("borg-unit-test-homes");
+            sweep_stale(&parent);
+            let own = parent.join(std::process::id().to_string());
+            // A reused pid must not inherit another run's database.
+            let _ = std::fs::remove_dir_all(&own);
+            let home = own.join(".borg");
+            if let Err(e) = std::fs::create_dir_all(&home) {
+                panic!(
+                    "cannot create the unit-test data dir {}: {e}",
+                    home.display()
+                );
+            }
+            home
+        })
+    }
+
+    /// No test process can clean up after itself (there is no exit hook), so
+    /// each one removes what earlier ones left behind.
+    fn sweep_stale(parent: &Path) {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age > STALE_AFTER);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
 /// Compose a subdirectory path under `home`.
@@ -320,7 +382,34 @@ mod tests {
             stray.path(),
             "BORG_DATA_DIR must no longer redirect the data dir"
         );
-        assert_eq!(resolved, dirs::home_dir().unwrap().join(".borg"));
+        assert_eq!(resolved, default_borg_home().unwrap());
+    }
+
+    /// A unit test that sets no `BORG_HOME` must land in a scratch directory.
+    /// Landing in the real `~/.borg` lets a test run migrate, and write to,
+    /// the developer's live database.
+    #[test]
+    fn unit_tests_never_default_to_the_real_data_dir() {
+        let _g = EnvGuard::set(None);
+        let real = dirs::home_dir().unwrap().join(".borg");
+
+        for resolved in [
+            resolve_borg_home_readonly(None).unwrap(),
+            resolve_borg_home(None).unwrap(),
+            crate::config::Config::data_dir().unwrap(),
+        ] {
+            assert!(
+                !resolved.starts_with(&real),
+                "{} is the real data dir",
+                resolved.display()
+            );
+        }
+        let db = crate::config::Config::db_path().unwrap();
+        assert!(
+            !db.starts_with(&real),
+            "{} is the live database",
+            db.display()
+        );
     }
 
     #[test]

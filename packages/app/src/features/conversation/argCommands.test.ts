@@ -23,6 +23,9 @@ describe("parseArgCommand", () => {
     ],
     ["/mode plan", { kind: "mode", mode: "plan" }],
     ["/mode Execute", { kind: "mode", mode: "execute" }],
+    ["/rollback", { kind: "rollback", point: 0, listOnly: false }],
+    ["/rollback list", { kind: "rollback", point: 0, listOnly: true }],
+    ["/rollback  3 ", { kind: "rollback", point: 3, listOnly: false }],
   ])("reads %j", (text, want) => {
     expect(parseArgCommand(text)).toEqual(want);
   });
@@ -34,11 +37,16 @@ describe("parseArgCommand", () => {
     "/hb nonsense",
     "/mode",
     "/mode fast",
+    "/rollback 0",
+    "/rollback -1",
+    "/rollback two",
+    "/rollback list 2",
+    "/rollback 1.5",
   ])("answers %j with usage instead of guessing", (text) => {
     expect(parseArgCommand(text)?.kind).toBe("usage");
   });
 
-  it.each(["/goals are nice", "what is my /goal", "/tmp/goal", "hello"])(
+  it.each(["/goals are nice", "what is my /goal", "/tmp/goal", "/rollbacks", "hello"])(
     "leaves %j to be sent as a message",
     (text) => {
       expect(parseArgCommand(text)).toBeUndefined();
@@ -82,6 +90,43 @@ describe("runArgCommand", () => {
     expect(await runArgCommand(borg, "c", { kind: "mode", mode: "plan" }, async () => false)).toBe(
       "That did not work: the mode did not change.",
     );
+  });
+
+  it("rolls files back in the live session and shows the daemon's own words", async () => {
+    const daemon = fakeDaemon({
+      Rollback: { report: "Files are back to how they were.", changed: true, points: [] },
+    });
+    const borg = createBorgClient(daemon.transport);
+    const save = async () => true;
+
+    const reply = await runArgCommand(
+      borg,
+      "agent-session",
+      { kind: "rollback", point: 2, listOnly: false },
+      save,
+      "live-session",
+    );
+
+    expect(reply).toBe("Files are back to how they were.");
+    // The live session, not the agent session the goal and heartbeat use.
+    expect(daemon.calls[0]).toMatchObject({
+      method: "Rollback",
+      request: { sessionId: "live-session", point: 2, listOnly: false },
+    });
+  });
+
+  it("says so when the daemon refuses a rollback", async () => {
+    const daemon = fakeDaemon({
+      Rollback: new BorgError(GrpcStatus.Internal, "the store is locked"),
+    });
+    const reply = await runArgCommand(
+      createBorgClient(daemon.transport),
+      "agent-session",
+      { kind: "rollback", point: 0, listOnly: true },
+      async () => true,
+      "live-session",
+    );
+    expect(reply).toBe("That did not work: the store is locked");
   });
 
   it("sets the goal on the session it was given, never the daemon's latest", async () => {

@@ -1285,6 +1285,21 @@ impl AgentControl {
         completions
     }
 
+    /// True while any child is still working.
+    ///
+    /// A child's status only moves when its completion is read, so the ones
+    /// that arrived since the last drain are folded in first. They are kept
+    /// for that drain: the parent has not been told about them yet.
+    pub fn has_running_agents(&mut self) -> bool {
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            self.record_completion(&completion);
+            self.completion_buffer.push(completion);
+        }
+        self.agents
+            .values()
+            .any(|handle| !handle.info.status.is_terminal())
+    }
+
     /// Fold a completion into the handle it belongs to.
     ///
     /// Shared by [`Self::drain_completions`] and [`Self::wait_for_agent`] so

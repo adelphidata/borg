@@ -31,12 +31,14 @@ use crate::tool_handlers;
 use crate::types::{Message, MessageContent, Role, ToolDefinition};
 
 pub mod btw;
+mod checkpoint;
 mod credentials;
 mod goal_loop;
 mod hooks_dispatch;
 mod interrupted;
 pub mod media_markers;
 mod prompt_assembly;
+pub mod rollback;
 mod session_manager;
 pub mod silence;
 pub mod steer;
@@ -402,8 +404,14 @@ pub struct Agent {
     /// All invalidation goes through typed event methods on this struct —
     /// callers do not poke fields directly. See [`SystemPromptCache`].
     pub(super) caches: SystemPromptCache,
-    /// Ghost commit created at session start for atomic undo (coding agent).
-    pub(super) ghost_commit: Option<crate::git::GhostCommit>,
+    /// Once-per-turn guard for the undo point taken before the first tool
+    /// call that can change files (see `checkpoint`). Reset at turn start
+    /// and when a goal continuation starts the next leg.
+    pub(super) turn_checkpointed: bool,
+    /// A workspace whose undo point ran out of time. A killed snapshot saves
+    /// nothing, so the next one would cost the same wait before every turn
+    /// that changes files; the session stops trying for that directory.
+    pub(super) checkpoint_timed_out_in: Option<std::path::PathBuf>,
     /// Per-session workspace execution context used by tools and prompt assembly.
     pub(super) execution_context: crate::execution_context::ExecutionContext,
     /// Git repo root (if CWD is inside a git repo).
@@ -661,7 +669,8 @@ impl Agent {
             config_pin: None,
             db: Mutex::new(common.db),
             caches: SystemPromptCache::default(),
-            ghost_commit: None,
+            turn_checkpointed: false,
+            checkpoint_timed_out_in: None,
             execution_context,
             git_repo_root,
             config_arc,
@@ -1241,8 +1250,8 @@ impl Agent {
     }
 
     #[instrument(skip_all, fields(session_id = %self.session.meta.id, turn_count = self.turn_count))]
-    /// One-time setup before entering the agent loop: ghost commit, project doc caching,
-    /// and background indexing of extra memory paths and past sessions.
+    /// One-time setup before entering the agent loop: project doc caching and
+    /// background indexing of extra memory paths and past sessions.
     async fn prepare_loop(&mut self) {
         // A storage fault only aborts the turn it occurred in. Clearing it
         // here means a fault from *between* turns (a failed `auto_save`)
@@ -1250,33 +1259,6 @@ impl Agent {
         // since-freed disk — and if the disk is still full, this turn's first
         // persist re-raises it immediately.
         self.storage_fault = None;
-
-        // Create ghost commit for coding safety (lazy, one-time)
-        if self.ghost_commit.is_none() {
-            if let Some(ref root) = self.git_repo_root {
-                match crate::git::create_ghost_commit(root).await {
-                    Ok(gc) => {
-                        tracing::info!(commit_id = %gc.commit_id, "Created ghost commit for session");
-                        {
-                            let guard = self.db.lock().await;
-                            if let Some(ref db) = *guard {
-                                crate::activity_log::log_activity(
-                                    db,
-                                    "info",
-                                    "session",
-                                    &format!("Ghost commit created: {}", gc.commit_id),
-                                )
-                                .await;
-                            }
-                        }
-                        self.ghost_commit = Some(gc);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Skipping ghost commit (no undo point for this turn): {e:#}")
-                    }
-                }
-            }
-        }
 
         // Cache project docs on first run (the system-prompt builder also
         // calls this lazily; running it here once outside that hot path
@@ -1487,6 +1469,7 @@ impl Agent {
         self.unknown_tool_tracker.reset();
         self.expensive_tool_budget.reset();
         self.nudged_for_dropped_tools = false;
+        self.turn_checkpointed = false;
         self.pending_request_hint = None;
 
         // Cross-turn stale-stream circuit breaker: a session whose streams

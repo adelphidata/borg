@@ -82,6 +82,8 @@ interface ComposerProps {
   onCommand?: (text: string) => boolean;
   /** Offered in the `/` menu; undefined while there is nothing to compact. */
   onCompact?: () => void;
+  /** Offered in the `/` menu; undefined while files cannot be put back. */
+  onRollback?: () => void;
 }
 
 /**
@@ -104,6 +106,7 @@ export function Composer({
   onCancel,
   onCommand,
   onCompact,
+  onRollback,
 }: ComposerProps) {
   const isMobile = useIsMobile();
   // Starts from storage rather than restoring in an effect: the effect that
@@ -234,6 +237,7 @@ export function Composer({
     // This surface has the prompt box a skill row writes into.
     withSkills: true,
     compact: onCompact,
+    rollbackFiles: onRollback,
   });
 
   // The failure belongs to the menu that caused it. The composer outlives the

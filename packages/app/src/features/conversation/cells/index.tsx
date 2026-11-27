@@ -463,6 +463,25 @@ function UserCell({
  * re-renders one cell instead of the whole conversation. Callers must pass
  * stable `respond`/`onEdit` callbacks for this to hold.
  */
+/**
+ * A one-line notice sits centred, like a divider. A report with lines of its
+ * own (the list of undo points) keeps them and reads from the left: run
+ * together into one centred paragraph, a numbered list cannot be picked from.
+ */
+function NoticeCell({ text }: { text: string }) {
+  const lines = text.split("\n");
+  if (lines.length === 1) {
+    return <div className="text-center text-[11.5px] leading-[1.5] text-ink3">{text}</div>;
+  }
+  return (
+    <div className="text-[11.5px] leading-[1.6] text-ink3">
+      {lines.map((line, index) => (
+        <div key={index}>{line}</div>
+      ))}
+    </div>
+  );
+}
+
 export const TranscriptCell = memo(function TranscriptCell({
   cell,
   respond,
@@ -525,7 +544,7 @@ function renderCell(
     case "sub-agent":
       return <SubAgentCell cell={cell} />;
     case "notice":
-      return <div className="text-center text-[11.5px] leading-[1.5] text-ink3">{cell.text}</div>;
+      return <NoticeCell text={cell.text} />;
     // No retry here, deliberately. A turn the daemon reported an error for is a
     // turn it has already written into the session's history, so re-sending the
     // message from the client would duplicate it there. The card explains and

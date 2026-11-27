@@ -27,6 +27,8 @@ interface UseCommandsOptions {
   withSkills?: boolean;
   /** Compacts the conversation this surface belongs to, when it can. */
   compact?: () => void;
+  /** Puts the files this conversation changed back, when it can. */
+  rollbackFiles?: () => void;
 }
 
 export interface CommandsResult {
@@ -51,6 +53,7 @@ export function useCommands({
   searching,
   withSkills = false,
   compact,
+  rollbackFiles,
 }: UseCommandsOptions): CommandsResult {
   const navigate = useNavigate();
   const settings = useSettings();
@@ -180,6 +183,7 @@ export function useCommands({
               sessions: commandSessions,
               markAllRead: anyUnread ? () => markAllSessionsRead(readRows) : undefined,
               compact,
+              rollbackFiles,
               skills: skills.state === "ready" ? skills.data : [],
               skillRecency,
               noteSkillUse: noteSkill,
@@ -201,6 +205,7 @@ export function useCommands({
       readRows,
       anyUnread,
       compact,
+      rollbackFiles,
       skills.state,
       skills.data,
       skillRecency,

@@ -23,6 +23,9 @@ use tokio_util::sync::CancellationToken;
 /// the lease lapse under a healthy daemon.
 const SESSION_LEASE_TTL_SECS: i64 = 3600;
 
+/// How long a rollback waits for the agent before it reports a running turn.
+const ROLLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Outcome of taking the per-session lease for a turn.
 enum LeaseStatus {
     /// This worker owns the session — proceed.
@@ -206,6 +209,10 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn undo(&self) -> anyhow::Result<usize> {
         Err(anyhow::anyhow!("undo not supported by this backend"))
     }
+    /// Put the workspace's files back to an undo point, or list the points.
+    async fn rollback(&self, _request: RollbackRequest) -> anyhow::Result<RollbackReply> {
+        Err(anyhow::anyhow!("rollback not supported by this backend"))
+    }
     /// Rewind history to the Nth user message. Returns # messages removed.
     fn rewind_to_nth_user_message(&self, _n: usize) -> anyhow::Result<usize> {
         Err(anyhow::anyhow!("rewind not supported by this backend"))
@@ -283,6 +290,39 @@ fn parse_exit_code(output: &str) -> i32 {
         .and_then(|l| l.strip_prefix("Exit code: "))
         .and_then(|n| n.trim().parse::<i32>().ok())
         .unwrap_or(0)
+}
+
+/// What `Session.Rollback` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackRequest {
+    /// List the undo points and change nothing.
+    List,
+    /// Go back to this numbered point, or — with `None` — to the most
+    /// recent one that differs from the files as they are.
+    Restore(Option<u32>),
+}
+
+impl RollbackRequest {
+    /// From the two fields of the RPC: `list_only` wins, and point 0 is
+    /// "the most recent one that differs".
+    pub fn from_wire(point: u32, list_only: bool) -> Self {
+        match (list_only, point) {
+            (true, _) => Self::List,
+            (false, 0) => Self::Restore(None),
+            (false, n) => Self::Restore(Some(n)),
+        }
+    }
+}
+
+/// Answer to a [`RollbackRequest`].
+#[derive(Debug, Clone)]
+pub struct RollbackReply {
+    /// What happened, in plain words.
+    pub report: String,
+    /// True when files were changed.
+    pub changed: bool,
+    /// The undo points, for [`RollbackRequest::List`].
+    pub points: Vec<cortex::agent::rollback::UndoPoint>,
 }
 
 /// Result of a `!cmd` shell-mode execution.
@@ -758,6 +798,51 @@ impl SessionBackend for AgentBackend {
         Ok(agent.undo())
     }
 
+    async fn rollback(&self, request: RollbackRequest) -> anyhow::Result<RollbackReply> {
+        // A running turn holds the agent and is writing the very files a
+        // rollback would move. Say so instead of queueing behind it — after
+        // a moment's wait, because a turn that has just ended on screen can
+        // hold the agent a little longer (its auto-save, its hooks), and so
+        // does every short call that only reads it.
+        let Ok(mut agent) = tokio::time::timeout(ROLLBACK_LOCK_WAIT, self.agent.lock()).await
+        else {
+            return Ok(RollbackReply {
+                report: "A turn is still running. Wait for it to finish, or stop it first."
+                    .to_string(),
+                changed: false,
+                points: Vec::new(),
+            });
+        };
+        match request {
+            RollbackRequest::List => {
+                let points = agent.undo_points().await?;
+                let report = cortex::agent::rollback::describe_undo_points(
+                    &points,
+                    &agent.undo_folder(),
+                    chrono::Utc::now().timestamp(),
+                );
+                Ok(RollbackReply {
+                    report,
+                    changed: false,
+                    points,
+                })
+            }
+            RollbackRequest::Restore(number) => {
+                let outcome = agent.rollback_files(number).await?;
+                let changed = matches!(
+                    &outcome,
+                    cortex::agent::rollback::RollbackOutcome::Restored(done)
+                        if !done.restored.is_empty() || !done.removed.is_empty()
+                );
+                Ok(RollbackReply {
+                    report: outcome.report(),
+                    changed,
+                    points: Vec::new(),
+                })
+            }
+        }
+    }
+
     fn rewind_to_nth_user_message(&self, n: usize) -> anyhow::Result<usize> {
         let mut agent = lock_agent(&self.agent);
         Ok(agent.rewind_to_nth_user_message(n))
@@ -1024,6 +1109,22 @@ mod tests {
         }
         let g = sync_lock_bridge(&mutex);
         assert_eq!(*g, 42);
+    }
+
+    /// The RPC carries two fields; `list_only` must win over a point, and
+    /// point 0 must never be read as "point number 0".
+    #[test]
+    fn a_rollback_request_is_read_from_its_two_wire_fields() {
+        assert_eq!(RollbackRequest::from_wire(0, true), RollbackRequest::List);
+        assert_eq!(RollbackRequest::from_wire(3, true), RollbackRequest::List);
+        assert_eq!(
+            RollbackRequest::from_wire(0, false),
+            RollbackRequest::Restore(None)
+        );
+        assert_eq!(
+            RollbackRequest::from_wire(3, false),
+            RollbackRequest::Restore(Some(3))
+        );
     }
 
     /// Regression: errors surfaced via `AgentEvent::Error` must include the

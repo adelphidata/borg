@@ -385,6 +385,49 @@ export interface UndoResponse {
   removed: number;
 }
 
+export interface RollbackRequest {
+  sessionId: string;
+  /**
+   * The undo point to go back to: its number in the list, where 1 is the
+   * most recent. 0 picks the most recent one that differs from the files
+   * as they are.
+   */
+  point: number;
+  /** List the undo points and change nothing. */
+  listOnly: boolean;
+}
+
+/** A state the workspace files can be put back to. */
+export interface UndoPoint {
+  number: number;
+  /** When it was taken, unix seconds. */
+  createdAt: number;
+  /**
+   * First line of the message that started the turn it precedes. Empty
+   * when that is not known.
+   */
+  prompt: string;
+  /** True for the files as an earlier rollback found them. */
+  beforeRollback: boolean;
+  /** How many files differ between this point and the files as they are. */
+  differingFiles: number;
+  /**
+   * True when the conversation holds nothing after the message that
+   * started the turn it precedes: the turn's work was undone or rewound,
+   * while its file changes may still be on disk.
+   */
+  turnUndone: boolean;
+}
+
+export interface RollbackResponse {
+  /** What happened, in plain words, ready to show as it is. */
+  report: string;
+  /** True when files were changed. */
+  changed: boolean;
+  /** The undo points, newest first. Filled for `list_only`. */
+  points: UndoPoint[];
+}
+
 export interface RewindRequest {
   sessionId: string;
   n: number;
@@ -5916,6 +5959,381 @@ export const UndoResponse: MessageFns<UndoResponse> = {
   },
 };
 
+function createBaseRollbackRequest(): RollbackRequest {
+  return { sessionId: "", point: 0, listOnly: false };
+}
+
+export const RollbackRequest: MessageFns<RollbackRequest> = {
+  encode(message: RollbackRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.point !== 0) {
+      writer.uint32(16).uint32(message.point);
+    }
+    if (message.listOnly !== false) {
+      writer.uint32(24).bool(message.listOnly);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RollbackRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRollbackRequest();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.sessionId = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.point = reader.uint32();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.listOnly = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RollbackRequest {
+    return {
+      sessionId: isSet(object.sessionId)
+        ? globalThis.String(object.sessionId)
+        : isSet(object.session_id)
+        ? globalThis.String(object.session_id)
+        : "",
+      point: isSet(object.point) ? globalThis.Number(object.point) : 0,
+      listOnly: isSet(object.listOnly)
+        ? globalThis.Boolean(object.listOnly)
+        : isSet(object.list_only)
+        ? globalThis.Boolean(object.list_only)
+        : false,
+    };
+  },
+
+  toJSON(message: RollbackRequest): unknown {
+    const obj: any = {};
+    if (message.sessionId !== "") {
+      obj.sessionId = message.sessionId;
+    }
+    if (message.point !== 0) {
+      obj.point = Math.round(message.point);
+    }
+    if (message.listOnly !== false) {
+      obj.listOnly = message.listOnly;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RollbackRequest>, I>>(base?: I): RollbackRequest {
+    return RollbackRequest.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RollbackRequest>, I>>(object: I): RollbackRequest {
+    const message = createBaseRollbackRequest();
+    message.sessionId = object.sessionId ?? "";
+    message.point = object.point ?? 0;
+    message.listOnly = object.listOnly ?? false;
+    return message;
+  },
+};
+
+function createBaseUndoPoint(): UndoPoint {
+  return { number: 0, createdAt: 0, prompt: "", beforeRollback: false, differingFiles: 0, turnUndone: false };
+}
+
+export const UndoPoint: MessageFns<UndoPoint> = {
+  encode(message: UndoPoint, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.number !== 0) {
+      writer.uint32(8).uint32(message.number);
+    }
+    if (message.createdAt !== 0) {
+      writer.uint32(16).int64(message.createdAt);
+    }
+    if (message.prompt !== "") {
+      writer.uint32(26).string(message.prompt);
+    }
+    if (message.beforeRollback !== false) {
+      writer.uint32(32).bool(message.beforeRollback);
+    }
+    if (message.differingFiles !== 0) {
+      writer.uint32(40).uint32(message.differingFiles);
+    }
+    if (message.turnUndone !== false) {
+      writer.uint32(48).bool(message.turnUndone);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UndoPoint {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseUndoPoint();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.number = reader.uint32();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.createdAt = longToNumber(reader.int64());
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.prompt = reader.string();
+            continue;
+          }
+          case 4: {
+            if (tag !== 32) {
+              break;
+            }
+
+            message.beforeRollback = reader.bool();
+            continue;
+          }
+          case 5: {
+            if (tag !== 40) {
+              break;
+            }
+
+            message.differingFiles = reader.uint32();
+            continue;
+          }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.turnUndone = reader.bool();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): UndoPoint {
+    return {
+      number: isSet(object.number) ? globalThis.Number(object.number) : 0,
+      createdAt: isSet(object.createdAt)
+        ? globalThis.Number(object.createdAt)
+        : isSet(object.created_at)
+        ? globalThis.Number(object.created_at)
+        : 0,
+      prompt: isSet(object.prompt) ? globalThis.String(object.prompt) : "",
+      beforeRollback: isSet(object.beforeRollback)
+        ? globalThis.Boolean(object.beforeRollback)
+        : isSet(object.before_rollback)
+        ? globalThis.Boolean(object.before_rollback)
+        : false,
+      differingFiles: isSet(object.differingFiles)
+        ? globalThis.Number(object.differingFiles)
+        : isSet(object.differing_files)
+        ? globalThis.Number(object.differing_files)
+        : 0,
+      turnUndone: isSet(object.turnUndone)
+        ? globalThis.Boolean(object.turnUndone)
+        : isSet(object.turn_undone)
+        ? globalThis.Boolean(object.turn_undone)
+        : false,
+    };
+  },
+
+  toJSON(message: UndoPoint): unknown {
+    const obj: any = {};
+    if (message.number !== 0) {
+      obj.number = Math.round(message.number);
+    }
+    if (message.createdAt !== 0) {
+      obj.createdAt = Math.round(message.createdAt);
+    }
+    if (message.prompt !== "") {
+      obj.prompt = message.prompt;
+    }
+    if (message.beforeRollback !== false) {
+      obj.beforeRollback = message.beforeRollback;
+    }
+    if (message.differingFiles !== 0) {
+      obj.differingFiles = Math.round(message.differingFiles);
+    }
+    if (message.turnUndone !== false) {
+      obj.turnUndone = message.turnUndone;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<UndoPoint>, I>>(base?: I): UndoPoint {
+    return UndoPoint.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<UndoPoint>, I>>(object: I): UndoPoint {
+    const message = createBaseUndoPoint();
+    message.number = object.number ?? 0;
+    message.createdAt = object.createdAt ?? 0;
+    message.prompt = object.prompt ?? "";
+    message.beforeRollback = object.beforeRollback ?? false;
+    message.differingFiles = object.differingFiles ?? 0;
+    message.turnUndone = object.turnUndone ?? false;
+    return message;
+  },
+};
+
+function createBaseRollbackResponse(): RollbackResponse {
+  return { report: "", changed: false, points: [] };
+}
+
+export const RollbackResponse: MessageFns<RollbackResponse> = {
+  encode(message: RollbackResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.report !== "") {
+      writer.uint32(10).string(message.report);
+    }
+    if (message.changed !== false) {
+      writer.uint32(16).bool(message.changed);
+    }
+    for (const v of message.points) {
+      UndoPoint.encode(v!, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RollbackResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseRollbackResponse();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.report = reader.string();
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.changed = reader.bool();
+            continue;
+          }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.points.push(UndoPoint.decode(reader, reader.uint32()));
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): RollbackResponse {
+    return {
+      report: isSet(object.report) ? globalThis.String(object.report) : "",
+      changed: isSet(object.changed) ? globalThis.Boolean(object.changed) : false,
+      points: globalThis.Array.isArray(object?.points) ? object.points.map((e: any) => UndoPoint.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: RollbackResponse): unknown {
+    const obj: any = {};
+    if (message.report !== "") {
+      obj.report = message.report;
+    }
+    if (message.changed !== false) {
+      obj.changed = message.changed;
+    }
+    if (message.points?.length) {
+      obj.points = message.points.map((e) => UndoPoint.toJSON(e));
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<RollbackResponse>, I>>(base?: I): RollbackResponse {
+    return RollbackResponse.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<RollbackResponse>, I>>(object: I): RollbackResponse {
+    const message = createBaseRollbackResponse();
+    message.report = object.report ?? "";
+    message.changed = object.changed ?? false;
+    message.points = object.points?.map((e) => UndoPoint.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseRewindRequest(): RewindRequest {
   return { sessionId: "", n: 0 };
 }
@@ -7443,6 +7861,19 @@ export const SessionDefinition = {
       requestType: UndoRequest as typeof UndoRequest,
       requestStream: false,
       responseType: UndoResponse as typeof UndoResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Put the files of the session's workspace back to an undo point, or
+     * list the points. Files only: the conversation is not rewound (that is
+     * `Undo`). Refused, with the reason in `report`, while a turn runs.
+     */
+    rollback: {
+      name: "Rollback",
+      requestType: RollbackRequest as typeof RollbackRequest,
+      requestStream: false,
+      responseType: RollbackResponse as typeof RollbackResponse,
       responseStream: false,
       options: {},
     },

@@ -1,4 +1,5 @@
 pub mod apns;
+pub mod checkpoints;
 pub mod computer_use;
 pub mod consolidation;
 pub mod data;
@@ -48,6 +49,7 @@ pub(crate) fn creds_file_env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use apns::ApnsConfig;
+pub use checkpoints::CheckpointsConfig;
 pub use computer_use::*;
 pub use consolidation::*;
 pub use data::*;
@@ -202,6 +204,9 @@ pub struct Config {
     /// Agent-loop safety guards: stuck-loop backoff + hallucinated-tool refusal.
     #[serde(default)]
     pub loop_guard: LoopGuardConfig,
+    /// Undo points taken before a turn changes files.
+    #[serde(default)]
+    pub checkpoints: CheckpointsConfig,
     /// Outside events that wake the agent, and the storm-control budget.
     #[serde(default)]
     pub subscriptions: SubscriptionsConfig,

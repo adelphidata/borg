@@ -17,8 +17,9 @@ use protocols::session::{
     CompactRequest, CompactResponse, ContextBreakdown, ContextComponent, Empty, ExecShellRequest,
     ExecShellResponse, ForkRequest, ForkResponse, InlineDocument, ListPathsRequest,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
-    OpenResponse, PathEntry, PathList, PromptResponse, RewindRequest, RewindResponse, SendRequest,
-    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    OpenResponse, PathEntry, PathList, PromptResponse, RewindRequest, RewindResponse,
+    RollbackRequest, RollbackResponse, SendRequest, SessionState, SessionStateRequest,
+    SteerRequest, StreamRequest, UndoPoint, UndoRequest, UndoResponse,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -738,6 +739,35 @@ impl Session for SessionSvc {
             .map_err(|e| TStatus::internal(format!("undo: {e}")))?;
         Ok(Response::new(UndoResponse {
             removed: removed as u64,
+        }))
+    }
+
+    async fn rollback(
+        &self,
+        req: Request<RollbackRequest>,
+    ) -> Result<Response<RollbackResponse>, TStatus> {
+        let req = req.into_inner();
+        let host = self.host_or_err(&req.session_id)?;
+        let request = crate::session::backend::RollbackRequest::from_wire(req.point, req.list_only);
+        let reply = host
+            .rollback(request)
+            .await
+            .map_err(|e| TStatus::internal(format!("{e:#}")))?;
+        Ok(Response::new(RollbackResponse {
+            report: reply.report,
+            changed: reply.changed,
+            points: reply
+                .points
+                .into_iter()
+                .map(|point| UndoPoint {
+                    number: point.number,
+                    created_at: point.created_at,
+                    prompt: point.prompt.unwrap_or_default(),
+                    before_rollback: point.before_rollback,
+                    differing_files: u32::try_from(point.differing_files).unwrap_or(u32::MAX),
+                    turn_undone: point.turn_undone,
+                })
+                .collect(),
         }))
     }
 
