@@ -14,7 +14,7 @@
 //!
 //! Running these as raw shell fails (the `apply_patch` binary isn't on
 //! `$PATH`) and bypasses borg's verified patch path (vitals classification,
-//! blocked-path enforcement, ghost-commit undo). The functions here recognize
+//! blocked-path enforcement, undo points). The functions here recognize
 //! the heredoc wrappers and pull out the patch body so the shell handler can
 //! reroute to `handle_apply_patch`.
 //!

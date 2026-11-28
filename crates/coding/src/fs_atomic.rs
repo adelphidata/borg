@@ -122,6 +122,26 @@ pub fn atomic_write_through_symlink(path: &Path, bytes: &[u8]) -> std::io::Resul
 /// also the case where the owner has not changed, so a failure there is
 /// expected and must not fail the write.
 pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomically(full_path, bytes, None)
+}
+
+/// [`atomic_write`] for putting a file back: when `full_path` no longer
+/// exists, the new file gets `permissions` instead of the umask default. They
+/// are set on the temp file before the rename, so a `0600` file is never at
+/// its own path with a wider mode, not even for a moment.
+pub fn atomic_write_restoring(
+    full_path: &Path,
+    bytes: &[u8],
+    permissions: &std::fs::Permissions,
+) -> std::io::Result<()> {
+    write_atomically(full_path, bytes, Some(permissions))
+}
+
+fn write_atomically(
+    full_path: &Path,
+    bytes: &[u8],
+    if_missing: Option<&std::fs::Permissions>,
+) -> std::io::Result<()> {
     let dir = full_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = full_path
         .file_name()
@@ -143,7 +163,10 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
     #[cfg(unix)]
-    let existing_perms = existing_meta.as_ref().map(std::fs::Metadata::permissions);
+    let existing_perms = existing_meta
+        .as_ref()
+        .map(std::fs::Metadata::permissions)
+        .or_else(|| if_missing.cloned());
 
     // Inner closure so a single `?`-chain covers create/write/flush, and we can
     // clean up the temp file on any failure.
@@ -210,6 +233,13 @@ pub fn atomic_write(full_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         // Rename failed, so the temp file is orphaned; the rename error is what matters.
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
+    }
+
+    // Off Unix the only permission is the read-only flag, and a read-only
+    // temp file could not have been written.
+    #[cfg(not(unix))]
+    if let Some(permissions) = if_missing {
+        std::fs::set_permissions(full_path, permissions.clone())?;
     }
 
     Ok(())
@@ -279,6 +309,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Putting back a file that is gone creates it with the mode it had, and
+    /// leaves an existing file's own mode alone.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_restoring_gives_a_missing_file_the_given_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let gone = dir.path().join("key");
+        atomic_write_restoring(&gone, b"secret", &std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&gone).unwrap(), b"secret");
+        assert_eq!(mode_of(&gone), 0o600);
+
+        let present = dir.path().join("run.sh");
+        std::fs::write(&present, "old").unwrap();
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o755)).unwrap();
+        atomic_write_restoring(&present, b"new", &std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(mode_of(&present), 0o755, "an existing file keeps its mode");
+    }
+
     #[test]
     fn atomic_write_new_file_gets_umask_default_not_0600() {
         use std::os::unix::fs::PermissionsExt as _;

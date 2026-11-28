@@ -208,8 +208,14 @@ impl ClaimedTargets {
 
 /// Snapshot of a file's state before patch application, for rollback.
 enum FileSnapshot {
-    /// File existed with this content.
-    Existed(String),
+    /// File existed with this content and these permissions. The writer
+    /// keeps the mode of a file it overwrites, but a file the patch deleted
+    /// or moved away is created anew on rollback and would come back without
+    /// its exec bit.
+    Existed {
+        content: String,
+        permissions: std::fs::Permissions,
+    },
     /// File did not exist (was created by the patch).
     DidNotExist,
     /// The entry was a symbolic link with this target. Rollback recreates
@@ -600,32 +606,49 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
             "Patch failed during commit, rolling back {} files",
             snapshots.len()
         );
+        // Paths the rollback could not put back: the tree is then neither
+        // the pre-patch nor the post-patch state, and the caller must know.
+        let mut not_restored: Vec<String> = Vec::new();
         for (path, snapshot) in snapshots.into_iter().rev() {
             let full_path = base_dir.join(&path);
             match snapshot {
-                FileSnapshot::Existed(content) => {
+                FileSnapshot::Existed {
+                    content,
+                    permissions,
+                } => {
                     if let Some(parent) = full_path.parent() {
                         if let Err(err) = std::fs::create_dir_all(parent) {
                             warn!(
                                 "Rollback: failed to recreate parent for {}: {err}",
                                 full_path.display()
                             );
+                            not_restored.push(path);
                             continue;
                         }
                     }
                     // Same atomic writer the forward path uses: a rollback that
                     // half-writes leaves the file in a third state that is
-                    // neither the pre-patch nor the post-patch content, and it
-                    // would drop the original's mode and owner too.
-                    if let Err(err) = crate::fs_atomic::atomic_write(&full_path, content.as_bytes())
-                    {
+                    // neither the pre-patch nor the post-patch content. A file
+                    // the patch removed is made anew, with the mode it had.
+                    let restored = crate::fs_atomic::atomic_write_restoring(
+                        &full_path,
+                        content.as_bytes(),
+                        &permissions,
+                    );
+                    if let Err(err) = restored {
                         warn!("Rollback: failed to restore {}: {err}", full_path.display());
+                        not_restored.push(path);
                     }
                 }
                 FileSnapshot::DidNotExist => {
                     if let Err(err) = std::fs::remove_file(&full_path) {
                         if err.kind() != std::io::ErrorKind::NotFound {
                             warn!("Rollback: failed to remove {}: {err}", full_path.display());
+                            // Only a file that is still there is left behind;
+                            // one whose parent never came to exist is not.
+                            if std::fs::symlink_metadata(&full_path).is_ok() {
+                                not_restored.push(path);
+                            }
                         }
                     }
                 }
@@ -636,11 +659,12 @@ fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<App
                             "Rollback: failed to restore symlink {}: {err}",
                             full_path.display()
                         );
+                        not_restored.push(path);
                     }
                 }
             }
         }
-        return Err(e);
+        return Err(with_rollback_report(e, &not_restored));
     }
 
     Ok(prepared.result)
@@ -691,6 +715,19 @@ fn deletable_file_state(
     virtual_file_state(path, base_dir, overlay)
 }
 
+/// The commit failure `error`, with the paths a rollback could not put back
+/// named in it. The failure's own text stays in front, unchanged.
+fn with_rollback_report(error: anyhow::Error, not_restored: &[String]) -> anyhow::Error {
+    if not_restored.is_empty() {
+        return error;
+    }
+    anyhow::anyhow!(
+        "{error:#}\nThe patch was not fully undone. These paths are not as they were \
+         before it: {}",
+        not_restored.join(", ")
+    )
+}
+
 fn snapshot_file_state(path: &str, base_dir: &Path) -> Result<FileSnapshot> {
     let full_path = base_dir.join(path);
     let Some(kind) = entry_kind(&full_path).with_context(|| format!("Failed to inspect {path}"))?
@@ -706,10 +743,13 @@ fn snapshot_file_state(path: &str, base_dir: &Path) -> Result<FileSnapshot> {
     }
     #[cfg(not(unix))]
     let _ = kind;
-    Ok(FileSnapshot::Existed(
-        std::fs::read_to_string(&full_path)
+    Ok(FileSnapshot::Existed {
+        content: std::fs::read_to_string(&full_path)
             .with_context(|| format!("Failed to read existing {path}"))?,
-    ))
+        permissions: std::fs::metadata(&full_path)
+            .with_context(|| format!("Failed to inspect {path}"))?
+            .permissions(),
+    })
 }
 
 /// Put a symlink back at `path`. A link that is still in place with the same
@@ -2522,6 +2562,110 @@ EOF";
 
         assert!(std::fs::symlink_metadata(&link).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+    }
+
+    /// A deleted file is created anew on rollback. It comes back with the
+    /// mode it had: a script that loses its exec bit is not "as it was".
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_a_deleted_file_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        // The second operation passes preflight and fails in the commit
+        // phase: a write through a live symlink is refused there.
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "original").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("live.txt")).unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::DeleteFile {
+                path: "run.sh".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "live.txt".to_string(),
+                content: "hacked".to_string(),
+            },
+        ]);
+        let err = apply_patch(&patch, dir.path()).unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750, "the mode was not restored: {mode:o}");
+        assert!(
+            !format!("{err:#}").contains("not fully undone"),
+            "a clean rollback reports nothing left behind: {err:#}"
+        );
+    }
+
+    /// A path the rollback cannot put back is named in the error. Here the
+    /// patch removes a link and then builds a folder where it was; the folder
+    /// is not empty when the link should return.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_the_rollback_cannot_put_back_is_named() {
+        let dir = TempDir::new().unwrap();
+        let (link, _target) = dangling_link(&dir, "spot");
+        std::fs::write(dir.path().join("keep.txt"), "kept").unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "original").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("live.txt")).unwrap();
+
+        let patch = make_patch(vec![
+            PatchOperation::DeleteFile {
+                path: "spot".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "spot/inside.txt".to_string(),
+                content: "new".to_string(),
+            },
+            PatchOperation::DeleteFile {
+                path: "keep.txt".to_string(),
+            },
+            PatchOperation::AddFile {
+                path: "live.txt".to_string(),
+                content: "hacked".to_string(),
+            },
+        ]);
+        let err = format!("{:#}", apply_patch(&patch, dir.path()).unwrap_err());
+
+        if std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) {
+            // The link went back after all: nothing was left behind to name.
+            assert!(!err.contains("not fully undone"), "{err}");
+        } else {
+            assert!(
+                err.contains("not fully undone") && err.contains("spot"),
+                "the error must name the path left behind: {err}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "kept",
+            "what could be put back was"
+        );
+    }
+
+    /// A rollback that leaves paths behind says which, after the failure's
+    /// own text; a clean one adds nothing.
+    #[test]
+    fn a_partial_rollback_is_named_in_the_error() {
+        let failure = || anyhow::anyhow!("Failed to write b.txt");
+
+        assert_eq!(
+            with_rollback_report(failure(), &[]).to_string(),
+            "Failed to write b.txt"
+        );
+        assert_eq!(
+            with_rollback_report(failure(), &["a.txt".to_string(), "d/c.txt".to_string()])
+                .to_string(),
+            "Failed to write b.txt\nThe patch was not fully undone. These paths are not as \
+             they were before it: a.txt, d/c.txt"
+        );
     }
 
     #[cfg(unix)]

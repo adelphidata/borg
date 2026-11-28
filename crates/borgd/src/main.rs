@@ -107,8 +107,8 @@ async fn async_main(nofile_result: Option<std::io::Result<impl std::fmt::Display
     // chromiumoxide/tungstenite warn on every CDP event their enums don't model
     // ("WS Invalid message: data did not match any variant"), which is normal
     // Chrome-version drift and not a browser-tool failure. Silenced by default
-    // so `daemon.log` stays readable; `RUST_LOG` still overrides, except for
-    // the CDP wire log that `log_filter` pins off.
+    // so `daemon.log` stays readable; `RUST_LOG` still overrides, up to the
+    // ceiling `install_subscriber` puts on the wire logs.
     let env_filter = cortex::telemetry::log_filter(
         std::env::var("RUST_LOG").ok().as_deref(),
         "info,chromiumoxide=error,tungstenite=error",

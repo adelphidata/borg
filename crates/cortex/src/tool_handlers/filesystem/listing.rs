@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
-use super::blocked::{is_blocked_path, is_read_denied};
+use super::blocked::ReadGate;
 use super::default_execution_context;
 use crate::tool_handlers::{optional_bool_param, optional_str_param, optional_u64_param};
 
@@ -44,12 +44,10 @@ pub fn handle_list_dir_with_context(
         Err(_) => return Ok(format!("Not a directory: {path_str}")),
     };
 
-    // Security: reuse the same read gate as read_file
-    if is_read_denied(
-        &canonical,
-        &config.security.blocked_paths,
-        &config.security.allowed_paths,
-    ) {
+    // Security: the same read gate as read_file, for the directory and for
+    // every entry the walk below shows.
+    let gate = ReadGate::new(&config.security);
+    if gate.denies(&canonical) {
         return Ok(format!("Access denied: {path_str} is in a blocked path"));
     }
 
@@ -58,27 +56,12 @@ pub fn handle_list_dir_with_context(
     }
 
     if let Some(query) = fuzzy_match {
-        let raw = fuzzy_list_dir(
-            &canonical,
-            query,
-            include_hidden,
-            max_results,
-            &config.security.blocked_paths,
-            &config.security.allowed_paths,
-        );
+        let raw = fuzzy_list_dir(&canonical, query, include_hidden, max_results, &gate);
         return Ok(paginate_listing(&raw, offset, limit));
     }
 
     let mut output = String::new();
-    list_dir_recursive(
-        &canonical,
-        depth,
-        0,
-        include_hidden,
-        &config.security.blocked_paths,
-        &config.security.allowed_paths,
-        &mut output,
-    )?;
+    list_dir_recursive(&canonical, depth, 0, include_hidden, &gate, &mut output)?;
     if output.is_empty() {
         return Ok("(empty directory)".to_string());
     }
@@ -119,8 +102,7 @@ fn fuzzy_list_dir(
     query: &str,
     include_hidden: bool,
     max_results: usize,
-    blocked_paths: &[String],
-    allowed_paths: &[String],
+    gate: &ReadGate<'_>,
 ) -> String {
     use nucleo_matcher::{
         pattern::{CaseMatching, Normalization, Pattern},
@@ -164,7 +146,7 @@ fn fuzzy_list_dir(
             }
             let path = entry.path();
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if is_blocked_path(&canonical, blocked_paths, allowed_paths) {
+            if gate.denies(&canonical) {
                 continue;
             }
             let ft = match entry.file_type() {
@@ -221,14 +203,12 @@ fn fuzzy_list_dir(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn list_dir_recursive(
     dir: &std::path::Path,
     max_depth: usize,
     current_depth: usize,
     include_hidden: bool,
-    blocked_paths: &[String],
-    allowed_paths: &[String],
+    gate: &ReadGate<'_>,
     output: &mut String,
 ) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
@@ -257,14 +237,14 @@ fn list_dir_recursive(
         let is_link = ft.is_symlink();
         let blocked = if is_link {
             match raw_path.canonicalize() {
-                Ok(target) => is_blocked_path(&target, blocked_paths, allowed_paths),
+                Ok(target) => gate.denies(&target),
                 // Broken/unresolvable symlink: hide it rather than leaking
                 // the raw link target string.
                 Err(_) => true,
             }
         } else {
             let entry_canonical = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
-            is_blocked_path(&entry_canonical, blocked_paths, allowed_paths)
+            gate.denies(&entry_canonical)
         };
 
         if blocked {
@@ -280,8 +260,7 @@ fn list_dir_recursive(
                     max_depth,
                     current_depth + 1,
                     include_hidden,
-                    blocked_paths,
-                    allowed_paths,
+                    gate,
                     output,
                 )?;
             }

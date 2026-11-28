@@ -211,17 +211,52 @@ fn browser_open_error_hint(config: &Config, e: &anyhow::Error) -> String {
     }
 }
 
-/// True when `raw` (as the model wrote it: `~`-relative, absolute, or relative
-/// to the process cwd) names a file the read gate refuses. Symlinks are
-/// resolved; a path that does not resolve is judged by its literal form.
-fn upload_path_denied(raw: &str, config: &Config) -> bool {
-    let expanded = std::path::PathBuf::from(crate::util::unix_ext::expand_tilde(raw));
-    let resolved = expanded.canonicalize().unwrap_or(expanded);
-    crate::tool_handlers::filesystem::is_read_denied(
-        &resolved,
-        &config.security.blocked_paths,
-        &config.security.allowed_paths,
-    )
+/// The files of an `upload`, as the paths the browser is handed, or the
+/// refusal to show the model.
+///
+/// An upload hands a file's bytes to the page, so each path passes the same
+/// read gate as `read_file`. The path the gate judged is the path that is
+/// sent: absolute (the browser would resolve a relative one against its own
+/// working directory, not Borg's) and with symlinks resolved (so a link
+/// re-pointed after the check is not followed). A path that does not resolve
+/// is still judged, by its literal form, before it is reported as missing.
+/// Only regular files are sent: a directory would upload everything below it.
+fn upload_files(args: &serde_json::Value, config: &Config) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    let named = args["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+    for raw in named {
+        let expanded = std::path::PathBuf::from(crate::util::unix_ext::expand_tilde(raw));
+        if !expanded.is_absolute() {
+            return Err(format!(
+                "Error: upload needs absolute file paths; '{raw}' is relative."
+            ));
+        }
+        let resolved = expanded.canonicalize();
+        let judged = resolved.as_deref().unwrap_or(&expanded);
+        if crate::tool_handlers::filesystem::is_read_denied(
+            judged,
+            &config.security.blocked_paths,
+            &config.security.allowed_paths,
+        ) {
+            return Err(format!("Access denied: {raw} is in a blocked path."));
+        }
+        match resolved {
+            // A page input that takes folders would be handed the whole tree
+            // under a directory, and the gate judged only its name.
+            Ok(path) if path.is_file() => files.push(path.to_string_lossy().into_owned()),
+            Ok(_) => {
+                return Err(format!(
+                    "Error: upload takes regular files; '{raw}' is not one."
+                ))
+            }
+            Err(e) => return Err(format!("Error: cannot read {raw}: {e}")),
+        }
+    }
+    Ok(files)
 }
 
 #[instrument(skip_all, fields(tool.name = "browser"))]
@@ -243,21 +278,15 @@ pub async fn handle_browser(
         return Ok(ToolOutput::Text(format!("Error: {err_msg}")));
     }
 
-    // An upload hands the file's bytes to the page, so every path passes the
-    // same read gate as `read_file` — before a browser is launched.
-    if action == "upload" {
-        let denied = args["files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .find(|f| upload_path_denied(f, config));
-        if let Some(denied) = denied {
-            return Ok(ToolOutput::Text(format!(
-                "Access denied: {denied} is in a blocked path."
-            )));
+    // Every upload path passes the read gate before a browser is launched.
+    let upload_files = if action == "upload" {
+        match upload_files(args, config) {
+            Ok(files) => files,
+            Err(refusal) => return Ok(ToolOutput::Text(refusal)),
         }
-    }
+    } else {
+        Vec::new()
+    };
 
     // Close runs before the session is required: closing an already-dead
     // browser must succeed, not fail with "no session".
@@ -548,15 +577,7 @@ pub async fn handle_browser(
         }
         "upload" => {
             let selector = require_str_param(args, "selector")?;
-            let files: Vec<String> = args
-                .get("files")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let files = upload_files;
             if files.is_empty() {
                 return Ok(ToolOutput::Text(
                     "Error: upload requires non-empty 'files' (string paths)".to_string(),
@@ -780,6 +801,57 @@ mod tests {
             );
             assert!(session.is_none(), "no browser may be launched");
         }
+    }
+
+    /// The gate covers Borg's own files too, the path it judged is the path
+    /// the browser gets, and a path it cannot pin down is refused: a relative
+    /// one (the browser resolves it elsewhere) and a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn upload_sends_only_resolved_absolute_paths_that_pass_the_read_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        std::fs::write(home.join("hooks.json"), "{}").expect("seed");
+        std::fs::write(root.join("report.pdf"), b"%PDF").expect("seed");
+        std::os::unix::fs::symlink(root.join("report.pdf"), root.join("latest.pdf"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(home.join("hooks.json"), root.join("innocent.txt"))
+            .expect("symlink");
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+        let config = Config::default();
+        let files = |paths: &[&str]| upload_files(&json!({"files": paths}), &config);
+        let at = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+
+        assert_eq!(
+            files(&[&at("latest.pdf")]),
+            Ok(vec![at("report.pdf")]),
+            "the link's target is what was judged, so it is what is sent"
+        );
+        for denied in [at("home/hooks.json"), at("innocent.txt")] {
+            assert_eq!(
+                files(&[&at("report.pdf"), &denied]),
+                Err(format!("Access denied: {denied} is in a blocked path.")),
+            );
+        }
+        assert_eq!(
+            files(&["report.pdf"]),
+            Err("Error: upload needs absolute file paths; 'report.pdf' is relative.".to_string()),
+        );
+        let folder = root.to_string_lossy().into_owned();
+        assert_eq!(
+            files(&[&folder]),
+            Err(format!(
+                "Error: upload takes regular files; '{folder}' is not one."
+            )),
+            "a folder would upload the whole tree below it"
+        );
+        let missing = files(&[&at("gone.pdf")]).expect_err("a missing file");
+        assert!(
+            missing.starts_with(&format!("Error: cannot read {}", at("gone.pdf"))),
+            "{missing}"
+        );
     }
 
     /// Upload without files is a silent no-op at the CDP layer — surface

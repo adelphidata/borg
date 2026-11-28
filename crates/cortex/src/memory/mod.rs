@@ -1312,7 +1312,7 @@ pub fn scan_extra_paths(
         //     (canonical check, e.g. a symlink pointing into ~/.ssh/)
         let expanded_path = std::path::PathBuf::from(&expanded);
         if path_has_blocked_component(&expanded_path, blocked_paths)
-            || crate::tool_handlers::is_blocked_path(&canonical, blocked_paths, &[])
+            || crate::tool_handlers::filesystem::is_read_denied(&canonical, blocked_paths, &[])
         {
             tracing::warn!("Extra path '{}' is in blocked_paths, skipping", raw_path);
             continue;
@@ -1595,6 +1595,24 @@ mod tests {
         // Only .md files should be included
         assert_eq!(files.len(), 1);
         assert!(files[0].0.contains("notes.md"));
+    }
+
+    /// An extra path that points into Borg's own guarded trees is skipped,
+    /// with an empty blocklist: a backup folder holds `.md` files too.
+    #[test]
+    fn scan_extra_paths_rejects_borgs_own_control_plane_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        for dir in ["backups", "notes"] {
+            std::fs::create_dir(home.join(dir)).unwrap();
+            std::fs::write(home.join(dir).join("readme.md"), "content").unwrap();
+        }
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+        let scan =
+            |dir: &str| scan_extra_paths(&[home.join(dir).to_string_lossy().into_owned()], &[]);
+
+        assert!(scan("backups").is_empty(), "the backup tree was scanned");
+        assert_eq!(scan("notes").len(), 1, "an ordinary folder must still load");
     }
 
     #[cfg(unix)]

@@ -418,6 +418,40 @@ mod tests {
         assert!(matches!(out.cards[0].kind, MentionCardKind::Dir { .. }));
     }
 
+    /// Borg's own key and DB files are never attached, with an empty
+    /// blocklist and under an allowlisted data dir.
+    #[test]
+    fn a_mention_of_borgs_own_control_plane_file_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::write(home.join("hooks.json"), "HOOK-BODY").unwrap();
+        std::fs::write(home.join("notes.md"), "ordinary notes").unwrap();
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+        let mut config = Config::default();
+        config.security.blocked_paths.clear();
+        config.security.allowed_paths = vec![home.to_string_lossy().into_owned()];
+
+        let text = format!(
+            "@{}/hooks.json and @{}/notes.md",
+            home.display(),
+            home.display()
+        );
+        let out = expand_mentions_with_cwd(&text, &config, &home);
+
+        assert!(
+            !out.augmented_text.contains("HOOK-BODY"),
+            "the file was attached"
+        );
+        assert!(out.augmented_text.contains("ordinary notes"));
+        assert!(matches!(
+            out.cards[0].kind,
+            MentionCardKind::Skipped {
+                reason: SkipReason::BlockedPath,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn blocked_path_produces_skipped_card_and_leaves_text_untouched() {
         let tmp = tempfile::tempdir().unwrap();

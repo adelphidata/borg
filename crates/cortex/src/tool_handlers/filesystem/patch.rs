@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
 use super::blocked::{
-    instruction_write_denied_message, is_blocked_path, is_control_plane_write_denied,
+    instruction_write_denied_message, is_blocked_path, is_control_plane_denied,
     is_instruction_file_write_denied,
 };
 use super::default_execution_context;
@@ -138,7 +138,9 @@ fn deny_write_target(
     ) {
         return Some(format!("Access denied: {raw_path} is in a blocked path"));
     }
-    if is_control_plane_write_denied(resolved) {
+    // Write-denied or read-denied: a patch reads the file it updates, and a
+    // `Move to` would carry a read-denied file out to where it can be read.
+    if is_control_plane_denied(resolved) {
         return Some(format!(
             "Access denied: {raw_path} is a Borg control-plane file"
         ));
@@ -562,7 +564,7 @@ fn patch_has_absolute_paths(patch_text: &str) -> bool {
 /// the applicator also accepts unified diffs (`parse_patch_with_mode` routes
 /// them to `parse_unified_diff`), whose headers carry no DSL marker. A marker
 /// scan therefore reports "touches nothing" for such a patch and waves it past
-/// `is_blocked_path` / `is_control_plane_write_denied` entirely.
+/// `is_blocked_path` / `is_control_plane_denied` entirely.
 ///
 /// `None` means the patch does not parse — it writes nothing, so callers hand
 /// it to the applicator for the real diagnostic rather than reporting a
@@ -1226,6 +1228,44 @@ diff --git a/.env b/.env
         );
     }
 
+    /// A patch target is read as well as written: `Update File` + `Move to`
+    /// on the data dir's `.env` would carry the provider keys to a path
+    /// `read_file` allows. Every control-plane file is refused, read-only
+    /// ones included, and nothing moves.
+    #[test]
+    fn patch_cannot_move_a_read_denied_control_plane_file_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("backups")).unwrap();
+        std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
+        std::fs::write(home.join("backups/borg.tar.gz"), "tarball").unwrap();
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+        // No blocklist: the refusal must come from the control-plane gate.
+        let mut config = Config::default();
+        config.security.blocked_paths.clear();
+        let ctx = ExecutionContext::unrestricted(root.clone());
+
+        for source in [".env", "backups/borg.tar.gz", ".credentials.json"] {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n*** End Patch",
+                home.join(source).display(),
+                root.join("readable.txt").display(),
+            );
+            let result =
+                handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+            assert!(
+                result.starts_with("Access denied") && result.contains("control-plane"),
+                "{source}: {result}"
+            );
+        }
+        assert!(!root.join("readable.txt").exists(), "a file was moved out");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".env")).unwrap(),
+            "OPENAI_API_KEY=sk-secret\n"
+        );
+    }
+
     /// `apply_patch` writes in-process with no sandbox, so the shell rule's
     /// rc/credential-file list must hold here too. Pure check against the real
     /// home — nothing is written.
@@ -1806,7 +1846,7 @@ diff --git a/notes.txt b/notes.txt
         // Regression: the guard used to scan for `*** Update File:` markers,
         // but the applicator also accepts unified diffs. A diff carrying no
         // DSL marker yielded an empty path list, so the `for` loop that calls
-        // is_blocked_path / is_control_plane_write_denied never ran and a
+        // is_blocked_path / is_control_plane_denied never ran and a
         // patch could write `.env`, `.ssh/authorized_keys`, or
         // `~/.borg/hooks.json` (arbitrary shell at every hook point).
         let patch = "\

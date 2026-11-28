@@ -99,8 +99,14 @@ pub async fn snapshot(
             // A control's `value` is its label only on button-like inputs. On
             // every other field it is what the user (or a login fill) typed —
             // a password, a one-time code, a card number — so it is never
-            // read. The `name` attribute identifies an unlabelled field.
+            // read. The `name` attribute identifies an unlabelled field. The
+            // text inside a `<textarea>`, a textbox or an editable region is
+            // the same kind of content, so the inner-text fallback skips
+            // those and anything that wraps one.
             const BUTTON_INPUTS = ['button', 'submit', 'reset'];
+            const EDITABLE = 'textarea, [role="textbox"], [contenteditable]:not([contenteditable="false"])';
+            const holdsTypedText = (el) => el.isContentEditable
+                || el.matches(EDITABLE) || el.querySelector(EDITABLE) !== null;
             const label = (el) => (el.tagName === 'INPUT'
                 && BUTTON_INPUTS.includes((el.getAttribute('type') || '').toLowerCase()))
                 ? el.value : '';
@@ -112,7 +118,7 @@ pub async fn snapshot(
                     || label(el)
                     || (el.tagName === 'INPUT' || el.tagName === 'SELECT'
                         || el.tagName === 'TEXTAREA' ? el.getAttribute('name') : '')
-                    || (el.innerText || '').trim();
+                    || (holdsTypedText(el) ? '' : (el.innerText || '').trim());
                 return (cand || '').slice(0, 200);
             }};
             const out = slice.map((el) => {{
@@ -327,6 +333,12 @@ mod tests {
                  <input name="card" value="4111111111111111">
                  <input type="text" placeholder="Email" value="someone@mail.example">
                  <textarea name="notes"></textarea>
+                 <textarea>unsent-draft-text</textarea>
+                 <div role="textbox" contenteditable="true">typed-passphrase</div>
+                 <div role="textbox" contenteditable="true" aria-label="Message">typed-reply</div>
+                 <div role="textbox"><div contenteditable="true">typed-in-a-wrapper</div></div>
+                 <a href="/next"><span contenteditable="true">typed-in-a-link</span></a>
+                 <button type="button">Plain button</button>
                  <input type="submit" value="Sign in">
                </form>"#,
         )
@@ -343,6 +355,11 @@ mod tests {
             "493817",
             "4111111111111111",
             "someone@mail.example",
+            "unsent-draft-text",
+            "typed-passphrase",
+            "typed-reply",
+            "typed-in-a-wrapper",
+            "typed-in-a-link",
         ] {
             assert!(!text.contains(content), "field content leaked: {text}");
         }
@@ -352,6 +369,8 @@ mod tests {
             "\"card\"",
             "\"Email\"",
             "\"notes\"",
+            "\"Message\"",
+            "\"Plain button\"",
             "\"Sign in\"",
         ] {
             assert!(text.contains(label), "missing {label}: {text}");

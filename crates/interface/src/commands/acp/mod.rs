@@ -91,9 +91,9 @@ fn init_acp_logging() -> Result<()> {
         .with_target(false)
         .with_ansi(false)
         .with_writer(non_blocking);
+    use tracing_subscriber::Layer as _;
     let registry = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer);
+        .with(fmt_layer.with_filter(cortex::telemetry::with_wire_log_ceiling(env_filter)));
     if let Err(set_err) = registry.try_init() {
         // A subscriber was already installed (e.g. by a cortex code path that
         // ran before us). Don't panic — write the conflict to acp.log

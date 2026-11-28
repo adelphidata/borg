@@ -186,6 +186,41 @@ mod tests {
         assert!(!is_supported_audio_mime("text/plain"));
     }
 
+    /// A file under Borg's own guarded trees is refused before it is read,
+    /// whatever its extension says it is.
+    #[tokio::test]
+    async fn handle_refuses_borgs_own_control_plane_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir_all(home.join("backups")).expect("mkdir");
+        std::fs::write(home.join("backups/borg.wav"), b"a tarball in disguise").expect("seed");
+        std::fs::write(home.join("hooks.json"), b"{}").expect("seed");
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+
+        let mut config = Config::default();
+        config.audio.enabled = true;
+        config.security.blocked_paths.clear();
+        let ctx = crate::execution_context::ExecutionContext::unrestricted(home.clone());
+
+        for path in ["backups/borg.wav", "hooks.json"] {
+            let result = handle(
+                &TranscribeAudioArgs {
+                    path: path.to_string(),
+                    mime_type: Some("audio/wav".to_string()),
+                    language: None,
+                },
+                &config,
+                &ctx,
+            )
+            .await
+            .expect("handler should return text");
+            assert_eq!(
+                result,
+                format!("Access denied: {path} is in a blocked path.")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn handle_rejects_oversized_file_before_provider_setup() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -149,6 +149,43 @@ pub fn blocked_entry_folds_case(entry: &str) -> bool {
     entry.starts_with('.')
 }
 
+/// Entries of `~/.borg` a sandboxed command may not read: the key and
+/// credential stores, the cleartext DB with the files SQLite keeps beside it,
+/// the provider-key `.env`, the backup tarballs (full copies of all of it),
+/// the user's unsent `$EDITOR` buffer and the undo points. Deny entries are
+/// paths, not patterns, so the DB's siblings are spelled out; copies with a
+/// timestamp in the name are added by [`borg_db_family`].
+const BORG_DIR_DENY_READ: &[&str] = &[
+    "secrets",
+    "identity",
+    "borg.db",
+    "borg.db-wal",
+    "borg.db-shm",
+    "borg.db-journal",
+    ".env",
+    ".credentials.json",
+    ".scripts_key",
+    "backups",
+    "editor",
+    "checkpoints",
+];
+
+/// Names in `borg_dir` that belong to the DB family beyond the fixed ones: a
+/// quarantined `borg.db.corrupt-<ts>` and its WAL/SHM. Read from disk when
+/// the policy is built; a directory that cannot be listed adds nothing.
+fn borg_db_family(borg_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(borg_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("borg.db.") || name.starts_with("borg.db-"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Component-level match with dotted-family coverage: `.env` also matches
 /// `.env.local`, `private_key` also matches `private_key.pem`. With `fold`
 /// (see [`blocked_entry_folds_case`]) both sides go through [`fold_case`].
@@ -426,7 +463,12 @@ impl SandboxPolicy {
             self.deny_write.push(borg_dir.clone());
         }
 
-        for sensitive in ["secrets", "identity", "borg.db", "editor", "checkpoints"] {
+        let db_family = borg_db_family(std::path::Path::new(&borg_dir));
+        for sensitive in BORG_DIR_DENY_READ
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(db_family)
+        {
             let path = format!("{borg_dir}/{sensitive}");
             if !self.deny_read.iter().any(|p| p == &path) {
                 self.deny_read.push(path);
@@ -1136,6 +1178,34 @@ mod tests {
         assert_eq!(secrets_count, 1);
     }
 
+    /// Quarantined DB copies carry a timestamp, so they are found on disk:
+    /// every `borg.db.*` / `borg.db-*` name, and nothing that only looks
+    /// similar.
+    #[test]
+    fn borg_db_family_lists_the_copies_beside_the_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "borg.db",
+            "borg.db-wal",
+            "borg.db.corrupt-1732700000",
+            "borg.db.corrupt-1732700000-wal",
+            "borg.dbx",
+            "notes.md",
+        ] {
+            std::fs::write(dir.path().join(name), "x").expect("seed");
+        }
+
+        assert_eq!(
+            borg_db_family(dir.path()),
+            [
+                "borg.db-wal",
+                "borg.db.corrupt-1732700000",
+                "borg.db.corrupt-1732700000-wal"
+            ]
+        );
+        assert!(borg_db_family(&dir.path().join("missing")).is_empty());
+    }
+
     #[test]
     fn with_borg_dir_protected_denies_read_of_secret_stores() {
         // M2/M1: the credential/key material inside ~/.borg must be deny-read,
@@ -1148,6 +1218,17 @@ mod tests {
             "/.borg/secrets",
             "/.borg/identity",
             "/.borg/borg.db",
+            // A deny entry is a path, not a pattern: SQLite's files beside
+            // the DB hold the same rows and are named one by one.
+            "/.borg/borg.db-wal",
+            "/.borg/borg.db-shm",
+            "/.borg/borg.db-journal",
+            // Provider keys, the keychain-less credential and script-key files,
+            // and the backup tarballs that copy all of the above.
+            "/.borg/.env",
+            "/.borg/.credentials.json",
+            "/.borg/.scripts_key",
+            "/.borg/backups",
             "/.borg/editor",
             // The undo points copy every workspace file, `.env` included.
             "/.borg/checkpoints",

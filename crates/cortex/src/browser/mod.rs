@@ -809,9 +809,9 @@ impl BrowserSession {
         .context("get_images timed out")?
     }
 
-    /// Set files on a file `<input>`. Chrome's CDP needs the absolute paths;
-    /// we don't sandbox them here because the operator's host filesystem is
-    /// already accessible to the agent via `apply_patch`/`read_file`.
+    /// Set files on a file `<input>`. `files` are absolute, symlink-free
+    /// paths that have passed the read gate; the browser tool handler is the
+    /// one caller and does both before it gets here.
     #[instrument(skip_all, fields(browser.action = "upload"))]
     pub async fn upload(
         &self,

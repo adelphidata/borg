@@ -264,7 +264,9 @@ fn read_doc_within_root(
     // `blocked_paths` is the list that already answers this question for
     // `fs_read`, including the dotted-family rule that covers `.env.local` and
     // `id_rsa.pem`, and it honors the operator's `allowed_paths` escape hatch.
-    if crate::tool_handlers::is_blocked_path(
+    // The read gate adds Borg's own key and DB files, which no list lifts: an
+    // `AGENTS.md -> ~/.borg/.env` must not put the provider keys in the prompt.
+    if crate::tool_handlers::filesystem::is_read_denied(
         &resolved,
         &security.blocked_paths,
         &security.allowed_paths,
@@ -646,6 +648,33 @@ mod tests {
         assert!(
             result.contains("PUBLIC_SETTING=1"),
             "allowed_paths must override the block: {result}"
+        );
+    }
+
+    /// Spec: Borg's own key and DB files never reach the prompt, whatever the
+    /// lists say. With the data dir as the project, `AGENTS.md -> hooks.json`
+    /// stays inside the root and is on the allowlist — and is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_doc_that_is_borgs_own_control_plane_file_is_refused() {
+        let repo = TempDir::new().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("hooks.json"), "HOOK-BODY").unwrap();
+        std::os::unix::fs::symlink(root.join("hooks.json"), root.join("AGENTS.md")).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "# Rules\nUse tabs.").unwrap();
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&root);
+
+        let mut security = sec();
+        security.blocked_paths.clear();
+        security.allowed_paths = vec![root.to_string_lossy().into_owned()];
+
+        let result = discover_project_docs(&root, &security)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(
+            !result.contains("HOOK-BODY"),
+            "the hooks file was read as a project doc: {result}"
         );
     }
 

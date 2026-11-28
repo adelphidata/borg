@@ -137,32 +137,68 @@ fn otel_export_filter() -> tracing_subscriber::filter::FilterFn {
     })
 }
 
-/// Log targets held at a fixed level whatever `RUST_LOG` asks for.
+/// The most verbose level each wire-log module may log at, whatever
+/// `RUST_LOG` asks for. A ceiling covers the module and everything below it.
 ///
 /// `chromiumoxide::conn` logs every CDP command and reply at TRACE, verbatim:
 /// the text typed into a page (passwords included) and everything a page
-/// evaluation returns. One layer down, `tungstenite::protocol` logs the whole
-/// payload of each WebSocket frame it sends — the same CDP commands again,
-/// key press by key press, and a channel's gateway frames (the one that
-/// carries its bot token among them). A debugging `RUST_LOG=trace` must not
-/// write either to `daemon.log`.
+/// evaluation returns; its `raw_ws::parse_errors` child logs the raw message
+/// at DEBUG. One layer down, `tungstenite` logs the whole payload of each
+/// WebSocket frame it sends — the same CDP commands again, key press by key
+/// press, and a channel's gateway frames (the one that carries its bot token
+/// among them) — and its handshake logs the request with its headers. A
+/// debugging `RUST_LOG=trace` must not write any of that to `daemon.log`.
 ///
-/// Each entry names the exact target of the payload-bearing events, so a
-/// `RUST_LOG` directive for the same target is replaced, not out-ranked.
-const PINNED_LOG_DIRECTIVES: &[&str] = &["chromiumoxide::conn=error", "tungstenite::protocol=info"];
+/// A ceiling only ever removes events. It is not an `EnvFilter` directive:
+/// a directive *enables* its level, so pinning `tungstenite=info` would turn
+/// INFO on under a quieter `RUST_LOG`.
+const WIRE_LOG_CEILINGS: &[(&str, tracing::Level)] = &[
+    ("chromiumoxide::conn", tracing::Level::ERROR),
+    ("tungstenite", tracing::Level::INFO),
+];
+
+/// False for an event a wire-log module must not log: `target` is one of
+/// [`WIRE_LOG_CEILINGS`] or a module below it, and `level` is more verbose
+/// than its ceiling.
+fn within_wire_log_ceiling(target: &str, level: tracing::Level) -> bool {
+    WIRE_LOG_CEILINGS.iter().all(|(module, ceiling)| {
+        let inside = target
+            .strip_prefix(module)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"));
+        !inside || level <= *ceiling
+    })
+}
 
 /// The process log filter: `rust_log` (the `RUST_LOG` value) when it is set
-/// and parses, otherwise `default`, with [`PINNED_LOG_DIRECTIVES`] applied
-/// last so neither can loosen them.
+/// and parses, otherwise `default`. Install it through [`install_subscriber`]
+/// or [`with_wire_log_ceiling`], never bare: those add the ceiling that keeps
+/// the wire logs off.
 pub fn log_filter(rust_log: Option<&str>, default: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
-    let base = rust_log
-        .and_then(|spec| EnvFilter::try_new(spec).ok())
-        .unwrap_or_else(|| EnvFilter::new(default));
-    PINNED_LOG_DIRECTIVES
-        .iter()
-        .filter_map(|directive| directive.parse().ok())
-        .fold(base, EnvFilter::add_directive)
+    let Some(spec) = rust_log else {
+        return EnvFilter::new(default);
+    };
+    EnvFilter::try_new(spec).unwrap_or_else(|e| {
+        // No subscriber exists yet, so stderr is the only place to say it.
+        eprintln!("RUST_LOG is not a valid log filter ({e}); using `{default}`");
+        EnvFilter::new(default)
+    })
+}
+
+/// `env_filter`, minus every event above its module's entry in
+/// [`WIRE_LOG_CEILINGS`]. This is the filter a log sink is built with.
+pub fn with_wire_log_ceiling<S>(
+    env_filter: tracing_subscriber::EnvFilter,
+) -> impl tracing_subscriber::layer::Filter<S> + Send + Sync + 'static
+where
+    S: tracing::Subscriber + 'static,
+{
+    use tracing_subscriber::filter::{filter_fn, FilterExt, LevelFilter};
+    // Without a hint of its own the pair reports "no maximum level", and
+    // every callsite in the process is then asked about, level by level.
+    let ceiling = filter_fn(|meta| within_wire_log_ceiling(meta.target(), *meta.level()))
+        .with_max_level_hint(LevelFilter::TRACE);
+    env_filter.and(ceiling)
 }
 
 /// Type alias for a boxed tracing layer compatible with Registry.
@@ -198,7 +234,7 @@ pub fn build_subscriber(
 ) -> impl tracing::Subscriber + Send + Sync {
     use tracing_subscriber::layer::{Layer as _, SubscriberExt};
     layers.push(fmt_layer);
-    tracing_subscriber::registry().with(layers.with_filter(env_filter))
+    tracing_subscriber::registry().with(layers.with_filter(with_wire_log_ceiling(env_filter)))
 }
 
 /// RAII guard that records a harness boot on construction and a graceful
@@ -746,6 +782,39 @@ pub(crate) mod tests {
                 log_filter(*rust_log, "warn").max_level_hint(),
                 Some(*expected),
                 "RUST_LOG={rust_log:?}"
+            );
+        }
+    }
+
+    /// The ceiling follows module boundaries: the module and its children,
+    /// not a neighbour whose name merely starts the same way.
+    #[test]
+    fn wire_log_ceiling_covers_a_module_and_its_children_only() {
+        use tracing::Level;
+        let cases: &[(&str, Level, bool)] = &[
+            ("chromiumoxide::conn", Level::ERROR, true),
+            ("chromiumoxide::conn", Level::WARN, false),
+            (
+                "chromiumoxide::conn::raw_ws::parse_errors",
+                Level::DEBUG,
+                false,
+            ),
+            ("chromiumoxide::connection", Level::TRACE, true),
+            ("chromiumoxide::handler", Level::TRACE, true),
+            ("tungstenite", Level::INFO, true),
+            ("tungstenite", Level::DEBUG, false),
+            ("tungstenite::protocol::frame", Level::TRACE, false),
+            ("tungstenite::handshake::client", Level::TRACE, false),
+            ("tungstenite::handshake::client", Level::WARN, true),
+            ("tungstenite_fork", Level::TRACE, true),
+            ("tokio_tungstenite", Level::TRACE, true),
+            ("cortex::agent", Level::TRACE, true),
+        ];
+        for (target, level, allowed) in cases {
+            assert_eq!(
+                within_wire_log_ceiling(target, *level),
+                *allowed,
+                "{target} at {level}"
             );
         }
     }

@@ -357,12 +357,12 @@ pub(crate) fn instruction_write_denied_message(raw_path: &str) -> String {
 /// daemon's gRPC API or shell out manually if you need to touch control-plane
 /// files from outside the agent loop.
 pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
-    let Ok(home) = crate::paths::resolve_borg_home_readonly(None) else {
+    let Some(home) = control_plane_home() else {
         return false;
     };
-    // Lifecycle-hooks config plus sockets / pidfile / lockfile at the home
-    // root. `hooks.json` runs arbitrary shell at every hook point, so it is the
-    // security-policy file an agent must not be able to rewrite.
+    // Sockets, pidfile and lockfile at the home root: nothing worth reading,
+    // but an agent must not replace them. The files that hold data are in
+    // `CONTROL_PLANE_FILES`, shared with the read deny.
     const WRITE_ONLY_FILES: &[&str] = &[
         "borgd.sock",
         "borgd-pair.sock",
@@ -372,10 +372,67 @@ pub fn is_control_plane_write_denied(path: &std::path::Path) -> bool {
     control_plane_match(path, &home, WRITE_ONLY_FILES, &[])
 }
 
-/// `$BORG_HOME` root files that hold the control-plane state: the SQLite DB
-/// with its WAL/SHM siblings (cleartext at rest, credential rows included)
-/// and the lifecycle-hooks config. Denied for writes and for egress reads.
-const CONTROL_PLANE_FILES: &[&str] = &["borg.db", "borg.db-wal", "borg.db-shm", "hooks.json"];
+/// `$BORG_HOME` root files that hold control-plane state, besides the DB
+/// family ([`is_db_family`]): the lifecycle-hooks config, the credential file
+/// the plugin installer writes when there is no OS keychain, and the file
+/// copy of the script-signing key. Denied for writes and for egress reads.
+const CONTROL_PLANE_FILES: &[&str] = &["hooks.json", ".credentials.json", ".scripts_key"];
+
+/// `target` is the DB at the root of `home` or a file the DB layer makes
+/// beside it: `borg.db-wal`, `borg.db-shm`, a rollback journal, and a
+/// quarantined copy (`borg.db.corrupt-<ts>`, with WAL/SHM siblings of its
+/// own). Every one is cleartext at rest and carries the credential rows, so
+/// the family is matched by name — `borg.db`, then `-` or `.` and anything —
+/// not listed file by file. A DB that is a link to another volume has its
+/// family there, beside the real file. Both paths are canonical already.
+fn is_db_family(target: &std::path::Path, home: &std::path::Path) -> bool {
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let name = sandbox::policy::fold_case(&name);
+    member_forms(home, crate::constants::DB_FILE).any(|db| {
+        let (Some(db_dir), Some(db_name)) = (db.parent(), db.file_name()) else {
+            return false;
+        };
+        let db_name = db_name.to_string_lossy();
+        same_path_ignoring_case(parent, db_dir)
+            && name
+                .strip_prefix(sandbox::policy::fold_case(&db_name).as_ref())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
+    })
+}
+
+/// The paths `name` under `home` goes by: the plain join and, when the entry
+/// is a link (a `backups` folder kept on a bigger volume), the place the link
+/// leads. Callers hand the gates a resolved path, so the plain join alone
+/// would never match what sits behind such a link.
+fn member_forms(home: &std::path::Path, name: &str) -> impl Iterator<Item = std::path::PathBuf> {
+    let plain = home.join(name);
+    let resolved = plain
+        .canonicalize()
+        .ok()
+        .filter(|resolved| *resolved != plain);
+    std::iter::once(plain).chain(resolved)
+}
+
+/// The data dir a forced `borg restore` set aside, when `target` is inside
+/// one: a sibling of `home` named `<home>.bak.<unix time>`. It is the whole
+/// former data dir — DB, keys and all — so it is guarded like the live one.
+fn set_aside_home(target: &std::path::Path, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parent = home.parent()?;
+    if !starts_with_ignoring_case(target, parent) {
+        return None;
+    }
+    let sibling = target.components().nth(parent.components().count())?;
+    let sibling = sibling.as_os_str().to_string_lossy();
+    let home_name = home.file_name()?.to_string_lossy();
+    let prefix = format!("{}.bak.", sandbox::policy::fold_case(&home_name));
+    let folded = sandbox::policy::fold_case(&sibling);
+    let stamp = folded.strip_prefix(prefix.as_str())?;
+    (!stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| parent.join(sibling.as_ref()))
+}
 
 /// `$BORG_HOME` subtrees denied as a whole for writes and egress reads:
 /// `secrets/` holds the KEK material (`kek.enc`, the dev KEK cache);
@@ -389,22 +446,87 @@ const CONTROL_PLANE_TREES: &[&str] = &["secrets", "checkpoints"];
 /// (file reads via [`is_read_denied`], `[MEDIA:]` reply attachments).
 ///
 /// Covers everything [`is_control_plane_write_denied`] protects that holds
-/// data — the DB and its WAL/SHM siblings (the DB is cleartext at rest and
-/// carries credential rows), the `secrets/` KEK tree, `hooks.json` — plus the
-/// data dir's own `.env` (provider keys) and the `backups/` tarballs, which
-/// are full copies of the DB and secrets. Sockets, the pidfile, and the lock
-/// carry nothing worth reading. Ordinary data-dir output such as
-/// `screenshots/` stays readable. Same resolution and case folding as the
-/// write check, and equally non-configurable.
+/// data — the DB family (cleartext at rest, credential rows included), the
+/// `secrets/` KEK tree, `hooks.json`, the fallback credential and script-key
+/// files — plus the data dir's own `.env` (provider keys), the `backups/`
+/// tarballs, which are full copies of the DB and secrets, and `editor/`, the
+/// user's unsent message. Sockets, the pidfile, and the lock carry nothing
+/// worth reading. Ordinary data-dir output such as `screenshots/` stays
+/// readable. Same resolution and case folding as the write check, and
+/// equally non-configurable.
 pub fn is_control_plane_read_denied(path: &std::path::Path, home: &std::path::Path) -> bool {
     const READ_ONLY_FILES: &[&str] = &[".env"];
-    const READ_ONLY_TREES: &[&str] = &["backups"];
+    const READ_ONLY_TREES: &[&str] = &["backups", "editor"];
     control_plane_match(path, home, READ_ONLY_FILES, READ_ONLY_TREES)
+}
+
+/// `path` is one of Borg's own control-plane files, for a write or for a
+/// read. The check for a tool that does both to its targets: `apply_patch`
+/// reads what it updates, and its `Move to` carries a file's bytes to a place
+/// `read_file` can reach.
+pub fn is_control_plane_denied(path: &std::path::Path) -> bool {
+    is_control_plane_write_denied(path)
+        || control_plane_home().is_some_and(|home| is_control_plane_read_denied(path, &home))
+}
+
+/// The data dir whose control-plane files the gates protect. `None` — with a
+/// warning, because the gates then protect nothing — when it does not
+/// resolve (no `$BORG_HOME` and no home directory).
+///
+/// A caller that judges many paths (a directory listing) or lives outside
+/// this crate resolves it once here and uses [`is_read_denied_under`].
+pub fn control_plane_home() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_home::current() {
+        return Some(home);
+    }
+    match crate::paths::resolve_borg_home_readonly(None) {
+        Ok(home) => Some(home),
+        Err(e) => {
+            tracing::warn!(
+                "Borg's data dir does not resolve, so its own files are not guarded: {e:#}"
+            );
+            None
+        }
+    }
+}
+
+/// A data dir for the gates on the current thread only, so a test of a tool
+/// handler can aim them at a scratch directory without setting the
+/// process-wide `$BORG_HOME` under every other test.
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current() -> Option<PathBuf> {
+        HOME.with(|home| home.borrow().clone())
+    }
+
+    /// Restores the thread's previous data dir when dropped.
+    pub(crate) struct Scoped(Option<PathBuf>);
+
+    /// Use `home` as the data dir on this thread until the guard drops.
+    pub(crate) fn scoped(home: &Path) -> Scoped {
+        Scoped(HOME.with(|slot| slot.replace(Some(home.to_path_buf()))))
+    }
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            HOME.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
 }
 
 /// The read gate for every in-process reader whose bytes reach the model or
 /// leave the machine: `read_file`, `list_dir`, `@path` mentions, audio
-/// transcription, browser uploads.
+/// transcription, browser uploads, project instruction files, the file a
+/// patch moves, `borg memory write --file`.
 ///
 /// Denies what the operator's `security.blocked_paths` denies, plus Borg's own
 /// control-plane data ([`is_control_plane_read_denied`]) under the resolved
@@ -412,9 +534,42 @@ pub fn is_control_plane_read_denied(path: &std::path::Path, home: &std::path::Pa
 /// lift it: the KEK file, the provider-key `.env`, the cleartext DB and the
 /// backup tarballs are never model input, whatever the blocklist says.
 pub fn is_read_denied(path: &std::path::Path, blocked: &[String], allowed: &[String]) -> bool {
+    is_read_denied_under(path, blocked, allowed, control_plane_home().as_deref())
+}
+
+/// The read gate with its inputs resolved once, for a caller that judges many
+/// paths in one go (a directory walk).
+pub struct ReadGate<'a> {
+    blocked: &'a [String],
+    allowed: &'a [String],
+    home: Option<std::path::PathBuf>,
+}
+
+impl<'a> ReadGate<'a> {
+    pub fn new(security: &'a crate::config::SecurityConfig) -> Self {
+        Self {
+            blocked: &security.blocked_paths,
+            allowed: &security.allowed_paths,
+            home: control_plane_home(),
+        }
+    }
+
+    /// [`is_read_denied`] for `path`.
+    pub fn denies(&self, path: &std::path::Path) -> bool {
+        is_read_denied_under(path, self.blocked, self.allowed, self.home.as_deref())
+    }
+}
+
+/// [`is_read_denied`] against an explicit data dir (`None` when it cannot be
+/// resolved, in which case there is no control plane to protect).
+pub fn is_read_denied_under(
+    path: &std::path::Path,
+    blocked: &[String],
+    allowed: &[String],
+    home: Option<&std::path::Path>,
+) -> bool {
     is_blocked_path(path, blocked, allowed)
-        || crate::paths::resolve_borg_home_readonly(None)
-            .is_ok_and(|home| is_control_plane_read_denied(path, &home))
+        || home.is_some_and(|home| is_control_plane_read_denied(path, home))
 }
 
 /// `path` resolves to one of the shared [`CONTROL_PLANE_FILES`] /
@@ -429,20 +584,32 @@ fn control_plane_match(
 ) -> bool {
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     let target = canonicalize_write_target(path);
-    CONTROL_PLANE_FILES
-        .iter()
-        .chain(files)
-        .any(|name| same_path_ignoring_case(&target, &home.join(name)))
-        || CONTROL_PLANE_TREES
-            .iter()
-            .chain(trees)
-            .any(|tree| starts_with_ignoring_case(&target, &home.join(tree)))
+    let set_aside = set_aside_home(&target, &home);
+    std::iter::once(&home)
+        .chain(set_aside.as_ref())
+        .any(|home| {
+            is_db_family(&target, home)
+                || CONTROL_PLANE_FILES.iter().chain(files).any(|name| {
+                    member_forms(home, name).any(|file| same_path_ignoring_case(&target, &file))
+                })
+                || CONTROL_PLANE_TREES.iter().chain(trees).any(|name| {
+                    member_forms(home, name).any(|tree| starts_with_ignoring_case(&target, &tree))
+                })
+        })
 }
 
-/// Conventional control-plane file leaves under `$BORG_HOME`. `borg.db`'s
-/// WAL/SHM siblings are covered by the `borg.db` substring; `secrets` matches
-/// the whole KEK subtree and `checkpoints` the whole undo-point store.
-const CONTROL_PLANE_LEAVES: &[&str] = &["hooks.json", "borg.db", "secrets", "checkpoints"];
+/// Conventional control-plane file leaves under `$BORG_HOME`. The rest of
+/// the DB family (WAL/SHM, a quarantined copy) is covered by the `borg.db`
+/// substring; `secrets` matches the whole KEK subtree and `checkpoints` the
+/// whole undo-point store.
+const CONTROL_PLANE_LEAVES: &[&str] = &[
+    "hooks.json",
+    "borg.db",
+    "secrets",
+    "checkpoints",
+    ".credentials.json",
+    ".scripts_key",
+];
 
 /// Substrings whose presence in a shell token means the token points at one of
 /// Borg's own control-plane files. Built once (process-lifetime) from the
@@ -480,6 +647,8 @@ const CONTROL_PLANE_BARE_LEAVES: &[&str] = &[
     "kek.enc",
     "secrets",
     "checkpoints",
+    ".credentials.json",
+    ".scripts_key",
     "borgd.sock",
     "borgd-pair.sock",
     "borgd.pid",
@@ -803,13 +972,6 @@ fn redirect_target_is_control_plane(frag: &str, bare_leaves: bool) -> bool {
 mod tests {
     use super::*;
 
-    /// Serializes the tests that mutate the process-global `BORG_HOME` env var.
-    /// `set_var`/`remove_var` are process-wide, so two such tests running on
-    /// parallel threads can clobber each other's home mid-assertion (observed:
-    /// one test's `remove_var` racing another's resolution). Hold this for the
-    /// duration of any test that touches `BORG_HOME`.
-    static BORG_HOME_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn is_blocked_path_matches_blocked_dir() {
         let home = dirs::home_dir().unwrap();
@@ -1057,10 +1219,9 @@ mod tests {
         // subtree denied, (c) `..` traversal cannot escape the deny, (d) a
         // symlink into a denied region is also denied via canonicalize, and
         // (e) ordinary user paths under home are unaffected.
-        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::env::set_var("BORG_HOME", &home);
+        let _home = test_home::scoped(&home);
         std::fs::create_dir_all(home.join("secrets")).expect("mkdir secrets");
         std::fs::write(home.join("borg.db"), b"db").expect("seed db");
 
@@ -1096,8 +1257,6 @@ mod tests {
 
         // Ordinary file under home — not a control-plane file — is allowed.
         assert!(!is_control_plane_write_denied(&home.join("notes.md")));
-
-        std::env::remove_var("BORG_HOME");
     }
 
     /// Egress reads of control-plane data are refused under any spelling
@@ -1117,6 +1276,36 @@ mod tests {
         std::fs::write(home.join("borg.db"), b"db").expect("seed db");
         let alias = tmp.path().join("alias");
         std::os::unix::fs::symlink(&home, &alias).expect("symlink");
+        let set_aside = home.with_file_name("home.bak.1732700000");
+        // A second data dir whose DB and backups live on another volume: a
+        // guarded entry that is a link is guarded where it leads.
+        let big_volume = home.with_file_name("volume");
+        let linked_home = home.with_file_name("linked-home");
+        std::fs::create_dir_all(big_volume.join("backups")).expect("mkdir volume");
+        std::fs::create_dir_all(&linked_home).expect("mkdir linked home");
+        std::fs::write(big_volume.join("borg.db"), b"db").expect("seed db");
+        std::os::unix::fs::symlink(big_volume.join("backups"), linked_home.join("backups"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(big_volume.join("borg.db"), linked_home.join("borg.db"))
+            .expect("symlink");
+        for p in [
+            big_volume.join("backups/borg-2026.tar.zst"),
+            big_volume.join("borg.db"),
+            big_volume.join("borg.db-wal"),
+        ] {
+            assert!(
+                is_control_plane_read_denied(&p, &linked_home),
+                "{p:?} is behind a link in the data dir and must be denied"
+            );
+            assert!(
+                !is_control_plane_read_denied(&p, &home),
+                "{p:?} belongs to another data dir"
+            );
+        }
+        assert!(!is_control_plane_read_denied(
+            &big_volume.join("notes.md"),
+            &linked_home
+        ));
 
         let denied = [
             home.join("borg.db"),
@@ -1127,10 +1316,26 @@ mod tests {
             home.join("secrets/dev-kek-cache.enc"),
             home.join("hooks.json"),
             home.join(".env"),
+            home.join(".credentials.json"),
+            home.join(".scripts_key"),
+            home.join(".SCRIPTS_KEY"),
             home.join("backups/borg-2026.tar.gz"),
+            home.join("editor/draft-1.md"),
             home.join("checkpoints/store/objects/ab/cdef"),
             home.join("screenshots/../borg.db"),
             alias.join("borg.db"),
+            // Whatever the DB layer writes beside the DB is the DB.
+            home.join("borg.db-journal"),
+            home.join("borg.db.corrupt-1732700000"),
+            home.join("borg.db.corrupt-1732700000-wal"),
+            home.join("Borg.DB.corrupt-1732700000"),
+            home.join("borg.db.notes.md"),
+            // The data dir a forced restore set aside is a full copy.
+            set_aside.join("borg.db"),
+            set_aside.join("secrets/kek.enc"),
+            set_aside.join(".credentials.json"),
+            set_aside.join("screenshots/../.env"),
+            home.with_file_name("HOME.BAK.1732700000/hooks.json"),
         ];
         for p in &denied {
             assert!(
@@ -1140,10 +1345,21 @@ mod tests {
         }
         let allowed = [
             home.join("screenshots/screenshot_1.png"),
-            home.join("borg.db.notes.md"),
             home.join("memory/notes.md"),
+            // The family is `borg.db` plus `-` or `.`, at the root only.
+            home.join("borg.dbx"),
+            home.join("borg.database.md"),
+            home.join("my-borg.db"),
+            home.join("memory/borg.db.corrupt-1"),
+            home.join("credentials.json"),
             tmp.path().join("borg.db"),
             tmp.path().join("project/chart.png"),
+            // Only `<home>.bak.<digits>` is a set-aside data dir.
+            home.with_file_name("home.bak.notes/borg.db"),
+            home.with_file_name("home.bak./borg.db"),
+            home.with_file_name("homework.bak.1/borg.db"),
+            set_aside.join("screenshots/shot.png"),
+            big_volume.join("notes.md"),
         ];
         for p in &allowed {
             assert!(
@@ -1161,10 +1377,9 @@ mod tests {
         // returned the literal raw path and skipped every comparison, so a
         // prompt-injected agent could create `~/.borg/borg.db` (or a
         // not-yet-existing subdir under `secrets/`) and bypass the deny.
-        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::env::set_var("BORG_HOME", &home);
+        let _home = test_home::scoped(&home);
         std::fs::create_dir_all(home.join("secrets")).expect("mkdir secrets");
 
         // Files that don't exist but live under canonical control-plane paths.
@@ -1182,8 +1397,6 @@ mod tests {
         // Lexical traversal through a non-existent prefix still resolves.
         let traversal = home.join("ghost").join("..").join("borg.db");
         assert!(is_control_plane_write_denied(&traversal));
-
-        std::env::remove_var("BORG_HOME");
     }
 
     /// Borg's own keys, DB, hooks and backups are never model input: the
@@ -1197,24 +1410,28 @@ mod tests {
         use crate::types::ToolOutput;
         use serde_json::json;
 
-        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::env::set_var("BORG_HOME", &home);
+        let _home = test_home::scoped(&home);
         for dir in ["secrets", "backups", "logs"] {
             std::fs::create_dir_all(home.join(dir)).expect("mkdir");
         }
         let denied = [
             "secrets/kek.enc",
             ".env",
+            ".credentials.json",
+            ".scripts_key",
             "hooks.json",
             "borg.db",
+            "borg.db.corrupt-1732700000",
             "backups/borg-2026.tar.gz",
         ];
         for rel in denied {
             std::fs::write(home.join(rel), "TOP-SECRET-CONTENT").expect("seed");
         }
         std::fs::write(home.join("logs/tui.log"), "an ordinary log line").expect("seed log");
+        std::os::unix::fs::symlink(home.join("secrets/kek.enc"), home.join("logs/innocent"))
+            .expect("symlink");
 
         let mut config = crate::config::Config::default();
         config.security.blocked_paths.clear();
@@ -1234,17 +1451,73 @@ mod tests {
         }
         assert!(read("logs/tui.log").contains("an ordinary log line"));
 
-        let list = |rel: &str| {
-            handle_list_dir(&json!({"path": home.join(rel).to_string_lossy()}), &config)
-                .expect("list_dir")
+        let list = |rel: &str, args: serde_json::Value| {
+            let mut args = args;
+            args["path"] = json!(home.join(rel).to_string_lossy());
+            handle_list_dir(&args, &config).expect("list_dir")
         };
         for rel in ["secrets", "backups"] {
-            let out = list(rel);
+            let out = list(rel, json!({}));
             assert!(out.starts_with("Access denied"), "{rel} was listed: {out}");
         }
-        assert!(list("logs").contains("tui.log"));
+        assert!(list("logs", json!({})).contains("tui.log"));
 
-        std::env::remove_var("BORG_HOME");
+        // Listed from above, the guarded entries are marked, not walked: the
+        // names inside `secrets/` and `backups/` never appear.
+        let tree = list("", json!({"depth": 3, "include_hidden": true}));
+        for hidden in ["kek.enc", "borg-2026.tar.gz"] {
+            assert!(!tree.contains(hidden), "{hidden} was listed:\n{tree}");
+        }
+        for marked in [
+            "[blocked] secrets",
+            "[blocked] borg.db",
+            "[blocked] .env",
+            // A link into a guarded tree is judged by where it leads.
+            "[blocked] innocent",
+        ] {
+            assert!(tree.contains(marked), "missing `{marked}` in:\n{tree}");
+        }
+        assert!(
+            tree.contains("tui.log"),
+            "the ordinary tree is gone:\n{tree}"
+        );
+
+        // The fuzzy search walks the same tree and finds none of it.
+        for query in ["kek", "credentials", "tar"] {
+            let found = list("", json!({"fuzzy_match": query, "include_hidden": true}));
+            for hidden in ["kek.enc", ".credentials.json", "borg-2026.tar.gz"] {
+                assert!(
+                    !found.contains(hidden),
+                    "`{query}` found {hidden}:\n{found}"
+                );
+            }
+        }
+        assert!(list("", json!({"fuzzy_match": "tui"})).contains("tui.log"));
+    }
+
+    /// The gate takes its data dir from the caller when given one, and
+    /// without one there is no control plane to guard — only the blocklist.
+    #[test]
+    fn read_gate_judges_against_the_data_dir_it_is_given() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let key = home.join("secrets/kek.enc");
+        let blocked = vec![".ssh".to_string()];
+
+        assert!(is_read_denied_under(&key, &blocked, &[], Some(&home)));
+        assert!(!is_read_denied_under(&key, &blocked, &[], None));
+        assert!(is_read_denied_under(
+            &home.join(".ssh/id_rsa"),
+            &blocked,
+            &[],
+            None
+        ));
+        assert!(!is_read_denied_under(
+            &home.join("logs/tui.log"),
+            &blocked,
+            &[],
+            Some(&home)
+        ));
     }
 
     #[test]
@@ -1254,10 +1527,9 @@ mod tests {
         // through canonicalization; on APFS the hooks loader then reads it as
         // `hooks.json` and runs it unsandboxed. None of these files are
         // created, so no on-disk lookup can fix the case.
-        let _env = BORG_HOME_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::env::set_var("BORG_HOME", &home);
+        let _home = test_home::scoped(&home);
 
         for name in [
             "HOOKS.JSON",
@@ -1277,8 +1549,6 @@ mod tests {
         assert!(!is_control_plane_write_denied(
             &home.join("SecretsArchive/x")
         ));
-
-        std::env::remove_var("BORG_HOME");
     }
 
     #[test]
@@ -1297,6 +1567,8 @@ mod tests {
             "sed -i.bak s/a/b/ ~/.borg/hooks.json",
             "dd if=/dev/zero of=~/.borg/borg.db",
             "truncate -s0 ~/.borg/secrets/kek.enc",
+            "echo '{}' > ~/.borg/.credentials.json",
+            "cp /tmp/key ~/.borg/.scripts_key",
             // The undo-point store: a rewritten ref or exclude file changes
             // what a rollback puts back.
             "cp /tmp/evil ~/.borg/checkpoints/store/HEAD",
