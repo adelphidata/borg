@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::daemon_client::{connect_or_spawn, AcpFsClient, DaemonClient};
 
@@ -84,15 +83,17 @@ fn init_acp_logging() -> Result<()> {
     }
     let file = opts.open(&log_path).context("open ACP log file")?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,hyper=error"));
+    let env_filter = cortex::telemetry::log_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        "warn,hyper=error",
+    );
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_writer(non_blocking);
+    use tracing_subscriber::Layer as _;
     let registry = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer);
+        .with(fmt_layer.with_filter(cortex::telemetry::with_wire_log_ceiling(env_filter)));
     if let Err(set_err) = registry.try_init() {
         // A subscriber was already installed (e.g. by a cortex code path that
         // ran before us). Don't panic — write the conflict to acp.log

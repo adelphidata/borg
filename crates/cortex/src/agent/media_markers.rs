@@ -118,13 +118,8 @@ pub fn validate_media_path(
     path: &Path,
     security: &crate::config::SecurityConfig,
 ) -> Result<(), String> {
-    match crate::paths::resolve_borg_home_readonly(None) {
-        Ok(home) => validate_media_path_under(path, security, Some(&home)),
-        Err(e) => {
-            tracing::warn!("media egress: could not resolve the data dir ({e:#}); skipping the control-plane check");
-            validate_media_path_under(path, security, None)
-        }
-    }
+    let home = crate::tool_handlers::filesystem::control_plane_home();
+    validate_media_path_under(path, security, home.as_deref())
 }
 
 /// [`validate_media_path`] against an explicit data dir (`None` when it

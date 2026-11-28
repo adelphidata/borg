@@ -445,7 +445,7 @@ fn beta(value: i32) -> i32 {
 //
 // `apply_hunks` splits on `content.lines()`, which strips `\r`. Joining back
 // with a bare `\n` rewrote every line of a CRLF file on a one-line edit: the
-// whole file shows as changed in `git diff`, the ghost-commit diff is
+// whole file shows as changed in `git diff`, the undo-point diff is
 // unreadable, and the actual change is invisible. The applicator now rejoins
 // with the file's own dominant terminator.
 //

@@ -139,3 +139,7 @@ libsql = { workspace = true }
 wasm-encoder = "0.263"
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry = { workspace = true, features = ["testing"] }
+# The wire-log ceiling test sends records the way `tungstenite` does: through
+# the `log` crate and the bridge into `tracing`.
+log = "0.4"
+tracing-log = "0.2"

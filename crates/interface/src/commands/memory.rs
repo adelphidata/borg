@@ -124,21 +124,9 @@ async fn run_write(
     let body = match (content, file) {
         (Some(c), None) => c,
         (None, Some(p)) => {
-            // Reuse the same blocked-paths filter that gates fs_read/fs_write
-            // so the agent can't shell out to `borg memory write --file ...`
-            // and exfiltrate `.ssh/`, `.env`, etc. into long-term memory.
             let config = cortex::config::Config::load_from_db().await?;
-            if cortex::tool_handlers::filesystem::is_blocked_path(
-                &p,
-                &config.security.blocked_paths,
-                &config.security.allowed_paths,
-            ) {
-                return Err(anyhow!(
-                    "{} is blocked by [security] blocked_paths",
-                    p.display()
-                ));
-            }
-            std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?
+            let home = cortex::tool_handlers::filesystem::control_plane_home();
+            read_memory_source(&p, &config.security, home.as_deref())?
         }
         (Some(_), Some(_)) => return Err(anyhow!("--content and --file are mutually exclusive")),
         (None, None) => return Err(anyhow!("provide --content <text> or --file <path>")),
@@ -195,6 +183,33 @@ async fn run_delete(scope: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read the file behind `borg memory write --file`.
+///
+/// It passes the same read gate as `read_file`, so the agent can't shell out
+/// to `borg memory write --file ...` and copy `.ssh/`, `.env`, or Borg's own
+/// key and DB files (those under `borg_home`) into long-term memory. The gate
+/// judges an absolute path: a relative one would otherwise be compared as
+/// written, from whatever directory the command ran in.
+fn read_memory_source(
+    path: &std::path::Path,
+    security: &cortex::config::SecurityConfig,
+    borg_home: Option<&std::path::Path>,
+) -> Result<String> {
+    let absolute = std::path::absolute(path).with_context(|| format!("read {}", path.display()))?;
+    if cortex::tool_handlers::filesystem::is_read_denied_under(
+        &absolute,
+        &security.blocked_paths,
+        &security.allowed_paths,
+        borg_home,
+    ) {
+        return Err(anyhow!(
+            "{} is a blocked path and cannot be saved to memory",
+            path.display()
+        ));
+    }
+    std::fs::read_to_string(&absolute).with_context(|| format!("read {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +224,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--content"));
+    }
+
+    /// `--file` passes the read gate on the absolute path: a blocked file is
+    /// refused however it is spelled, an ordinary one is read.
+    #[test]
+    fn memory_source_file_passes_the_read_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_rsa"), "PRIVATE KEY").unwrap();
+        std::fs::write(root.join("notes.md"), "plain notes").unwrap();
+        let security = cortex::config::SecurityConfig {
+            blocked_paths: vec![".ssh".to_string()],
+            allowed_paths: Vec::new(),
+            ..Default::default()
+        };
+
+        std::fs::write(root.join("hooks.json"), "HOOKS").unwrap();
+        let read = |rel: &str| read_memory_source(&root.join(rel), &security, Some(&root));
+
+        // The operator's blocklist, and Borg's own files under the data dir.
+        for blocked in ["notes.md/../.ssh/id_rsa", "hooks.json"] {
+            let refused = read(blocked).expect_err("a blocked file");
+            assert!(
+                refused.to_string().contains("is a blocked path"),
+                "{blocked}: {refused:#}"
+            );
+        }
+        assert_eq!(read("notes.md").unwrap(), "plain notes");
+        // The same file outside any data dir is an ordinary file.
+        assert_eq!(
+            read_memory_source(&root.join("hooks.json"), &security, None).unwrap(),
+            "HOOKS"
+        );
     }
 }

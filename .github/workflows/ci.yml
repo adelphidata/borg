@@ -96,6 +96,12 @@ jobs:
         # where the workspace actually is and only ever moves up, so coverage
         # can never silently regress while we climb.
         run: cargo llvm-cov --workspace --lib --bins --no-fail-fast --fail-under-lines 82 --lcov --output-path lcov.info
+      - name: Coverage total
+        # The ratchet can only be raised by someone who can see the number,
+        # and the lcov run above prints none. Reads the profile data that run
+        # left behind; nothing is built or run again.
+        if: success() || failure()
+        run: cargo llvm-cov report --summary-only | tail -n 1
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:

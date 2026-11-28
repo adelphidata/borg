@@ -1,15 +1,14 @@
-//! `apply_patch` (cwd / skills / channels), `create_channel`, ghost-commit
-//! rollback, ACP text-bridge integration, and patch-DSL path
+//! `apply_patch` (cwd / skills / channels), `create_channel`, ACP text-bridge integration, and patch-DSL path
 //! extraction & normalization.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
 use crate::execution_context::ExecutionContext;
 
 use super::blocked::{
-    instruction_write_denied_message, is_blocked_path, is_control_plane_write_denied,
+    instruction_write_denied_message, is_blocked_path, is_control_plane_denied,
     is_instruction_file_write_denied,
 };
 use super::default_execution_context;
@@ -139,7 +138,9 @@ fn deny_write_target(
     ) {
         return Some(format!("Access denied: {raw_path} is in a blocked path"));
     }
-    if is_control_plane_write_denied(resolved) {
+    // Write-denied or read-denied: a patch reads the file it updates, and a
+    // `Move to` would carry a read-denied file out to where it can be read.
+    if is_control_plane_denied(resolved) {
         return Some(format!(
             "Access denied: {raw_path} is a Borg control-plane file"
         ));
@@ -297,7 +298,6 @@ pub fn handle_apply_patch_with_context(
 
     let has_non_relative = patch_has_absolute_paths(patch_text);
 
-    let snapshot = ghost_snapshot_for(cwd);
     let outcome: std::result::Result<coding::ApplyPatchResult, anyhow::Error> = if has_non_relative
     {
         // Normalize all paths to absolute so we can use "/" as base_dir
@@ -319,169 +319,12 @@ pub fn handle_apply_patch_with_context(
             }
             Ok(msg)
         }
-        Err(e) => {
-            // Ghost-commit rollback: if the cwd is inside a git repo
-            // and we snapshotted before the failed patch attempt, restore
-            // tracked files and clean up post-snapshot creations so a
-            // multi-file patch that fails partway doesn't leave the working
-            // tree half-applied. Best-effort outside a repo.
-            if let Some(snapshot) = snapshot {
-                if let Err(restore_err) = restore_ghost_snapshot_sync(&snapshot) {
-                    tracing::warn!(
-                        repo = %snapshot.repo_root.display(),
-                        error = %restore_err,
-                        "ghost rollback after apply_patch failure failed"
-                    );
-                }
-            }
-            Ok(format!("Error applying patch: {e}"))
-        }
+        // No rollback here: `coding::apply_patch` snapshots exactly the files
+        // the patch names and puts them back itself when a write fails
+        // partway. A second, repository-wide restore on top of that could only
+        // revert files the patch never named.
+        Err(e) => Ok(format!("Error applying patch: {e}")),
     }
-}
-
-/// Snapshot of the working tree captured before a disk-backed apply_patch.
-/// Used purely to roll back on failure; on success we just drop it (Git's
-/// GC reclaims the unreferenced commit).
-struct DiskGhostSnapshot {
-    repo_root: std::path::PathBuf,
-    commit_id: String,
-    /// Untracked files that already existed before the snapshot — restore
-    /// must not delete these even though they aren't in the snapshot tree.
-    preexisting_untracked: Vec<std::path::PathBuf>,
-}
-
-/// Best-effort: build a ghost snapshot if `cwd` lives inside a git repo,
-/// otherwise return None. Sync wrapper using `std::process::Command` so the
-/// existing sync apply_patch dispatch doesn't have to migrate to async.
-fn ghost_snapshot_for(cwd: &std::path::Path) -> Option<DiskGhostSnapshot> {
-    let repo_root = crate::git::find_repo_root(cwd)?;
-    match build_ghost_snapshot_sync(&repo_root) {
-        Ok(snapshot) => Some(snapshot),
-        Err(e) => {
-            tracing::debug!(
-                repo = %repo_root.display(),
-                error = %e,
-                "ghost snapshot skipped; proceeding without rollback safety net"
-            );
-            None
-        }
-    }
-}
-
-fn build_ghost_snapshot_sync(repo_root: &std::path::Path) -> Result<DiskGhostSnapshot> {
-    let has_head = run_git_sync(repo_root, &["rev-parse", "HEAD"], &[]).is_ok();
-    let tmp_index = tempfile::NamedTempFile::new()?;
-    let tmp_path = tmp_index.path().to_string_lossy().to_string();
-    // Index env plus filter-neutralizing config: `add`/`read-tree` would
-    // otherwise run repo-configured `filter.<name>.clean`/`.process` drivers
-    // against an untrusted tree.
-    let mut index_env = vec![("GIT_INDEX_FILE".to_string(), tmp_path)];
-    // Fails closed: without the overrides the snapshot is not taken at all.
-    index_env.extend(crate::git::filter_neutralizing_env_sync(repo_root)?);
-    let untracked = run_git_sync(
-        repo_root,
-        &["ls-files", "--others", "--exclude-standard"],
-        &[],
-    )
-    .unwrap_or_default();
-    let preexisting_untracked: Vec<std::path::PathBuf> = untracked
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(std::path::PathBuf::from)
-        .collect();
-    if has_head {
-        run_git_sync(repo_root, &["read-tree", "HEAD"], &index_env)?;
-    }
-    run_git_sync(repo_root, &["add", "--all"], &index_env)?;
-    let tree_id = run_git_sync(repo_root, &["write-tree"], &index_env)?;
-    let mut commit_args: Vec<&str> =
-        vec!["commit-tree", &tree_id, "-m", "borg disk-apply-patch ghost"];
-    let head_parent;
-    if has_head {
-        head_parent = run_git_sync(repo_root, &["rev-parse", "HEAD"], &[])?;
-        commit_args.push("-p");
-        commit_args.push(head_parent.as_str());
-    }
-    let commit_id = run_git_sync(repo_root, &commit_args, &[])?;
-    Ok(DiskGhostSnapshot {
-        repo_root: repo_root.to_path_buf(),
-        commit_id,
-        preexisting_untracked,
-    })
-}
-
-fn restore_ghost_snapshot_sync(snapshot: &DiskGhostSnapshot) -> Result<()> {
-    // Worktree checkout runs `filter.<name>.smudge`/`.process` drivers.
-    let filter_env = crate::git::filter_neutralizing_env_sync(&snapshot.repo_root)
-        .context("ghost rollback not run; the working tree was left as the patch left it")?;
-    // Not an early return: `git restore` is not transactional, and the
-    // post-snapshot sweep below is the other half of the rollback. Skipping it
-    // on a partial restore would leave every agent-created file behind too.
-    let restored = run_git_sync(
-        &snapshot.repo_root,
-        &[
-            "restore",
-            "--source",
-            &snapshot.commit_id,
-            "--worktree",
-            "--",
-            ".",
-        ],
-        &filter_env,
-    );
-    let current = run_git_sync(
-        &snapshot.repo_root,
-        &["ls-files", "--others", "--exclude-standard"],
-        &[],
-    )
-    .unwrap_or_default();
-    for line in current.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let path = std::path::PathBuf::from(line);
-        if snapshot.preexisting_untracked.contains(&path) {
-            continue;
-        }
-        let full = snapshot.repo_root.join(&path);
-        if full.exists() {
-            if let Err(e) = std::fs::remove_file(&full) {
-                tracing::warn!(
-                    path = %full.display(),
-                    error = %e,
-                    "ghost rollback: failed to remove post-snapshot file"
-                );
-            }
-        }
-    }
-    restored.context(
-        "ghost rollback failed partway: the working tree may hold a mix of \
-         snapshot and post-patch content",
-    )?;
-    Ok(())
-}
-
-fn run_git_sync(cwd: &std::path::Path, args: &[&str], env: &[(String, String)]) -> Result<String> {
-    // Prepend the hardening prelude so a repository's own `core.fsmonitor`/hooks
-    // can't execute while we operate inside its tree.
-    let mut argv: Vec<&str> = crate::git::hardened_prelude().to_vec();
-    argv.extend_from_slice(args);
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(&argv).current_dir(cwd);
-    crate::git::harden_git_command_sync(&mut cmd);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let output = crate::git::run_sync_with_timeout(cmd)
-        .with_context(|| format!("run `git {}`", args.join(" ")))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn handle_apply_patch_via_text_bridge(
@@ -721,7 +564,7 @@ fn patch_has_absolute_paths(patch_text: &str) -> bool {
 /// the applicator also accepts unified diffs (`parse_patch_with_mode` routes
 /// them to `parse_unified_diff`), whose headers carry no DSL marker. A marker
 /// scan therefore reports "touches nothing" for such a patch and waves it past
-/// `is_blocked_path` / `is_control_plane_write_denied` entirely.
+/// `is_blocked_path` / `is_control_plane_denied` entirely.
 ///
 /// `None` means the patch does not parse — it writes nothing, so callers hand
 /// it to the applicator for the real diagnostic rather than reporting a
@@ -1222,70 +1065,45 @@ mod tests {
         );
     }
 
+    /// A multi-file patch whose second file cannot be written reports the
+    /// failure and leaves the first file as it was — in a plain directory,
+    /// with no git repository to lean on — and a file the patch never named
+    /// keeps its content.
     #[test]
-    fn ghost_snapshot_round_trip_restores_tracked_files_in_git_repo() {
-        // Regression: validate that a snapshot taken before a disk-backed
-        // apply_patch can faithfully restore the working tree if the apply
-        // fails partway. `coding::apply_patch_to_dir` already preflights
-        // simple hunks, but I/O-level failures (disk full, EPERM, races)
-        // can still leave the tree half-written — that's where the
-        // ghost-commit safety net earns its keep. We exercise the
-        // build/restore plumbing directly here: snapshot a clean repo,
-        // mutate two files plus add a new one, restore from the snapshot,
-        // and assert everything is back to pre-snapshot state.
+    fn apply_patch_failing_partway_leaves_no_partial_write() {
+        let config = Config::default();
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .output()
-            .expect("git init");
-        for (key, value) in [("user.email", "ci@borg.test"), ("user.name", "ci")] {
-            std::process::Command::new("git")
-                .args(["config", "--local", key, value])
-                .current_dir(&repo)
-                .output()
-                .expect("git config");
-        }
-        let file_a = repo.join("a.txt");
-        let file_b = repo.join("b.txt");
-        std::fs::write(&file_a, "v1\n").unwrap();
-        std::fs::write(&file_b, "ok\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&repo)
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-qm", "init"])
-            .current_dir(&repo)
-            .output()
-            .expect("git commit");
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = ExecutionContext::for_workspace(root.clone(), root.clone()).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        // `blocker` is a file, so `blocker/child.txt` cannot be created.
+        std::fs::write(root.join("blocker"), "not a directory\n").unwrap();
+        std::fs::write(root.join("bystander.txt"), "untracked work\n").unwrap();
+        let patch = "*** Begin Patch\n\
+*** Update File: a.txt\n\
+@@\n\
+-one\n\
++two\n\
+*** Add File: blocker/child.txt\n\
++x\n\
+*** End Patch";
 
-        let snapshot = ghost_snapshot_for(&repo).expect("snapshot inside git repo");
+        let result =
+            handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
 
-        // Mutate the working tree as if a half-applied patch had run.
-        std::fs::write(&file_a, "v2\n").unwrap();
-        std::fs::write(&file_b, "WRECKED\n").unwrap();
-        std::fs::write(repo.join("orphan.txt"), "leak\n").unwrap();
-
-        restore_ghost_snapshot_sync(&snapshot).expect("rollback");
-
-        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1\n");
-        assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "ok\n");
-        assert!(
-            !repo.join("orphan.txt").exists(),
-            "post-snapshot creation must be removed by rollback"
+        assert!(result.starts_with("Error applying patch"), "got: {result}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\n"
         );
-    }
-
-    #[test]
-    fn ghost_snapshot_returns_none_outside_git_repo() {
-        // Outside a git repo, the disk apply_patch path runs without a
-        // safety net (acceptable per plan: "fall through to existing
-        // direct path"). Confirm the helper does not error or panic.
-        let dir = tempfile::tempdir().unwrap();
-        assert!(ghost_snapshot_for(dir.path()).is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("blocker")).unwrap(),
+            "not a directory\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("bystander.txt")).unwrap(),
+            "untracked work\n"
+        );
     }
 
     #[test]
@@ -1407,6 +1225,44 @@ diff --git a/.env b/.env
         assert_eq!(
             std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
             "# rules\n"
+        );
+    }
+
+    /// A patch target is read as well as written: `Update File` + `Move to`
+    /// on the data dir's `.env` would carry the provider keys to a path
+    /// `read_file` allows. Every control-plane file is refused, read-only
+    /// ones included, and nothing moves.
+    #[test]
+    fn patch_cannot_move_a_read_denied_control_plane_file_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("backups")).unwrap();
+        std::fs::write(home.join(".env"), "OPENAI_API_KEY=sk-secret\n").unwrap();
+        std::fs::write(home.join("backups/borg.tar.gz"), "tarball").unwrap();
+        let _home = crate::tool_handlers::filesystem::test_home::scoped(&home);
+        // No blocklist: the refusal must come from the control-plane gate.
+        let mut config = Config::default();
+        config.security.blocked_paths.clear();
+        let ctx = ExecutionContext::unrestricted(root.clone());
+
+        for source in [".env", "backups/borg.tar.gz", ".credentials.json"] {
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n*** End Patch",
+                home.join(source).display(),
+                root.join("readable.txt").display(),
+            );
+            let result =
+                handle_apply_patch_with_context(&json!({"patch": patch}), &config, &ctx).unwrap();
+            assert!(
+                result.starts_with("Access denied") && result.contains("control-plane"),
+                "{source}: {result}"
+            );
+        }
+        assert!(!root.join("readable.txt").exists(), "a file was moved out");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".env")).unwrap(),
+            "OPENAI_API_KEY=sk-secret\n"
         );
     }
 
@@ -1990,7 +1846,7 @@ diff --git a/notes.txt b/notes.txt
         // Regression: the guard used to scan for `*** Update File:` markers,
         // but the applicator also accepts unified diffs. A diff carrying no
         // DSL marker yielded an empty path list, so the `for` loop that calls
-        // is_blocked_path / is_control_plane_write_denied never ran and a
+        // is_blocked_path / is_control_plane_denied never ran and a
         // patch could write `.env`, `.ssh/authorized_keys`, or
         // `~/.borg/hooks.json` (arbitrary shell at every hook point).
         let patch = "\

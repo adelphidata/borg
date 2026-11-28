@@ -1,10 +1,10 @@
-//! Filesystem tool handlers: apply_patch, list_dir, read_file, read_pdf.
+//! Filesystem tool handlers: apply_patch, list_dir, read_file.
 //!
 //! Split into focused submodules:
-//! - [`patch`] — `apply_patch` (cwd / skills / channels), ghost-commit rollback,
-//!   ACP text-bridge integration, patch-DSL path extraction & normalization.
+//! - [`patch`] — `apply_patch` (cwd / skills / channels), ACP text-bridge
+//!   integration, patch-DSL path extraction & normalization.
 //! - [`listing`] — `list_dir` with recursive walk, fuzzy matching, pagination.
-//! - [`read`] — `read_file` (text + image multimodal) and `read_pdf`.
+//! - [`read`] — `read_file` (text, documents, and image multimodal).
 //! - [`document`] — Word/PowerPoint/Excel/OpenDocument/RTF/EPUB/PDF →
 //!   Markdown conversion used by `read`.
 //! - [`blocked`] — security blocklist enforcement shared by the others.
@@ -19,8 +19,11 @@ mod listing;
 mod patch;
 mod read;
 
+#[cfg(test)]
+pub(crate) use blocked::test_home;
 pub use blocked::{
-    is_blocked_path, is_control_plane_read_denied, shell_command_targets_control_plane,
+    control_plane_home, is_blocked_path, is_control_plane_denied, is_control_plane_read_denied,
+    is_read_denied, is_read_denied_under, shell_command_targets_control_plane, ReadGate,
 };
 pub use completion::{complete_paths, PathSuggestion, MAX_PATH_SUGGESTIONS};
 pub use listing::{handle_list_dir, handle_list_dir_with_context};
@@ -31,7 +34,7 @@ pub use patch::{
 // Re-exported for the concurrency planner in `crate::tool::effects`, which must
 // reserve exactly the paths these markers cause this handler to write.
 pub(crate) use patch::PATCH_DSL_MARKERS;
-pub use read::{handle_read_file, handle_read_file_with_context, handle_read_pdf};
+pub use read::{handle_read_file, handle_read_file_with_context};
 
 /// Build a default `ExecutionContext` from the running process. Used by the
 /// public `handle_X` thunks that don't take an explicit context.

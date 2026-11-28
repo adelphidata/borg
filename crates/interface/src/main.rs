@@ -27,7 +27,6 @@ use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
 // Action enums and their dispatch live in `commands/<name>.rs`; the `Cli`
 // `Subcommand` enum below just refers to them.
@@ -711,8 +710,10 @@ async fn init_diagnostics(
             (Vec::new(), cortex::telemetry::TelemetryGuard::noop())
         });
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,chromiumoxide=error,tungstenite=error"));
+    let env_filter = cortex::telemetry::log_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        "warn,chromiumoxide=error,tungstenite=error",
+    );
 
     let guard = if tui_mode {
         let (non_blocking, guard) = tui_log_writer();

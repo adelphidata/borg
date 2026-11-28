@@ -29,7 +29,9 @@ pub struct SnapshotElement {
     pub r#ref: String,
     /// `tag` is the lowercased element tag (`a`, `button`, `input`).
     pub tag: String,
-    /// Best-effort accessible name (aria-label, alt, value, or trimmed text).
+    /// Best-effort accessible name (aria-label, alt, title, placeholder, a
+    /// button's label, the field's `name` attribute, or trimmed text). Never
+    /// the content of an editable field.
     pub name: String,
     /// Where the element sits on the page in CSS pixels, post-layout.
     pub bounds: ElementBounds,
@@ -94,13 +96,29 @@ pub async fn snapshot(
                 }}
                 return parts.join(' > ');
             }};
+            // A control's `value` is its label only on button-like inputs. On
+            // every other field it is what the user (or a login fill) typed —
+            // a password, a one-time code, a card number — so it is never
+            // read. The `name` attribute identifies an unlabelled field. The
+            // text inside a `<textarea>`, a textbox or an editable region is
+            // the same kind of content, so the inner-text fallback skips
+            // those and anything that wraps one.
+            const BUTTON_INPUTS = ['button', 'submit', 'reset'];
+            const EDITABLE = 'textarea, [role="textbox"], [contenteditable]:not([contenteditable="false"])';
+            const holdsTypedText = (el) => el.isContentEditable
+                || el.matches(EDITABLE) || el.querySelector(EDITABLE) !== null;
+            const label = (el) => (el.tagName === 'INPUT'
+                && BUTTON_INPUTS.includes((el.getAttribute('type') || '').toLowerCase()))
+                ? el.value : '';
             const name = (el) => {{
                 const cand = el.getAttribute('aria-label')
                     || el.getAttribute('alt')
                     || el.getAttribute('title')
                     || el.getAttribute('placeholder')
-                    || el.value
-                    || (el.innerText || '').trim();
+                    || label(el)
+                    || (el.tagName === 'INPUT' || el.tagName === 'SELECT'
+                        || el.tagName === 'TEXTAREA' ? el.getAttribute('name') : '')
+                    || (holdsTypedText(el) ? '' : (el.innerText || '').trim());
                 return (cand || '').slice(0, 200);
             }};
             const out = slice.map((el) => {{
@@ -291,5 +309,72 @@ mod tests {
             "missing truncation marker: {text}"
         );
         assert!(text.contains("249 more"));
+    }
+
+    /// What sits in an editable field is the user's data (or a filled login),
+    /// not the field's label: a snapshot must name the field without ever
+    /// carrying its content to the model. Button-like inputs are the one
+    /// place `value` is the label.
+    #[tokio::test]
+    #[ignore] // Requires a real Chromium-family browser; run with --ignored.
+    async fn snapshot_names_fields_without_their_content() {
+        let config = crate::config::BrowserConfig {
+            headless: true,
+            ..Default::default()
+        };
+        let session = crate::browser::BrowserSession::launch(&config)
+            .await
+            .expect("launch a local browser");
+        let page = session.tab_manager.active_page();
+        page.set_content(
+            r#"<form>
+                 <input type="password" name="pw" value="hunter2-secret">
+                 <input type="text" name="otp" autocomplete="one-time-code" value="493817">
+                 <input name="card" value="4111111111111111">
+                 <input type="text" placeholder="Email" value="someone@mail.example">
+                 <textarea name="notes"></textarea>
+                 <textarea>unsent-draft-text</textarea>
+                 <div role="textbox" contenteditable="true">typed-passphrase</div>
+                 <div role="textbox" contenteditable="true" aria-label="Message">typed-reply</div>
+                 <div role="textbox"><div contenteditable="true">typed-in-a-wrapper</div></div>
+                 <a href="/next"><span contenteditable="true">typed-in-a-link</span></a>
+                 <button type="button">Plain button</button>
+                 <input type="submit" value="Sign in">
+               </form>"#,
+        )
+        .await
+        .expect("set page content");
+
+        let result = snapshot(page, 50, Duration::from_secs(10))
+            .await
+            .expect("snapshot");
+        let text = render(&result);
+
+        for content in [
+            "hunter2-secret",
+            "493817",
+            "4111111111111111",
+            "someone@mail.example",
+            "unsent-draft-text",
+            "typed-passphrase",
+            "typed-reply",
+            "typed-in-a-wrapper",
+            "typed-in-a-link",
+        ] {
+            assert!(!text.contains(content), "field content leaked: {text}");
+        }
+        for label in [
+            "\"pw\"",
+            "\"otp\"",
+            "\"card\"",
+            "\"Email\"",
+            "\"notes\"",
+            "\"Message\"",
+            "\"Plain button\"",
+            "\"Sign in\"",
+        ] {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+        session.close().await.expect("close");
     }
 }

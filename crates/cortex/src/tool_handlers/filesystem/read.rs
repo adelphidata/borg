@@ -1,4 +1,4 @@
-//! `read_file` (text, documents, and image multimodal) and `read_pdf` tool
+//! `read_file` (text, documents, and image multimodal) tool
 //! handlers.
 
 use anyhow::Result;
@@ -10,7 +10,7 @@ use crate::constants;
 use crate::execution_context::ExecutionContext;
 use crate::types::{ContentPart, MediaData, ToolOutput};
 
-use super::blocked::is_blocked_path;
+use super::blocked::is_read_denied;
 use super::default_execution_context;
 use super::document;
 use crate::tool_handlers::{optional_u64_param, require_str_param};
@@ -19,35 +19,6 @@ use crate::tool_handlers::{optional_u64_param, require_str_param};
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "svg",
 ];
-
-pub fn handle_read_pdf(args: &serde_json::Value) -> Result<String> {
-    let file_path = require_str_param(args, "file_path")?;
-    let max_chars = args["max_chars"]
-        .as_u64()
-        .unwrap_or(constants::DEFAULT_READ_MAX_CHARS as u64) as usize;
-    let path = std::path::Path::new(file_path);
-    if !path.exists() {
-        return Ok(format!("File not found: {file_path}"));
-    }
-    match document::convert(path) {
-        Ok(doc) => {
-            // `coverage_warning` stays silent when *every* page is empty,
-            // deferring to this message — without it a fully-scanned PDF
-            // returns an empty string, which reads as "the document is blank".
-            if doc.markdown.trim().is_empty() {
-                return Ok(format!(
-                    "[No extractable text in {file_path} — the document may be empty, or scanned images with no text layer]"
-                ));
-            }
-            // Same disclosure as the read_file path: a part-scanned PDF must
-            // not present its partial text as the whole document.
-            let mut output = document::coverage_warning(&doc).unwrap_or_default();
-            output.push_str(&window_text(&doc.markdown, 1, 0, max_chars));
-            Ok(output)
-        }
-        Err(e) => Ok(format!("Error reading PDF: {e}")),
-    }
-}
 
 /// Convert a document named by a document extension, reporting the failure
 /// when it cannot be read — the caller asked for a `.docx`, so "this `.docx`
@@ -263,8 +234,8 @@ pub fn handle_read_file_with_context(
         )));
     }
 
-    // Security: check blocked paths
-    if is_blocked_path(
+    // Security: blocked paths, plus Borg's own keys, DB and backups
+    if is_read_denied(
         &canonical,
         &config.security.blocked_paths,
         &config.security.allowed_paths,
@@ -499,18 +470,6 @@ mod tests {
                 .insert(path.to_path_buf(), content.to_string());
             Ok(())
         }
-    }
-
-    #[test]
-    fn handle_read_pdf_missing_file() {
-        let result = handle_read_pdf(&json!({"file_path": "/nonexistent/path.pdf"})).unwrap();
-        assert!(result.contains("not found"));
-    }
-
-    #[test]
-    fn handle_read_pdf_missing_param() {
-        let result = handle_read_pdf(&json!({}));
-        assert!(result.is_err());
     }
 
     #[test]

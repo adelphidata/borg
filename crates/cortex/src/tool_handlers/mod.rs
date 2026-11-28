@@ -74,8 +74,7 @@ pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) ->
 
 pub use filesystem::{
     complete_paths, handle_apply_patch_unified, handle_apply_skill_patch, handle_create_channel,
-    handle_list_dir, handle_read_file, handle_read_pdf, is_blocked_path, PathSuggestion,
-    MAX_PATH_SUGGESTIONS,
+    handle_list_dir, handle_read_file, is_blocked_path, PathSuggestion, MAX_PATH_SUGGESTIONS,
 };
 pub use list::{handle_list, handle_list_channels, handle_list_skills};
 pub use media::{handle_browser, handle_generate_image, handle_text_to_speech};
