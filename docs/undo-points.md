@@ -83,11 +83,11 @@ whole disk.
 - **`borg --worktree <name>` and editors (ACP)** work in the folder they
   name, and are confined to it.
 - **The web and desktop apps, channels, scheduled tasks and the heartbeat**
-  name no folder. Set one under **Settings → Conversation → Folder to work
-  in** (`conversation.default_folder`, made if it is missing) and they work
-  there. Project instructions and project skills are then read from that
-  folder too. Without the setting they run in the folder the daemon was
-  started in.
+  name no folder. Set one under **Settings → Advanced → Conversation**
+  (`conversation.default_folder`; "Folder to work in" in the terminal; made
+  if it is missing) and new conversations work there. Project instructions
+  and project skills are then read from that folder too. Without the setting
+  they run in the folder the daemon was started in.
 - A conversation you return to in the web or desktop app carries on in the
   folder it last worked in.
 - A conversation that is still open keeps its folder. When you resume it from
