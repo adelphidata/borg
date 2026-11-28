@@ -29,6 +29,11 @@ impl BwrapVersion {
         (self.major, self.minor) >= (0, 3)
     }
 
+    /// Returns true if this version supports `--ro-bind-try` (added in 0.3.1).
+    pub fn supports_bind_try(&self) -> bool {
+        (self.major, self.minor, self.patch) >= (0, 3, 1)
+    }
+
     /// Returns true if this version supports `--perms` (added in 0.5.0).
     pub fn supports_perms(&self) -> bool {
         (self.major, self.minor) >= (0, 5)
@@ -461,6 +466,86 @@ fn hide_sockets(args: &mut Vec<String>, path: &str) {
 #[cfg(not(unix))]
 fn hide_sockets(_args: &mut Vec<String>, _path: &str) {}
 
+/// Bind the write-denied directory `dir` as a view that holds only what may
+/// be read: an empty tmpfs, each child that no `deny_read` entry names bound
+/// back read-only, and the whole made read-only. Returns `false`, having
+/// emitted nothing, when a plain read-only bind is the right tool: `dir` has
+/// no read-denied child, is not a directory that can be listed, or bwrap is
+/// too old for `--ro-bind-try`.
+///
+/// Masking a denied child in place fails for a file that comes and goes.
+/// SQLite removes `borg.db-wal` when the last connection closes; if that
+/// happens between the check here and bwrap's mount, bwrap cannot make a
+/// mount point in the read-only parent and refuses the whole command. And a
+/// mask sits on one file: the next WAL is a new one, with none. A view built
+/// from what is allowed has neither fault. A denied name is absent whenever
+/// it appears, and a child that vanishes is skipped by `--ro-bind-try`.
+///
+/// Sockets are left out, which is what [`hide_sockets`] is for. A symlink is
+/// made again as a link, never bound: bwrap binds what a source points at,
+/// so a link into a denied child would put that child's content back.
+#[cfg(unix)]
+fn bind_view_without_denied(
+    args: &mut Vec<String>,
+    dir: &str,
+    deny_read: &[String],
+    version: Option<&BwrapVersion>,
+) -> bool {
+    let denied = |child: &str| deny_read.iter().any(|d| Path::new(d) == Path::new(child));
+    let has_denied_child = deny_read
+        .iter()
+        .any(|d| Path::new(d).parent() == Some(Path::new(dir)));
+    if !has_denied_child || !version.is_none_or(BwrapVersion::supports_bind_try) {
+        return false;
+    }
+    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut names: Vec<(String, std::fs::FileType)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry.file_name().into_string().ok()?,
+                entry.file_type().ok()?,
+            ))
+        })
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+
+    args.extend(["--tmpfs".to_string(), dir.to_string()]);
+    for (name, kind) in names {
+        let child = format!("{}/{name}", dir.trim_end_matches('/'));
+        if denied(&child) {
+            continue;
+        }
+        if kind.is_dir() || kind.is_file() {
+            push_bind(args, "--ro-bind-try", &child);
+        } else if kind.is_symlink() {
+            if let Some(target) = std::fs::read_link(&child)
+                .ok()
+                .and_then(|target| target.to_str().map(str::to_string))
+            {
+                args.extend(["--symlink".to_string(), target, child]);
+            }
+        }
+    }
+    args.extend(["--remount-ro".to_string(), dir.to_string()]);
+    true
+}
+
+#[cfg(not(unix))]
+fn bind_view_without_denied(
+    _args: &mut Vec<String>,
+    _dir: &str,
+    _deny_read: &[String],
+    _version: Option<&BwrapVersion>,
+) -> bool {
+    false
+}
+
 /// Build bwrap args with an explicit version for testability.
 pub fn build_bwrap_args_versioned(
     policy: &SandboxPolicy,
@@ -518,21 +603,39 @@ pub fn build_bwrap_args_probed(
         }
     }
 
+    // A write-denied directory with read-denied children (the data dir) is
+    // bound as a view without them; any other is bound read-only as it is.
+    let mut views: Vec<&str> = Vec::new();
     for path in &policy.deny_write {
-        push_bind_if_exists(&mut args, "--ro-bind", path);
+        if bind_view_without_denied(&mut args, path, &policy.deny_read, version) {
+            views.push(path);
+        } else {
+            push_bind_if_exists(&mut args, "--ro-bind", path);
+        }
     }
+    let in_a_view = |path: &str| {
+        views
+            .iter()
+            .any(|view| Path::new(path).parent() == Some(Path::new(view)))
+    };
 
-    // After every bind that could expose them, so these overlays win.
+    // After every bind that could expose them, so these overlays win. A view
+    // holds no socket to hide.
     for path in &policy.deny_write {
-        hide_sockets(&mut args, path);
+        if !views.contains(&path.as_str()) {
+            hide_sockets(&mut args, path);
+        }
     }
 
     // Deny reads. Emitted AFTER the fs_read `--ro-bind`s so these overlays win
     // when a deny_read path sits under a broadly-bound read root (e.g. the
     // `trusted` profile binds `/`). Directories are hidden with an empty tmpfs;
-    // regular files are shadowed by a read-only bind of /dev/null.
+    // regular files are shadowed by a read-only bind of /dev/null. A child a
+    // view left out is not there to hide.
     for path in &policy.deny_read {
-        hide_path(&mut args, path);
+        if !in_a_view(path) {
+            hide_path(&mut args, path);
+        }
     }
 
     // Defense-in-depth backstop: hide the well-known sensitive home directories
@@ -1104,6 +1207,162 @@ mod tests {
                 .any(|w| w[0] == "--ro-bind" && w[1] == protected_str),
             "denied path must still be bound read-only: {args:?}"
         );
+    }
+
+    /// The data dir's shape: write-denied, with read-denied children. The
+    /// sandbox gets a view built from what may be read, so a denied name is
+    /// absent whether it exists now, later (a WAL SQLite makes again), or not
+    /// at all — and no mount is put on a file that may be gone a moment later.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_denied_dir_with_read_denied_children_is_bound_without_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("borg");
+        std::fs::create_dir_all(dir.join("skills")).unwrap();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"plain").unwrap();
+        std::fs::write(dir.join("borg.db"), b"secret").unwrap();
+        std::fs::write(dir.join("secrets/kek.enc"), b"secret").unwrap();
+        std::os::unix::fs::symlink("secrets/kek.enc", dir.join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.join("d.sock")).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let policy = SandboxPolicy {
+            deny_write: vec![dir_s.clone()],
+            // The WAL is denied and not on disk, as between two connections.
+            deny_read: vec![s("borg.db"), s("borg.db-wal"), s("secrets")],
+            ..Default::default()
+        };
+
+        let args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR), Path::new(NO_BWRAP));
+
+        let at = |want: &[&str]| {
+            args.windows(want.len())
+                .position(|w| w.iter().map(String::as_str).eq(want.iter().copied()))
+        };
+        let tmpfs = at(&["--tmpfs", &dir_s]).expect("an empty view first");
+        let sealed = at(&["--remount-ro", &dir_s]).expect("the view is made read-only");
+        for kept in ["notes.txt", "skills"] {
+            let bound = at(&["--ro-bind-try", &s(kept), &s(kept)])
+                .unwrap_or_else(|| panic!("{kept} must be bound back: {args:?}"));
+            assert!(tmpfs < bound && bound < sealed, "{kept} out of order");
+        }
+        // A link is made again as a link: bound, it would carry the content
+        // of the denied file it points at.
+        let link = at(&["--symlink", "secrets/kek.enc", &s("link")]).expect("the link");
+        assert!(tmpfs < link && link < sealed);
+        for absent in ["borg.db", "borg.db-wal", "secrets", "d.sock"] {
+            assert!(
+                !args.contains(&s(absent)),
+                "{absent} must not be named at all: {args:?}"
+            );
+        }
+        assert_eq!(
+            at(&["--ro-bind", &dir_s, &dir_s]),
+            None,
+            "the whole directory must not be bound"
+        );
+    }
+
+    /// The view, run by a real bwrap. What may be read is readable and
+    /// nothing is writable; a denied child is absent; and a file that goes
+    /// away between the argument list and the mount — a WAL at the last
+    /// close, a pid file — does not refuse the command, which is what a mask
+    /// on the file itself did.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_bwrap_runs_with_the_view_while_files_come_and_go() {
+        let Ok(bwrap) = which::which("bwrap") else {
+            eprintln!("bwrap is not installed; nothing to run");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("borg");
+        std::fs::create_dir_all(dir.join("skills")).unwrap();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "plain").unwrap();
+        std::fs::write(dir.join("borg.db"), "secret").unwrap();
+        std::fs::write(dir.join("borg.db-wal"), "secret").unwrap();
+        std::fs::write(dir.join("borgd.pid"), "1").unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let policy = SandboxPolicy {
+            deny_write: vec![dir_s.clone()],
+            deny_read: vec![s("borg.db"), s("borg.db-wal"), s("secrets")],
+            ..Default::default()
+        };
+        let mut args = build_bwrap_args(&policy, Path::new(TEST_TOOL_DIR), &bwrap);
+        // Gone after the argument list was made, as when a connection closes.
+        std::fs::remove_file(dir.join("borg.db-wal")).unwrap();
+        std::fs::remove_file(dir.join("borgd.pid")).unwrap();
+
+        let script = format!(
+            "cd '{dir_s}' && test \"$(cat notes.txt)\" = plain && test -d skills \
+             && ! test -e borg.db && ! test -e borg.db-wal && ! test -e secrets \
+             && ! test -e borgd.pid && ! touch new 2>/dev/null && echo view-ok"
+        );
+        args.extend(["/bin/sh".to_string(), "-c".to_string(), script]);
+        let out = std::process::Command::new(&bwrap)
+            .args(&args)
+            .output()
+            .expect("run bwrap");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("view-ok"),
+            "status {:?}\nstdout: {stdout}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Without `--ro-bind-try` (bwrap before 0.3.1) a view cannot skip a
+    /// child that vanishes, and a directory with nothing read-denied in it
+    /// needs none: both keep the plain read-only bind and the masks.
+    #[test]
+    fn a_plain_read_only_bind_stays_where_a_view_is_not_possible_or_not_needed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("borg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("borg.db"), b"secret").unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let db = dir.join("borg.db").to_string_lossy().into_owned();
+        let plain_bind = |args: &[String]| {
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == dir_s && w[2] == dir_s)
+        };
+
+        let with_denied_child = SandboxPolicy {
+            deny_write: vec![dir_s.clone()],
+            deny_read: vec![db.clone()],
+            ..Default::default()
+        };
+        let old = BwrapVersion {
+            major: 0,
+            minor: 3,
+            patch: 0,
+        };
+        let args =
+            build_bwrap_args_versioned(&with_denied_child, Path::new(TEST_TOOL_DIR), Some(&old));
+        assert!(plain_bind(&args), "{args:?}");
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == db),
+            "the denied file must still be masked: {args:?}"
+        );
+        assert!(!args.contains(&"--ro-bind-try".to_string()));
+
+        let nothing_denied = SandboxPolicy {
+            deny_write: vec![dir_s.clone()],
+            ..Default::default()
+        };
+        let args = build_bwrap_args(
+            &nothing_denied,
+            Path::new(TEST_TOOL_DIR),
+            Path::new(NO_BWRAP),
+        );
+        assert!(plain_bind(&args), "{args:?}");
+        assert!(!args.contains(&"--ro-bind-try".to_string()));
     }
 
     #[test]
