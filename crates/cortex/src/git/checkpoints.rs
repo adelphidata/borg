@@ -233,6 +233,7 @@ impl CheckpointStore {
                 let snap_ref = format!("refs/borg/snap/{}/{commit}", ws.key);
                 self.git(ws, &["update-ref", snap_ref.as_str(), commit], &[])
                     .await?;
+                self.note_handed_out(ws, commit);
                 return Ok(SnapshotOutcome::Taken(Checkpoint {
                     commit_id: commit.to_string(),
                     root: ws.root.clone(),
@@ -254,12 +255,75 @@ impl CheckpointStore {
             self.git(ws, &["update-ref", name, commit_id.as_str()], &[])
                 .await?;
         }
+        self.note_handed_out(ws, &commit_id);
         Ok(SnapshotOutcome::Taken(Checkpoint {
             commit_id,
             root: ws.root.clone(),
             is_new: true,
             uncovered,
         }))
+    }
+
+    /// Where the store keeps which checkpoints of the workspace it knows as
+    /// `key` it handed out lately, and when.
+    fn handed_out_file(&self, key: &str) -> PathBuf {
+        self.dir.join("handed-out").join(key)
+    }
+
+    /// Note that the checkpoint `commit_id` of `ws` was handed out just now.
+    ///
+    /// A caller files its undo point in the database a moment after the
+    /// snapshot returns, and a prune that read the database before that would
+    /// take an unchanged folder's reused commit for one nobody has used in
+    /// weeks. This note is written under the workspace lock the prune also
+    /// takes, so the prune sees it whatever the database said. It names the
+    /// commit: the tip may have moved on by the time the prune looks.
+    ///
+    /// Failing to write it loses only that protection; the checkpoint is
+    /// good, so it is logged and the snapshot stands.
+    fn note_handed_out(&self, ws: &Workspace, commit_id: &str) {
+        let path = self.handed_out_file(&ws.key);
+        let now = unix_now();
+        let mut notes = self.handed_out(&ws.key);
+        notes.retain(|(noted, at)| noted != commit_id && *at >= now - HAND_OUT_NOTE_SECS);
+        notes.push((commit_id.to_string(), now));
+        let body: String = notes
+            .iter()
+            .map(|(noted, at)| format!("{at} {noted}\n"))
+            .collect();
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, body));
+        if let Err(e) = written {
+            tracing::warn!(path = %path.display(), "checkpoint use not noted: {e}");
+        }
+    }
+
+    /// The checkpoints of the workspace `key` handed out lately, each with
+    /// the unix second of it. Empty when none was noted. A note that cannot
+    /// be read protects nothing, so that is logged.
+    fn handed_out(&self, key: &str) -> Vec<(String, i64)> {
+        let path = self.handed_out_file(key);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "checkpoint use note not read: {e}");
+                return Vec::new();
+            }
+        };
+        text.lines()
+            .filter_map(|line| {
+                let note = line
+                    .split_once(' ')
+                    .and_then(|(at, commit)| Some((commit.to_string(), at.parse().ok()?)));
+                if note.is_none() {
+                    tracing::warn!(path = %path.display(), "checkpoint use note has a line that is not `<time> <commit>`: {line:?}");
+                }
+                note
+            })
+            .collect()
     }
 
     /// Write the workspace as it is into the store as a tree, and return the
@@ -599,6 +663,18 @@ fn workspace_key(root: &Path) -> String {
 
 fn workspace_lock(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
     workspace_lock_by_key(&workspace_key(root))
+}
+
+/// How long a hand-out note is kept. A caller files its undo point within a
+/// moment of the hand-out; an hour is that with room to spare.
+const HAND_OUT_NOTE_SECS: i64 = 3600;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The lock of the workspace the store knows as `key`.

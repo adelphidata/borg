@@ -17,16 +17,35 @@ export interface Empty {
 export interface OpenRequest {
   /** Optional resume_id — if set, daemon resumes that session's history. */
   resumeId: string;
-  /** Optional workspace context for session-scoped execution. */
+  /**
+   * Optional workspace context for session-scoped execution. A session
+   * given one is confined to `workspace_root`.
+   */
   workspaceCwd: string;
   workspaceRoot: string;
   enforceWorkspaceRoot: boolean;
+  /**
+   * The folder the session works in, without confinement: relative paths
+   * and the shell start there, project instructions are read from it, and
+   * undo points cover it. An absolute path to an existing directory.
+   * Ignored when a workspace context is given. Empty: the daemon chooses —
+   * the folder a resumed session last worked in, else the
+   * `conversation.default_folder` setting, else its own directory.
+   */
+  workingDir: string;
 }
 
 export interface OpenResponse {
   sessionId: string;
   /** Last event_seq currently buffered for this session (0 for new). */
   lastEventSeq: number;
+  /**
+   * The folder the session works in: where its relative paths resolve and
+   * what its undo points cover. A resumed session that is still live keeps
+   * the folder it has, whatever the request named, so a client reads it here
+   * rather than assuming its own. Empty from a daemon without the field.
+   */
+  workingDir: string;
 }
 
 export interface SendRequest {
@@ -569,7 +588,7 @@ export const Empty: MessageFns<Empty> = {
 };
 
 function createBaseOpenRequest(): OpenRequest {
-  return { resumeId: "", workspaceCwd: "", workspaceRoot: "", enforceWorkspaceRoot: false };
+  return { resumeId: "", workspaceCwd: "", workspaceRoot: "", enforceWorkspaceRoot: false, workingDir: "" };
 }
 
 export const OpenRequest: MessageFns<OpenRequest> = {
@@ -585,6 +604,9 @@ export const OpenRequest: MessageFns<OpenRequest> = {
     }
     if (message.enforceWorkspaceRoot !== false) {
       writer.uint32(32).bool(message.enforceWorkspaceRoot);
+    }
+    if (message.workingDir !== "") {
+      writer.uint32(42).string(message.workingDir);
     }
     return writer;
   },
@@ -634,6 +656,14 @@ export const OpenRequest: MessageFns<OpenRequest> = {
             message.enforceWorkspaceRoot = reader.bool();
             continue;
           }
+          case 5: {
+            if (tag !== 42) {
+              break;
+            }
+
+            message.workingDir = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -668,6 +698,11 @@ export const OpenRequest: MessageFns<OpenRequest> = {
         : isSet(object.enforce_workspace_root)
         ? globalThis.Boolean(object.enforce_workspace_root)
         : false,
+      workingDir: isSet(object.workingDir)
+        ? globalThis.String(object.workingDir)
+        : isSet(object.working_dir)
+        ? globalThis.String(object.working_dir)
+        : "",
     };
   },
 
@@ -685,6 +720,9 @@ export const OpenRequest: MessageFns<OpenRequest> = {
     if (message.enforceWorkspaceRoot !== false) {
       obj.enforceWorkspaceRoot = message.enforceWorkspaceRoot;
     }
+    if (message.workingDir !== "") {
+      obj.workingDir = message.workingDir;
+    }
     return obj;
   },
 
@@ -697,12 +735,13 @@ export const OpenRequest: MessageFns<OpenRequest> = {
     message.workspaceCwd = object.workspaceCwd ?? "";
     message.workspaceRoot = object.workspaceRoot ?? "";
     message.enforceWorkspaceRoot = object.enforceWorkspaceRoot ?? false;
+    message.workingDir = object.workingDir ?? "";
     return message;
   },
 };
 
 function createBaseOpenResponse(): OpenResponse {
-  return { sessionId: "", lastEventSeq: 0 };
+  return { sessionId: "", lastEventSeq: 0, workingDir: "" };
 }
 
 export const OpenResponse: MessageFns<OpenResponse> = {
@@ -712,6 +751,9 @@ export const OpenResponse: MessageFns<OpenResponse> = {
     }
     if (message.lastEventSeq !== 0) {
       writer.uint32(16).uint64(message.lastEventSeq);
+    }
+    if (message.workingDir !== "") {
+      writer.uint32(26).string(message.workingDir);
     }
     return writer;
   },
@@ -745,6 +787,14 @@ export const OpenResponse: MessageFns<OpenResponse> = {
             message.lastEventSeq = longToNumber(reader.uint64());
             continue;
           }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.workingDir = reader.string();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -769,6 +819,11 @@ export const OpenResponse: MessageFns<OpenResponse> = {
         : isSet(object.last_event_seq)
         ? globalThis.Number(object.last_event_seq)
         : 0,
+      workingDir: isSet(object.workingDir)
+        ? globalThis.String(object.workingDir)
+        : isSet(object.working_dir)
+        ? globalThis.String(object.working_dir)
+        : "",
     };
   },
 
@@ -780,6 +835,9 @@ export const OpenResponse: MessageFns<OpenResponse> = {
     if (message.lastEventSeq !== 0) {
       obj.lastEventSeq = Math.round(message.lastEventSeq);
     }
+    if (message.workingDir !== "") {
+      obj.workingDir = message.workingDir;
+    }
     return obj;
   },
 
@@ -790,6 +848,7 @@ export const OpenResponse: MessageFns<OpenResponse> = {
     const message = createBaseOpenResponse();
     message.sessionId = object.sessionId ?? "";
     message.lastEventSeq = object.lastEventSeq ?? 0;
+    message.workingDir = object.workingDir ?? "";
     return message;
   },
 };

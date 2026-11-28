@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { act, render, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { BorgError, GrpcStatus, type session as sessionPb } from "@borg/client";
+import { FIRST_DELAY_MS } from "../../lib/backoff";
 import { PlatformProvider } from "../../lib/platform";
 import { SettingsProvider } from "../../lib/settings";
 import { FAILED_PRECONDITION, fakeDaemon } from "../../test/harness";
@@ -580,6 +581,17 @@ describe("useConversation context and branching", () => {
   });
 });
 
+/**
+ * Waits for the stream to be dialled a second time. The first redial is drawn
+ * at random from a window as long as `waitFor`'s own default patience, so the
+ * wait is given the whole window and room to spare.
+ */
+async function redialled(daemon: ReturnType<typeof fakeDaemon>): Promise<void> {
+  await waitFor(() => expect(daemon.streams.filter((s) => s.method === "Stream").length).toBe(2), {
+    timeout: FIRST_DELAY_MS + 2_000,
+  });
+}
+
 describe("useConversation stream health", () => {
   it("says the connection ended rather than freezing the transcript", async () => {
     const daemon = fakeDaemon(OPEN);
@@ -601,7 +613,7 @@ describe("useConversation stream health", () => {
 
     act(() => stream.handlers.onComplete?.());
     // Not at once: a close is also how a session ends on purpose.
-    await waitFor(() => expect(daemon.streams.filter((s) => s.method === "Stream").length).toBe(2));
+    await redialled(daemon);
     expect(conv.current.streamError).toBeUndefined();
     // The redial is accepted and ended again: the daemon is going away.
     act(() =>
@@ -616,6 +628,24 @@ describe("useConversation stream health", () => {
     );
   });
 
+  it("does not call the slowest first redial an outage", async () => {
+    // The redial delay is a random draw. At the top of its window the redial
+    // takes as long as it ever does, and that is still inside the grace.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.999);
+    try {
+      const daemon = fakeDaemon(OPEN);
+      const conv = mount(daemon);
+      await ready(conv);
+      const stream = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
+
+      act(() => stream.handlers.onComplete?.());
+      await redialled(daemon);
+      expect(conv.current.streamError).toBeUndefined();
+    } finally {
+      random.mockRestore();
+    }
+  });
+
   it("shows no outage for a close the resubscribe recovers from in time", async () => {
     // Archiving the conversation on screen closes its session; the redial
     // finds it gone and reopens it. Nothing was wrong with the connection.
@@ -624,7 +654,7 @@ describe("useConversation stream health", () => {
     await ready(conv);
     const first = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
     act(() => first.handlers.onComplete?.());
-    await waitFor(() => expect(daemon.streams.filter((s) => s.method === "Stream").length).toBe(2));
+    await redialled(daemon);
     const second = daemon.streams.filter((s) => s.method === "Stream").at(-1)!;
     act(() => second.handlers.onMessage?.({ seq: 8n } as never));
     await new Promise((r) => setTimeout(r, CLEAN_CLOSE_GRACE_MS + 300));

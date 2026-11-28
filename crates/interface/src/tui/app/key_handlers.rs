@@ -174,14 +174,21 @@ impl<'a> App<'a> {
         if is_suspend_key(&key) && !self.any_popup_visible() && !self.wants_alt_screen() {
             return Ok(AppAction::Suspend);
         }
-        // A Tab inside a non-bracketed paste burst is pasted whitespace. Route
-        // it into the burst before popup completion (Idle) or the streaming
-        // no-op binding can claim it — either would drop the tab and split
-        // the paste in two.
-        if matches!(self.state, AppState::Idle | AppState::Streaming { .. })
-            && self.composer.capture_burst_tab(&key)
-        {
-            return Ok(AppAction::Continue);
+        if matches!(self.state, AppState::Idle | AppState::Streaming { .. }) {
+            // A burst that went idle is finished text. It goes into the
+            // composer before this key is routed, and the popups follow:
+            // a popup still filtered by what was there before the paste
+            // would run its pick for that, not for what is on screen.
+            if self.composer.tick() {
+                self.popups_follow_landed_text();
+            }
+            // A Tab or Enter inside a non-bracketed paste burst is pasted
+            // text. Route it into the burst before popup completion or
+            // accept (Idle) or the streaming bindings can claim it — either
+            // would act on the part of the paste that has already landed.
+            if self.composer.capture_burst_control(&key) {
+                return Ok(AppAction::Continue);
+            }
         }
         match &self.state {
             AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
@@ -594,9 +601,25 @@ impl<'a> App<'a> {
         if let Some(text) = self.composer.handle_key(key) {
             return self.handle_submit(&text);
         }
-        // Update popup filters after normal key input, unless a history
-        // search is now active — the preview text isn't a user query and
-        // shouldn't open `/` or `@` popups.
+        self.sync_popups_with_composer();
+        Ok(AppAction::Continue)
+    }
+
+    /// Text reached the composer without a key press (a finished paste
+    /// burst). The popups follow it only in `Idle`, the one state whose keys
+    /// keep them current: a popup opened while a turn runs would hold its
+    /// first pick through whatever is typed next, and run it on Enter once
+    /// the turn ends.
+    pub(super) fn popups_follow_landed_text(&mut self) {
+        if matches!(self.state, AppState::Idle) {
+            self.sync_popups_with_composer();
+        }
+    }
+
+    /// Bring the `/` and `@` popups in line with the composer's text, unless
+    /// a history search is active — the preview text isn't a user query and
+    /// shouldn't open either.
+    pub(super) fn sync_popups_with_composer(&mut self) {
         if !self.composer.is_searching() {
             let text = self.composer.text();
             self.command_popup.update_filter(&text);
@@ -604,7 +627,6 @@ impl<'a> App<'a> {
                 self.sync_file_popup();
             }
         }
-        Ok(AppAction::Continue)
     }
 
     /// Handle keys during backtrack mode (selecting a past user message to rewind to).

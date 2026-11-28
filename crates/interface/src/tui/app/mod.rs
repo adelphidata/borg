@@ -847,8 +847,10 @@ impl<'a> App<'a> {
 
     pub fn tick_paste_burst(&mut self) {
         // Don't flush paste-burst into the composer while a popup is open.
-        if !self.any_popup_visible() {
-            self.composer.tick();
+        if !self.any_popup_visible() && self.composer.tick() {
+            // The `/` and `@` popups read the composer: text that lands
+            // without a key press must reach them too.
+            self.popups_follow_landed_text();
         }
     }
 

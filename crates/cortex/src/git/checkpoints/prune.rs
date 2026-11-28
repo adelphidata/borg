@@ -199,6 +199,17 @@ impl CheckpointStore {
             // had no files, and a rollback to it removes them all.
             let lock = super::workspace_lock_by_key(workspace);
             let _held = lock.lock().await;
+            // The caller's record of use is older than this lock. A turn may
+            // have been given a checkpoint since, and not have filed it yet.
+            let kept = if self.count_hand_outs_as_used(workspace, stored) {
+                stored
+                    .iter()
+                    .take(keep)
+                    .take_while(|checkpoint| checkpoint.last_used.at >= cutoff)
+                    .count()
+            } else {
+                kept
+            };
             for gone in stored.drain(kept..) {
                 let name = format!("refs/borg/snap/{}/{}", gone.workspace, gone.commit_id);
                 self.store_git(&["update-ref", "-d", name.as_str()], super::GIT_BUDGET)
@@ -213,16 +224,45 @@ impl CheckpointStore {
                 self.store_git(&["update-ref", "-d", tip.as_str()], super::GIT_BUDGET)
                     .await
                     .with_context(|| format!("drop the tip of workspace {workspace}"))?;
-                let index = self.dir.join("indexes").join(workspace);
-                match std::fs::remove_file(&index) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| format!("remove {}", index.display())),
+                for file in [
+                    self.dir.join("indexes").join(workspace),
+                    self.handed_out_file(workspace),
+                ] {
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("remove {}", file.display()))
+                        }
+                    }
                 }
             }
         }
         by_workspace.retain(|_, stored| !stored.is_empty());
         Ok(dropped)
+    }
+
+    /// Count each checkpoint of `workspace` the store noted handing out as
+    /// used at that time, and put `stored` back in order. True when anything
+    /// changed. The caller holds the workspace lock.
+    fn count_hand_outs_as_used(&self, workspace: &str, stored: &mut [Stored]) -> bool {
+        let mut changed = false;
+        for (commit_id, at) in self.handed_out(workspace) {
+            // Ahead of any filing made in that same second: it is the newer use.
+            let handed_out = Filed { at, seq: i64::MAX };
+            if let Some(checkpoint) = stored
+                .iter_mut()
+                .find(|checkpoint| checkpoint.commit_id == commit_id)
+                .filter(|checkpoint| checkpoint.last_used < handed_out)
+            {
+                checkpoint.last_used = handed_out;
+                changed = true;
+            }
+        }
+        if changed {
+            stored.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.last_used));
+        }
+        changed
     }
 
     /// True when the store holds no checkpoint of `workspace` right now. The
@@ -341,6 +381,15 @@ mod tests {
             matches!(outcome, RestoreOutcome::Restored(_))
         }
 
+        /// The store's name for the fixture's one workspace.
+        fn only_workspace(&self) -> String {
+            self.only_index()
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned()
+        }
+
         /// The index file of the fixture's one workspace.
         fn only_index(&self) -> std::path::PathBuf {
             let mut indexes: Vec<_> = std::fs::read_dir(self.store.dir().join("indexes"))
@@ -350,6 +399,144 @@ mod tests {
             assert_eq!(indexes.len(), 1, "{indexes:?}");
             indexes.remove(0)
         }
+    }
+
+    /// A turn in a folder nobody touched for weeks is given the folder's old
+    /// checkpoint again, and files it a moment later. A prune that read "who
+    /// used what" before that moment must not drop it: the store's own note
+    /// of the hand-out counts, whatever the caller's record says.
+    #[tokio::test]
+    async fn a_checkpoint_handed_out_since_the_callers_record_is_kept() {
+        let fx = Fixture::new();
+        let older = fx.checkpoint_of("first\n").await;
+        let tip = fx.checkpoint_of("unchanged since\n").await;
+        // The record the prune is given: the older one was filed last, the
+        // tip never. Room for one.
+        let last_used = HashMap::from([(
+            older.clone(),
+            Filed {
+                at: now() + 60,
+                seq: 9,
+            },
+        )]);
+        // Handed out again, as it is to a turn in the unchanged folder; the
+        // note says "after that record".
+        assert_eq!(fx.checkpoint_of("unchanged since\n").await, tip);
+        std::fs::write(
+            fx.store.handed_out_file(&fx.only_workspace()),
+            format!("{} {tip}\n", now() + 120),
+        )
+        .expect("note");
+
+        let report = fx
+            .store
+            .prune(&policy(1), now() + 180, &last_used)
+            .await
+            .expect("prune");
+
+        assert_eq!(report.dropped, 1);
+        assert!(!fx.can_restore(&older).await);
+        assert!(fx.can_restore(&tip).await);
+    }
+
+    /// The note names each commit. A turn is given the old tip, then the
+    /// folder changes and the next turn's snapshot moves the tip: both
+    /// hand-outs count, not only the one the tip points at now.
+    #[tokio::test]
+    async fn a_hand_out_counts_after_the_tip_has_moved_on() {
+        let fx = Fixture::new();
+        let oldest = fx.checkpoint_of("first\n").await;
+        let handed_out = fx.checkpoint_of("second\n").await;
+        let tip = fx.checkpoint_of("third\n").await;
+        // The record the prune is given knows only the oldest. Room for two.
+        let last_used = HashMap::from([(
+            oldest.clone(),
+            Filed {
+                at: now() + 60,
+                seq: 9,
+            },
+        )]);
+        std::fs::write(
+            fx.store.handed_out_file(&fx.only_workspace()),
+            format!("{} {handed_out}\n{} {tip}\n", now() + 120, now() + 130),
+        )
+        .expect("note");
+
+        let report = fx
+            .store
+            .prune(&policy(2), now() + 180, &last_used)
+            .await
+            .expect("prune");
+
+        assert_eq!(report.dropped, 1);
+        assert!(!fx.can_restore(&oldest).await);
+        assert!(fx.can_restore(&handed_out).await);
+        assert!(fx.can_restore(&tip).await);
+    }
+
+    /// The note is read line by line: one that is not `<time> <commit>` is
+    /// passed over and the others still count. The next snapshot drops the
+    /// lines older than an hour — a caller files its undo point within a
+    /// moment, so nothing waits on them.
+    #[tokio::test]
+    async fn the_note_survives_a_bad_line_and_sheds_old_ones() {
+        let fx = Fixture::new();
+        let first = fx.checkpoint_of("v1\n").await;
+        let key = fx.only_workspace();
+        let long_ago = now() - 2 * 3600;
+        std::fs::write(
+            fx.store.handed_out_file(&key),
+            format!("{long_ago} aaaa\nnot a note\n{} {first}\n", now()),
+        )
+        .expect("note");
+
+        let commits = |notes: Vec<(String, i64)>| -> Vec<String> {
+            notes.into_iter().map(|(commit, _)| commit).collect()
+        };
+        assert_eq!(
+            commits(fx.store.handed_out(&key)),
+            ["aaaa".to_string(), first.clone()]
+        );
+
+        let second = fx.checkpoint_of("v2\n").await;
+        assert_eq!(commits(fx.store.handed_out(&key)), [first, second]);
+    }
+
+    /// A snapshot notes the hand-out itself, and a forgotten workspace takes
+    /// the note with it.
+    #[tokio::test]
+    async fn the_store_notes_each_hand_out_and_forgets_it_with_the_workspace() {
+        let fx = Fixture::new();
+        let before = now();
+        let taken = fx.checkpoint_of("v1\n").await;
+        let key = fx.only_workspace();
+
+        let noted = fx.store.handed_out(&key);
+        let [(commit, at)] = noted.as_slice() else {
+            panic!("one note, got {noted:?}");
+        };
+        assert_eq!(commit, &taken);
+        assert!((before..=now()).contains(at), "{at}");
+
+        // The next checkpoint is noted beside the first, and one handed out
+        // twice is noted once.
+        let next = fx.checkpoint_of("v2\n").await;
+        assert_eq!(fx.checkpoint_of("v2\n").await, next);
+        let commits: Vec<String> = fx
+            .store
+            .handed_out(&key)
+            .into_iter()
+            .map(|(commit, _)| commit)
+            .collect();
+        assert_eq!(commits, [taken, next]);
+
+        fx.store
+            .prune(&PrunePolicy::default(), now() + 30 * DAY, &HashMap::new())
+            .await
+            .expect("prune");
+
+        assert_eq!(fx.store.handed_out(&key), Vec::new());
+        assert!(!fx.store.handed_out_file(&key).exists());
     }
 
     /// A workspace's index goes when its last checkpoint does. A snapshot in

@@ -118,6 +118,7 @@ define_settings! {
         "conversation.concurrent_tools.enabled" => conversation.concurrent_tools.enabled, parsed(bool);
         "conversation.concurrent_tools.max_workers" => conversation.concurrent_tools.max_workers, parsed(usize);
         "conversation.context_window_guidance" => conversation.context_window_guidance, string;
+        "conversation.default_folder" => conversation.default_folder, opt_string;
 
         // ── Interface ──
         "ui.shell_mode_enabled" => ui.shell_mode_enabled, parsed(bool);
@@ -1026,6 +1027,7 @@ define_settings! {
         "conversation.max_iterations" => "Max agent steps", Uint, "Conversation";
         "conversation.tool_output_max_tokens" => "Tool output cap (tokens)", Uint, "Conversation";
         "conversation.concurrent_tools.enabled" => "Parallel tools", Bool, "Conversation";
+        "conversation.default_folder" => "Folder to work in", Text, "Conversation";
 
         // — Memory & Skills —
         "skills.enabled" => "Allow skills", Bool, "Memory & Skills";

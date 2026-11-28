@@ -63,10 +63,18 @@ impl SessionFactory for DaemonSessionFactory {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SessionHost>> + Send + 'a>> {
         Box::pin(async move {
             let config = self.config_rx.borrow().clone();
+            // A client that names no folder gets the session's last one or
+            // the configured default.
+            let execution_context = match execution_context {
+                Some(ctx) => Some(ctx),
+                None => {
+                    crate::session::backend::default_execution_context(&config, resume_id).await
+                }
+            };
             // Inject the daemon-wide subprocess registry into the session's
             // ExecutionContext so every tool handler that spawns a child can
             // register it. Falls through to a registry-less context when the
-            // request didn't carry workspace coordinates.
+            // session has no folder of its own.
             let execution_context = execution_context
                 .map(|ctx| ctx.with_process_registry(Some(self.process_registry.clone())));
             let backend = AgentBackend::new(

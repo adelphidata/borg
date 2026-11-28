@@ -46,6 +46,64 @@ pub trait SessionFactory: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>>;
 }
 
+/// Where the client asked the session to work, or `None` when it left the
+/// choice to the daemon. `Err` is the reason a named folder cannot be used.
+///
+/// Any workspace field makes a confined session, whatever the value of
+/// `enforce_workspace_root`: clients that send one have always been
+/// confined, and an older client must not lose that. `working_dir` is the
+/// unconfined form and only counts when no workspace field is set.
+fn requested_context(
+    req: &OpenRequest,
+) -> Result<Option<cortex::execution_context::ExecutionContext>, String> {
+    use cortex::execution_context::ExecutionContext;
+    use std::path::{Path, PathBuf};
+
+    if !req.workspace_cwd.is_empty() || !req.workspace_root.is_empty() || req.enforce_workspace_root
+    {
+        let workspace_cwd = PathBuf::from(&req.workspace_cwd);
+        let workspace_root = if req.workspace_root.is_empty() {
+            workspace_cwd.clone()
+        } else {
+            PathBuf::from(&req.workspace_root)
+        };
+        return ExecutionContext::for_workspace(workspace_cwd, workspace_root)
+            .map(Some)
+            .map_err(|e| format!("invalid workspace context: {e}"));
+    }
+    if req.working_dir.is_empty() {
+        return Ok(None);
+    }
+    let dir = Path::new(&req.working_dir);
+    if dir.is_absolute() && !dir.is_dir() {
+        // The client is somewhere this daemon cannot work: another machine's
+        // path over a forwarded socket, or a folder it may not enter. The
+        // session opens as one that named no folder, and the answer to
+        // `Open` says where that is.
+        tracing::warn!(
+            "the client's folder {} is not a folder here; the session gets the default",
+            dir.display()
+        );
+        return Ok(None);
+    }
+    ExecutionContext::unrestricted_in(dir)
+        .map(Some)
+        .map_err(|e| format!("invalid working folder: {e:#}"))
+}
+
+/// The answer to `Open` for `host`: the folder is the one the host works in,
+/// which for a session that was still live is not the one the request named.
+fn opened(host: &SessionHost) -> OpenResponse {
+    OpenResponse {
+        session_id: host.id().to_string(),
+        last_event_seq: host.last_event_seq(),
+        working_dir: host
+            .working_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
 /// Type alias for the boxed server-stream future returned by Send/Stream.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<AgentEvent, TStatus>> + Send + 'static>>;
 /// Type alias for the boxed ACP bidi server-stream.
@@ -298,36 +356,12 @@ impl Session for SessionSvc {
     async fn open(&self, req: Request<OpenRequest>) -> Result<Response<OpenResponse>, TStatus> {
         let req = req.into_inner();
         let resume = (!req.resume_id.is_empty()).then_some(req.resume_id.as_str());
-        let execution_context = if !req.workspace_cwd.is_empty()
-            || !req.workspace_root.is_empty()
-            || req.enforce_workspace_root
-        {
-            let workspace_cwd = std::path::PathBuf::from(req.workspace_cwd);
-            let workspace_root = if req.workspace_root.is_empty() {
-                workspace_cwd.clone()
-            } else {
-                std::path::PathBuf::from(req.workspace_root)
-            };
-            Some(
-                cortex::execution_context::ExecutionContext::for_workspace(
-                    workspace_cwd,
-                    workspace_root,
-                )
-                .map_err(|e| {
-                    TStatus::invalid_argument(format!("invalid workspace context: {e}"))
-                })?,
-            )
-        } else {
-            None
-        };
+        let execution_context = requested_context(&req).map_err(TStatus::invalid_argument)?;
 
         // If resuming and the host is still live, just hand back its cursor.
         if let Some(id) = resume {
             if let Some(host) = self.registry.get(id) {
-                return Ok(Response::new(OpenResponse {
-                    session_id: host.id().to_string(),
-                    last_event_seq: host.last_event_seq(),
-                }));
+                return Ok(Response::new(opened(&host)));
             }
         }
 
@@ -336,13 +370,9 @@ impl Session for SessionSvc {
             .open(resume, execution_context)
             .await
             .map_err(|e| TStatus::internal(format!("session open failed: {e}")))?;
-        let session_id = host.id().to_string();
-        let last_event_seq = host.last_event_seq();
+        let response = opened(&host);
         self.registry.insert(host);
-        Ok(Response::new(OpenResponse {
-            session_id,
-            last_event_seq,
-        }))
+        Ok(Response::new(response))
     }
 
     async fn send(&self, req: Request<SendRequest>) -> Result<Response<Self::SendStream>, TStatus> {
@@ -1126,5 +1156,69 @@ mod stored_title_tests {
         assert_eq!(stored_title(&db, "blank", "Live".into()).await, "Live");
         assert_eq!(stored_title(&db, "unknown", "Live".into()).await, "Live");
         assert_eq!(stored_title(&db, "", "Live".into()).await, "Live");
+    }
+}
+
+#[cfg(test)]
+mod requested_context_tests {
+    use super::*;
+
+    fn open(working_dir: &str, workspace_cwd: &str) -> OpenRequest {
+        OpenRequest {
+            working_dir: working_dir.to_string(),
+            workspace_cwd: workspace_cwd.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A working folder is where the session works, with nothing fenced off;
+    /// a workspace is a fence, and wins when a client sends both.
+    #[test]
+    fn a_working_folder_is_unconfined_and_a_workspace_is_confined() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonicalize");
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        let ctx = requested_context(&open(&dir_str, ""))
+            .expect("a folder that exists")
+            .expect("a context");
+        assert_eq!(ctx.workspace_cwd(), dir);
+        assert!(!ctx.enforce_workspace_root());
+
+        let ctx = requested_context(&open(&dir_str, &dir_str))
+            .expect("a workspace that exists")
+            .expect("a context");
+        assert!(
+            ctx.enforce_workspace_root(),
+            "the workspace must still confine"
+        );
+
+        assert!(requested_context(&open("", ""))
+            .expect("nothing asked")
+            .is_none());
+    }
+
+    /// A client's folder that is not a folder on this machine — the client
+    /// is on another one, or the daemon may not enter it — is no reason to
+    /// refuse the session: it opens as one that named none. A path that is
+    /// not absolute is a client fault, and is refused by name.
+    #[test]
+    fn a_folder_this_machine_does_not_have_falls_back_and_a_relative_one_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "x").expect("seed");
+        let missing = tmp.path().join("gone");
+
+        for elsewhere in [&missing, &file] {
+            let context = requested_context(&open(&elsewhere.to_string_lossy(), ""))
+                .expect("not a reason to refuse the session");
+            assert!(context.is_none(), "{}", elsewhere.display());
+        }
+
+        let refused = requested_context(&open("relative/dir", "")).expect_err("must be refused");
+        assert_eq!(
+            refused,
+            "invalid working folder: relative/dir is not an absolute path"
+        );
     }
 }
